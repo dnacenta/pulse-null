@@ -8,6 +8,9 @@ use tokio::sync::RwLock;
 use super::output;
 use super::{Schedule, ScheduledTask};
 use crate::llm::{Message, Role};
+use crate::monitoring::signals;
+use crate::pipeline;
+use crate::pipeline::health as pipeline_health;
 use crate::server::prompt;
 use crate::server::AppState;
 
@@ -160,6 +163,32 @@ async fn execute_task(
 
     // Log to LOGBOOK.md
     log_execution(&root_dir, task, &parsed.clean_content);
+
+    // Post-execution: extract cognitive signals
+    if state.config.monitoring.enabled {
+        let frame = signals::extract(&result.content, &task.id);
+        if let Err(e) = signals::record(&root_dir, frame, state.config.monitoring.window_size) {
+            tracing::error!("Failed to record signals for task '{}': {}", task.id, e);
+        }
+    }
+
+    // Post-execution: update pipeline state and auto-archive
+    if state.config.pipeline.enabled {
+        let health = pipeline_health::calculate(&root_dir, &state.config.pipeline);
+        let new_counts = pipeline_health::counts_from_health(&health);
+
+        let mut pipeline_state = pipeline::PipelineState::load(&root_dir);
+        pipeline_state.update_counts(&new_counts);
+        if let Err(e) = pipeline_state.save(&root_dir) {
+            tracing::error!("Failed to save pipeline state: {}", e);
+        }
+
+        let archived =
+            pipeline::archive::check_and_archive(&root_dir, &state.config.pipeline, &health);
+        for doc in &archived {
+            tracing::info!("Auto-archived overflow from {}", doc);
+        }
+    }
 }
 
 /// Append a task execution record to LOGBOOK.md

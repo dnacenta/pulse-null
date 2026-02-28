@@ -5,6 +5,8 @@ mod config;
 mod init;
 mod llm;
 mod memory;
+mod monitoring;
+mod pipeline;
 mod scheduler;
 mod server;
 
@@ -35,6 +37,16 @@ enum Commands {
     Schedule {
         #[command(subcommand)]
         action: ScheduleAction,
+    },
+    /// Pipeline health and document tracking
+    Pipeline {
+        #[command(subcommand)]
+        action: PipelineAction,
+    },
+    /// Manage document archives
+    Archive {
+        #[command(subcommand)]
+        action: ArchiveAction,
     },
 }
 
@@ -67,6 +79,29 @@ enum ScheduleAction {
     Disable {
         /// Task ID
         id: String,
+    },
+}
+
+#[derive(Subcommand)]
+enum PipelineAction {
+    /// Show document counts and threshold status
+    Health,
+    /// List stale documents that need attention
+    Stale,
+}
+
+#[derive(Subcommand)]
+enum ArchiveAction {
+    /// List archived files
+    List {
+        /// Filter by document type (learning, thoughts, curiosity, reflections, praxis)
+        #[arg(long)]
+        document: Option<String>,
+    },
+    /// Manually archive a document
+    Run {
+        /// Document to archive (learning, thoughts, curiosity, reflections, praxis)
+        document: String,
     },
 }
 
@@ -115,6 +150,26 @@ async fn main() {
                 ScheduleAction::Remove { id } => cli::schedule::remove(id).await,
                 ScheduleAction::Enable { id } => cli::schedule::enable(id).await,
                 ScheduleAction::Disable { id } => cli::schedule::disable(id).await,
+            };
+            if let Err(e) = result {
+                eprintln!("Error: {e}");
+                std::process::exit(1);
+            }
+        }
+        Commands::Pipeline { action } => {
+            let result = match action {
+                PipelineAction::Health => cli::pipeline::health_cmd().await,
+                PipelineAction::Stale => cli::pipeline::stale_cmd().await,
+            };
+            if let Err(e) = result {
+                eprintln!("Error: {e}");
+                std::process::exit(1);
+            }
+        }
+        Commands::Archive { action } => {
+            let result = match action {
+                ArchiveAction::List { document } => cli::archive::list(document).await,
+                ArchiveAction::Run { document } => cli::archive::run(document).await,
             };
             if let Err(e) = result {
                 eprintln!("Error: {e}");

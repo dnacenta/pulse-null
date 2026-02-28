@@ -60,6 +60,27 @@ timezone = "{timezone}"
 [scheduler.output]
 # share_webhook = "https://discord.com/api/webhooks/..."
 # call_endpoint = "http://localhost:8443/api/call"
+
+[pipeline]
+enabled = true
+learning_soft = 5
+learning_hard = 8
+thoughts_soft = 5
+thoughts_hard = 10
+curiosity_soft = 3
+curiosity_hard = 7
+reflections_soft = 15
+reflections_hard = 20
+praxis_soft = 5
+praxis_hard = 10
+thoughts_staleness_days = 7
+curiosity_staleness_days = 14
+freeze_threshold = 3
+
+[monitoring]
+enabled = true
+window_size = 10
+min_samples = 5
 "#,
         entity_name = data.entity_name,
         owner_name = data.owner_name,
