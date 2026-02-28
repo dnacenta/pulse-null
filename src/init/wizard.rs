@@ -217,6 +217,10 @@ pub async fn run(target_dir: &Path) -> Result<(), Box<dyn std::error::Error>> {
         ))
         .green()
     );
+    println!(
+        "  Add plugins with: {}",
+        style("echo-system plugin add <name>").green()
+    );
     println!();
 
     Ok(())

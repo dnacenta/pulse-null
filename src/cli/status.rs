@@ -11,6 +11,21 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
     println!("LLM: {}", config.llm.provider);
     println!("Server: {}:{}", config.server.host, config.server.port);
 
+    // Plugins
+    if config.plugins.is_empty() {
+        println!("Plugins: none");
+    } else {
+        let names: Vec<&String> = config.plugins.keys().collect();
+        println!(
+            "Plugins: {}",
+            names
+                .iter()
+                .map(|n| n.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+    }
+
     // Check if server is running
     let url = format!(
         "http://{}:{}/health",

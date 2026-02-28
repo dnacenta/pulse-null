@@ -7,6 +7,7 @@ mod llm;
 mod memory;
 mod monitoring;
 mod pipeline;
+mod plugins;
 mod scheduler;
 mod server;
 
@@ -48,6 +49,11 @@ enum Commands {
         #[command(subcommand)]
         action: ArchiveAction,
     },
+    /// Manage plugins
+    Plugin {
+        #[command(subcommand)]
+        action: PluginAction,
+    },
 }
 
 #[derive(Subcommand)]
@@ -88,6 +94,22 @@ enum PipelineAction {
     Health,
     /// List stale documents that need attention
     Stale,
+}
+
+#[derive(Subcommand)]
+enum PluginAction {
+    /// List available and installed plugins
+    List,
+    /// Add a plugin
+    Add {
+        /// Plugin name
+        name: String,
+    },
+    /// Remove a plugin
+    Remove {
+        /// Plugin name
+        name: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -170,6 +192,17 @@ async fn main() {
             let result = match action {
                 ArchiveAction::List { document } => cli::archive::list(document).await,
                 ArchiveAction::Run { document } => cli::archive::run(document).await,
+            };
+            if let Err(e) = result {
+                eprintln!("Error: {e}");
+                std::process::exit(1);
+            }
+        }
+        Commands::Plugin { action } => {
+            let result = match action {
+                PluginAction::List => cli::plugin::list().await,
+                PluginAction::Add { name } => cli::plugin::add(name).await,
+                PluginAction::Remove { name } => cli::plugin::remove(name).await,
             };
             if let Err(e) = result {
                 eprintln!("Error: {e}");
