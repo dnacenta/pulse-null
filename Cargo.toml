@@ -39,6 +39,10 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 dialoguer = { version = "0.11", features = ["fuzzy-select"] }
 console = "0.15"
 
+# Scheduler
+cron = "0.15"
+chrono-tz = "0.10"
+
 # Misc
 uuid = { version = "1", features = ["v4"] }
 chrono = { version = "0.4", features = ["serde"] }

@@ -84,6 +84,37 @@ pub async fn run(target_dir: &Path) -> Result<(), Box<dyn std::error::Error>> {
         .interact_text()?;
 
     println!();
+    println!("  {}", style("Scheduler configuration.").bold());
+    println!();
+
+    // Timezone
+    let common_timezones = vec![
+        "UTC",
+        "US/Eastern",
+        "US/Central",
+        "US/Pacific",
+        "Europe/London",
+        "Europe/Madrid",
+        "Europe/Berlin",
+        "Europe/Paris",
+        "Asia/Tokyo",
+        "Asia/Shanghai",
+        "Australia/Sydney",
+    ];
+    let tz_idx = Select::new()
+        .with_prompt("  Timezone for scheduled tasks")
+        .items(&common_timezones)
+        .default(0)
+        .interact()?;
+
+    let timezone = if tz_idx < common_timezones.len() {
+        common_timezones[tz_idx].to_string()
+    } else {
+        // Fallback (shouldn't happen with Select)
+        "UTC".to_string()
+    };
+
+    println!();
     println!(
         "  Creating entity \"{}\"...",
         style(&entity_name).cyan().bold()
@@ -110,6 +141,7 @@ pub async fn run(target_dir: &Path) -> Result<(), Box<dyn std::error::Error>> {
         provider: provider_name,
         api_key,
         port,
+        timezone: timezone.clone(),
     };
 
     // Write all files
@@ -146,6 +178,10 @@ pub async fn run(target_dir: &Path) -> Result<(), Box<dyn std::error::Error>> {
         (
             "journal/LOGBOOK.md",
             format!("# {} — Logbook\n\nSession tracking and daily records.\n", entity_name),
+        ),
+        (
+            "schedule.json",
+            templates::render_schedule_json(),
         ),
     ];
 

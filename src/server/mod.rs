@@ -13,6 +13,7 @@ use tower_http::services::ServeDir;
 use crate::config::Config;
 use crate::llm::claude_api::ClaudeProvider;
 use crate::llm::{LmProvider, Message};
+use crate::scheduler::Schedule;
 
 /// Shared application state
 pub struct AppState {
@@ -40,6 +41,12 @@ pub async fn start(config: Config) -> Result<(), Box<dyn std::error::Error>> {
         system_prompt: RwLock::new(system_prompt),
     });
 
+    // Load schedule and start scheduler
+    let schedule = Schedule::load(&root_dir)?;
+    let schedule = Arc::new(RwLock::new(schedule));
+    let scheduler_handles =
+        crate::scheduler::start(Arc::clone(&state), Arc::clone(&schedule)).await?;
+
     // Resolve static files directory relative to entity root
     let static_dir = root_dir.join("static");
 
@@ -57,6 +64,11 @@ pub async fn start(config: Config) -> Result<(), Box<dyn std::error::Error>> {
     tracing::info!("Listening on {}", addr);
 
     axum::serve(listener, app).await?;
+
+    // Clean up scheduler tasks on shutdown
+    for handle in scheduler_handles {
+        handle.abort();
+    }
 
     Ok(())
 }
