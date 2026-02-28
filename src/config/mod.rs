@@ -16,6 +16,8 @@ pub struct Config {
     pub trust: TrustConfig,
     #[serde(default)]
     pub memory: MemoryConfig,
+    #[serde(default)]
+    pub scheduler: SchedulerConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -65,6 +67,36 @@ pub struct MemoryConfig {
     pub memory_max_lines: usize,
     #[serde(default = "default_archive_max")]
     pub archive_max_logs: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SchedulerConfig {
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    #[serde(default = "default_timezone")]
+    pub timezone: String,
+    #[serde(default)]
+    pub output: OutputConfig,
+}
+
+impl Default for SchedulerConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            timezone: default_timezone(),
+            output: OutputConfig::default(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct OutputConfig {
+    /// Webhook URL for [SHARE:] output (Discord, Slack, etc.)
+    #[serde(default)]
+    pub share_webhook: Option<String>,
+    /// Endpoint for [CALL:] output (voice plugin)
+    #[serde(default)]
+    pub call_endpoint: Option<String>,
 }
 
 impl Default for MemoryConfig {
@@ -168,4 +200,8 @@ fn default_memory_limit() -> usize {
 
 fn default_archive_max() -> usize {
     100
+}
+
+fn default_timezone() -> String {
+    "UTC".to_string()
 }

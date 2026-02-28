@@ -14,6 +14,7 @@ pub struct ConfigData {
     pub provider: String,
     pub api_key: Option<String>,
     pub port: u16,
+    pub timezone: String,
 }
 
 pub fn render_config(data: &ConfigData) -> String {
@@ -51,6 +52,14 @@ verified = ["chat", "voice"]
 [memory]
 memory_max_lines = 200
 archive_max_logs = 100
+
+[scheduler]
+enabled = true
+timezone = "{timezone}"
+
+[scheduler.output]
+# share_webhook = "https://discord.com/api/webhooks/..."
+# call_endpoint = "http://localhost:8443/api/call"
 "#,
         entity_name = data.entity_name,
         owner_name = data.owner_name,
@@ -58,6 +67,7 @@ archive_max_logs = 100
         port = data.port,
         provider = data.provider,
         api_key_line = api_key_line,
+        timezone = data.timezone,
     )
 }
 
@@ -145,6 +155,11 @@ Ideas flow: LEARNING → THOUGHTS → REFLECTIONS → SELF.md / PRAXIS.md
         owner_name = identity.owner_name,
         owner_alias = identity.owner_alias,
     )
+}
+
+pub fn render_schedule_json() -> String {
+    let schedule = crate::scheduler::Schedule::with_defaults();
+    serde_json::to_string_pretty(&schedule).unwrap_or_else(|_| "{}".to_string())
 }
 
 pub fn render_memory_md(identity: &Identity) -> String {

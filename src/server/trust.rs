@@ -41,7 +41,8 @@ impl TrustLevel {
 mod tests {
     use super::*;
     use crate::config::{
-        Config, EntityConfig, LlmConfig, MemoryConfig, SecurityConfig, ServerConfig, TrustConfig,
+        Config, EntityConfig, LlmConfig, MemoryConfig, SchedulerConfig, SecurityConfig,
+        ServerConfig, TrustConfig,
     };
 
     fn test_config() -> Config {
@@ -67,6 +68,7 @@ mod tests {
                 verified: vec!["chat".into(), "voice".into()],
             },
             memory: MemoryConfig::default(),
+            scheduler: SchedulerConfig::default(),
         }
     }
 

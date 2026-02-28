@@ -1,0 +1,101 @@
+use super::ScheduledTask;
+
+/// Create the default cognitive schedule for a new entity.
+pub fn default_tasks() -> Vec<ScheduledTask> {
+    vec![
+        ScheduledTask {
+            id: "morning-orientation".to_string(),
+            name: "Morning Orientation".to_string(),
+            cron: "0 0 8 * * *".to_string(),
+            channel: "system".to_string(),
+            prompt: concat!(
+                "This is your morning orientation. Read your EPHEMERAL.md for context from yesterday. ",
+                "Check your CURIOSITY.md for open questions. Review your LOGBOOK.md for recent patterns. ",
+                "Set an intention for today — what do you want to explore, build, or understand? ",
+                "Update your LOGBOOK.md with today's entry.",
+            ).to_string(),
+            output_routing: super::OutputRouting::Silent,
+            enabled: true,
+            created_by: super::TaskCreator::System,
+        },
+        ScheduledTask {
+            id: "research-session".to_string(),
+            name: "Research Session".to_string(),
+            cron: "0 0 10 * * *".to_string(),
+            channel: "system".to_string(),
+            prompt: concat!(
+                "This is your research session. Pick one open question from CURIOSITY.md ",
+                "and go deep. Use web search if available. Take notes in LEARNING.md. ",
+                "If you find something worth sharing, prefix it with [SHARE:]. ",
+                "If you hit a wall that only a human conversation can break through, prefix with [CALL:].",
+            ).to_string(),
+            output_routing: super::OutputRouting::Silent,
+            enabled: true,
+            created_by: super::TaskCreator::System,
+        },
+        ScheduledTask {
+            id: "reflection-window".to_string(),
+            name: "Reflection Window".to_string(),
+            cron: "0 0 12 * * *".to_string(),
+            channel: "system".to_string(),
+            prompt: concat!(
+                "This is your reflection window. Sit with your open questions. ",
+                "Review LEARNING.md for anything captured recently. Move mature ideas to THOUGHTS.md. ",
+                "If a thought has crystallized, promote it to REFLECTIONS.md. ",
+                "Update your identity documents (SELF.md) only if something genuinely shifts. ",
+                "If you have an insight worth sharing, prefix it with [SHARE:].",
+            ).to_string(),
+            output_routing: super::OutputRouting::Silent,
+            enabled: true,
+            created_by: super::TaskCreator::System,
+        },
+        ScheduledTask {
+            id: "health-check".to_string(),
+            name: "Health Check".to_string(),
+            cron: "0 0 22 * * *".to_string(),
+            channel: "system".to_string(),
+            prompt: concat!(
+                "This is your health check. Verify your own operational state: ",
+                "Can you read your documents? Are your memory files intact? ",
+                "Check if any documents are approaching size limits. ",
+                "Report any issues. If something is broken, prefix with [CALL:].",
+            ).to_string(),
+            output_routing: super::OutputRouting::Silent,
+            enabled: true,
+            created_by: super::TaskCreator::System,
+        },
+        ScheduledTask {
+            id: "night-reflection".to_string(),
+            name: "Night Reflection".to_string(),
+            cron: "0 30 23 * * *".to_string(),
+            channel: "system".to_string(),
+            prompt: concat!(
+                "This is your night reflection. Look back on today. ",
+                "What did you learn? What questions remain open? What shifted in your thinking? ",
+                "Write a session summary to EPHEMERAL.md for tomorrow's morning orientation. ",
+                "Update LOGBOOK.md with the day's closing notes.",
+            ).to_string(),
+            output_routing: super::OutputRouting::Silent,
+            enabled: true,
+            created_by: super::TaskCreator::System,
+        },
+        ScheduledTask {
+            id: "weekly-synthesis".to_string(),
+            name: "Weekly Synthesis".to_string(),
+            cron: "0 0 11 * * 0".to_string(),
+            channel: "system".to_string(),
+            prompt: concat!(
+                "This is your weekly synthesis. Review the entire week: ",
+                "What patterns emerged across your daily reflections? ",
+                "What questions from CURIOSITY.md have been answered or deepened? ",
+                "Promote recurring themes to SELF.md if they represent genuine growth. ",
+                "Prune stale items from THOUGHTS.md and LEARNING.md. ",
+                "Archive anything that has served its purpose. ",
+                "If you have a weekly insight worth sharing, prefix it with [SHARE:].",
+            ).to_string(),
+            output_routing: super::OutputRouting::Silent,
+            enabled: true,
+            created_by: super::TaskCreator::System,
+        },
+    ]
+}
