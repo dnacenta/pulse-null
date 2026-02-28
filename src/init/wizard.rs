@@ -183,6 +183,14 @@ pub async fn run(target_dir: &Path) -> Result<(), Box<dyn std::error::Error>> {
             "schedule.json",
             templates::render_schedule_json(),
         ),
+        (
+            "pipeline-state.json",
+            "{}".to_string(),
+        ),
+        (
+            "monitoring/signals.json",
+            "[]".to_string(),
+        ),
     ];
 
     for (path, content) in &files {
@@ -226,6 +234,7 @@ fn create_directory_structure(dir: &Path) -> Result<(), Box<dyn std::error::Erro
         "archives/learning",
         "archives/curiosity",
         "archives/thoughts",
+        "archives/praxis",
         "plugins",
         "logs",
     ];

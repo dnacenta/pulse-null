@@ -1,6 +1,9 @@
 use std::path::Path;
 
 use crate::config::Config;
+use crate::monitoring::assess;
+use crate::pipeline;
+use crate::pipeline::health;
 
 /// Build the system prompt from entity documents
 pub fn build_system_prompt(
@@ -43,6 +46,31 @@ pub fn build_system_prompt(
         if !content.trim().is_empty() {
             parts.push(format!("<last-session>\n{}\n</last-session>", content));
         }
+    }
+
+    // Pipeline health — document counts and threshold status
+    if config.pipeline.enabled {
+        let pipeline_state = pipeline::PipelineState::load(root_dir);
+        let pipeline_health = health::calculate(root_dir, &config.pipeline);
+        let pipeline_text = health::render(
+            &pipeline_health,
+            pipeline_state.sessions_without_movement,
+            config.pipeline.freeze_threshold,
+        );
+        parts.push(format!(
+            "<pipeline-health>\n{}\n</pipeline-health>",
+            pipeline_text
+        ));
+    }
+
+    // Cognitive health — metacognitive monitoring assessment
+    if config.monitoring.enabled {
+        let cognitive_health = assess::assess(root_dir, &config.monitoring);
+        let cognitive_text = assess::render(&cognitive_health);
+        parts.push(format!(
+            "<cognitive-health>\n{}\n</cognitive-health>",
+            cognitive_text
+        ));
     }
 
     Ok(parts.join("\n\n"))

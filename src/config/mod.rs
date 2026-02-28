@@ -18,6 +18,10 @@ pub struct Config {
     pub memory: MemoryConfig,
     #[serde(default)]
     pub scheduler: SchedulerConfig,
+    #[serde(default)]
+    pub pipeline: PipelineConfig,
+    #[serde(default)]
+    pub monitoring: MonitoringConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -204,4 +208,62 @@ fn default_archive_max() -> usize {
 
 fn default_timezone() -> String {
     "UTC".to_string()
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct PipelineConfig {
+    pub enabled: bool,
+    pub learning_soft: usize,
+    pub learning_hard: usize,
+    pub thoughts_soft: usize,
+    pub thoughts_hard: usize,
+    pub curiosity_soft: usize,
+    pub curiosity_hard: usize,
+    pub reflections_soft: usize,
+    pub reflections_hard: usize,
+    pub praxis_soft: usize,
+    pub praxis_hard: usize,
+    pub thoughts_staleness_days: u32,
+    pub curiosity_staleness_days: u32,
+    pub freeze_threshold: u32,
+}
+
+impl Default for PipelineConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            learning_soft: 5,
+            learning_hard: 8,
+            thoughts_soft: 5,
+            thoughts_hard: 10,
+            curiosity_soft: 3,
+            curiosity_hard: 7,
+            reflections_soft: 15,
+            reflections_hard: 20,
+            praxis_soft: 5,
+            praxis_hard: 10,
+            thoughts_staleness_days: 7,
+            curiosity_staleness_days: 14,
+            freeze_threshold: 3,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct MonitoringConfig {
+    pub enabled: bool,
+    pub window_size: usize,
+    pub min_samples: usize,
+}
+
+impl Default for MonitoringConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            window_size: 10,
+            min_samples: 5,
+        }
+    }
 }
