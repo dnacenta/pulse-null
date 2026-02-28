@@ -71,6 +71,7 @@ mod tests {
             scheduler: SchedulerConfig::default(),
             pipeline: PipelineConfig::default(),
             monitoring: MonitoringConfig::default(),
+            plugins: std::collections::HashMap::new(),
         }
     }
 

@@ -81,6 +81,11 @@ freeze_threshold = 3
 enabled = true
 window_size = 10
 min_samples = 5
+
+# [plugins]
+# Add plugins with: echo-system plugin add <name>
+# [plugins.voice-echo]
+# [plugins.discord-echo]
 "#,
         entity_name = data.entity_name,
         owner_name = data.owner_name,
