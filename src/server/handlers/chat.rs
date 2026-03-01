@@ -83,7 +83,7 @@ pub async fn chat(
     // Accumulate total token usage across rounds
     let mut total_input_tokens: Option<u32> = None;
     let mut total_output_tokens: Option<u32> = None;
-    let mut final_model = String::new();
+    let mut final_model: String;
 
     let system_prompt = state.system_prompt.read().await;
     let mut rounds: u32 = 0;
