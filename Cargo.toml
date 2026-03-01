@@ -8,6 +8,8 @@ description = "One binary. One command. Your own AI entity."
 repository = "https://github.com/dnacenta/echo-system"
 keywords = ["ai", "entity", "assistant", "claude", "llm"]
 categories = ["command-line-utilities"]
+authors = ["dnacenta"]
+readme = "README.md"
 
 [dependencies]
 # CLI
