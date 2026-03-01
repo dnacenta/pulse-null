@@ -21,7 +21,8 @@ pub async fn run_task_loop(
     schedule: Arc<RwLock<Schedule>>,
     tz: chrono_tz::Tz,
 ) {
-    let cron_expr = match CronSchedule::from_str(&task.cron) {
+    let normalized_cron = super::normalize_cron(&task.cron);
+    let cron_expr = match CronSchedule::from_str(&normalized_cron) {
         Ok(c) => c,
         Err(e) => {
             tracing::error!("Invalid cron for task '{}': {} — {}", task.id, task.cron, e);
