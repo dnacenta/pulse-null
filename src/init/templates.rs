@@ -47,7 +47,7 @@ injection_detection = true
 
 [trust]
 trusted = ["reflection", "system"]
-verified = ["chat", "voice"]
+verified = ["chat", "voice", "web"]
 
 [memory]
 memory_max_lines = 200

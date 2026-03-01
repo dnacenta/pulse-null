@@ -113,7 +113,7 @@ my-entity/
 | `security`     | `secret`                 | --                   | Auth secret (enables `X-Echo-Secret` header)   |
 | `security`     | `injection_detection`    | `true`               | Prompt injection scanning                      |
 | `trust`        | `trusted`                | `["reflection", "system"]` | Channels with full access                |
-| `trust`        | `verified`               | `["chat", "voice"]`  | Channels with limited access                   |
+| `trust`        | `verified`               | `["chat", "voice", "web"]` | Channels with limited access              |
 | `scheduler`    | `enabled`                | `true`               | Enable scheduled tasks                         |
 | `scheduler`    | `timezone`               | `UTC`                | Timezone for cron expressions                  |
 | `pipeline`     | `enabled`                | `true`               | Document threshold enforcement                 |
