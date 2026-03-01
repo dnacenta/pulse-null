@@ -82,7 +82,7 @@ pub fn default_tasks() -> Vec<ScheduledTask> {
         ScheduledTask {
             id: "weekly-synthesis".to_string(),
             name: "Weekly Synthesis".to_string(),
-            cron: "0 0 11 * * 0".to_string(),
+            cron: "0 0 11 * * 7".to_string(),
             channel: "system".to_string(),
             prompt: concat!(
                 "This is your weekly synthesis. Review the entire week: ",

@@ -5,7 +5,7 @@ use axum::http::StatusCode;
 use axum::Json;
 use serde::{Deserialize, Serialize};
 
-use crate::llm::{Message, Role};
+use crate::llm::{ContentBlock, Message, MessageContent, Role, StopReason};
 use crate::server::trust::TrustLevel;
 use crate::server::{injection, AppState};
 
@@ -31,6 +31,9 @@ pub struct ChatResponse {
 fn default_channel() -> String {
     "chat".to_string()
 }
+
+/// Maximum number of tool-use round trips before we force a text response.
+const MAX_TOOL_ROUNDS: u32 = 25;
 
 pub async fn chat(
     State(state): State<Arc<AppState>>,
@@ -66,36 +69,131 @@ pub async fn chat(
     let mut conversation = state.conversation.write().await;
     conversation.push(Message {
         role: Role::User,
-        content: user_message,
+        content: MessageContent::Text(user_message),
     });
 
-    // Invoke LLM
+    // Build tool definitions (only if provider supports tools)
+    let tool_defs = if state.provider.supports_tools() && !state.tools.is_empty() {
+        Some(state.tools.definitions())
+    } else {
+        None
+    };
+    let tool_defs_ref = tool_defs.as_deref();
+
+    // Accumulate total token usage across rounds
+    let mut total_input_tokens: Option<u32> = None;
+    let mut total_output_tokens: Option<u32> = None;
+    let mut final_model: String;
+
     let system_prompt = state.system_prompt.read().await;
-    let result = state
-        .provider
-        .invoke(&system_prompt, &conversation, state.config.llm.max_tokens)
-        .await
-        .map_err(|e: Box<dyn std::error::Error + Send + Sync>| {
-            tracing::error!("LLM invocation failed: {}", e);
-            (StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
-        })?;
+    let mut rounds: u32 = 0;
 
-    // Add assistant response to conversation
-    conversation.push(Message {
-        role: Role::Assistant,
-        content: result.content.clone(),
-    });
+    loop {
+        // Invoke LLM
+        let result = state
+            .provider
+            .invoke(
+                &system_prompt,
+                &conversation,
+                state.config.llm.max_tokens,
+                tool_defs_ref,
+            )
+            .await
+            .map_err(|e: Box<dyn std::error::Error + Send + Sync>| {
+                tracing::error!("LLM invocation failed: {}", e);
+                (StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
+            })?;
 
-    // Keep conversation bounded (last 100 messages)
-    if conversation.len() > 100 {
-        let drain_count = conversation.len() - 100;
-        conversation.drain(..drain_count);
+        // Accumulate token counts
+        total_input_tokens =
+            Some(total_input_tokens.unwrap_or(0) + result.input_tokens.unwrap_or(0));
+        total_output_tokens =
+            Some(total_output_tokens.unwrap_or(0) + result.output_tokens.unwrap_or(0));
+        final_model = result.model.clone();
+
+        // Add assistant response to conversation
+        conversation.push(Message {
+            role: Role::Assistant,
+            content: MessageContent::Blocks(result.content.clone()),
+        });
+
+        match result.stop_reason {
+            StopReason::EndTurn | StopReason::MaxTokens | StopReason::StopSequence => {
+                // Done — extract text and return
+                let text = result.text();
+
+                // Keep conversation bounded (last 100 messages)
+                if conversation.len() > 100 {
+                    let drain_count = conversation.len() - 100;
+                    conversation.drain(..drain_count);
+                }
+
+                return Ok(Json(ChatResponse {
+                    response: text,
+                    model: final_model,
+                    input_tokens: total_input_tokens,
+                    output_tokens: total_output_tokens,
+                }));
+            }
+            StopReason::ToolUse => {
+                rounds += 1;
+                if rounds > MAX_TOOL_ROUNDS {
+                    tracing::warn!(
+                        "Tool loop exceeded {} rounds, forcing response",
+                        MAX_TOOL_ROUNDS
+                    );
+                    let text = result.text();
+                    return Ok(Json(ChatResponse {
+                        response: text,
+                        model: final_model,
+                        input_tokens: total_input_tokens,
+                        output_tokens: total_output_tokens,
+                    }));
+                }
+
+                // Execute all tool_use blocks and collect results
+                let mut tool_results = Vec::new();
+                for block in &result.content {
+                    if let ContentBlock::ToolUse { id, name, input } = block {
+                        let tool_result = match state.tools.get(name) {
+                            Some(tool) => match tool.execute(input.clone()).await {
+                                Ok(output) => ContentBlock::ToolResult {
+                                    tool_use_id: id.clone(),
+                                    content: output,
+                                    is_error: None,
+                                },
+                                Err(e) => ContentBlock::ToolResult {
+                                    tool_use_id: id.clone(),
+                                    content: format!("Error: {}", e),
+                                    is_error: Some(true),
+                                },
+                            },
+                            None => ContentBlock::ToolResult {
+                                tool_use_id: id.clone(),
+                                content: format!("Error: Unknown tool '{}'", name),
+                                is_error: Some(true),
+                            },
+                        };
+                        tool_results.push(tool_result);
+                    }
+                }
+
+                // Add tool results as a user message and loop
+                conversation.push(Message {
+                    role: Role::User,
+                    content: MessageContent::Blocks(tool_results),
+                });
+            }
+            StopReason::Other(ref reason) => {
+                tracing::warn!("Unexpected stop reason: {}", reason);
+                let text = result.text();
+                return Ok(Json(ChatResponse {
+                    response: text,
+                    model: final_model,
+                    input_tokens: total_input_tokens,
+                    output_tokens: total_output_tokens,
+                }));
+            }
+        }
     }
-
-    Ok(Json(ChatResponse {
-        response: result.content,
-        model: result.model,
-        input_tokens: result.input_tokens,
-        output_tokens: result.output_tokens,
-    }))
 }

@@ -7,7 +7,7 @@ use tokio::sync::RwLock;
 
 use super::output;
 use super::{Schedule, ScheduledTask};
-use crate::llm::{Message, Role};
+use crate::llm::{Message, MessageContent, Role};
 use crate::monitoring::signals;
 use crate::pipeline;
 use crate::pipeline::health as pipeline_health;
@@ -21,7 +21,8 @@ pub async fn run_task_loop(
     schedule: Arc<RwLock<Schedule>>,
     tz: chrono_tz::Tz,
 ) {
-    let cron_expr = match CronSchedule::from_str(&task.cron) {
+    let normalized_cron = super::normalize_cron(&task.cron);
+    let cron_expr = match CronSchedule::from_str(&normalized_cron) {
         Ok(c) => c,
         Err(e) => {
             tracing::error!("Invalid cron for task '{}': {} — {}", task.id, task.cron, e);
@@ -104,13 +105,13 @@ async fn execute_task(
     // Create a fresh conversation (no shared state with chat)
     let messages = vec![Message {
         role: Role::User,
-        content: user_message,
+        content: MessageContent::Text(user_message),
     }];
 
-    // Invoke LLM
+    // Invoke LLM (no tools for scheduled tasks)
     let result = match state
         .provider
-        .invoke(&system_prompt, &messages, state.config.llm.max_tokens)
+        .invoke(&system_prompt, &messages, state.config.llm.max_tokens, None)
         .await
     {
         Ok(r) => r,
@@ -128,7 +129,8 @@ async fn execute_task(
     );
 
     // Parse and route output
-    let parsed = output::parse_output(&result.content);
+    let response_text = result.text();
+    let parsed = output::parse_output(&response_text);
 
     // Handle [SCHEDULE:] markers — create new dynamic tasks
     for schedule_json in &parsed.schedule_requests {
@@ -166,7 +168,7 @@ async fn execute_task(
 
     // Post-execution: extract cognitive signals
     if state.config.monitoring.enabled {
-        let frame = signals::extract(&result.content, &task.id);
+        let frame = signals::extract(&response_text, &task.id);
         if let Err(e) = signals::record(&root_dir, frame, state.config.monitoring.window_size) {
             tracing::error!("Failed to record signals for task '{}': {}", task.id, e);
         }

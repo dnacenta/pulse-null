@@ -10,6 +10,7 @@ mod pipeline;
 mod plugins;
 mod scheduler;
 mod server;
+mod tools;
 
 #[derive(Parser)]
 #[command(name = "echo-system")]

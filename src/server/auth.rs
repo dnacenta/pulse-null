@@ -63,6 +63,7 @@ mod tests {
         SchedulerConfig, SecurityConfig, ServerConfig, TrustConfig,
     };
     use crate::llm::Message;
+    use crate::tools::ToolRegistry;
 
     fn test_state(secret: Option<String>) -> Arc<AppState> {
         Arc::new(AppState {
@@ -96,6 +97,7 @@ mod tests {
             )),
             conversation: RwLock::new(Vec::<Message>::new()),
             system_prompt: RwLock::new(String::new()),
+            tools: ToolRegistry::new(),
         })
     }
 

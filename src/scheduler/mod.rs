@@ -170,3 +170,41 @@ pub async fn start(
 fn default_true() -> bool {
     true
 }
+
+/// Normalize a 6-field cron expression so that Sunday `0` becomes `7`.
+/// The `cron` crate requires day-of-week in 1-7 (Mon-Sun), but most users
+/// expect 0 = Sunday (the POSIX convention).
+pub fn normalize_cron(expr: &str) -> String {
+    let fields: Vec<&str> = expr.split_whitespace().collect();
+    if fields.len() == 6 {
+        let dow = fields[5];
+        if dow == "0" {
+            return format!(
+                "{} {} {} {} {} 7",
+                fields[0], fields[1], fields[2], fields[3], fields[4]
+            );
+        }
+    }
+    expr.to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn normalize_sunday_zero_to_seven() {
+        assert_eq!(normalize_cron("0 0 11 * * 0"), "0 0 11 * * 7");
+    }
+
+    #[test]
+    fn leave_other_days_unchanged() {
+        assert_eq!(normalize_cron("0 0 11 * * 1"), "0 0 11 * * 1");
+        assert_eq!(normalize_cron("0 0 11 * * 7"), "0 0 11 * * 7");
+    }
+
+    #[test]
+    fn leave_wildcard_unchanged() {
+        assert_eq!(normalize_cron("0 0 8 * * *"), "0 0 8 * * *");
+    }
+}
