@@ -54,6 +54,7 @@ pub async fn start(config: Config) -> Result<(), Box<dyn std::error::Error>> {
     tools.register(Box::new(crate::tools::file_list::FileListTool::new(
         root_dir.clone(),
     )));
+    tools.register(Box::new(crate::tools::web_fetch::WebFetchTool::new()));
     tracing::info!("Registered {} built-in tool(s)", tools.definitions().len());
 
     // Initialize and start plugins
