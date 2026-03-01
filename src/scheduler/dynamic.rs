@@ -25,7 +25,8 @@ pub fn create_task_from_marker(
         .ok_or("Missing 'prompt' in schedule marker")?
         .to_string();
 
-    // Validate the cron expression
+    // Normalize and validate the cron expression
+    let cron = super::normalize_cron(&cron);
     CronSchedule::from_str(&cron)
         .map_err(|e| format!("Invalid cron expression '{}': {}", cron, e))?;
 

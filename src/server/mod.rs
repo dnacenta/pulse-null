@@ -18,6 +18,7 @@ use crate::llm::claude_api::ClaudeProvider;
 use crate::llm::{LmProvider, Message};
 use crate::plugins::manager::PluginManager;
 use crate::scheduler::Schedule;
+use crate::tools::ToolRegistry;
 
 /// Shared application state
 pub struct AppState {
@@ -25,6 +26,7 @@ pub struct AppState {
     pub provider: Box<dyn LmProvider>,
     pub conversation: RwLock<Vec<Message>>,
     pub system_prompt: RwLock<String>,
+    pub tools: ToolRegistry,
 }
 
 pub async fn start(config: Config) -> Result<(), Box<dyn std::error::Error>> {
@@ -40,6 +42,19 @@ pub async fn start(config: Config) -> Result<(), Box<dyn std::error::Error>> {
     // Build system prompt from SELF.md + CLAUDE.md + MEMORY.md
     let root_dir = config.root_dir()?;
     let system_prompt = prompt::build_system_prompt(&root_dir, &config)?;
+
+    // Register built-in tools
+    let mut tools = ToolRegistry::new();
+    tools.register(Box::new(crate::tools::file_read::FileReadTool::new(
+        root_dir.clone(),
+    )));
+    tools.register(Box::new(crate::tools::file_write::FileWriteTool::new(
+        root_dir.clone(),
+    )));
+    tools.register(Box::new(crate::tools::file_list::FileListTool::new(
+        root_dir.clone(),
+    )));
+    tracing::info!("Registered {} built-in tool(s)", tools.definitions().len());
 
     // Initialize and start plugins
     let mut plugin_manager = PluginManager::new(&config);
@@ -60,6 +75,7 @@ pub async fn start(config: Config) -> Result<(), Box<dyn std::error::Error>> {
         provider,
         conversation: RwLock::new(Vec::new()),
         system_prompt: RwLock::new(system_prompt),
+        tools,
     });
 
     // Load schedule and start scheduler
