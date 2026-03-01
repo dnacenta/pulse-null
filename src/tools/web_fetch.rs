@@ -41,6 +41,8 @@ fn is_private_url(url: &reqwest::Url) -> bool {
         if host == "169.254.169.254" || host.ends_with(".internal") {
             return true;
         }
+        // Domain name passed all checks — allow it
+        return false;
     }
     true // No host = blocked
 }
