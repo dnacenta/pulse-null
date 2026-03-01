@@ -1,6 +1,7 @@
 pub mod file_list;
 pub mod file_read;
 pub mod file_write;
+pub mod web_fetch;
 
 use std::fmt;
 use std::future::Future;
