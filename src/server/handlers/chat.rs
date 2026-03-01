@@ -36,8 +36,7 @@ pub async fn chat(
     State(state): State<Arc<AppState>>,
     Json(req): Json<ChatRequest>,
 ) -> Result<Json<ChatResponse>, (StatusCode, String)> {
-    // Check authentication if secret is configured
-    // TODO: implement header-based auth check
+    // Auth is enforced by middleware (server/auth.rs)
 
     // Determine trust level
     let trust = TrustLevel::from_channel(&req.channel, &state.config);

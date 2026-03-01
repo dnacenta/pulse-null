@@ -1,10 +1,13 @@
+pub mod auth;
 mod handlers;
 pub mod injection;
 pub mod prompt;
+pub mod rate_limit;
 pub mod trust;
 
 use std::sync::Arc;
 
+use axum::middleware;
 use axum::routing::{get, post};
 use axum::Router;
 use tokio::sync::RwLock;
@@ -68,6 +71,9 @@ pub async fn start(config: Config) -> Result<(), Box<dyn std::error::Error>> {
     // Collect plugin routes (stateless — merged after .with_state())
     let plugin_routes = plugin_manager.collect_routes();
 
+    // Rate limiter (10 burst, 2/sec)
+    let limiter = rate_limit::default_limiter();
+
     // Resolve static files directory relative to entity root
     let static_dir = root_dir.join("static");
 
@@ -75,7 +81,15 @@ pub async fn start(config: Config) -> Result<(), Box<dyn std::error::Error>> {
         .route("/health", get(handlers::health::health))
         .route("/api/status", get(handlers::status::status))
         .route("/chat", post(handlers::chat::chat))
+        .route_layer(middleware::from_fn_with_state(
+            Arc::clone(&state),
+            auth::require_auth,
+        ))
         .with_state(state)
+        .layer(middleware::from_fn_with_state(
+            limiter,
+            rate_limit::rate_limit,
+        ))
         .merge(plugin_routes)
         .nest_service("/static", ServeDir::new(&static_dir))
         .fallback_service(ServeDir::new(&static_dir).append_index_html_on_directories(true));
