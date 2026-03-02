@@ -10,9 +10,11 @@ use super::executor::{self, ExecutionConfig};
 use super::intent::{self, IntentQueue, IntentSource};
 use super::output;
 use super::{Schedule, ScheduledTask};
-use crate::monitoring::signals;
+use crate::events::EntityEvent;
+use crate::monitoring::{assess as cognitive_assess, signals};
 use crate::pipeline;
 use crate::pipeline::health as pipeline_health;
+use crate::pipeline::health::ThresholdStatus;
 use crate::server::prompt;
 use crate::server::AppState;
 
@@ -293,11 +295,25 @@ async fn execute_task(
     // Log to LOGBOOK.md
     log_execution(&root_dir, task, &parsed.clean_content);
 
-    // Post-execution: extract cognitive signals
+    // Post-execution: extract cognitive signals and check for health changes
     if state.config.monitoring.enabled {
+        // Assess health BEFORE recording new signals (to detect change)
+        let health_before = cognitive_assess::assess(&root_dir, &state.config.monitoring);
+        let previous_status = health_before.status.to_string();
+
         let frame = signals::extract(&response_text, &task.id);
         if let Err(e) = signals::record(&root_dir, frame, state.config.monitoring.window_size) {
             tracing::error!("Failed to record signals for task '{}': {}", task.id, e);
+        }
+
+        // Assess health AFTER recording new signals
+        let health_after = cognitive_assess::assess(&root_dir, &state.config.monitoring);
+        if health_after.sufficient_data && health_after.status != health_before.status {
+            state.event_bus.emit(EntityEvent::CognitiveHealthChanged {
+                previous: previous_status,
+                current: health_after.status.to_string(),
+                suggestions: health_after.suggestions,
+            });
         }
     }
 
@@ -310,6 +326,31 @@ async fn execute_task(
         pipeline_state.update_counts(&new_counts);
         if let Err(e) = pipeline_state.save(&root_dir) {
             tracing::error!("Failed to save pipeline state: {}", e);
+        }
+
+        // Emit PipelineAlert for any document at hard limit
+        let docs = [
+            ("LEARNING", &health.learning),
+            ("THOUGHTS", &health.thoughts),
+            ("CURIOSITY", &health.curiosity),
+            ("REFLECTIONS", &health.reflections),
+            ("PRAXIS", &health.praxis),
+        ];
+        for (name, doc_health) in &docs {
+            if doc_health.status == ThresholdStatus::Red {
+                state.event_bus.emit(EntityEvent::PipelineAlert {
+                    document: name.to_string(),
+                    count: doc_health.count,
+                    hard_limit: doc_health.hard,
+                });
+            }
+        }
+
+        // Emit PipelineFrozen if no movement for >= freeze_threshold sessions
+        if pipeline_state.sessions_without_movement >= state.config.pipeline.freeze_threshold {
+            state.event_bus.emit(EntityEvent::PipelineFrozen {
+                sessions_without_movement: pipeline_state.sessions_without_movement,
+            });
         }
 
         let archived =

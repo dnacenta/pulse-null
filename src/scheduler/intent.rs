@@ -11,9 +11,11 @@ use super::executor::{self, ExecutionConfig};
 use super::output;
 use super::Schedule;
 use crate::config::AutonomyConfig;
-use crate::monitoring::signals;
+use crate::events::EntityEvent;
+use crate::monitoring::{assess as cognitive_assess, signals};
 use crate::pipeline;
 use crate::pipeline::health as pipeline_health;
+use crate::pipeline::health::ThresholdStatus;
 use crate::server::prompt;
 use crate::server::AppState;
 
@@ -616,11 +618,23 @@ async fn execute_intent(
     // Log to LOGBOOK.md
     log_intent_execution(&root_dir, intent, &parsed.clean_content);
 
-    // Extract cognitive signals
+    // Extract cognitive signals and check for health changes
     if state.config.monitoring.enabled {
+        let health_before = cognitive_assess::assess(&root_dir, &state.config.monitoring);
+        let previous_status = health_before.status.to_string();
+
         let frame = signals::extract(&result.response_text, &intent.id);
         if let Err(e) = signals::record(&root_dir, frame, state.config.monitoring.window_size) {
             tracing::error!("Failed to record signals for intent '{}': {}", intent.id, e);
+        }
+
+        let health_after = cognitive_assess::assess(&root_dir, &state.config.monitoring);
+        if health_after.sufficient_data && health_after.status != health_before.status {
+            state.event_bus.emit(EntityEvent::CognitiveHealthChanged {
+                previous: previous_status,
+                current: health_after.status.to_string(),
+                suggestions: health_after.suggestions,
+            });
         }
     }
 
@@ -631,6 +645,31 @@ async fn execute_intent(
         let mut pipeline_state = pipeline::PipelineState::load(&root_dir);
         pipeline_state.update_counts(&new_counts);
         let _ = pipeline_state.save(&root_dir);
+
+        // Emit PipelineAlert for documents at hard limit
+        let docs = [
+            ("LEARNING", &health.learning),
+            ("THOUGHTS", &health.thoughts),
+            ("CURIOSITY", &health.curiosity),
+            ("REFLECTIONS", &health.reflections),
+            ("PRAXIS", &health.praxis),
+        ];
+        for (name, doc_health) in &docs {
+            if doc_health.status == ThresholdStatus::Red {
+                state.event_bus.emit(EntityEvent::PipelineAlert {
+                    document: name.to_string(),
+                    count: doc_health.count,
+                    hard_limit: doc_health.hard,
+                });
+            }
+        }
+
+        // Emit PipelineFrozen if pipeline is stuck
+        if pipeline_state.sessions_without_movement >= state.config.pipeline.freeze_threshold {
+            state.event_bus.emit(EntityEvent::PipelineFrozen {
+                sessions_without_movement: pipeline_state.sessions_without_movement,
+            });
+        }
 
         let archived =
             pipeline::archive::check_and_archive(&root_dir, &state.config.pipeline, &health);

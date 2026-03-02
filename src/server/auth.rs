@@ -62,6 +62,7 @@ mod tests {
         AutonomyConfig, Config, EntityConfig, LlmConfig, MemoryConfig, MonitoringConfig,
         PipelineConfig, SchedulerConfig, SecurityConfig, ServerConfig, TrustConfig,
     };
+    use crate::events::EventBus;
     use crate::llm::Message;
     use crate::tools::ToolRegistry;
 
@@ -99,6 +100,7 @@ mod tests {
             conversation: RwLock::new(Vec::<Message>::new()),
             system_prompt: RwLock::new(String::new()),
             tools: ToolRegistry::new(),
+            event_bus: Arc::new(EventBus::new(16)),
         })
     }
 

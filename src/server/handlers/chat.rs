@@ -5,6 +5,7 @@ use axum::http::StatusCode;
 use axum::Json;
 use serde::{Deserialize, Serialize};
 
+use crate::events::EntityEvent;
 use crate::llm::{ContentBlock, Message, MessageContent, Role, StopReason};
 use crate::server::trust::TrustLevel;
 use crate::server::{injection, AppState};
@@ -85,6 +86,7 @@ pub async fn chat(
     let mut total_output_tokens: Option<u32> = None;
     let mut final_model: String;
 
+    let channel = req.channel.clone();
     let system_prompt = state.system_prompt.read().await;
     let mut rounds: u32 = 0;
 
@@ -128,6 +130,15 @@ pub async fn chat(
                     conversation.drain(..drain_count);
                 }
 
+                // Emit PostConversation event
+                emit_post_conversation(
+                    &state,
+                    &channel,
+                    &text,
+                    total_input_tokens.unwrap_or(0),
+                    total_output_tokens.unwrap_or(0),
+                );
+
                 return Ok(Json(ChatResponse {
                     response: text,
                     model: final_model,
@@ -143,6 +154,13 @@ pub async fn chat(
                         MAX_TOOL_ROUNDS
                     );
                     let text = result.text();
+                    emit_post_conversation(
+                        &state,
+                        &channel,
+                        &text,
+                        total_input_tokens.unwrap_or(0),
+                        total_output_tokens.unwrap_or(0),
+                    );
                     return Ok(Json(ChatResponse {
                         response: text,
                         model: final_model,
@@ -187,6 +205,13 @@ pub async fn chat(
             StopReason::Other(ref reason) => {
                 tracing::warn!("Unexpected stop reason: {}", reason);
                 let text = result.text();
+                emit_post_conversation(
+                    &state,
+                    &channel,
+                    &text,
+                    total_input_tokens.unwrap_or(0),
+                    total_output_tokens.unwrap_or(0),
+                );
                 return Ok(Json(ChatResponse {
                     response: text,
                     model: final_model,
@@ -196,4 +221,27 @@ pub async fn chat(
             }
         }
     }
+}
+
+/// Emit a PostConversation event (fire-and-forget).
+fn emit_post_conversation(
+    state: &Arc<AppState>,
+    channel: &str,
+    response_text: &str,
+    input_tokens: u32,
+    output_tokens: u32,
+) {
+    // Truncate summary for the event (first 300 chars)
+    let summary = if response_text.len() > 300 {
+        format!("{}...", &response_text[..300])
+    } else {
+        response_text.to_string()
+    };
+
+    state.event_bus.emit(EntityEvent::PostConversation {
+        channel: channel.to_string(),
+        summary,
+        input_tokens,
+        output_tokens,
+    });
 }

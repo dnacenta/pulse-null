@@ -16,6 +16,7 @@ use crate::config::{
     AutonomyConfig, Config, EntityConfig, LlmConfig, MemoryConfig, MonitoringConfig,
     PipelineConfig, SchedulerConfig, SecurityConfig, ServerConfig, TrustConfig,
 };
+use crate::events::EventBus;
 use crate::llm::{ContentBlock, LlmResponse, LlmResult, LmProvider, Message, StopReason};
 use crate::server::handlers;
 use crate::server::AppState;
@@ -128,6 +129,7 @@ fn build_state(provider: MockProvider, tools: ToolRegistry) -> Arc<AppState> {
         conversation: RwLock::new(Vec::new()),
         system_prompt: RwLock::new("You are a test entity.".to_string()),
         tools,
+        event_bus: Arc::new(EventBus::new(16)),
     })
 }
 
