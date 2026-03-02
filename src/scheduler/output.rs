@@ -14,6 +14,10 @@ pub struct ParsedOutput {
     pub call_content: Vec<String>,
     /// JSON content extracted from [SCHEDULE:] markers
     pub schedule_requests: Vec<String>,
+    /// JSON content extracted from [INTENT:] markers
+    pub intent_requests: Vec<String>,
+    /// JSON content extracted from [CHAIN:] markers
+    pub chain_requests: Vec<String>,
 }
 
 static SHARE_RE: LazyLock<Regex> =
@@ -23,6 +27,12 @@ static CALL_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\[CALL:\s*([\s\S
 
 static SCHEDULE_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"\[SCHEDULE:\s*(\{[\s\S]*?\})\]").unwrap());
+
+static INTENT_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"\[INTENT:\s*(\{[\s\S]*?\})\]").unwrap());
+
+static CHAIN_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"\[CHAIN:\s*(\{[\s\S]*?\})\]").unwrap());
 
 /// Parse LLM response for output routing markers.
 pub fn parse_output(content: &str) -> ParsedOutput {
@@ -41,11 +51,23 @@ pub fn parse_output(content: &str) -> ParsedOutput {
         .map(|c| c[1].trim().to_string())
         .collect();
 
+    let intent_requests: Vec<String> = INTENT_RE
+        .captures_iter(content)
+        .map(|c| c[1].trim().to_string())
+        .collect();
+
+    let chain_requests: Vec<String> = CHAIN_RE
+        .captures_iter(content)
+        .map(|c| c[1].trim().to_string())
+        .collect();
+
     // Strip all markers from content for the clean version
     let mut clean = content.to_string();
     clean = SHARE_RE.replace_all(&clean, "").to_string();
     clean = CALL_RE.replace_all(&clean, "").to_string();
     clean = SCHEDULE_RE.replace_all(&clean, "").to_string();
+    clean = INTENT_RE.replace_all(&clean, "").to_string();
+    clean = CHAIN_RE.replace_all(&clean, "").to_string();
     let clean_content = clean.trim().to_string();
 
     ParsedOutput {
@@ -53,6 +75,8 @@ pub fn parse_output(content: &str) -> ParsedOutput {
         share_content,
         call_content,
         schedule_requests,
+        intent_requests,
+        chain_requests,
     }
 }
 
@@ -176,6 +200,43 @@ mod tests {
         assert!(parsed.share_content.is_empty());
         assert!(parsed.call_content.is_empty());
         assert!(parsed.schedule_requests.is_empty());
+        assert!(parsed.intent_requests.is_empty());
+        assert!(parsed.chain_requests.is_empty());
         assert_eq!(parsed.clean_content, input);
+    }
+
+    #[test]
+    fn parse_intent_marker() {
+        let input = r#"Some text. [INTENT: {"description": "Research memory", "prompt": "Deep dive.", "priority": "high"}] More text."#;
+        let parsed = parse_output(input);
+        assert_eq!(parsed.intent_requests.len(), 1);
+        assert!(parsed.intent_requests[0].contains("Research memory"));
+        assert!(!parsed.clean_content.contains("[INTENT:"));
+    }
+
+    #[test]
+    fn parse_chain_marker() {
+        let input = r#"Research done. [CHAIN: {"description": "Reflect", "prompt": "Reflect on: {result}"}]"#;
+        let parsed = parse_output(input);
+        assert_eq!(parsed.chain_requests.len(), 1);
+        assert!(parsed.chain_requests[0].contains("Reflect"));
+        assert!(!parsed.clean_content.contains("[CHAIN:"));
+    }
+
+    #[test]
+    fn parse_all_marker_types() {
+        let input = r#"Text.
+[SHARE: Share this.]
+[CALL: Call about this.]
+[SCHEDULE: {"name": "task", "cron": "0 0 * * * *", "prompt": "Do it."}]
+[INTENT: {"description": "Research", "prompt": "Go deep."}]
+[CHAIN: {"description": "Follow up", "prompt": "Continue: {result}"}]"#;
+        let parsed = parse_output(input);
+        assert_eq!(parsed.share_content.len(), 1);
+        assert_eq!(parsed.call_content.len(), 1);
+        assert_eq!(parsed.schedule_requests.len(), 1);
+        assert_eq!(parsed.intent_requests.len(), 1);
+        assert_eq!(parsed.chain_requests.len(), 1);
+        assert_eq!(parsed.clean_content, "Text.");
     }
 }

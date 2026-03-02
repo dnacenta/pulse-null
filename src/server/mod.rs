@@ -19,6 +19,7 @@ use crate::config::Config;
 use crate::llm::claude_api::ClaudeProvider;
 use crate::llm::{LmProvider, Message};
 use crate::plugins::manager::PluginManager;
+use crate::scheduler::intent::IntentQueue;
 use crate::scheduler::Schedule;
 use crate::tools::ToolRegistry;
 
@@ -84,11 +85,17 @@ pub async fn start(config: Config) -> Result<(), Box<dyn std::error::Error>> {
         tools,
     });
 
-    // Load schedule and start scheduler
+    // Load schedule and intent queue, start scheduler
     let schedule = Schedule::load(&root_dir)?;
     let schedule = Arc::new(RwLock::new(schedule));
-    let scheduler_handles =
-        crate::scheduler::start(Arc::clone(&state), Arc::clone(&schedule)).await?;
+    let intent_queue = IntentQueue::load(&root_dir);
+    let intent_queue = Arc::new(RwLock::new(intent_queue));
+    let scheduler_handles = crate::scheduler::start(
+        Arc::clone(&state),
+        Arc::clone(&schedule),
+        Arc::clone(&intent_queue),
+    )
+    .await?;
 
     // Collect plugin routes (stateless — merged after .with_state())
     let plugin_routes = plugin_manager.collect_routes();
