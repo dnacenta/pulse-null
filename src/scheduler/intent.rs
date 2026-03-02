@@ -45,10 +45,11 @@ pub struct Intent {
 }
 
 /// Where this intent came from.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum IntentSource {
     /// Created by the entity via [INTENT:] marker
+    #[default]
     EntityMarker,
     /// Created by an internal event trigger
     Event(String),
@@ -60,26 +61,15 @@ pub enum IntentSource {
     Chain(String),
 }
 
-impl Default for IntentSource {
-    fn default() -> Self {
-        Self::EntityMarker
-    }
-}
-
 /// Intent priority — higher values are processed first.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum IntentPriority {
     Low = 0,
+    #[default]
     Normal = 1,
     High = 2,
     Urgent = 3,
-}
-
-impl Default for IntentPriority {
-    fn default() -> Self {
-        Self::Normal
-    }
 }
 
 /// How to route an intent's output.
