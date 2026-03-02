@@ -114,10 +114,13 @@ async fn execute_task(
 
     // Add scheduling context to the prompt
     let now = Utc::now();
-    let tool_hint = if state.config.autonomy.enabled {
-        "\n\nYou have tools available: file_read, file_write, file_list, grep, web_fetch. Use them to read and write your documents, search your files, and research on the web."
+    let autonomy_context = if state.config.autonomy.enabled {
+        format!(
+            "\n\n{}",
+            prompt::build_autonomy_context(&root_dir, &state.config)
+        )
     } else {
-        ""
+        String::new()
     };
     let user_message = format!(
         "[Scheduled task: {} | Time: {} | Channel: {}]\n\n{}{}",
@@ -125,7 +128,7 @@ async fn execute_task(
         now.format("%Y-%m-%d %H:%M UTC"),
         task.channel,
         task.prompt,
-        tool_hint,
+        autonomy_context,
     );
 
     // Execute with or without tools based on autonomy config

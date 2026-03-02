@@ -457,10 +457,11 @@ async fn execute_intent(
         }
     };
 
-    // Build user message
+    // Build user message with autonomy context
+    let autonomy_context = prompt::build_autonomy_context(&root_dir, &state.config);
     let user_message = format!(
-        "[Intent: {} | Priority: {:?} | Source: {:?}]\n\n{}\n\nYou have tools available: file_read, file_write, file_list, grep, web_fetch. Use them to read and write your documents, search your files, and research on the web.",
-        intent.description, intent.priority, intent.source, intent.prompt
+        "[Intent: {} | Priority: {:?} | Source: {:?}]\n\n{}\n\n{}",
+        intent.description, intent.priority, intent.source, intent.prompt, autonomy_context
     );
 
     let exec_config = ExecutionConfig {
