@@ -291,6 +291,9 @@ pub struct AutonomyConfig {
     pub max_chain_depth: u32,
     /// Rough daily API cost limit in cents (0 = unlimited)
     pub daily_cost_limit_cents: u32,
+    /// Event-driven intent configuration
+    #[serde(default)]
+    pub events: EventsConfig,
 }
 
 impl Default for AutonomyConfig {
@@ -303,6 +306,32 @@ impl Default for AutonomyConfig {
             max_intents_per_hour: 10,
             max_chain_depth: 3,
             daily_cost_limit_cents: 500,
+            events: EventsConfig::default(),
+        }
+    }
+}
+
+/// Which internal events auto-queue intents
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct EventsConfig {
+    /// Queue reflection intent after chat conversations end
+    pub post_conversation: bool,
+    /// Queue archiving intent when a document hits its hard limit
+    pub pipeline_alert: bool,
+    /// Queue investigation intent when pipeline has no movement
+    pub pipeline_frozen: bool,
+    /// Queue adjustment intent when cognitive health declines
+    pub cognitive_decline: bool,
+}
+
+impl Default for EventsConfig {
+    fn default() -> Self {
+        Self {
+            post_conversation: false,
+            pipeline_alert: true,
+            pipeline_frozen: true,
+            cognitive_decline: true,
         }
     }
 }
