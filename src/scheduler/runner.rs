@@ -5,9 +5,10 @@ use chrono::Utc;
 use cron::Schedule as CronSchedule;
 use tokio::sync::RwLock;
 
+use super::cost::CostTracker;
+use super::executor::{self, ExecutionConfig};
 use super::output;
 use super::{Schedule, ScheduledTask};
-use crate::llm::{Message, MessageContent, Role};
 use crate::monitoring::signals;
 use crate::pipeline;
 use crate::pipeline::health as pipeline_health;
@@ -69,7 +70,7 @@ pub async fn run_task_loop(
     }
 }
 
-/// Execute a scheduled task: build prompt, call LLM, route output.
+/// Execute a scheduled task: build prompt, call LLM (with tools if autonomy enabled), route output.
 async fn execute_task(
     task: &ScheduledTask,
     state: &Arc<AppState>,
@@ -84,6 +85,20 @@ async fn execute_task(
         }
     };
 
+    // Check daily cost limit before executing
+    if state.config.autonomy.enabled && state.config.autonomy.daily_cost_limit_cents > 0 {
+        let tracker = CostTracker::load(&root_dir);
+        if tracker.is_over_limit(state.config.autonomy.daily_cost_limit_cents) {
+            tracing::warn!(
+                "Task '{}' skipped — daily cost limit reached ({}/{}¢)",
+                task.id,
+                tracker.daily_cost_cents,
+                state.config.autonomy.daily_cost_limit_cents
+            );
+            return;
+        }
+    }
+
     let system_prompt = match prompt::build_system_prompt(&root_dir, &state.config) {
         Ok(p) => p,
         Err(e) => {
@@ -94,42 +109,98 @@ async fn execute_task(
 
     // Add scheduling context to the prompt
     let now = Utc::now();
+    let tool_hint = if state.config.autonomy.enabled {
+        "\n\nYou have tools available: file_read, file_write, file_list, grep, web_fetch. Use them to read and write your documents, search your files, and research on the web."
+    } else {
+        ""
+    };
     let user_message = format!(
-        "[Scheduled task: {} | Time: {} | Channel: {}]\n\n{}",
+        "[Scheduled task: {} | Time: {} | Channel: {}]\n\n{}{}",
         task.name,
         now.format("%Y-%m-%d %H:%M UTC"),
         task.channel,
         task.prompt,
+        tool_hint,
     );
 
-    // Create a fresh conversation (no shared state with chat)
-    let messages = vec![Message {
-        role: Role::User,
-        content: MessageContent::Text(user_message),
-    }];
-
-    // Invoke LLM (no tools for scheduled tasks)
-    let result = match state
-        .provider
-        .invoke(&system_prompt, &messages, state.config.llm.max_tokens, None)
-        .await
+    // Execute with or without tools based on autonomy config
+    let (response_text, input_tokens, output_tokens, tool_rounds) = if state.config.autonomy.enabled
     {
-        Ok(r) => r,
-        Err(e) => {
-            tracing::error!("LLM invocation failed for task '{}': {}", task.id, e);
-            return;
+        let exec_config = ExecutionConfig {
+            max_tool_rounds: state.config.autonomy.max_tool_rounds,
+            max_tokens: state.config.llm.max_tokens,
+            task_id: task.id.clone(),
+        };
+
+        match executor::execute_with_tools(
+            state.provider.as_ref(),
+            &system_prompt,
+            &user_message,
+            &state.tools,
+            &exec_config,
+        )
+        .await
+        {
+            Ok(result) => (
+                result.response_text,
+                result.total_input_tokens,
+                result.total_output_tokens,
+                result.tool_rounds_used,
+            ),
+            Err(e) => {
+                tracing::error!("LLM invocation failed for task '{}': {}", task.id, e);
+                return;
+            }
+        }
+    } else {
+        // Legacy path: no tools
+        use crate::llm::{Message, MessageContent, Role};
+        let messages = vec![Message {
+            role: Role::User,
+            content: MessageContent::Text(user_message),
+        }];
+
+        match state
+            .provider
+            .invoke(&system_prompt, &messages, state.config.llm.max_tokens, None)
+            .await
+        {
+            Ok(result) => (
+                result.text(),
+                result.input_tokens.unwrap_or(0),
+                result.output_tokens.unwrap_or(0),
+                0u32,
+            ),
+            Err(e) => {
+                tracing::error!("LLM invocation failed for task '{}': {}", task.id, e);
+                return;
+            }
         }
     };
 
+    let tool_info = if tool_rounds > 0 {
+        format!(", {} tool rounds", tool_rounds)
+    } else {
+        String::new()
+    };
     tracing::info!(
-        "Task '{}' completed ({} tokens in, {} tokens out)",
+        "Task '{}' completed ({} tokens in, {} tokens out{})",
         task.id,
-        result.input_tokens.unwrap_or(0),
-        result.output_tokens.unwrap_or(0),
+        input_tokens,
+        output_tokens,
+        tool_info,
     );
 
+    // Track cost
+    if state.config.autonomy.enabled {
+        let mut tracker = CostTracker::load(&root_dir);
+        tracker.record(input_tokens, output_tokens);
+        if let Err(e) = tracker.save(&root_dir) {
+            tracing::error!("Failed to save cost tracker: {}", e);
+        }
+    }
+
     // Parse and route output
-    let response_text = result.text();
     let parsed = output::parse_output(&response_text);
 
     // Handle [SCHEDULE:] markers — create new dynamic tasks

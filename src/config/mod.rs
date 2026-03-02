@@ -24,6 +24,8 @@ pub struct Config {
     #[serde(default)]
     pub monitoring: MonitoringConfig,
     #[serde(default)]
+    pub autonomy: AutonomyConfig,
+    #[serde(default)]
     pub plugins: HashMap<String, toml::Value>,
 }
 
@@ -267,6 +269,40 @@ impl Default for MonitoringConfig {
             enabled: true,
             window_size: 10,
             min_samples: 5,
+        }
+    }
+}
+
+/// Configuration for the self-initiation / autonomy system
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct AutonomyConfig {
+    /// Enable tools for scheduled tasks and the intent queue
+    pub enabled: bool,
+    /// Maximum tool execution rounds for autonomous sessions (lower than chat's 25)
+    pub max_tool_rounds: u32,
+    /// How often to check the intent queue (seconds)
+    pub intent_poll_interval: u64,
+    /// Maximum intents that can be queued at once
+    pub max_queue_size: usize,
+    /// Maximum intents processed per hour (sliding window)
+    pub max_intents_per_hour: u32,
+    /// Maximum chain depth (prevents infinite A→B→C chains)
+    pub max_chain_depth: u32,
+    /// Rough daily API cost limit in cents (0 = unlimited)
+    pub daily_cost_limit_cents: u32,
+}
+
+impl Default for AutonomyConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            max_tool_rounds: 15,
+            intent_poll_interval: 60,
+            max_queue_size: 20,
+            max_intents_per_hour: 10,
+            max_chain_depth: 3,
+            daily_cost_limit_cents: 500,
         }
     }
 }

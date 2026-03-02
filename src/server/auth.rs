@@ -59,8 +59,8 @@ mod tests {
 
     use super::*;
     use crate::config::{
-        Config, EntityConfig, LlmConfig, MemoryConfig, MonitoringConfig, PipelineConfig,
-        SchedulerConfig, SecurityConfig, ServerConfig, TrustConfig,
+        AutonomyConfig, Config, EntityConfig, LlmConfig, MemoryConfig, MonitoringConfig,
+        PipelineConfig, SchedulerConfig, SecurityConfig, ServerConfig, TrustConfig,
     };
     use crate::llm::Message;
     use crate::tools::ToolRegistry;
@@ -89,6 +89,7 @@ mod tests {
                 scheduler: SchedulerConfig::default(),
                 pipeline: PipelineConfig::default(),
                 monitoring: MonitoringConfig::default(),
+                autonomy: AutonomyConfig::default(),
                 plugins: std::collections::HashMap::new(),
             },
             provider: Box::new(crate::llm::claude_api::ClaudeProvider::new(

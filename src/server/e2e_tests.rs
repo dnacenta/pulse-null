@@ -13,8 +13,8 @@ use tokio::sync::RwLock;
 use tower::ServiceExt;
 
 use crate::config::{
-    Config, EntityConfig, LlmConfig, MemoryConfig, MonitoringConfig, PipelineConfig,
-    SchedulerConfig, SecurityConfig, ServerConfig, TrustConfig,
+    AutonomyConfig, Config, EntityConfig, LlmConfig, MemoryConfig, MonitoringConfig,
+    PipelineConfig, SchedulerConfig, SecurityConfig, ServerConfig, TrustConfig,
 };
 use crate::llm::{ContentBlock, LlmResponse, LlmResult, LmProvider, Message, StopReason};
 use crate::server::handlers;
@@ -105,6 +105,7 @@ fn test_config() -> Config {
         scheduler: SchedulerConfig::default(),
         pipeline: PipelineConfig::default(),
         monitoring: MonitoringConfig::default(),
+        autonomy: AutonomyConfig::default(),
         plugins: HashMap::new(),
     }
 }
