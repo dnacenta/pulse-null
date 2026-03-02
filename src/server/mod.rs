@@ -1,4 +1,6 @@
 pub mod auth;
+#[cfg(test)]
+mod e2e_tests;
 mod handlers;
 pub mod injection;
 pub mod prompt;
