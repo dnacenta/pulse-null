@@ -1,4 +1,6 @@
 pub mod auth;
+#[cfg(test)]
+mod e2e_tests;
 mod handlers;
 pub mod injection;
 pub mod prompt;
@@ -52,6 +54,9 @@ pub async fn start(config: Config) -> Result<(), Box<dyn std::error::Error>> {
         root_dir.clone(),
     )));
     tools.register(Box::new(crate::tools::file_list::FileListTool::new(
+        root_dir.clone(),
+    )));
+    tools.register(Box::new(crate::tools::grep::GrepTool::new(
         root_dir.clone(),
     )));
     tools.register(Box::new(crate::tools::web_fetch::WebFetchTool::new()));

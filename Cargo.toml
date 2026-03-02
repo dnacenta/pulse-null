@@ -1,6 +1,6 @@
 [package]
 name = "echo-system"
-version = "0.3.1"
+version = "0.4.0"
 edition = "2021"
 rust-version = "1.80"
 license = "AGPL-3.0-only"
@@ -32,6 +32,10 @@ reqwest = { version = "0.12", features = ["json"] }
 
 # Security
 regex = "1"
+
+# File tools
+walkdir = "2"
+globset = "0.4"
 
 # Logging
 tracing = "0.1"
