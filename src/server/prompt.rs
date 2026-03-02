@@ -4,6 +4,8 @@ use crate::config::Config;
 use crate::monitoring::assess;
 use crate::pipeline;
 use crate::pipeline::health;
+use crate::scheduler::cost::CostTracker;
+use crate::scheduler::intent::IntentQueue;
 
 /// Build the system prompt from entity documents
 pub fn build_system_prompt(
@@ -74,4 +76,67 @@ pub fn build_system_prompt(
     }
 
     Ok(parts.join("\n\n"))
+}
+
+/// Build context block for autonomous sessions (scheduled tasks and intents).
+/// Includes: tool list, output markers, queue status, cost status.
+pub fn build_autonomy_context(root_dir: &Path, config: &Config) -> String {
+    let mut sections = Vec::new();
+
+    // Tool documentation
+    sections.push(
+        "You have tools available for this autonomous session:\n\
+        - file_read: Read a file from your entity directory\n\
+        - file_write: Write or update a file in your entity directory\n\
+        - file_list: List files in a directory\n\
+        - grep: Search file contents with a pattern\n\
+        - web_fetch: Fetch and read a web page (HTTPS only)\n\n\
+        Use these tools to read your documents, write findings, and research on the web."
+            .to_string(),
+    );
+
+    // Output marker documentation
+    sections.push(
+        "You can use these markers in your response to trigger actions:\n\
+        - [SHARE: <content>] — Post content to the configured share channel (Discord, etc.)\n\
+        - [CALL: <reason>] — Request a call with the owner\n\
+        - [SCHEDULE: {\"name\": \"...\", \"cron\": \"...\", \"prompt\": \"...\"}] — Create a recurring scheduled task\n\
+        - [INTENT: {\"description\": \"...\", \"prompt\": \"...\", \"priority\": \"low|normal|high|urgent\"}] — Queue a one-shot task for later\n\
+        - [CHAIN: {\"description\": \"...\", \"prompt\": \"Based on: {result}\"}] — Queue a follow-up that receives this task's output\n\n\
+        Use markers sparingly. Only share content worth surfacing. Only queue intents for genuine follow-up work."
+            .to_string(),
+    );
+
+    // Intent queue status
+    let queue = IntentQueue::load(root_dir);
+    if !queue.is_empty() {
+        let mut queue_lines = vec![format!("{} pending intent(s):", queue.len())];
+        for intent in queue.list().iter().take(5) {
+            queue_lines.push(format!(
+                "  - [{}] {}",
+                format!("{:?}", intent.priority).to_lowercase(),
+                intent.description
+            ));
+        }
+        if queue.len() > 5 {
+            queue_lines.push(format!("  ... and {} more", queue.len() - 5));
+        }
+        sections.push(queue_lines.join("\n"));
+    }
+
+    // Cost status
+    if config.autonomy.daily_cost_limit_cents > 0 {
+        let tracker = CostTracker::load(root_dir);
+        if tracker.daily_cost_cents > 0 {
+            sections.push(format!(
+                "Daily API cost: {}/{}¢ ({:.0}% of limit)",
+                tracker.daily_cost_cents,
+                config.autonomy.daily_cost_limit_cents,
+                (tracker.daily_cost_cents as f64 / config.autonomy.daily_cost_limit_cents as f64)
+                    * 100.0
+            ));
+        }
+    }
+
+    sections.join("\n\n")
 }
