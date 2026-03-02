@@ -16,6 +16,7 @@ use tokio::sync::RwLock;
 use tower_http::services::ServeDir;
 
 use crate::config::Config;
+use crate::events::EventBus;
 use crate::llm::claude_api::ClaudeProvider;
 use crate::llm::{LmProvider, Message};
 use crate::plugins::manager::PluginManager;
@@ -30,6 +31,7 @@ pub struct AppState {
     pub conversation: RwLock<Vec<Message>>,
     pub system_prompt: RwLock<String>,
     pub tools: ToolRegistry,
+    pub event_bus: Arc<EventBus>,
 }
 
 pub async fn start(config: Config) -> Result<(), Box<dyn std::error::Error>> {
@@ -77,12 +79,16 @@ pub async fn start(config: Config) -> Result<(), Box<dyn std::error::Error>> {
         tracing::info!("{} plugin(s) started", plugin_manager.count());
     }
 
+    // Create event bus
+    let event_bus = Arc::new(EventBus::new(64));
+
     let state = Arc::new(AppState {
         config: config.clone(),
         provider,
         conversation: RwLock::new(Vec::new()),
         system_prompt: RwLock::new(system_prompt),
         tools,
+        event_bus: Arc::clone(&event_bus),
     });
 
     // Load schedule and intent queue, start scheduler
@@ -96,6 +102,24 @@ pub async fn start(config: Config) -> Result<(), Box<dyn std::error::Error>> {
         Arc::clone(&intent_queue),
     )
     .await?;
+
+    // Start event listener (translates events → intents)
+    if config.autonomy.enabled {
+        let listener_rx = event_bus.subscribe();
+        let listener_queue = Arc::clone(&intent_queue);
+        let events_config = config.autonomy.events.clone();
+        let max_queue_size = config.autonomy.max_queue_size;
+        tokio::spawn(async move {
+            crate::events::listener::event_listener(
+                listener_rx,
+                listener_queue,
+                events_config,
+                max_queue_size,
+            )
+            .await;
+        });
+        tracing::info!("Event listener started");
+    }
 
     // Collect plugin routes (stateless — merged after .with_state())
     let plugin_routes = plugin_manager.collect_routes();

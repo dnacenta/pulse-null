@@ -2,6 +2,7 @@ use clap::{Parser, Subcommand};
 
 mod cli;
 mod config;
+mod events;
 mod init;
 mod llm;
 mod memory;
