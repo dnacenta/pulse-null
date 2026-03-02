@@ -7,6 +7,7 @@ use tokio::sync::RwLock;
 
 use super::cost::CostTracker;
 use super::executor::{self, ExecutionConfig};
+use super::intent::{self, IntentQueue, IntentSource};
 use super::output;
 use super::{Schedule, ScheduledTask};
 use crate::monitoring::signals;
@@ -20,6 +21,7 @@ pub async fn run_task_loop(
     task: ScheduledTask,
     state: Arc<AppState>,
     schedule: Arc<RwLock<Schedule>>,
+    intent_queue: Arc<RwLock<IntentQueue>>,
     tz: chrono_tz::Tz,
 ) {
     let normalized_cron = super::normalize_cron(&task.cron);
@@ -66,7 +68,7 @@ pub async fn run_task_loop(
         }
 
         tracing::info!("Executing scheduled task: {}", task.name);
-        execute_task(&task, &state, &schedule).await;
+        execute_task(&task, &state, &schedule, &intent_queue).await;
     }
 }
 
@@ -75,6 +77,7 @@ async fn execute_task(
     task: &ScheduledTask,
     state: &Arc<AppState>,
     schedule: &Arc<RwLock<Schedule>>,
+    intent_queue: &Arc<RwLock<IntentQueue>>,
 ) {
     // Build a fresh system prompt (re-reads documents each time)
     let root_dir = match state.config.root_dir() {
@@ -232,6 +235,59 @@ async fn execute_task(
     // Handle [CALL:] content
     for content in &parsed.call_content {
         output::route_call(content, &state.config, &task.name).await;
+    }
+
+    // Handle [INTENT:] markers — queue one-shot intents
+    if state.config.autonomy.enabled {
+        for intent_json in &parsed.intent_requests {
+            let source = IntentSource::ScheduledTask(task.id.clone());
+            match intent::create_intent_from_marker(intent_json, source) {
+                Ok(new_intent) => {
+                    tracing::info!(
+                        "Task '{}' queued intent: '{}'",
+                        task.id,
+                        new_intent.description
+                    );
+                    let mut q = intent_queue.write().await;
+                    q.push(new_intent, state.config.autonomy.max_queue_size);
+                    let _ = q.save();
+                }
+                Err(e) => tracing::warn!("Invalid [INTENT:] marker: {}", e),
+            }
+        }
+
+        // Handle [CHAIN:] markers — queue follow-up intent with {result} substitution
+        if let Some(chain_json) = parsed.chain_requests.first() {
+            match intent::create_chain_from_marker(chain_json) {
+                Ok(chain) => {
+                    let chain_prompt = chain.prompt.replace("{result}", &parsed.clean_content);
+                    let chain_intent = intent::Intent {
+                        id: format!(
+                            "chain-{}-{}",
+                            task.id,
+                            &uuid::Uuid::new_v4().to_string()[..8]
+                        ),
+                        description: chain.description,
+                        prompt: chain_prompt,
+                        source: IntentSource::ScheduledTask(task.id.clone()),
+                        priority: intent::IntentPriority::Normal,
+                        created_at: Utc::now(),
+                        chain: None,
+                        output_routing: chain.output_routing,
+                        depth: 0,
+                    };
+                    tracing::info!(
+                        "Task '{}' queued chain: '{}'",
+                        task.id,
+                        chain_intent.description
+                    );
+                    let mut q = intent_queue.write().await;
+                    q.push(chain_intent, state.config.autonomy.max_queue_size);
+                    let _ = q.save();
+                }
+                Err(e) => tracing::warn!("Invalid [CHAIN:] marker: {}", e),
+            }
+        }
     }
 
     // Log to LOGBOOK.md

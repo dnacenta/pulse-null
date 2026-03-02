@@ -1,6 +1,7 @@
 pub mod cost;
 pub mod dynamic;
 pub mod executor;
+pub mod intent;
 pub mod output;
 pub mod runner;
 pub mod tasks;
@@ -129,6 +130,7 @@ impl Schedule {
 pub async fn start(
     state: Arc<AppState>,
     schedule: Arc<RwLock<Schedule>>,
+    intent_queue: Arc<RwLock<intent::IntentQueue>>,
 ) -> Result<Vec<tokio::task::JoinHandle<()>>, Box<dyn std::error::Error>> {
     if !state.config.scheduler.enabled {
         tracing::info!("Scheduler disabled in config");
@@ -158,12 +160,29 @@ pub async fn start(
     for task in enabled_tasks {
         let state = Arc::clone(&state);
         let schedule = Arc::clone(&schedule);
+        let queue = Arc::clone(&intent_queue);
 
         let handle = tokio::spawn(async move {
-            runner::run_task_loop(task, state, schedule, tz).await;
+            runner::run_task_loop(task, state, schedule, queue, tz).await;
         });
 
         handles.push(handle);
+    }
+
+    // Start the intent drain loop
+    if state.config.autonomy.enabled {
+        let drain_state = Arc::clone(&state);
+        let drain_queue = Arc::clone(&intent_queue);
+        let drain_schedule = Arc::clone(&schedule);
+        let drain_handle = tokio::spawn(async move {
+            intent::drain_loop(drain_state, drain_queue, drain_schedule).await;
+        });
+        handles.push(drain_handle);
+
+        let queue = intent_queue.read().await;
+        if !queue.is_empty() {
+            tracing::info!("Intent queue has {} pending intents", queue.len());
+        }
     }
 
     Ok(handles)
