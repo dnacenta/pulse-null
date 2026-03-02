@@ -45,10 +45,7 @@ impl EventBus {
     /// Emit an event. Returns number of receivers that got it.
     /// Returns 0 if no listeners — that's fine, events are fire-and-forget.
     pub fn emit(&self, event: EntityEvent) -> usize {
-        match self.sender.send(event) {
-            Ok(n) => n,
-            Err(_) => 0, // No active receivers
-        }
+        self.sender.send(event).unwrap_or_default()
     }
 
     /// Subscribe to events.
