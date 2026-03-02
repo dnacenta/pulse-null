@@ -1,6 +1,19 @@
 pub mod manager;
 pub mod registry;
 
+#[cfg(feature = "bridge")]
+pub mod bridge_echo;
+#[cfg(feature = "chat")]
+pub mod chat_echo;
+// discord_echo blocked on songbird dep fix
+// #[cfg(feature = "discord")]
+// pub mod discord_echo;
+#[cfg(feature = "praxis")]
+pub mod praxis_echo;
+#[cfg(feature = "recall")]
+pub mod recall_echo;
+#[cfg(feature = "vigil")]
+pub mod vigil_echo;
 #[cfg(feature = "voice")]
 pub mod voice_echo;
 
@@ -12,6 +25,11 @@ use std::sync::Arc;
 use crate::llm::LmProvider;
 use crate::scheduler::ScheduledTask;
 
+// Re-export shared types from echo-system-types.
+// HealthStatus is aliased as PluginHealth to preserve existing API.
+pub use echo_system_types::HealthStatus as PluginHealth;
+pub use echo_system_types::{PluginMeta, SetupPrompt};
+
 /// Error type alias for plugin operations
 pub type PluginResult<'a> =
     Pin<Box<dyn Future<Output = Result<(), Box<dyn std::error::Error + Send + Sync>>> + Send + 'a>>;
@@ -21,42 +39,6 @@ pub struct PluginContext {
     pub entity_root: PathBuf,
     pub entity_name: String,
     pub provider: Arc<Box<dyn LmProvider>>,
-}
-
-/// Plugin health status
-#[derive(Debug, Clone)]
-pub enum PluginHealth {
-    Healthy,
-    Degraded(String),
-    Down(String),
-}
-
-impl std::fmt::Display for PluginHealth {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Healthy => write!(f, "healthy"),
-            Self::Degraded(msg) => write!(f, "degraded: {}", msg),
-            Self::Down(msg) => write!(f, "down: {}", msg),
-        }
-    }
-}
-
-/// Plugin metadata
-#[derive(Debug, Clone)]
-pub struct PluginMeta {
-    pub name: String,
-    pub version: String,
-    pub description: String,
-}
-
-/// Setup prompt for plugin configuration wizard
-#[derive(Debug, Clone)]
-pub struct SetupPrompt {
-    pub key: String,
-    pub question: String,
-    pub default: Option<String>,
-    pub required: bool,
-    pub secret: bool,
 }
 
 /// The Plugin trait — dyn-compatible, no async_trait dependency.

@@ -14,53 +14,8 @@ use tokio::sync::RwLock;
 
 use crate::server::AppState;
 
-/// A scheduled task definition
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ScheduledTask {
-    pub id: String,
-    pub name: String,
-    /// Cron expression (6-field: sec min hour dom month dow)
-    pub cron: String,
-    /// Trust channel for the session
-    pub channel: String,
-    /// Prompt sent to the LLM
-    pub prompt: String,
-    /// How to route the output
-    #[serde(default)]
-    pub output_routing: OutputRouting,
-    /// Whether this task is active
-    #[serde(default = "default_true")]
-    pub enabled: bool,
-    /// Who created this task
-    #[serde(default)]
-    pub created_by: TaskCreator,
-}
-
-/// How to route a scheduled task's output
-#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
-#[serde(rename_all = "lowercase")]
-pub enum OutputRouting {
-    /// Don't share output (just update documents)
-    #[default]
-    Silent,
-    /// Post to configured share webhook
-    Share,
-    /// Trigger outbound call
-    Call,
-}
-
-/// Who created the task
-#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
-#[serde(rename_all = "lowercase")]
-pub enum TaskCreator {
-    /// Created by echo-system defaults
-    #[default]
-    System,
-    /// Created by the entity during a session
-    Entity,
-    /// Created by the user via CLI
-    User,
-}
+// Re-export shared types from echo-system-types
+pub use echo_system_types::{OutputRouting, ScheduledTask, TaskCreator};
 
 /// The full schedule — loaded from and persisted to schedule.json
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -186,10 +141,6 @@ pub async fn start(
     }
 
     Ok(handles)
-}
-
-fn default_true() -> bool {
-    true
 }
 
 /// Normalize a 6-field cron expression so that Sunday `0` becomes `7`.

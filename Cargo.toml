@@ -53,11 +53,30 @@ chrono-tz = "0.10"
 uuid = { version = "1", features = ["v4"] }
 chrono = { version = "0.4", features = ["serde"] }
 
+# Shared types
+echo-system-types = { git = "https://github.com/dnacenta/echo-system-types", tag = "v0.1.0" }
+
+# Plugins (optional)
+voice-echo = { git = "https://github.com/dnacenta/voice-echo", branch = "development", optional = true }
+chat-echo = { git = "https://github.com/dnacenta/chat-echo", branch = "development", optional = true }
+# discord-voice-echo blocked: songbird fork's serenity next branch broke upstream.
+# Fix songbird's Cargo.toml to pin serenity rev, then re-add.
+# discord-voice-echo = { git = "https://github.com/dnacenta/discord-voice-echo", branch = "development", optional = true }
+bridge-echo = { git = "https://github.com/dnacenta/bridge-echo", branch = "development", optional = true }
+recall-echo = { git = "https://github.com/dnacenta/recall-echo", branch = "development", optional = true }
+praxis-echo = { git = "https://github.com/dnacenta/praxis-echo", branch = "development", optional = true }
+vigil-echo = { git = "https://github.com/dnacenta/vigil-echo", branch = "development", optional = true }
+
 [features]
 default = []
-voice = []
-discord = ["voice"]
-all-plugins = ["voice", "discord"]
+voice = ["dep:voice-echo"]
+chat = ["dep:chat-echo"]
+# discord = ["dep:discord-voice-echo", "voice"]  # blocked on songbird dep fix
+bridge = ["dep:bridge-echo"]
+recall = ["dep:recall-echo"]
+praxis = ["dep:praxis-echo"]
+vigil = ["dep:vigil-echo"]
+all-plugins = ["voice", "chat", "bridge", "recall", "praxis", "vigil"]
 
 [dev-dependencies]
 tempfile = "3"
