@@ -33,6 +33,10 @@ reqwest = { version = "0.12", features = ["json"] }
 # Security
 regex = "1"
 
+# File tools
+walkdir = "2"
+globset = "0.4"
+
 # Logging
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
