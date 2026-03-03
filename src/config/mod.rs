@@ -137,6 +137,7 @@ impl Config {
     }
 
     /// Load config from a specific directory
+    #[allow(dead_code)]
     pub fn load_from(dir: &std::path::Path) -> Result<Self, Box<dyn std::error::Error>> {
         let path = dir.join(CONFIG_FILENAME);
         let content = std::fs::read_to_string(&path)?;
@@ -232,6 +233,24 @@ pub struct PipelineConfig {
     pub thoughts_staleness_days: u32,
     pub curiosity_staleness_days: u32,
     pub freeze_threshold: u32,
+}
+
+impl PipelineConfig {
+    /// Convert to praxis-echo runtime thresholds.
+    pub fn to_thresholds(&self) -> praxis_echo::runtime::Thresholds {
+        praxis_echo::runtime::Thresholds {
+            learning_soft: self.learning_soft,
+            learning_hard: self.learning_hard,
+            thoughts_soft: self.thoughts_soft,
+            thoughts_hard: self.thoughts_hard,
+            curiosity_soft: self.curiosity_soft,
+            curiosity_hard: self.curiosity_hard,
+            reflections_soft: self.reflections_soft,
+            reflections_hard: self.reflections_hard,
+            praxis_soft: self.praxis_soft,
+            praxis_hard: self.praxis_hard,
+        }
+    }
 }
 
 impl Default for PipelineConfig {

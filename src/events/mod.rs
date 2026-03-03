@@ -4,6 +4,7 @@ use tokio::sync::broadcast;
 
 /// Internal entity events that can trigger autonomous actions.
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub enum EntityEvent {
     /// Emitted after a chat conversation completes.
     PostConversation {

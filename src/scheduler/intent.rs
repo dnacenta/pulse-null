@@ -12,10 +12,6 @@ use super::output;
 use super::Schedule;
 use crate::config::AutonomyConfig;
 use crate::events::EntityEvent;
-use crate::monitoring::{assess as cognitive_assess, signals};
-use crate::pipeline;
-use crate::pipeline::health as pipeline_health;
-use crate::pipeline::health::ThresholdStatus;
 use crate::server::prompt;
 use crate::server::AppState;
 
@@ -621,15 +617,18 @@ async fn execute_intent(
 
     // Extract cognitive signals and check for health changes
     if state.config.monitoring.enabled {
-        let health_before = cognitive_assess::assess(&root_dir, &state.config.monitoring);
+        let window = state.config.monitoring.window_size;
+        let min_samples = state.config.monitoring.min_samples;
+
+        let health_before = vigil_echo::runtime::assess(&root_dir, window, min_samples);
         let previous_status = health_before.status.to_string();
 
-        let frame = signals::extract(&result.response_text, &intent.id);
-        if let Err(e) = signals::record(&root_dir, frame, state.config.monitoring.window_size) {
+        let frame = vigil_echo::runtime::extract(&result.response_text, &intent.id);
+        if let Err(e) = vigil_echo::runtime::record(&root_dir, frame, window) {
             tracing::error!("Failed to record signals for intent '{}': {}", intent.id, e);
         }
 
-        let health_after = cognitive_assess::assess(&root_dir, &state.config.monitoring);
+        let health_after = vigil_echo::runtime::assess(&root_dir, window, min_samples);
         if health_after.sufficient_data && health_after.status != health_before.status {
             state.event_bus.emit(EntityEvent::CognitiveHealthChanged {
                 previous: previous_status,
@@ -641,9 +640,10 @@ async fn execute_intent(
 
     // Update pipeline state
     if state.config.pipeline.enabled {
-        let health = pipeline_health::calculate(&root_dir, &state.config.pipeline);
-        let new_counts = pipeline_health::counts_from_health(&health);
-        let mut pipeline_state = pipeline::PipelineState::load(&root_dir);
+        let thresholds = state.config.pipeline.to_thresholds();
+        let health = praxis_echo::runtime::calculate(&root_dir, &thresholds);
+        let new_counts = praxis_echo::runtime::counts_from_health(&health);
+        let mut pipeline_state = praxis_echo::runtime::PipelineState::load(&root_dir);
         pipeline_state.update_counts(&new_counts);
         let _ = pipeline_state.save(&root_dir);
 
@@ -656,7 +656,7 @@ async fn execute_intent(
             ("PRAXIS", &health.praxis),
         ];
         for (name, doc_health) in &docs {
-            if doc_health.status == ThresholdStatus::Red {
+            if doc_health.status == praxis_echo::runtime::ThresholdStatus::Red {
                 state.event_bus.emit(EntityEvent::PipelineAlert {
                     document: name.to_string(),
                     count: doc_health.count,
@@ -672,8 +672,7 @@ async fn execute_intent(
             });
         }
 
-        let archived =
-            pipeline::archive::check_and_archive(&root_dir, &state.config.pipeline, &health);
+        let archived = praxis_echo::runtime::check_and_archive(&root_dir, &thresholds, &health);
         for doc in &archived {
             tracing::info!("Auto-archived overflow from {} (intent)", doc);
         }

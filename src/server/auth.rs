@@ -63,8 +63,8 @@ mod tests {
         PipelineConfig, SchedulerConfig, SecurityConfig, ServerConfig, TrustConfig,
     };
     use crate::events::EventBus;
-    use crate::llm::Message;
     use crate::tools::ToolRegistry;
+    use echo_system_types::llm::Message;
 
     fn test_state(secret: Option<String>) -> Arc<AppState> {
         Arc::new(AppState {
@@ -93,7 +93,7 @@ mod tests {
                 autonomy: AutonomyConfig::default(),
                 plugins: std::collections::HashMap::new(),
             },
-            provider: Box::new(crate::llm::claude_api::ClaudeProvider::new(
+            provider: Box::new(crate::claude_provider::ClaudeProvider::new(
                 "fake".into(),
                 "test".into(),
             )),

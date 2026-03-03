@@ -5,13 +5,13 @@ use std::pin::Pin;
 
 use super::{Plugin, PluginContext, PluginHealth, PluginMeta, PluginResult, SetupPrompt};
 
-/// Adapter wrapping the voice-echo crate's `VoiceEcho` struct.
-pub struct VoiceEchoPlugin {
-    inner: Option<voice_echo::VoiceEcho>,
+/// Adapter wrapping the discord-voice-echo crate's `DiscordEcho` struct.
+pub struct DiscordEchoPlugin {
+    inner: Option<discord_voice_echo::DiscordEcho>,
     started: bool,
 }
 
-impl VoiceEchoPlugin {
+impl DiscordEchoPlugin {
     pub fn new() -> Self {
         Self {
             inner: None,
@@ -20,12 +20,12 @@ impl VoiceEchoPlugin {
     }
 }
 
-impl Plugin for VoiceEchoPlugin {
+impl Plugin for DiscordEchoPlugin {
     fn meta(&self) -> PluginMeta {
         PluginMeta {
-            name: "voice-echo".to_string(),
+            name: "discord-echo".to_string(),
             version: env!("CARGO_PKG_VERSION").to_string(),
-            description: "Phone calls via Twilio (STT + TTS + voice pipeline)".to_string(),
+            description: "Discord bot presence and voice channels".to_string(),
         }
     }
 
@@ -37,23 +37,22 @@ impl Plugin for VoiceEchoPlugin {
         Box::pin(async move {
             let config = config::from_toml(toml_config)?;
             tracing::info!(
-                "voice-echo: configured on {}:{}",
-                config.server.host,
-                config.server.port
+                "discord-echo: configured for guild {}",
+                config.discord.guild_id
             );
-            self.inner = Some(voice_echo::VoiceEcho::new(config));
+            self.inner = Some(discord_voice_echo::DiscordEcho::new(config));
             Ok(())
         })
     }
 
     fn start(&mut self) -> PluginResult<'_> {
         Box::pin(async move {
-            let inner = self.inner.as_mut().ok_or("voice-echo: not initialized")?;
+            let inner = self.inner.as_mut().ok_or("discord-echo: not initialized")?;
             inner
                 .start()
                 .await
                 .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> {
-                    format!("voice-echo start failed: {e}").into()
+                    format!("discord-echo start failed: {e}").into()
                 })?;
             self.started = true;
             Ok(())
@@ -67,7 +66,7 @@ impl Plugin for VoiceEchoPlugin {
                     .stop()
                     .await
                     .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> {
-                        format!("voice-echo stop failed: {e}").into()
+                        format!("discord-echo stop failed: {e}").into()
                     })?;
                 self.started = false;
             }
@@ -84,12 +83,8 @@ impl Plugin for VoiceEchoPlugin {
         })
     }
 
-    fn routes(&self) -> Option<axum::Router> {
-        self.inner.as_ref().and_then(|inner| inner.routes())
-    }
-
     fn setup_prompts(&self) -> Vec<SetupPrompt> {
-        voice_echo::VoiceEcho::setup_prompts()
+        discord_voice_echo::DiscordEcho::setup_prompts()
     }
 }
 
@@ -99,21 +94,21 @@ mod tests {
 
     #[test]
     fn meta_returns_correct_info() {
-        let plugin = VoiceEchoPlugin::new();
+        let plugin = DiscordEchoPlugin::new();
         let meta = plugin.meta();
-        assert_eq!(meta.name, "voice-echo");
+        assert_eq!(meta.name, "discord-echo");
     }
 
     #[test]
     fn setup_prompts_not_empty() {
-        let plugin = VoiceEchoPlugin::new();
+        let plugin = DiscordEchoPlugin::new();
         let prompts = plugin.setup_prompts();
         assert!(!prompts.is_empty());
     }
 
     #[tokio::test]
     async fn health_before_init_is_down() {
-        let plugin = VoiceEchoPlugin::new();
+        let plugin = DiscordEchoPlugin::new();
         let health = plugin.health().await;
         assert!(matches!(health, PluginHealth::Down(_)));
     }
