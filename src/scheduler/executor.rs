@@ -1,5 +1,5 @@
-use crate::llm::{ContentBlock, LmProvider, Message, MessageContent, Role, StopReason};
 use crate::tools::ToolRegistry;
+use echo_system_types::llm::{ContentBlock, LmProvider, Message, MessageContent, Role, StopReason};
 
 /// Configuration for an autonomous execution session.
 pub struct ExecutionConfig {
@@ -12,6 +12,7 @@ pub struct ExecutionConfig {
 }
 
 /// Result of an autonomous execution session.
+#[allow(dead_code)]
 pub struct ExecutionResult {
     /// The full response text (all text blocks concatenated)
     pub response_text: String,

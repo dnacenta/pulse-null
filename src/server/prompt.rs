@@ -1,9 +1,6 @@
 use std::path::Path;
 
 use crate::config::Config;
-use crate::monitoring::assess;
-use crate::pipeline;
-use crate::pipeline::health;
 use crate::scheduler::cost::CostTracker;
 use crate::scheduler::intent::IntentQueue;
 
@@ -52,9 +49,10 @@ pub fn build_system_prompt(
 
     // Pipeline health — document counts and threshold status
     if config.pipeline.enabled {
-        let pipeline_state = pipeline::PipelineState::load(root_dir);
-        let pipeline_health = health::calculate(root_dir, &config.pipeline);
-        let pipeline_text = health::render(
+        let thresholds = config.pipeline.to_thresholds();
+        let pipeline_state = praxis_echo::runtime::PipelineState::load(root_dir);
+        let pipeline_health = praxis_echo::runtime::calculate(root_dir, &thresholds);
+        let pipeline_text = praxis_echo::runtime::render(
             &pipeline_health,
             pipeline_state.sessions_without_movement,
             config.pipeline.freeze_threshold,
@@ -67,8 +65,12 @@ pub fn build_system_prompt(
 
     // Cognitive health — metacognitive monitoring assessment
     if config.monitoring.enabled {
-        let cognitive_health = assess::assess(root_dir, &config.monitoring);
-        let cognitive_text = assess::render(&cognitive_health);
+        let cognitive_health = vigil_echo::runtime::assess(
+            root_dir,
+            config.monitoring.window_size,
+            config.monitoring.min_samples,
+        );
+        let cognitive_text = vigil_echo::runtime::render(&cognitive_health);
         parts.push(format!(
             "<cognitive-health>\n{}\n</cognitive-health>",
             cognitive_text
