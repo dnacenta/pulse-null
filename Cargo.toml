@@ -66,12 +66,14 @@ pulse-echo = { git = "https://github.com/dnacenta/pulse-echo", tag = "v0.1.0" }
 # Plugins (optional — different interfaces to speak through)
 voice-echo = { git = "https://github.com/dnacenta/voice-echo", branch = "development", optional = true }
 discord-voice-echo = { git = "https://github.com/dnacenta/discord-voice-echo", branch = "development", optional = true }
+discord-echo = { git = "https://github.com/dnacenta/discord-echo", branch = "development", optional = true }
 
 [features]
 default = []
 voice = ["dep:voice-echo"]
 discord = ["dep:discord-voice-echo", "voice"]
-all-plugins = ["voice", "discord"]
+discord-text = ["dep:discord-echo"]
+all-plugins = ["voice", "discord", "discord-text"]
 
 [dev-dependencies]
 tempfile = "3"

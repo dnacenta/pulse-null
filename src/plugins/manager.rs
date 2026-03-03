@@ -137,6 +137,24 @@ impl PluginManager {
         tasks
     }
 
+    /// Collect all tools from plugins
+    pub fn collect_tools(&self) -> Vec<Box<dyn crate::tools::Tool>> {
+        let mut tools = Vec::new();
+        for plugin in &self.plugins {
+            let meta = plugin.meta();
+            let plugin_tools = plugin.tools();
+            if !plugin_tools.is_empty() {
+                tracing::info!(
+                    "Plugin '{}' contributed {} tool(s)",
+                    meta.name,
+                    plugin_tools.len()
+                );
+                tools.extend(plugin_tools);
+            }
+        }
+        tools
+    }
+
     /// Get health status of all plugins
     #[allow(dead_code)]
     pub async fn health_all(&self) -> Vec<PluginStatus> {
