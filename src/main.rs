@@ -29,6 +29,8 @@ enum Commands {
     },
     /// Start the entity
     Up,
+    /// Open the chat UI
+    Chat,
     /// Stop the entity
     Down,
     /// Show entity status
@@ -175,6 +177,12 @@ async fn main() {
         }
         Commands::Up => {
             if let Err(e) = cli::up::run().await {
+                eprintln!("Error: {e}");
+                std::process::exit(1);
+            }
+        }
+        Commands::Chat => {
+            if let Err(e) = cli::chat::run().await {
                 eprintln!("Error: {e}");
                 std::process::exit(1);
             }

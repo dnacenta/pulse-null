@@ -1,4 +1,5 @@
 pub mod archive;
+pub mod chat;
 pub mod down;
 pub mod init;
 pub mod intent;
