@@ -41,8 +41,8 @@ impl TrustLevel {
 mod tests {
     use super::*;
     use crate::config::{
-        Config, EntityConfig, LlmConfig, MemoryConfig, MonitoringConfig, PipelineConfig,
-        SchedulerConfig, SecurityConfig, ServerConfig, TrustConfig,
+        AutonomyConfig, Config, EntityConfig, LlmConfig, MemoryConfig, MonitoringConfig,
+        PipelineConfig, SchedulerConfig, SecurityConfig, ServerConfig, TrustConfig,
     };
 
     fn test_config() -> Config {
@@ -71,6 +71,7 @@ mod tests {
             scheduler: SchedulerConfig::default(),
             pipeline: PipelineConfig::default(),
             monitoring: MonitoringConfig::default(),
+            autonomy: AutonomyConfig::default(),
             plugins: std::collections::HashMap::new(),
         }
     }

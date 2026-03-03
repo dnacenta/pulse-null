@@ -1,6 +1,7 @@
 pub mod archive;
 pub mod down;
 pub mod init;
+pub mod intent;
 pub mod pipeline;
 pub mod plugin;
 pub mod schedule;

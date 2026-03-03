@@ -6,8 +6,8 @@ use axum::Router;
 use super::registry;
 use super::{Plugin, PluginContext, PluginHealth, PluginMeta};
 use crate::config::Config;
-use crate::llm::LmProvider;
 use crate::scheduler::ScheduledTask;
+use echo_system_types::llm::LmProvider;
 
 /// Manages the lifecycle of all enabled plugins
 pub struct PluginManager {
@@ -16,6 +16,7 @@ pub struct PluginManager {
 }
 
 /// Summary of a plugin's status for display
+#[allow(dead_code)]
 pub struct PluginStatus {
     pub meta: PluginMeta,
     pub health: PluginHealth,
@@ -118,6 +119,7 @@ impl PluginManager {
     }
 
     /// Collect all scheduled tasks from plugins
+    #[allow(dead_code)]
     pub fn collect_tasks(&self) -> Vec<ScheduledTask> {
         let mut tasks = Vec::new();
         for plugin in &self.plugins {
@@ -136,6 +138,7 @@ impl PluginManager {
     }
 
     /// Get health status of all plugins
+    #[allow(dead_code)]
     pub async fn health_all(&self) -> Vec<PluginStatus> {
         let mut statuses = Vec::new();
         for plugin in &self.plugins {
@@ -152,6 +155,7 @@ impl PluginManager {
     }
 
     /// Whether the manager has been started
+    #[allow(dead_code)]
     pub fn is_started(&self) -> bool {
         self.started
     }
@@ -161,8 +165,8 @@ impl PluginManager {
 mod tests {
     use super::*;
     use crate::config::{
-        Config, EntityConfig, LlmConfig, MemoryConfig, MonitoringConfig, PipelineConfig,
-        SchedulerConfig, SecurityConfig, ServerConfig, TrustConfig,
+        AutonomyConfig, Config, EntityConfig, LlmConfig, MemoryConfig, MonitoringConfig,
+        PipelineConfig, SchedulerConfig, SecurityConfig, ServerConfig, TrustConfig,
     };
 
     fn test_config() -> Config {
@@ -191,6 +195,7 @@ mod tests {
             scheduler: SchedulerConfig::default(),
             pipeline: PipelineConfig::default(),
             monitoring: MonitoringConfig::default(),
+            autonomy: AutonomyConfig::default(),
             plugins: std::collections::HashMap::new(),
         }
     }

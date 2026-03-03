@@ -1,6 +1,6 @@
 [package]
 name = "echo-system"
-version = "0.4.0"
+version = "0.5.0"
 edition = "2021"
 rust-version = "1.80"
 license = "AGPL-3.0-only"
@@ -20,7 +20,6 @@ tokio = { version = "1", features = ["full"] }
 
 # HTTP server
 axum = "0.8"
-tower-http = { version = "0.6", features = ["cors", "fs"] }
 
 # Serialization
 serde = { version = "1", features = ["derive"] }
@@ -52,6 +51,26 @@ chrono-tz = "0.10"
 # Misc
 uuid = { version = "1", features = ["v4"] }
 chrono = { version = "0.4", features = ["serde"] }
+
+# Shared types
+echo-system-types = { git = "https://github.com/dnacenta/echo-system-types", tag = "v0.2.0" }
+
+# Core dependencies (always included — these define an entity)
+vigil-echo = { git = "https://github.com/dnacenta/vigil-echo", branch = "development" }
+praxis-echo = { git = "https://github.com/dnacenta/praxis-echo", branch = "development" }
+chat-echo = { git = "https://github.com/dnacenta/chat-echo", branch = "development" }
+bridge-echo = { git = "https://github.com/dnacenta/bridge-echo", branch = "development" }
+recall-echo = { git = "https://github.com/dnacenta/recall-echo", branch = "development" }
+
+# Plugins (optional — different interfaces to speak through)
+voice-echo = { git = "https://github.com/dnacenta/voice-echo", branch = "development", optional = true }
+discord-voice-echo = { git = "https://github.com/dnacenta/discord-voice-echo", branch = "development", optional = true }
+
+[features]
+default = []
+voice = ["dep:voice-echo"]
+discord = ["dep:discord-voice-echo", "voice"]
+all-plugins = ["voice", "discord"]
 
 [dev-dependencies]
 tempfile = "3"

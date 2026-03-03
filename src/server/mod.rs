@@ -13,14 +13,15 @@ use axum::middleware;
 use axum::routing::{get, post};
 use axum::Router;
 use tokio::sync::RwLock;
-use tower_http::services::ServeDir;
 
+use crate::claude_provider::ClaudeProvider;
 use crate::config::Config;
-use crate::llm::claude_api::ClaudeProvider;
-use crate::llm::{LmProvider, Message};
+use crate::events::EventBus;
 use crate::plugins::manager::PluginManager;
+use crate::scheduler::intent::IntentQueue;
 use crate::scheduler::Schedule;
 use crate::tools::ToolRegistry;
+use echo_system_types::llm::{LmProvider, Message};
 
 /// Shared application state
 pub struct AppState {
@@ -29,6 +30,7 @@ pub struct AppState {
     pub conversation: RwLock<Vec<Message>>,
     pub system_prompt: RwLock<String>,
     pub tools: ToolRegistry,
+    pub event_bus: Arc<EventBus>,
 }
 
 pub async fn start(config: Config) -> Result<(), Box<dyn std::error::Error>> {
@@ -76,28 +78,53 @@ pub async fn start(config: Config) -> Result<(), Box<dyn std::error::Error>> {
         tracing::info!("{} plugin(s) started", plugin_manager.count());
     }
 
+    // Create event bus
+    let event_bus = Arc::new(EventBus::new(64));
+
     let state = Arc::new(AppState {
         config: config.clone(),
         provider,
         conversation: RwLock::new(Vec::new()),
         system_prompt: RwLock::new(system_prompt),
         tools,
+        event_bus: Arc::clone(&event_bus),
     });
 
-    // Load schedule and start scheduler
+    // Load schedule and intent queue, start scheduler
     let schedule = Schedule::load(&root_dir)?;
     let schedule = Arc::new(RwLock::new(schedule));
-    let scheduler_handles =
-        crate::scheduler::start(Arc::clone(&state), Arc::clone(&schedule)).await?;
+    let intent_queue = IntentQueue::load(&root_dir);
+    let intent_queue = Arc::new(RwLock::new(intent_queue));
+    let scheduler_handles = crate::scheduler::start(
+        Arc::clone(&state),
+        Arc::clone(&schedule),
+        Arc::clone(&intent_queue),
+    )
+    .await?;
+
+    // Start event listener (translates events → intents)
+    if config.autonomy.enabled {
+        let listener_rx = event_bus.subscribe();
+        let listener_queue = Arc::clone(&intent_queue);
+        let events_config = config.autonomy.events.clone();
+        let max_queue_size = config.autonomy.max_queue_size;
+        tokio::spawn(async move {
+            crate::events::listener::event_listener(
+                listener_rx,
+                listener_queue,
+                events_config,
+                max_queue_size,
+            )
+            .await;
+        });
+        tracing::info!("Event listener started");
+    }
 
     // Collect plugin routes (stateless — merged after .with_state())
     let plugin_routes = plugin_manager.collect_routes();
 
     // Rate limiter (10 burst, 2/sec)
     let limiter = rate_limit::default_limiter();
-
-    // Resolve static files directory relative to entity root
-    let static_dir = root_dir.join("static");
 
     let app = Router::new()
         .route("/health", get(handlers::health::health))
@@ -112,9 +139,7 @@ pub async fn start(config: Config) -> Result<(), Box<dyn std::error::Error>> {
             limiter,
             rate_limit::rate_limit,
         ))
-        .merge(plugin_routes)
-        .nest_service("/static", ServeDir::new(&static_dir))
-        .fallback_service(ServeDir::new(&static_dir).append_index_html_on_directories(true));
+        .merge(plugin_routes);
 
     let addr = format!("{}:{}", config.server.host, config.server.port);
     let listener = tokio::net::TcpListener::bind(&addr).await?;

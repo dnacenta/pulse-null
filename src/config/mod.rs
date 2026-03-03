@@ -24,6 +24,8 @@ pub struct Config {
     #[serde(default)]
     pub monitoring: MonitoringConfig,
     #[serde(default)]
+    pub autonomy: AutonomyConfig,
+    #[serde(default)]
     pub plugins: HashMap<String, toml::Value>,
 }
 
@@ -135,6 +137,7 @@ impl Config {
     }
 
     /// Load config from a specific directory
+    #[allow(dead_code)]
     pub fn load_from(dir: &std::path::Path) -> Result<Self, Box<dyn std::error::Error>> {
         let path = dir.join(CONFIG_FILENAME);
         let content = std::fs::read_to_string(&path)?;
@@ -232,6 +235,24 @@ pub struct PipelineConfig {
     pub freeze_threshold: u32,
 }
 
+impl PipelineConfig {
+    /// Convert to praxis-echo runtime thresholds.
+    pub fn to_thresholds(&self) -> praxis_echo::runtime::Thresholds {
+        praxis_echo::runtime::Thresholds {
+            learning_soft: self.learning_soft,
+            learning_hard: self.learning_hard,
+            thoughts_soft: self.thoughts_soft,
+            thoughts_hard: self.thoughts_hard,
+            curiosity_soft: self.curiosity_soft,
+            curiosity_hard: self.curiosity_hard,
+            reflections_soft: self.reflections_soft,
+            reflections_hard: self.reflections_hard,
+            praxis_soft: self.praxis_soft,
+            praxis_hard: self.praxis_hard,
+        }
+    }
+}
+
 impl Default for PipelineConfig {
     fn default() -> Self {
         Self {
@@ -267,6 +288,69 @@ impl Default for MonitoringConfig {
             enabled: true,
             window_size: 10,
             min_samples: 5,
+        }
+    }
+}
+
+/// Configuration for the self-initiation / autonomy system
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct AutonomyConfig {
+    /// Enable tools for scheduled tasks and the intent queue
+    pub enabled: bool,
+    /// Maximum tool execution rounds for autonomous sessions (lower than chat's 25)
+    pub max_tool_rounds: u32,
+    /// How often to check the intent queue (seconds)
+    pub intent_poll_interval: u64,
+    /// Maximum intents that can be queued at once
+    pub max_queue_size: usize,
+    /// Maximum intents processed per hour (sliding window)
+    pub max_intents_per_hour: u32,
+    /// Maximum chain depth (prevents infinite A→B→C chains)
+    pub max_chain_depth: u32,
+    /// Rough daily API cost limit in cents (0 = unlimited)
+    pub daily_cost_limit_cents: u32,
+    /// Event-driven intent configuration
+    #[serde(default)]
+    pub events: EventsConfig,
+}
+
+impl Default for AutonomyConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            max_tool_rounds: 15,
+            intent_poll_interval: 60,
+            max_queue_size: 20,
+            max_intents_per_hour: 10,
+            max_chain_depth: 3,
+            daily_cost_limit_cents: 500,
+            events: EventsConfig::default(),
+        }
+    }
+}
+
+/// Which internal events auto-queue intents
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct EventsConfig {
+    /// Queue reflection intent after chat conversations end
+    pub post_conversation: bool,
+    /// Queue archiving intent when a document hits its hard limit
+    pub pipeline_alert: bool,
+    /// Queue investigation intent when pipeline has no movement
+    pub pipeline_frozen: bool,
+    /// Queue adjustment intent when cognitive health declines
+    pub cognitive_decline: bool,
+}
+
+impl Default for EventsConfig {
+    fn default() -> Self {
+        Self {
+            post_conversation: false,
+            pipeline_alert: true,
+            pipeline_frozen: true,
+            cognitive_decline: true,
         }
     }
 }
