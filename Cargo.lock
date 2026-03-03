@@ -903,6 +903,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "discord-echo"
+version = "0.1.0"
+source = "git+https://github.com/dnacenta/discord-echo?tag=v0.1.0#2af8efbe6b3f175df73bb433cb68eaf002c3622b"
+dependencies = [
+ "echo-system-types",
+ "futures-util",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tokio-tungstenite 0.26.2",
+ "tracing",
+]
+
+[[package]]
 name = "discord-voice-echo"
 version = "0.1.0"
 source = "git+https://github.com/dnacenta/discord-voice-echo?branch=development#18f4759f8f388007f77cb321eb409767afc48bbc"
@@ -970,7 +985,7 @@ dependencies = [
 
 [[package]]
 name = "echo-system"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "axum",
  "bridge-echo",
@@ -981,6 +996,7 @@ dependencies = [
  "console",
  "cron",
  "dialoguer",
+ "discord-echo",
  "discord-voice-echo",
  "echo-system-types",
  "globset",
@@ -4388,9 +4404,11 @@ checksum = "7a9daff607c6d2bf6c16fd681ccb7eecc83e4e2cdc1ca067ffaadfca5de7f084"
 dependencies = [
  "futures-util",
  "log",
+ "native-tls",
  "rustls 0.23.37",
  "rustls-pki-types",
  "tokio",
+ "tokio-native-tls",
  "tokio-rustls 0.26.4",
  "tungstenite 0.26.2",
  "webpki-roots 0.26.11",
@@ -4662,6 +4680,7 @@ dependencies = [
  "http",
  "httparse",
  "log",
+ "native-tls",
  "rand 0.9.2",
  "rustls 0.23.37",
  "rustls-pki-types",

@@ -60,6 +60,12 @@ pub fn known_plugins() -> Vec<RegistryEntry> {
             version: "0.1.0".to_string(),
             available: true,
         },
+        RegistryEntry {
+            name: "discord-text-echo".to_string(),
+            description: "Discord text channels (read + write)".to_string(),
+            version: "0.1.0".to_string(),
+            available: cfg!(feature = "discord-text"),
+        },
     ]
 }
 
@@ -84,6 +90,10 @@ pub fn create_plugin(name: &str) -> Option<Box<dyn Plugin>> {
         "voice-echo" => Some(Box::new(super::voice_echo::VoiceEchoPlugin::new())),
         #[cfg(feature = "discord")]
         "discord-echo" => Some(Box::new(super::discord_echo::DiscordEchoPlugin::new())),
+        #[cfg(feature = "discord-text")]
+        "discord-text-echo" => Some(Box::new(
+            super::discord_text_echo::DiscordTextEchoPlugin::new(),
+        )),
         _ => {
             tracing::debug!("Plugin '{name}' is not available");
             None
@@ -127,6 +137,7 @@ mod tests {
         assert!(names.contains(&"praxis-echo"));
         assert!(names.contains(&"pulse-echo"));
         assert!(names.contains(&"vigil-echo"));
+        assert!(names.contains(&"discord-text-echo"));
     }
 
     #[test]
