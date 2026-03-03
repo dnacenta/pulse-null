@@ -22,7 +22,7 @@ pub fn known_plugins() -> Vec<RegistryEntry> {
             name: "chat-echo".to_string(),
             description: "Web chat UI for echo-system".to_string(),
             version: "0.1.0".to_string(),
-            available: cfg!(feature = "chat"),
+            available: true,
         },
         RegistryEntry {
             name: "discord-echo".to_string(),
@@ -34,25 +34,25 @@ pub fn known_plugins() -> Vec<RegistryEntry> {
             name: "bridge-echo".to_string(),
             description: "HTTP bridge for Claude Code integration".to_string(),
             version: "0.2.0".to_string(),
-            available: cfg!(feature = "bridge"),
+            available: true,
         },
         RegistryEntry {
             name: "recall-echo".to_string(),
             description: "Three-layer persistent memory system".to_string(),
             version: "0.6.0".to_string(),
-            available: cfg!(feature = "recall"),
+            available: true,
         },
         RegistryEntry {
             name: "praxis-echo".to_string(),
             description: "Pipeline enforcement and behavioral policies".to_string(),
             version: "0.1.0".to_string(),
-            available: cfg!(feature = "praxis"),
+            available: true,
         },
         RegistryEntry {
             name: "vigil-echo".to_string(),
             description: "Metacognitive monitoring and signal tracking".to_string(),
             version: "0.1.0".to_string(),
-            available: cfg!(feature = "vigil"),
+            available: true,
         },
     ]
 }
@@ -66,20 +66,17 @@ pub fn find_plugin(name: &str) -> Option<RegistryEntry> {
 /// Returns None if the plugin is not compiled in or not yet implemented.
 pub fn create_plugin(name: &str) -> Option<Box<dyn Plugin>> {
     match name {
+        // Core plugins (always available)
+        "chat-echo" => Some(Box::new(super::chat_echo::ChatEchoPlugin::new())),
+        "bridge-echo" => Some(Box::new(super::bridge_echo::BridgeEchoPlugin::new())),
+        "recall-echo" => Some(Box::new(super::recall_echo::RecallEchoPlugin::new())),
+        "praxis-echo" => Some(Box::new(super::praxis_echo::PraxisEchoPlugin::new())),
+        "vigil-echo" => Some(Box::new(super::vigil_echo::VigilEchoPlugin::new())),
+        // Optional plugins (feature-gated)
         #[cfg(feature = "voice")]
         "voice-echo" => Some(Box::new(super::voice_echo::VoiceEchoPlugin::new())),
-        #[cfg(feature = "chat")]
-        "chat-echo" => Some(Box::new(super::chat_echo::ChatEchoPlugin::new())),
         #[cfg(feature = "discord")]
         "discord-echo" => Some(Box::new(super::discord_echo::DiscordEchoPlugin::new())),
-        #[cfg(feature = "bridge")]
-        "bridge-echo" => Some(Box::new(super::bridge_echo::BridgeEchoPlugin::new())),
-        #[cfg(feature = "recall")]
-        "recall-echo" => Some(Box::new(super::recall_echo::RecallEchoPlugin::new())),
-        #[cfg(feature = "praxis")]
-        "praxis-echo" => Some(Box::new(super::praxis_echo::PraxisEchoPlugin::new())),
-        #[cfg(feature = "vigil")]
-        "vigil-echo" => Some(Box::new(super::vigil_echo::VigilEchoPlugin::new())),
         _ => {
             tracing::debug!("Plugin '{name}' is not available");
             None

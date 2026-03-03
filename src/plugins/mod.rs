@@ -1,18 +1,16 @@
 pub mod manager;
 pub mod registry;
 
-#[cfg(feature = "bridge")]
+// Core modules (always included)
 pub mod bridge_echo;
-#[cfg(feature = "chat")]
 pub mod chat_echo;
+pub mod praxis_echo;
+pub mod recall_echo;
+pub mod vigil_echo;
+
+// Optional plugins (feature-gated)
 #[cfg(feature = "discord")]
 pub mod discord_echo;
-#[cfg(feature = "praxis")]
-pub mod praxis_echo;
-#[cfg(feature = "recall")]
-pub mod recall_echo;
-#[cfg(feature = "vigil")]
-pub mod vigil_echo;
 #[cfg(feature = "voice")]
 pub mod voice_echo;
 
@@ -34,6 +32,7 @@ pub type PluginResult<'a> =
     Pin<Box<dyn Future<Output = Result<(), Box<dyn std::error::Error + Send + Sync>>> + Send + 'a>>;
 
 /// Context passed to plugins during initialization
+#[allow(dead_code)]
 pub struct PluginContext {
     pub entity_root: PathBuf,
     pub entity_name: String,
@@ -42,6 +41,7 @@ pub struct PluginContext {
 
 /// The Plugin trait — dyn-compatible, no async_trait dependency.
 /// Uses the same Pin<Box<dyn Future>> pattern as LmProvider.
+#[allow(dead_code)]
 pub trait Plugin: Send + Sync {
     /// Plugin identity
     fn meta(&self) -> PluginMeta;

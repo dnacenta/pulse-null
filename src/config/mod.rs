@@ -137,6 +137,7 @@ impl Config {
     }
 
     /// Load config from a specific directory
+    #[allow(dead_code)]
     pub fn load_from(dir: &std::path::Path) -> Result<Self, Box<dyn std::error::Error>> {
         let path = dir.join(CONFIG_FILENAME);
         let content = std::fs::read_to_string(&path)?;

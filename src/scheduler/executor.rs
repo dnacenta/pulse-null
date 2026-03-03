@@ -12,6 +12,7 @@ pub struct ExecutionConfig {
 }
 
 /// Result of an autonomous execution session.
+#[allow(dead_code)]
 pub struct ExecutionResult {
     /// The full response text (all text blocks concatenated)
     pub response_text: String,

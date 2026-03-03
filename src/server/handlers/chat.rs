@@ -11,6 +11,7 @@ use crate::server::{injection, AppState};
 use echo_system_types::llm::{ContentBlock, Message, MessageContent, Role, StopReason};
 
 #[derive(Deserialize)]
+#[allow(dead_code)]
 pub struct ChatRequest {
     pub message: String,
     #[serde(default = "default_channel")]
