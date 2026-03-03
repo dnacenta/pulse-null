@@ -5,7 +5,6 @@ mod config;
 mod events;
 mod init;
 mod llm;
-mod memory;
 mod monitoring;
 mod pipeline;
 mod plugins;
