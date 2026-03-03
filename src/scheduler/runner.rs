@@ -294,6 +294,23 @@ async fn execute_task(
     // Log to LOGBOOK.md
     log_execution(&root_dir, task, &parsed.clean_content);
 
+    // Record outcome for pulse-echo
+    if state.config.pulse.enabled {
+        let outcome = pulse_echo::runtime::build_outcome(
+            &task.id,
+            &task.name,
+            &parsed.clean_content,
+            tool_rounds,
+            input_tokens,
+            output_tokens,
+        );
+        if let Err(e) =
+            pulse_echo::runtime::record_outcome(&root_dir, outcome, state.config.pulse.max_outcomes)
+        {
+            tracing::error!("Failed to record outcome for task '{}': {}", task.id, e);
+        }
+    }
+
     // Post-execution: extract cognitive signals and check for health changes
     if state.config.monitoring.enabled {
         let window = state.config.monitoring.window_size;
