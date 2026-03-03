@@ -28,7 +28,7 @@ pub fn known_plugins() -> Vec<RegistryEntry> {
             name: "discord-echo".to_string(),
             description: "Discord bot presence and voice channels".to_string(),
             version: "0.1.0".to_string(),
-            available: false, // blocked on songbird dep fix
+            available: cfg!(feature = "discord"),
         },
         RegistryEntry {
             name: "bridge-echo".to_string(),
@@ -70,7 +70,8 @@ pub fn create_plugin(name: &str) -> Option<Box<dyn Plugin>> {
         "voice-echo" => Some(Box::new(super::voice_echo::VoiceEchoPlugin::new())),
         #[cfg(feature = "chat")]
         "chat-echo" => Some(Box::new(super::chat_echo::ChatEchoPlugin::new())),
-        // "discord-echo" blocked on songbird dep fix
+        #[cfg(feature = "discord")]
+        "discord-echo" => Some(Box::new(super::discord_echo::DiscordEchoPlugin::new())),
         #[cfg(feature = "bridge")]
         "bridge-echo" => Some(Box::new(super::bridge_echo::BridgeEchoPlugin::new())),
         #[cfg(feature = "recall")]

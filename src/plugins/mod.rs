@@ -5,9 +5,8 @@ pub mod registry;
 pub mod bridge_echo;
 #[cfg(feature = "chat")]
 pub mod chat_echo;
-// discord_echo blocked on songbird dep fix
-// #[cfg(feature = "discord")]
-// pub mod discord_echo;
+#[cfg(feature = "discord")]
+pub mod discord_echo;
 #[cfg(feature = "praxis")]
 pub mod praxis_echo;
 #[cfg(feature = "recall")]
