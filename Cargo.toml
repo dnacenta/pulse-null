@@ -61,6 +61,7 @@ praxis-echo = { git = "https://github.com/dnacenta/praxis-echo", branch = "devel
 chat-echo = { git = "https://github.com/dnacenta/chat-echo", tag = "v0.1.1" }
 bridge-echo = { git = "https://github.com/dnacenta/bridge-echo", branch = "development" }
 recall-echo = { git = "https://github.com/dnacenta/recall-echo", branch = "development" }
+pulse-echo = { git = "https://github.com/dnacenta/pulse-echo", branch = "development" }
 
 # Plugins (optional — different interfaces to speak through)
 voice-echo = { git = "https://github.com/dnacenta/voice-echo", branch = "development", optional = true }
