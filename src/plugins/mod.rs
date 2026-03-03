@@ -1,6 +1,9 @@
 pub mod manager;
 pub mod registry;
 
+#[cfg(feature = "voice")]
+pub mod voice_echo;
+
 use std::future::Future;
 use std::path::PathBuf;
 use std::pin::Pin;
