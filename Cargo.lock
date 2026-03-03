@@ -404,8 +404,8 @@ dependencies = [
 
 [[package]]
 name = "chat-echo"
-version = "0.1.0"
-source = "git+https://github.com/dnacenta/chat-echo?branch=development#b2b6ff55bd37b212587452a05f70b64a395b9eee"
+version = "0.1.1"
+source = "git+https://github.com/dnacenta/chat-echo?tag=v0.1.1#c0fe0df04a5a2da5f87cf687ef2c1300b6cf84f3"
 dependencies = [
  "axum",
  "echo-system-types",
