@@ -13,7 +13,6 @@ use axum::middleware;
 use axum::routing::{get, post};
 use axum::Router;
 use tokio::sync::RwLock;
-use tower_http::services::ServeDir;
 
 use crate::config::Config;
 use crate::events::EventBus;
@@ -127,9 +126,6 @@ pub async fn start(config: Config) -> Result<(), Box<dyn std::error::Error>> {
     // Rate limiter (10 burst, 2/sec)
     let limiter = rate_limit::default_limiter();
 
-    // Resolve static files directory relative to entity root
-    let static_dir = root_dir.join("static");
-
     let app = Router::new()
         .route("/health", get(handlers::health::health))
         .route("/api/status", get(handlers::status::status))
@@ -143,9 +139,7 @@ pub async fn start(config: Config) -> Result<(), Box<dyn std::error::Error>> {
             limiter,
             rate_limit::rate_limit,
         ))
-        .merge(plugin_routes)
-        .nest_service("/static", ServeDir::new(&static_dir))
-        .fallback_service(ServeDir::new(&static_dir).append_index_html_on_directories(true));
+        .merge(plugin_routes);
 
     let addr = format!("{}:{}", config.server.host, config.server.port);
     let listener = tokio::net::TcpListener::bind(&addr).await?;
