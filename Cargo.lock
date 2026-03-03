@@ -905,7 +905,7 @@ dependencies = [
 [[package]]
 name = "discord-echo"
 version = "0.1.0"
-source = "git+https://github.com/dnacenta/discord-echo?branch=development#2af8efbe6b3f175df73bb433cb68eaf002c3622b"
+source = "git+https://github.com/dnacenta/discord-echo?tag=v0.1.0#2af8efbe6b3f175df73bb433cb68eaf002c3622b"
 dependencies = [
  "echo-system-types",
  "futures-util",
@@ -985,7 +985,7 @@ dependencies = [
 
 [[package]]
 name = "echo-system"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "axum",
  "bridge-echo",
