@@ -14,7 +14,7 @@ use tower::ServiceExt;
 
 use crate::config::{
     AutonomyConfig, Config, EntityConfig, LlmConfig, MemoryConfig, MonitoringConfig,
-    PipelineConfig, SchedulerConfig, SecurityConfig, ServerConfig, TrustConfig,
+    PipelineConfig, PulseConfig, SchedulerConfig, SecurityConfig, ServerConfig, TrustConfig,
 };
 use crate::events::EventBus;
 use crate::server::handlers;
@@ -109,6 +109,7 @@ fn test_config() -> Config {
         pipeline: PipelineConfig::default(),
         monitoring: MonitoringConfig::default(),
         autonomy: AutonomyConfig::default(),
+        pulse: PulseConfig::default(),
         plugins: HashMap::new(),
     }
 }

@@ -1,6 +1,6 @@
 [package]
 name = "echo-system"
-version = "0.5.2"
+version = "0.6.0"
 edition = "2021"
 rust-version = "1.80"
 license = "AGPL-3.0-only"
@@ -61,6 +61,7 @@ praxis-echo = { git = "https://github.com/dnacenta/praxis-echo", branch = "devel
 chat-echo = { git = "https://github.com/dnacenta/chat-echo", tag = "v0.1.1" }
 bridge-echo = { git = "https://github.com/dnacenta/bridge-echo", branch = "development" }
 recall-echo = { git = "https://github.com/dnacenta/recall-echo", branch = "development" }
+pulse-echo = { git = "https://github.com/dnacenta/pulse-echo", tag = "v0.1.0" }
 
 # Plugins (optional — different interfaces to speak through)
 voice-echo = { git = "https://github.com/dnacenta/voice-echo", branch = "development", optional = true }
