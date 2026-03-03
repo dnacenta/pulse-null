@@ -15,6 +15,8 @@ pub struct ConfigData {
     pub api_key: Option<String>,
     pub port: u16,
     pub timezone: String,
+    /// Plugin configs: (plugin_name, [(key, value)])
+    pub plugins: Vec<(String, Vec<(String, String)>)>,
 }
 
 pub fn render_config(data: &ConfigData) -> String {
@@ -82,10 +84,22 @@ enabled = true
 window_size = 10
 min_samples = 5
 
-# [plugins]
-# Add plugins with: echo-system plugin add <name>
-# [plugins.voice-echo]
-# [plugins.discord-echo]
+[autonomy]
+enabled = true
+max_tool_rounds = 15
+intent_poll_interval = 60
+max_queue_size = 20
+max_intents_per_hour = 10
+max_chain_depth = 3
+daily_cost_limit_cents = 500
+
+[autonomy.events]
+post_conversation = false
+pipeline_alert = true
+pipeline_frozen = true
+cognitive_decline = true
+
+{plugins_section}
 "#,
         entity_name = data.entity_name,
         owner_name = data.owner_name,
@@ -94,7 +108,26 @@ min_samples = 5
         provider = data.provider,
         api_key_line = api_key_line,
         timezone = data.timezone,
+        plugins_section = render_plugins_section(&data.plugins),
     )
+}
+
+fn render_plugins_section(plugins: &[(String, Vec<(String, String)>)]) -> String {
+    if plugins.is_empty() {
+        return "# [plugins]\n# Add plugins with: echo-system plugin add <name>".to_string();
+    }
+
+    let mut lines = Vec::new();
+    for (name, config) in plugins {
+        lines.push(format!("[plugins.{}]", name));
+        for (key, value) in config {
+            // Quote the value for TOML
+            lines.push(format!("{} = \"{}\"", key, value.replace('\"', "\\\"")));
+        }
+        lines.push(String::new());
+    }
+
+    lines.join("\n")
 }
 
 pub fn render_self_md(identity: &Identity) -> String {

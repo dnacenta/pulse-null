@@ -13,13 +13,16 @@ use tokio::sync::RwLock;
 use tower::ServiceExt;
 
 use crate::config::{
-    Config, EntityConfig, LlmConfig, MemoryConfig, MonitoringConfig, PipelineConfig,
-    SchedulerConfig, SecurityConfig, ServerConfig, TrustConfig,
+    AutonomyConfig, Config, EntityConfig, LlmConfig, MemoryConfig, MonitoringConfig,
+    PipelineConfig, SchedulerConfig, SecurityConfig, ServerConfig, TrustConfig,
 };
-use crate::llm::{ContentBlock, LlmResponse, LlmResult, LmProvider, Message, StopReason};
+use crate::events::EventBus;
 use crate::server::handlers;
 use crate::server::AppState;
 use crate::tools::ToolRegistry;
+use echo_system_types::llm::{
+    ContentBlock, LlmResponse, LlmResult, LmProvider, Message, StopReason,
+};
 
 // ---------------------------------------------------------------------------
 // Mock LLM Provider
@@ -105,6 +108,7 @@ fn test_config() -> Config {
         scheduler: SchedulerConfig::default(),
         pipeline: PipelineConfig::default(),
         monitoring: MonitoringConfig::default(),
+        autonomy: AutonomyConfig::default(),
         plugins: HashMap::new(),
     }
 }
@@ -127,6 +131,7 @@ fn build_state(provider: MockProvider, tools: ToolRegistry) -> Arc<AppState> {
         conversation: RwLock::new(Vec::new()),
         system_prompt: RwLock::new("You are a test entity.".to_string()),
         tools,
+        event_bus: Arc::new(EventBus::new(16)),
     })
 }
 

@@ -59,11 +59,12 @@ mod tests {
 
     use super::*;
     use crate::config::{
-        Config, EntityConfig, LlmConfig, MemoryConfig, MonitoringConfig, PipelineConfig,
-        SchedulerConfig, SecurityConfig, ServerConfig, TrustConfig,
+        AutonomyConfig, Config, EntityConfig, LlmConfig, MemoryConfig, MonitoringConfig,
+        PipelineConfig, SchedulerConfig, SecurityConfig, ServerConfig, TrustConfig,
     };
-    use crate::llm::Message;
+    use crate::events::EventBus;
     use crate::tools::ToolRegistry;
+    use echo_system_types::llm::Message;
 
     fn test_state(secret: Option<String>) -> Arc<AppState> {
         Arc::new(AppState {
@@ -89,15 +90,17 @@ mod tests {
                 scheduler: SchedulerConfig::default(),
                 pipeline: PipelineConfig::default(),
                 monitoring: MonitoringConfig::default(),
+                autonomy: AutonomyConfig::default(),
                 plugins: std::collections::HashMap::new(),
             },
-            provider: Box::new(crate::llm::claude_api::ClaudeProvider::new(
+            provider: Box::new(crate::claude_provider::ClaudeProvider::new(
                 "fake".into(),
                 "test".into(),
             )),
             conversation: RwLock::new(Vec::<Message>::new()),
             system_prompt: RwLock::new(String::new()),
             tools: ToolRegistry::new(),
+            event_bus: Arc::new(EventBus::new(16)),
         })
     }
 

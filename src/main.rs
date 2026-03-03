@@ -1,12 +1,10 @@
 use clap::{Parser, Subcommand};
 
+mod claude_provider;
 mod cli;
 mod config;
+mod events;
 mod init;
-mod llm;
-mod memory;
-mod monitoring;
-mod pipeline;
 mod plugins;
 mod scheduler;
 mod server;
@@ -54,6 +52,11 @@ enum Commands {
     Plugin {
         #[command(subcommand)]
         action: PluginAction,
+    },
+    /// Manage the intent queue
+    Intent {
+        #[command(subcommand)]
+        action: IntentAction,
     },
 }
 
@@ -111,6 +114,30 @@ enum PluginAction {
         /// Plugin name
         name: String,
     },
+}
+
+#[derive(Subcommand)]
+enum IntentAction {
+    /// List queued intents
+    List,
+    /// Add a one-shot intent to the queue
+    Add {
+        /// Description of the intent
+        description: String,
+        /// Prompt to send to the LLM
+        #[arg(long)]
+        prompt: String,
+        /// Priority: low, normal, high, urgent
+        #[arg(long, default_value = "normal")]
+        priority: String,
+    },
+    /// Remove an intent from the queue
+    Remove {
+        /// Intent ID
+        id: String,
+    },
+    /// Clear all pending intents
+    Clear,
 }
 
 #[derive(Subcommand)]
@@ -204,6 +231,22 @@ async fn main() {
                 PluginAction::List => cli::plugin::list().await,
                 PluginAction::Add { name } => cli::plugin::add(name).await,
                 PluginAction::Remove { name } => cli::plugin::remove(name).await,
+            };
+            if let Err(e) = result {
+                eprintln!("Error: {e}");
+                std::process::exit(1);
+            }
+        }
+        Commands::Intent { action } => {
+            let result = match action {
+                IntentAction::List => cli::intent::list().await,
+                IntentAction::Add {
+                    description,
+                    prompt,
+                    priority,
+                } => cli::intent::add(description, prompt, priority).await,
+                IntentAction::Remove { id } => cli::intent::remove(id).await,
+                IntentAction::Clear => cli::intent::clear().await,
             };
             if let Err(e) = result {
                 eprintln!("Error: {e}");

@@ -1,63 +1,47 @@
 pub mod manager;
 pub mod registry;
 
+// Core modules (always included)
+pub mod bridge_echo;
+pub mod chat_echo;
+pub mod praxis_echo;
+pub mod recall_echo;
+pub mod vigil_echo;
+
+// Optional plugins (feature-gated)
+#[cfg(feature = "discord")]
+pub mod discord_echo;
+#[cfg(feature = "voice")]
+pub mod voice_echo;
+
 use std::future::Future;
 use std::path::PathBuf;
 use std::pin::Pin;
 use std::sync::Arc;
 
-use crate::llm::LmProvider;
 use crate::scheduler::ScheduledTask;
+use echo_system_types::llm::LmProvider;
+
+// Re-export shared types from echo-system-types.
+// HealthStatus is aliased as PluginHealth to preserve existing API.
+pub use echo_system_types::HealthStatus as PluginHealth;
+pub use echo_system_types::{PluginMeta, SetupPrompt};
 
 /// Error type alias for plugin operations
 pub type PluginResult<'a> =
     Pin<Box<dyn Future<Output = Result<(), Box<dyn std::error::Error + Send + Sync>>> + Send + 'a>>;
 
 /// Context passed to plugins during initialization
+#[allow(dead_code)]
 pub struct PluginContext {
     pub entity_root: PathBuf,
     pub entity_name: String,
     pub provider: Arc<Box<dyn LmProvider>>,
 }
 
-/// Plugin health status
-#[derive(Debug, Clone)]
-pub enum PluginHealth {
-    Healthy,
-    Degraded(String),
-    Down(String),
-}
-
-impl std::fmt::Display for PluginHealth {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Healthy => write!(f, "healthy"),
-            Self::Degraded(msg) => write!(f, "degraded: {}", msg),
-            Self::Down(msg) => write!(f, "down: {}", msg),
-        }
-    }
-}
-
-/// Plugin metadata
-#[derive(Debug, Clone)]
-pub struct PluginMeta {
-    pub name: String,
-    pub version: String,
-    pub description: String,
-}
-
-/// Setup prompt for plugin configuration wizard
-#[derive(Debug, Clone)]
-pub struct SetupPrompt {
-    pub key: String,
-    pub question: String,
-    pub default: Option<String>,
-    pub required: bool,
-    pub secret: bool,
-}
-
 /// The Plugin trait — dyn-compatible, no async_trait dependency.
 /// Uses the same Pin<Box<dyn Future>> pattern as LmProvider.
+#[allow(dead_code)]
 pub trait Plugin: Send + Sync {
     /// Plugin identity
     fn meta(&self) -> PluginMeta;

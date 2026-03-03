@@ -1,7 +1,7 @@
 use std::path::Path;
 
 use console::style;
-use dialoguer::{Input, Select};
+use dialoguer::{Input, MultiSelect, Password, Select};
 
 use super::templates;
 
@@ -114,6 +114,9 @@ pub async fn run(target_dir: &Path) -> Result<(), Box<dyn std::error::Error>> {
         "UTC".to_string()
     };
 
+    // Plugin selection
+    let plugin_configs = collect_plugin_configs()?;
+
     println!();
     println!(
         "  Creating entity \"{}\"...",
@@ -142,6 +145,7 @@ pub async fn run(target_dir: &Path) -> Result<(), Box<dyn std::error::Error>> {
         api_key,
         port,
         timezone: timezone.clone(),
+        plugins: plugin_configs,
     };
 
     // Write all files
@@ -218,8 +222,8 @@ pub async fn run(target_dir: &Path) -> Result<(), Box<dyn std::error::Error>> {
         .green()
     );
     println!(
-        "  Add plugins with: {}",
-        style("echo-system plugin add <name>").green()
+        "  Manage plugins with: {}",
+        style("echo-system plugin add|remove <name>").green()
     );
     println!();
 
@@ -248,6 +252,100 @@ fn create_directory_structure(dir: &Path) -> Result<(), Box<dyn std::error::Erro
     }
 
     Ok(())
+}
+
+type PluginConfigs = Vec<(String, Vec<(String, String)>)>;
+
+fn collect_plugin_configs() -> Result<PluginConfigs, Box<dyn std::error::Error>> {
+    use crate::plugins::registry;
+
+    let available: Vec<_> = registry::known_plugins()
+        .into_iter()
+        .filter(|p| p.available)
+        .collect();
+
+    if available.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    println!();
+    println!("  {}", style("Plugins (optional).").bold());
+    println!();
+
+    let labels: Vec<String> = available
+        .iter()
+        .map(|p| format!("{} — {}", p.name, p.description))
+        .collect();
+
+    let selected = MultiSelect::new()
+        .with_prompt("  Select plugins to enable (space to toggle, enter to confirm)")
+        .items(&labels)
+        .interact()?;
+
+    if selected.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let mut plugin_configs = Vec::new();
+
+    for &idx in &selected {
+        let entry = &available[idx];
+        let plugin = match registry::create_plugin(&entry.name) {
+            Some(p) => p,
+            None => continue,
+        };
+
+        let prompts = plugin.setup_prompts();
+        if prompts.is_empty() {
+            // Plugin has no config — just enable it with empty table
+            plugin_configs.push((entry.name.clone(), Vec::new()));
+            continue;
+        }
+
+        println!();
+        println!("  Configuring {}...", style(&entry.name).cyan());
+
+        let mut config_pairs = Vec::new();
+
+        for prompt in &prompts {
+            let value = if prompt.secret {
+                if prompt.required {
+                    Password::new()
+                        .with_prompt(format!("  {}", prompt.question))
+                        .interact()?
+                } else {
+                    Password::new()
+                        .with_prompt(format!("  {} (optional)", prompt.question))
+                        .allow_empty_password(true)
+                        .interact()?
+                }
+            } else if let Some(ref default) = prompt.default {
+                Input::<String>::new()
+                    .with_prompt(format!("  {}", prompt.question))
+                    .default(default.clone())
+                    .allow_empty(!prompt.required)
+                    .interact_text()?
+            } else if prompt.required {
+                Input::<String>::new()
+                    .with_prompt(format!("  {}", prompt.question))
+                    .interact_text()?
+            } else {
+                Input::<String>::new()
+                    .with_prompt(format!("  {} (optional)", prompt.question))
+                    .allow_empty(true)
+                    .interact_text()?
+            };
+
+            // Skip empty optional values
+            if !value.is_empty() {
+                config_pairs.push((prompt.key.clone(), value));
+            }
+        }
+
+        plugin_configs.push((entry.name.clone(), config_pairs));
+    }
+
+    Ok(plugin_configs)
 }
 
 fn read_multiline(prompt: &str) -> Result<Vec<String>, Box<dyn std::error::Error>> {

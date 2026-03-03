@@ -1,7 +1,7 @@
 use console::style;
+use praxis_echo::runtime::{self, ThresholdStatus};
 
 use crate::config::Config;
-use crate::pipeline::health::{self, ThresholdStatus};
 
 pub async fn health_cmd() -> Result<(), Box<dyn std::error::Error>> {
     let config = Config::load()?;
@@ -12,8 +12,9 @@ pub async fn health_cmd() -> Result<(), Box<dyn std::error::Error>> {
         return Ok(());
     }
 
-    let pipeline_health = health::calculate(&root_dir, &config.pipeline);
-    let state = crate::pipeline::PipelineState::load(&root_dir);
+    let thresholds = config.pipeline.to_thresholds();
+    let pipeline_health = runtime::calculate(&root_dir, &thresholds);
+    let state = runtime::PipelineState::load(&root_dir);
 
     println!();
     println!("  {}", style("Pipeline Health").bold());
@@ -42,7 +43,7 @@ pub async fn health_cmd() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-fn print_doc_status(name: &str, doc: &health::DocumentHealth) {
+fn print_doc_status(name: &str, doc: &runtime::DocumentHealth) {
     let status_color = match doc.status {
         ThresholdStatus::Green => style(format!("{}/{}", doc.count, doc.hard)).green(),
         ThresholdStatus::Yellow => style(format!("{}/{}", doc.count, doc.hard)).yellow(),
