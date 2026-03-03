@@ -970,7 +970,7 @@ dependencies = [
 
 [[package]]
 name = "echo-system"
-version = "0.5.2"
+version = "0.6.0"
 dependencies = [
  "axum",
  "bridge-echo",
@@ -2947,7 +2947,7 @@ dependencies = [
 [[package]]
 name = "pulse-echo"
 version = "0.1.0"
-source = "git+https://github.com/dnacenta/pulse-echo?branch=development#e09a608a316761ac8efe3b57312e4cdceadb45d5"
+source = "git+https://github.com/dnacenta/pulse-echo?tag=v0.1.0#1c1c2e84e123d15f64069b0ef91fd2e34aac21b8"
 dependencies = [
  "chrono",
  "dirs",
