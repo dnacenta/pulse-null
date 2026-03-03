@@ -166,7 +166,7 @@ mod tests {
     use super::*;
     use crate::config::{
         AutonomyConfig, Config, EntityConfig, LlmConfig, MemoryConfig, MonitoringConfig,
-        PipelineConfig, SchedulerConfig, SecurityConfig, ServerConfig, TrustConfig,
+        PipelineConfig, PulseConfig, SchedulerConfig, SecurityConfig, ServerConfig, TrustConfig,
     };
 
     fn test_config() -> Config {
@@ -196,6 +196,7 @@ mod tests {
             pipeline: PipelineConfig::default(),
             monitoring: MonitoringConfig::default(),
             autonomy: AutonomyConfig::default(),
+            pulse: PulseConfig::default(),
             plugins: std::collections::HashMap::new(),
         }
     }
