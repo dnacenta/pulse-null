@@ -1,10 +1,10 @@
 use clap::{Parser, Subcommand};
 
+mod claude_provider;
 mod cli;
 mod config;
 mod events;
 mod init;
-mod llm;
 mod plugins;
 mod scheduler;
 mod server;

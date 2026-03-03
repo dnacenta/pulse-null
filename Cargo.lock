@@ -97,7 +97,7 @@ version = "1.1.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "40c48f72fd53cd289104fc64099abca73db4166ad86ea0b4341abe65af83dadc"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
@@ -108,7 +108,7 @@ checksum = "291e6a250ff86cd4a820112fb8898808a366d8f9f58ce16d1f538353ad55747d"
 dependencies = [
  "anstyle",
  "once_cell_polyfill",
- "windows-sys 0.61.2",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
@@ -306,7 +306,7 @@ version = "0.2.0"
 source = "git+https://github.com/dnacenta/bridge-echo?branch=development#6d5e3e205c8285614a98658ff44665bb573d1a88"
 dependencies = [
  "axum",
- "echo-system-types",
+ "echo-system-types 0.1.0",
  "regex",
  "reqwest",
  "serde",
@@ -408,7 +408,7 @@ version = "0.1.0"
 source = "git+https://github.com/dnacenta/chat-echo?branch=development#a6cc9075f3fe26238794342aba866f88e4071293"
 dependencies = [
  "axum",
- "echo-system-types",
+ "echo-system-types 0.1.0",
  "futures-util",
  "reqwest",
  "serde",
@@ -899,7 +899,7 @@ dependencies = [
  "libc",
  "option-ext",
  "redox_users",
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -910,7 +910,7 @@ dependencies = [
  "async-trait",
  "base64",
  "dotenvy",
- "echo-system-types",
+ "echo-system-types 0.1.0",
  "futures-util",
  "hound",
  "rubato 1.0.1",
@@ -982,7 +982,7 @@ dependencies = [
  "cron",
  "dialoguer",
  "discord-voice-echo",
- "echo-system-types",
+ "echo-system-types 0.2.0",
  "globset",
  "praxis-echo",
  "recall-echo",
@@ -1008,6 +1008,15 @@ version = "0.1.0"
 source = "git+https://github.com/dnacenta/echo-system-types?tag=v0.1.0#febdf25f02fc1a470fe412ccc2d2f40e5356f888"
 dependencies = [
  "serde",
+]
+
+[[package]]
+name = "echo-system-types"
+version = "0.2.0"
+source = "git+https://github.com/dnacenta/echo-system-types?tag=v0.2.0#acbadc847e4af646025d67b968330c07083a0d96"
+dependencies = [
+ "serde",
+ "serde_json",
 ]
 
 [[package]]
@@ -1090,7 +1099,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -2373,7 +2382,7 @@ version = "0.50.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7957b9740744892f114936ab4a57b3f487491bbeafaf8083688b16841a4240e5"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -2874,11 +2883,11 @@ dependencies = [
 [[package]]
 name = "praxis-echo"
 version = "0.1.0"
-source = "git+https://github.com/dnacenta/praxis-echo?branch=feat/PE-7-runtime-module#40abbdb5e23a8bbebd119603af0336fa4a4185ce"
+source = "git+https://github.com/dnacenta/praxis-echo?branch=development#b20eeecae382f1aa4e8ecb7c1b922baf4f965357"
 dependencies = [
  "clap",
  "dirs",
- "echo-system-types",
+ "echo-system-types 0.1.0",
  "serde",
  "serde_json",
 ]
@@ -3107,7 +3116,7 @@ source = "git+https://github.com/dnacenta/recall-echo?branch=development#a5a47b0
 dependencies = [
  "clap",
  "dirs",
- "echo-system-types",
+ "echo-system-types 0.1.0",
  "serde_json",
 ]
 
@@ -3340,7 +3349,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -4155,7 +4164,7 @@ dependencies = [
  "getrandom 0.4.1",
  "once_cell",
  "rustix",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -4873,11 +4882,11 @@ checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
 [[package]]
 name = "vigil-echo"
 version = "0.1.0"
-source = "git+https://github.com/dnacenta/vigil-echo?branch=feat/VIG-9-runtime-module#bd53efcddbe52a7b211b893ec637e48475467009"
+source = "git+https://github.com/dnacenta/vigil-echo?branch=development#f1bca649109391de7546b7375988c30366dcd7d6"
 dependencies = [
  "clap",
  "dirs",
- "echo-system-types",
+ "echo-system-types 0.1.0",
  "owo-colors",
  "serde",
  "serde_json",
@@ -4905,7 +4914,7 @@ dependencies = [
  "bytes",
  "chrono",
  "dotenvy",
- "echo-system-types",
+ "echo-system-types 0.1.0",
  "hound",
  "rand 0.8.5",
  "reqwest",
@@ -5149,7 +5158,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]

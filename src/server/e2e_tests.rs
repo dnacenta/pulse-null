@@ -17,10 +17,12 @@ use crate::config::{
     PipelineConfig, SchedulerConfig, SecurityConfig, ServerConfig, TrustConfig,
 };
 use crate::events::EventBus;
-use crate::llm::{ContentBlock, LlmResponse, LlmResult, LmProvider, Message, StopReason};
 use crate::server::handlers;
 use crate::server::AppState;
 use crate::tools::ToolRegistry;
+use echo_system_types::llm::{
+    ContentBlock, LlmResponse, LlmResult, LmProvider, Message, StopReason,
+};
 
 // ---------------------------------------------------------------------------
 // Mock LLM Provider

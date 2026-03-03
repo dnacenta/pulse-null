@@ -158,7 +158,7 @@ async fn execute_task(
         }
     } else {
         // Legacy path: no tools
-        use crate::llm::{Message, MessageContent, Role};
+        use echo_system_types::llm::{Message, MessageContent, Role};
         let messages = vec![Message {
             role: Role::User,
             content: MessageContent::Text(user_message),

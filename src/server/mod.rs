@@ -14,14 +14,14 @@ use axum::routing::{get, post};
 use axum::Router;
 use tokio::sync::RwLock;
 
+use crate::claude_provider::ClaudeProvider;
 use crate::config::Config;
 use crate::events::EventBus;
-use crate::llm::claude_api::ClaudeProvider;
-use crate::llm::{LmProvider, Message};
 use crate::plugins::manager::PluginManager;
 use crate::scheduler::intent::IntentQueue;
 use crate::scheduler::Schedule;
 use crate::tools::ToolRegistry;
+use echo_system_types::llm::{LmProvider, Message};
 
 /// Shared application state
 pub struct AppState {

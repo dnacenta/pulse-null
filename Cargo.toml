@@ -53,11 +53,11 @@ uuid = { version = "1", features = ["v4"] }
 chrono = { version = "0.4", features = ["serde"] }
 
 # Shared types
-echo-system-types = { git = "https://github.com/dnacenta/echo-system-types", tag = "v0.1.0" }
+echo-system-types = { git = "https://github.com/dnacenta/echo-system-types", tag = "v0.2.0" }
 
 # Core dependencies (runtime modules used by scheduler/server)
-vigil-echo = { git = "https://github.com/dnacenta/vigil-echo", branch = "feat/VIG-9-runtime-module" }
-praxis-echo = { git = "https://github.com/dnacenta/praxis-echo", branch = "feat/PE-7-runtime-module" }
+vigil-echo = { git = "https://github.com/dnacenta/vigil-echo", branch = "development" }
+praxis-echo = { git = "https://github.com/dnacenta/praxis-echo", branch = "development" }
 
 # Plugins (optional)
 voice-echo = { git = "https://github.com/dnacenta/voice-echo", branch = "development", optional = true }

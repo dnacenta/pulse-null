@@ -160,7 +160,7 @@ mod tests {
 }
 
 #[cfg(test)]
-use crate::llm::{LlmResult, LmProvider, Message};
+use echo_system_types::llm::{LlmResult, LmProvider, Message};
 
 #[cfg(test)]
 struct MockProvider;
@@ -175,9 +175,9 @@ impl LmProvider for MockProvider {
         _: Option<&[serde_json::Value]>,
     ) -> LlmResult<'_> {
         Box::pin(async {
-            Ok(crate::llm::LlmResponse {
+            Ok(echo_system_types::llm::LlmResponse {
                 content: vec![],
-                stop_reason: crate::llm::StopReason::EndTurn,
+                stop_reason: echo_system_types::llm::StopReason::EndTurn,
                 model: "mock".to_string(),
                 input_tokens: None,
                 output_tokens: None,

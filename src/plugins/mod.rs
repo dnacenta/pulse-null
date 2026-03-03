@@ -21,8 +21,8 @@ use std::path::PathBuf;
 use std::pin::Pin;
 use std::sync::Arc;
 
-use crate::llm::LmProvider;
 use crate::scheduler::ScheduledTask;
+use echo_system_types::llm::LmProvider;
 
 // Re-export shared types from echo-system-types.
 // HealthStatus is aliased as PluginHealth to preserve existing API.
