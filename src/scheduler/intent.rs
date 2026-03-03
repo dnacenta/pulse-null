@@ -615,6 +615,23 @@ async fn execute_intent(
     // Log to LOGBOOK.md
     log_intent_execution(&root_dir, intent, &parsed.clean_content);
 
+    // Record outcome for pulse-echo
+    if state.config.pulse.enabled {
+        let outcome = pulse_echo::runtime::build_outcome(
+            &intent.id,
+            &intent.description,
+            &parsed.clean_content,
+            result.tool_rounds_used,
+            result.total_input_tokens,
+            result.total_output_tokens,
+        );
+        if let Err(e) =
+            pulse_echo::runtime::record_outcome(&root_dir, outcome, state.config.pulse.max_outcomes)
+        {
+            tracing::error!("Failed to record outcome for intent '{}': {}", intent.id, e);
+        }
+    }
+
     // Extract cognitive signals and check for health changes
     if state.config.monitoring.enabled {
         let window = state.config.monitoring.window_size;

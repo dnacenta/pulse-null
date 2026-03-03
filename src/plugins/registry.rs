@@ -49,6 +49,12 @@ pub fn known_plugins() -> Vec<RegistryEntry> {
             available: true,
         },
         RegistryEntry {
+            name: "pulse-echo".to_string(),
+            description: "Operational self-model and outcome tracking".to_string(),
+            version: "0.1.0".to_string(),
+            available: true,
+        },
+        RegistryEntry {
             name: "vigil-echo".to_string(),
             description: "Metacognitive monitoring and signal tracking".to_string(),
             version: "0.1.0".to_string(),
@@ -71,6 +77,7 @@ pub fn create_plugin(name: &str) -> Option<Box<dyn Plugin>> {
         "bridge-echo" => Some(Box::new(super::bridge_echo::BridgeEchoPlugin::new())),
         "recall-echo" => Some(Box::new(super::recall_echo::RecallEchoPlugin::new())),
         "praxis-echo" => Some(Box::new(super::praxis_echo::PraxisEchoPlugin::new())),
+        "pulse-echo" => Some(Box::new(super::pulse_echo::PulseEchoPlugin::new())),
         "vigil-echo" => Some(Box::new(super::vigil_echo::VigilEchoPlugin::new())),
         // Optional plugins (feature-gated)
         #[cfg(feature = "voice")]
@@ -118,6 +125,7 @@ mod tests {
         assert!(names.contains(&"bridge-echo"));
         assert!(names.contains(&"recall-echo"));
         assert!(names.contains(&"praxis-echo"));
+        assert!(names.contains(&"pulse-echo"));
         assert!(names.contains(&"vigil-echo"));
     }
 

@@ -26,6 +26,8 @@ pub struct Config {
     #[serde(default)]
     pub autonomy: AutonomyConfig,
     #[serde(default)]
+    pub pulse: PulseConfig,
+    #[serde(default)]
     pub plugins: HashMap<String, toml::Value>,
 }
 
@@ -351,6 +353,25 @@ impl Default for EventsConfig {
             pipeline_alert: true,
             pipeline_frozen: true,
             cognitive_decline: true,
+        }
+    }
+}
+
+/// Configuration for pulse-echo outcome tracking
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct PulseConfig {
+    /// Enable outcome recording after task/intent execution
+    pub enabled: bool,
+    /// Maximum outcomes to keep (rolling window)
+    pub max_outcomes: usize,
+}
+
+impl Default for PulseConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            max_outcomes: 200,
         }
     }
 }

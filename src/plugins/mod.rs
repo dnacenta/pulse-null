@@ -5,6 +5,7 @@ pub mod registry;
 pub mod bridge_echo;
 pub mod chat_echo;
 pub mod praxis_echo;
+pub mod pulse_echo;
 pub mod recall_echo;
 pub mod vigil_echo;
 
