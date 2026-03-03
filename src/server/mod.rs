@@ -76,6 +76,12 @@ pub async fn start(config: Config) -> Result<(), Box<dyn std::error::Error>> {
             .await?;
         plugin_manager.start_all().await?;
         tracing::info!("{} plugin(s) started", plugin_manager.count());
+
+        // Collect plugin-contributed tools
+        for tool in plugin_manager.collect_tools() {
+            tracing::info!("Registered plugin tool: {}", tool.name());
+            tools.register(tool);
+        }
     }
 
     // Create event bus
