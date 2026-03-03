@@ -16,7 +16,7 @@ pub fn known_plugins() -> Vec<RegistryEntry> {
             name: "voice-echo".to_string(),
             description: "Phone calls via Twilio (STT + TTS + voice pipeline)".to_string(),
             version: "0.1.0".to_string(),
-            available: false, // Not yet implemented
+            available: cfg!(feature = "voice"),
         },
         RegistryEntry {
             name: "discord-echo".to_string(),
@@ -41,12 +41,14 @@ pub fn find_plugin(name: &str) -> Option<RegistryEntry> {
 /// Factory function: create a plugin instance by name.
 /// Returns None if the plugin is not known or not yet implemented.
 pub fn create_plugin(name: &str) -> Option<Box<dyn Plugin>> {
-    // Plugins will be added here as they're implemented:
-    // "voice-echo" => Some(Box::new(voice_echo::VoiceEchoPlugin::new())),
-    // "discord-echo" => Some(Box::new(discord_echo::DiscordEchoPlugin::new())),
-    let _ = name; // suppress unused warning when no plugins exist
-    tracing::debug!("Plugin '{}' is not yet available", name);
-    None
+    match name {
+        #[cfg(feature = "voice")]
+        "voice-echo" => Some(Box::new(super::voice_echo::VoiceEchoPlugin::new())),
+        _ => {
+            tracing::debug!("Plugin '{}' is not available", name);
+            None
+        }
+    }
 }
 
 #[cfg(test)]
@@ -74,15 +76,25 @@ mod tests {
     }
 
     #[test]
-    fn test_create_plugin_not_available() {
-        // Known plugins exist but aren't implemented yet
+    fn test_create_voice_echo_plugin() {
         let plugin = create_plugin("voice-echo");
-        assert!(plugin.is_none());
+        if cfg!(feature = "voice") {
+            assert!(plugin.is_some());
+            assert_eq!(plugin.unwrap().meta().name, "voice-echo");
+        } else {
+            assert!(plugin.is_none());
+        }
     }
 
     #[test]
     fn test_create_unknown_plugin() {
         let plugin = create_plugin("totally-unknown");
         assert!(plugin.is_none());
+    }
+
+    #[test]
+    fn test_voice_echo_availability_matches_feature() {
+        let entry = find_plugin("voice-echo").unwrap();
+        assert_eq!(entry.available, cfg!(feature = "voice"));
     }
 }
