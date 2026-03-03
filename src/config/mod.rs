@@ -234,6 +234,24 @@ pub struct PipelineConfig {
     pub freeze_threshold: u32,
 }
 
+impl PipelineConfig {
+    /// Convert to praxis-echo runtime thresholds.
+    pub fn to_thresholds(&self) -> praxis_echo::runtime::Thresholds {
+        praxis_echo::runtime::Thresholds {
+            learning_soft: self.learning_soft,
+            learning_hard: self.learning_hard,
+            thoughts_soft: self.thoughts_soft,
+            thoughts_hard: self.thoughts_hard,
+            curiosity_soft: self.curiosity_soft,
+            curiosity_hard: self.curiosity_hard,
+            reflections_soft: self.reflections_soft,
+            reflections_hard: self.reflections_hard,
+            praxis_soft: self.praxis_soft,
+            praxis_hard: self.praxis_hard,
+        }
+    }
+}
+
 impl Default for PipelineConfig {
     fn default() -> Self {
         Self {

@@ -5,8 +5,6 @@ mod config;
 mod events;
 mod init;
 mod llm;
-mod monitoring;
-mod pipeline;
 mod plugins;
 mod scheduler;
 mod server;
