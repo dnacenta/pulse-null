@@ -1,6 +1,6 @@
 [package]
 name = "echo-system"
-version = "0.5.1"
+version = "0.5.2"
 edition = "2021"
 rust-version = "1.80"
 license = "AGPL-3.0-only"
@@ -58,7 +58,7 @@ echo-system-types = { git = "https://github.com/dnacenta/echo-system-types", tag
 # Core dependencies (always included — these define an entity)
 vigil-echo = { git = "https://github.com/dnacenta/vigil-echo", branch = "development" }
 praxis-echo = { git = "https://github.com/dnacenta/praxis-echo", branch = "development" }
-chat-echo = { git = "https://github.com/dnacenta/chat-echo", branch = "development" }
+chat-echo = { git = "https://github.com/dnacenta/chat-echo", tag = "v0.1.1" }
 bridge-echo = { git = "https://github.com/dnacenta/bridge-echo", branch = "development" }
 recall-echo = { git = "https://github.com/dnacenta/recall-echo", branch = "development" }
 
