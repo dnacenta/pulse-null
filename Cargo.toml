@@ -1,6 +1,6 @@
 [package]
 name = "echo-system"
-version = "0.6.0"
+version = "0.7.0"
 edition = "2021"
 rust-version = "1.80"
 license = "AGPL-3.0-only"
@@ -66,12 +66,14 @@ pulse-echo = { git = "https://github.com/dnacenta/pulse-echo", tag = "v0.1.0" }
 # Plugins (optional — different interfaces to speak through)
 voice-echo = { git = "https://github.com/dnacenta/voice-echo", branch = "development", optional = true }
 discord-voice-echo = { git = "https://github.com/dnacenta/discord-voice-echo", branch = "development", optional = true }
+discord-echo = { git = "https://github.com/dnacenta/discord-echo", tag = "v0.1.0", optional = true }
 
 [features]
 default = []
 voice = ["dep:voice-echo"]
 discord = ["dep:discord-voice-echo", "voice"]
-all-plugins = ["voice", "discord"]
+discord-text = ["dep:discord-echo"]
+all-plugins = ["voice", "discord", "discord-text"]
 
 [dev-dependencies]
 tempfile = "3"

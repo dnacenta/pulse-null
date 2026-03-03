@@ -12,6 +12,8 @@ pub mod vigil_echo;
 // Optional plugins (feature-gated)
 #[cfg(feature = "discord")]
 pub mod discord_echo;
+#[cfg(feature = "discord-text")]
+pub mod discord_text_echo;
 #[cfg(feature = "voice")]
 pub mod voice_echo;
 
@@ -71,6 +73,12 @@ pub trait Plugin: Send + Sync {
 
     /// Optional: setup wizard prompts for first-time configuration
     fn setup_prompts(&self) -> Vec<SetupPrompt> {
+        Vec::new()
+    }
+
+    /// Optional: contribute tools to the entity's tool registry.
+    /// Called after init(), tools are registered before AppState is constructed.
+    fn tools(&self) -> Vec<Box<dyn crate::tools::Tool>> {
         Vec::new()
     }
 }
