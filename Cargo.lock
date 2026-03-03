@@ -970,7 +970,7 @@ dependencies = [
 
 [[package]]
 name = "echo-system"
-version = "0.5.2"
+version = "0.6.0"
 dependencies = [
  "axum",
  "bridge-echo",
@@ -985,6 +985,7 @@ dependencies = [
  "echo-system-types",
  "globset",
  "praxis-echo",
+ "pulse-echo",
  "recall-echo",
  "regex",
  "reqwest",
@@ -2941,6 +2942,18 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8fd00f0bb2e90d81d1044c2b32617f68fcb9fa3bb7640c23e9c748e53fb30934"
 dependencies = [
  "unicode-ident",
+]
+
+[[package]]
+name = "pulse-echo"
+version = "0.1.0"
+source = "git+https://github.com/dnacenta/pulse-echo?tag=v0.1.0#1c1c2e84e123d15f64069b0ef91fd2e34aac21b8"
+dependencies = [
+ "chrono",
+ "dirs",
+ "echo-system-types",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]
