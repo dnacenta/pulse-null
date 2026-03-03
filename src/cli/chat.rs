@@ -18,13 +18,17 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
     );
 
     let mut chat = chat_echo::ChatEcho::new(chat_config);
-    chat.start().await.map_err(|e| format!("chat-echo failed to start: {e}"))?;
+    chat.start()
+        .await
+        .map_err(|e| format!("chat-echo failed to start: {e}"))?;
 
     // Wait for Ctrl+C
     tokio::signal::ctrl_c().await?;
 
     tracing::info!("Shutting down chat UI...");
-    chat.stop().await.map_err(|e| format!("chat-echo failed to stop: {e}"))?;
+    chat.stop()
+        .await
+        .map_err(|e| format!("chat-echo failed to stop: {e}"))?;
 
     Ok(())
 }
@@ -40,10 +44,7 @@ fn build_chat_config(config: &Config) -> chat_echo::config::Config {
                     .and_then(|v| v.as_str())
                     .unwrap_or("127.0.0.1")
                     .to_string(),
-                port: t
-                    .get("port")
-                    .and_then(|v| v.as_integer())
-                    .unwrap_or(8080) as u16,
+                port: t.get("port").and_then(|v| v.as_integer()).unwrap_or(8080) as u16,
                 bridge_url: t
                     .get("bridge_url")
                     .and_then(|v| v.as_str())
