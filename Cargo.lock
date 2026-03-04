@@ -2953,6 +2953,7 @@ dependencies = [
  "discord-voice-echo",
  "echo-system-types",
  "globset",
+ "libc",
  "praxis-echo",
  "pulse-echo",
  "recall-echo",

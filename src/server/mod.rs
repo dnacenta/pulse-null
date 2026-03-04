@@ -17,6 +17,7 @@ use tokio::sync::RwLock;
 use crate::claude_provider::ClaudeProvider;
 use crate::config::Config;
 use crate::events::EventBus;
+use crate::pidfile;
 use crate::plugins::manager::PluginManager;
 use crate::scheduler::intent::IntentQueue;
 use crate::scheduler::Schedule;
@@ -151,9 +152,24 @@ pub async fn start(config: Config) -> Result<(), Box<dyn std::error::Error>> {
     let addr = format!("{}:{}", config.server.host, config.server.port);
     let listener = tokio::net::TcpListener::bind(&addr).await?;
 
+    // Write PID file so `pulse-null down` can find us
+    pidfile::write(&root_dir)?;
     tracing::info!("Listening on {}", addr);
 
-    axum::serve(listener, app).await?;
+    // Graceful shutdown on SIGTERM or SIGINT
+    let shutdown = async {
+        let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+            .expect("failed to install SIGTERM handler");
+        let sigint = tokio::signal::ctrl_c();
+        tokio::select! {
+            _ = sigterm.recv() => tracing::info!("Received SIGTERM"),
+            _ = sigint => tracing::info!("Received SIGINT"),
+        }
+    };
+
+    axum::serve(listener, app)
+        .with_graceful_shutdown(shutdown)
+        .await?;
 
     // Clean up plugins on shutdown
     plugin_manager.stop_all().await;
@@ -162,6 +178,10 @@ pub async fn start(config: Config) -> Result<(), Box<dyn std::error::Error>> {
     for handle in scheduler_handles {
         handle.abort();
     }
+
+    // Remove PID file
+    pidfile::remove(&root_dir);
+    tracing::info!("Shutdown complete");
 
     Ok(())
 }
