@@ -38,5 +38,5 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
     chat::banner::render(&config, &root_dir, plugin_count);
 
     // Enter REPL
-    chat::repl::run(&config, &provider, &tools, &system_prompt).await
+    chat::repl::run(&config, &root_dir, &provider, &tools, &system_prompt).await
 }

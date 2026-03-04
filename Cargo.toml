@@ -58,7 +58,7 @@ echo-system-types = { git = "https://github.com/dnacenta/echo-system-types", tag
 # Core dependencies (always included — these define an entity)
 vigil-echo = { git = "https://github.com/dnacenta/vigil-echo", branch = "development" }
 praxis-echo = { git = "https://github.com/dnacenta/praxis-echo", branch = "development" }
-chat-echo = { git = "https://github.com/dnacenta/chat-echo", tag = "v0.2.0" }
+chat-echo = { git = "https://github.com/dnacenta/chat-echo", tag = "v0.2.1" }
 bridge-echo = { git = "https://github.com/dnacenta/bridge-echo", branch = "development" }
 recall-echo = { git = "https://github.com/dnacenta/recall-echo", branch = "development" }
 pulse-echo = { git = "https://github.com/dnacenta/pulse-echo", tag = "v0.1.0" }

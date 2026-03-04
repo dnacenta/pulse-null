@@ -1,7 +1,9 @@
 use std::io::{self, BufRead, Write};
+use std::path::Path;
 
 use echo_system_types::llm::{ContentBlock, LmProvider, Message, MessageContent, Role, StopReason};
 
+use crate::chat;
 use crate::config::Config;
 use crate::tools::ToolRegistry;
 
@@ -11,6 +13,7 @@ const MAX_TOOL_ROUNDS: u32 = 25;
 /// Run the interactive REPL loop.
 pub async fn run(
     config: &Config,
+    root_dir: &Path,
     provider: &dyn LmProvider,
     tools: &ToolRegistry,
     system_prompt: &str,
@@ -18,6 +21,7 @@ pub async fn run(
     let mut conversation: Vec<Message> = Vec::new();
     let stdin = io::stdin();
     let entity_name = &config.entity.name;
+    let plugin_count = config.plugins.len();
 
     loop {
         // Prompt
@@ -41,6 +45,13 @@ pub async fn run(
         // Exit commands
         if matches!(input, "/exit" | "/quit" | "/q") {
             break;
+        }
+
+        // Status command — re-render dashboard
+        if input == "/status" {
+            println!();
+            chat::banner::render(config, root_dir, plugin_count);
+            continue;
         }
 
         // Add user message to conversation
@@ -166,7 +177,66 @@ pub async fn run(
         }
     }
 
+    // Save session to EPHEMERAL.md
+    save_session(root_dir, entity_name, &conversation);
+
     Ok(())
+}
+
+/// Save a brief session summary to EPHEMERAL.md.
+fn save_session(root_dir: &Path, entity_name: &str, conversation: &[Message]) {
+    // Only save if there was actual conversation
+    let message_count = conversation.len();
+    if message_count == 0 {
+        return;
+    }
+
+    let ephemeral_path = root_dir.join("EPHEMERAL.md");
+
+    let now = chrono::Utc::now().format("%Y-%m-%d %H:%M UTC");
+
+    // Collect user messages for the summary
+    let user_messages: Vec<&str> = conversation
+        .iter()
+        .filter_map(|m| {
+            if matches!(m.role, Role::User) {
+                if let MessageContent::Text(ref t) = m.content {
+                    Some(t.as_str())
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
+        })
+        .collect();
+
+    let topics: Vec<&str> = user_messages.iter().take(5).copied().collect();
+
+    let mut content = format!("## CLI Chat Session — {}\n\n", now);
+    content.push_str(&format!(
+        "Conversation with {} ({} messages)\n\n",
+        entity_name, message_count
+    ));
+    content.push_str("### Topics discussed\n\n");
+    for topic in &topics {
+        // Truncate long messages
+        let display = if topic.len() > 80 {
+            format!("{}...", &topic[..77])
+        } else {
+            topic.to_string()
+        };
+        content.push_str(&format!("- {}\n", display));
+    }
+    if user_messages.len() > 5 {
+        content.push_str(&format!("- ...and {} more\n", user_messages.len() - 5));
+    }
+
+    if let Err(e) = std::fs::write(&ephemeral_path, content) {
+        eprintln!("  \x1b[33mwarning\x1b[0m  could not save session: {}", e);
+    } else {
+        println!("  \x1b[2msession saved to EPHEMERAL.md\x1b[0m");
+    }
 }
 
 /// Print a tool execution indicator (dimmed).
