@@ -55,6 +55,9 @@ pub struct LlmConfig {
     pub model: String,
     #[serde(default = "default_max_tokens")]
     pub max_tokens: u32,
+    /// Maximum estimated tokens in conversation before compaction triggers (0 = default 150k).
+    #[serde(default)]
+    pub context_budget: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

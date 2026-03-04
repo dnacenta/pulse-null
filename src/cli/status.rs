@@ -1,7 +1,9 @@
 use crate::config::Config;
+use crate::pidfile;
 
 pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let config = Config::load()?;
+    let root_dir = config.root_dir()?;
 
     println!("Entity: {}", config.entity.name);
     println!(
@@ -26,19 +28,26 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
         );
     }
 
-    // Check if server is running
-    let url = format!(
-        "http://{}:{}/health",
-        config.server.host, config.server.port
-    );
-    match reqwest::get(&url).await {
-        Ok(resp) if resp.status().is_success() => {
-            println!("Status: RUNNING");
+    // Check PID file first, then fall back to health endpoint
+    let status = match pidfile::read(&root_dir) {
+        Some(pid) if pidfile::is_alive(pid) => format!("RUNNING (pid {})", pid),
+        Some(pid) => {
+            pidfile::remove(&root_dir);
+            format!("STOPPED (stale pid {})", pid)
         }
-        _ => {
-            println!("Status: STOPPED");
+        None => {
+            // No PID file — try health endpoint as fallback
+            let url = format!(
+                "http://{}:{}/health",
+                config.server.host, config.server.port
+            );
+            match reqwest::get(&url).await {
+                Ok(resp) if resp.status().is_success() => "RUNNING".to_string(),
+                _ => "STOPPED".to_string(),
+            }
         }
-    }
+    };
 
+    println!("Status: {}", status);
     Ok(())
 }

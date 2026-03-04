@@ -60,6 +60,15 @@ pub async fn run(
             content: MessageContent::Text(input.to_string()),
         });
 
+        // Compact conversation if approaching context budget
+        crate::context::compact_if_needed(
+            &mut conversation,
+            provider,
+            config.llm.context_budget,
+            config.llm.max_tokens,
+        )
+        .await;
+
         // Tool definitions
         let tool_defs = if provider.supports_tools() && !tools.is_empty() {
             Some(tools.definitions())
@@ -168,12 +177,6 @@ pub async fn run(
                     break;
                 }
             }
-        }
-
-        // Keep conversation bounded
-        if conversation.len() > 100 {
-            let drain_count = conversation.len() - 100;
-            conversation.drain(..drain_count);
         }
     }
 
