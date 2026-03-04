@@ -36,7 +36,7 @@ pub struct AppState {
 pub async fn start(config: Config) -> Result<(), Box<dyn std::error::Error>> {
     let api_key = config
         .resolve_api_key()
-        .ok_or("No API key found. Set it in echo-system.toml or ANTHROPIC_API_KEY env var.")?;
+        .ok_or("No API key found. Set it in pulse-null.toml or ANTHROPIC_API_KEY env var.")?;
 
     let provider = Box::new(ClaudeProvider::new(
         api_key.clone(),

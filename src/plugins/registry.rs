@@ -20,7 +20,7 @@ pub fn known_plugins() -> Vec<RegistryEntry> {
         },
         RegistryEntry {
             name: "chat-echo".to_string(),
-            description: "Web chat UI for echo-system".to_string(),
+            description: "Web chat UI for pulse-null".to_string(),
             version: "0.1.0".to_string(),
             available: true,
         },

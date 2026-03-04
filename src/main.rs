@@ -11,7 +11,7 @@ mod server;
 mod tools;
 
 #[derive(Parser)]
-#[command(name = "echo-system")]
+#[command(name = "pulse-null")]
 #[command(about = "One binary. One command. Your own AI entity.")]
 #[command(version)]
 struct Cli {
@@ -162,7 +162,7 @@ async fn main() {
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "echo_system=info".into()),
+                .unwrap_or_else(|_| "pulse_null=info".into()),
         )
         .init();
 
