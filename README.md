@@ -1,25 +1,25 @@
-# echo-system
+# pulse-null
 
-[![License: AGPL-3.0](https://img.shields.io/github/license/dnacenta/echo-system)](LICENSE)
+[![License: AGPL-3.0](https://img.shields.io/github/license/dnacenta/pulse-null)](LICENSE)
 [![Rust](https://img.shields.io/badge/rust-1.80%2B-orange)](https://rustup.rs/)
 
 One binary. One command. Your own AI entity.
 
-`echo-system` is a Rust binary that creates and runs a persistent AI entity with identity, memory, scheduled cognition, and a plugin system. Your entity has its own documents, personality, growth pipeline, and can be extended with plugins for voice, Discord, n8n workflows, and more.
+`pulse-null` is a Rust binary that creates and runs a persistent AI entity with identity, memory, scheduled cognition, and a plugin system. Your entity has its own documents, personality, growth pipeline, and can be extended with plugins for voice, Discord, n8n workflows, and more.
 
 ## Quick Start
 
 ```bash
-git clone https://github.com/dnacenta/echo-system.git
-cd echo-system
+git clone https://github.com/dnacenta/pulse-null.git
+cd pulse-null
 cargo build --release
 
 # Create your entity
-./target/release/echo-system init
+./target/release/pulse-null init
 
 # Start it
 cd <your-entity-name>
-echo-system up
+pulse-null up
 ```
 
 The init wizard walks you through naming your entity, defining its personality, choosing an LLM provider, and configuring the scheduler.
@@ -28,7 +28,7 @@ The init wizard walks you through naming your entity, defining its personality, 
 
 ```
                         ┌──────────────────────────────────────────┐
-                        │            echo-system (axum)            │
+                        │            pulse-null (axum)            │
                         │                                          │
   Browser ◄──► chat-echo ◄──►│  POST /chat ──► Claude API ──► response │
                         │       │         │                        │
@@ -68,11 +68,11 @@ The init wizard walks you through naming your entity, defining its personality, 
 
 ## What Gets Created
 
-When you run `echo-system init`, the wizard creates a complete entity directory:
+When you run `pulse-null init`, the wizard creates a complete entity directory:
 
 ```
 my-entity/
-├── echo-system.toml          # Configuration
+├── pulse-null.toml          # Configuration
 ├── SELF.md                    # Entity identity and values
 ├── CLAUDE.md                  # System instructions for the LLM
 ├── schedule.json              # Scheduled cognitive tasks
@@ -97,7 +97,7 @@ my-entity/
 
 ## Configuration
 
-### echo-system.toml
+### pulse-null.toml
 
 | Section        | Key                      | Default              | Description                                    |
 |----------------|--------------------------|----------------------|------------------------------------------------|
@@ -124,32 +124,32 @@ my-entity/
 | Variable             | Description                           |
 |----------------------|---------------------------------------|
 | `ANTHROPIC_API_KEY`  | Anthropic API key (overrides config)  |
-| `ECHO_SYSTEM_API_KEY`| Alternative API key env var           |
-| `RUST_LOG`           | Log level (e.g. `echo_system=debug`) |
+| `PULSE_NULL_API_KEY`| Alternative API key env var           |
+| `RUST_LOG`           | Log level (e.g. `pulse_null=debug`) |
 
 ## CLI Commands
 
 ```
-echo-system init [--dir <path>]     Create a new entity
-echo-system up                      Start the entity server
-echo-system down                    Stop the entity
-echo-system status                  Show entity status
+pulse-null init [--dir <path>]     Create a new entity
+pulse-null up                      Start the entity server
+pulse-null down                    Stop the entity
+pulse-null status                  Show entity status
 
-echo-system schedule list           List scheduled tasks
-echo-system schedule add            Add a scheduled task
-echo-system schedule remove <id>    Remove a scheduled task
-echo-system schedule enable <id>    Enable a task
-echo-system schedule disable <id>   Disable a task
+pulse-null schedule list           List scheduled tasks
+pulse-null schedule add            Add a scheduled task
+pulse-null schedule remove <id>    Remove a scheduled task
+pulse-null schedule enable <id>    Enable a task
+pulse-null schedule disable <id>   Disable a task
 
-echo-system pipeline health         Document counts and thresholds
-echo-system pipeline stale          List stale documents
+pulse-null pipeline health         Document counts and thresholds
+pulse-null pipeline stale          List stale documents
 
-echo-system archive list            List archived files
-echo-system archive run <doc>       Manually archive a document
+pulse-null archive list            List archived files
+pulse-null archive run <doc>       Manually archive a document
 
-echo-system plugin list             List available plugins
-echo-system plugin add <name>       Install a plugin
-echo-system plugin remove <name>    Remove a plugin
+pulse-null plugin list             List available plugins
+pulse-null plugin add <name>       Install a plugin
+pulse-null plugin remove <name>    Remove a plugin
 ```
 
 ## HTTP API
