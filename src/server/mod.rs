@@ -7,6 +7,7 @@ pub mod prompt;
 pub mod rate_limit;
 pub mod trust;
 
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use axum::middleware;
@@ -32,6 +33,7 @@ pub struct AppState {
     pub system_prompt: RwLock<String>,
     pub tools: ToolRegistry,
     pub event_bus: Arc<EventBus>,
+    pub root_dir: PathBuf,
 }
 
 pub async fn start(config: Config) -> Result<(), Box<dyn std::error::Error>> {
@@ -95,6 +97,7 @@ pub async fn start(config: Config) -> Result<(), Box<dyn std::error::Error>> {
         system_prompt: RwLock::new(system_prompt),
         tools,
         event_bus: Arc::clone(&event_bus),
+        root_dir: root_dir.clone(),
     });
 
     // Load schedule and intent queue, start scheduler
@@ -142,7 +145,7 @@ pub async fn start(config: Config) -> Result<(), Box<dyn std::error::Error>> {
             Arc::clone(&state),
             auth::require_auth,
         ))
-        .with_state(state)
+        .with_state(Arc::clone(&state))
         .layer(middleware::from_fn_with_state(
             limiter,
             rate_limit::rate_limit,
@@ -170,6 +173,20 @@ pub async fn start(config: Config) -> Result<(), Box<dyn std::error::Error>> {
     axum::serve(listener, app)
         .with_graceful_shutdown(shutdown)
         .await?;
+
+    // Archive conversation on shutdown
+    {
+        let conversation = state.conversation.read().await;
+        if !conversation.is_empty() {
+            crate::session::end_session(
+                &root_dir,
+                &config.entity.name,
+                &conversation,
+                "http",
+                "server-shutdown",
+            );
+        }
+    }
 
     // Clean up plugins on shutdown
     plugin_manager.stop_all().await;

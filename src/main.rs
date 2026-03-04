@@ -11,6 +11,7 @@ mod pidfile;
 mod plugins;
 mod scheduler;
 mod server;
+mod session;
 mod tools;
 
 #[derive(Parser)]

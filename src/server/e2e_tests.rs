@@ -134,6 +134,7 @@ fn build_state(provider: MockProvider, tools: ToolRegistry) -> Arc<AppState> {
         system_prompt: RwLock::new("You are a test entity.".to_string()),
         tools,
         event_bus: Arc::new(EventBus::new(16)),
+        root_dir: std::env::temp_dir(),
     })
 }
 

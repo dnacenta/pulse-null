@@ -103,6 +103,7 @@ mod tests {
             system_prompt: RwLock::new(String::new()),
             tools: ToolRegistry::new(),
             event_bus: Arc::new(EventBus::new(16)),
+            root_dir: std::env::temp_dir(),
         })
     }
 
