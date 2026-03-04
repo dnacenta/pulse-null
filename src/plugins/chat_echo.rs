@@ -37,7 +37,7 @@ impl Plugin for ChatEchoPlugin {
         PluginMeta {
             name: "chat-echo".to_string(),
             version: env!("CARGO_PKG_VERSION").to_string(),
-            description: "Web chat UI for echo-system".to_string(),
+            description: "Web chat UI for pulse-null".to_string(),
         }
     }
 

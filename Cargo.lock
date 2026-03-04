@@ -984,42 +984,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "echo-system"
-version = "0.7.0"
-dependencies = [
- "axum",
- "bridge-echo",
- "chat-echo",
- "chrono",
- "chrono-tz",
- "clap",
- "console",
- "cron",
- "dialoguer",
- "discord-echo",
- "discord-voice-echo",
- "echo-system-types",
- "globset",
- "praxis-echo",
- "pulse-echo",
- "recall-echo",
- "regex",
- "reqwest",
- "serde",
- "serde_json",
- "tempfile",
- "tokio",
- "toml",
- "tower",
- "tracing",
- "tracing-subscriber",
- "uuid",
- "vigil-echo",
- "voice-echo",
- "walkdir",
-]
-
-[[package]]
 name = "echo-system-types"
 version = "0.2.0"
 source = "git+https://github.com/dnacenta/echo-system-types?tag=v0.2.0#acbadc847e4af646025d67b968330c07083a0d96"
@@ -2970,6 +2934,42 @@ dependencies = [
  "echo-system-types",
  "serde",
  "serde_json",
+]
+
+[[package]]
+name = "pulse-null"
+version = "0.7.0"
+dependencies = [
+ "axum",
+ "bridge-echo",
+ "chat-echo",
+ "chrono",
+ "chrono-tz",
+ "clap",
+ "console",
+ "cron",
+ "dialoguer",
+ "discord-echo",
+ "discord-voice-echo",
+ "echo-system-types",
+ "globset",
+ "praxis-echo",
+ "pulse-echo",
+ "recall-echo",
+ "regex",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "toml",
+ "tower",
+ "tracing",
+ "tracing-subscriber",
+ "uuid",
+ "vigil-echo",
+ "voice-echo",
+ "walkdir",
 ]
 
 [[package]]
