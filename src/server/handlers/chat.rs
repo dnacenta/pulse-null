@@ -80,6 +80,9 @@ pub async fn chat(
         state.provider.as_ref(),
         state.config.llm.context_budget,
         state.config.llm.max_tokens,
+        &state.root_dir,
+        &state.config.entity.name,
+        &req.channel,
     )
     .await;
 

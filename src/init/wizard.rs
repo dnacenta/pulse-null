@@ -243,6 +243,7 @@ fn create_directory_structure(dir: &Path) -> Result<(), Box<dyn std::error::Erro
         "archives/curiosity",
         "archives/thoughts",
         "archives/praxis",
+        "archives/conversations",
         "plugins",
         "logs",
     ];
