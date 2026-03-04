@@ -1,5 +1,6 @@
 use clap::{Parser, Subcommand};
 
+mod chat;
 mod claude_provider;
 mod cli;
 mod config;
@@ -29,7 +30,7 @@ enum Commands {
     },
     /// Start the entity
     Up,
-    /// Open the chat UI
+    /// Talk to your entity in the terminal
     Chat,
     /// Stop the entity
     Down,
