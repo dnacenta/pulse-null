@@ -40,7 +40,7 @@ pub async fn list() -> Result<(), Box<dyn std::error::Error>> {
 pub async fn add(name: String) -> Result<(), Box<dyn std::error::Error>> {
     let entry = registry::find_plugin(&name).ok_or_else(|| {
         format!(
-            "Unknown plugin: '{}'. Run `echo-system plugin list` to see available plugins.",
+            "Unknown plugin: '{}'. Run `pulse-null plugin list` to see available plugins.",
             name
         )
     })?;
@@ -63,7 +63,7 @@ pub async fn add(name: String) -> Result<(), Box<dyn std::error::Error>> {
 
     // Read the current config file and append the plugin section
     let root_dir = config.root_dir()?;
-    let config_path = root_dir.join("echo-system.toml");
+    let config_path = root_dir.join("pulse-null.toml");
     let mut content = std::fs::read_to_string(&config_path)?;
 
     content.push_str(&format!("\n[plugins.{}]\n", name));
@@ -75,7 +75,7 @@ pub async fn add(name: String) -> Result<(), Box<dyn std::error::Error>> {
     std::fs::write(&config_path, content)?;
 
     println!("Plugin '{}' installed.", name);
-    println!("Configure it in echo-system.toml under [plugins.{}]", name);
+    println!("Configure it in pulse-null.toml under [plugins.{}]", name);
 
     Ok(())
 }
@@ -91,7 +91,7 @@ pub async fn remove(name: String) -> Result<(), Box<dyn std::error::Error>> {
 
     // Read the current config file and remove the plugin section
     let root_dir = config.root_dir()?;
-    let config_path = root_dir.join("echo-system.toml");
+    let config_path = root_dir.join("pulse-null.toml");
     let content = std::fs::read_to_string(&config_path)?;
 
     // Parse and re-serialize without the plugin
