@@ -135,6 +135,7 @@ pub async fn start(config: Config) -> Result<(), Box<dyn std::error::Error>> {
     let app = Router::new()
         .route("/health", get(handlers::health::health))
         .route("/api/status", get(handlers::status::status))
+        .route("/api/dashboard", get(handlers::dashboard::dashboard))
         .route("/chat", post(handlers::chat::chat))
         .route_layer(middleware::from_fn_with_state(
             Arc::clone(&state),
