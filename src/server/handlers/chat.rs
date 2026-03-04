@@ -74,6 +74,15 @@ pub async fn chat(
         content: MessageContent::Text(user_message),
     });
 
+    // Compact conversation if approaching context budget
+    crate::context::compact_if_needed(
+        &mut conversation,
+        state.provider.as_ref(),
+        state.config.llm.context_budget,
+        state.config.llm.max_tokens,
+    )
+    .await;
+
     // Build tool definitions (only if provider supports tools)
     let tool_defs = if state.provider.supports_tools() && !state.tools.is_empty() {
         Some(state.tools.definitions())
@@ -124,12 +133,6 @@ pub async fn chat(
             StopReason::EndTurn | StopReason::MaxTokens | StopReason::StopSequence => {
                 // Done — extract text and return
                 let text = result.text();
-
-                // Keep conversation bounded (last 100 messages)
-                if conversation.len() > 100 {
-                    let drain_count = conversation.len() - 100;
-                    conversation.drain(..drain_count);
-                }
 
                 // Emit PostConversation event
                 emit_post_conversation(

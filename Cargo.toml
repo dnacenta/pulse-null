@@ -51,6 +51,7 @@ chrono-tz = "0.10"
 # Misc
 uuid = { version = "1", features = ["v4"] }
 chrono = { version = "0.4", features = ["serde"] }
+libc = "0.2"
 
 # Shared types
 echo-system-types = { git = "https://github.com/dnacenta/echo-system-types", tag = "v0.2.0" }

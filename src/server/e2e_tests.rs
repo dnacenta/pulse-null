@@ -98,6 +98,7 @@ fn test_config() -> Config {
             api_key: None,
             model: "mock-model".to_string(),
             max_tokens: 1024,
+            context_budget: 0,
         },
         security: SecurityConfig {
             secret: None,
