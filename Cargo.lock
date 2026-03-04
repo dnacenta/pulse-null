@@ -404,8 +404,8 @@ dependencies = [
 
 [[package]]
 name = "chat-echo"
-version = "0.1.1"
-source = "git+https://github.com/dnacenta/chat-echo?tag=v0.1.1#c0fe0df04a5a2da5f87cf687ef2c1300b6cf84f3"
+version = "0.2.1"
+source = "git+https://github.com/dnacenta/chat-echo?tag=v0.2.1#b16079bb3b41d3c738388a9d499ec908f444fdfb"
 dependencies = [
  "axum",
  "echo-system-types",
@@ -2938,7 +2938,7 @@ dependencies = [
 
 [[package]]
 name = "pulse-null"
-version = "0.8.0"
+version = "0.9.0"
 dependencies = [
  "axum",
  "bridge-echo",
