@@ -4,7 +4,7 @@ Contributions are welcome. This document explains the workflow.
 
 ## Reporting bugs or requesting features
 
-Open an [issue](https://github.com/dnacenta/echo-system/issues). Use a clear title and include enough context to reproduce the problem or understand the request.
+Open an [issue](https://github.com/dnacenta/pulse-null/issues). Use a clear title and include enough context to reproduce the problem or understand the request.
 
 ## Making changes
 

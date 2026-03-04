@@ -26,7 +26,7 @@ pub fn render_config(data: &ConfigData) -> String {
     };
 
     format!(
-        r#"# echo-system configuration
+        r#"# pulse-null configuration
 
 [entity]
 name = "{entity_name}"
@@ -114,7 +114,7 @@ cognitive_decline = true
 
 fn render_plugins_section(plugins: &[(String, Vec<(String, String)>)]) -> String {
     if plugins.is_empty() {
-        return "# [plugins]\n# Add plugins with: echo-system plugin add <name>".to_string();
+        return "# [plugins]\n# Add plugins with: pulse-null plugin add <name>".to_string();
     }
 
     let mut lines = Vec::new();
