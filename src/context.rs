@@ -1,3 +1,5 @@
+use std::path::Path;
+
 use echo_system_types::llm::{ContentBlock, LmProvider, Message, MessageContent, Role};
 
 /// Default context budget in estimated tokens (leaves room for system prompt + response).
@@ -89,6 +91,9 @@ pub async fn compact_if_needed(
     provider: &dyn LmProvider,
     context_budget: usize,
     max_tokens: u32,
+    root_dir: &Path,
+    entity_name: &str,
+    channel: &str,
 ) {
     let budget = if context_budget > 0 {
         context_budget
@@ -125,6 +130,17 @@ pub async fn compact_if_needed(
     }
 
     let old_messages = &conversation[..split_at];
+
+    // Archive the messages about to be compacted
+    let meta = crate::session::ArchiveMeta {
+        trigger: "compaction".to_string(),
+        channel: channel.to_string(),
+        entity_name: entity_name.to_string(),
+    };
+    if let Err(e) = crate::session::archive_conversation(root_dir, old_messages, &meta) {
+        tracing::warn!("Failed to archive compacted messages: {}", e);
+    }
+
     let summary_input = build_summary_prompt(old_messages);
 
     let summarize_prompt = format!(
