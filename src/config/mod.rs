@@ -5,7 +5,7 @@ use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
-const CONFIG_FILENAME: &str = "echo-system.toml";
+const CONFIG_FILENAME: &str = "pulse-null.toml";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
@@ -157,16 +157,14 @@ impl Config {
                 return Ok(candidate);
             }
             if !dir.pop() {
-                return Err(format!(
-                    "No {} found. Run `echo-system init` first.",
-                    CONFIG_FILENAME
-                )
-                .into());
+                return Err(
+                    format!("No {} found. Run `pulse-null init` first.", CONFIG_FILENAME).into(),
+                );
             }
         }
     }
 
-    /// Get the entity root directory (where echo-system.toml lives)
+    /// Get the entity root directory (where pulse-null.toml lives)
     pub fn root_dir(&self) -> Result<PathBuf, Box<dyn std::error::Error>> {
         let path = Self::find_config()?;
         Ok(path.parent().ok_or("Invalid config path")?.to_path_buf())
@@ -178,7 +176,7 @@ impl Config {
             .api_key
             .clone()
             .or_else(|| std::env::var("ANTHROPIC_API_KEY").ok())
-            .or_else(|| std::env::var("ECHO_SYSTEM_API_KEY").ok())
+            .or_else(|| std::env::var("PULSE_NULL_API_KEY").ok())
     }
 }
 

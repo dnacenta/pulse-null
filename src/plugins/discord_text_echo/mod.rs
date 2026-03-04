@@ -101,7 +101,7 @@ impl Plugin for DiscordTextEchoPlugin {
     }
 }
 
-/// Wraps discord-echo's DiscordPostTool to implement echo-system's Tool trait.
+/// Wraps discord-echo's DiscordPostTool to implement pulse-null's Tool trait.
 struct DiscordPostToolAdapter {
     client: Arc<discord_echo::client::DiscordClient>,
 }

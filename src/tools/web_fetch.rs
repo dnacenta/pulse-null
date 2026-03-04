@@ -241,7 +241,7 @@ impl Tool for WebFetchTool {
             let response = self
                 .client
                 .get(url)
-                .header("User-Agent", "echo-system/0.2.0")
+                .header("User-Agent", "pulse-null/0.7.0")
                 .send()
                 .await
                 .map_err(|e| ToolError::ExecutionFailed(format!("Request failed: {}", e)))?;

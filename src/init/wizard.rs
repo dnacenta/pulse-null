@@ -7,7 +7,7 @@ use super::templates;
 
 pub async fn run(target_dir: &Path) -> Result<(), Box<dyn std::error::Error>> {
     println!();
-    println!("  {}", style("Welcome to echo-system.").bold());
+    println!("  {}", style("Welcome to pulse-null.").bold());
     println!("  Let's create your entity.");
     println!();
 
@@ -150,7 +150,7 @@ pub async fn run(target_dir: &Path) -> Result<(), Box<dyn std::error::Error>> {
 
     // Write all files
     let files = vec![
-        ("echo-system.toml", templates::render_config(&config)),
+        ("pulse-null.toml", templates::render_config(&config)),
         ("SELF.md", templates::render_self_md(&identity)),
         ("CLAUDE.md", templates::render_claude_md(&identity)),
         (
@@ -216,14 +216,14 @@ pub async fn run(target_dir: &Path) -> Result<(), Box<dyn std::error::Error>> {
     println!(
         "  Run {} to start.",
         style(format!(
-            "cd {} && echo-system up",
+            "cd {} && pulse-null up",
             entity_name.to_lowercase()
         ))
         .green()
     );
     println!(
         "  Manage plugins with: {}",
-        style("echo-system plugin add|remove <name>").green()
+        style("pulse-null plugin add|remove <name>").green()
     );
     println!();
 
