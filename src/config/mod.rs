@@ -239,9 +239,9 @@ pub struct PipelineConfig {
 }
 
 impl PipelineConfig {
-    /// Convert to praxis-echo runtime thresholds.
-    pub fn to_thresholds(&self) -> praxis_echo::runtime::Thresholds {
-        praxis_echo::runtime::Thresholds {
+    /// Convert to shared pipeline thresholds.
+    pub fn to_thresholds(&self) -> echo_system_types::monitoring::PipelineThresholds {
+        echo_system_types::monitoring::PipelineThresholds {
             learning_soft: self.learning_soft,
             learning_hard: self.learning_hard,
             thoughts_soft: self.thoughts_soft,

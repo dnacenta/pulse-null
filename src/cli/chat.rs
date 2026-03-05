@@ -15,7 +15,7 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
 
     // Build system prompt from identity documents
     let root_dir = config.root_dir()?;
-    let system_prompt = prompt::build_system_prompt(&root_dir, &config)?;
+    let system_prompt = prompt::build_system_prompt(&root_dir, &config, None, None)?;
 
     // Register tools
     let mut tools = ToolRegistry::new();

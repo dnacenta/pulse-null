@@ -135,6 +135,9 @@ fn build_state(provider: MockProvider, tools: ToolRegistry) -> Arc<AppState> {
         tools,
         event_bus: Arc::new(EventBus::new(16)),
         root_dir: std::env::temp_dir(),
+        pipeline_monitor: None,
+        cognitive_monitor: None,
+        outcome_tracker: None,
     })
 }
 

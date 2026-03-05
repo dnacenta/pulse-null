@@ -64,6 +64,11 @@ enum Commands {
         #[command(subcommand)]
         action: IntentAction,
     },
+    /// Memory dashboard and tools
+    Recall {
+        #[command(subcommand)]
+        action: Option<RecallAction>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -144,6 +149,20 @@ enum IntentAction {
     },
     /// Clear all pending intents
     Clear,
+}
+
+#[derive(Subcommand)]
+enum RecallAction {
+    /// Search conversation archives
+    Search {
+        /// Search query
+        query: String,
+        /// Use ranked scoring instead of line-level matches
+        #[arg(long)]
+        ranked: bool,
+    },
+    /// Analyze and auto-distill MEMORY.md
+    Distill,
 }
 
 #[derive(Subcommand)]
@@ -243,6 +262,19 @@ async fn main() {
                 PluginAction::List => cli::plugin::list().await,
                 PluginAction::Add { name } => cli::plugin::add(name).await,
                 PluginAction::Remove { name } => cli::plugin::remove(name).await,
+            };
+            if let Err(e) = result {
+                eprintln!("Error: {e}");
+                std::process::exit(1);
+            }
+        }
+        Commands::Recall { action } => {
+            let result = match action {
+                None => cli::recall::dashboard_cmd().await,
+                Some(RecallAction::Search { query, ranked }) => {
+                    cli::recall::search(query, ranked).await
+                }
+                Some(RecallAction::Distill) => cli::recall::distill().await,
             };
             if let Err(e) = result {
                 eprintln!("Error: {e}");
