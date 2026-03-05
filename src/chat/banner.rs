@@ -1,7 +1,8 @@
 use std::path::Path;
 
-use praxis_echo::runtime::{self as pipeline, ThresholdStatus};
-use vigil_echo::runtime::{self as vigil, CognitiveStatus, Trend};
+use echo_system_types::monitoring::{
+    CognitiveMonitor, CognitiveStatus, DocumentHealth, PipelineMonitor, ThresholdStatus, Trend,
+};
 
 use crate::config::Config;
 
@@ -53,21 +54,23 @@ pub fn render(config: &Config, root_dir: &Path, plugin_count: usize) {
 
     // Pipeline health
     if config.pipeline.enabled {
-        render_pipeline(root_dir, config);
+        let monitor = praxis_echo::runtime::PraxisMonitor::new();
+        render_pipeline(root_dir, config, &monitor);
     }
 
     // Cognitive health
     if config.monitoring.enabled {
-        render_vigil(root_dir, config);
+        let monitor = vigil_echo::runtime::VigilMonitor::new();
+        render_vigil(root_dir, config, &monitor);
     }
 
     println!();
 }
 
 /// Render pipeline document progress bars.
-fn render_pipeline(root_dir: &Path, config: &Config) {
+fn render_pipeline(root_dir: &Path, config: &Config, monitor: &dyn PipelineMonitor) {
     let thresholds = config.pipeline.to_thresholds();
-    let health = pipeline::calculate(root_dir, &thresholds);
+    let health = monitor.calculate(root_dir, &thresholds);
 
     println!();
 
@@ -83,7 +86,7 @@ fn render_pipeline(root_dir: &Path, config: &Config) {
 }
 
 /// Print a single document progress bar with color.
-fn print_doc_bar(name: &str, doc: &pipeline::DocumentHealth) {
+fn print_doc_bar(name: &str, doc: &DocumentHealth) {
     let bar = status_bar(doc.count, doc.hard);
     let count_label = format!("{}/{}", doc.count, doc.hard);
 
@@ -118,8 +121,8 @@ fn status_bar(count: usize, hard: usize) -> String {
 }
 
 /// Render cognitive health signals.
-fn render_vigil(root_dir: &Path, config: &Config) {
-    let health = vigil::assess(
+fn render_vigil(root_dir: &Path, config: &Config, monitor: &dyn CognitiveMonitor) {
+    let health = monitor.assess(
         root_dir,
         config.monitoring.window_size,
         config.monitoring.min_samples,

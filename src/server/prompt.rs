@@ -1,4 +1,7 @@
 use std::path::Path;
+use std::sync::Arc;
+
+use echo_system_types::monitoring::{CognitiveMonitor, PipelineMonitor};
 
 use crate::config::Config;
 use crate::scheduler::cost::CostTracker;
@@ -8,6 +11,8 @@ use crate::scheduler::intent::IntentQueue;
 pub fn build_system_prompt(
     root_dir: &Path,
     config: &Config,
+    pipeline_monitor: Option<&Arc<dyn PipelineMonitor>>,
+    cognitive_monitor: Option<&Arc<dyn CognitiveMonitor>>,
 ) -> Result<String, Box<dyn std::error::Error>> {
     let mut parts = Vec::new();
 
@@ -48,11 +53,11 @@ pub fn build_system_prompt(
     }
 
     // Pipeline health — document counts and threshold status
-    if config.pipeline.enabled {
+    if let Some(monitor) = pipeline_monitor {
         let thresholds = config.pipeline.to_thresholds();
-        let pipeline_state = praxis_echo::runtime::PipelineState::load(root_dir);
-        let pipeline_health = praxis_echo::runtime::calculate(root_dir, &thresholds);
-        let pipeline_text = praxis_echo::runtime::render(
+        let pipeline_state = monitor.load_state(root_dir);
+        let pipeline_health = monitor.calculate(root_dir, &thresholds);
+        let pipeline_text = monitor.render_for_prompt(
             &pipeline_health,
             pipeline_state.sessions_without_movement,
             config.pipeline.freeze_threshold,
@@ -64,13 +69,13 @@ pub fn build_system_prompt(
     }
 
     // Cognitive health — metacognitive monitoring assessment
-    if config.monitoring.enabled {
-        let cognitive_health = vigil_echo::runtime::assess(
+    if let Some(monitor) = cognitive_monitor {
+        let cognitive_health = monitor.assess(
             root_dir,
             config.monitoring.window_size,
             config.monitoring.min_samples,
         );
-        let cognitive_text = vigil_echo::runtime::render(&cognitive_health);
+        let cognitive_text = monitor.render_for_prompt(&cognitive_health);
         parts.push(format!(
             "<cognitive-health>\n{}\n</cognitive-health>",
             cognitive_text

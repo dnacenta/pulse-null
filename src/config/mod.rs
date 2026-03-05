@@ -55,6 +55,9 @@ pub struct LlmConfig {
     pub model: String,
     #[serde(default = "default_max_tokens")]
     pub max_tokens: u32,
+    /// Maximum estimated tokens in conversation before compaction triggers (0 = default 150k).
+    #[serde(default)]
+    pub context_budget: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -236,9 +239,9 @@ pub struct PipelineConfig {
 }
 
 impl PipelineConfig {
-    /// Convert to praxis-echo runtime thresholds.
-    pub fn to_thresholds(&self) -> praxis_echo::runtime::Thresholds {
-        praxis_echo::runtime::Thresholds {
+    /// Convert to shared pipeline thresholds.
+    pub fn to_thresholds(&self) -> echo_system_types::monitoring::PipelineThresholds {
+        echo_system_types::monitoring::PipelineThresholds {
             learning_soft: self.learning_soft,
             learning_hard: self.learning_hard,
             thoughts_soft: self.thoughts_soft,

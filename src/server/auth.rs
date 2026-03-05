@@ -80,6 +80,7 @@ mod tests {
                     api_key: None,
                     model: "test".into(),
                     max_tokens: 1024,
+                    context_budget: 0,
                 },
                 security: SecurityConfig {
                     secret,
@@ -102,6 +103,10 @@ mod tests {
             system_prompt: RwLock::new(String::new()),
             tools: ToolRegistry::new(),
             event_bus: Arc::new(EventBus::new(16)),
+            root_dir: std::env::temp_dir(),
+            pipeline_monitor: None,
+            cognitive_monitor: None,
+            outcome_tracker: None,
         })
     }
 

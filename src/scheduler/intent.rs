@@ -441,7 +441,12 @@ async fn execute_intent(
     }
 
     // Build system prompt
-    let system_prompt = match prompt::build_system_prompt(&root_dir, &state.config) {
+    let system_prompt = match prompt::build_system_prompt(
+        &root_dir,
+        &state.config,
+        state.pipeline_monitor.as_ref(),
+        state.cognitive_monitor.as_ref(),
+    ) {
         Ok(p) => p,
         Err(e) => {
             tracing::error!(
@@ -616,8 +621,8 @@ async fn execute_intent(
     log_intent_execution(&root_dir, intent, &parsed.clean_content);
 
     // Record outcome for pulse-echo
-    if state.config.pulse.enabled {
-        let outcome = pulse_echo::runtime::build_outcome(
+    if let Some(ref tracker) = state.outcome_tracker {
+        let outcome = tracker.build_outcome(
             &intent.id,
             &intent.description,
             &parsed.clean_content,
@@ -625,27 +630,26 @@ async fn execute_intent(
             result.total_input_tokens,
             result.total_output_tokens,
         );
-        if let Err(e) =
-            pulse_echo::runtime::record_outcome(&root_dir, outcome, state.config.pulse.max_outcomes)
+        if let Err(e) = tracker.record_outcome(&root_dir, outcome, state.config.pulse.max_outcomes)
         {
             tracing::error!("Failed to record outcome for intent '{}': {}", intent.id, e);
         }
     }
 
     // Extract cognitive signals and check for health changes
-    if state.config.monitoring.enabled {
+    if let Some(ref monitor) = state.cognitive_monitor {
         let window = state.config.monitoring.window_size;
         let min_samples = state.config.monitoring.min_samples;
 
-        let health_before = vigil_echo::runtime::assess(&root_dir, window, min_samples);
+        let health_before = monitor.assess(&root_dir, window, min_samples);
         let previous_status = health_before.status.to_string();
 
-        let frame = vigil_echo::runtime::extract(&result.response_text, &intent.id);
-        if let Err(e) = vigil_echo::runtime::record(&root_dir, frame, window) {
+        let frame = monitor.extract(&result.response_text, &intent.id);
+        if let Err(e) = monitor.record(&root_dir, frame, window) {
             tracing::error!("Failed to record signals for intent '{}': {}", intent.id, e);
         }
 
-        let health_after = vigil_echo::runtime::assess(&root_dir, window, min_samples);
+        let health_after = monitor.assess(&root_dir, window, min_samples);
         if health_after.sufficient_data && health_after.status != health_before.status {
             state.event_bus.emit(EntityEvent::CognitiveHealthChanged {
                 previous: previous_status,
@@ -656,13 +660,15 @@ async fn execute_intent(
     }
 
     // Update pipeline state
-    if state.config.pipeline.enabled {
+    if let Some(ref monitor) = state.pipeline_monitor {
         let thresholds = state.config.pipeline.to_thresholds();
-        let health = praxis_echo::runtime::calculate(&root_dir, &thresholds);
-        let new_counts = praxis_echo::runtime::counts_from_health(&health);
-        let mut pipeline_state = praxis_echo::runtime::PipelineState::load(&root_dir);
-        pipeline_state.update_counts(&new_counts);
-        let _ = pipeline_state.save(&root_dir);
+        let health = monitor.calculate(&root_dir, &thresholds);
+        let new_counts = monitor.counts_from_health(&health);
+        let mut pipeline_state = monitor.load_state(&root_dir);
+        pipeline_state.update_counts(&new_counts, &chrono::Utc::now().to_rfc3339());
+        if let Err(e) = monitor.save_state(&root_dir, &pipeline_state) {
+            tracing::error!("Failed to save pipeline state: {}", e);
+        }
 
         // Emit PipelineAlert for documents at hard limit
         let docs = [
@@ -673,7 +679,7 @@ async fn execute_intent(
             ("PRAXIS", &health.praxis),
         ];
         for (name, doc_health) in &docs {
-            if doc_health.status == praxis_echo::runtime::ThresholdStatus::Red {
+            if doc_health.status == echo_system_types::monitoring::ThresholdStatus::Red {
                 state.event_bus.emit(EntityEvent::PipelineAlert {
                     document: name.to_string(),
                     count: doc_health.count,
@@ -689,7 +695,7 @@ async fn execute_intent(
             });
         }
 
-        let archived = praxis_echo::runtime::check_and_archive(&root_dir, &thresholds, &health);
+        let archived = monitor.check_and_archive(&root_dir, &thresholds, &health);
         for doc in &archived {
             tracing::info!("Auto-archived overflow from {} (intent)", doc);
         }
