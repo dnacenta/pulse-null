@@ -98,6 +98,7 @@ fn test_config() -> Config {
             api_key: None,
             model: "mock-model".to_string(),
             max_tokens: 1024,
+            context_budget: 0,
         },
         security: SecurityConfig {
             secret: None,
@@ -133,6 +134,10 @@ fn build_state(provider: MockProvider, tools: ToolRegistry) -> Arc<AppState> {
         system_prompt: RwLock::new("You are a test entity.".to_string()),
         tools,
         event_bus: Arc::new(EventBus::new(16)),
+        root_dir: std::env::temp_dir(),
+        pipeline_monitor: None,
+        cognitive_monitor: None,
+        outcome_tracker: None,
     })
 }
 
