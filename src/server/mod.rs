@@ -24,6 +24,7 @@ use crate::scheduler::intent::IntentQueue;
 use crate::scheduler::Schedule;
 use crate::tools::ToolRegistry;
 use echo_system_types::llm::{LmProvider, Message};
+use echo_system_types::monitoring::{CognitiveMonitor, OutcomeTracker, PipelineMonitor};
 
 /// Shared application state
 pub struct AppState {
@@ -34,6 +35,9 @@ pub struct AppState {
     pub tools: ToolRegistry,
     pub event_bus: Arc<EventBus>,
     pub root_dir: PathBuf,
+    pub pipeline_monitor: Option<Arc<dyn PipelineMonitor>>,
+    pub cognitive_monitor: Option<Arc<dyn CognitiveMonitor>>,
+    pub outcome_tracker: Option<Arc<dyn OutcomeTracker>>,
 }
 
 pub async fn start(config: Config) -> Result<(), Box<dyn std::error::Error>> {
@@ -46,9 +50,34 @@ pub async fn start(config: Config) -> Result<(), Box<dyn std::error::Error>> {
         config.llm.model.clone(),
     ));
 
-    // Build system prompt from SELF.md + CLAUDE.md + MEMORY.md
     let root_dir = config.root_dir()?;
-    let system_prompt = prompt::build_system_prompt(&root_dir, &config)?;
+
+    // Construct monitoring trait objects based on config
+    let pipeline_monitor: Option<Arc<dyn PipelineMonitor>> = if config.pipeline.enabled {
+        Some(Arc::new(praxis_echo::runtime::PraxisMonitor::new()))
+    } else {
+        None
+    };
+
+    let cognitive_monitor: Option<Arc<dyn CognitiveMonitor>> = if config.monitoring.enabled {
+        Some(Arc::new(vigil_echo::runtime::VigilMonitor::new()))
+    } else {
+        None
+    };
+
+    let outcome_tracker: Option<Arc<dyn OutcomeTracker>> = if config.pulse.enabled {
+        Some(Arc::new(pulse_echo::runtime::PulseTracker::new()))
+    } else {
+        None
+    };
+
+    // Build system prompt from SELF.md + CLAUDE.md + MEMORY.md
+    let system_prompt = prompt::build_system_prompt(
+        &root_dir,
+        &config,
+        pipeline_monitor.as_ref(),
+        cognitive_monitor.as_ref(),
+    )?;
 
     // Register built-in tools
     let mut tools = ToolRegistry::new();
@@ -98,6 +127,9 @@ pub async fn start(config: Config) -> Result<(), Box<dyn std::error::Error>> {
         tools,
         event_bus: Arc::clone(&event_bus),
         root_dir: root_dir.clone(),
+        pipeline_monitor,
+        cognitive_monitor,
+        outcome_tracker,
     });
 
     // Load schedule and intent queue, start scheduler

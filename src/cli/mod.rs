@@ -5,6 +5,7 @@ pub mod init;
 pub mod intent;
 pub mod pipeline;
 pub mod plugin;
+pub mod recall;
 pub mod schedule;
 pub mod status;
 pub mod up;
