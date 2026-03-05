@@ -3,8 +3,7 @@ use std::sync::Arc;
 use axum::extract::State;
 use axum::Json;
 
-use praxis_echo::runtime::{self as pipeline, ThresholdStatus};
-use vigil_echo::runtime::{self as vigil, CognitiveStatus, Trend};
+use echo_system_types::monitoring::{CognitiveStatus, DocumentHealth, ThresholdStatus, Trend};
 
 use crate::server::AppState;
 
@@ -23,10 +22,10 @@ pub async fn dashboard(State(state): State<Arc<AppState>>) -> Json<serde_json::V
     });
 
     // Pipeline health
-    let pipeline_data = if config.pipeline.enabled {
+    let pipeline_data = if let Some(ref monitor) = state.pipeline_monitor {
         if let Ok(root_dir) = config.root_dir() {
             let thresholds = config.pipeline.to_thresholds();
-            let health = pipeline::calculate(&root_dir, &thresholds);
+            let health = monitor.calculate(&root_dir, &thresholds);
             serde_json::json!({
                 "learning": doc_json(&health.learning),
                 "thoughts": doc_json(&health.thoughts),
@@ -43,9 +42,9 @@ pub async fn dashboard(State(state): State<Arc<AppState>>) -> Json<serde_json::V
     };
 
     // Cognitive health
-    let cognitive_data = if config.monitoring.enabled {
+    let cognitive_data = if let Some(ref monitor) = state.cognitive_monitor {
         if let Ok(root_dir) = config.root_dir() {
-            let health = vigil::assess(
+            let health = monitor.assess(
                 &root_dir,
                 config.monitoring.window_size,
                 config.monitoring.min_samples,
@@ -82,7 +81,7 @@ pub async fn dashboard(State(state): State<Arc<AppState>>) -> Json<serde_json::V
     }))
 }
 
-fn doc_json(doc: &pipeline::DocumentHealth) -> serde_json::Value {
+fn doc_json(doc: &DocumentHealth) -> serde_json::Value {
     serde_json::json!({
         "count": doc.count,
         "hard_limit": doc.hard,

@@ -1,6 +1,6 @@
 [package]
 name = "pulse-null"
-version = "0.9.1"
+version = "0.10.0"
 edition = "2021"
 rust-version = "1.80"
 license = "AGPL-3.0-only"
@@ -54,15 +54,15 @@ chrono = { version = "0.4", features = ["serde"] }
 libc = "0.2"
 
 # Shared types
-echo-system-types = { git = "https://github.com/dnacenta/echo-system-types", tag = "v0.2.0" }
+echo-system-types = { git = "https://github.com/dnacenta/echo-system-types", tag = "v0.3.0" }
 
 # Core dependencies (always included — these define an entity)
 vigil-echo = { git = "https://github.com/dnacenta/vigil-echo", branch = "development" }
 praxis-echo = { git = "https://github.com/dnacenta/praxis-echo", branch = "development" }
-chat-echo = { git = "https://github.com/dnacenta/chat-echo", tag = "v0.2.2" }
+chat-echo = { git = "https://github.com/dnacenta/chat-echo", branch = "development" }
 bridge-echo = { git = "https://github.com/dnacenta/bridge-echo", branch = "development" }
 recall-echo = { git = "https://github.com/dnacenta/recall-echo", branch = "development" }
-pulse-echo = { git = "https://github.com/dnacenta/pulse-echo", tag = "v0.1.0" }
+pulse-echo = { git = "https://github.com/dnacenta/pulse-echo", branch = "development" }
 
 # Plugins (optional — different interfaces to speak through)
 voice-echo = { git = "https://github.com/dnacenta/voice-echo", branch = "development", optional = true }
