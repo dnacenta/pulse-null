@@ -29,15 +29,15 @@ impl Plugin for RecallEchoPlugin {
         ctx: &'a PluginContext,
     ) -> PluginResult<'a> {
         Box::pin(async move {
-            let base_dir = toml_config
+            let entity_root = toml_config
                 .as_table()
-                .and_then(|t| t.get("base_dir"))
+                .and_then(|t| t.get("entity_root"))
                 .and_then(|v| v.as_str())
                 .map(std::path::PathBuf::from)
-                .unwrap_or_else(|| ctx.entity_root.join("memory"));
+                .unwrap_or_else(|| ctx.entity_root.clone());
 
-            tracing::info!("recall-echo: base_dir = {}", base_dir.display());
-            self.inner = Some(recall_echo::RecallEcho::new(base_dir));
+            tracing::info!("recall-echo: entity_root = {}", entity_root.display());
+            self.inner = Some(recall_echo::RecallEcho::new(entity_root));
             Ok(())
         })
     }

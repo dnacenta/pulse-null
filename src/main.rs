@@ -153,6 +153,8 @@ enum IntentAction {
 
 #[derive(Subcommand)]
 enum RecallAction {
+    /// Quick memory health check
+    Status,
     /// Search conversation archives
     Search {
         /// Search query
@@ -271,6 +273,7 @@ async fn main() {
         Commands::Recall { action } => {
             let result = match action {
                 None => cli::recall::dashboard_cmd().await,
+                Some(RecallAction::Status) => cli::recall::status_cmd().await,
                 Some(RecallAction::Search { query, ranked }) => {
                     cli::recall::search(query, ranked).await
                 }
