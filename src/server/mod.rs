@@ -97,15 +97,10 @@ pub async fn start(config: Config) -> Result<(), Box<dyn std::error::Error>> {
     tracing::info!("Registered {} built-in tool(s)", tools.definitions().len());
 
     // Initialize and start plugins
-    let mut plugin_manager = PluginManager::new(&config);
+    let plugin_provider: Arc<dyn LmProvider> =
+        Arc::new(ClaudeProvider::new(api_key, config.llm.model.clone()));
+    let mut plugin_manager = PluginManager::new(&config, &root_dir, plugin_provider).await?;
     if plugin_manager.count() > 0 {
-        let plugin_provider: Arc<Box<dyn LmProvider>> = Arc::new(Box::new(ClaudeProvider::new(
-            api_key,
-            config.llm.model.clone(),
-        )));
-        plugin_manager
-            .init_all(&config, &root_dir, plugin_provider)
-            .await?;
         plugin_manager.start_all().await?;
         tracing::info!("{} plugin(s) started", plugin_manager.count());
 

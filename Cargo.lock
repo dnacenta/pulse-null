@@ -303,10 +303,10 @@ dependencies = [
 [[package]]
 name = "bridge-echo"
 version = "0.3.0"
-source = "git+https://github.com/dnacenta/bridge-echo?branch=development#8a1cccbc59a57b585fe73d1eeedd3825f316ed55"
+source = "git+https://github.com/dnacenta/bridge-echo?branch=feat/plugin-trait#4e89210b40e911babd454fc97e9ba4290b636afc"
 dependencies = [
  "axum",
- "echo-system-types 0.3.0",
+ "echo-system-types",
  "regex",
  "reqwest",
  "serde",
@@ -405,10 +405,10 @@ dependencies = [
 [[package]]
 name = "chat-echo"
 version = "0.2.2"
-source = "git+https://github.com/dnacenta/chat-echo?branch=development#db49c536e3dbf8248cf60f47da6613f16d978765"
+source = "git+https://github.com/dnacenta/chat-echo?branch=feat/plugin-trait#4fbe98db26cf0031defa50581f4e8b6df037a421"
 dependencies = [
  "axum",
- "echo-system-types 0.3.0",
+ "echo-system-types",
  "futures-util",
  "reqwest",
  "serde",
@@ -905,9 +905,9 @@ dependencies = [
 [[package]]
 name = "discord-echo"
 version = "0.1.0"
-source = "git+https://github.com/dnacenta/discord-echo?tag=v0.1.0#f03166b5ed1dfadd50c3c590c4991518b00e0643"
+source = "git+https://github.com/dnacenta/discord-echo?branch=feat/plugin-trait#82b703e21a12677676c575bc2ce6befa9e5714aa"
 dependencies = [
- "echo-system-types 0.2.0",
+ "echo-system-types",
  "futures-util",
  "reqwest",
  "serde",
@@ -920,12 +920,12 @@ dependencies = [
 [[package]]
 name = "discord-voice-echo"
 version = "0.2.0"
-source = "git+https://github.com/dnacenta/discord-voice-echo?branch=development#8f8a115135f50460d5d68d640c97af06860c94df"
+source = "git+https://github.com/dnacenta/discord-voice-echo?branch=feat/plugin-trait#2519c73792a2288362ea2d61e2616a2d33e77d4b"
 dependencies = [
  "async-trait",
  "base64",
  "dotenvy",
- "echo-system-types 0.2.0",
+ "echo-system-types",
  "futures-util",
  "hound",
  "rubato 1.0.1",
@@ -985,17 +985,8 @@ dependencies = [
 
 [[package]]
 name = "echo-system-types"
-version = "0.2.0"
-source = "git+https://github.com/dnacenta/echo-system-types?tag=v0.2.0#acbadc847e4af646025d67b968330c07083a0d96"
-dependencies = [
- "serde",
- "serde_json",
-]
-
-[[package]]
-name = "echo-system-types"
-version = "0.3.0"
-source = "git+https://github.com/dnacenta/echo-system-types?tag=v0.3.0#ad901031f50fe6f0bef5a9476bbc97a778d00124"
+version = "0.4.0"
+source = "git+https://github.com/dnacenta/echo-system-types?branch=feat/v0.4.0-plugin-trait#3a220179d01805aad155ed5b62a0ff005019b438"
 dependencies = [
  "serde",
  "serde_json",
@@ -1736,7 +1727,7 @@ dependencies = [
  "libc",
  "percent-encoding",
  "pin-project-lite",
- "socket2 0.6.2",
+ "socket2 0.5.10",
  "system-configuration",
  "tokio",
  "tower-service",
@@ -2865,11 +2856,11 @@ dependencies = [
 [[package]]
 name = "praxis-echo"
 version = "0.3.0"
-source = "git+https://github.com/dnacenta/praxis-echo?branch=development#099e69ace1a38ea914d9839d14ea3b14289b48b0"
+source = "git+https://github.com/dnacenta/praxis-echo?branch=feat/plugin-trait#052de4d717219279d3af536bd0503e35cfe7c749"
 dependencies = [
  "clap",
  "dirs",
- "echo-system-types 0.3.0",
+ "echo-system-types",
  "serde",
  "serde_json",
 ]
@@ -2936,11 +2927,11 @@ dependencies = [
 [[package]]
 name = "pulse-echo"
 version = "0.2.0"
-source = "git+https://github.com/dnacenta/pulse-echo?branch=development#08e01d1fc7c77e1769717ac13d8e941a2efdb5fe"
+source = "git+https://github.com/dnacenta/pulse-echo?branch=feat/plugin-trait#ce65fb2763cdfcedd63fc0231383d12fafdd3c65"
 dependencies = [
  "chrono",
  "dirs",
- "echo-system-types 0.3.0",
+ "echo-system-types",
  "serde",
  "serde_json",
 ]
@@ -2960,7 +2951,7 @@ dependencies = [
  "dialoguer",
  "discord-echo",
  "discord-voice-echo",
- "echo-system-types 0.3.0",
+ "echo-system-types",
  "globset",
  "libc",
  "praxis-echo",
@@ -2995,7 +2986,7 @@ dependencies = [
  "quinn-udp",
  "rustc-hash",
  "rustls 0.23.37",
- "socket2 0.6.2",
+ "socket2 0.5.10",
  "thiserror 2.0.18",
  "tokio",
  "tracing",
@@ -3032,7 +3023,7 @@ dependencies = [
  "cfg_aliases",
  "libc",
  "once_cell",
- "socket2 0.6.2",
+ "socket2 0.5.10",
  "tracing",
  "windows-sys 0.60.2",
 ]
@@ -3149,11 +3140,11 @@ dependencies = [
 [[package]]
 name = "recall-echo"
 version = "2.0.0"
-source = "git+https://github.com/dnacenta/recall-echo?branch=feat/v2.0-pulse-null#02cacb36ad6c450e01d47f8fed4be587aedfd5ed"
+source = "git+https://github.com/dnacenta/recall-echo?branch=feat/v2.0-pulse-null#5d52f0d8cd267611e21f71e8a6deb25b613ca09a"
 dependencies = [
  "clap",
  "dirs",
- "echo-system-types 0.3.0",
+ "echo-system-types",
  "serde",
  "serde_json",
 ]
@@ -4923,11 +4914,11 @@ checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
 [[package]]
 name = "vigil-echo"
 version = "0.3.0"
-source = "git+https://github.com/dnacenta/vigil-echo?branch=development#208986acf5d28ce722205962a2b227662b9ccd69"
+source = "git+https://github.com/dnacenta/vigil-echo?branch=feat/plugin-trait#bcc98c9e1795a405a56030a897112788a71bd48d"
 dependencies = [
  "clap",
  "dirs",
- "echo-system-types 0.3.0",
+ "echo-system-types",
  "owo-colors",
  "serde",
  "serde_json",
@@ -4948,14 +4939,14 @@ dependencies = [
 [[package]]
 name = "voice-echo"
 version = "0.7.0"
-source = "git+https://github.com/dnacenta/voice-echo?branch=development#06a978e0201f3c6ab39afcb194b9457b08eb78da"
+source = "git+https://github.com/dnacenta/voice-echo?branch=feat/plugin-trait#8e5a1047ca6109e747b2ea944e9477b89cc7b3fa"
 dependencies = [
  "axum",
  "base64",
  "bytes",
  "chrono",
  "dotenvy",
- "echo-system-types 0.2.0",
+ "echo-system-types",
  "hound",
  "rand 0.8.5",
  "reqwest",

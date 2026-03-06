@@ -54,20 +54,20 @@ chrono = { version = "0.4", features = ["serde"] }
 libc = "0.2"
 
 # Shared types
-echo-system-types = { git = "https://github.com/dnacenta/echo-system-types", tag = "v0.3.0" }
+echo-system-types = { git = "https://github.com/dnacenta/echo-system-types", branch = "feat/v0.4.0-plugin-trait" }
 
 # Core dependencies (always included — these define an entity)
-vigil-echo = { git = "https://github.com/dnacenta/vigil-echo", branch = "development" }
-praxis-echo = { git = "https://github.com/dnacenta/praxis-echo", branch = "development" }
-chat-echo = { git = "https://github.com/dnacenta/chat-echo", branch = "development" }
-bridge-echo = { git = "https://github.com/dnacenta/bridge-echo", branch = "development" }
+vigil-echo = { git = "https://github.com/dnacenta/vigil-echo", branch = "feat/plugin-trait" }
+praxis-echo = { git = "https://github.com/dnacenta/praxis-echo", branch = "feat/plugin-trait" }
+chat-echo = { git = "https://github.com/dnacenta/chat-echo", branch = "feat/plugin-trait" }
+bridge-echo = { git = "https://github.com/dnacenta/bridge-echo", branch = "feat/plugin-trait" }
 recall-echo = { git = "https://github.com/dnacenta/recall-echo", branch = "feat/v2.0-pulse-null" }
-pulse-echo = { git = "https://github.com/dnacenta/pulse-echo", branch = "development" }
+pulse-echo = { git = "https://github.com/dnacenta/pulse-echo", branch = "feat/plugin-trait" }
 
 # Plugins (optional — different interfaces to speak through)
-voice-echo = { git = "https://github.com/dnacenta/voice-echo", branch = "development", optional = true }
-discord-voice-echo = { git = "https://github.com/dnacenta/discord-voice-echo", branch = "development", optional = true }
-discord-echo = { git = "https://github.com/dnacenta/discord-echo", tag = "v0.1.0", optional = true }
+voice-echo = { git = "https://github.com/dnacenta/voice-echo", branch = "feat/plugin-trait", optional = true }
+discord-voice-echo = { git = "https://github.com/dnacenta/discord-voice-echo", branch = "feat/plugin-trait", optional = true }
+discord-echo = { git = "https://github.com/dnacenta/discord-echo", branch = "feat/plugin-trait", optional = true }
 
 [features]
 default = []
