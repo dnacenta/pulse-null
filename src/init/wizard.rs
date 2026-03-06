@@ -1,9 +1,11 @@
 use std::path::Path;
+use std::sync::Arc;
 
 use console::style;
 use dialoguer::{Input, MultiSelect, Password, Select};
 
 use super::templates;
+use echo_system_types::llm::{LlmResponse, LlmResult, LmProvider, Message, StopReason};
 
 pub async fn run(target_dir: &Path) -> Result<(), Box<dyn std::error::Error>> {
     println!();
@@ -115,7 +117,7 @@ pub async fn run(target_dir: &Path) -> Result<(), Box<dyn std::error::Error>> {
     };
 
     // Plugin selection
-    let plugin_configs = collect_plugin_configs()?;
+    let plugin_configs = collect_plugin_configs(target_dir).await?;
 
     println!();
     println!(
@@ -255,9 +257,36 @@ fn create_directory_structure(dir: &Path) -> Result<(), Box<dyn std::error::Erro
     Ok(())
 }
 
+/// Noop LLM provider — used only to construct PluginContext for setup prompts.
+struct NoopProvider;
+impl LmProvider for NoopProvider {
+    fn invoke(
+        &self,
+        _: &str,
+        _: &[Message],
+        _: u32,
+        _: Option<&[serde_json::Value]>,
+    ) -> LlmResult<'_> {
+        Box::pin(async {
+            Ok(LlmResponse {
+                content: vec![],
+                stop_reason: StopReason::EndTurn,
+                model: "noop".into(),
+                input_tokens: None,
+                output_tokens: None,
+            })
+        })
+    }
+    fn name(&self) -> &str {
+        "noop"
+    }
+}
+
 type PluginConfigs = Vec<(String, Vec<(String, String)>)>;
 
-fn collect_plugin_configs() -> Result<PluginConfigs, Box<dyn std::error::Error>> {
+async fn collect_plugin_configs(
+    target_dir: &Path,
+) -> Result<PluginConfigs, Box<dyn std::error::Error>> {
     use crate::plugins::registry;
 
     let available: Vec<_> = registry::known_plugins()
@@ -287,21 +316,26 @@ fn collect_plugin_configs() -> Result<PluginConfigs, Box<dyn std::error::Error>>
         return Ok(Vec::new());
     }
 
+    // Build a dummy context for fetching setup prompts
+    let ctx = crate::plugins::PluginContext {
+        entity_root: target_dir.to_path_buf(),
+        entity_name: "init".into(),
+        provider: Arc::new(NoopProvider) as Arc<dyn LmProvider>,
+    };
+
     let mut plugin_configs = Vec::new();
 
     for &idx in &selected {
         let entry = &available[idx];
-        let plugin = match registry::create_plugin(&entry.name) {
-            Some(p) => p,
-            None => continue,
-        };
 
-        let prompts = plugin.setup_prompts();
-        if prompts.is_empty() {
-            // Plugin has no config — just enable it with empty table
-            plugin_configs.push((entry.name.clone(), Vec::new()));
-            continue;
-        }
+        let prompts = match registry::setup_prompts_for(&entry.name, &ctx).await {
+            Some(p) => p,
+            None => {
+                // Plugin has no config or failed to construct — just enable it
+                plugin_configs.push((entry.name.clone(), Vec::new()));
+                continue;
+            }
+        };
 
         println!();
         println!("  Configuring {}...", style(&entry.name).cyan());

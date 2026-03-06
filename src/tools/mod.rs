@@ -4,48 +4,11 @@ pub mod file_write;
 pub mod grep;
 pub mod web_fetch;
 
-use std::fmt;
-use std::future::Future;
 use std::path::{Path, PathBuf};
-use std::pin::Pin;
 
-/// Result type for tool execution.
-pub type ToolResult<'a> = Pin<Box<dyn Future<Output = Result<String, ToolError>> + Send + 'a>>;
-
-/// Errors from tool execution.
-#[derive(Debug)]
-pub enum ToolError {
-    NotFound(String),
-    ExecutionFailed(String),
-    PermissionDenied(String),
-}
-
-impl fmt::Display for ToolError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            ToolError::NotFound(msg) => write!(f, "Not found: {}", msg),
-            ToolError::ExecutionFailed(msg) => write!(f, "Execution failed: {}", msg),
-            ToolError::PermissionDenied(msg) => write!(f, "Permission denied: {}", msg),
-        }
-    }
-}
-
-impl std::error::Error for ToolError {}
-
-/// A tool that can be invoked by an LLM.
-pub trait Tool: Send + Sync {
-    /// Tool name (must match what the LLM calls).
-    fn name(&self) -> &str;
-
-    /// Human-readable description for the LLM.
-    fn description(&self) -> &str;
-
-    /// JSON Schema for the tool's input parameters.
-    fn input_schema(&self) -> serde_json::Value;
-
-    /// Execute the tool with the given input.
-    fn execute(&self, input: serde_json::Value) -> ToolResult<'_>;
-}
+// Re-export Tool trait and types from echo-system-types.
+// Built-in tools and plugin-contributed tools use the same trait.
+pub use echo_system_types::tool::{Tool, ToolError, ToolResult};
 
 /// Registry of available tools.
 pub struct ToolRegistry {

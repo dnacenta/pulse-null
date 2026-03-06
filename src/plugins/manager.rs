@@ -4,9 +4,10 @@ use std::sync::Arc;
 use axum::Router;
 
 use super::registry;
-use super::{Plugin, PluginContext, PluginHealth, PluginMeta};
+use super::{Plugin, PluginContext, PluginHealth, PluginMeta, PluginRole};
 use crate::config::Config;
 use crate::scheduler::ScheduledTask;
+use crate::tools::Tool;
 use echo_system_types::llm::LmProvider;
 
 /// Manages the lifecycle of all enabled plugins
@@ -23,54 +24,66 @@ pub struct PluginStatus {
 }
 
 impl PluginManager {
-    /// Create a new plugin manager and instantiate all enabled plugins from config
-    pub fn new(config: &Config) -> Self {
-        let mut plugins: Vec<Box<dyn Plugin>> = Vec::new();
-
-        for plugin_name in config.plugins.keys() {
-            match registry::create_plugin(plugin_name) {
-                Some(plugin) => {
-                    tracing::info!("Loaded plugin: {}", plugin_name);
-                    plugins.push(plugin);
-                }
-                None => {
-                    tracing::warn!("Unknown plugin in config: {}", plugin_name);
-                }
-            }
-        }
-
-        Self {
-            plugins,
-            started: false,
-        }
-    }
-
-    /// Initialize all plugins with their config and context
-    pub async fn init_all(
-        &mut self,
+    /// Create a plugin manager, constructing all enabled plugins from config.
+    ///
+    /// Plugins are fully initialized by their factory functions — no separate
+    /// init step. Uses `Arc<dyn LmProvider>` (no double indirection).
+    pub async fn new(
         config: &Config,
         entity_root: &Path,
-        provider: Arc<Box<dyn LmProvider>>,
-    ) -> Result<(), Box<dyn std::error::Error>> {
+        provider: Arc<dyn LmProvider>,
+    ) -> Result<Self, Box<dyn std::error::Error>> {
         let ctx = PluginContext {
             entity_root: entity_root.to_path_buf(),
             entity_name: config.entity.name.clone(),
             provider,
         };
 
-        for plugin in &mut self.plugins {
-            let meta = plugin.meta();
-            let plugin_config = config
-                .plugins
-                .get(&meta.name)
-                .cloned()
-                .unwrap_or(toml::Value::Table(toml::value::Table::new()));
+        let mut plugins: Vec<Box<dyn Plugin>> = Vec::new();
 
-            tracing::info!("Initializing plugin: {} v{}", meta.name, meta.version);
-            plugin
-                .init(&plugin_config, &ctx)
-                .await
-                .map_err(|e| format!("Failed to initialize plugin '{}': {}", meta.name, e))?;
+        for (plugin_name, plugin_config) in &config.plugins {
+            match registry::create_plugin(plugin_name, plugin_config, &ctx).await {
+                Ok(Some(plugin)) => {
+                    tracing::info!("Loaded plugin: {} v{}", plugin_name, plugin.meta().version);
+                    plugins.push(plugin);
+                }
+                Ok(None) => {
+                    tracing::warn!("Unknown plugin in config: {}", plugin_name);
+                }
+                Err(e) => {
+                    return Err(format!("Failed to create plugin '{}': {}", plugin_name, e).into());
+                }
+            }
+        }
+
+        // Validate role constraints
+        Self::validate_roles(&plugins)?;
+
+        Ok(Self {
+            plugins,
+            started: false,
+        })
+    }
+
+    /// Validate plugin role constraints.
+    /// Memory role: exactly one required.
+    fn validate_roles(plugins: &[Box<dyn Plugin>]) -> Result<(), Box<dyn std::error::Error>> {
+        let memory_count = plugins
+            .iter()
+            .filter(|p| p.role() == PluginRole::Memory)
+            .count();
+
+        if memory_count == 0 {
+            return Err(
+                "No Memory plugin loaded. A memory plugin (e.g. recall-echo) is required.".into(),
+            );
+        }
+        if memory_count > 1 {
+            return Err(format!(
+                "Multiple Memory plugins loaded ({}). Exactly one is allowed.",
+                memory_count
+            )
+            .into());
         }
 
         Ok(())
@@ -102,16 +115,33 @@ impl PluginManager {
         self.started = false;
     }
 
-    /// Collect all plugin routes, nested under /plugins/{name}/
+    /// Collect all plugin routes via `as_any()` downcast.
+    ///
+    /// Routes are not part of the Plugin trait (axum is too heavy for shared types).
+    /// Instead, the host knows which concrete types expose routes and downcasts.
     pub fn collect_routes(&self) -> Router {
         let mut router = Router::new();
 
         for plugin in &self.plugins {
             let meta = plugin.meta();
-            if let Some(plugin_routes) = plugin.routes() {
+            let any = plugin.as_any();
+
+            // Chat-echo contributes routes; bridge-echo runs its own server.
+            let plugin_routes: Option<Router> = any
+                .downcast_ref::<chat_echo::ChatEcho>()
+                .map(|chat| chat.routes());
+
+            // Feature-gated route discovery
+            #[cfg(feature = "voice")]
+            let plugin_routes = plugin_routes.or_else(|| {
+                any.downcast_ref::<voice_echo::VoiceEcho>()
+                    .and_then(|v| v.routes())
+            });
+
+            if let Some(routes) = plugin_routes {
                 let prefix = format!("/plugins/{}", meta.name);
                 tracing::info!("Registering routes for plugin: {} at {}", meta.name, prefix);
-                router = router.nest(&prefix, plugin_routes);
+                router = router.nest(&prefix, routes);
             }
         }
 
@@ -138,7 +168,7 @@ impl PluginManager {
     }
 
     /// Collect all tools from plugins
-    pub fn collect_tools(&self) -> Vec<Box<dyn crate::tools::Tool>> {
+    pub fn collect_tools(&self) -> Vec<Box<dyn Tool>> {
         let mut tools = Vec::new();
         for plugin in &self.plugins {
             let meta = plugin.meta();
@@ -221,35 +251,20 @@ mod tests {
     }
 
     #[test]
-    fn test_empty_plugin_manager() {
-        let config = test_config();
-        let manager = PluginManager::new(&config);
-        assert_eq!(manager.count(), 0);
-        assert!(!manager.is_started());
-    }
-
-    #[test]
-    fn test_unknown_plugin_in_config() {
-        let mut config = test_config();
-        config.plugins.insert(
-            "nonexistent-plugin".to_string(),
-            toml::Value::Table(toml::value::Table::new()),
-        );
-        let manager = PluginManager::new(&config);
-        assert_eq!(manager.count(), 0); // unknown plugins are skipped
-    }
-
-    #[test]
     fn test_collect_routes_empty() {
-        let config = test_config();
-        let manager = PluginManager::new(&config);
+        let manager = PluginManager {
+            plugins: vec![],
+            started: false,
+        };
         let _routes = manager.collect_routes(); // should not panic
     }
 
     #[test]
     fn test_collect_tasks_empty() {
-        let config = test_config();
-        let manager = PluginManager::new(&config);
+        let manager = PluginManager {
+            plugins: vec![],
+            started: false,
+        };
         let tasks = manager.collect_tasks();
         assert!(tasks.is_empty());
     }
