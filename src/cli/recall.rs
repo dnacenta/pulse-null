@@ -11,9 +11,16 @@ fn build_recall(config: &Config) -> Result<RecallEcho, Box<dyn std::error::Error
 pub async fn dashboard_cmd() -> Result<(), Box<dyn std::error::Error>> {
     let config = Config::load()?;
     let recall = build_recall(&config)?;
-    let status = recall.health();
-    println!("Memory health: {:?}", status);
+    let entity_name = &config.entity.name;
+    let version = env!("CARGO_PKG_VERSION");
+    recall_echo::dashboard::render(&recall, entity_name, version, 200);
     Ok(())
+}
+
+pub async fn status_cmd() -> Result<(), Box<dyn std::error::Error>> {
+    let config = Config::load()?;
+    let root_dir = config.root_dir()?;
+    recall_echo::status::run_with_base(&root_dir).map_err(|e| e.into())
 }
 
 pub async fn search(query: String, ranked: bool) -> Result<(), Box<dyn std::error::Error>> {

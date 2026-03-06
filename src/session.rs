@@ -1,278 +1,43 @@
-use std::fs;
-use std::io::Write as IoWrite;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
-use chrono::Utc;
-use echo_system_types::llm::{ContentBlock, Message, MessageContent, Role};
+use echo_system_types::llm::{LmProvider, Message};
 
-/// Metadata for an archive log entry.
-pub struct ArchiveMeta {
-    pub trigger: String,
-    pub channel: String,
-    pub entity_name: String,
-}
-
-/// Serialize a conversation to grep-searchable markdown.
-pub fn conversation_to_markdown(conversation: &[Message]) -> String {
-    let mut output = String::new();
-
-    for (i, msg) in conversation.iter().enumerate() {
-        if i > 0 {
-            output.push_str("\n---\n\n");
-        }
-
-        let role_label = match msg.role {
-            Role::User => "User",
-            Role::Assistant => "Assistant",
-        };
-
-        match &msg.content {
-            MessageContent::Text(text) => {
-                output.push_str(&format!("### {}\n\n{}\n", role_label, text));
-            }
-            MessageContent::Blocks(blocks) => {
-                output.push_str(&format!("### {}\n\n", role_label));
-                for block in blocks {
-                    match block {
-                        ContentBlock::Text { text } => {
-                            output.push_str(text);
-                            output.push('\n');
-                        }
-                        ContentBlock::ToolUse { id, name, input } => {
-                            let input_display = serde_json::to_string_pretty(input)
-                                .unwrap_or_else(|_| input.to_string());
-                            output.push_str(&format!(
-                                "**Tool: {}** (id: {})\n```json\n{}\n```\n\n",
-                                name, id, input_display
-                            ));
-                        }
-                        ContentBlock::ToolResult {
-                            tool_use_id,
-                            content,
-                            is_error,
-                        } => {
-                            let status = if *is_error == Some(true) {
-                                " [ERROR]"
-                            } else {
-                                ""
-                            };
-                            let display = if content.len() > 2000 {
-                                format!(
-                                    "{}...\n\n[truncated, {} bytes total]",
-                                    &content[..2000],
-                                    content.len()
-                                )
-                            } else {
-                                content.clone()
-                            };
-                            output.push_str(&format!(
-                                "**Tool Result**{} (for: {})\n```\n{}\n```\n\n",
-                                status, tool_use_id, display
-                            ));
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    output
-}
-
-/// Archives directory for conversations.
-fn conversations_dir(root_dir: &Path) -> PathBuf {
-    root_dir.join("archives").join("conversations")
-}
-
-/// Index file path.
-fn index_path(root_dir: &Path) -> PathBuf {
-    conversations_dir(root_dir).join("INDEX.md")
-}
-
-/// Scan for the highest conversation-NNN.md number. Returns 0 if none exist.
-fn highest_log_number(dir: &Path) -> u32 {
-    let entries = match fs::read_dir(dir) {
-        Ok(e) => e,
-        Err(_) => return 0,
-    };
-
-    let mut max = 0u32;
-    for entry in entries.flatten() {
-        let name = entry.file_name();
-        let name = name.to_string_lossy();
-        if let Some(num_str) = name
-            .strip_prefix("conversation-")
-            .and_then(|s| s.strip_suffix(".md"))
-        {
-            if let Ok(n) = num_str.parse::<u32>() {
-                if n > max {
-                    max = n;
-                }
-            }
-        }
-    }
-    max
-}
-
-/// Write a full conversation archive. Returns the path to the created file.
-pub fn archive_conversation(
-    root_dir: &Path,
-    conversation: &[Message],
-    meta: &ArchiveMeta,
-) -> Result<PathBuf, String> {
-    if conversation.is_empty() {
-        return Err("Nothing to archive (empty conversation)".to_string());
-    }
-
-    let conv_dir = conversations_dir(root_dir);
-    fs::create_dir_all(&conv_dir)
-        .map_err(|e| format!("Failed to create conversations archive dir: {e}"))?;
-
-    let next_num = highest_log_number(&conv_dir) + 1;
-    let now = Utc::now();
-    let date_full = now.format("%Y-%m-%dT%H:%M:%SZ").to_string();
-    let date_short = now.format("%Y-%m-%d").to_string();
-    let message_count = conversation.len();
-
-    let conversation_md = conversation_to_markdown(conversation);
-
-    let content = format!(
-        "---\nlog: {next_num}\ndate: \"{date_full}\"\ntrigger: {trigger}\nchannel: {channel}\nentity: \"{entity}\"\nmessage_count: {message_count}\n---\n\n# Conversation {next_num:03}\n\n{conversation_md}",
-        trigger = meta.trigger,
-        channel = meta.channel,
-        entity = meta.entity_name,
-    );
-
-    let log_path = conv_dir.join(format!("conversation-{next_num:03}.md"));
-    fs::write(&log_path, &content)
-        .map_err(|e| format!("Failed to write conversation archive: {e}"))?;
-
-    append_index(
-        root_dir,
-        next_num,
-        &date_short,
-        &meta.trigger,
-        &meta.channel,
-        message_count,
-    )?;
-
-    Ok(log_path)
-}
-
-/// Append an entry to INDEX.md. Creates it if missing.
-fn append_index(
-    root_dir: &Path,
-    log_num: u32,
-    date: &str,
-    trigger: &str,
-    channel: &str,
-    message_count: usize,
-) -> Result<(), String> {
-    let idx = index_path(root_dir);
-
-    if !idx.exists() {
-        fs::write(
-            &idx,
-            "# Conversation Archive Index\n\n| Log | Date | Trigger | Channel | Messages |\n|-----|------|---------|---------|----------|\n",
-        )
-        .map_err(|e| format!("Failed to create INDEX.md: {e}"))?;
-    }
-
-    let mut file = fs::OpenOptions::new()
-        .append(true)
-        .open(&idx)
-        .map_err(|e| format!("Failed to open INDEX.md: {e}"))?;
-
-    writeln!(
-        file,
-        "| {log_num:03} | {date} | {trigger} | {channel} | {message_count} |"
-    )
-    .map_err(|e| format!("Failed to write to INDEX.md: {e}"))?;
-
-    Ok(())
-}
-
-/// Full session-end routine: archive conversation + write EPHEMERAL summary.
-pub fn end_session(
+/// Full session-end routine: archive conversation via recall-echo + EPHEMERAL FIFO.
+pub async fn end_session(
     root_dir: &Path,
     entity_name: &str,
     conversation: &[Message],
-    channel: &str,
+    _channel: &str,
     trigger: &str,
+    provider: Option<&dyn LmProvider>,
 ) {
     if conversation.is_empty() {
         return;
     }
 
-    // Path 1: Archive full conversation
-    let meta = ArchiveMeta {
-        trigger: trigger.to_string(),
-        channel: channel.to_string(),
+    let memory_dir = root_dir.join("memory");
+    if !memory_dir.exists() {
+        tracing::warn!("memory/ directory not found — skipping archive");
+        return;
+    }
+
+    let now = recall_echo::conversation::utc_now();
+    let metadata = recall_echo::SessionMetadata {
+        session_id: format!("{}-{}", trigger, &now[..19].replace(':', "")),
+        started_at: None,
+        ended_at: Some(now),
         entity_name: entity_name.to_string(),
     };
 
-    match archive_conversation(root_dir, conversation, &meta) {
-        Ok(path) => {
-            tracing::info!("Conversation archived to {}", path.display());
+    match recall_echo::archive::archive_session(&memory_dir, conversation, &metadata, provider)
+        .await
+    {
+        Ok(num) => {
+            tracing::info!("Archived conversation-{:03}.md via recall-echo", num);
         }
         Err(e) => {
             tracing::warn!("Failed to archive conversation: {}", e);
         }
-    }
-
-    // Path 2: Write lightweight EPHEMERAL summary
-    write_ephemeral_summary(root_dir, entity_name, conversation);
-}
-
-/// Write a lightweight session summary to memory/EPHEMERAL.md.
-fn write_ephemeral_summary(root_dir: &Path, entity_name: &str, conversation: &[Message]) {
-    if conversation.is_empty() {
-        return;
-    }
-
-    let ephemeral_path = root_dir.join("memory").join("EPHEMERAL.md");
-    let now = Utc::now().format("%Y-%m-%d %H:%M UTC");
-
-    let user_messages: Vec<&str> = conversation
-        .iter()
-        .filter_map(|m| {
-            if matches!(m.role, Role::User) {
-                if let MessageContent::Text(ref t) = m.content {
-                    Some(t.as_str())
-                } else {
-                    None
-                }
-            } else {
-                None
-            }
-        })
-        .collect();
-
-    let topics: Vec<&str> = user_messages.iter().take(5).copied().collect();
-
-    let mut content = format!("## Chat Session — {}\n\n", now);
-    content.push_str(&format!(
-        "Conversation with {} ({} messages)\n\n",
-        entity_name,
-        conversation.len()
-    ));
-    content.push_str("### Topics discussed\n\n");
-    for topic in &topics {
-        let display = if topic.len() > 80 {
-            format!("{}...", &topic[..77])
-        } else {
-            topic.to_string()
-        };
-        content.push_str(&format!("- {}\n", display));
-    }
-    if user_messages.len() > 5 {
-        content.push_str(&format!("- ...and {} more\n", user_messages.len() - 5));
-    }
-
-    if let Err(e) = fs::write(&ephemeral_path, content) {
-        tracing::warn!("Could not save session summary: {}", e);
-    } else {
-        println!("  \x1b[2msession saved to EPHEMERAL.md\x1b[0m");
     }
 }
 
@@ -280,6 +45,73 @@ fn write_ephemeral_summary(root_dir: &Path, entity_name: &str, conversation: &[M
 mod tests {
     use super::*;
     use echo_system_types::llm::{ContentBlock, Message, MessageContent, Role};
+
+    /// Serialize a conversation to grep-searchable markdown.
+    fn conversation_to_markdown(conversation: &[Message]) -> String {
+        let mut output = String::new();
+
+        for (i, msg) in conversation.iter().enumerate() {
+            if i > 0 {
+                output.push_str("\n---\n\n");
+            }
+
+            let role_label = match msg.role {
+                Role::User => "User",
+                Role::Assistant => "Assistant",
+            };
+
+            match &msg.content {
+                MessageContent::Text(text) => {
+                    output.push_str(&format!("### {}\n\n{}\n", role_label, text));
+                }
+                MessageContent::Blocks(blocks) => {
+                    output.push_str(&format!("### {}\n\n", role_label));
+                    for block in blocks {
+                        match block {
+                            ContentBlock::Text { text } => {
+                                output.push_str(text);
+                                output.push('\n');
+                            }
+                            ContentBlock::ToolUse { id, name, input } => {
+                                let input_display = serde_json::to_string_pretty(input)
+                                    .unwrap_or_else(|_| input.to_string());
+                                output.push_str(&format!(
+                                    "**Tool: {}** (id: {})\n```json\n{}\n```\n\n",
+                                    name, id, input_display
+                                ));
+                            }
+                            ContentBlock::ToolResult {
+                                tool_use_id,
+                                content,
+                                is_error,
+                            } => {
+                                let status = if *is_error == Some(true) {
+                                    " [ERROR]"
+                                } else {
+                                    ""
+                                };
+                                let display = if content.len() > 2000 {
+                                    format!(
+                                        "{}...\n\n[truncated, {} bytes total]",
+                                        &content[..2000],
+                                        content.len()
+                                    )
+                                } else {
+                                    content.clone()
+                                };
+                                output.push_str(&format!(
+                                    "**Tool Result**{} (for: {})\n```\n{}\n```\n\n",
+                                    status, tool_use_id, display
+                                ));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        output
+    }
 
     #[test]
     fn empty_conversation_produces_empty_markdown() {
@@ -365,76 +197,45 @@ mod tests {
         assert!(md.contains("[ERROR]"));
     }
 
-    #[test]
-    fn archive_conversation_creates_file_and_index() {
+    #[tokio::test]
+    async fn end_session_with_empty_conversation_is_noop() {
         let tmp = tempfile::tempdir().unwrap();
-        let root = tmp.path();
-        fs::create_dir_all(root.join("archives/conversations")).unwrap();
-
-        let conversation = vec![Message {
-            role: Role::User,
-            content: MessageContent::Text("test".into()),
-        }];
-        let meta = ArchiveMeta {
-            trigger: "session-end".into(),
-            channel: "repl".into(),
-            entity_name: "TestEntity".into(),
-        };
-
-        let path = archive_conversation(root, &conversation, &meta).unwrap();
-        assert!(path.exists());
-
-        let content = fs::read_to_string(&path).unwrap();
-        assert!(content.starts_with("---\n"));
-        assert!(content.contains("log: 1"));
-        assert!(content.contains("trigger: session-end"));
-        assert!(content.contains("channel: repl"));
-        assert!(content.contains("message_count: 1"));
-        assert!(content.contains("# Conversation 001"));
-
-        let idx = root.join("archives/conversations/INDEX.md");
-        assert!(idx.exists());
-        let index_content = fs::read_to_string(&idx).unwrap();
-        assert!(index_content.contains("| 001 |"));
+        end_session(tmp.path(), "Test", &[], "repl", "session-end", None).await;
+        // Should not create any files
     }
 
-    #[test]
-    fn archive_sequences_correctly() {
+    #[tokio::test]
+    async fn end_session_archives_via_recall_echo() {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path();
-        fs::create_dir_all(root.join("archives/conversations")).unwrap();
-        fs::write(
-            root.join("archives/conversations/conversation-003.md"),
-            "old",
-        )
-        .unwrap();
 
-        let conversation = vec![Message {
-            role: Role::User,
-            content: MessageContent::Text("test".into()),
-        }];
-        let meta = ArchiveMeta {
-            trigger: "session-end".into(),
-            channel: "repl".into(),
-            entity_name: "Test".into(),
-        };
+        // Initialize recall-echo memory structure
+        recall_echo::init::run(root).unwrap();
 
-        let path = archive_conversation(root, &conversation, &meta).unwrap();
-        assert!(path.to_string_lossy().contains("conversation-004.md"));
-    }
-
-    #[test]
-    fn empty_conversation_returns_error() {
-        let tmp = tempfile::tempdir().unwrap();
-        let result = archive_conversation(
-            tmp.path(),
-            &[],
-            &ArchiveMeta {
-                trigger: "session-end".into(),
-                channel: "repl".into(),
-                entity_name: "Test".into(),
+        let conversation = vec![
+            Message {
+                role: Role::User,
+                content: MessageContent::Text("What is Rust?".into()),
             },
-        );
-        assert!(result.is_err());
+            Message {
+                role: Role::Assistant,
+                content: MessageContent::Text("Rust is a systems programming language.".into()),
+            },
+        ];
+
+        end_session(root, "Nova", &conversation, "repl", "session-end", None).await;
+
+        // Check conversation file was created
+        assert!(root
+            .join("memory/conversations/conversation-001.md")
+            .exists());
+
+        // Check EPHEMERAL.md was updated
+        let ephemeral = std::fs::read_to_string(root.join("memory/EPHEMERAL.md")).unwrap();
+        assert!(!ephemeral.trim().is_empty());
+
+        // Check ARCHIVE.md index was updated
+        let archive = std::fs::read_to_string(root.join("memory/ARCHIVE.md")).unwrap();
+        assert!(archive.contains("001"));
     }
 }

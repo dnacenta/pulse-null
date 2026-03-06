@@ -61,7 +61,7 @@ vigil-echo = { git = "https://github.com/dnacenta/vigil-echo", branch = "develop
 praxis-echo = { git = "https://github.com/dnacenta/praxis-echo", branch = "development" }
 chat-echo = { git = "https://github.com/dnacenta/chat-echo", branch = "development" }
 bridge-echo = { git = "https://github.com/dnacenta/bridge-echo", branch = "development" }
-recall-echo = { git = "https://github.com/dnacenta/recall-echo", branch = "development" }
+recall-echo = { git = "https://github.com/dnacenta/recall-echo", branch = "feat/v2.0-pulse-null" }
 pulse-echo = { git = "https://github.com/dnacenta/pulse-echo", branch = "development" }
 
 # Plugins (optional — different interfaces to speak through)

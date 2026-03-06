@@ -206,7 +206,7 @@ pub async fn start(config: Config) -> Result<(), Box<dyn std::error::Error>> {
         .with_graceful_shutdown(shutdown)
         .await?;
 
-    // Archive conversation on shutdown
+    // Archive conversation on shutdown via recall-echo
     {
         let conversation = state.conversation.read().await;
         if !conversation.is_empty() {
@@ -216,7 +216,9 @@ pub async fn start(config: Config) -> Result<(), Box<dyn std::error::Error>> {
                 &conversation,
                 "http",
                 "server-shutdown",
-            );
+                Some(state.provider.as_ref()),
+            )
+            .await;
         }
     }
 

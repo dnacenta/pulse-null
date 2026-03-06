@@ -183,8 +183,16 @@ pub async fn run(
         }
     }
 
-    // Archive full conversation + write EPHEMERAL summary
-    crate::session::end_session(root_dir, entity_name, &conversation, "repl", "session-end");
+    // Archive conversation via recall-echo
+    crate::session::end_session(
+        root_dir,
+        entity_name,
+        &conversation,
+        "repl",
+        "session-end",
+        Some(provider),
+    )
+    .await;
 
     Ok(())
 }
