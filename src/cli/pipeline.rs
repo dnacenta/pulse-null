@@ -1,6 +1,7 @@
 use console::style;
 
 use echo_system_types::monitoring::{DocumentHealth, PipelineMonitor, ThresholdStatus};
+use praxis_echo::calibrate;
 use praxis_echo::runtime::PraxisMonitor;
 
 use crate::config::Config;
@@ -102,6 +103,39 @@ pub async fn stale_cmd() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     println!();
+    Ok(())
+}
+
+pub async fn calibrate_cmd() -> Result<(), Box<dyn std::error::Error>> {
+    let config = Config::load()?;
+    let root_dir = config.root_dir()?;
+
+    if !config.pipeline.enabled {
+        println!("Pipeline monitoring is disabled.");
+        return Ok(());
+    }
+
+    let thresholds = config.pipeline.to_thresholds();
+    let claude_dir = root_dir.join("monitoring");
+
+    let report = calibrate::run(&claude_dir, &root_dir, &thresholds)
+        .map_err(|e| format!("Calibration failed: {e}"))?;
+
+    if report.recommendations.is_empty() && report.sample_size == 0 {
+        println!();
+        println!(
+            "  {} No calibration data yet. Pipeline history is recorded on each pulse.",
+            style("i").cyan()
+        );
+        println!("  Run some sessions first, then try again.");
+        println!();
+        return Ok(());
+    }
+
+    println!();
+    println!("{}", calibrate::render_report(&report));
+    println!();
+
     Ok(())
 }
 

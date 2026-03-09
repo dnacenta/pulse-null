@@ -109,6 +109,8 @@ enum PipelineAction {
     Health,
     /// List stale documents that need attention
     Stale,
+    /// Analyze thresholds and recommend adjustments
+    Calibrate,
 }
 
 #[derive(Subcommand)]
@@ -243,6 +245,7 @@ async fn main() {
             let result = match action {
                 PipelineAction::Health => cli::pipeline::health_cmd().await,
                 PipelineAction::Stale => cli::pipeline::stale_cmd().await,
+                PipelineAction::Calibrate => cli::pipeline::calibrate_cmd().await,
             };
             if let Err(e) = result {
                 eprintln!("Error: {e}");

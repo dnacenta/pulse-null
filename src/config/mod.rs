@@ -236,6 +236,7 @@ pub struct PipelineConfig {
     pub thoughts_staleness_days: u32,
     pub curiosity_staleness_days: u32,
     pub freeze_threshold: u32,
+    pub pulse_cooldown_secs: u64,
 }
 
 impl PipelineConfig {
@@ -273,6 +274,7 @@ impl Default for PipelineConfig {
             thoughts_staleness_days: 7,
             curiosity_staleness_days: 14,
             freeze_threshold: 3,
+            pulse_cooldown_secs: 60,
         }
     }
 }
