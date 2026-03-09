@@ -3,6 +3,7 @@ use std::path::Path;
 
 use echo_system_types::llm::{ContentBlock, LmProvider, Message, MessageContent, Role, StopReason};
 
+use super::theme::Theme;
 use crate::chat;
 use crate::config::Config;
 use crate::tools::ToolRegistry;
@@ -18,14 +19,16 @@ pub async fn run(
     tools: &ToolRegistry,
     system_prompt: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    let theme = Theme::nord();
     let mut conversation: Vec<Message> = Vec::new();
     let stdin = io::stdin();
     let entity_name = &config.entity.name;
     let plugin_count = config.plugins.len();
+    let r = theme.reset;
 
     loop {
         // Prompt
-        print!("  you \u{203a} ");
+        print!("  {}you{} \u{203a} ", theme.user_prompt, r);
         io::stdout().flush()?;
 
         // Read input
@@ -96,7 +99,7 @@ pub async fn run(
             {
                 Ok(r) => r,
                 Err(e) => {
-                    eprintln!("  \x1b[31merror\x1b[0m  {}", e);
+                    eprintln!("  {}error{}  {}", theme.error, r, e);
                     println!();
                     break;
                 }
@@ -113,7 +116,7 @@ pub async fn run(
                     // Print the response
                     let text = result.text();
                     if !text.is_empty() {
-                        print_response(entity_name, &text);
+                        print_response(entity_name, &text, &theme);
                     }
                     break;
                 }
@@ -122,7 +125,7 @@ pub async fn run(
                     if rounds > MAX_TOOL_ROUNDS {
                         let text = result.text();
                         if !text.is_empty() {
-                            print_response(entity_name, &text);
+                            print_response(entity_name, &text, &theme);
                         }
                         break;
                     }
@@ -132,7 +135,7 @@ pub async fn run(
                     for block in &result.content {
                         if let ContentBlock::ToolUse { id, name, input } = block {
                             // Print tool indicator
-                            print_tool_indicator(name, input);
+                            print_tool_indicator(name, input, &theme);
 
                             let tool_result = match tools.get(name) {
                                 Some(tool) => match tool.execute(input.clone()).await {
@@ -159,7 +162,7 @@ pub async fn run(
                         // Also print any text blocks that come with tool use
                         if let ContentBlock::Text { text } = block {
                             if !text.is_empty() {
-                                print_response(entity_name, text);
+                                print_response(entity_name, text, &theme);
                             }
                         }
                     }
@@ -173,9 +176,12 @@ pub async fn run(
                 StopReason::Other(ref reason) => {
                     let text = result.text();
                     if !text.is_empty() {
-                        print_response(entity_name, &text);
+                        print_response(entity_name, &text, &theme);
                     } else {
-                        eprintln!("  \x1b[33mwarning\x1b[0m  unexpected stop: {}", reason);
+                        eprintln!(
+                            "  {}warning{}  unexpected stop: {}",
+                            theme.warning, r, reason
+                        );
                     }
                     break;
                 }
@@ -198,7 +204,7 @@ pub async fn run(
 }
 
 /// Print a tool execution indicator (dimmed).
-fn print_tool_indicator(name: &str, input: &serde_json::Value) {
+fn print_tool_indicator(name: &str, input: &serde_json::Value, theme: &Theme) {
     let detail = match name {
         "file_read" => input
             .get("path")
@@ -227,13 +233,14 @@ fn print_tool_indicator(name: &str, input: &serde_json::Value) {
             .unwrap_or_else(|| "fetching web page...".into()),
         _ => format!("{}...", name),
     };
-    // Dim gray
-    println!("  \x1b[2m[{}]\x1b[0m", detail);
+    println!("  {}[{}]{}", theme.dim, detail, theme.reset);
 }
 
 /// Print entity response with name label.
-fn print_response(entity_name: &str, text: &str) {
-    // Cyan entity name, then wrapped text
-    println!("  \x1b[36m{}\x1b[0m \u{203a} {}", entity_name, text);
+fn print_response(entity_name: &str, text: &str, theme: &Theme) {
+    println!(
+        "  {}{}{} \u{203a} {}",
+        theme.entity_name, entity_name, theme.reset, text
+    );
     println!();
 }
