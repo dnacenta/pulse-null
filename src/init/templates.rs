@@ -78,6 +78,7 @@ praxis_hard = 10
 thoughts_staleness_days = 7
 curiosity_staleness_days = 14
 freeze_threshold = 3
+pulse_cooldown_secs = 60
 
 [monitoring]
 enabled = true

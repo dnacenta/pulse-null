@@ -42,7 +42,37 @@ impl PluginManager {
         let mut plugins: Vec<Box<dyn Plugin>> = Vec::new();
 
         for (plugin_name, plugin_config) in &config.plugins {
-            match registry::create_plugin(plugin_name, plugin_config, &ctx).await {
+            // Inject pipeline config values into praxis-echo's plugin config
+            // so it receives thresholds from the single [pipeline] source of truth.
+            let enriched_config = if plugin_name == "praxis-echo" {
+                let mut c = plugin_config.clone();
+                if let toml::Value::Table(ref mut table) = c {
+                    table
+                        .entry("thoughts_staleness_days")
+                        .or_insert(toml::Value::Integer(
+                            config.pipeline.thoughts_staleness_days as i64,
+                        ));
+                    table
+                        .entry("curiosity_staleness_days")
+                        .or_insert(toml::Value::Integer(
+                            config.pipeline.curiosity_staleness_days as i64,
+                        ));
+                    table
+                        .entry("freeze_threshold")
+                        .or_insert(toml::Value::Integer(
+                            config.pipeline.freeze_threshold as i64,
+                        ));
+                    table
+                        .entry("pulse_cooldown_secs")
+                        .or_insert(toml::Value::Integer(
+                            config.pipeline.pulse_cooldown_secs as i64,
+                        ));
+                }
+                c
+            } else {
+                plugin_config.clone()
+            };
+            match registry::create_plugin(plugin_name, &enriched_config, &ctx).await {
                 Ok(Some(plugin)) => {
                     tracing::info!("Loaded plugin: {} v{}", plugin_name, plugin.meta().version);
                     plugins.push(plugin);
