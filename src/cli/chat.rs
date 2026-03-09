@@ -1,17 +1,13 @@
 use crate::chat;
-use crate::claude_provider::ClaudeProvider;
 use crate::config::Config;
+use crate::providers;
 use crate::server::prompt;
 use crate::tools::ToolRegistry;
 
 pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let config = Config::load()?;
 
-    let api_key = config
-        .resolve_api_key()
-        .ok_or("No API key found. Set it in pulse-null.toml or PULSE_NULL_API_KEY env var.")?;
-
-    let provider = ClaudeProvider::new(api_key, config.llm.model.clone());
+    let provider = providers::create_provider(&config)?;
 
     // Build system prompt from identity documents
     let root_dir = config.root_dir()?;
@@ -38,5 +34,12 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
     chat::banner::render(&config, &root_dir, plugin_count);
 
     // Enter REPL
-    chat::repl::run(&config, &root_dir, &provider, &tools, &system_prompt).await
+    chat::repl::run(
+        &config,
+        &root_dir,
+        provider.as_ref(),
+        &tools,
+        &system_prompt,
+    )
+    .await
 }

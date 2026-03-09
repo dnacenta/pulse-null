@@ -260,6 +260,7 @@ mod tests {
                 api_key: None,
                 model: "test".into(),
                 max_tokens: 1024,
+                base_url: None,
                 context_budget: 0,
             },
             security: SecurityConfig {
