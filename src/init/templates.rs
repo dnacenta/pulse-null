@@ -42,6 +42,7 @@ provider = "{provider}"
 {api_key_line}
 model = "claude-sonnet-4-20250514"
 max_tokens = 4096
+# base_url = "http://localhost:11434"  # Override for Ollama or custom endpoints
 
 [security]
 # secret = "generate-a-strong-secret-here"
