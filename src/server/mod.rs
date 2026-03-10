@@ -58,7 +58,7 @@ pub async fn start(config: Config) -> Result<(), Box<dyn std::error::Error>> {
     };
 
     let outcome_tracker: Option<Arc<dyn OutcomeTracker>> = if config.pulse.enabled {
-        Some(Arc::new(pulse_echo::runtime::PulseTracker::new()))
+        Some(Arc::new(caliber_echo::runtime::PulseTracker::new()))
     } else {
         None
     };

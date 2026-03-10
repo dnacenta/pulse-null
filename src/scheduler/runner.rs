@@ -299,7 +299,7 @@ async fn execute_task(
     // Log to LOGBOOK.md
     log_execution(&root_dir, task, &parsed.clean_content);
 
-    // Record outcome for pulse-echo
+    // Record outcome for caliber-echo
     if let Some(ref tracker) = state.outcome_tracker {
         let outcome = tracker.build_outcome(
             &task.id,
