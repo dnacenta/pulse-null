@@ -3,21 +3,21 @@ use std::pin::Pin;
 
 use super::{Plugin, PluginContext, PluginHealth, PluginMeta, PluginResult, SetupPrompt};
 
-/// Adapter wrapping the pulse-echo crate's `PulseEcho` struct.
-pub struct PulseEchoPlugin {
-    inner: Option<pulse_echo::PulseEcho>,
+/// Adapter wrapping the caliber-echo crate's `CaliberEcho` struct.
+pub struct CaliberEchoPlugin {
+    inner: Option<caliber_echo::CaliberEcho>,
 }
 
-impl PulseEchoPlugin {
+impl CaliberEchoPlugin {
     pub fn new() -> Self {
         Self { inner: None }
     }
 }
 
-impl Plugin for PulseEchoPlugin {
+impl Plugin for CaliberEchoPlugin {
     fn meta(&self) -> PluginMeta {
         PluginMeta {
-            name: "pulse-echo".to_string(),
+            name: "caliber-echo".to_string(),
             version: env!("CARGO_PKG_VERSION").to_string(),
             description: "Operational self-model and outcome tracking".to_string(),
         }
@@ -37,8 +37,8 @@ impl Plugin for PulseEchoPlugin {
                 .map(std::path::PathBuf::from)
                 .unwrap_or_else(|| ctx.entity_root.clone());
 
-            tracing::info!("pulse-echo: docs_dir = {}", docs_dir.display());
-            self.inner = Some(pulse_echo::PulseEcho::new(docs_dir));
+            tracing::info!("caliber-echo: docs_dir = {}", docs_dir.display());
+            self.inner = Some(caliber_echo::CaliberEcho::new(docs_dir));
             Ok(())
         })
     }
@@ -61,7 +61,7 @@ impl Plugin for PulseEchoPlugin {
     }
 
     fn setup_prompts(&self) -> Vec<SetupPrompt> {
-        pulse_echo::PulseEcho::setup_prompts()
+        caliber_echo::CaliberEcho::setup_prompts()
     }
 }
 
@@ -71,21 +71,21 @@ mod tests {
 
     #[test]
     fn meta_returns_correct_info() {
-        let plugin = PulseEchoPlugin::new();
+        let plugin = CaliberEchoPlugin::new();
         let meta = plugin.meta();
-        assert_eq!(meta.name, "pulse-echo");
+        assert_eq!(meta.name, "caliber-echo");
     }
 
     #[test]
     fn setup_prompts_not_empty() {
-        let plugin = PulseEchoPlugin::new();
+        let plugin = CaliberEchoPlugin::new();
         let prompts = plugin.setup_prompts();
         assert!(!prompts.is_empty());
     }
 
     #[tokio::test]
     async fn health_before_init_is_down() {
-        let plugin = PulseEchoPlugin::new();
+        let plugin = CaliberEchoPlugin::new();
         let health = plugin.health().await;
         assert!(matches!(health, PluginHealth::Down(_)));
     }

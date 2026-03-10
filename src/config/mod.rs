@@ -361,7 +361,7 @@ impl Default for EventsConfig {
     }
 }
 
-/// Configuration for pulse-echo outcome tracking
+/// Configuration for caliber-echo outcome tracking
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct PulseConfig {

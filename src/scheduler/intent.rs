@@ -620,7 +620,7 @@ async fn execute_intent(
     // Log to LOGBOOK.md
     log_intent_execution(&root_dir, intent, &parsed.clean_content);
 
-    // Record outcome for pulse-echo
+    // Record outcome for caliber-echo
     if let Some(ref tracker) = state.outcome_tracker {
         let outcome = tracker.build_outcome(
             &intent.id,
