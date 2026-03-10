@@ -15,7 +15,6 @@ use axum::routing::{get, post};
 use axum::Router;
 use tokio::sync::RwLock;
 
-use crate::claude_provider::ClaudeProvider;
 use crate::config::Config;
 use crate::events::EventBus;
 use crate::pidfile;
@@ -41,14 +40,7 @@ pub struct AppState {
 }
 
 pub async fn start(config: Config) -> Result<(), Box<dyn std::error::Error>> {
-    let api_key = config
-        .resolve_api_key()
-        .ok_or("No API key found. Set it in pulse-null.toml or ANTHROPIC_API_KEY env var.")?;
-
-    let provider = Box::new(ClaudeProvider::new(
-        api_key.clone(),
-        config.llm.model.clone(),
-    ));
+    let provider = crate::providers::create_provider(&config)?;
 
     let root_dir = config.root_dir()?;
 
@@ -99,10 +91,7 @@ pub async fn start(config: Config) -> Result<(), Box<dyn std::error::Error>> {
     // Initialize and start plugins
     let mut plugin_manager = PluginManager::new(&config);
     if plugin_manager.count() > 0 {
-        let plugin_provider: Arc<Box<dyn LmProvider>> = Arc::new(Box::new(ClaudeProvider::new(
-            api_key,
-            config.llm.model.clone(),
-        )));
+        let plugin_provider = crate::providers::create_provider_arc(&config)?;
         plugin_manager
             .init_all(&config, &root_dir, plugin_provider)
             .await?;

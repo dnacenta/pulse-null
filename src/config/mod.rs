@@ -55,6 +55,9 @@ pub struct LlmConfig {
     pub model: String,
     #[serde(default = "default_max_tokens")]
     pub max_tokens: u32,
+    /// Base URL for the LLM API (used by Ollama; defaults to http://localhost:11434).
+    #[serde(default)]
+    pub base_url: Option<String>,
     /// Maximum estimated tokens in conversation before compaction triggers (0 = default 150k).
     #[serde(default)]
     pub context_budget: usize,
