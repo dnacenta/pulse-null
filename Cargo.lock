@@ -303,10 +303,10 @@ dependencies = [
 [[package]]
 name = "bridge-echo"
 version = "0.3.0"
-source = "git+https://github.com/dnacenta/bridge-echo?branch=development#8a1cccbc59a57b585fe73d1eeedd3825f316ed55"
+source = "git+https://github.com/dnacenta/bridge-echo?tag=v0.4.0#cd92f3962a3c9488f894d8208b8c346a461e5a58"
 dependencies = [
  "axum",
- "echo-system-types 0.3.0",
+ "echo-system-types",
  "regex",
  "reqwest",
  "serde",
@@ -349,6 +349,18 @@ name = "bytes"
 version = "1.11.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1e748733b7cbc798e1434b6ac524f0c1ff2ab456fe201501e6497c8417a4fc33"
+
+[[package]]
+name = "caliber-echo"
+version = "0.2.0"
+source = "git+https://github.com/dnacenta/caliber-echo?tag=v0.3.0#402d225e9ab1661be93f964bbbaf7c1c23b013d4"
+dependencies = [
+ "chrono",
+ "dirs",
+ "echo-system-types",
+ "serde",
+ "serde_json",
+]
 
 [[package]]
 name = "cc"
@@ -405,10 +417,10 @@ dependencies = [
 [[package]]
 name = "chat-echo"
 version = "0.2.2"
-source = "git+https://github.com/dnacenta/chat-echo?branch=development#db49c536e3dbf8248cf60f47da6613f16d978765"
+source = "git+https://github.com/dnacenta/chat-echo?tag=v0.3.0#4a1683a90cfc4280a4cb36b865f77e57053a507a"
 dependencies = [
  "axum",
- "echo-system-types 0.3.0",
+ "echo-system-types",
  "futures-util",
  "reqwest",
  "serde",
@@ -905,9 +917,9 @@ dependencies = [
 [[package]]
 name = "discord-echo"
 version = "0.1.0"
-source = "git+https://github.com/dnacenta/discord-echo?tag=v0.1.0#f03166b5ed1dfadd50c3c590c4991518b00e0643"
+source = "git+https://github.com/dnacenta/discord-echo?tag=v0.2.0#ce98d9fb2acefae8972dd42eda6f054891199d8d"
 dependencies = [
- "echo-system-types 0.2.0",
+ "echo-system-types",
  "futures-util",
  "reqwest",
  "serde",
@@ -920,12 +932,12 @@ dependencies = [
 [[package]]
 name = "discord-voice-echo"
 version = "0.2.0"
-source = "git+https://github.com/dnacenta/discord-voice-echo?branch=development#8f8a115135f50460d5d68d640c97af06860c94df"
+source = "git+https://github.com/dnacenta/discord-voice-echo?tag=v0.3.0#0581fc064650fe7be3f25a4c2747267a6efce088"
 dependencies = [
  "async-trait",
  "base64",
  "dotenvy",
- "echo-system-types 0.2.0",
+ "echo-system-types",
  "futures-util",
  "hound",
  "rubato 1.0.1",
@@ -985,17 +997,8 @@ dependencies = [
 
 [[package]]
 name = "echo-system-types"
-version = "0.2.0"
-source = "git+https://github.com/dnacenta/echo-system-types?tag=v0.2.0#acbadc847e4af646025d67b968330c07083a0d96"
-dependencies = [
- "serde",
- "serde_json",
-]
-
-[[package]]
-name = "echo-system-types"
-version = "0.3.0"
-source = "git+https://github.com/dnacenta/echo-system-types?tag=v0.3.0#ad901031f50fe6f0bef5a9476bbc97a778d00124"
+version = "0.4.0"
+source = "git+https://github.com/dnacenta/echo-system-types?branch=main#2b4a1bdaab4baff0ffa6df44de039e01aece9805"
 dependencies = [
  "serde",
  "serde_json",
@@ -2865,11 +2868,11 @@ dependencies = [
 [[package]]
 name = "praxis-echo"
 version = "0.3.0"
-source = "git+https://github.com/dnacenta/praxis-echo?branch=development#099e69ace1a38ea914d9839d14ea3b14289b48b0"
+source = "git+https://github.com/dnacenta/praxis-echo?tag=v0.4.0#e15586ab6b3d7449e6f12f0d38bab0b36c0620a9"
 dependencies = [
  "clap",
  "dirs",
- "echo-system-types 0.3.0",
+ "echo-system-types",
  "serde",
  "serde_json",
 ]
@@ -2934,23 +2937,12 @@ dependencies = [
 ]
 
 [[package]]
-name = "pulse-echo"
-version = "0.2.0"
-source = "git+https://github.com/dnacenta/pulse-echo?branch=development#08e01d1fc7c77e1769717ac13d8e941a2efdb5fe"
-dependencies = [
- "chrono",
- "dirs",
- "echo-system-types 0.3.0",
- "serde",
- "serde_json",
-]
-
-[[package]]
 name = "pulse-null"
-version = "0.10.0"
+version = "0.11.0"
 dependencies = [
  "axum",
  "bridge-echo",
+ "caliber-echo",
  "chat-echo",
  "chrono",
  "chrono-tz",
@@ -2960,11 +2952,10 @@ dependencies = [
  "dialoguer",
  "discord-echo",
  "discord-voice-echo",
- "echo-system-types 0.3.0",
+ "echo-system-types",
  "globset",
  "libc",
  "praxis-echo",
- "pulse-echo",
  "recall-echo",
  "regex",
  "reqwest",
@@ -3148,12 +3139,12 @@ dependencies = [
 
 [[package]]
 name = "recall-echo"
-version = "1.0.0"
-source = "git+https://github.com/dnacenta/recall-echo?branch=development#f9ee77a733403bf9d63fb2b4e6306587032b72fb"
+version = "2.0.0"
+source = "git+https://github.com/dnacenta/recall-echo?tag=v2.1.0#fa9124972f093757ecb58c360e8da07b9235129f"
 dependencies = [
  "clap",
  "dirs",
- "echo-system-types 0.3.0",
+ "echo-system-types",
  "serde",
  "serde_json",
 ]
@@ -4923,11 +4914,11 @@ checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
 [[package]]
 name = "vigil-echo"
 version = "0.3.0"
-source = "git+https://github.com/dnacenta/vigil-echo?branch=development#208986acf5d28ce722205962a2b227662b9ccd69"
+source = "git+https://github.com/dnacenta/vigil-echo?tag=v0.4.0#736d1a9441c1b38bd207da7fcac2077b80f8c6ea"
 dependencies = [
  "clap",
  "dirs",
- "echo-system-types 0.3.0",
+ "echo-system-types",
  "owo-colors",
  "serde",
  "serde_json",
@@ -4948,14 +4939,14 @@ dependencies = [
 [[package]]
 name = "voice-echo"
 version = "0.7.0"
-source = "git+https://github.com/dnacenta/voice-echo?branch=development#06a978e0201f3c6ab39afcb194b9457b08eb78da"
+source = "git+https://github.com/dnacenta/voice-echo?tag=v0.8.0#ff2985c75161445a43014136c4287e9eda073b48"
 dependencies = [
  "axum",
  "base64",
  "bytes",
  "chrono",
  "dotenvy",
- "echo-system-types 0.2.0",
+ "echo-system-types",
  "hound",
  "rand 0.8.5",
  "reqwest",

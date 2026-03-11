@@ -1,6 +1,8 @@
 use std::future::Future;
 use std::pin::Pin;
 
+use echo_system_types::plugin::Plugin as _;
+
 use super::{Plugin, PluginContext, PluginHealth, PluginMeta, PluginResult, SetupPrompt};
 
 /// Adapter wrapping the chat-echo crate's `ChatEcho` struct.
@@ -100,7 +102,7 @@ impl Plugin for ChatEchoPlugin {
     fn health(&self) -> Pin<Box<dyn Future<Output = PluginHealth> + Send + '_>> {
         Box::pin(async move {
             match &self.inner {
-                Some(inner) => inner.health(),
+                Some(inner) => inner.health().await,
                 None => PluginHealth::Down("not initialized".to_string()),
             }
         })
@@ -111,7 +113,11 @@ impl Plugin for ChatEchoPlugin {
     }
 
     fn setup_prompts(&self) -> Vec<SetupPrompt> {
-        chat_echo::ChatEcho::setup_prompts()
+        if let Some(inner) = &self.inner {
+            inner.setup_prompts()
+        } else {
+            Vec::new()
+        }
     }
 }
 

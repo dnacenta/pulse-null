@@ -1,3 +1,4 @@
+use echo_system_types::plugin::Plugin as _;
 use recall_echo::RecallEcho;
 
 use crate::config::Config;
@@ -11,7 +12,7 @@ fn build_recall(config: &Config) -> Result<RecallEcho, Box<dyn std::error::Error
 pub async fn dashboard_cmd() -> Result<(), Box<dyn std::error::Error>> {
     let config = Config::load()?;
     let recall = build_recall(&config)?;
-    let status = recall.health();
+    let status = recall.health().await;
     println!("Memory health: {:?}", status);
     Ok(())
 }

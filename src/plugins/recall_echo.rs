@@ -1,6 +1,8 @@
 use std::future::Future;
 use std::pin::Pin;
 
+use echo_system_types::plugin::Plugin as _;
+
 use super::{Plugin, PluginContext, PluginHealth, PluginMeta, PluginResult, SetupPrompt};
 
 /// Adapter wrapping the recall-echo crate's `RecallEcho` struct.
@@ -53,14 +55,20 @@ impl Plugin for RecallEchoPlugin {
     fn health(&self) -> Pin<Box<dyn Future<Output = PluginHealth> + Send + '_>> {
         Box::pin(async move {
             match &self.inner {
-                Some(inner) => inner.health(),
+                Some(inner) => inner.health().await,
                 None => PluginHealth::Down("not initialized".to_string()),
             }
         })
     }
 
     fn setup_prompts(&self) -> Vec<SetupPrompt> {
-        recall_echo::RecallEcho::setup_prompts()
+        if let Some(inner) = &self.inner {
+            inner.setup_prompts()
+        } else {
+            recall_echo::RecallEcho::from_default()
+                .map(|r| r.setup_prompts())
+                .unwrap_or_default()
+        }
     }
 }
 
