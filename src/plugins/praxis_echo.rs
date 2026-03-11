@@ -1,6 +1,8 @@
 use std::future::Future;
 use std::pin::Pin;
 
+use echo_system_types::plugin::Plugin as _;
+
 use super::{Plugin, PluginContext, PluginHealth, PluginMeta, PluginResult, SetupPrompt};
 
 /// Adapter wrapping the praxis-echo crate's `PraxisEcho` struct.
@@ -48,7 +50,11 @@ impl Plugin for PraxisEchoPlugin {
                 claude_dir.display(),
                 docs_dir.display()
             );
-            self.inner = Some(praxis_echo::PraxisEcho::new(claude_dir, docs_dir));
+            self.inner = Some(praxis_echo::PraxisEcho::new(praxis_echo::PraxisConfig {
+                claude_dir,
+                docs_dir,
+                ..Default::default()
+            }));
             Ok(())
         })
     }
@@ -64,14 +70,20 @@ impl Plugin for PraxisEchoPlugin {
     fn health(&self) -> Pin<Box<dyn Future<Output = PluginHealth> + Send + '_>> {
         Box::pin(async move {
             match &self.inner {
-                Some(inner) => inner.health(),
+                Some(inner) => inner.health().await,
                 None => PluginHealth::Down("not initialized".to_string()),
             }
         })
     }
 
     fn setup_prompts(&self) -> Vec<SetupPrompt> {
-        praxis_echo::PraxisEcho::setup_prompts()
+        if let Some(inner) = &self.inner {
+            inner.setup_prompts()
+        } else {
+            praxis_echo::PraxisEcho::from_default()
+                .map(|r| r.setup_prompts())
+                .unwrap_or_default()
+        }
     }
 }
 

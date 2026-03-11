@@ -54,7 +54,7 @@ chrono = { version = "0.4", features = ["serde"] }
 libc = "0.2"
 
 # Shared types
-echo-system-types = { git = "https://github.com/dnacenta/echo-system-types", tag = "v0.3.0" }
+echo-system-types = { git = "https://github.com/dnacenta/echo-system-types", branch = "main" }
 
 # Core dependencies (always included — these define an entity)
 vigil-echo = { git = "https://github.com/dnacenta/vigil-echo", tag = "v0.4.0" }
