@@ -1,6 +1,7 @@
 use clap::{Parser, Subcommand};
 
 mod chat;
+mod claude_code_provider;
 mod claude_provider;
 mod cli;
 mod config;

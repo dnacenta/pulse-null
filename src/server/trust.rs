@@ -59,6 +59,7 @@ mod tests {
                 model: "test".into(),
                 max_tokens: 1024,
                 base_url: None,
+                claude_bin: None,
                 context_budget: 0,
             },
             security: SecurityConfig {
