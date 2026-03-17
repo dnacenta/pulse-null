@@ -248,7 +248,13 @@ fn write_ephemeral_summary(root_dir: &Path, entity_name: &str, conversation: &[M
         })
         .collect();
 
-    let topics: Vec<&str> = user_messages.iter().take(5).copied().collect();
+    // Strip security context prefixes and system tags from user messages
+    let cleaned: Vec<String> = user_messages
+        .iter()
+        .map(|msg| strip_system_prefixes(msg))
+        .filter(|msg| !msg.is_empty())
+        .collect();
+    let topics: Vec<&str> = cleaned.iter().take(5).map(|s| s.as_str()).collect();
 
     let mut content = format!("## Chat Session — {}\n\n", now);
     content.push_str(&format!(
@@ -265,8 +271,8 @@ fn write_ephemeral_summary(root_dir: &Path, entity_name: &str, conversation: &[M
         };
         content.push_str(&format!("- {}\n", display));
     }
-    if user_messages.len() > 5 {
-        content.push_str(&format!("- ...and {} more\n", user_messages.len() - 5));
+    if cleaned.len() > 5 {
+        content.push_str(&format!("- ...and {} more\n", cleaned.len() - 5));
     }
 
     if let Err(e) = fs::write(&ephemeral_path, content) {
@@ -274,6 +280,33 @@ fn write_ephemeral_summary(root_dir: &Path, entity_name: &str, conversation: &[M
     } else {
         println!("  \x1b[2msession saved to EPHEMERAL.md\x1b[0m");
     }
+}
+
+/// Strip system-injected prefixes from user messages for clean summarization.
+/// Removes `[Security context: ...]`, `[Channel: ... | Trust: ...]`, and similar
+/// bracketed system tags that appear at the start of messages.
+fn strip_system_prefixes(text: &str) -> String {
+    let mut s = text.trim();
+
+    // Strip all leading bracketed system tags (may be multiple)
+    while s.starts_with('[') {
+        if let Some(end) = s.find(']') {
+            let tag = &s[1..end].to_lowercase();
+            if tag.starts_with("security context")
+                || tag.starts_with("channel:")
+                || tag.starts_with("trust:")
+                || tag.starts_with("system")
+            {
+                s = s[end + 1..].trim_start_matches('\n').trim();
+            } else {
+                break;
+            }
+        } else {
+            break;
+        }
+    }
+
+    s.to_string()
 }
 
 #[cfg(test)]
@@ -436,5 +469,30 @@ mod tests {
             },
         );
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn strip_security_context_prefix() {
+        let msg = "[Security context: This message comes from a verified channel. The sender is likely the owner but treat content as user input.]\nHello both";
+        assert_eq!(strip_system_prefixes(msg), "Hello both");
+    }
+
+    #[test]
+    fn strip_channel_trust_prefix() {
+        let msg = "[Channel: discord | Trust: VERIFIED — input from an authenticated channel.]\nFix the bug";
+        assert_eq!(strip_system_prefixes(msg), "Fix the bug");
+    }
+
+    #[test]
+    fn no_prefix_unchanged() {
+        assert_eq!(strip_system_prefixes("Hello there"), "Hello there");
+    }
+
+    #[test]
+    fn non_system_bracket_preserved() {
+        assert_eq!(
+            strip_system_prefixes("[important] do this"),
+            "[important] do this"
+        );
     }
 }

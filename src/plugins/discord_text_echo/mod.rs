@@ -7,6 +7,10 @@ use std::sync::Arc;
 use super::{Plugin, PluginContext, PluginHealth, PluginMeta, PluginResult, SetupPrompt};
 use crate::tools::{Tool, ToolError, ToolResult};
 
+// Bring the external Plugin trait into scope so we can call
+// start/stop/health/setup_prompts on DiscordEcho.
+use echo_system_types::plugin::Plugin as EstPlugin;
+
 /// Adapter wrapping the discord-echo crate for Discord text channels.
 pub struct DiscordTextEchoPlugin {
     inner: Option<discord_echo::DiscordEcho>,
@@ -83,14 +87,17 @@ impl Plugin for DiscordTextEchoPlugin {
     fn health(&self) -> Pin<Box<dyn Future<Output = PluginHealth> + Send + '_>> {
         Box::pin(async move {
             match &self.inner {
-                Some(inner) => inner.health(),
+                Some(inner) => inner.health().await,
                 None => PluginHealth::Down("not initialized".to_string()),
             }
         })
     }
 
     fn setup_prompts(&self) -> Vec<SetupPrompt> {
-        discord_echo::DiscordEcho::setup_prompts()
+        match &self.inner {
+            Some(inner) => EstPlugin::setup_prompts(inner),
+            None => vec![],
+        }
     }
 
     fn tools(&self) -> Vec<Box<dyn Tool>> {
@@ -147,10 +154,10 @@ mod tests {
     }
 
     #[test]
-    fn setup_prompts_not_empty() {
+    fn setup_prompts_empty_before_init() {
         let plugin = DiscordTextEchoPlugin::new();
         let prompts = plugin.setup_prompts();
-        assert!(!prompts.is_empty());
+        assert!(prompts.is_empty());
     }
 
     #[tokio::test]

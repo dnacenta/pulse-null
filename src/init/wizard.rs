@@ -50,8 +50,8 @@ pub async fn run(target_dir: &Path) -> Result<(), Box<dyn std::error::Error>> {
 
     // LLM provider
     let providers = vec![
+        "Claude Code (uses claude CLI — no API key needed)",
         "Claude API (requires Anthropic API key)",
-        "OpenAI API (requires API key)",
         "Ollama (local, requires Ollama running)",
     ];
     let provider_idx = Select::new()
@@ -60,20 +60,57 @@ pub async fn run(target_dir: &Path) -> Result<(), Box<dyn std::error::Error>> {
         .default(0)
         .interact()?;
 
-    let (provider_name, api_key) = match provider_idx {
+    let (provider_name, api_key, model) = match provider_idx {
         0 => {
-            let key: String = Input::new()
-                .with_prompt("  Anthropic API key")
-                .interact_text()?;
-            ("claude".to_string(), Some(key))
+            // Claude Code — check binary exists
+            let claude_bin = std::env::var("CLAUDE_BIN").unwrap_or_else(|_| "claude".into());
+            match std::process::Command::new(&claude_bin)
+                .arg("--version")
+                .output()
+            {
+                Ok(output) if output.status.success() => {
+                    let ver = String::from_utf8_lossy(&output.stdout);
+                    println!("    {} claude found: {}", style("✓").green(), ver.trim());
+                }
+                _ => {
+                    println!(
+                        "    {} claude CLI not found. Install it and run {} first.",
+                        style("⚠").yellow(),
+                        style("claude login").cyan()
+                    );
+                }
+            }
+
+            let models = vec!["opus", "sonnet", "haiku"];
+            let model_idx = Select::new()
+                .with_prompt("  Model")
+                .items(&models)
+                .default(0)
+                .interact()?;
+
+            (
+                "claude-code".to_string(),
+                None,
+                models[model_idx].to_string(),
+            )
         }
         1 => {
             let key: String = Input::new()
-                .with_prompt("  OpenAI API key")
+                .with_prompt("  Anthropic API key")
                 .interact_text()?;
-            ("openai".to_string(), Some(key))
+
+            let model: String = Input::new()
+                .with_prompt("  Model")
+                .default("claude-sonnet-4-20250514".into())
+                .interact_text()?;
+
+            ("claude".to_string(), Some(key), model)
         }
-        2 => ("ollama".to_string(), None),
+        2 => {
+            // Ollama — try to list installed models
+            let model = pick_ollama_model()?;
+            ("ollama".to_string(), None, model)
+        }
         _ => unreachable!(),
     };
 
@@ -143,6 +180,7 @@ pub async fn run(target_dir: &Path) -> Result<(), Box<dyn std::error::Error>> {
         owner_alias: owner_alias.clone(),
         provider: provider_name,
         api_key,
+        model,
         port,
         timezone: timezone.clone(),
         plugins: plugin_configs,
@@ -347,6 +385,60 @@ fn collect_plugin_configs() -> Result<PluginConfigs, Box<dyn std::error::Error>>
     }
 
     Ok(plugin_configs)
+}
+
+fn pick_ollama_model() -> Result<String, Box<dyn std::error::Error>> {
+    // Try `ollama list` to get installed models
+    match std::process::Command::new("ollama").arg("list").output() {
+        Ok(output) if output.status.success() => {
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let models: Vec<String> = stdout
+                .lines()
+                .skip(1) // skip header
+                .filter_map(|line| {
+                    let name = line.split_whitespace().next()?;
+                    if name.is_empty() {
+                        None
+                    } else {
+                        Some(name.to_string())
+                    }
+                })
+                .collect();
+
+            if models.is_empty() {
+                println!(
+                    "    {} No models installed. Run {} to pull one.",
+                    style("⚠").yellow(),
+                    style("ollama pull <model>").cyan()
+                );
+                let model: String = Input::new()
+                    .with_prompt("  Model name")
+                    .default("llama3.2:latest".into())
+                    .interact_text()?;
+                return Ok(model);
+            }
+
+            let idx = Select::new()
+                .with_prompt("  Select model")
+                .items(&models)
+                .default(0)
+                .interact()?;
+
+            Ok(models[idx].clone())
+        }
+        _ => {
+            println!(
+                "    {} Ollama not found. Install it from {}",
+                style("⚠").yellow(),
+                style("https://ollama.com").cyan()
+            );
+            let model: String = Input::new()
+                .with_prompt("  Model name")
+                .default("llama3.2:latest".into())
+                .interact_text()?;
+            Ok(model)
+        }
+    }
 }
 
 fn read_multiline(prompt: &str) -> Result<Vec<String>, Box<dyn std::error::Error>> {

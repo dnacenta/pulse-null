@@ -13,6 +13,7 @@ pub struct ConfigData {
     pub owner_alias: String,
     pub provider: String,
     pub api_key: Option<String>,
+    pub model: String,
     pub port: u16,
     pub timezone: String,
     /// Plugin configs: (plugin_name, [(key, value)])
@@ -23,6 +24,13 @@ pub fn render_config(data: &ConfigData) -> String {
     let api_key_line = match &data.api_key {
         Some(key) => format!("api_key = \"{}\"", key),
         None => "# api_key = \"your-key-here\"".to_string(),
+    };
+
+    let provider_extras = match data.provider.as_str() {
+        "claude-code" => "# claude_bin = \"claude\"  # Override path to claude CLI".to_string(),
+        "ollama" => "base_url = \"http://localhost:11434\"  # Ollama endpoint".to_string(),
+        _ => "# base_url = \"http://localhost:11434\"  # Override for Ollama or custom endpoints"
+            .to_string(),
     };
 
     format!(
@@ -40,9 +48,9 @@ port = {port}
 [llm]
 provider = "{provider}"
 {api_key_line}
-model = "claude-sonnet-4-20250514"
+model = "{model}"
 max_tokens = 4096
-# base_url = "http://localhost:11434"  # Override for Ollama or custom endpoints
+{provider_extras}
 
 [security]
 # secret = "generate-a-strong-secret-here"
@@ -108,6 +116,8 @@ cognitive_decline = true
         port = data.port,
         provider = data.provider,
         api_key_line = api_key_line,
+        model = data.model,
+        provider_extras = provider_extras,
         timezone = data.timezone,
         plugins_section = render_plugins_section(&data.plugins),
     )
