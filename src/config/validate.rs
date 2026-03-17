@@ -26,7 +26,7 @@ pub fn validate(config: &Config) -> Result<(), Box<dyn std::error::Error>> {
     if config.server.port == 0 {
         return Err("Server port must be > 0".into());
     }
-    let valid_providers = ["claude", "openai", "ollama"];
+    let valid_providers = ["claude", "openai", "ollama", "claude-code"];
     if !valid_providers.contains(&config.llm.provider.as_str()) {
         return Err(format!(
             "Unknown LLM provider: {}. Valid: {:?}",

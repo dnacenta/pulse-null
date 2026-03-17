@@ -58,6 +58,9 @@ pub struct LlmConfig {
     /// Base URL for the LLM API (used by Ollama; defaults to http://localhost:11434).
     #[serde(default)]
     pub base_url: Option<String>,
+    /// Path to the claude CLI binary (used by claude-code provider; defaults to "claude").
+    #[serde(default)]
+    pub claude_bin: Option<String>,
     /// Maximum estimated tokens in conversation before compaction triggers (0 = default 150k).
     #[serde(default)]
     pub context_budget: usize,

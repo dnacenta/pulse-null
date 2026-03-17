@@ -2,6 +2,7 @@ use std::sync::Arc;
 
 use echo_system_types::llm::LmProvider;
 
+use crate::claude_code_provider::ClaudeCodeProvider;
 use crate::claude_provider::ClaudeProvider;
 use crate::config::Config;
 use crate::ollama_provider::OllamaProvider;
@@ -21,6 +22,10 @@ pub fn create_provider(config: &Config) -> Result<Box<dyn LmProvider>, Box<dyn s
         "ollama" => Ok(Box::new(OllamaProvider::new(
             config.llm.model.clone(),
             config.llm.base_url.clone(),
+        ))),
+        "claude-code" => Ok(Box::new(ClaudeCodeProvider::new(
+            config.llm.model.clone(),
+            config.llm.claude_bin.clone(),
         ))),
         other => Err(format!("Unknown LLM provider: {}", other).into()),
     }

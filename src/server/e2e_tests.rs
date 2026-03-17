@@ -99,6 +99,7 @@ fn test_config() -> Config {
             model: "mock-model".to_string(),
             max_tokens: 1024,
             base_url: None,
+            claude_bin: None,
             context_budget: 0,
         },
         security: SecurityConfig {
