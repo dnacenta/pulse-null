@@ -33,7 +33,14 @@ impl Schedule {
             return Ok(schedule);
         }
         let content = std::fs::read_to_string(&path)?;
-        let schedule: Schedule = serde_json::from_str(&content)?;
+        // Accept both {"tasks": [...]} and bare [...]
+        let schedule: Schedule = match serde_json::from_str::<Schedule>(&content) {
+            Ok(s) => s,
+            Err(_) => {
+                let tasks: Vec<ScheduledTask> = serde_json::from_str(&content)?;
+                Schedule { tasks }
+            }
+        };
         Ok(schedule)
     }
 
