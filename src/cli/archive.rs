@@ -1,6 +1,6 @@
 use console::style;
 
-use praxis_echo::runtime::PraxisMonitor;
+use crate::praxis::runtime::PraxisMonitor;
 use pulse_system_types::monitoring::PipelineMonitor;
 
 use crate::config::Config;

@@ -82,9 +82,9 @@ pub fn create_plugin(name: &str) -> Option<Box<dyn Plugin>> {
         "chat-echo" => Some(Box::new(super::chat_echo::ChatEchoPlugin::new())),
         "bridge-echo" => Some(Box::new(super::bridge_echo::BridgeEchoPlugin::new())),
         "recall-echo" => Some(Box::new(super::recall_echo::RecallEchoPlugin::new())),
-        "praxis-echo" => Some(Box::new(super::praxis_echo::PraxisEchoPlugin::new())),
-        "caliber-echo" => Some(Box::new(super::caliber_echo::CaliberEchoPlugin::new())),
-        "vigil-echo" => Some(Box::new(super::vigil_echo::VigilEchoPlugin::new())),
+        "praxis-echo" => Some(Box::new(crate::praxis::PraxisEchoPlugin::new())),
+        "caliber-echo" => Some(Box::new(crate::caliber::CaliberEchoPlugin::new())),
+        "vigil-echo" => Some(Box::new(crate::vigil::VigilEchoPlugin::new())),
         // Optional plugins (feature-gated)
         #[cfg(feature = "voice")]
         "voice-echo" => Some(Box::new(super::voice_echo::VoiceEchoPlugin::new())),
