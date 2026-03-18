@@ -1,5 +1,6 @@
 use clap::{Parser, Subcommand};
 
+mod caliber;
 mod chat;
 mod claude_code_provider;
 mod claude_provider;
@@ -11,11 +12,13 @@ mod init;
 mod ollama_provider;
 mod pidfile;
 mod plugins;
+mod praxis;
 mod providers;
 mod scheduler;
 mod server;
 mod session;
 mod tools;
+mod vigil;
 
 #[derive(Parser)]
 #[command(name = "pulse-null")]

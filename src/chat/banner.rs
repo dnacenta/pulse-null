@@ -54,13 +54,13 @@ pub fn render(config: &Config, root_dir: &Path, plugin_count: usize) {
 
     // Pipeline health
     if config.pipeline.enabled {
-        let monitor = praxis_echo::runtime::PraxisMonitor::new();
+        let monitor = crate::praxis::runtime::PraxisMonitor::new();
         render_pipeline(root_dir, config, &monitor);
     }
 
     // Cognitive health
     if config.monitoring.enabled {
-        let monitor = vigil_echo::runtime::VigilMonitor::new();
+        let monitor = crate::vigil::runtime::VigilMonitor::new();
         render_vigil(root_dir, config, &monitor);
     }
 

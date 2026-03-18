@@ -46,19 +46,19 @@ pub async fn start(config: Config) -> Result<(), Box<dyn std::error::Error>> {
 
     // Construct monitoring trait objects based on config
     let pipeline_monitor: Option<Arc<dyn PipelineMonitor>> = if config.pipeline.enabled {
-        Some(Arc::new(praxis_echo::runtime::PraxisMonitor::new()))
+        Some(Arc::new(crate::praxis::runtime::PraxisMonitor::new()))
     } else {
         None
     };
 
     let cognitive_monitor: Option<Arc<dyn CognitiveMonitor>> = if config.monitoring.enabled {
-        Some(Arc::new(vigil_echo::runtime::VigilMonitor::new()))
+        Some(Arc::new(crate::vigil::runtime::VigilMonitor::new()))
     } else {
         None
     };
 
     let outcome_tracker: Option<Arc<dyn OutcomeTracker>> = if config.pulse.enabled {
-        Some(Arc::new(caliber_echo::runtime::CaliberTracker::new()))
+        Some(Arc::new(crate::caliber::runtime::CaliberTracker::new()))
     } else {
         None
     };

@@ -3,11 +3,8 @@ pub mod registry;
 
 // Core modules (always included)
 pub mod bridge_echo;
-pub mod caliber_echo;
 pub mod chat_echo;
-pub mod praxis_echo;
 pub mod recall_echo;
-pub mod vigil_echo;
 
 // Optional plugins (feature-gated)
 #[cfg(feature = "discord")]

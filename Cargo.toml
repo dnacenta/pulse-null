@@ -36,6 +36,9 @@ regex = "1"
 walkdir = "2"
 globset = "0.4"
 
+# Terminal colors (vigil dashboard)
+owo-colors = "4"
+
 # Logging
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
@@ -57,12 +60,9 @@ libc = "0.2"
 pulse-system-types = { git = "https://github.com/dnacenta/pulse-null-types", branch = "main" }
 
 # Core dependencies (always included — these define an entity)
-vigil-echo = { git = "https://github.com/dnacenta/vigil-echo", branch = "main" }
-praxis-echo = { git = "https://github.com/dnacenta/praxis-echo", branch = "main" }
 chat-echo = { git = "https://github.com/dnacenta/chat-echo", branch = "main" }
 bridge-echo = { git = "https://github.com/dnacenta/bridge-echo", branch = "main" }
 recall-echo = { git = "https://github.com/dnacenta/recall-echo", branch = "main", features = ["pulse-null"] }
-caliber-echo = { git = "https://github.com/dnacenta/caliber-echo", branch = "main", package = "caliber-echo" }
 
 # Plugins (optional — different interfaces to speak through)
 voice-echo = { git = "https://github.com/dnacenta/voice-echo", branch = "main", optional = true }
