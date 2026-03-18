@@ -199,13 +199,25 @@ pub async fn start(config: Config) -> Result<(), Box<dyn std::error::Error>> {
     {
         let conversation = state.conversation.read().await;
         if !conversation.is_empty() {
-            crate::session::end_session(
+            let archive_path = crate::session::end_session(
                 &root_dir,
                 &config.entity.name,
                 &conversation,
                 "http",
                 "server-shutdown",
             );
+
+            // Graph ingestion (if enabled)
+            if config.graph.enabled && config.graph.auto_ingest {
+                if let Some(ref path) = archive_path {
+                    crate::session::graph_ingest_archive(
+                        &root_dir,
+                        path,
+                        Some(state.provider.as_ref()),
+                    )
+                    .await;
+                }
+            }
         }
     }
 

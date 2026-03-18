@@ -9,6 +9,7 @@ mod config;
 mod context;
 mod events;
 mod init;
+mod logbook;
 mod ollama_provider;
 mod pidfile;
 mod plugins;

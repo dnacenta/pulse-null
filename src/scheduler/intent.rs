@@ -6,7 +6,6 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use tokio::sync::RwLock;
 
-use super::cost::CostTracker;
 use super::executor::{self, ExecutionConfig};
 use super::output;
 use super::Schedule;
@@ -428,18 +427,6 @@ async fn execute_intent(
         }
     };
 
-    // Cost limit check
-    if config.daily_cost_limit_cents > 0 {
-        let tracker = CostTracker::load(&root_dir);
-        if tracker.is_over_limit(config.daily_cost_limit_cents) {
-            tracing::warn!(
-                "Intent '{}' skipped — daily cost limit reached",
-                intent.description
-            );
-            return None;
-        }
-    }
-
     // Build system prompt
     let system_prompt = match prompt::build_system_prompt(
         &root_dir,
@@ -494,11 +481,6 @@ async fn execute_intent(
         result.total_output_tokens,
         result.tool_rounds_used,
     );
-
-    // Track cost
-    let mut tracker = CostTracker::load(&root_dir);
-    tracker.record(result.total_input_tokens, result.total_output_tokens);
-    let _ = tracker.save(&root_dir);
 
     // Parse output for markers
     let parsed = output::parse_output(&result.response_text);
@@ -701,12 +683,20 @@ async fn execute_intent(
         }
     }
 
+    // Graph pipeline sync (if enabled)
+    #[cfg(feature = "graph")]
+    if state.config.graph.enabled && state.config.graph.pipeline_sync {
+        crate::session::graph_sync_pipeline(&root_dir).await;
+    }
+
     Some(parsed.clean_content)
 }
 
 /// Log intent execution to LOGBOOK.md
 fn log_intent_execution(root_dir: &Path, intent: &Intent, summary: &str) {
     let logbook_path = root_dir.join("journal/LOGBOOK.md");
+    crate::logbook::rotate_if_needed(root_dir, &logbook_path);
+
     let now = Utc::now();
     let entry = format!(
         "\n### {} — Intent: {}\n\n{}\n",

@@ -5,7 +5,6 @@ use chrono::Utc;
 use cron::Schedule as CronSchedule;
 use tokio::sync::RwLock;
 
-use super::cost::CostTracker;
 use super::executor::{self, ExecutionConfig};
 use super::intent::{self, IntentQueue, IntentSource};
 use super::output;
@@ -85,20 +84,6 @@ async fn execute_task(
             return;
         }
     };
-
-    // Check daily cost limit before executing
-    if state.config.autonomy.enabled && state.config.autonomy.daily_cost_limit_cents > 0 {
-        let tracker = CostTracker::load(&root_dir);
-        if tracker.is_over_limit(state.config.autonomy.daily_cost_limit_cents) {
-            tracing::warn!(
-                "Task '{}' skipped — daily cost limit reached ({}/{}¢)",
-                task.id,
-                tracker.daily_cost_cents,
-                state.config.autonomy.daily_cost_limit_cents
-            );
-            return;
-        }
-    }
 
     let system_prompt = match prompt::build_system_prompt(
         &root_dir,
@@ -199,15 +184,6 @@ async fn execute_task(
         output_tokens,
         tool_info,
     );
-
-    // Track cost
-    if state.config.autonomy.enabled {
-        let mut tracker = CostTracker::load(&root_dir);
-        tracker.record(input_tokens, output_tokens);
-        if let Err(e) = tracker.save(&root_dir) {
-            tracing::error!("Failed to save cost tracker: {}", e);
-        }
-    }
 
     // Parse and route output
     let parsed = output::parse_output(&response_text);
@@ -382,17 +358,24 @@ async fn execute_task(
             tracing::info!("Auto-archived overflow from {}", doc);
         }
     }
+
+    // Graph pipeline sync (if enabled)
+    #[cfg(feature = "graph")]
+    if state.config.graph.enabled && state.config.graph.pipeline_sync {
+        crate::session::graph_sync_pipeline(&root_dir).await;
+    }
 }
 
-/// Append a task execution record to LOGBOOK.md
+/// Append a task execution record to LOGBOOK.md, rotating if too long.
 fn log_execution(root_dir: &std::path::Path, task: &ScheduledTask, summary: &str) {
     let logbook_path = root_dir.join("journal/LOGBOOK.md");
+    crate::logbook::rotate_if_needed(root_dir, &logbook_path);
+
     let now = Utc::now();
     let entry = format!(
         "\n### {} — {}\n\n{}\n",
         now.format("%Y-%m-%d %H:%M UTC"),
         task.name,
-        // Truncate long output for the logbook
         if summary.len() > 500 {
             format!("{}...", &summary[..500])
         } else {

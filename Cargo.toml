@@ -64,6 +64,9 @@ chat-echo = { git = "https://github.com/dnacenta/chat-echo", branch = "main" }
 bridge-echo = { git = "https://github.com/dnacenta/bridge-echo", branch = "main" }
 recall-echo = { git = "https://github.com/dnacenta/recall-echo", branch = "main", features = ["pulse-null"] }
 
+# Knowledge graph (optional — enabled by graph feature)
+recall-graph = { git = "https://github.com/dnacenta/recall-graph", branch = "main", optional = true }
+
 # Plugins (optional — different interfaces to speak through)
 voice-echo = { git = "https://github.com/dnacenta/voice-echo", branch = "main", optional = true }
 discord-voice-echo = { git = "https://github.com/dnacenta/discord-voice-echo", branch = "main", optional = true }
@@ -71,6 +74,7 @@ discord-echo = { git = "https://github.com/dnacenta/discord-echo", branch = "mai
 
 [features]
 default = []
+graph = ["dep:recall-graph"]
 voice = ["dep:voice-echo"]
 discord = ["dep:discord-voice-echo", "voice"]
 discord-text = ["dep:discord-echo"]

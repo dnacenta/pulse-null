@@ -28,6 +28,8 @@ pub struct Config {
     #[serde(default)]
     pub pulse: PulseConfig,
     #[serde(default)]
+    pub graph: GraphConfig,
+    #[serde(default)]
     pub plugins: HashMap<String, toml::Value>,
 }
 
@@ -317,8 +319,6 @@ pub struct AutonomyConfig {
     pub max_intents_per_hour: u32,
     /// Maximum chain depth (prevents infinite A→B→C chains)
     pub max_chain_depth: u32,
-    /// Rough daily API cost limit in cents (0 = unlimited)
-    pub daily_cost_limit_cents: u32,
     /// Event-driven intent configuration
     #[serde(default)]
     pub events: EventsConfig,
@@ -333,7 +333,6 @@ impl Default for AutonomyConfig {
             max_queue_size: 20,
             max_intents_per_hour: 10,
             max_chain_depth: 3,
-            daily_cost_limit_cents: 500,
             events: EventsConfig::default(),
         }
     }
@@ -360,6 +359,28 @@ impl Default for EventsConfig {
             pipeline_alert: true,
             pipeline_frozen: true,
             cognitive_decline: true,
+        }
+    }
+}
+
+/// Configuration for recall-graph knowledge graph integration
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct GraphConfig {
+    /// Enable graph memory (requires recall-graph)
+    pub enabled: bool,
+    /// Auto-ingest conversation archives into the graph
+    pub auto_ingest: bool,
+    /// Sync pipeline documents to graph after task/intent execution
+    pub pipeline_sync: bool,
+}
+
+impl Default for GraphConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            auto_ingest: true,
+            pipeline_sync: true,
         }
     }
 }

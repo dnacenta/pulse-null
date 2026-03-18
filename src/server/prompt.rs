@@ -4,7 +4,6 @@ use std::sync::Arc;
 use pulse_system_types::monitoring::{CognitiveMonitor, PipelineMonitor};
 
 use crate::config::Config;
-use crate::scheduler::cost::CostTracker;
 use crate::scheduler::intent::IntentQueue;
 
 /// Build the system prompt from entity documents
@@ -129,20 +128,6 @@ pub fn build_autonomy_context(root_dir: &Path, config: &Config) -> String {
             queue_lines.push(format!("  ... and {} more", queue.len() - 5));
         }
         sections.push(queue_lines.join("\n"));
-    }
-
-    // Cost status
-    if config.autonomy.daily_cost_limit_cents > 0 {
-        let tracker = CostTracker::load(root_dir);
-        if tracker.daily_cost_cents > 0 {
-            sections.push(format!(
-                "Daily API cost: {}/{}¢ ({:.0}% of limit)",
-                tracker.daily_cost_cents,
-                config.autonomy.daily_cost_limit_cents,
-                (tracker.daily_cost_cents as f64 / config.autonomy.daily_cost_limit_cents as f64)
-                    * 100.0
-            ));
-        }
     }
 
     sections.join("\n\n")

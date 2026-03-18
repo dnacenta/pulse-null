@@ -183,8 +183,9 @@ impl PluginManager {
 mod tests {
     use super::*;
     use crate::config::{
-        AutonomyConfig, Config, EntityConfig, LlmConfig, MemoryConfig, MonitoringConfig,
-        PipelineConfig, PulseConfig, SchedulerConfig, SecurityConfig, ServerConfig, TrustConfig,
+        AutonomyConfig, Config, EntityConfig, GraphConfig, LlmConfig, MemoryConfig,
+        MonitoringConfig, PipelineConfig, PulseConfig, SchedulerConfig, SecurityConfig,
+        ServerConfig, TrustConfig,
     };
 
     fn test_config() -> Config {
@@ -218,6 +219,7 @@ mod tests {
             monitoring: MonitoringConfig::default(),
             autonomy: AutonomyConfig::default(),
             pulse: PulseConfig::default(),
+            graph: GraphConfig::default(),
             plugins: std::collections::HashMap::new(),
         }
     }
