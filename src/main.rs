@@ -75,6 +75,16 @@ enum Commands {
         #[command(subcommand)]
         action: Option<RecallAction>,
     },
+    /// Pipeline enforcement (praxis-echo)
+    Praxis {
+        #[command(subcommand)]
+        action: PraxisAction,
+    },
+    /// Metacognitive monitoring (vigil-echo)
+    Vigil {
+        #[command(subcommand)]
+        action: VigilAction,
+    },
 }
 
 #[derive(Subcommand)]
@@ -169,6 +179,52 @@ enum RecallAction {
     },
     /// Analyze and auto-distill MEMORY.md
     Distill,
+}
+
+#[derive(Subcommand)]
+enum PraxisAction {
+    /// Inject pipeline state at session start
+    Pulse,
+    /// Save checkpoint before context compaction
+    Checkpoint,
+    /// Review pipeline changes at session end
+    Review,
+    /// Show pipeline health dashboard
+    Status,
+    /// Deep scan of all documents
+    Scan {
+        /// Output as JSON instead of human-readable
+        #[arg(long)]
+        json: bool,
+    },
+    /// Check archive thresholds
+    Archive {
+        /// Dry run — show what would be archived
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// Initialize praxis pipeline
+    Init,
+}
+
+#[derive(Subcommand)]
+enum VigilAction {
+    /// Inject cognitive health assessment at session start
+    Pulse,
+    /// Extract signals from identity documents
+    Collect {
+        /// Trigger source for logging
+        #[arg(long, default_value = "manual")]
+        trigger: String,
+    },
+    /// Show vigil health dashboard
+    Status {
+        /// Output as JSON instead of human-readable
+        #[arg(long)]
+        json: bool,
+    },
+    /// Initialize vigil monitoring
+    Init,
 }
 
 #[derive(Subcommand)]
@@ -297,6 +353,33 @@ async fn main() {
                 } => cli::intent::add(description, prompt, priority).await,
                 IntentAction::Remove { id } => cli::intent::remove(id).await,
                 IntentAction::Clear => cli::intent::clear().await,
+            };
+            if let Err(e) = result {
+                eprintln!("Error: {e}");
+                std::process::exit(1);
+            }
+        }
+        Commands::Praxis { action } => {
+            let result = match action {
+                PraxisAction::Pulse => cli::praxis::pulse().await,
+                PraxisAction::Checkpoint => cli::praxis::checkpoint().await,
+                PraxisAction::Review => cli::praxis::review().await,
+                PraxisAction::Status => cli::praxis::status().await,
+                PraxisAction::Scan { json } => cli::praxis::scan(json).await,
+                PraxisAction::Archive { dry_run } => cli::praxis::archive(dry_run).await,
+                PraxisAction::Init => cli::praxis::init().await,
+            };
+            if let Err(e) = result {
+                eprintln!("Error: {e}");
+                std::process::exit(1);
+            }
+        }
+        Commands::Vigil { action } => {
+            let result = match action {
+                VigilAction::Pulse => cli::vigil::pulse().await,
+                VigilAction::Collect { trigger } => cli::vigil::collect(trigger).await,
+                VigilAction::Status { json } => cli::vigil::status(json).await,
+                VigilAction::Init => cli::vigil::init().await,
             };
             if let Err(e) = result {
                 eprintln!("Error: {e}");
