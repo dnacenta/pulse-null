@@ -679,7 +679,7 @@ async fn execute_intent(
             ("PRAXIS", &health.praxis),
         ];
         for (name, doc_health) in &docs {
-            if doc_health.status == echo_system_types::monitoring::ThresholdStatus::Red {
+            if doc_health.status == pulse_system_types::monitoring::ThresholdStatus::Red {
                 state.event_bus.emit(EntityEvent::PipelineAlert {
                     document: name.to_string(),
                     count: doc_health.count,

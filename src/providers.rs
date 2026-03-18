@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use echo_system_types::llm::LmProvider;
+use pulse_system_types::llm::LmProvider;
 
 use crate::claude_code_provider::ClaudeCodeProvider;
 use crate::claude_provider::ClaudeProvider;

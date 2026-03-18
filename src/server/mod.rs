@@ -22,8 +22,8 @@ use crate::plugins::manager::PluginManager;
 use crate::scheduler::intent::IntentQueue;
 use crate::scheduler::Schedule;
 use crate::tools::ToolRegistry;
-use echo_system_types::llm::{LmProvider, Message};
-use echo_system_types::monitoring::{CognitiveMonitor, OutcomeTracker, PipelineMonitor};
+use pulse_system_types::llm::{LmProvider, Message};
+use pulse_system_types::monitoring::{CognitiveMonitor, OutcomeTracker, PipelineMonitor};
 
 /// Shared application state
 pub struct AppState {

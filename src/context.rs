@@ -1,6 +1,6 @@
 use std::path::Path;
 
-use echo_system_types::llm::{ContentBlock, LmProvider, Message, MessageContent, Role};
+use pulse_system_types::llm::{ContentBlock, LmProvider, Message, MessageContent, Role};
 
 /// Default context budget in estimated tokens (leaves room for system prompt + response).
 const DEFAULT_CONTEXT_BUDGET: usize = 150_000;

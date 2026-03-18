@@ -246,8 +246,8 @@ pub struct PipelineConfig {
 
 impl PipelineConfig {
     /// Convert to shared pipeline thresholds.
-    pub fn to_thresholds(&self) -> echo_system_types::monitoring::PipelineThresholds {
-        echo_system_types::monitoring::PipelineThresholds {
+    pub fn to_thresholds(&self) -> pulse_system_types::monitoring::PipelineThresholds {
+        pulse_system_types::monitoring::PipelineThresholds {
             learning_soft: self.learning_soft,
             learning_hard: self.learning_hard,
             thoughts_soft: self.thoughts_soft,

@@ -3,7 +3,7 @@ use std::sync::Arc;
 use axum::extract::State;
 use axum::Json;
 
-use echo_system_types::monitoring::{CognitiveStatus, DocumentHealth, ThresholdStatus, Trend};
+use pulse_system_types::monitoring::{CognitiveStatus, DocumentHealth, ThresholdStatus, Trend};
 
 use crate::server::AppState;
 

@@ -1,7 +1,7 @@
 use console::style;
 
-use echo_system_types::monitoring::PipelineMonitor;
 use praxis_echo::runtime::PraxisMonitor;
+use pulse_system_types::monitoring::PipelineMonitor;
 
 use crate::config::Config;
 

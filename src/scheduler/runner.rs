@@ -163,7 +163,7 @@ async fn execute_task(
         }
     } else {
         // Legacy path: no tools
-        use echo_system_types::llm::{Message, MessageContent, Role};
+        use pulse_system_types::llm::{Message, MessageContent, Role};
         let messages = vec![Message {
             role: Role::User,
             content: MessageContent::Text(user_message),
@@ -361,7 +361,7 @@ async fn execute_task(
             ("PRAXIS", &health.praxis),
         ];
         for (name, doc_health) in &docs {
-            if doc_health.status == echo_system_types::monitoring::ThresholdStatus::Red {
+            if doc_health.status == pulse_system_types::monitoring::ThresholdStatus::Red {
                 state.event_bus.emit(EntityEvent::PipelineAlert {
                     document: name.to_string(),
                     count: doc_health.count,

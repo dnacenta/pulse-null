@@ -7,7 +7,7 @@ use super::registry;
 use super::{Plugin, PluginContext, PluginHealth, PluginMeta};
 use crate::config::Config;
 use crate::scheduler::ScheduledTask;
-use echo_system_types::llm::LmProvider;
+use pulse_system_types::llm::LmProvider;
 
 /// Manages the lifecycle of all enabled plugins
 pub struct PluginManager {

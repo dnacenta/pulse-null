@@ -1,4 +1,4 @@
-use echo_system_types::plugin::Plugin as _;
+use pulse_system_types::plugin::Plugin as _;
 use recall_echo::RecallEcho;
 
 use crate::config::Config;

@@ -1,7 +1,7 @@
 use std::future::Future;
 use std::pin::Pin;
 
-use echo_system_types::plugin::Plugin as _;
+use pulse_system_types::plugin::Plugin as _;
 
 use super::{Plugin, PluginContext, PluginHealth, PluginMeta, PluginResult, SetupPrompt};
 
@@ -166,7 +166,7 @@ mod tests {
 }
 
 #[cfg(test)]
-use echo_system_types::llm::{LlmResult, LmProvider, Message};
+use pulse_system_types::llm::{LlmResult, LmProvider, Message};
 
 #[cfg(test)]
 struct MockProvider;
@@ -181,9 +181,9 @@ impl LmProvider for MockProvider {
         _: Option<&[serde_json::Value]>,
     ) -> LlmResult<'_> {
         Box::pin(async {
-            Ok(echo_system_types::llm::LlmResponse {
+            Ok(pulse_system_types::llm::LlmResponse {
                 content: vec![],
-                stop_reason: echo_system_types::llm::StopReason::EndTurn,
+                stop_reason: pulse_system_types::llm::StopReason::EndTurn,
                 model: "mock".to_string(),
                 input_tokens: None,
                 output_tokens: None,
