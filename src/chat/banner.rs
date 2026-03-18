@@ -1,6 +1,6 @@
 use std::path::Path;
 
-use echo_system_types::monitoring::{
+use pulse_system_types::monitoring::{
     CognitiveMonitor, CognitiveStatus, DocumentHealth, PipelineMonitor, ThresholdStatus, Trend,
 };
 

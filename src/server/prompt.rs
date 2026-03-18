@@ -1,7 +1,7 @@
 use std::path::Path;
 use std::sync::Arc;
 
-use echo_system_types::monitoring::{CognitiveMonitor, PipelineMonitor};
+use pulse_system_types::monitoring::{CognitiveMonitor, PipelineMonitor};
 
 use crate::config::Config;
 use crate::scheduler::cost::CostTracker;

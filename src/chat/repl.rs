@@ -1,7 +1,9 @@
 use std::io::{self, BufRead, Write};
 use std::path::Path;
 
-use echo_system_types::llm::{ContentBlock, LmProvider, Message, MessageContent, Role, StopReason};
+use pulse_system_types::llm::{
+    ContentBlock, LmProvider, Message, MessageContent, Role, StopReason,
+};
 
 use crate::chat;
 use crate::config::Config;

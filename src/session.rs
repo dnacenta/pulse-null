@@ -3,7 +3,7 @@ use std::io::Write as IoWrite;
 use std::path::{Path, PathBuf};
 
 use chrono::Utc;
-use echo_system_types::llm::{ContentBlock, Message, MessageContent, Role};
+use pulse_system_types::llm::{ContentBlock, Message, MessageContent, Role};
 
 /// Metadata for an archive log entry.
 pub struct ArchiveMeta {
@@ -312,7 +312,7 @@ fn strip_system_prefixes(text: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use echo_system_types::llm::{ContentBlock, Message, MessageContent, Role};
+    use pulse_system_types::llm::{ContentBlock, Message, MessageContent, Role};
 
     #[test]
     fn empty_conversation_produces_empty_markdown() {

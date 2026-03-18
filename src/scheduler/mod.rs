@@ -15,7 +15,7 @@ use tokio::sync::RwLock;
 use crate::server::AppState;
 
 // Re-export shared types from echo-system-types
-pub use echo_system_types::{OutputRouting, ScheduledTask, TaskCreator};
+pub use pulse_system_types::{OutputRouting, ScheduledTask, TaskCreator};
 
 /// The full schedule — loaded from and persisted to schedule.json
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -1,4 +1,4 @@
-use echo_system_types::llm::{
+use pulse_system_types::llm::{
     ContentBlock, LlmResponse, LlmResult, LmProvider, Message, MessageContent, StopReason,
 };
 
@@ -34,8 +34,8 @@ impl LmProvider for ClaudeProvider {
                 .iter()
                 .map(|m| {
                     let role = match m.role {
-                        echo_system_types::llm::Role::User => "user",
-                        echo_system_types::llm::Role::Assistant => "assistant",
+                        pulse_system_types::llm::Role::User => "user",
+                        pulse_system_types::llm::Role::Assistant => "assistant",
                     };
                     let content = match &m.content {
                         MessageContent::Text(s) => serde_json::Value::String(s.clone()),

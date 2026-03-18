@@ -64,7 +64,7 @@ mod tests {
     };
     use crate::events::EventBus;
     use crate::tools::ToolRegistry;
-    use echo_system_types::llm::Message;
+    use pulse_system_types::llm::Message;
 
     fn test_state(secret: Option<String>) -> Arc<AppState> {
         Arc::new(AppState {

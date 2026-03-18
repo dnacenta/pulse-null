@@ -1,4 +1,4 @@
-use echo_system_types::llm::{
+use pulse_system_types::llm::{
     ContentBlock, LlmResponse, LlmResult, LmProvider, Message, MessageContent, StopReason,
 };
 
@@ -45,8 +45,8 @@ impl LmProvider for OllamaProvider {
                 match &msg.content {
                     MessageContent::Text(text) => {
                         let role = match msg.role {
-                            echo_system_types::llm::Role::User => "user",
-                            echo_system_types::llm::Role::Assistant => "assistant",
+                            pulse_system_types::llm::Role::User => "user",
+                            pulse_system_types::llm::Role::Assistant => "assistant",
                         };
                         ollama_messages.push(serde_json::json!({
                             "role": role,
@@ -58,8 +58,8 @@ impl LmProvider for OllamaProvider {
                             match block {
                                 ContentBlock::Text { text } => {
                                     let role = match msg.role {
-                                        echo_system_types::llm::Role::User => "user",
-                                        echo_system_types::llm::Role::Assistant => "assistant",
+                                        pulse_system_types::llm::Role::User => "user",
+                                        pulse_system_types::llm::Role::Assistant => "assistant",
                                     };
                                     ollama_messages.push(serde_json::json!({
                                         "role": role,

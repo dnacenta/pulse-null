@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 use crate::events::EntityEvent;
 use crate::server::trust::TrustLevel;
 use crate::server::{injection, AppState};
-use echo_system_types::llm::{ContentBlock, Message, MessageContent, Role, StopReason};
+use pulse_system_types::llm::{ContentBlock, Message, MessageContent, Role, StopReason};
 
 #[derive(Deserialize)]
 #[allow(dead_code)]

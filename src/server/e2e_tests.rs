@@ -20,7 +20,7 @@ use crate::events::EventBus;
 use crate::server::handlers;
 use crate::server::AppState;
 use crate::tools::ToolRegistry;
-use echo_system_types::llm::{
+use pulse_system_types::llm::{
     ContentBlock, LlmResponse, LlmResult, LmProvider, Message, StopReason,
 };
 

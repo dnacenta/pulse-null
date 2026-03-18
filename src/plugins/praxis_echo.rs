@@ -1,7 +1,7 @@
 use std::future::Future;
 use std::pin::Pin;
 
-use echo_system_types::plugin::Plugin as _;
+use pulse_system_types::plugin::Plugin as _;
 
 use super::{Plugin, PluginContext, PluginHealth, PluginMeta, PluginResult, SetupPrompt};
 

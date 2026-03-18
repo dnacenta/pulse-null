@@ -1,6 +1,6 @@
 use std::process::Stdio;
 
-use echo_system_types::llm::{
+use pulse_system_types::llm::{
     ContentBlock, LlmResponse, LlmResult, LmProvider, Message, MessageContent, Role, StopReason,
 };
 

@@ -9,7 +9,7 @@ use crate::tools::{Tool, ToolError, ToolResult};
 
 // Bring the external Plugin trait into scope so we can call
 // start/stop/health/setup_prompts on DiscordEcho.
-use echo_system_types::plugin::Plugin as EstPlugin;
+use pulse_system_types::plugin::Plugin as EstPlugin;
 
 /// Adapter wrapping the discord-echo crate for Discord text channels.
 pub struct DiscordTextEchoPlugin {
