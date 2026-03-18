@@ -100,7 +100,6 @@ intent_poll_interval = 60
 max_queue_size = 20
 max_intents_per_hour = 10
 max_chain_depth = 3
-daily_cost_limit_cents = 500
 
 [autonomy.events]
 post_conversation = false
