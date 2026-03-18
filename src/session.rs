@@ -193,15 +193,16 @@ fn append_index(
 }
 
 /// Full session-end routine: archive conversation + write EPHEMERAL summary.
+/// Returns the archive path on success (for graph ingestion).
 pub fn end_session(
     root_dir: &Path,
     entity_name: &str,
     conversation: &[Message],
     channel: &str,
     trigger: &str,
-) {
+) -> Option<PathBuf> {
     if conversation.is_empty() {
-        return;
+        return None;
     }
 
     // Path 1: Archive full conversation
@@ -211,17 +212,135 @@ pub fn end_session(
         entity_name: entity_name.to_string(),
     };
 
-    match archive_conversation(root_dir, conversation, &meta) {
+    let archive_path = match archive_conversation(root_dir, conversation, &meta) {
         Ok(path) => {
             tracing::info!("Conversation archived to {}", path.display());
+            Some(path)
         }
         Err(e) => {
             tracing::warn!("Failed to archive conversation: {}", e);
+            None
         }
-    }
+    };
 
     // Path 2: Write lightweight EPHEMERAL summary
     write_ephemeral_summary(root_dir, entity_name, conversation);
+
+    archive_path
+}
+
+/// Ingest an archived conversation into the knowledge graph (async, non-blocking).
+///
+/// Reads the archive file and calls recall-echo's graph bridge.
+/// Logs on failure but never panics or returns errors to the caller.
+pub async fn graph_ingest_archive(
+    root_dir: &Path,
+    archive_path: &Path,
+    provider: Option<&dyn pulse_system_types::llm::LmProvider>,
+) {
+    let memory_dir = root_dir.join("memory");
+
+    let archive_content = match fs::read_to_string(archive_path) {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::warn!(
+                "graph ingest: cannot read archive {}: {}",
+                archive_path.display(),
+                e
+            );
+            return;
+        }
+    };
+
+    // Extract session_id and log_number from filename (conversation-NNN.md)
+    let filename = archive_path
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("unknown");
+    let log_number: Option<u32> = filename
+        .strip_prefix("conversation-")
+        .and_then(|s| s.parse().ok());
+    let session_id = filename;
+
+    match recall_echo::graph_bridge::ingest_into_graph_with_llm(
+        &memory_dir,
+        &archive_content,
+        session_id,
+        log_number,
+        provider,
+    )
+    .await
+    {
+        Ok(report) => {
+            tracing::info!(
+                "graph: ingested archive {} — {} episodes, {} entities, {} relationships",
+                filename,
+                report.episodes_created,
+                report.entities_created,
+                report.relationships_created,
+            );
+        }
+        Err(e) => {
+            tracing::warn!("graph: ingestion failed for {}: {}", filename, e);
+        }
+    }
+}
+
+/// Sync pipeline documents to the knowledge graph.
+///
+/// Reads LEARNING.md, THOUGHTS.md, CURIOSITY.md, REFLECTIONS.md, PRAXIS.md
+/// from root_dir/journal/ and syncs them to the graph store in root_dir/memory/graph/.
+/// Uses spawn_blocking + dedicated runtime since SurrealDB types aren't Send.
+#[cfg(feature = "graph")]
+pub async fn graph_sync_pipeline(root_dir: &Path) {
+    let graph_dir = root_dir.join("memory").join("graph");
+    if !graph_dir.exists() {
+        tracing::debug!("graph: pipeline sync skipped — graph/ not initialized");
+        return;
+    }
+
+    let journal = root_dir.join("journal");
+    let read_or_empty =
+        |name: &str| -> String { fs::read_to_string(journal.join(name)).unwrap_or_default() };
+
+    let docs = recall_graph::types::PipelineDocuments {
+        learning: read_or_empty("LEARNING.md"),
+        thoughts: read_or_empty("THOUGHTS.md"),
+        curiosity: read_or_empty("CURIOSITY.md"),
+        reflections: read_or_empty("REFLECTIONS.md"),
+        praxis: read_or_empty("PRAXIS.md"),
+    };
+
+    let graph_dir_owned = graph_dir.to_path_buf();
+    let result = tokio::task::spawn_blocking(move || {
+        let rt = match tokio::runtime::Runtime::new() {
+            Ok(rt) => rt,
+            Err(e) => return Err(format!("failed to create runtime: {e}")),
+        };
+        rt.block_on(async {
+            let gm = recall_graph::GraphMemory::open(&graph_dir_owned)
+                .await
+                .map_err(|e| format!("graph open: {e}"))?;
+            gm.sync_pipeline(&docs)
+                .await
+                .map_err(|e| format!("sync: {e}"))
+        })
+    })
+    .await;
+
+    match result {
+        Ok(Ok(report)) => {
+            tracing::info!(
+                "graph: pipeline sync — {} created, {} updated, {} archived, {} relationships",
+                report.entities_created,
+                report.entities_updated,
+                report.entities_archived,
+                report.relationships_created,
+            );
+        }
+        Ok(Err(e)) => tracing::warn!("graph: pipeline sync failed: {}", e),
+        Err(e) => tracing::warn!("graph: pipeline sync task panicked: {}", e),
+    }
 }
 
 /// Write a lightweight session summary to memory/EPHEMERAL.md.
@@ -304,6 +423,13 @@ fn strip_system_prefixes(text: &str) -> String {
         } else {
             break;
         }
+    }
+
+    // Strip "User message: " prefix
+    if let Some(rest) = s.strip_prefix("User message: ") {
+        s = rest.trim();
+    } else if let Some(rest) = s.strip_prefix("User message:") {
+        s = rest.trim();
     }
 
     s.to_string()
@@ -481,6 +607,12 @@ mod tests {
     fn strip_channel_trust_prefix() {
         let msg = "[Channel: discord | Trust: VERIFIED — input from an authenticated channel.]\nFix the bug";
         assert_eq!(strip_system_prefixes(msg), "Fix the bug");
+    }
+
+    #[test]
+    fn strip_channel_trust_with_user_message_prefix() {
+        let msg = "[Channel: discord | Trust: VERIFIED — D. is likely the sender.]\n\nUser message: hello there";
+        assert_eq!(strip_system_prefixes(msg), "hello there");
     }
 
     #[test]

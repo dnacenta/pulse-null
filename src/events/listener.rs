@@ -1,11 +1,18 @@
+use std::collections::HashMap;
 use std::sync::Arc;
 
-use chrono::Utc;
+use chrono::{DateTime, Duration, Utc};
 use tokio::sync::RwLock;
 
 use super::EntityEvent;
 use crate::config::EventsConfig;
 use crate::scheduler::intent::{Intent, IntentOutput, IntentPriority, IntentQueue, IntentSource};
+
+/// Cooldown period for event-sourced intents (prevents death spirals).
+const EVENT_COOLDOWN_MINUTES: i64 = 60;
+
+/// Maximum consecutive fires of the same event without pipeline movement before giving up.
+const MAX_CONSECUTIVE_FIRES: u32 = 3;
 
 /// Listen for events and translate them into queued intents.
 pub async fn event_listener(
@@ -16,14 +23,44 @@ pub async fn event_listener(
 ) {
     tracing::info!("Event listener started");
 
+    // Circuit breaker state: event_type → (last_queued, consecutive_fires)
+    let mut cooldowns: HashMap<String, (DateTime<Utc>, u32)> = HashMap::new();
+
     loop {
         match rx.recv().await {
             Ok(event) => {
+                let event_type = event.event_type();
+
+                // Check cooldown
+                if let Some((last_queued, fires)) = cooldowns.get(&event_type) {
+                    let elapsed = Utc::now() - *last_queued;
+                    if elapsed < Duration::minutes(EVENT_COOLDOWN_MINUTES) {
+                        tracing::debug!(
+                            "Event '{}' on cooldown ({} min remaining), skipping",
+                            event_type,
+                            EVENT_COOLDOWN_MINUTES - elapsed.num_minutes()
+                        );
+                        continue;
+                    }
+                    if *fires >= MAX_CONSECUTIVE_FIRES {
+                        tracing::warn!(
+                            "Event '{}' fired {} consecutive times without resolution — circuit breaker tripped",
+                            event_type, fires
+                        );
+                        continue;
+                    }
+                }
+
                 if let Some(intent) = translate_event(&event, &events_config) {
                     let mut q = intent_queue.write().await;
                     if q.push(intent.clone(), max_queue_size) {
                         tracing::info!("Event → intent queued: '{}'", intent.description);
                         let _ = q.save();
+
+                        // Update cooldown tracking
+                        let entry = cooldowns.entry(event_type).or_insert((Utc::now(), 0));
+                        entry.0 = Utc::now();
+                        entry.1 += 1;
                     } else {
                         tracing::debug!(
                             "Event intent not queued (full or duplicate): '{}'",

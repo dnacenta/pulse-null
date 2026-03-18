@@ -13,7 +13,7 @@ use tokio::sync::RwLock;
 use tower::ServiceExt;
 
 use crate::config::{
-    AutonomyConfig, Config, EntityConfig, LlmConfig, MemoryConfig, MonitoringConfig,
+    AutonomyConfig, Config, EntityConfig, GraphConfig, LlmConfig, MemoryConfig, MonitoringConfig,
     PipelineConfig, PulseConfig, SchedulerConfig, SecurityConfig, ServerConfig, TrustConfig,
 };
 use crate::events::EventBus;
@@ -113,6 +113,7 @@ fn test_config() -> Config {
         monitoring: MonitoringConfig::default(),
         autonomy: AutonomyConfig::default(),
         pulse: PulseConfig::default(),
+        graph: GraphConfig::default(),
         plugins: HashMap::new(),
     }
 }

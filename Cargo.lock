@@ -4940,6 +4940,7 @@ dependencies = [
  "owo-colors",
  "pulse-system-types",
  "recall-echo",
+ "recall-graph",
  "regex",
  "reqwest",
  "serde",

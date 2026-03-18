@@ -32,6 +32,18 @@ pub enum EntityEvent {
     },
 }
 
+impl EntityEvent {
+    /// String key for cooldown/circuit breaker tracking.
+    pub fn event_type(&self) -> String {
+        match self {
+            EntityEvent::PostConversation { .. } => "post_conversation".into(),
+            EntityEvent::PipelineAlert { document, .. } => format!("pipeline_alert_{}", document),
+            EntityEvent::PipelineFrozen { .. } => "pipeline_frozen".into(),
+            EntityEvent::CognitiveHealthChanged { .. } => "cognitive_decline".into(),
+        }
+    }
+}
+
 /// Lightweight event bus backed by a tokio broadcast channel.
 pub struct EventBus {
     sender: broadcast::Sender<EntityEvent>,
