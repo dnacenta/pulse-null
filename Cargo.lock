@@ -771,18 +771,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "caliber-echo"
-version = "0.2.0"
-source = "git+https://github.com/dnacenta/caliber-echo?branch=main#7b7bc9ce57149bc1529e75f846350e205988508d"
-dependencies = [
- "chrono",
- "dirs",
- "pulse-system-types",
- "serde",
- "serde_json",
-]
-
-[[package]]
 name = "castaway"
 version = "0.2.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3206,12 +3194,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "is_ci"
-version = "1.2.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7655c9839580ee829dfacba1d1278c2b7883e50a277ff7541299489d6bdfdc45"
-
-[[package]]
 name = "is_terminal_polyfill"
 version = "1.70.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4788,18 +4770,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "praxis-echo"
-version = "0.3.0"
-source = "git+https://github.com/dnacenta/praxis-echo?branch=main#f67f1e9d63b97aaca79a81e71fc59dfccaa626ed"
-dependencies = [
- "clap",
- "dirs",
- "pulse-system-types",
- "serde",
- "serde_json",
-]
-
-[[package]]
 name = "precomputed-hash"
 version = "0.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4956,7 +4926,6 @@ version = "0.12.0"
 dependencies = [
  "axum",
  "bridge-echo",
- "caliber-echo",
  "chat-echo",
  "chrono",
  "chrono-tz",
@@ -4968,7 +4937,7 @@ dependencies = [
  "discord-voice-echo",
  "globset",
  "libc",
- "praxis-echo",
+ "owo-colors",
  "pulse-system-types",
  "recall-echo",
  "regex",
@@ -4982,7 +4951,6 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "uuid",
- "vigil-echo",
  "voice-echo",
  "walkdir",
 ]
@@ -6630,15 +6598,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "13c2bddecc57b384dee18652358fb23172facb8a2c51ccc10d74c157bdea3292"
 
 [[package]]
-name = "supports-color"
-version = "3.0.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c64fc7232dd8d2e4ac5ce4ef302b1d81e0b80d055b9d77c7c4f51f6aa4c867d6"
-dependencies = [
- "is_ci",
-]
-
-[[package]]
 name = "surrealdb"
 version = "3.0.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -7975,20 +7934,6 @@ name = "version_check"
 version = "0.9.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
-
-[[package]]
-name = "vigil-echo"
-version = "0.3.0"
-source = "git+https://github.com/dnacenta/vigil-echo?branch=main#ee9ceae94d62f77ff2dadd82ddf08d9103d5498d"
-dependencies = [
- "clap",
- "dirs",
- "owo-colors",
- "pulse-system-types",
- "serde",
- "serde_json",
- "supports-color",
-]
 
 [[package]]
 name = "visibility"
