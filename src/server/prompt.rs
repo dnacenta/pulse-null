@@ -42,6 +42,23 @@ pub fn build_system_prompt(
         parts.push(format!("<memory>\n{}\n</memory>", limited));
     }
 
+    // Memory curation instructions — tell the entity how to maintain MEMORY.md
+    parts.push(
+        "<memory-curation>\n\
+        You have a file_write tool. Use it to maintain your memory/MEMORY.md file.\n\
+        When you learn something stable about D, their preferences, projects, or \
+        recurring patterns — or when a conversation produces a decision worth \
+        remembering — write it to MEMORY.md using file_write.\n\n\
+        Rules:\n\
+        - Only write confirmed, stable information. Not session-specific or speculative.\n\
+        - Read MEMORY.md first to avoid duplicates. Update existing entries rather than adding new ones.\n\
+        - Keep it concise. MEMORY.md is loaded into every conversation — bloat costs context.\n\
+        - Do not write secrets, API keys, or credentials to MEMORY.md.\n\
+        - You do not need to write memory on every conversation. Only when something genuinely worth remembering comes up.\n\
+        </memory-curation>"
+            .to_string(),
+    );
+
     // EPHEMERAL.md — last session summary
     let ephemeral_path = root_dir.join("memory/EPHEMERAL.md");
     if ephemeral_path.exists() {
