@@ -61,56 +61,62 @@ mod tests {
     use crate::config::{
         AutonomyConfig, Config, EntityConfig, GraphConfig, LlmConfig, MemoryConfig,
         MonitoringConfig, PipelineConfig, PulseConfig, SchedulerConfig, SecurityConfig,
-        ServerConfig, TrustConfig,
+        ServerConfig, SessionConfig, TrustConfig,
     };
     use crate::events::EventBus;
     use crate::tools::ToolRegistry;
-    use pulse_system_types::llm::Message;
 
-    fn test_state(secret: Option<String>) -> Arc<AppState> {
-        Arc::new(AppState {
-            config: Config {
-                entity: EntityConfig {
-                    name: "Test".into(),
-                    owner_name: "Owner".into(),
-                    owner_alias: "O".into(),
-                },
-                server: ServerConfig::default(),
-                llm: LlmConfig {
-                    provider: "claude".into(),
-                    api_key: None,
-                    model: "test".into(),
-                    max_tokens: 1024,
-                    base_url: None,
-                    claude_bin: None,
-                    context_budget: 0,
-                },
-                security: SecurityConfig {
-                    secret,
-                    injection_detection: true,
-                },
-                trust: TrustConfig::default(),
-                memory: MemoryConfig::default(),
-                scheduler: SchedulerConfig::default(),
-                pipeline: PipelineConfig::default(),
-                monitoring: MonitoringConfig::default(),
-                autonomy: AutonomyConfig::default(),
-                pulse: PulseConfig::default(),
-                graph: GraphConfig::default(),
-                plugins: std::collections::HashMap::new(),
+    async fn test_state(secret: Option<String>) -> Arc<AppState> {
+        let root_dir = std::env::temp_dir();
+        let config = Config {
+            entity: EntityConfig {
+                name: "Test".into(),
+                owner_name: "Owner".into(),
+                owner_alias: "O".into(),
             },
+            server: ServerConfig::default(),
+            llm: LlmConfig {
+                provider: "claude".into(),
+                api_key: None,
+                model: "test".into(),
+                max_tokens: 1024,
+                base_url: None,
+                claude_bin: None,
+                context_budget: 0,
+            },
+            security: SecurityConfig {
+                secret,
+                injection_detection: true,
+            },
+            trust: TrustConfig::default(),
+            memory: MemoryConfig::default(),
+            scheduler: SchedulerConfig::default(),
+            pipeline: PipelineConfig::default(),
+            monitoring: MonitoringConfig::default(),
+            autonomy: AutonomyConfig::default(),
+            pulse: PulseConfig::default(),
+            graph: GraphConfig::default(),
+            sessions: SessionConfig::default(),
+            context_buffer: crate::context_buffer::ContextBufferConfig::default(),
+            plugins: std::collections::HashMap::new(),
+        };
+        let session_store =
+            crate::session_store::SessionStore::new(&root_dir, &config.sessions).await;
+        Arc::new(AppState {
+            config,
             provider: Box::new(crate::claude_provider::ClaudeProvider::new(
                 "fake".into(),
                 "test".into(),
             )),
-            conversation: RwLock::new(Vec::<Message>::new()),
+            session_store,
             system_prompt: RwLock::new(String::new()),
             tools: ToolRegistry::new(),
             event_bus: Arc::new(EventBus::new(16)),
-            root_dir: std::env::temp_dir(),
+            root_dir,
             pipeline_monitor: None,
             cognitive_monitor: None,
             outcome_tracker: None,
+            context_buffer: None,
         })
     }
 
@@ -128,7 +134,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_no_secret_allows_all() {
-        let state = test_state(None);
+        let state = test_state(None).await;
         let app = build_app(state);
 
         let resp = app
@@ -141,7 +147,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_health_bypasses_auth() {
-        let state = test_state(Some("my-secret".into()));
+        let state = test_state(Some("my-secret".into())).await;
         let app = build_app(state);
 
         let resp = app
@@ -159,7 +165,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_missing_secret_returns_401() {
-        let state = test_state(Some("my-secret".into()));
+        let state = test_state(Some("my-secret".into())).await;
         let app = build_app(state);
 
         let resp = app
@@ -172,7 +178,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_wrong_secret_returns_401() {
-        let state = test_state(Some("my-secret".into()));
+        let state = test_state(Some("my-secret".into())).await;
         let app = build_app(state);
 
         let resp = app
@@ -191,7 +197,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_correct_secret_allows_request() {
-        let state = test_state(Some("my-secret".into()));
+        let state = test_state(Some("my-secret".into())).await;
         let app = build_app(state);
 
         let resp = app

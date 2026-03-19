@@ -7,6 +7,7 @@ mod claude_provider;
 mod cli;
 mod config;
 mod context;
+mod context_buffer;
 mod events;
 mod init;
 mod logbook;
@@ -18,6 +19,7 @@ mod providers;
 mod scheduler;
 mod server;
 mod session;
+mod session_store;
 mod tools;
 mod vigil;
 

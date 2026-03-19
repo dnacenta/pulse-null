@@ -30,6 +30,10 @@ pub struct Config {
     #[serde(default)]
     pub graph: GraphConfig,
     #[serde(default)]
+    pub sessions: SessionConfig,
+    #[serde(default)]
+    pub context_buffer: crate::context_buffer::ContextBufferConfig,
+    #[serde(default)]
     pub plugins: HashMap<String, toml::Value>,
 }
 
@@ -381,6 +385,31 @@ impl Default for GraphConfig {
             enabled: false,
             auto_ingest: true,
             pipeline_sync: true,
+        }
+    }
+}
+
+/// Configuration for session persistence
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct SessionConfig {
+    /// Time-to-live for inactive sessions in seconds (default: 24h)
+    pub ttl_seconds: u64,
+    /// Maximum number of concurrent sessions (LRU eviction)
+    pub max_sessions: usize,
+    /// Background cleanup interval in seconds
+    pub cleanup_interval_seconds: u64,
+    /// Whether to persist sessions to disk
+    pub persist: bool,
+}
+
+impl Default for SessionConfig {
+    fn default() -> Self {
+        Self {
+            ttl_seconds: 86400,
+            max_sessions: 50,
+            cleanup_interval_seconds: 300,
+            persist: true,
         }
     }
 }

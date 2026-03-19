@@ -71,6 +71,7 @@ pub async fn run(
             root_dir,
             entity_name,
             "repl",
+            None,
         )
         .await;
 

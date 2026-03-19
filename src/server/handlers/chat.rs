@@ -8,6 +8,7 @@ use serde::{Deserialize, Serialize};
 use crate::events::EntityEvent;
 use crate::server::trust::TrustLevel;
 use crate::server::{injection, AppState};
+use crate::session_store::SessionStore;
 use pulse_system_types::llm::{ContentBlock, Message, MessageContent, Role, StopReason};
 
 #[derive(Deserialize)]
@@ -82,25 +83,52 @@ pub async fn chat(
         user_message.push('\n');
     }
 
+    // Inject channel context buffer (recent activity on this channel)
+    if let Some(ref cb) = state.context_buffer {
+        if let Some(channel_context) = cb.get_context(&req.channel).await {
+            user_message.push_str("\n[Recent channel activity]\n");
+            user_message.push_str(&channel_context);
+            user_message.push_str("\n[End channel activity]\n");
+        }
+    }
+
     user_message.push_str("\nUser message: ");
     user_message.push_str(&req.message);
 
-    // Add to conversation history
-    let mut conversation = state.conversation.write().await;
-    conversation.push(Message {
+    // Record incoming message to context buffer
+    if let Some(ref cb) = state.context_buffer {
+        cb.record(&req.channel, sender_label, "user", &req.message)
+            .await;
+    }
+
+    // Get or create session for this channel:sender pair
+    let session_key = SessionStore::session_key(&req.channel, req.sender.as_deref());
+    let session_arc = state
+        .session_store
+        .get_or_create(&req.channel, req.sender.as_deref())
+        .await;
+
+    // Lock the session for this request
+    let mut session = session_arc.write().await;
+    session.touch();
+
+    // Add user message to session
+    session.data.messages.push(Message {
         role: Role::User,
         content: MessageContent::Text(user_message),
     });
+    session.data.message_count += 1;
 
     // Compact conversation if approaching context budget
     crate::context::compact_if_needed(
-        &mut conversation,
+        &mut session.data.messages,
         state.provider.as_ref(),
         state.config.llm.context_budget,
         state.config.llm.max_tokens,
         &state.root_dir,
         &state.config.entity.name,
         &req.channel,
+        Some(&session_key),
     )
     .await;
 
@@ -127,7 +155,7 @@ pub async fn chat(
             .provider
             .invoke(
                 &system_prompt,
-                &conversation,
+                &session.data.messages,
                 state.config.llm.max_tokens,
                 tool_defs_ref,
             )
@@ -144,8 +172,8 @@ pub async fn chat(
             Some(total_output_tokens.unwrap_or(0) + result.output_tokens.unwrap_or(0));
         final_model = result.model.clone();
 
-        // Add assistant response to conversation
-        conversation.push(Message {
+        // Add assistant response to session
+        session.data.messages.push(Message {
             role: Role::Assistant,
             content: MessageContent::Blocks(result.content.clone()),
         });
@@ -154,6 +182,20 @@ pub async fn chat(
             StopReason::EndTurn | StopReason::MaxTokens | StopReason::StopSequence => {
                 // Done — extract text and return
                 let text = result.text();
+
+                // Record entity response to context buffer
+                if let Some(ref cb) = state.context_buffer {
+                    cb.record(&channel, &state.config.entity.name, "assistant", &text)
+                        .await;
+                }
+
+                // Mark session dirty and persist asynchronously
+                session.mark_dirty();
+                let persist_key = session_key.clone();
+                let persist_store = &state.session_store;
+                // Drop the session lock before persisting to avoid deadlock
+                drop(session);
+                persist_store.persist(&persist_key).await;
 
                 // Emit PostConversation event
                 emit_post_conversation(
@@ -179,6 +221,19 @@ pub async fn chat(
                         MAX_TOOL_ROUNDS
                     );
                     let text = result.text();
+
+                    // Record entity response to context buffer
+                    if let Some(ref cb) = state.context_buffer {
+                        cb.record(&channel, &state.config.entity.name, "assistant", &text)
+                            .await;
+                    }
+
+                    session.mark_dirty();
+                    let persist_key = session_key.clone();
+                    let persist_store = &state.session_store;
+                    drop(session);
+                    persist_store.persist(&persist_key).await;
+
                     emit_post_conversation(
                         &state,
                         &channel,
@@ -222,7 +277,7 @@ pub async fn chat(
                 }
 
                 // Add tool results as a user message and loop
-                conversation.push(Message {
+                session.data.messages.push(Message {
                     role: Role::User,
                     content: MessageContent::Blocks(tool_results),
                 });
@@ -230,6 +285,19 @@ pub async fn chat(
             StopReason::Other(ref reason) => {
                 tracing::warn!("Unexpected stop reason: {}", reason);
                 let text = result.text();
+
+                // Record entity response to context buffer
+                if let Some(ref cb) = state.context_buffer {
+                    cb.record(&channel, &state.config.entity.name, "assistant", &text)
+                        .await;
+                }
+
+                session.mark_dirty();
+                let persist_key = session_key.clone();
+                let persist_store = &state.session_store;
+                drop(session);
+                persist_store.persist(&persist_key).await;
+
                 emit_post_conversation(
                     &state,
                     &channel,

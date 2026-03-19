@@ -21,15 +21,16 @@ use crate::pidfile;
 use crate::plugins::manager::PluginManager;
 use crate::scheduler::intent::IntentQueue;
 use crate::scheduler::Schedule;
+use crate::session_store::SessionStore;
 use crate::tools::ToolRegistry;
-use pulse_system_types::llm::{LmProvider, Message};
+use pulse_system_types::llm::LmProvider;
 use pulse_system_types::monitoring::{CognitiveMonitor, OutcomeTracker, PipelineMonitor};
 
 /// Shared application state
 pub struct AppState {
     pub config: Config,
     pub provider: Box<dyn LmProvider>,
-    pub conversation: RwLock<Vec<Message>>,
+    pub session_store: SessionStore,
     pub system_prompt: RwLock<String>,
     pub tools: ToolRegistry,
     pub event_bus: Arc<EventBus>,
@@ -37,12 +38,16 @@ pub struct AppState {
     pub pipeline_monitor: Option<Arc<dyn PipelineMonitor>>,
     pub cognitive_monitor: Option<Arc<dyn CognitiveMonitor>>,
     pub outcome_tracker: Option<Arc<dyn OutcomeTracker>>,
+    pub context_buffer: Option<crate::context_buffer::ContextBufferStore>,
 }
 
 pub async fn start(config: Config) -> Result<(), Box<dyn std::error::Error>> {
     let provider = crate::providers::create_provider(&config)?;
 
     let root_dir = config.root_dir()?;
+
+    // Ensure required directories and files exist
+    ensure_infrastructure(&root_dir);
 
     // Construct monitoring trait objects based on config
     let pipeline_monitor: Option<Arc<dyn PipelineMonitor>> = if config.pipeline.enabled {
@@ -108,10 +113,30 @@ pub async fn start(config: Config) -> Result<(), Box<dyn std::error::Error>> {
     // Create event bus
     let event_bus = Arc::new(EventBus::new(64));
 
+    // Initialize session store (loads persisted sessions from disk)
+    let session_store = SessionStore::new(&root_dir, &config.sessions).await;
+    let loaded_count = session_store.count().await;
+    if loaded_count > 0 {
+        tracing::info!("{} session(s) restored from disk", loaded_count);
+    }
+
+    // Initialize context buffer (loads persisted buffers from disk)
+    let context_buffer = if config.context_buffer.enabled {
+        let cb =
+            crate::context_buffer::ContextBufferStore::new(&root_dir, &config.context_buffer).await;
+        tracing::info!(
+            "Context buffer enabled (max {} messages per channel)",
+            config.context_buffer.max_messages
+        );
+        Some(cb)
+    } else {
+        None
+    };
+
     let state = Arc::new(AppState {
         config: config.clone(),
         provider,
-        conversation: RwLock::new(Vec::new()),
+        session_store,
         system_prompt: RwLock::new(system_prompt),
         tools,
         event_bus: Arc::clone(&event_bus),
@@ -119,6 +144,7 @@ pub async fn start(config: Config) -> Result<(), Box<dyn std::error::Error>> {
         pipeline_monitor,
         cognitive_monitor,
         outcome_tracker,
+        context_buffer,
     });
 
     // Load schedule and intent queue, start scheduler
@@ -149,6 +175,26 @@ pub async fn start(config: Config) -> Result<(), Box<dyn std::error::Error>> {
             .await;
         });
         tracing::info!("Event listener started");
+    }
+
+    // Start background session cleanup task
+    if config.sessions.persist {
+        let cleanup_state = Arc::clone(&state);
+        let cleanup_interval = config.sessions.cleanup_interval_seconds;
+        tokio::spawn(async move {
+            let mut interval =
+                tokio::time::interval(std::time::Duration::from_secs(cleanup_interval));
+            interval.tick().await; // Skip first immediate tick
+            loop {
+                interval.tick().await;
+                cleanup_state
+                    .session_store
+                    .cleanup_expired(&cleanup_state.root_dir, &cleanup_state.config.entity.name)
+                    .await;
+                cleanup_state.session_store.persist_all().await;
+            }
+        });
+        tracing::info!("Session cleanup task started (every {}s)", cleanup_interval);
     }
 
     // Collect plugin routes (stateless — merged after .with_state())
@@ -195,31 +241,11 @@ pub async fn start(config: Config) -> Result<(), Box<dyn std::error::Error>> {
         .with_graceful_shutdown(shutdown)
         .await?;
 
-    // Archive conversation on shutdown
-    {
-        let conversation = state.conversation.read().await;
-        if !conversation.is_empty() {
-            let archive_path = crate::session::end_session(
-                &root_dir,
-                &config.entity.name,
-                &conversation,
-                "http",
-                "server-shutdown",
-            );
-
-            // Graph ingestion (if enabled)
-            if config.graph.enabled && config.graph.auto_ingest {
-                if let Some(ref path) = archive_path {
-                    crate::session::graph_ingest_archive(
-                        &root_dir,
-                        path,
-                        Some(state.provider.as_ref()),
-                    )
-                    .await;
-                }
-            }
-        }
-    }
+    // Archive all sessions on shutdown and persist to disk
+    state
+        .session_store
+        .archive_all(&root_dir, &config.entity.name)
+        .await;
 
     // Clean up plugins on shutdown
     plugin_manager.stop_all().await;
@@ -234,4 +260,49 @@ pub async fn start(config: Config) -> Result<(), Box<dyn std::error::Error>> {
     tracing::info!("Shutdown complete");
 
     Ok(())
+}
+
+/// Ensure all required directories and seed files exist.
+///
+/// Called on every startup so that entities created before certain features
+/// were added (or set up manually) get the infrastructure they need.
+fn ensure_infrastructure(root_dir: &std::path::Path) {
+    let dirs = [
+        "memory",
+        "sessions",
+        "archives",
+        "archives/conversations",
+        "journal",
+        "logs",
+        "monitoring",
+    ];
+
+    for d in &dirs {
+        let path = root_dir.join(d);
+        if !path.exists() {
+            if let Err(e) = std::fs::create_dir_all(&path) {
+                tracing::warn!("Failed to create {}: {}", path.display(), e);
+            } else {
+                tracing::info!("Created missing directory: {}", d);
+            }
+        }
+    }
+
+    // Seed files — create only if missing, never overwrite
+    let seed_files: &[(&str, &str)] = &[
+        ("memory/MEMORY.md", ""),
+        ("memory/EPHEMERAL.md", ""),
+        ("memory/ARCHIVE.md", "# Archive Index\n"),
+    ];
+
+    for (path, default_content) in seed_files {
+        let full_path = root_dir.join(path);
+        if !full_path.exists() {
+            if let Err(e) = std::fs::write(&full_path, default_content) {
+                tracing::warn!("Failed to create {}: {}", full_path.display(), e);
+            } else {
+                tracing::info!("Created missing file: {}", path);
+            }
+        }
+    }
 }
