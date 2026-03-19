@@ -684,22 +684,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "36f64beae40a84da1b4b26ff2761a5b895c12adc41dc25aaee1c4f2bbfe97a6e"
 
 [[package]]
-name = "bridge-echo"
-version = "0.3.0"
-source = "git+https://github.com/dnacenta/bridge-echo?branch=main#7cba953536c2b9a0096a0c0088548d8f96445008"
-dependencies = [
- "axum",
- "pulse-system-types",
- "regex",
- "reqwest",
- "serde",
- "serde_json",
- "tokio",
- "tracing",
- "tracing-subscriber",
-]
-
-[[package]]
 name = "bstr"
 version = "1.12.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4925,7 +4909,6 @@ name = "pulse-null"
 version = "0.12.0"
 dependencies = [
  "axum",
- "bridge-echo",
  "chat-echo",
  "chrono",
  "chrono-tz",
