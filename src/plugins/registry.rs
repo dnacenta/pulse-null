@@ -31,12 +31,6 @@ pub fn known_plugins() -> Vec<RegistryEntry> {
             available: cfg!(feature = "discord"),
         },
         RegistryEntry {
-            name: "bridge-echo".to_string(),
-            description: "HTTP bridge for Claude Code integration".to_string(),
-            version: "0.2.0".to_string(),
-            available: true,
-        },
-        RegistryEntry {
             name: "recall-echo".to_string(),
             description: "Three-layer persistent memory system".to_string(),
             version: "0.6.0".to_string(),
@@ -80,7 +74,6 @@ pub fn create_plugin(name: &str) -> Option<Box<dyn Plugin>> {
     match name {
         // Core plugins (always available)
         "chat-echo" => Some(Box::new(super::chat_echo::ChatEchoPlugin::new())),
-        "bridge-echo" => Some(Box::new(super::bridge_echo::BridgeEchoPlugin::new())),
         "recall-echo" => Some(Box::new(super::recall_echo::RecallEchoPlugin::new())),
         "praxis-echo" => Some(Box::new(crate::praxis::PraxisEchoPlugin::new())),
         "caliber-echo" => Some(Box::new(crate::caliber::CaliberEchoPlugin::new())),
@@ -132,7 +125,6 @@ mod tests {
         assert!(names.contains(&"voice-echo"));
         assert!(names.contains(&"chat-echo"));
         assert!(names.contains(&"discord-echo"));
-        assert!(names.contains(&"bridge-echo"));
         assert!(names.contains(&"recall-echo"));
         assert!(names.contains(&"praxis-echo"));
         assert!(names.contains(&"caliber-echo"));

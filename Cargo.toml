@@ -61,7 +61,6 @@ pulse-system-types = { git = "https://github.com/dnacenta/pulse-null-types", bra
 
 # Core dependencies (always included — these define an entity)
 chat-echo = { git = "https://github.com/dnacenta/chat-echo", branch = "main" }
-bridge-echo = { git = "https://github.com/dnacenta/bridge-echo", branch = "main" }
 recall-echo = { git = "https://github.com/dnacenta/recall-echo", branch = "main", features = ["pulse-null"] }
 
 # Knowledge graph (optional — enabled by graph feature)
