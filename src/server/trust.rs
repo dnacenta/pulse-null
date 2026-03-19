@@ -43,7 +43,7 @@ mod tests {
     use crate::config::{
         AutonomyConfig, Config, EntityConfig, GraphConfig, LlmConfig, MemoryConfig,
         MonitoringConfig, PipelineConfig, PulseConfig, SchedulerConfig, SecurityConfig,
-        ServerConfig, TrustConfig,
+        ServerConfig, SessionConfig, TrustConfig,
     };
 
     fn test_config() -> Config {
@@ -78,6 +78,8 @@ mod tests {
             autonomy: AutonomyConfig::default(),
             pulse: PulseConfig::default(),
             graph: GraphConfig::default(),
+            sessions: SessionConfig::default(),
+            context_buffer: crate::context_buffer::ContextBufferConfig::default(),
             plugins: std::collections::HashMap::new(),
         }
     }

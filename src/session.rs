@@ -10,6 +10,7 @@ pub struct ArchiveMeta {
     pub trigger: String,
     pub channel: String,
     pub entity_name: String,
+    pub session_key: Option<String>,
 }
 
 /// Serialize a conversation to grep-searchable markdown.
@@ -136,8 +137,13 @@ pub fn archive_conversation(
 
     let conversation_md = conversation_to_markdown(conversation);
 
+    let session_key_line = match &meta.session_key {
+        Some(key) => format!("session_key: \"{}\"\n", key),
+        None => String::new(),
+    };
+
     let content = format!(
-        "---\nlog: {next_num}\ndate: \"{date_full}\"\ntrigger: {trigger}\nchannel: {channel}\nentity: \"{entity}\"\nmessage_count: {message_count}\n---\n\n# Conversation {next_num:03}\n\n{conversation_md}",
+        "---\nlog: {next_num}\ndate: \"{date_full}\"\ntrigger: {trigger}\nchannel: {channel}\nentity: \"{entity}\"\n{session_key_line}message_count: {message_count}\n---\n\n# Conversation {next_num:03}\n\n{conversation_md}",
         trigger = meta.trigger,
         channel = meta.channel,
         entity = meta.entity_name,
@@ -210,6 +216,7 @@ pub fn end_session(
         trigger: trigger.to_string(),
         channel: channel.to_string(),
         entity_name: entity_name.to_string(),
+        session_key: None,
     };
 
     let archive_path = match archive_conversation(root_dir, conversation, &meta) {
@@ -538,6 +545,7 @@ mod tests {
             trigger: "session-end".into(),
             channel: "repl".into(),
             entity_name: "TestEntity".into(),
+            session_key: None,
         };
 
         let path = archive_conversation(root, &conversation, &meta).unwrap();
@@ -576,6 +584,7 @@ mod tests {
             trigger: "session-end".into(),
             channel: "repl".into(),
             entity_name: "Test".into(),
+            session_key: None,
         };
 
         let path = archive_conversation(root, &conversation, &meta).unwrap();
@@ -592,6 +601,7 @@ mod tests {
                 trigger: "session-end".into(),
                 channel: "repl".into(),
                 entity_name: "Test".into(),
+                session_key: None,
             },
         );
         assert!(result.is_err());

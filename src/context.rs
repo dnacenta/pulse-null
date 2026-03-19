@@ -94,6 +94,7 @@ pub async fn compact_if_needed(
     root_dir: &Path,
     entity_name: &str,
     channel: &str,
+    session_key: Option<&str>,
 ) {
     let budget = if context_budget > 0 {
         context_budget
@@ -136,6 +137,7 @@ pub async fn compact_if_needed(
         trigger: "compaction".to_string(),
         channel: channel.to_string(),
         entity_name: entity_name.to_string(),
+        session_key: session_key.map(|s| s.to_string()),
     };
     if let Err(e) = crate::session::archive_conversation(root_dir, old_messages, &meta) {
         tracing::warn!("Failed to archive compacted messages: {}", e);

@@ -14,7 +14,8 @@ use tower::ServiceExt;
 
 use crate::config::{
     AutonomyConfig, Config, EntityConfig, GraphConfig, LlmConfig, MemoryConfig, MonitoringConfig,
-    PipelineConfig, PulseConfig, SchedulerConfig, SecurityConfig, ServerConfig, TrustConfig,
+    PipelineConfig, PulseConfig, SchedulerConfig, SecurityConfig, ServerConfig, SessionConfig,
+    TrustConfig,
 };
 use crate::events::EventBus;
 use crate::server::handlers;
@@ -114,6 +115,8 @@ fn test_config() -> Config {
         autonomy: AutonomyConfig::default(),
         pulse: PulseConfig::default(),
         graph: GraphConfig::default(),
+        sessions: SessionConfig::default(),
+        context_buffer: crate::context_buffer::ContextBufferConfig::default(),
         plugins: HashMap::new(),
     }
 }
@@ -129,18 +132,22 @@ fn build_app(state: Arc<AppState>) -> Router {
         .with_state(state)
 }
 
-fn build_state(provider: MockProvider, tools: ToolRegistry) -> Arc<AppState> {
+async fn build_state(provider: MockProvider, tools: ToolRegistry) -> Arc<AppState> {
+    let root_dir = std::env::temp_dir();
+    let config = test_config();
+    let session_store = crate::session_store::SessionStore::new(&root_dir, &config.sessions).await;
     Arc::new(AppState {
-        config: test_config(),
+        config,
         provider: Box::new(provider),
-        conversation: RwLock::new(Vec::new()),
+        session_store,
         system_prompt: RwLock::new("You are a test entity.".to_string()),
         tools,
         event_bus: Arc::new(EventBus::new(16)),
-        root_dir: std::env::temp_dir(),
+        root_dir,
         pipeline_monitor: None,
         cognitive_monitor: None,
         outcome_tracker: None,
+        context_buffer: None,
     })
 }
 
@@ -169,7 +176,7 @@ async fn post_chat(app: &Router, message: &str) -> (StatusCode, String) {
 #[tokio::test]
 async fn e2e_health_endpoint() {
     let provider = MockProvider::new(vec![]);
-    let state = build_state(provider, ToolRegistry::new());
+    let state = build_state(provider, ToolRegistry::new()).await;
     let app = build_app(state);
 
     let req = Request::builder()
@@ -193,7 +200,7 @@ async fn e2e_chat_simple_response() {
         output_tokens: Some(5),
     }]);
 
-    let state = build_state(provider, ToolRegistry::new());
+    let state = build_state(provider, ToolRegistry::new()).await;
     let app = build_app(state);
 
     let (status, body) = post_chat(&app, "Hello").await;
@@ -242,7 +249,7 @@ async fn e2e_chat_file_read_tool() {
         tmp.path().to_path_buf(),
     )));
 
-    let state = build_state(provider, tools);
+    let state = build_state(provider, tools).await;
     let app = build_app(state);
 
     let (status, body) = post_chat(&app, "Read hello.txt").await;
@@ -292,7 +299,7 @@ async fn e2e_chat_grep_tool() {
         tmp.path().to_path_buf(),
     )));
 
-    let state = build_state(provider, tools);
+    let state = build_state(provider, tools).await;
     let app = build_app(state);
 
     let (status, body) = post_chat(&app, "Search for 'find me'").await;
@@ -337,7 +344,7 @@ async fn e2e_chat_file_write_tool() {
         tmp.path().to_path_buf(),
     )));
 
-    let state = build_state(provider, tools);
+    let state = build_state(provider, tools).await;
     let app = build_app(state);
 
     let (status, body) = post_chat(&app, "Write a file").await;
@@ -386,7 +393,7 @@ async fn e2e_chat_file_list_tool() {
         tmp.path().to_path_buf(),
     )));
 
-    let state = build_state(provider, tools);
+    let state = build_state(provider, tools).await;
     let app = build_app(state);
 
     let (status, _body) = post_chat(&app, "List my files").await;
@@ -420,7 +427,7 @@ async fn e2e_chat_unknown_tool_returns_error() {
         },
     ]);
 
-    let state = build_state(provider, ToolRegistry::new());
+    let state = build_state(provider, ToolRegistry::new()).await;
     let app = build_app(state);
 
     let (status, body) = post_chat(&app, "Use a fake tool").await;
@@ -483,7 +490,7 @@ async fn e2e_chat_multi_tool_chain() {
         tmp.path().to_path_buf(),
     )));
 
-    let state = build_state(provider, tools);
+    let state = build_state(provider, tools).await;
     let app = build_app(state);
 
     let (status, body) = post_chat(&app, "Write then read").await;
@@ -533,7 +540,7 @@ async fn e2e_token_accumulation_across_rounds() {
         tmp.path().to_path_buf(),
     )));
 
-    let state = build_state(provider, tools);
+    let state = build_state(provider, tools).await;
     let app = build_app(state);
 
     let (status, body) = post_chat(&app, "Read a.txt").await;
