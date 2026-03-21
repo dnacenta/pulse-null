@@ -57,25 +57,23 @@ chrono = { version = "0.4", features = ["serde"] }
 libc = "0.2"
 
 # Shared types
-pulse-system-types = { git = "https://github.com/dnacenta/pulse-null-types", branch = "main" }
+pulse-system-types = "0.5"
 
 # Core dependencies (always included — these define an entity)
-chat-echo = { git = "https://github.com/dnacenta/chat-echo", branch = "main" }
-recall-echo = { git = "https://github.com/dnacenta/recall-echo", branch = "main", features = ["pulse-null"] }
-vigil-pulse = { git = "https://github.com/dnacenta/vigil-pulse", branch = "main" }
+chat-echo = "0.2"
+recall-echo = { version = "3.2", features = ["pulse-null"] }
+vigil-pulse = "0.1"
 
 # Plugins (optional — different interfaces to speak through)
-voice-echo = { git = "https://github.com/dnacenta/voice-echo", branch = "main", optional = true }
-discord-voice-echo = { git = "https://github.com/dnacenta/discord-voice-echo", branch = "main", optional = true }
-discord-echo = { git = "https://github.com/dnacenta/discord-echo", branch = "main", optional = true }
+voice-echo = { version = "0.8", optional = true }
+discord-echo = { version = "0.1", optional = true }
 
 [features]
 default = []
 graph = ["recall-echo/graph"]
 voice = ["dep:voice-echo"]
-discord = ["dep:discord-voice-echo", "voice"]
 discord-text = ["dep:discord-echo"]
-all-plugins = ["voice", "discord", "discord-text"]
+all-plugins = ["voice", "discord-text"]
 
 [dev-dependencies]
 tempfile = "3"
