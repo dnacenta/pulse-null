@@ -23,6 +23,19 @@ pub fn validate(config: &Config) -> Result<(), Box<dyn std::error::Error>> {
     if config.entity.owner_name.is_empty() {
         return Err("Owner name cannot be empty".into());
     }
+    if let Some(ref rules_dir) = config.entity.rules_dir {
+        let path = std::path::Path::new(rules_dir);
+        if !path.exists() {
+            return Err(format!(
+                "rules_dir '{}' does not exist. Create it or remove the config entry.",
+                rules_dir
+            )
+            .into());
+        }
+        if !path.is_dir() {
+            return Err(format!("rules_dir '{}' is not a directory", rules_dir).into());
+        }
+    }
     if config.server.port == 0 {
         return Err("Server port must be > 0".into());
     }

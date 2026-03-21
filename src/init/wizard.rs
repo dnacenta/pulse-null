@@ -121,6 +121,46 @@ pub async fn run(target_dir: &Path) -> Result<(), Box<dyn std::error::Error>> {
         .interact_text()?;
 
     println!();
+    println!("  {}", style("Shared protocols (optional).").bold());
+    println!("  If you have shared rule files (recall, praxis, vigil, etc.) in a directory,");
+    println!("  pulse-null will load them into the system prompt.");
+    println!();
+
+    let rules_dir_input: String = Input::new()
+        .with_prompt("  Path to shared rules directory (leave empty to skip)")
+        .allow_empty(true)
+        .interact_text()?;
+
+    let rules_dir = if rules_dir_input.trim().is_empty() {
+        None
+    } else {
+        let path = std::path::Path::new(&rules_dir_input);
+        if path.exists() && path.is_dir() {
+            let md_count = std::fs::read_dir(path)
+                .map(|entries| {
+                    entries
+                        .filter_map(|e| e.ok())
+                        .filter(|e| e.path().extension().map(|ext| ext == "md").unwrap_or(false))
+                        .count()
+                })
+                .unwrap_or(0);
+            println!(
+                "    {} Found {} rule file(s) in {}",
+                style("✓").green(),
+                md_count,
+                rules_dir_input
+            );
+            Some(rules_dir_input)
+        } else {
+            println!(
+                "    {} Directory not found. Skipping shared rules.",
+                style("⚠").yellow()
+            );
+            None
+        }
+    };
+
+    println!();
     println!("  {}", style("Scheduler configuration.").bold());
     println!();
 
@@ -184,6 +224,7 @@ pub async fn run(target_dir: &Path) -> Result<(), Box<dyn std::error::Error>> {
         port,
         timezone: timezone.clone(),
         plugins: plugin_configs,
+        rules_dir,
     };
 
     // Write all files

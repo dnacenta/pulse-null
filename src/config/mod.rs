@@ -42,6 +42,9 @@ pub struct EntityConfig {
     pub name: String,
     pub owner_name: String,
     pub owner_alias: String,
+    /// Path to shared rule/protocol files (*.md). Loaded into system prompt.
+    #[serde(default)]
+    pub rules_dir: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

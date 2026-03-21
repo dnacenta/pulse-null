@@ -3,7 +3,7 @@ use std::path::PathBuf;
 
 use owo_colors::OwoColorize;
 
-const PROTOCOL_TEMPLATE: &str = include_str!("../../templates/vigil-echo.md");
+const PROTOCOL_TEMPLATE: &str = include_str!("../../templates/vigil-pulse.md");
 
 const PULSE_COMMAND: &str = "vigil-echo pulse";
 const COLLECT_COMMAND: &str = "vigil-echo collect --trigger session-end";
@@ -66,7 +66,7 @@ fn write_protocol(path: &PathBuf) {
     match fs::write(path, PROTOCOL_TEMPLATE) {
         Ok(()) => print_status(
             Status::Created,
-            "Created protocol rules (~/.claude/rules/vigil-echo.md)",
+            "Created protocol rules (~/.claude/rules/vigil-pulse.md)",
         ),
         Err(e) => print_status(
             Status::Error,
