@@ -92,6 +92,7 @@ fn test_config() -> Config {
             name: "TestEntity".to_string(),
             owner_name: "Tester".to_string(),
             owner_alias: "T".to_string(),
+            rules_dir: None,
         },
         server: ServerConfig::default(),
         llm: LlmConfig {

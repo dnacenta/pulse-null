@@ -72,7 +72,7 @@ pub fn rules_dir() -> Result<PathBuf, String> {
 }
 
 pub fn protocol_file() -> Result<PathBuf, String> {
-    Ok(rules_dir()?.join("vigil-echo.md"))
+    Ok(rules_dir()?.join("vigil-pulse.md"))
 }
 
 // Document paths

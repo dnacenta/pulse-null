@@ -18,6 +18,8 @@ pub struct ConfigData {
     pub timezone: String,
     /// Plugin configs: (plugin_name, [(key, value)])
     pub plugins: Vec<(String, Vec<(String, String)>)>,
+    /// Path to shared rule/protocol files
+    pub rules_dir: Option<String>,
 }
 
 pub fn render_config(data: &ConfigData) -> String {
@@ -33,6 +35,11 @@ pub fn render_config(data: &ConfigData) -> String {
             .to_string(),
     };
 
+    let rules_dir_line = match &data.rules_dir {
+        Some(dir) => format!("rules_dir = \"{}\"", dir),
+        None => "# rules_dir = \"/path/to/shared/rules\"  # Shared protocol files".to_string(),
+    };
+
     format!(
         r#"# pulse-null configuration
 
@@ -40,6 +47,7 @@ pub fn render_config(data: &ConfigData) -> String {
 name = "{entity_name}"
 owner_name = "{owner_name}"
 owner_alias = "{owner_alias}"
+{rules_dir_line}
 
 [server]
 host = "127.0.0.1"
@@ -112,6 +120,7 @@ cognitive_decline = true
         entity_name = data.entity_name,
         owner_name = data.owner_name,
         owner_alias = data.owner_alias,
+        rules_dir_line = rules_dir_line,
         port = data.port,
         provider = data.provider,
         api_key_line = api_key_line,
@@ -219,6 +228,12 @@ Your growth pipeline lives in the journal/ directory:
 - journal/LOGBOOK.md — session records
 
 Ideas flow: LEARNING → THOUGHTS → REFLECTIONS → SELF.md / PRAXIS.md
+
+## Protocols
+
+Shared protocols may be loaded into your context from a rules directory.
+These define how you operate: memory management, pipeline enforcement,
+metacognitive monitoring, and security boundaries. Follow them.
 "#,
         entity_name = identity.entity_name,
         owner_name = identity.owner_name,

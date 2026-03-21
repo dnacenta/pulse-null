@@ -4,7 +4,7 @@ use std::path::PathBuf;
 use super::state;
 use super::PraxisConfig;
 
-const PROTOCOL_TEMPLATE: &str = include_str!("../../templates/praxis-echo.md");
+const PROTOCOL_TEMPLATE: &str = include_str!("../../templates/vigil-pulse.md");
 
 const PULSE_COMMAND: &str = "praxis-echo pulse";
 const CHECKPOINT_COMMAND: &str = "praxis-echo checkpoint";
@@ -76,7 +76,7 @@ fn write_protocol(path: &PathBuf) {
     match fs::write(path, PROTOCOL_TEMPLATE) {
         Ok(()) => print_status(
             Status::Created,
-            "Created pipeline protocol (~/.claude/rules/praxis-echo.md)",
+            "Created pipeline protocol (~/.claude/rules/vigil-pulse.md)",
         ),
         Err(e) => print_status(
             Status::Error,

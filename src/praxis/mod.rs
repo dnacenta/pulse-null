@@ -50,7 +50,7 @@ pub fn rules_dir(claude_dir: &PathBuf) -> PathBuf {
 }
 
 pub fn protocol_file(claude_dir: &PathBuf) -> PathBuf {
-    rules_dir(claude_dir).join("praxis-echo.md")
+    rules_dir(claude_dir).join("vigil-pulse.md")
 }
 
 // Document paths

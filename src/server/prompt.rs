@@ -2,6 +2,7 @@ use std::path::Path;
 use std::sync::Arc;
 
 use pulse_system_types::monitoring::{CognitiveMonitor, PipelineMonitor};
+use tracing::{info, warn};
 
 use crate::config::Config;
 use crate::scheduler::intent::IntentQueue;
@@ -20,6 +21,23 @@ pub fn build_system_prompt(
     if claude_path.exists() {
         let content = std::fs::read_to_string(&claude_path)?;
         parts.push(content);
+    }
+
+    // Shared rule/protocol files
+    if let Some(ref rules_dir) = config.entity.rules_dir {
+        match load_rule_files(rules_dir) {
+            Ok(rules) => {
+                for (name, content) in rules {
+                    parts.push(format!(
+                        "<protocol name=\"{}\">\n{}\n</protocol>",
+                        name, content
+                    ));
+                }
+            }
+            Err(e) => {
+                warn!("Failed to load rule files from '{}': {}", rules_dir, e);
+            }
+        }
     }
 
     // SELF.md — identity
@@ -99,6 +117,60 @@ pub fn build_system_prompt(
     }
 
     Ok(parts.join("\n\n"))
+}
+
+/// Load shared rule/protocol files from the configured rules directory.
+/// Returns (protocol_name, content) tuples sorted alphabetically by filename.
+fn load_rule_files(rules_dir: &str) -> Result<Vec<(String, String)>, Box<dyn std::error::Error>> {
+    let dir = Path::new(rules_dir);
+    if !dir.exists() || !dir.is_dir() {
+        return Ok(Vec::new());
+    }
+
+    let mut entries: Vec<_> = std::fs::read_dir(dir)?
+        .filter_map(|entry| entry.ok())
+        .filter(|entry| {
+            entry
+                .path()
+                .extension()
+                .map(|ext| ext == "md")
+                .unwrap_or(false)
+        })
+        .collect();
+
+    entries.sort_by_key(|e| e.file_name());
+
+    let mut rules = Vec::new();
+    let mut total_chars = 0;
+
+    for entry in entries {
+        let path = entry.path();
+        let protocol_name = path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("unknown")
+            .to_string();
+
+        match std::fs::read_to_string(&path) {
+            Ok(content) => {
+                total_chars += content.len();
+                rules.push((protocol_name, content));
+            }
+            Err(e) => {
+                warn!("Skipping rule file {:?}: {}", path, e);
+            }
+        }
+    }
+
+    let estimated_tokens = total_chars / 4;
+    info!(
+        "Loaded {} rule file(s) from {} (~{} tokens)",
+        rules.len(),
+        rules_dir,
+        estimated_tokens
+    );
+
+    Ok(rules)
 }
 
 /// Build context block for autonomous sessions (scheduled tasks and intents).
