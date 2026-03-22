@@ -202,7 +202,8 @@ my-entity/
 ├── memory/
 │   ├── MEMORY.md                 # Curated knowledge (always in context)
 │   ├── EPHEMERAL.md              # Last 5 session summaries
-│   └── ARCHIVE.md                # Long-term archive index
+│   ├── ARCHIVE.md                # Long-term archive index
+│   └── conversations/            # Full conversation archives
 │
 ├── journal/
 │   ├── LEARNING.md               # Active research threads (capture)
@@ -212,6 +213,8 @@ my-entity/
 │   ├── PRAXIS.md                 # Behavioral policies (integrate)
 │   └── LOGBOOK.md                # Session records
 │
+├── caliber/                      # Outcome tracking (vigil-pulse)
+│   └── outcomes.json
 ├── monitoring/
 │   └── signals.json              # Cognitive health metrics (vigil-pulse)
 │
@@ -220,6 +223,21 @@ my-entity/
 ├── static/                       # Web UI assets
 └── logs/                         # Service logs
 ```
+
+### Multi-Entity Vault
+
+When running multiple entities, you can organize them in a shared vault with symlinks for centralized visibility (e.g., via Obsidian):
+
+```
+vault/
+├── entities/
+│   ├── echo  → /home/echo/entity/     # symlink to live entity
+│   ├── nova  → /home/nova/entity/     # symlink to live entity
+│   └── synth → /home/synth/entity/    # symlink to live entity
+└── ...
+```
+
+Each entity's directory is the source of truth. The vault provides a unified view across all entities without duplicating files. Use Unix groups and ownership to control access — entities can read the entire vault but only write to their own directory.
 
 ## Configuration
 
