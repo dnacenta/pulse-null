@@ -364,6 +364,12 @@ async fn execute_task(
     if state.config.graph.enabled && state.config.graph.pipeline_sync {
         crate::session::graph_sync_pipeline(&root_dir).await;
     }
+
+    // Graph vigil sync (if enabled)
+    #[cfg(feature = "graph")]
+    if state.config.graph.enabled {
+        crate::session::graph_sync_vigil(&root_dir).await;
+    }
 }
 
 /// Append a task execution record to LOGBOOK.md, rotating if too long.

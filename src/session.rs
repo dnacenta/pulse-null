@@ -310,7 +310,7 @@ pub async fn graph_sync_pipeline(root_dir: &Path) {
     let read_or_empty =
         |name: &str| -> String { fs::read_to_string(journal.join(name)).unwrap_or_default() };
 
-    let docs = recall_graph::types::PipelineDocuments {
+    let docs = recall_echo::graph::types::PipelineDocuments {
         learning: read_or_empty("LEARNING.md"),
         thoughts: read_or_empty("THOUGHTS.md"),
         curiosity: read_or_empty("CURIOSITY.md"),
@@ -325,7 +325,7 @@ pub async fn graph_sync_pipeline(root_dir: &Path) {
             Err(e) => return Err(format!("failed to create runtime: {e}")),
         };
         rt.block_on(async {
-            let gm = recall_graph::GraphMemory::open(&graph_dir_owned)
+            let gm = recall_echo::graph::GraphMemory::open(&graph_dir_owned)
                 .await
                 .map_err(|e| format!("graph open: {e}"))?;
             gm.sync_pipeline(&docs)
@@ -347,6 +347,62 @@ pub async fn graph_sync_pipeline(root_dir: &Path) {
         }
         Ok(Err(e)) => tracing::warn!("graph: pipeline sync failed: {}", e),
         Err(e) => tracing::warn!("graph: pipeline sync task panicked: {}", e),
+    }
+}
+
+/// Sync vigil-pulse signals and outcomes to the knowledge graph.
+///
+/// Reads monitoring/signals.json and caliber/outcomes.json from root_dir
+/// and syncs them to the graph store in root_dir/memory/graph/.
+#[cfg(feature = "graph")]
+pub async fn graph_sync_vigil(root_dir: &Path) {
+    let graph_dir = root_dir.join("memory").join("graph");
+    if !graph_dir.exists() {
+        tracing::debug!("graph: vigil sync skipped — graph/ not initialized");
+        return;
+    }
+
+    let signals_path = root_dir.join("monitoring").join("signals.json");
+    let outcomes_path = root_dir.join("caliber").join("outcomes.json");
+
+    if !signals_path.exists() && !outcomes_path.exists() {
+        tracing::debug!("graph: vigil sync skipped — no signal/outcome data");
+        return;
+    }
+
+    let graph_dir_owned = graph_dir.to_path_buf();
+    let result = tokio::task::spawn_blocking(move || {
+        let rt = match tokio::runtime::Runtime::new() {
+            Ok(rt) => rt,
+            Err(e) => return Err(format!("failed to create runtime: {e}")),
+        };
+        rt.block_on(async {
+            let gm = recall_echo::graph::GraphMemory::open(&graph_dir_owned)
+                .await
+                .map_err(|e| format!("graph open: {e}"))?;
+            gm.sync_vigil(&signals_path, &outcomes_path)
+                .await
+                .map_err(|e| format!("vigil sync: {e}"))
+        })
+    })
+    .await;
+
+    match result {
+        Ok(Ok(report)) => {
+            if report.measurements_created > 0
+                || report.outcomes_created > 0
+            {
+                tracing::info!(
+                    "graph: vigil sync — {} measurements, {} outcomes, {} rels, {} skipped",
+                    report.measurements_created,
+                    report.outcomes_created,
+                    report.relationships_created,
+                    report.skipped,
+                );
+            }
+        }
+        Ok(Err(e)) => tracing::warn!("graph: vigil sync failed: {}", e),
+        Err(e) => tracing::warn!("graph: vigil sync task panicked: {}", e),
     }
 }
 

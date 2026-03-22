@@ -3901,7 +3901,7 @@ dependencies = [
 
 [[package]]
 name = "pulse-null"
-version = "0.12.0"
+version = "0.13.0"
 dependencies = [
  "axum",
  "chat-echo",
@@ -4168,9 +4168,9 @@ checksum = "bbc4a4ea2a66a41a1152c4b3d86e8954dc087bdf33af35446e6e176db4e73c8c"
 
 [[package]]
 name = "recall-echo"
-version = "3.2.0"
+version = "3.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "aebc41ce1991db4c2ff4ea9990abe5a9a4a9198e702c2af340ae79a99190cddd"
+checksum = "ba59dd6b78cefb9ee1f286e18bd61b3427b9a62bd1813fc1a640b47fb00f35b1"
 dependencies = [
  "async-trait",
  "chrono",
