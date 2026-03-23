@@ -43,7 +43,7 @@ pub fn docs_dir() -> Result<PathBuf, String> {
         return Ok(PathBuf::from(p));
     }
     std::env::var("HOME")
-        .map(PathBuf::from)
+        .map(|h| PathBuf::from(h).join("entity").join("journal"))
         .map_err(|_| "Could not determine home directory".to_string())
 }
 
@@ -182,7 +182,7 @@ impl VigilEcho {
                 question: "Identity documents directory:".into(),
                 required: true,
                 secret: false,
-                default: Some("~/".into()),
+                default: Some("~/entity/journal".into()),
             },
         ]
     }
@@ -230,7 +230,7 @@ impl Plugin for VigilEchoPlugin {
                 .and_then(|t| t.get("docs_dir"))
                 .and_then(|v| v.as_str())
                 .map(std::path::PathBuf::from)
-                .unwrap_or_else(|| ctx.entity_root.clone());
+                .unwrap_or_else(|| ctx.entity_root.join("journal"));
 
             tracing::info!(
                 "vigil-echo: claude_dir = {}, docs_dir = {}",
