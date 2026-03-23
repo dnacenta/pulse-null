@@ -20,7 +20,9 @@ mod scheduler;
 mod server;
 mod session;
 mod session_store;
+mod streaming;
 mod tools;
+mod tui;
 mod vigil;
 
 #[derive(Parser)]
@@ -41,7 +43,11 @@ enum Commands {
         dir: Option<String>,
     },
     /// Start the entity
-    Up,
+    Up {
+        /// Run in headless mode (HTTP server only, no TUI). Use for systemd services.
+        #[arg(long)]
+        headless: bool,
+    },
     /// Talk to your entity in the terminal
     Chat,
     /// Stop the entity
@@ -263,8 +269,8 @@ async fn main() {
                 std::process::exit(1);
             }
         }
-        Commands::Up => {
-            if let Err(e) = cli::up::run().await {
+        Commands::Up { headless } => {
+            if let Err(e) = cli::up::run(headless).await {
                 eprintln!("Error: {e}");
                 std::process::exit(1);
             }

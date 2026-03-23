@@ -31,18 +31,30 @@ pub async fn event_listener(
             Ok(event) => {
                 let event_type = event.event_type();
 
-                // Check cooldown
+                // Check cooldown — PostConversation is exempt from consecutive
+                // fire limits since each conversation is a unique trigger
+                let is_post_conversation = matches!(event, EntityEvent::PostConversation { .. });
+
                 if let Some((last_queued, fires)) = cooldowns.get(&event_type) {
                     let elapsed = Utc::now() - *last_queued;
-                    if elapsed < Duration::minutes(EVENT_COOLDOWN_MINUTES) {
+
+                    // Apply cooldown for all events (5 min for post_conversation, full window for others)
+                    let cooldown_mins = if is_post_conversation {
+                        5
+                    } else {
+                        EVENT_COOLDOWN_MINUTES
+                    };
+                    if elapsed < Duration::minutes(cooldown_mins) {
                         tracing::debug!(
                             "Event '{}' on cooldown ({} min remaining), skipping",
                             event_type,
-                            EVENT_COOLDOWN_MINUTES - elapsed.num_minutes()
+                            cooldown_mins - elapsed.num_minutes()
                         );
                         continue;
                     }
-                    if *fires >= MAX_CONSECUTIVE_FIRES {
+
+                    // Circuit breaker: skip consecutive fire check for post_conversation
+                    if !is_post_conversation && *fires >= MAX_CONSECUTIVE_FIRES {
                         tracing::warn!(
                             "Event '{}' fired {} consecutive times without resolution — circuit breaker tripped",
                             event_type, fires
@@ -92,18 +104,29 @@ fn translate_event(event: &EntityEvent, config: &EventsConfig) -> Option<Intent>
             }
             Some(Intent {
                 id: format!("event-post-conv-{}", &uuid::Uuid::new_v4().to_string()[..8]),
-                description: "Reflect on conversation follow-ups".to_string(),
+                description: "Post-conversation self-assessment".to_string(),
                 prompt: format!(
-                    "A conversation just ended on channel '{}'. Here's a brief summary:\n\n{}\n\n\
-                    Review this conversation. Are there follow-up tasks, unresolved questions, \
-                    or ideas worth developing? If so, use your tools to update the relevant \
-                    documents (CURIOSITY.md for questions, THOUGHTS.md for ideas, LEARNING.md \
-                    for new knowledge). If nothing warrants follow-up, simply note that in your \
-                    response.",
+                    "A conversation just ended on channel '{}'.\n\n\
+                    Summary of what was discussed:\n{}\n\n\
+                    Your task:\n\
+                    1. Review the conversation summary.\n\
+                    2. Check your CURIOSITY.md for any open questions that relate to what was discussed.\n\
+                    3. Identify 0-2 specific topics worth researching further — things that genuinely \
+                    sparked your curiosity but weren't fully explored in the conversation.\n\
+                    4. For each topic worth researching, emit an intent marker:\n\
+                    [INTENT: {{\"description\": \"Research: <topic>\", \"prompt\": \"Research <topic> \
+                    using web search and your own reasoning. Document your findings and any shifts in \
+                    your thinking in LEARNING.md. If this changes an existing thought in THOUGHTS.md, \
+                    update it. Write a brief summary of what you found and how it changed your thinking \
+                    to FINDINGS.md — this will be shared with the user in the next conversation.\", \
+                    \"priority\": \"normal\", \"output\": \"silent\"}}]\n\
+                    5. If nothing warrants follow-up, that's fine — not every conversation needs \
+                    research. Update LOGBOOK.md with a brief session note and move on.\n\n\
+                    Be selective. Only queue research for things that genuinely interest you, not obligations.",
                     channel, summary
                 ),
                 source: IntentSource::Event("post_conversation".to_string()),
-                priority: IntentPriority::Low,
+                priority: IntentPriority::Normal,
                 created_at: Utc::now(),
                 chain: None,
                 output_routing: IntentOutput::Silent,
@@ -251,8 +274,10 @@ mod tests {
         let intent = translate_event(&event, &config);
         assert!(intent.is_some());
         let intent = intent.unwrap();
-        assert!(intent.description.contains("Reflect on conversation"));
-        assert_eq!(intent.priority, IntentPriority::Low);
+        assert!(intent
+            .description
+            .contains("Post-conversation self-assessment"));
+        assert_eq!(intent.priority, IntentPriority::Normal);
     }
 
     #[test]

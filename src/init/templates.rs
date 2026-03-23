@@ -107,10 +107,10 @@ max_tool_rounds = 15
 intent_poll_interval = 60
 max_queue_size = 20
 max_intents_per_hour = 10
-max_chain_depth = 3
+max_chain_depth = 5
 
 [autonomy.events]
-post_conversation = false
+post_conversation = true
 pipeline_alert = true
 pipeline_frozen = true
 cognitive_decline = true
