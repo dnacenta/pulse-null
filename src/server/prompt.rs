@@ -86,6 +86,23 @@ pub fn build_system_prompt(
         }
     }
 
+    // FINDINGS.md — autonomous research findings to surface in next conversation
+    let findings_path = root_dir.join("FINDINGS.md");
+    if findings_path.exists() {
+        let content = std::fs::read_to_string(&findings_path)?;
+        if !content.trim().is_empty() {
+            parts.push(format!(
+                "<autonomous-findings>\n\
+                Between conversations, you did some research on your own. Here is what you found. \
+                Bring these findings up naturally in conversation when relevant — don't dump them \
+                all at once, but mention them when the topic connects. After you've shared a finding \
+                with the user, you can remove it from FINDINGS.md using file_write.\n\n\
+                {}\n</autonomous-findings>",
+                content
+            ));
+        }
+    }
+
     // Pipeline health — document counts and threshold status
     if let Some(monitor) = pipeline_monitor {
         let thresholds = config.pipeline.to_thresholds();

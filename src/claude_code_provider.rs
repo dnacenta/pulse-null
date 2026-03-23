@@ -4,6 +4,8 @@ use pulse_system_types::llm::{
     ContentBlock, LlmResponse, LlmResult, LmProvider, Message, MessageContent, Role, StopReason,
 };
 
+use crate::streaming::{self, StreamResult, StreamingProvider};
+
 pub struct ClaudeCodeProvider {
     model: String,
     claude_bin: String,
@@ -81,6 +83,22 @@ impl LmProvider for ClaudeCodeProvider {
 
     fn supports_tools(&self) -> bool {
         false
+    }
+}
+
+impl StreamingProvider for ClaudeCodeProvider {
+    fn supports_streaming(&self) -> bool {
+        false
+    }
+
+    fn invoke_streaming(
+        &self,
+        system_prompt: &str,
+        messages: &[Message],
+        max_tokens: u32,
+        tools: Option<&[serde_json::Value]>,
+    ) -> StreamResult<'_> {
+        streaming::invoke_as_stream(self, system_prompt, messages, max_tokens, tools)
     }
 }
 

@@ -1,4 +1,5 @@
-use crate::chat;
+use std::sync::Arc;
+
 use crate::config::Config;
 use crate::providers;
 use crate::server::prompt;
@@ -7,7 +8,8 @@ use crate::tools::ToolRegistry;
 pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let config = Config::load()?;
 
-    let provider = providers::create_provider(&config)?;
+    let provider = providers::create_streaming_provider(&config)?;
+    let provider: Arc<dyn crate::streaming::StreamingProvider> = Arc::from(provider);
 
     // Build system prompt from identity documents
     let root_dir = config.root_dir()?;
@@ -28,18 +30,8 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
         root_dir.clone(),
     )));
     tools.register(Box::new(crate::tools::web_fetch::WebFetchTool::new()));
+    let tools = Arc::new(tools);
 
-    // Render banner
-    let plugin_count = config.plugins.len();
-    chat::banner::render(&config, &root_dir, plugin_count);
-
-    // Enter REPL
-    chat::repl::run(
-        &config,
-        &root_dir,
-        provider.as_ref(),
-        &tools,
-        &system_prompt,
-    )
-    .await
+    // Enter v2 TUI (direct to chat, skip splash)
+    crate::tui::run_chat(&config, &root_dir, provider, tools, &system_prompt).await
 }
