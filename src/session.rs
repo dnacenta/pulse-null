@@ -389,9 +389,7 @@ pub async fn graph_sync_vigil(root_dir: &Path) {
 
     match result {
         Ok(Ok(report)) => {
-            if report.measurements_created > 0
-                || report.outcomes_created > 0
-            {
+            if report.measurements_created > 0 || report.outcomes_created > 0 {
                 tracing::info!(
                     "graph: vigil sync — {} measurements, {} outcomes, {} rels, {} skipped",
                     report.measurements_created,
