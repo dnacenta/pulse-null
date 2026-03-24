@@ -287,16 +287,18 @@ pub async fn run_chat(
 /// Handle mouse events for the main screen.
 fn handle_mouse(mouse: crossterm::event::MouseEvent, main: &mut MainScreen) {
     match mouse.kind {
-        MouseEventKind::ScrollUp => {
-            if main.active_tab == tabs::Tab::Chat {
-                main.chat.scroll_up(3);
-            }
-        }
-        MouseEventKind::ScrollDown => {
-            if main.active_tab == tabs::Tab::Chat {
-                main.chat.scroll_down(3);
-            }
-        }
+        MouseEventKind::ScrollUp => match main.active_tab {
+            tabs::Tab::Chat => main.chat.scroll_up(3),
+            tabs::Tab::Entity => main.entity.scroll_up(3),
+            tabs::Tab::Evolution => main.evolution.scroll_up(3),
+            _ => {}
+        },
+        MouseEventKind::ScrollDown => match main.active_tab {
+            tabs::Tab::Chat => main.chat.scroll_down(3),
+            tabs::Tab::Entity => main.entity.scroll_down(3),
+            tabs::Tab::Evolution => main.evolution.scroll_down(3),
+            _ => {}
+        },
         MouseEventKind::Down(crossterm::event::MouseButton::Left) => {
             // Tab bar click detection: header is 5 rows (0-4), tab bar is rows 5-7
             if mouse.row >= 5 && mouse.row <= 7 && !main.fullscreen {

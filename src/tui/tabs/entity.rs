@@ -85,6 +85,14 @@ impl EntityTab {
             self.session_count = Some(content.lines().filter(|l| l.starts_with("| ")).count().saturating_sub(2));
         }
     }
+
+    pub fn scroll_up(&mut self, amount: u16) {
+        self.scroll = self.scroll.saturating_add(amount);
+    }
+
+    pub fn scroll_down(&mut self, amount: u16) {
+        self.scroll = self.scroll.saturating_sub(amount);
+    }
 }
 
 impl TabView for EntityTab {
@@ -105,153 +113,107 @@ impl TabView for EntityTab {
             return;
         }
 
-        // Layout: identity (left) + self summary (right) on top, thoughts + questions on bottom
-        let rows = Layout::vertical([
-            Constraint::Length(8), // identity + self
-            Constraint::Min(6),   // thoughts
-            Constraint::Min(6),   // questions
-        ])
-        .split(area);
+        // Outer block
+        let outer_block = Block::bordered()
+            .border_type(BorderType::Rounded)
+            .border_style(Style::default().fg(COLOR_BORDER))
+            .title(Span::styled(" entity ", Style::default().fg(NORD7)));
+        let outer_inner = outer_block.inner(area);
+        frame.render_widget(outer_block, area);
 
-        // Top row: identity | self summary
-        let top_cols = Layout::horizontal([
-            Constraint::Percentage(35),
-            Constraint::Percentage(65),
-        ])
-        .split(rows[0]);
+        // Build all content as lines for a single scrollable Paragraph
+        let mut lines: Vec<Line> = Vec::new();
 
-        // Identity panel
-        {
-            let block = Block::bordered()
-                .border_type(BorderType::Rounded)
-                .border_style(Style::default().fg(COLOR_BORDER))
-                .title(Span::styled(" identity ", Style::default().fg(NORD7)));
-            let inner = block.inner(top_cols[0]);
-            frame.render_widget(block, top_cols[0]);
+        // Identity section
+        let name = ctx.entity_name.as_deref().unwrap_or("unknown");
+        let model = ctx.model_name.as_deref().unwrap_or("unknown");
+        let sessions = self
+            .session_count
+            .map(|n| n.to_string())
+            .unwrap_or_else(|| "—".to_string());
 
-            let name = ctx.entity_name.as_deref().unwrap_or("unknown");
-            let model = ctx.model_name.as_deref().unwrap_or("unknown");
-            let sessions = self
-                .session_count
-                .map(|n| n.to_string())
-                .unwrap_or_else(|| "—".to_string());
+        lines.push(Line::styled(
+            "  ── identity ──",
+            Style::default().fg(NORD7),
+        ));
+        lines.push(Line::from(vec![
+            Span::styled("  Name:     ", Style::default().fg(COLOR_DIM)),
+            Span::styled(name, Style::default().fg(NORD7).add_modifier(Modifier::BOLD)),
+        ]));
+        lines.push(Line::from(vec![
+            Span::styled("  Model:    ", Style::default().fg(COLOR_DIM)),
+            Span::styled(model, Style::default().fg(COLOR_TEXT)),
+        ]));
+        lines.push(Line::from(vec![
+            Span::styled("  Sessions: ", Style::default().fg(COLOR_DIM)),
+            Span::styled(sessions, Style::default().fg(COLOR_TEXT)),
+        ]));
+        lines.push(Line::from(""));
 
-            let lines = vec![
-                Line::from(vec![
-                    Span::styled("  Name:     ", Style::default().fg(COLOR_DIM)),
-                    Span::styled(name, Style::default().fg(NORD7).add_modifier(Modifier::BOLD)),
-                ]),
-                Line::from(vec![
-                    Span::styled("  Model:    ", Style::default().fg(COLOR_DIM)),
-                    Span::styled(model, Style::default().fg(COLOR_TEXT)),
-                ]),
-                Line::from(vec![
-                    Span::styled("  Sessions: ", Style::default().fg(COLOR_DIM)),
-                    Span::styled(sessions, Style::default().fg(COLOR_TEXT)),
-                ]),
-            ];
-            frame.render_widget(Paragraph::new(lines), inner);
-        }
-
-        // Self summary panel
-        {
-            let block = Block::bordered()
-                .border_type(BorderType::Rounded)
-                .border_style(Style::default().fg(COLOR_BORDER))
-                .title(Span::styled(" self ", Style::default().fg(NORD8)));
-            let inner = block.inner(top_cols[1]);
-            frame.render_widget(block, top_cols[1]);
-
-            let text = if self.self_summary.is_empty() {
-                "  No SELF.md found.".to_string()
-            } else {
-                format!("  {}", self.self_summary)
-            };
-            frame.render_widget(
-                Paragraph::new(text)
-                    .style(Style::default().fg(COLOR_TEXT))
-                    .wrap(Wrap { trim: false }),
-                inner,
-            );
-        }
-
-        // Active thoughts panel
-        {
-            let block = Block::bordered()
-                .border_type(BorderType::Rounded)
-                .border_style(Style::default().fg(COLOR_BORDER))
-                .title(Span::styled(
-                    format!(" active thoughts ({}) ", self.thoughts.len()),
-                    Style::default().fg(NORD13),
+        // Self summary section
+        lines.push(Line::styled(
+            "  ── self ──",
+            Style::default().fg(NORD8),
+        ));
+        if self.self_summary.is_empty() {
+            lines.push(Line::styled(
+                "  No SELF.md found.",
+                Style::default().fg(COLOR_DIM),
+            ));
+        } else {
+            for line in self.self_summary.lines() {
+                lines.push(Line::styled(
+                    format!("  {}", line),
+                    Style::default().fg(COLOR_TEXT),
                 ));
-            let inner = block.inner(rows[1]);
-            frame.render_widget(block, rows[1]);
+            }
+        }
+        lines.push(Line::from(""));
 
-            if self.thoughts.is_empty() {
-                frame.render_widget(
-                    Paragraph::new(Line::styled(
-                        "  No active thoughts.",
-                        Style::default().fg(COLOR_DIM),
-                    )),
-                    inner,
-                );
-            } else {
-                let lines: Vec<Line> = self
-                    .thoughts
-                    .iter()
-                    .enumerate()
-                    .map(|(i, t)| {
-                        Line::from(vec![
-                            Span::styled(format!("  {}. ", i + 1), Style::default().fg(COLOR_DIM)),
-                            Span::styled(t.as_str(), Style::default().fg(COLOR_TEXT)),
-                        ])
-                    })
-                    .collect();
-                frame.render_widget(
-                    Paragraph::new(lines).wrap(Wrap { trim: false }),
-                    inner,
-                );
+        // Thoughts section
+        lines.push(Line::styled(
+            format!("  ── active thoughts ({}) ──", self.thoughts.len()),
+            Style::default().fg(NORD13),
+        ));
+        if self.thoughts.is_empty() {
+            lines.push(Line::styled(
+                "  No active thoughts.",
+                Style::default().fg(COLOR_DIM),
+            ));
+        } else {
+            for (i, t) in self.thoughts.iter().enumerate() {
+                lines.push(Line::from(vec![
+                    Span::styled(format!("  {}. ", i + 1), Style::default().fg(COLOR_DIM)),
+                    Span::styled(t.as_str(), Style::default().fg(COLOR_TEXT)),
+                ]));
+            }
+        }
+        lines.push(Line::from(""));
+
+        // Questions section
+        lines.push(Line::styled(
+            format!("  ── open questions ({}) ──", self.questions.len()),
+            Style::default().fg(NORD9),
+        ));
+        if self.questions.is_empty() {
+            lines.push(Line::styled(
+                "  No open questions.",
+                Style::default().fg(COLOR_DIM),
+            ));
+        } else {
+            for (i, q) in self.questions.iter().enumerate() {
+                lines.push(Line::from(vec![
+                    Span::styled(format!("  {}. ", i + 1), Style::default().fg(COLOR_DIM)),
+                    Span::styled(q.as_str(), Style::default().fg(COLOR_TEXT)),
+                ]));
             }
         }
 
-        // Open questions panel
-        {
-            let block = Block::bordered()
-                .border_type(BorderType::Rounded)
-                .border_style(Style::default().fg(COLOR_BORDER))
-                .title(Span::styled(
-                    format!(" open questions ({}) ", self.questions.len()),
-                    Style::default().fg(NORD9),
-                ));
-            let inner = block.inner(rows[2]);
-            frame.render_widget(block, rows[2]);
-
-            if self.questions.is_empty() {
-                frame.render_widget(
-                    Paragraph::new(Line::styled(
-                        "  No open questions.",
-                        Style::default().fg(COLOR_DIM),
-                    )),
-                    inner,
-                );
-            } else {
-                let lines: Vec<Line> = self
-                    .questions
-                    .iter()
-                    .enumerate()
-                    .map(|(i, q)| {
-                        Line::from(vec![
-                            Span::styled(format!("  {}. ", i + 1), Style::default().fg(COLOR_DIM)),
-                            Span::styled(q.as_str(), Style::default().fg(COLOR_TEXT)),
-                        ])
-                    })
-                    .collect();
-                frame.render_widget(
-                    Paragraph::new(lines).wrap(Wrap { trim: false }),
-                    inner,
-                );
-            }
-        }
+        // Render as single scrollable paragraph
+        let paragraph = Paragraph::new(lines)
+            .wrap(Wrap { trim: false })
+            .scroll((self.scroll, 0));
+        frame.render_widget(paragraph, outer_inner);
     }
 
     fn handle_key(&mut self, key: KeyEvent, _ctx: &mut AppContext) -> ScreenAction {
