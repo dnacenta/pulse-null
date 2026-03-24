@@ -10,7 +10,7 @@ use ratatui::Frame;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tokio_stream::StreamExt;
-use tui_textarea::{CursorMove, TextArea};
+use tui_textarea::TextArea;
 
 use pulse_system_types::llm::{ContentBlock, Message, MessageContent, Role, StopReason};
 
@@ -55,8 +55,6 @@ pub struct ChatTab {
     pub messages: Vec<ChatMessage>,
     pub conversation: Vec<Message>,
     pub textarea: TextArea<'static>,
-    pub input_history: Vec<String>,
-    pub history_idx: Option<usize>,
     pub scroll: u16,
     pub auto_scroll: bool,
     pub state: EntityState,
@@ -90,8 +88,6 @@ impl ChatTab {
             messages: Vec::new(),
             conversation: Vec::new(),
             textarea,
-            input_history: Vec::new(),
-            history_idx: None,
             scroll: 0,
             auto_scroll: true,
             state: EntityState::Idle,
@@ -249,8 +245,6 @@ impl ChatTab {
                     return None;
                 }
 
-                self.input_history.push(text.clone());
-                self.history_idx = None;
                 self.reset_textarea();
 
                 if text.starts_with('/') {
@@ -263,50 +257,26 @@ impl ChatTab {
 
                 Some(ChatAction::SendMessage(text))
             }
-            // Up: history when single line
-            KeyCode::Up if self.textarea.lines().len() <= 1 => {
-                if self.input_history.is_empty() {
-                    return None;
-                }
-                let idx = match self.history_idx {
-                    Some(0) => return None,
-                    Some(i) => i - 1,
-                    None => self.input_history.len() - 1,
-                };
-                self.history_idx = Some(idx);
-                let text = self.input_history[idx].clone();
-                self.textarea = TextArea::new(vec![text]);
-                Self::style_textarea(&mut self.textarea, &self.owner_alias);
-                self.textarea.move_cursor(CursorMove::End);
+            // Shift+Enter: insert newline
+            KeyCode::Enter if key.modifiers.contains(KeyModifiers::SHIFT) => {
+                self.textarea.insert_newline();
                 None
             }
-            // Down: history when single line
-            KeyCode::Down if self.textarea.lines().len() <= 1 => {
-                if let Some(idx) = self.history_idx {
-                    if idx + 1 < self.input_history.len() {
-                        self.history_idx = Some(idx + 1);
-                        let text = self.input_history[idx + 1].clone();
-                        self.textarea = TextArea::new(vec![text]);
-                        Self::style_textarea(&mut self.textarea, &self.owner_alias);
-                        self.textarea.move_cursor(CursorMove::End);
-                    } else {
-                        self.history_idx = None;
-                        self.reset_textarea();
-                    }
-                }
+            // Shift+Up/Down or PgUp/PgDn: scroll conversation
+            KeyCode::Up if key.modifiers.contains(KeyModifiers::SHIFT) => {
+                self.scroll_up(3);
                 None
             }
-            // PgUp/PgDn: scroll conversation
+            KeyCode::Down if key.modifiers.contains(KeyModifiers::SHIFT) => {
+                self.scroll_down(3);
+                None
+            }
             KeyCode::PageUp => {
-                self.scroll = self.scroll.saturating_add(10);
-                self.auto_scroll = false;
+                self.scroll_up(10);
                 None
             }
             KeyCode::PageDown => {
-                self.scroll = self.scroll.saturating_sub(10);
-                if self.scroll == 0 {
-                    self.auto_scroll = true;
-                }
+                self.scroll_down(10);
                 None
             }
             // Tab: don't pass to textarea (let parent handle tab switching)
@@ -314,7 +284,6 @@ impl ChatTab {
             // Everything else: delegate to textarea
             _ => {
                 self.textarea.input(key);
-                self.history_idx = None;
                 None
             }
         }

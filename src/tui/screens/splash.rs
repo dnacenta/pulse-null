@@ -19,19 +19,18 @@ const TITLE: [&str; 13] = [
     "██╔═══╝ ██║   ██║██║     ╚════██║██╔══╝  ",
     "██║     ╚██████╔╝███████╗███████║███████╗",
     "╚═╝      ╚═════╝ ╚══════╝╚══════╝╚══════╝",
-    "                  ╱╱                      ",
-    "███╗   ██╗██╗   ██╗██╗     ██╗            ",
-    "████╗  ██║██║   ██║██║     ██║            ",
-    "██╔██╗ ██║██║   ██║██║     ██║            ",
-    "██║╚██╗██║██║   ██║██║     ██║            ",
-    "██║ ╚████║╚██████╔╝███████╗███████╗      ",
-    "╚═╝  ╚═══╝ ╚═════╝ ╚══════╝╚══════╝      ",
+    "                                          ",
+    "  ███╗   ██╗██╗   ██╗██╗     ██╗          ",
+    "  ████╗  ██║██║   ██║██║     ██║          ",
+    "  ██╔██╗ ██║██║   ██║██║     ██║          ",
+    "  ██║╚██╗██║██║   ██║██║     ██║          ",
+    "  ██║ ╚████║╚██████╔╝███████╗███████╗    ",
+    "  ╚═╝  ╚═══╝ ╚═════╝ ╚══════╝╚══════╝    ",
 ];
 const TITLE_WIDTH: u16 = 42;
 
 /// Two-color title rendering (Rebels in the Sky approach).
-/// Full block chars (█) get NORD6 (snow white), box-drawing chars get NORD8 (frost blue),
-/// the // separator gets NORD13 (aurora yellow).
+/// Full block chars (█) get NORD6 (snow white), box-drawing chars get NORD8 (frost blue).
 fn big_text(text: &[&str]) -> Paragraph<'static> {
     let lines: Vec<Line> = text
         .iter()
@@ -41,8 +40,6 @@ fn big_text(text: &[&str]) -> Paragraph<'static> {
                 .map(|c| {
                     if c == '█' {
                         Span::styled(c.to_string(), Style::default().fg(NORD6))
-                    } else if c == '╱' {
-                        Span::styled(c.to_string(), Style::default().fg(NORD13))
                     } else if c == ' ' {
                         Span::raw(c.to_string())
                     } else {
@@ -182,8 +179,8 @@ impl Screen for SplashScreen {
             Constraint::Length(3),                                      // aurora waveform
             Constraint::Length(1),                                      // spacer
             Constraint::Length((self.menu_items.len() * 2 - 1) as u16), // menu with spacing
-            Constraint::Length(2),                                      // spacer + version
             Constraint::Min(0),                                         // flexible space
+            Constraint::Length(1),                                      // version
             Constraint::Length(1),                                      // footer hints
         ])
         .split(inner);
@@ -205,8 +202,6 @@ impl Screen for SplashScreen {
                         .map(|c| {
                             if c == '█' {
                                 Span::styled(c.to_string(), Style::default().fg(NORD6))
-                            } else if c == '╱' {
-                                Span::styled(c.to_string(), Style::default().fg(NORD13))
                             } else if c == ' ' {
                                 Span::raw(c.to_string())
                             } else {
@@ -293,7 +288,7 @@ impl Screen for SplashScreen {
             Style::default().fg(COLOR_DIM),
         ))
         .alignment(Alignment::Center);
-        frame.render_widget(version_line, chunks[6]);
+        frame.render_widget(version_line, chunks[7]);
 
         // ─── Footer Hints ───
         let hint_style_key = Style::default().fg(NORD0).bg(NORD3);

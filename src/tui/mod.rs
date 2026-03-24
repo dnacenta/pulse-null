@@ -302,23 +302,24 @@ fn handle_mouse(mouse: crossterm::event::MouseEvent, main: &mut MainScreen) {
             _ => {}
         },
         MouseEventKind::Down(crossterm::event::MouseButton::Left) => {
-            // Tab bar click detection: header is 5 rows (0-4), tab bar is rows 5-7
-            if mouse.row >= 5 && mouse.row <= 7 && !main.fullscreen {
+            // Tab bar click detection: header is 8 rows (0-7), tab bar is rows 8-10
+            if mouse.row >= 8 && mouse.row <= 10 && !main.fullscreen {
+                // Calculate tab positions dynamically based on label widths + separators
+                // Format: " Label │ Label │ ..."  — each label is " {name} " + " │ "
+                let mut col_start = 2u16; // initial " " padding + border
                 let col = mouse.column;
-                let tab = if col < 12 {
-                    Some(tabs::Tab::Chat)
-                } else if col < 26 {
-                    Some(tabs::Tab::Dashboard)
-                } else if col < 40 {
-                    Some(tabs::Tab::Evolution)
-                } else if col < 52 {
-                    Some(tabs::Tab::Entity)
-                } else if col < 62 {
-                    Some(tabs::Tab::Logs)
-                } else {
-                    None
-                };
-                if let Some(t) = tab {
+                let mut clicked_tab = None;
+                for i in 0..tabs::Tab::COUNT {
+                    let tab = tabs::Tab::from_index(i);
+                    let label_len = tab.label().len() as u16 + 2; // " Label "
+                    let col_end = col_start + label_len;
+                    if col >= col_start && col < col_end {
+                        clicked_tab = Some(tab);
+                        break;
+                    }
+                    col_start = col_end + 3; // " │ " separator
+                }
+                if let Some(t) = clicked_tab {
                     main.active_tab = t;
                 }
             }
