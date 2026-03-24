@@ -14,7 +14,7 @@ use crate::tui::tabs::evolution::EvolutionTab;
 use crate::tui::tabs::logs::LogsTab;
 use crate::tui::tabs::{Tab, TabView};
 use crate::tui::theme::*;
-use crate::tui::widgets::{header, pulse};
+use crate::tui::widgets::header;
 
 pub struct MainScreen {
     pub active_tab: Tab,
@@ -64,7 +64,7 @@ impl MainScreen {
         frame.render_widget(block, area);
 
         let mut spans = Vec::new();
-        spans.push(Span::raw("  "));
+        spans.push(Span::raw(" "));
 
         for i in 0..Tab::COUNT {
             let tab = Tab::from_index(i);
@@ -72,20 +72,21 @@ impl MainScreen {
 
             if is_active {
                 spans.push(Span::styled(
-                    format!("[{} {}]", i + 1, tab.label()),
+                    format!(" {} ", tab.label()),
                     Style::default()
-                        .fg(COLOR_TEXT_BRIGHT)
+                        .fg(NORD0)
+                        .bg(NORD8)
                         .add_modifier(Modifier::BOLD),
                 ));
             } else {
                 spans.push(Span::styled(
-                    format!(" {} {} ", i + 1, tab.label()),
+                    format!(" {} ", tab.label()),
                     Style::default().fg(COLOR_DIM),
                 ));
             }
 
             if i < Tab::COUNT - 1 {
-                spans.push(Span::raw(" "));
+                spans.push(Span::styled(" │ ", Style::default().fg(COLOR_BORDER)));
             }
         }
 
@@ -109,25 +110,19 @@ impl Screen for MainScreen {
             return;
         }
 
-        // Layout: header, tab bar, content, pulse, input
-        let show_pulse = self.active_tab == Tab::Chat && !self.fullscreen;
-
+        // Layout: header, tab bar, content, input, footer
         let mut constraints = vec![];
 
         if !self.fullscreen {
-            constraints.push(Constraint::Length(5)); // header
+            constraints.push(Constraint::Length(8)); // header (logo + status + heartbeat)
             constraints.push(Constraint::Length(3)); // tab bar
         }
 
-        if show_pulse {
+        let is_chat = self.active_tab == Tab::Chat;
+        if is_chat {
             let input_height = self.chat.input_height();
             constraints.push(Constraint::Min(6)); // content (conversation)
-            constraints.push(Constraint::Length(6)); // pulse
             constraints.push(Constraint::Length(input_height)); // input (dynamic)
-        } else if self.active_tab == Tab::Chat && self.fullscreen {
-            let input_height = self.chat.input_height();
-            constraints.push(Constraint::Min(6)); // content
-            constraints.push(Constraint::Length(input_height)); // input
         } else {
             constraints.push(Constraint::Min(10)); // content fills
         }
@@ -141,13 +136,16 @@ impl Screen for MainScreen {
         let content_idx = if self.fullscreen { 0 } else { 2 };
 
         if !self.fullscreen {
-            // Header
+            // Header (logo + status + heartbeat)
             header::draw(
                 frame,
                 chunks[0],
                 ctx.entity_name.as_deref(),
                 Some("HEALTHY"),
                 ctx.model_name.as_deref(),
+                &self.chat.pulse_data,
+                &self.chat.state,
+                &self.chat.pulse_color,
             );
 
             // Tab bar
@@ -158,21 +156,12 @@ impl Screen for MainScreen {
         match self.active_tab {
             Tab::Chat => {
                 self.chat.draw_conversation(frame, chunks[content_idx]);
-
-                if self.fullscreen {
-                    // Input only (no pulse)
-                    frame.render_widget(&self.chat.textarea, chunks[content_idx + 1]);
-                } else if show_pulse {
-                    pulse::draw(
-                        frame,
-                        chunks[content_idx + 1],
-                        &self.chat.pulse_data,
-                        &self.chat.state,
-                        &self.chat.entity_name,
-                        &self.chat.pulse_color,
-                    );
-                    frame.render_widget(&self.chat.textarea, chunks[content_idx + 2]);
-                }
+                let input_idx = if self.fullscreen {
+                    content_idx + 1
+                } else {
+                    content_idx + 1
+                };
+                frame.render_widget(&self.chat.textarea, chunks[input_idx]);
             }
             Tab::Dashboard => {
                 self.dashboard.render(frame, chunks[content_idx], ctx);
@@ -199,7 +188,7 @@ impl Screen for MainScreen {
                     Span::styled(" Send  ", hint_style_desc),
                     Span::styled(" S+Enter ", hint_style_key),
                     Span::styled(" Newline  ", hint_style_desc),
-                    Span::styled(" PgUp/Dn ", hint_style_key),
+                    Span::styled(" S+\u{2191}\u{2193} ", hint_style_key),
                     Span::styled(" Scroll  ", hint_style_desc),
                     Span::styled(" Tab ", hint_style_key),
                     Span::styled(" Next tab ", hint_style_desc),
@@ -207,7 +196,7 @@ impl Screen for MainScreen {
                 _ => vec![
                     Span::styled(" Tab ", hint_style_key),
                     Span::styled(" Next tab  ", hint_style_desc),
-                    Span::styled(" PgUp/Dn ", hint_style_key),
+                    Span::styled(" S+\u{2191}\u{2193} ", hint_style_key),
                     Span::styled(" Scroll  ", hint_style_desc),
                     Span::styled(" q ", hint_style_key),
                     Span::styled(" Quit ", hint_style_desc),
@@ -364,12 +353,11 @@ fn draw_help_overlay(frame: &mut Frame, area: Rect) {
         ("── Chat ──", ""),
         ("Enter", "Send message"),
         ("Shift+Enter", "New line"),
-        ("Up/Down", "History (empty input)"),
-        ("PageUp/Down", "Scroll conversation"),
+        ("Shift+Up/Down", "Scroll conversation"),
         ("Ctrl+L", "Clear conversation"),
         ("", ""),
         ("── Other tabs ──", ""),
-        ("PageUp/Down", "Scroll content"),
+        ("Shift+Up/Down", "Scroll content"),
     ];
 
     let lines: Vec<Line> = bindings

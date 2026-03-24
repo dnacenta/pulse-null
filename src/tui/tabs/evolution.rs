@@ -1,6 +1,6 @@
 use std::path::Path;
 
-use crossterm::event::{KeyCode, KeyEvent};
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::Style;
 use ratatui::symbols::Marker;
@@ -126,6 +126,16 @@ impl EvolutionTab {
         ];
     }
 
+    fn signal_description(label: &str) -> &'static str {
+        match label {
+            "vocabulary" => "Lexical diversity in reflections. Tracks whether language stays fresh or becomes repetitive.",
+            "curiosity" => "Active question generation. Measures whether new questions are being asked across sessions.",
+            "grounding" => "Evidence-based reasoning. Checks if conclusions reference specific inputs and experiences.",
+            "lifecycle" => "Thought progression. Monitors whether ideas develop, graduate, or stagnate over time.",
+            _ => "Signal data not yet available.",
+        }
+    }
+
     fn draw_signal_chart(frame: &mut Frame, area: Rect, chart: &SignalChart) {
         if chart.data.is_empty() {
             let block = Block::bordered()
@@ -135,7 +145,23 @@ impl EvolutionTab {
                     format!(" {} ", chart.label),
                     Style::default().fg(chart.color),
                 ));
+            let inner = block.inner(area);
             frame.render_widget(block, area);
+
+            let desc = Self::signal_description(chart.label);
+            let lines = vec![
+                Line::from(""),
+                Line::styled(format!("  {}", desc), Style::default().fg(COLOR_DIM)),
+                Line::from(""),
+                Line::styled(
+                    "  Populates after vigil-echo collects signals.",
+                    Style::default().fg(COLOR_DIM),
+                ),
+            ];
+            frame.render_widget(
+                Paragraph::new(lines).wrap(ratatui::widgets::Wrap { trim: false }),
+                inner,
+            );
             return;
         }
 
@@ -217,6 +243,12 @@ impl TabView for EvolutionTab {
 
     fn handle_key(&mut self, key: KeyEvent, _ctx: &mut AppContext) -> ScreenAction {
         match key.code {
+            KeyCode::Up if key.modifiers.contains(KeyModifiers::SHIFT) => {
+                self.scroll = self.scroll.saturating_add(3)
+            }
+            KeyCode::Down if key.modifiers.contains(KeyModifiers::SHIFT) => {
+                self.scroll = self.scroll.saturating_sub(3)
+            }
             KeyCode::PageUp => self.scroll = self.scroll.saturating_add(5),
             KeyCode::PageDown => self.scroll = self.scroll.saturating_sub(5),
             _ => {}

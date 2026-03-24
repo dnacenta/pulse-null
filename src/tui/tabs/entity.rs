@@ -1,6 +1,6 @@
 use std::path::Path;
 
-use crossterm::event::{KeyCode, KeyEvent};
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
@@ -230,6 +230,12 @@ impl TabView for EntityTab {
 
     fn handle_key(&mut self, key: KeyEvent, _ctx: &mut AppContext) -> ScreenAction {
         match key.code {
+            KeyCode::Up if key.modifiers.contains(KeyModifiers::SHIFT) => {
+                self.scroll = self.scroll.saturating_add(3)
+            }
+            KeyCode::Down if key.modifiers.contains(KeyModifiers::SHIFT) => {
+                self.scroll = self.scroll.saturating_sub(3)
+            }
             KeyCode::PageUp => self.scroll = self.scroll.saturating_add(5),
             KeyCode::PageDown => self.scroll = self.scroll.saturating_sub(5),
             _ => {}
@@ -272,12 +278,39 @@ fn push_bordered_section<'a>(
     ]);
     lines.push(top);
 
-    // Content lines: │  text  │
+    // Content lines: │ text │
+    // Truncate text to fit within borders (width - 2 for │...│)
+    let inner_width = width.saturating_sub(2);
     for line in content {
         let mut spans = vec![Span::styled("│", border_style)];
-        spans.extend(line.spans.iter().cloned());
-        // We don't pad to exact width here — the Paragraph handles it
-        spans.push(Span::raw(""));
+        // Calculate visible length of all spans
+        let text_len: usize = line.spans.iter().map(|s| s.content.len()).sum();
+        if text_len <= inner_width {
+            spans.extend(line.spans.iter().cloned());
+            // Pad to fill width
+            let pad = inner_width.saturating_sub(text_len);
+            if pad > 0 {
+                spans.push(Span::raw(" ".repeat(pad)));
+            }
+        } else {
+            // Truncate: walk spans and cut at inner_width - 1 (leave room for …)
+            let mut remaining = inner_width.saturating_sub(1);
+            for span in &line.spans {
+                if remaining == 0 {
+                    break;
+                }
+                if span.content.len() <= remaining {
+                    spans.push(span.clone());
+                    remaining -= span.content.len();
+                } else {
+                    let truncated: String = span.content.chars().take(remaining).collect();
+                    spans.push(Span::styled(truncated, span.style));
+                    remaining = 0;
+                }
+            }
+            spans.push(Span::styled("…", Style::default().fg(COLOR_DIM)));
+        }
+        spans.push(Span::styled("│", border_style));
         lines.push(Line::from(spans));
     }
 
