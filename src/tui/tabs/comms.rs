@@ -1385,6 +1385,106 @@ impl CommsTab {
         ScreenAction::None
     }
 
+    // ─── Scroll ───
+
+    pub fn scroll_up(&mut self, amount: u16) {
+        if matches!(
+            self.state,
+            CommsState::Connecting | CommsState::Active { .. } | CommsState::Finished
+        ) {
+            self.scroll = self.scroll.saturating_add(amount);
+            self.auto_scroll = false;
+        }
+    }
+
+    pub fn scroll_down(&mut self, amount: u16) {
+        if matches!(
+            self.state,
+            CommsState::Connecting | CommsState::Active { .. } | CommsState::Finished
+        ) {
+            self.scroll = self.scroll.saturating_sub(amount);
+            if self.scroll == 0 {
+                self.auto_scroll = true;
+            }
+        }
+    }
+
+    // ─── Mouse ───
+
+    pub fn handle_mouse(&mut self, row: u16, col: u16, area: Rect) {
+        // Only handle clicks in setup and peer mgmt form states
+        match &self.state {
+            CommsState::Setup => self.handle_mouse_setup(row, col, area),
+            CommsState::PeerMgmt if self.mgmt_view == MgmtView::Form => {
+                self.handle_mouse_form(row, col, area);
+            }
+            _ => {}
+        }
+    }
+
+    fn handle_mouse_setup(&mut self, row: u16, _col: u16, area: Rect) {
+        // The setup screen has a left column (40%) with peer list, mode, and topic
+        let outer_inner_y = area.y + 1; // border offset
+
+        // Estimate section positions based on rendering order:
+        // Bordered "connect to" section starts at top
+        // Then gap, then "mode" section, then optional "topic" section
+        // These are rough — we check relative to the area
+
+        let rel_row = row.saturating_sub(outer_inner_y);
+
+        // Peer list items start after the bordered section header (2 lines: top border + title)
+        // Each peer is one line. After peers: bottom border, gap, mode section.
+        let peer_count = self.peers.len();
+        let peer_section_end = 2 + peer_count as u16 + 1; // header + peers + bottom border
+
+        // Click in peer area
+        if rel_row >= 2 && rel_row < 2 + peer_count as u16 {
+            let idx = (rel_row - 2) as usize;
+            if idx < self.peers.len() {
+                self.selected_peer = idx;
+            }
+            return;
+        }
+
+        // Mode section: after peer section + 1 gap + header
+        let mode_start = peer_section_end + 1 + 1; // gap + border
+        if rel_row >= mode_start && rel_row < mode_start + 2 {
+            if rel_row == mode_start {
+                self.mode = CommsMode::Topic;
+            } else {
+                self.mode = CommsMode::Free;
+            }
+            return;
+        }
+
+        // Topic section: if in topic mode, after mode section + bottom border + gap + header
+        if self.mode == CommsMode::Topic {
+            let topic_start = mode_start + 2 + 1 + 1 + 1; // 2 mode lines + border + gap + border
+            if rel_row >= topic_start && rel_row < topic_start + 2 {
+                self.topic_editing = true;
+            }
+        }
+    }
+
+    fn handle_mouse_form(&mut self, row: u16, _col: u16, area: Rect) {
+        let outer_inner = Rect::new(area.x + 1, area.y + 1, area.width - 2, area.height - 2);
+        let field_height = 3u16;
+        let total_height = field_height * 4 + 4;
+        let form_y = outer_inner.y + outer_inner.height.saturating_sub(total_height).min(2);
+
+        // Determine which field was clicked based on row
+        if row >= form_y && row < form_y + field_height {
+            self.form_focus = FormField::Name;
+        } else if row >= form_y + field_height && row < form_y + field_height * 2 {
+            self.form_focus = FormField::Host;
+        } else if row >= form_y + field_height * 2 && row < form_y + field_height * 3 {
+            self.form_focus = FormField::Port;
+        } else if row >= form_y + field_height * 3 && row < form_y + field_height * 4 {
+            self.form_focus = FormField::Secret;
+        }
+    }
+
     // ─── Tick ───
 
     fn tick_pulse(&mut self) {

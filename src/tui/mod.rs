@@ -13,6 +13,7 @@ use crossterm::event::{self, Event, MouseEventKind};
 use crossterm::execute;
 use crossterm::terminal::{self, EnterAlternateScreen, LeaveAlternateScreen};
 use ratatui::backend::CrosstermBackend;
+use ratatui::layout::Rect;
 use ratatui::Terminal;
 use tokio_stream::StreamExt;
 
@@ -293,15 +294,24 @@ fn handle_mouse(mouse: crossterm::event::MouseEvent, main: &mut MainScreen) {
             tabs::Tab::Chat => main.chat.scroll_up(3),
             tabs::Tab::Entity => main.entity.scroll_up(3),
             tabs::Tab::Evolution => main.evolution.scroll_up(3),
+            tabs::Tab::Comms => main.comms.scroll_up(3),
             _ => {}
         },
         MouseEventKind::ScrollDown => match main.active_tab {
             tabs::Tab::Chat => main.chat.scroll_down(3),
             tabs::Tab::Entity => main.entity.scroll_down(3),
             tabs::Tab::Evolution => main.evolution.scroll_down(3),
+            tabs::Tab::Comms => main.comms.scroll_down(3),
             _ => {}
         },
         MouseEventKind::Down(crossterm::event::MouseButton::Left) => {
+            // Tab-specific click handling
+            if main.active_tab == tabs::Tab::Comms && mouse.row > 10 {
+                let term = crossterm::terminal::size().unwrap_or((80, 24));
+                let content_area = Rect::new(0, 11, term.0, term.1.saturating_sub(12));
+                main.comms
+                    .handle_mouse(mouse.row, mouse.column, content_area);
+            }
             // Tab bar click detection: header is 8 rows (0-7), tab bar is rows 8-10
             if mouse.row >= 8 && mouse.row <= 10 && !main.fullscreen {
                 // Calculate tab positions dynamically based on label widths + separators
