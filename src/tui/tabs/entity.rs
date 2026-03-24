@@ -44,10 +44,7 @@ impl EntityTab {
             .unwrap_or_else(|| "entity".to_string());
 
         // Try to load SELF.md
-        let self_paths = [
-            root_dir.join("entity/SELF.md"),
-            root_dir.join("SELF.md"),
-        ];
+        let self_paths = [root_dir.join("entity/SELF.md"), root_dir.join("SELF.md")];
         for path in &self_paths {
             if let Ok(content) = std::fs::read_to_string(path) {
                 self.self_summary = extract_core_identity(&content);
@@ -62,7 +59,7 @@ impl EntityTab {
         ];
         for path in &thought_paths {
             if let Ok(content) = std::fs::read_to_string(path) {
-                self.thoughts = extract_section_items(&content, "Active");
+                self.thoughts = extract_thoughts(&content);
                 break;
             }
         }
@@ -74,15 +71,29 @@ impl EntityTab {
         ];
         for path in &curiosity_paths {
             if let Ok(content) = std::fs::read_to_string(path) {
-                self.questions = extract_section_items(&content, "Open Questions");
+                self.questions = extract_questions(&content);
                 break;
             }
         }
 
-        // Try to count sessions from archive
-        let archive_path = root_dir.join(".claude/ARCHIVE.md");
-        if let Ok(content) = std::fs::read_to_string(archive_path) {
-            self.session_count = Some(content.lines().filter(|l| l.starts_with("| ")).count().saturating_sub(2));
+        // Try to count sessions from archive — check multiple locations
+        let archive_paths = [
+            root_dir.join(".claude/ARCHIVE.md"),
+            root_dir.join("memory/ARCHIVE.md"),
+            root_dir.join("../.claude/ARCHIVE.md"),
+        ];
+        for path in &archive_paths {
+            if let Ok(content) = std::fs::read_to_string(path) {
+                let count = content
+                    .lines()
+                    .filter(|l| l.starts_with("| "))
+                    .count()
+                    .saturating_sub(2);
+                if count > 0 {
+                    self.session_count = Some(count);
+                }
+                break;
+            }
         }
     }
 
@@ -121,7 +132,10 @@ impl TabView for EntityTab {
         let outer_inner = outer_block.inner(area);
         frame.render_widget(outer_block, area);
 
-        // Build all content as lines for a single scrollable Paragraph
+        // Calculate available inner width for bordered sections
+        let inner_w = outer_inner.width.saturating_sub(2) as usize; // margin on each side
+
+        // Build all content as lines with bordered sections
         let mut lines: Vec<Line> = Vec::new();
 
         // Identity section
@@ -132,82 +146,80 @@ impl TabView for EntityTab {
             .map(|n| n.to_string())
             .unwrap_or_else(|| "—".to_string());
 
-        lines.push(Line::styled(
-            "  ── identity ──",
-            Style::default().fg(NORD7),
-        ));
-        lines.push(Line::from(vec![
-            Span::styled("  Name:     ", Style::default().fg(COLOR_DIM)),
-            Span::styled(name, Style::default().fg(NORD7).add_modifier(Modifier::BOLD)),
-        ]));
-        lines.push(Line::from(vec![
-            Span::styled("  Model:    ", Style::default().fg(COLOR_DIM)),
-            Span::styled(model, Style::default().fg(COLOR_TEXT)),
-        ]));
-        lines.push(Line::from(vec![
-            Span::styled("  Sessions: ", Style::default().fg(COLOR_DIM)),
-            Span::styled(sessions, Style::default().fg(COLOR_TEXT)),
-        ]));
-        lines.push(Line::from(""));
+        let identity_content: Vec<Line> = vec![
+            Line::from(vec![
+                Span::styled("  Name:     ", Style::default().fg(COLOR_DIM)),
+                Span::styled(
+                    name,
+                    Style::default().fg(NORD7).add_modifier(Modifier::BOLD),
+                ),
+            ]),
+            Line::from(vec![
+                Span::styled("  Model:    ", Style::default().fg(COLOR_DIM)),
+                Span::styled(model, Style::default().fg(COLOR_TEXT)),
+            ]),
+            Line::from(vec![
+                Span::styled("  Sessions: ", Style::default().fg(COLOR_DIM)),
+                Span::styled(sessions, Style::default().fg(COLOR_TEXT)),
+            ]),
+        ];
+        push_bordered_section(&mut lines, "identity", NORD7, &identity_content, inner_w);
 
         // Self summary section
-        lines.push(Line::styled(
-            "  ── self ──",
-            Style::default().fg(NORD8),
-        ));
-        if self.self_summary.is_empty() {
-            lines.push(Line::styled(
+        let self_content: Vec<Line> = if self.self_summary.is_empty() {
+            vec![Line::styled(
                 "  No SELF.md found.",
                 Style::default().fg(COLOR_DIM),
-            ));
+            )]
         } else {
-            for line in self.self_summary.lines() {
-                lines.push(Line::styled(
-                    format!("  {}", line),
-                    Style::default().fg(COLOR_TEXT),
-                ));
-            }
-        }
-        lines.push(Line::from(""));
+            self.self_summary
+                .lines()
+                .map(|l| Line::styled(format!("  {}", l), Style::default().fg(COLOR_TEXT)))
+                .collect()
+        };
+        push_bordered_section(&mut lines, "self", NORD8, &self_content, inner_w);
 
         // Thoughts section
-        lines.push(Line::styled(
-            format!("  ── active thoughts ({}) ──", self.thoughts.len()),
-            Style::default().fg(NORD13),
-        ));
-        if self.thoughts.is_empty() {
-            lines.push(Line::styled(
+        let title = format!("active thoughts ({})", self.thoughts.len());
+        let thoughts_content: Vec<Line> = if self.thoughts.is_empty() {
+            vec![Line::styled(
                 "  No active thoughts.",
                 Style::default().fg(COLOR_DIM),
-            ));
+            )]
         } else {
-            for (i, t) in self.thoughts.iter().enumerate() {
-                lines.push(Line::from(vec![
-                    Span::styled(format!("  {}. ", i + 1), Style::default().fg(COLOR_DIM)),
-                    Span::styled(t.as_str(), Style::default().fg(COLOR_TEXT)),
-                ]));
-            }
-        }
-        lines.push(Line::from(""));
+            self.thoughts
+                .iter()
+                .enumerate()
+                .map(|(i, t)| {
+                    Line::from(vec![
+                        Span::styled(format!("  {}. ", i + 1), Style::default().fg(COLOR_DIM)),
+                        Span::styled(t.as_str(), Style::default().fg(COLOR_TEXT)),
+                    ])
+                })
+                .collect()
+        };
+        push_bordered_section(&mut lines, &title, NORD13, &thoughts_content, inner_w);
 
         // Questions section
-        lines.push(Line::styled(
-            format!("  ── open questions ({}) ──", self.questions.len()),
-            Style::default().fg(NORD9),
-        ));
-        if self.questions.is_empty() {
-            lines.push(Line::styled(
+        let title = format!("open questions ({})", self.questions.len());
+        let questions_content: Vec<Line> = if self.questions.is_empty() {
+            vec![Line::styled(
                 "  No open questions.",
                 Style::default().fg(COLOR_DIM),
-            ));
+            )]
         } else {
-            for (i, q) in self.questions.iter().enumerate() {
-                lines.push(Line::from(vec![
-                    Span::styled(format!("  {}. ", i + 1), Style::default().fg(COLOR_DIM)),
-                    Span::styled(q.as_str(), Style::default().fg(COLOR_TEXT)),
-                ]));
-            }
-        }
+            self.questions
+                .iter()
+                .enumerate()
+                .map(|(i, q)| {
+                    Line::from(vec![
+                        Span::styled(format!("  {}. ", i + 1), Style::default().fg(COLOR_DIM)),
+                        Span::styled(q.as_str(), Style::default().fg(COLOR_TEXT)),
+                    ])
+                })
+                .collect()
+        };
+        push_bordered_section(&mut lines, &title, NORD9, &questions_content, inner_w);
 
         // Render as single scrollable paragraph
         let paragraph = Paragraph::new(lines)
@@ -234,6 +246,49 @@ impl TabView for EntityTab {
             }
         }
     }
+}
+
+// ─── Bordered Section Helper ───
+
+/// Draw a bordered section using Unicode box chars within a Paragraph.
+/// Creates: ╭ title ────╮ / │  content  │ / ╰────────────╯
+fn push_bordered_section<'a>(
+    lines: &mut Vec<Line<'a>>,
+    title: &str,
+    title_color: ratatui::style::Color,
+    content: &[Line<'a>],
+    width: usize,
+) {
+    let border_style = Style::default().fg(COLOR_BORDER);
+
+    // Top border: ╭ title ─────╮
+    let title_part = format!(" {} ", title);
+    let fill_len = width.saturating_sub(title_part.len() + 2); // 2 for ╭ and ╮
+    let top = Line::from(vec![
+        Span::styled("╭", border_style),
+        Span::styled(title_part, Style::default().fg(title_color)),
+        Span::styled("─".repeat(fill_len), border_style),
+        Span::styled("╮", border_style),
+    ]);
+    lines.push(top);
+
+    // Content lines: │  text  │
+    for line in content {
+        let mut spans = vec![Span::styled("│", border_style)];
+        spans.extend(line.spans.iter().cloned());
+        // We don't pad to exact width here — the Paragraph handles it
+        spans.push(Span::raw(""));
+        lines.push(Line::from(spans));
+    }
+
+    // Bottom border: ╰─────╯
+    let bottom_fill = width.saturating_sub(2);
+    let bottom = Line::from(vec![
+        Span::styled("╰", border_style),
+        Span::styled("─".repeat(bottom_fill), border_style),
+        Span::styled("╯", border_style),
+    ]);
+    lines.push(bottom);
 }
 
 // ─── Helpers ───
@@ -266,22 +321,106 @@ fn extract_core_identity(content: &str) -> String {
     lines.join(" ")
 }
 
-fn extract_section_items(content: &str, section_name: &str) -> Vec<String> {
+/// Extract active thoughts from THOUGHTS.md.
+/// Supports multiple formats:
+/// - Echo format: `## Active` section with `### Title` entries
+/// - Synth format: top-level `## Date — Title` entries (no Active section)
+/// - Nova format: `## Title (Date)` entries
+///   Skips struck-through (`~~`) entries and meta-sections.
+fn extract_thoughts(content: &str) -> Vec<String> {
+    let mut items = Vec::new();
+
+    // First try Echo format: look for `## Active` section with `### ` sub-items
+    let mut in_active = false;
+    for line in content.lines() {
+        if line.starts_with("## ") {
+            if line.contains("Active") {
+                in_active = true;
+                continue;
+            } else if in_active {
+                break;
+            }
+        }
+        if in_active && line.starts_with("### ") {
+            let title = line.trim_start_matches("### ").trim().to_string();
+            if !title.is_empty() && !title.starts_with("~~") {
+                items.push(title);
+            }
+        }
+    }
+    if !items.is_empty() {
+        return items;
+    }
+
+    // Fallback: collect all `## ` entries, skip meta-sections
+    let skip_sections = [
+        "Graduated",
+        "Dissolved",
+        "Archived",
+        "Explored",
+        "Themes",
+        "New (",
+    ];
+    for line in content.lines() {
+        if line.starts_with("## ") {
+            let heading = line.trim_start_matches("## ").trim();
+            if heading.is_empty() || heading.starts_with("~~") {
+                continue;
+            }
+            // Skip meta-sections
+            if skip_sections.iter().any(|s| heading.starts_with(s)) {
+                continue;
+            }
+            // Skip the document title (first line starting with #)
+            if heading.contains("Thoughts") || heading.contains("thoughts") {
+                continue;
+            }
+            items.push(heading.to_string());
+        }
+    }
+
+    items
+}
+
+/// Extract open questions from CURIOSITY.md.
+/// Supports:
+/// - Echo format: `## Open Questions` with `### Title` items
+/// - Synth/Nova format: `## Open Questions` with `- bullet` items
+fn extract_questions(content: &str) -> Vec<String> {
     let mut items = Vec::new();
     let mut in_section = false;
 
     for line in content.lines() {
-        if line.starts_with("## ") && line.contains(section_name) {
-            in_section = true;
+        if line.starts_with("## ") {
+            if line.contains("Open Questions") {
+                in_section = true;
+                continue;
+            } else if in_section {
+                break;
+            }
+        }
+        if !in_section {
             continue;
         }
-        if in_section && line.starts_with("## ") {
-            break;
+        let trimmed = line.trim();
+        // Match `### Title` (Echo format)
+        if let Some(title) = trimmed.strip_prefix("### ") {
+            let title = title.trim();
+            if !title.is_empty() && !title.starts_with("~~") {
+                items.push(title.to_string());
+            }
         }
-        if in_section && line.starts_with("### ") {
-            let title = line.trim_start_matches("### ").trim().to_string();
-            if !title.is_empty() {
-                items.push(title);
+        // Match `- text` (Synth/Nova format)
+        else if let Some(bullet) = trimmed.strip_prefix("- ") {
+            let text = bullet.trim();
+            if !text.is_empty() && !text.starts_with("~~") {
+                // Trim to first sentence or ~80 chars for display
+                let display = if text.len() > 80 {
+                    format!("{}…", &text[..text[..80].rfind(' ').unwrap_or(80)])
+                } else {
+                    text.to_string()
+                };
+                items.push(display);
             }
         }
     }

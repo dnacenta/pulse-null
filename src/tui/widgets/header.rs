@@ -23,39 +23,18 @@ pub fn draw(
     // Split inner area: logo on left, status on right
     let chunks = Layout::horizontal([Constraint::Min(32), Constraint::Min(20)]).split(inner);
 
-    // Logo — PULSE in cyan, connector in yellow, NULL in teal
+    // Logo — compact single-line styled text
     let logo_lines = vec![
+        Line::from(""),
         Line::from(vec![
             Span::styled(
-                " \u{2554}\u{2550}\u{2557}\u{2566} \u{2566}\u{2566}  \u{2554}\u{2550}\u{2557}\u{2554}\u{2550}\u{2557}",
-                Style::default().fg(NORD8),
+                " PULSE",
+                Style::default().fg(NORD8).add_modifier(Modifier::BOLD),
             ),
-            Span::raw("   "),
+            Span::styled(" // ", Style::default().fg(NORD13)),
             Span::styled(
-                "\u{2554}\u{2557}\u{2554}\u{2566} \u{2566}\u{2566}  \u{2566}",
-                Style::default().fg(NORD7),
-            ),
-        ]),
-        Line::from(vec![
-            Span::styled(
-                " \u{2560}\u{2550}\u{255d}\u{2551} \u{2551}\u{2551}  \u{255a}\u{2550}\u{2557}\u{2551}\u{2563} ",
-                Style::default().fg(NORD8),
-            ),
-            Span::raw("   "),
-            Span::styled(
-                "\u{2551}\u{2551}\u{2551}\u{2551} \u{2551}\u{2551}  \u{2551}",
-                Style::default().fg(NORD7),
-            ),
-        ]),
-        Line::from(vec![
-            Span::styled(
-                " \u{2569}  \u{255a}\u{2550}\u{255d}\u{2569}\u{2550}\u{255d}\u{255a}\u{2550}\u{255d}\u{255a}\u{2550}\u{255d}",
-                Style::default().fg(NORD8),
-            ),
-            Span::styled("\u{2500}\u{2500}\u{2500}", Style::default().fg(NORD13)),
-            Span::styled(
-                "\u{255d}\u{255a}\u{255d}\u{255a}\u{2550}\u{255d}\u{2569}\u{2550}\u{255d}\u{2569}\u{2550}\u{255d}",
-                Style::default().fg(NORD7),
+                "NULL",
+                Style::default().fg(NORD7).add_modifier(Modifier::BOLD),
             ),
         ]),
     ];

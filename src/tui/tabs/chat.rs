@@ -61,6 +61,7 @@ pub struct ChatTab {
     pub auto_scroll: bool,
     pub state: EntityState,
     pub entity_name: String,
+    pub owner_alias: String,
     pub pulse_data: VecDeque<f64>,
     pub pulse_tick: u64,
     pub pulse_color: PulseColorTransition,
@@ -71,7 +72,7 @@ pub struct ChatTab {
 }
 
 impl ChatTab {
-    pub fn new(entity_name: &str) -> Self {
+    pub fn new(entity_name: &str, owner_alias: &str) -> Self {
         let term_width = crossterm::terminal::size()
             .map(|(w, _)| w as usize)
             .unwrap_or(120);
@@ -83,7 +84,7 @@ impl ChatTab {
         let (ui_tx, ui_rx) = mpsc::unbounded_channel();
 
         let mut textarea = TextArea::default();
-        Self::style_textarea(&mut textarea);
+        Self::style_textarea(&mut textarea, owner_alias);
 
         Self {
             messages: Vec::new(),
@@ -95,6 +96,7 @@ impl ChatTab {
             auto_scroll: true,
             state: EntityState::Idle,
             entity_name: entity_name.to_string(),
+            owner_alias: owner_alias.to_string(),
             pulse_data,
             pulse_tick: 0,
             pulse_color: PulseColorTransition::new(&EntityState::Idle),
@@ -105,7 +107,7 @@ impl ChatTab {
         }
     }
 
-    fn style_textarea(textarea: &mut TextArea<'static>) {
+    fn style_textarea(textarea: &mut TextArea<'static>, owner_alias: &str) {
         textarea.set_placeholder_text("...");
         textarea.set_placeholder_style(Style::default().fg(COLOR_DIM));
         textarea.set_cursor_line_style(Style::default());
@@ -115,7 +117,7 @@ impl ChatTab {
                 .border_type(BorderType::Rounded)
                 .border_style(Style::default().fg(COLOR_BORDER))
                 .title(Span::styled(
-                    " you \u{203a} ",
+                    format!(" {} \u{203a} ", owner_alias),
                     Style::default()
                         .fg(COLOR_TEXT_BRIGHT)
                         .add_modifier(Modifier::BOLD),
@@ -125,7 +127,7 @@ impl ChatTab {
 
     fn reset_textarea(&mut self) {
         self.textarea = TextArea::default();
-        Self::style_textarea(&mut self.textarea);
+        Self::style_textarea(&mut self.textarea, &self.owner_alias);
     }
 
     pub fn input_is_empty(&self) -> bool {
@@ -137,8 +139,23 @@ impl ChatTab {
     }
 
     pub fn input_height(&self) -> u16 {
-        let lines = self.textarea.lines().len() as u16;
-        lines.clamp(1, MAX_INPUT_LINES) + 2 // +2 for borders
+        // Account for visual line wraps, not just logical lines
+        let inner_width = crossterm::terminal::size()
+            .map(|(w, _)| w.saturating_sub(6) as usize) // borders + padding
+            .unwrap_or(114);
+        let visual_lines: usize = self
+            .textarea
+            .lines()
+            .iter()
+            .map(|l| {
+                if l.is_empty() || inner_width == 0 {
+                    1
+                } else {
+                    (l.len() + inner_width - 1) / inner_width
+                }
+            })
+            .sum();
+        (visual_lines as u16).clamp(1, MAX_INPUT_LINES) + 2 // +2 for borders
     }
 
     pub fn scroll_up(&mut self, amount: u16) {
@@ -175,7 +192,6 @@ impl ChatTab {
                 if let Some(last) = self.messages.last_mut() {
                     if !last.is_user {
                         last.text.push_str(&text);
-                        self.auto_scroll = true;
                         return;
                     }
                 }
@@ -183,7 +199,6 @@ impl ChatTab {
                     is_user: false,
                     text,
                 });
-                self.auto_scroll = true;
             }
             UiEvent::Complete {
                 conversation,
@@ -261,7 +276,7 @@ impl ChatTab {
                 self.history_idx = Some(idx);
                 let text = self.input_history[idx].clone();
                 self.textarea = TextArea::new(vec![text]);
-                Self::style_textarea(&mut self.textarea);
+                Self::style_textarea(&mut self.textarea, &self.owner_alias);
                 self.textarea.move_cursor(CursorMove::End);
                 None
             }
@@ -272,7 +287,7 @@ impl ChatTab {
                         self.history_idx = Some(idx + 1);
                         let text = self.input_history[idx + 1].clone();
                         self.textarea = TextArea::new(vec![text]);
-                        Self::style_textarea(&mut self.textarea);
+                        Self::style_textarea(&mut self.textarea, &self.owner_alias);
                         self.textarea.move_cursor(CursorMove::End);
                     } else {
                         self.history_idx = None;
@@ -416,7 +431,7 @@ impl ChatTab {
             if msg.is_user {
                 lines.push(Line::from(vec![
                     Span::styled(
-                        "  you",
+                        format!("  {}", self.owner_alias),
                         Style::default()
                             .fg(COLOR_TEXT_BRIGHT)
                             .add_modifier(Modifier::BOLD),
@@ -426,7 +441,7 @@ impl ChatTab {
                 ]));
             } else {
                 let label = format!("  {}", self.entity_name);
-                let padding = " ".repeat(label.len() + 3);
+                let padding = "    ";
 
                 for (i, line) in msg.text.lines().enumerate() {
                     if i == 0 {
@@ -437,7 +452,7 @@ impl ChatTab {
                         ]));
                     } else {
                         lines.push(Line::from(Span::styled(
-                            format!("{}{}", padding, line),
+                            format!("{padding}{line}"),
                             Style::default().fg(COLOR_TEXT),
                         )));
                     }
@@ -447,8 +462,7 @@ impl ChatTab {
         }
 
         // Calculate visual line count (accounts for line wrapping)
-        let paragraph = Paragraph::new(lines)
-            .wrap(Wrap { trim: false });
+        let paragraph = Paragraph::new(lines).wrap(Wrap { trim: false });
         let content_height = paragraph.line_count(inner.width) as u16;
         let view_height = inner.height;
         let max_scroll = content_height.saturating_sub(view_height);

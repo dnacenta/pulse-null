@@ -70,6 +70,7 @@ pub async fn run(
 
     let entity_available = config.is_some();
     let entity_name = config.map(|c| c.entity.name.as_str());
+    let owner_alias = config.map(|c| c.entity.owner_alias.as_str());
 
     // Screens
     let mut current_screen = AppScreen::Splash;
@@ -128,7 +129,8 @@ pub async fn run(
                             }
                             if screen == AppScreen::Main && main_screen.is_none() {
                                 let name = entity_name.unwrap_or("entity");
-                                main_screen = Some(MainScreen::new(name));
+                                let alias = owner_alias.unwrap_or("you");
+                                main_screen = Some(MainScreen::new(name, alias));
                             }
                             current_screen = screen;
                         }
@@ -236,7 +238,7 @@ pub async fn run_chat(
         Some(system_prompt.to_string()),
     );
 
-    let mut main = MainScreen::new(&config.entity.name);
+    let mut main = MainScreen::new(&config.entity.name, &config.entity.owner_alias);
     let mut events = event::EventStream::new();
     let mut tick = tokio::time::interval(Duration::from_millis(100));
 
