@@ -1,4 +1,5 @@
 pub mod chat;
+pub mod comms;
 pub mod dashboard;
 pub mod entity;
 pub mod evolution;
@@ -18,6 +19,7 @@ pub enum Tab {
     Evolution,
     Entity,
     Logs,
+    Comms,
 }
 
 impl Tab {
@@ -28,6 +30,7 @@ impl Tab {
             Tab::Evolution => 2,
             Tab::Entity => 3,
             Tab::Logs => 4,
+            Tab::Comms => 5,
         }
     }
 
@@ -38,6 +41,7 @@ impl Tab {
             2 => Tab::Evolution,
             3 => Tab::Entity,
             4 => Tab::Logs,
+            5 => Tab::Comms,
             _ => Tab::Chat,
         }
     }
@@ -49,10 +53,11 @@ impl Tab {
             Tab::Evolution => "evolution",
             Tab::Entity => "entity",
             Tab::Logs => "logs",
+            Tab::Comms => "comms",
         }
     }
 
-    pub const COUNT: usize = 5;
+    pub const COUNT: usize = 6;
 }
 
 pub trait TabView {

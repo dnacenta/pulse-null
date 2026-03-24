@@ -12,6 +12,7 @@ mod events;
 mod init;
 mod logbook;
 mod ollama_provider;
+mod peer;
 mod pidfile;
 mod plugins;
 mod praxis;
