@@ -258,7 +258,7 @@ impl TabView for EntityTab {
 
 /// Draw a bordered section using Unicode box chars within a Paragraph.
 /// Creates: ╭ title ────╮ / │  content  │ / ╰────────────╯
-fn push_bordered_section<'a>(
+pub fn push_bordered_section<'a>(
     lines: &mut Vec<Line<'a>>,
     title: &str,
     title_color: ratatui::style::Color,

@@ -34,6 +34,8 @@ pub struct Config {
     #[serde(default)]
     pub context_buffer: crate::context_buffer::ContextBufferConfig,
     #[serde(default)]
+    pub peers: HashMap<String, PeerConfig>,
+    #[serde(default)]
     pub plugins: HashMap<String, toml::Value>,
 }
 
@@ -166,8 +168,8 @@ impl Config {
         Ok(config)
     }
 
-    /// Find echo-system.toml by walking up from current directory
-    fn find_config() -> Result<PathBuf, Box<dyn std::error::Error>> {
+    /// Find pulse-null.toml by walking up from current directory
+    pub fn find_config() -> Result<PathBuf, Box<dyn std::error::Error>> {
         let mut dir = std::env::current_dir()?;
         loop {
             let candidate = dir.join(CONFIG_FILENAME);
@@ -415,6 +417,15 @@ impl Default for SessionConfig {
             persist: true,
         }
     }
+}
+
+/// Configuration for a remote peer entity
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PeerConfig {
+    pub host: String,
+    pub port: u16,
+    #[serde(default)]
+    pub secret: Option<String>,
 }
 
 /// Configuration for caliber-echo outcome tracking

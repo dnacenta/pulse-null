@@ -8,6 +8,7 @@ use ratatui::Frame;
 use super::{Screen, ScreenAction};
 use crate::tui::app::AppContext;
 use crate::tui::tabs::chat::{ChatAction, ChatTab};
+use crate::tui::tabs::comms::CommsTab;
 use crate::tui::tabs::dashboard::DashboardTab;
 use crate::tui::tabs::entity::EntityTab;
 use crate::tui::tabs::evolution::EvolutionTab;
@@ -23,6 +24,7 @@ pub struct MainScreen {
     pub evolution: EvolutionTab,
     pub entity: EntityTab,
     pub logs: LogsTab,
+    pub comms: CommsTab,
     pub fullscreen: bool,
     pub show_help: bool,
 }
@@ -36,6 +38,7 @@ impl MainScreen {
             evolution: EvolutionTab::new(),
             entity: EntityTab::new(),
             logs: LogsTab::new(),
+            comms: CommsTab::new(entity_name),
             fullscreen: false,
             show_help: false,
         }
@@ -175,6 +178,9 @@ impl Screen for MainScreen {
             Tab::Logs => {
                 self.logs.render(frame, chunks[content_idx], ctx);
             }
+            Tab::Comms => {
+                self.comms.render(frame, chunks[content_idx], ctx);
+            }
         }
 
         // Footer hints
@@ -192,6 +198,18 @@ impl Screen for MainScreen {
                     Span::styled(" Scroll  ", hint_style_desc),
                     Span::styled(" Tab ", hint_style_key),
                     Span::styled(" Next tab ", hint_style_desc),
+                ],
+                Tab::Comms => vec![
+                    Span::styled(" Enter ", hint_style_key),
+                    Span::styled(" Start  ", hint_style_desc),
+                    Span::styled(" \u{2191}\u{2193} ", hint_style_key),
+                    Span::styled(" Select  ", hint_style_desc),
+                    Span::styled(" \u{2190}\u{2192} ", hint_style_key),
+                    Span::styled(" Mode  ", hint_style_desc),
+                    Span::styled(" r ", hint_style_key),
+                    Span::styled(" Refresh  ", hint_style_desc),
+                    Span::styled(" p ", hint_style_key),
+                    Span::styled(" Peers ", hint_style_desc),
                 ],
                 _ => vec![
                     Span::styled(" Tab ", hint_style_key),
@@ -272,6 +290,10 @@ impl Screen for MainScreen {
                     self.active_tab = Tab::Logs;
                     return ScreenAction::None;
                 }
+                KeyCode::Char('6') => {
+                    self.active_tab = Tab::Comms;
+                    return ScreenAction::None;
+                }
                 // ? opens help (only when not typing)
                 KeyCode::Char('?') => {
                     self.show_help = true;
@@ -301,6 +323,7 @@ impl Screen for MainScreen {
             Tab::Evolution => self.evolution.handle_key(key, ctx),
             Tab::Entity => self.entity.handle_key(key, ctx),
             Tab::Logs => self.logs.handle_key(key, ctx),
+            Tab::Comms => self.comms.handle_key(key, ctx),
         }
     }
 
@@ -318,6 +341,7 @@ impl Screen for MainScreen {
         self.chat.tick();
         self.evolution.handle_tick(ctx);
         self.entity.handle_tick(ctx);
+        self.comms.handle_tick(ctx);
     }
 }
 
@@ -345,7 +369,7 @@ fn draw_help_overlay(frame: &mut Frame, area: Rect) {
 
     let bindings = vec![
         ("Tab / Shift+Tab", "Switch tabs"),
-        ("1-5", "Jump to tab"),
+        ("1-6", "Jump to tab"),
         ("Ctrl+F", "Toggle fullscreen"),
         ("F1 / ?", "Toggle this help"),
         ("Ctrl+C / Esc", "Quit (chat empty)"),
@@ -354,10 +378,12 @@ fn draw_help_overlay(frame: &mut Frame, area: Rect) {
         ("Enter", "Send message"),
         ("Shift+Enter", "New line"),
         ("Shift+Up/Down", "Scroll conversation"),
-        ("Ctrl+L", "Clear conversation"),
         ("", ""),
-        ("── Other tabs ──", ""),
-        ("Shift+Up/Down", "Scroll content"),
+        ("── Comms ──", ""),
+        ("\u{2191}\u{2193} / \u{2190}\u{2192}", "Select peer / mode"),
+        ("Enter", "Start conversation"),
+        ("Space", "Pause/resume"),
+        ("p", "Peer management"),
     ];
 
     let lines: Vec<Line> = bindings
