@@ -49,6 +49,28 @@ pub async fn start(config: Config) -> Result<(), Box<dyn std::error::Error>> {
     // Ensure required directories and files exist
     ensure_infrastructure(&root_dir);
 
+    // Verify Claude Code integration if applicable
+    if config.llm.provider == "claude-code" {
+        if let Ok(home) = std::env::var("HOME") {
+            let home_dir = std::path::PathBuf::from(home);
+            let items = crate::init::claude_code_bootstrap::verify(&root_dir, &home_dir);
+            for item in &items {
+                match &item.status {
+                    crate::init::claude_code_bootstrap::ItemStatus::Missing => {
+                        tracing::warn!(
+                            "Claude Code: {} missing — run 'pulse-null repair' to fix",
+                            item.path.display()
+                        );
+                    }
+                    crate::init::claude_code_bootstrap::ItemStatus::Wrong(reason) => {
+                        tracing::warn!("Claude Code: {} — {}", item.path.display(), reason);
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+
     // Construct monitoring trait objects based on config
     let pipeline_monitor: Option<Arc<dyn PipelineMonitor>> = if config.pipeline.enabled {
         Some(Arc::new(crate::praxis::runtime::PraxisMonitor::new()))
