@@ -57,6 +57,14 @@ impl EvolutionTab {
         }
     }
 
+    pub fn scroll_up(&mut self, amount: u16) {
+        self.scroll = self.scroll.saturating_add(amount);
+    }
+
+    pub fn scroll_down(&mut self, amount: u16) {
+        self.scroll = self.scroll.saturating_sub(amount);
+    }
+
     fn load_signals(&mut self, root_dir: &Path) {
         self.loaded = true;
 
