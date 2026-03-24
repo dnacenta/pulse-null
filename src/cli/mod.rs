@@ -7,6 +7,7 @@ pub mod pipeline;
 pub mod plugin;
 pub mod praxis;
 pub mod recall;
+pub mod repair;
 pub mod schedule;
 pub mod status;
 pub mod up;

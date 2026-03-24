@@ -94,6 +94,8 @@ enum Commands {
         #[command(subcommand)]
         action: VigilAction,
     },
+    /// Verify and repair Claude Code integration (symlinks, hooks, config)
+    Repair,
 }
 
 #[derive(Subcommand)]
@@ -391,6 +393,12 @@ async fn main() {
                 VigilAction::Init => cli::vigil::init().await,
             };
             if let Err(e) = result {
+                eprintln!("Error: {e}");
+                std::process::exit(1);
+            }
+        }
+        Commands::Repair => {
+            if let Err(e) = cli::repair::run().await {
                 eprintln!("Error: {e}");
                 std::process::exit(1);
             }
