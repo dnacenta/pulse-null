@@ -185,10 +185,7 @@ impl TabView for EvolutionTab {
             let block = Block::bordered()
                 .border_type(BorderType::Rounded)
                 .border_style(Style::default().fg(COLOR_BORDER))
-                .title(Span::styled(
-                    " evolution ",
-                    Style::default().fg(NORD15),
-                ));
+                .title(Span::styled(" evolution ", Style::default().fg(NORD15)));
             let inner = block.inner(area);
             frame.render_widget(block, area);
 

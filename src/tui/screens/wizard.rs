@@ -270,7 +270,11 @@ impl WizardScreen {
         let model = get_text(&self.model);
         let api_key = if self.provider_idx == 1 {
             let k = get_text(&self.api_key);
-            if k.is_empty() { None } else { Some(k) }
+            if k.is_empty() {
+                None
+            } else {
+                Some(k)
+            }
         } else {
             None
         };
@@ -289,10 +293,20 @@ impl WizardScreen {
 
         // Create directory structure
         let dirs = [
-            "", "memory", "memory/logs", "journal", "monitoring", "archives",
-            "archives/reflections", "archives/learning", "archives/curiosity",
-            "archives/thoughts", "archives/praxis", "archives/conversations",
-            "plugins", "logs",
+            "",
+            "memory",
+            "memory/logs",
+            "journal",
+            "monitoring",
+            "archives",
+            "archives/reflections",
+            "archives/learning",
+            "archives/curiosity",
+            "archives/thoughts",
+            "archives/praxis",
+            "archives/conversations",
+            "plugins",
+            "logs",
         ];
         for d in &dirs {
             if let Err(e) = std::fs::create_dir_all(entity_dir.join(d)) {
@@ -331,12 +345,39 @@ impl WizardScreen {
             ("memory/MEMORY.md", templates::render_memory_md(&identity)),
             ("memory/EPHEMERAL.md", String::new()),
             ("memory/ARCHIVE.md", "# Archive Index\n".to_string()),
-            ("journal/LEARNING.md", format!("# {} — Learning\n\nResearch journal. Raw notes.\n", entity_name)),
-            ("journal/THOUGHTS.md", format!("# {} — Thoughts\n\nIncubation space.\n", entity_name)),
-            ("journal/REFLECTIONS.md", format!("# {} — Reflections\n\nCrystallized observations.\n", entity_name)),
-            ("journal/CURIOSITY.md", format!("# {} — Curiosity\n\n## Open Questions\n\n## Themes\n\n## Explored\n", entity_name)),
-            ("journal/PRAXIS.md", format!("# {} — Praxis\n\nBehavioral policies.\n", entity_name)),
-            ("journal/LOGBOOK.md", format!("# {} — Logbook\n\nSession records.\n", entity_name)),
+            (
+                "journal/LEARNING.md",
+                format!(
+                    "# {} — Learning\n\nResearch journal. Raw notes.\n",
+                    entity_name
+                ),
+            ),
+            (
+                "journal/THOUGHTS.md",
+                format!("# {} — Thoughts\n\nIncubation space.\n", entity_name),
+            ),
+            (
+                "journal/REFLECTIONS.md",
+                format!(
+                    "# {} — Reflections\n\nCrystallized observations.\n",
+                    entity_name
+                ),
+            ),
+            (
+                "journal/CURIOSITY.md",
+                format!(
+                    "# {} — Curiosity\n\n## Open Questions\n\n## Themes\n\n## Explored\n",
+                    entity_name
+                ),
+            ),
+            (
+                "journal/PRAXIS.md",
+                format!("# {} — Praxis\n\nBehavioral policies.\n", entity_name),
+            ),
+            (
+                "journal/LOGBOOK.md",
+                format!("# {} — Logbook\n\nSession records.\n", entity_name),
+            ),
             ("schedule.json", templates::render_schedule_json()),
             ("pipeline-state.json", "{}".to_string()),
             ("monitoring/signals.json", "[]".to_string()),
@@ -393,7 +434,7 @@ impl Screen for WizardScreen {
         let chunks = Layout::vertical([
             Constraint::Length(3), // title
             Constraint::Length(2), // progress bar
-            Constraint::Min(10),  // content
+            Constraint::Min(10),   // content
             Constraint::Length(2), // navigation hint + errors
         ])
         .split(area);
@@ -434,9 +475,7 @@ impl Screen for WizardScreen {
         }
 
         // Nav hints + error
-        let mut hint_spans = vec![
-            Span::styled("  ", Style::default()),
-        ];
+        let mut hint_spans = vec![Span::styled("  ", Style::default())];
         match self.step {
             WizardStep::Done => {
                 hint_spans.push(Span::styled(
@@ -633,7 +672,11 @@ impl WizardScreen {
         ])
         .split(area);
 
-        let labels = ["Entity name:", "Your name:", "How should the entity address you?"];
+        let labels = [
+            "Entity name:",
+            "Your name:",
+            "How should the entity address you?",
+        ];
         let fields: [&TextArea; 3] = [&self.entity_name, &self.owner_name, &self.owner_alias];
 
         for (i, (label, field)) in labels.iter().zip(fields.iter()).enumerate() {
@@ -666,7 +709,10 @@ impl WizardScreen {
         ])
         .split(area);
 
-        let labels = ["Core values (one per line):", "Personality traits (one per line):"];
+        let labels = [
+            "Core values (one per line):",
+            "Personality traits (one per line):",
+        ];
         let fields: [&TextArea; 2] = [&self.values, &self.traits];
 
         for (i, (label, field)) in labels.iter().zip(fields.iter()).enumerate() {
@@ -890,7 +936,10 @@ impl WizardScreen {
             Line::from(""),
             Line::from(vec![
                 Span::styled("    Entity:    ", Style::default().fg(COLOR_DIM)),
-                Span::styled(entity_name, Style::default().fg(NORD7).add_modifier(Modifier::BOLD)),
+                Span::styled(
+                    entity_name,
+                    Style::default().fg(NORD7).add_modifier(Modifier::BOLD),
+                ),
             ]),
             Line::from(vec![
                 Span::styled("    Owner:     ", Style::default().fg(COLOR_DIM)),

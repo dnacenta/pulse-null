@@ -11,6 +11,51 @@ use super::{AppScreen, Screen, ScreenAction};
 use crate::tui::app::AppContext;
 use crate::tui::theme::*;
 
+// ANSI Shadow figlet title — same approach as Rebels in the Sky
+const TITLE: [&str; 13] = [
+    "██████╗ ██╗   ██╗██╗     ███████╗███████╗",
+    "██╔══██╗██║   ██║██║     ██╔════╝██╔════╝",
+    "██████╔╝██║   ██║██║     ███████╗█████╗  ",
+    "██╔═══╝ ██║   ██║██║     ╚════██║██╔══╝  ",
+    "██║     ╚██████╔╝███████╗███████║███████╗",
+    "╚═╝      ╚═════╝ ╚══════╝╚══════╝╚══════╝",
+    "                  ╱╱                      ",
+    "███╗   ██╗██╗   ██╗██╗     ██╗            ",
+    "████╗  ██║██║   ██║██║     ██║            ",
+    "██╔██╗ ██║██║   ██║██║     ██║            ",
+    "██║╚██╗██║██║   ██║██║     ██║            ",
+    "██║ ╚████║╚██████╔╝███████╗███████╗      ",
+    "╚═╝  ╚═══╝ ╚═════╝ ╚══════╝╚══════╝      ",
+];
+const TITLE_WIDTH: u16 = 42;
+
+/// Two-color title rendering (Rebels in the Sky approach).
+/// Full block chars (█) get NORD6 (snow white), box-drawing chars get NORD8 (frost blue),
+/// the // separator gets NORD13 (aurora yellow).
+fn big_text(text: &[&str]) -> Paragraph<'static> {
+    let lines: Vec<Line> = text
+        .iter()
+        .map(|line| {
+            let spans: Vec<Span> = line
+                .chars()
+                .map(|c| {
+                    if c == '█' {
+                        Span::styled(c.to_string(), Style::default().fg(NORD6))
+                    } else if c == '╱' {
+                        Span::styled(c.to_string(), Style::default().fg(NORD13))
+                    } else if c == ' ' {
+                        Span::raw(c.to_string())
+                    } else {
+                        Span::styled(c.to_string(), Style::default().fg(NORD8))
+                    }
+                })
+                .collect();
+            Line::from(spans)
+        })
+        .collect();
+    Paragraph::new(lines).alignment(Alignment::Center)
+}
+
 struct MenuItem {
     label: String,
     target: AppScreen,
@@ -36,14 +81,14 @@ struct AuroraWave {
 
 impl SplashScreen {
     pub fn new(entity_available: bool, entity_name: Option<&str>) -> Self {
-        let resume_label = match entity_name {
-            Some(name) => format!("Resume Session ({})", name),
-            None => "Resume Session".to_string(),
+        let talk_label = match entity_name {
+            Some(name) => format!("Talk to {}", name),
+            None => "Talk".to_string(),
         };
 
         let menu_items = vec![
             MenuItem {
-                label: resume_label,
+                label: talk_label,
                 target: AppScreen::Main,
                 enabled: entity_available,
             },
@@ -51,11 +96,6 @@ impl SplashScreen {
                 label: "New Entity".to_string(),
                 target: AppScreen::Wizard,
                 enabled: true,
-            },
-            MenuItem {
-                label: "Dashboard".to_string(),
-                target: AppScreen::Main,
-                enabled: entity_available,
             },
             MenuItem {
                 label: "Quit".to_string(),
@@ -136,75 +176,58 @@ impl Screen for SplashScreen {
 
         // Layout: top padding, logo, aurora, menu, version, bottom padding
         let chunks = Layout::vertical([
-            Constraint::Min(2),                               // top padding
-            Constraint::Length(3),                            // logo
-            Constraint::Length(1),                            // spacer
-            Constraint::Length(3),                            // aurora waveform
-            Constraint::Length(1),                            // spacer
-            Constraint::Length(self.menu_items.len() as u16), // menu
-            Constraint::Length(2),                            // spacer + version
-            Constraint::Min(1),                               // bottom padding
+            Constraint::Min(1),                                         // top padding
+            Constraint::Length(TITLE.len() as u16),                     // logo (13 lines)
+            Constraint::Length(1),                                      // spacer
+            Constraint::Length(3),                                      // aurora waveform
+            Constraint::Length(1),                                      // spacer
+            Constraint::Length((self.menu_items.len() * 2 - 1) as u16), // menu with spacing
+            Constraint::Length(2),                                      // spacer + version
+            Constraint::Min(0),                                         // flexible space
+            Constraint::Length(1),                                      // footer hints
         ])
         .split(inner);
 
-        // ─── Logo ───
-        let title_full = [
-            "\u{2554}\u{2550}\u{2557}\u{2566} \u{2566}\u{2566}  \u{2554}\u{2550}\u{2557}\u{2554}\u{2550}\u{2557}   \u{2554}\u{2557}\u{2554}\u{2566} \u{2566}\u{2566}  \u{2566}",
-            "\u{2560}\u{2550}\u{255d}\u{2551} \u{2551}\u{2551}  \u{255a}\u{2550}\u{2557}\u{2551}\u{2563}    \u{2551}\u{2551}\u{2551}\u{2551} \u{2551}\u{2551}  \u{2551}",
-            "\u{2569}  \u{255a}\u{2550}\u{255d}\u{2569}\u{2550}\u{255d}\u{255a}\u{2550}\u{255d}\u{255a}\u{2550}\u{255d}\u{2500}\u{2500}\u{2500}\u{255d}\u{255a}\u{255d}\u{255a}\u{2550}\u{255d}\u{2569}\u{2550}\u{255d}\u{2569}\u{2550}\u{255d}",
-        ];
-
-        let logo_lines: Vec<Line> = if self.title_progress >= title_full[0].chars().count() {
-            // Full logo with colors
-            vec![
-                Line::from(vec![
-                    Span::styled(
-                        "\u{2554}\u{2550}\u{2557}\u{2566} \u{2566}\u{2566}  \u{2554}\u{2550}\u{2557}\u{2554}\u{2550}\u{2557}",
-                        Style::default().fg(NORD8),
-                    ),
-                    Span::raw("   "),
-                    Span::styled(
-                        "\u{2554}\u{2557}\u{2554}\u{2566} \u{2566}\u{2566}  \u{2566}",
-                        Style::default().fg(NORD7),
-                    ),
-                ]),
-                Line::from(vec![
-                    Span::styled(
-                        "\u{2560}\u{2550}\u{255d}\u{2551} \u{2551}\u{2551}  \u{255a}\u{2550}\u{2557}\u{2551}\u{2563} ",
-                        Style::default().fg(NORD8),
-                    ),
-                    Span::raw("   "),
-                    Span::styled(
-                        "\u{2551}\u{2551}\u{2551}\u{2551} \u{2551}\u{2551}  \u{2551}",
-                        Style::default().fg(NORD7),
-                    ),
-                ]),
-                Line::from(vec![
-                    Span::styled(
-                        "\u{2569}  \u{255a}\u{2550}\u{255d}\u{2569}\u{2550}\u{255d}\u{255a}\u{2550}\u{255d}\u{255a}\u{2550}\u{255d}",
-                        Style::default().fg(NORD8),
-                    ),
-                    Span::styled("\u{2500}\u{2500}\u{2500}", Style::default().fg(NORD13)),
-                    Span::styled(
-                        "\u{255d}\u{255a}\u{255d}\u{255a}\u{2550}\u{255d}\u{2569}\u{2550}\u{255d}\u{2569}\u{2550}\u{255d}",
-                        Style::default().fg(NORD7),
-                    ),
-                ]),
-            ]
+        // ─── Logo (Rebels in the Sky style) ───
+        let max_chars = TITLE[0].chars().count();
+        let logo = if self.title_progress >= max_chars {
+            // Full logo with two-color styling
+            big_text(&TITLE)
         } else {
-            // Type-in animation: show partial chars
+            // Type-in animation: reveal chars progressively with styling
             let chars_to_show = self.title_progress;
-            title_full
+            let lines: Vec<Line> = TITLE
                 .iter()
                 .map(|line| {
-                    let visible: String = line.chars().take(chars_to_show).collect();
-                    Line::styled(visible, Style::default().fg(NORD8))
+                    let spans: Vec<Span> = line
+                        .chars()
+                        .take(chars_to_show)
+                        .map(|c| {
+                            if c == '█' {
+                                Span::styled(c.to_string(), Style::default().fg(NORD6))
+                            } else if c == '╱' {
+                                Span::styled(c.to_string(), Style::default().fg(NORD13))
+                            } else if c == ' ' {
+                                Span::raw(c.to_string())
+                            } else {
+                                Span::styled(c.to_string(), Style::default().fg(NORD8))
+                            }
+                        })
+                        .collect();
+                    Line::from(spans)
                 })
-                .collect()
+                .collect();
+            Paragraph::new(lines).alignment(Alignment::Center)
         };
 
-        let logo = Paragraph::new(logo_lines).alignment(Alignment::Center);
-        frame.render_widget(logo, chunks[1]);
+        // Center the logo with fixed width
+        let title_area = Layout::horizontal([
+            Constraint::Fill(1),
+            Constraint::Length(TITLE_WIDTH),
+            Constraint::Fill(1),
+        ])
+        .split(chunks[1]);
+        frame.render_widget(logo, title_area[1]);
 
         // ─── Aurora Waveform ───
         if chunks[3].width > 4 && chunks[3].height > 0 {
@@ -244,6 +267,9 @@ impl Screen for SplashScreen {
         // ─── Menu ───
         let mut menu_lines: Vec<Line> = Vec::new();
         for (i, item) in self.menu_items.iter().enumerate() {
+            if i > 0 {
+                menu_lines.push(Line::from("")); // spacing between items
+            }
             let is_selected = i == self.selected;
             let style = if !item.enabled {
                 Style::default().fg(COLOR_DIM)
@@ -262,15 +288,25 @@ impl Screen for SplashScreen {
 
         // ─── Version ───
         let version = env!("CARGO_PKG_VERSION");
-        let version_text = if self.entity_available {
-            format!("v{} \u{00b7} entity system", version)
-        } else {
-            format!("v{} \u{00b7} entity system", version)
-        };
-        let version_line =
-            Paragraph::new(Line::styled(version_text, Style::default().fg(COLOR_DIM)))
-                .alignment(Alignment::Center);
+        let version_line = Paragraph::new(Line::styled(
+            format!("v{}", version),
+            Style::default().fg(COLOR_DIM),
+        ))
+        .alignment(Alignment::Center);
         frame.render_widget(version_line, chunks[6]);
+
+        // ─── Footer Hints ───
+        let hint_style_key = Style::default().fg(NORD0).bg(NORD3);
+        let hint_style_desc = Style::default().fg(NORD3);
+        let footer = Paragraph::new(Line::from(vec![
+            Span::styled(" Esc ", hint_style_key),
+            Span::styled(" Quit  ", hint_style_desc),
+            Span::styled(" \u{2191}\u{2193} ", hint_style_key),
+            Span::styled(" Navigate  ", hint_style_desc),
+            Span::styled(" Enter ", hint_style_key),
+            Span::styled(" Select ", hint_style_desc),
+        ]));
+        frame.render_widget(footer, chunks[8]);
     }
 
     fn handle_key(&mut self, key: KeyEvent, _ctx: &mut AppContext) -> ScreenAction {
@@ -303,10 +339,10 @@ impl Screen for SplashScreen {
     fn handle_tick(&mut self, _ctx: &mut AppContext) {
         self.tick += 1;
 
-        // Title type-in animation: 2 chars per tick
-        let max_chars = 30; // approx logo char count
+        // Title type-in animation: 3 chars per tick
+        let max_chars = TITLE[0].chars().count();
         if self.title_progress < max_chars {
-            self.title_progress += 2;
+            self.title_progress += 3;
         }
 
         // Advance aurora wave phases

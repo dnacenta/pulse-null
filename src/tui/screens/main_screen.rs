@@ -28,10 +28,10 @@ pub struct MainScreen {
 }
 
 impl MainScreen {
-    pub fn new(entity_name: &str) -> Self {
+    pub fn new(entity_name: &str, owner_alias: &str) -> Self {
         Self {
             active_tab: Tab::Chat,
-            chat: ChatTab::new(entity_name),
+            chat: ChatTab::new(entity_name, owner_alias),
             dashboard: DashboardTab::new(),
             evolution: EvolutionTab::new(),
             entity: EntityTab::new(),
@@ -132,6 +132,10 @@ impl Screen for MainScreen {
             constraints.push(Constraint::Min(10)); // content fills
         }
 
+        if !self.fullscreen {
+            constraints.push(Constraint::Length(1)); // footer hints
+        }
+
         let chunks = Layout::vertical(constraints).split(area);
 
         let content_idx = if self.fullscreen { 0 } else { 2 };
@@ -182,6 +186,34 @@ impl Screen for MainScreen {
             Tab::Logs => {
                 self.logs.render(frame, chunks[content_idx], ctx);
             }
+        }
+
+        // Footer hints
+        if !self.fullscreen {
+            let footer_idx = chunks.len() - 1;
+            let hint_style_key = Style::default().fg(NORD0).bg(NORD3);
+            let hint_style_desc = Style::default().fg(NORD3);
+            let hints: Vec<Span> = match self.active_tab {
+                Tab::Chat => vec![
+                    Span::styled(" Enter ", hint_style_key),
+                    Span::styled(" Send  ", hint_style_desc),
+                    Span::styled(" S+Enter ", hint_style_key),
+                    Span::styled(" Newline  ", hint_style_desc),
+                    Span::styled(" PgUp/Dn ", hint_style_key),
+                    Span::styled(" Scroll  ", hint_style_desc),
+                    Span::styled(" Tab ", hint_style_key),
+                    Span::styled(" Next tab ", hint_style_desc),
+                ],
+                _ => vec![
+                    Span::styled(" Tab ", hint_style_key),
+                    Span::styled(" Next tab  ", hint_style_desc),
+                    Span::styled(" PgUp/Dn ", hint_style_key),
+                    Span::styled(" Scroll  ", hint_style_desc),
+                    Span::styled(" q ", hint_style_key),
+                    Span::styled(" Quit ", hint_style_desc),
+                ],
+            };
+            frame.render_widget(Paragraph::new(Line::from(hints)), chunks[footer_idx]);
         }
 
         // Help overlay
@@ -317,9 +349,7 @@ fn draw_help_overlay(frame: &mut Frame, area: Rect) {
         .border_style(Style::default().fg(NORD8))
         .title(Span::styled(
             " keybindings ",
-            Style::default()
-                .fg(NORD8)
-                .add_modifier(Modifier::BOLD),
+            Style::default().fg(NORD8).add_modifier(Modifier::BOLD),
         ));
     let inner = block.inner(popup);
     frame.render_widget(block, popup);
@@ -349,10 +379,7 @@ fn draw_help_overlay(frame: &mut Frame, area: Rect) {
                 Line::styled(*key, Style::default().fg(COLOR_DIM))
             } else {
                 Line::from(vec![
-                    Span::styled(
-                        format!("  {:18}", key),
-                        Style::default().fg(NORD8),
-                    ),
+                    Span::styled(format!("  {:18}", key), Style::default().fg(NORD8)),
                     Span::styled(*desc, Style::default().fg(COLOR_TEXT)),
                 ])
             }
