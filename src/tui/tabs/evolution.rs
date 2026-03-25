@@ -2,7 +2,7 @@ use std::path::Path;
 
 use crossterm::event::{KeyCode, KeyEvent};
 use ratatui::layout::{Constraint, Layout, Rect};
-use ratatui::style::Style;
+use ratatui::style::{Modifier, Style};
 use ratatui::symbols::Marker;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::canvas::{Canvas, Line as CanvasLine};
@@ -186,57 +186,95 @@ impl EvolutionTab {
         frame.render_widget(canvas, inner);
     }
 
-    fn render_summary(&self, frame: &mut Frame, area: Rect) {
-        let mut spans: Vec<Span> = Vec::new();
-        spans.push(Span::raw("  "));
+    fn render_panel(&self, frame: &mut Frame, area: Rect) {
+        let block = Block::bordered()
+            .border_type(BorderType::Rounded)
+            .border_style(Style::default().fg(COLOR_BORDER))
+            .title(Span::styled(" signals ", Style::default().fg(NORD15)));
+        let inner = block.inner(area);
+        frame.render_widget(block, area);
 
-        if !self.sufficient_data && self.signal_count == 0 {
-            spans.push(Span::styled("awakening...", Style::default().fg(COLOR_DIM)));
-        } else {
-            let signals: [(&str, f64, &Option<Trend>, ratatui::style::Color); 4] = [
-                ("vocabulary", self.vocabulary, &self.vocab_trend, NORD14),
-                ("curiosity", self.curiosity, &self.curiosity_trend, NORD13),
-                ("grounding", self.grounding, &self.grounding_trend, NORD9),
-                ("lifecycle", self.lifecycle, &self.lifecycle_trend, NORD15),
-            ];
+        let mut lines: Vec<Line> = Vec::new();
 
-            for (i, (label, value, trend, color)) in signals.iter().enumerate() {
-                if i > 0 {
-                    spans.push(Span::styled("    ", Style::default()));
-                }
-                spans.push(Span::styled(
-                    format!("{} ", label),
-                    Style::default().fg(COLOR_DIM),
-                ));
-                spans.push(Span::styled(
-                    format!("{:.2}", value),
-                    Style::default().fg(*color),
-                ));
-                if let Some(t) = trend {
-                    let (arrow, arrow_color) = match t {
-                        Trend::Improving => (" \u{2197}", NORD14),
-                        Trend::Stable => (" \u{2192}", NORD4),
-                        Trend::Declining => (" \u{2198}", NORD11),
-                    };
-                    spans.push(Span::styled(arrow, Style::default().fg(arrow_color)));
-                }
-            }
+        // Status
+        if let Some(ref status) = self.status {
+            let (label, color) = match status {
+                CognitiveStatus::Healthy => ("HEALTHY", COLOR_HEALTHY),
+                CognitiveStatus::Watch => ("WATCH", COLOR_WATCH),
+                CognitiveStatus::Concern => ("CONCERN", NORD12),
+                CognitiveStatus::Alert => ("ALERT", COLOR_ALERT),
+            };
+            lines.push(Line::from(""));
+            lines.push(Line::from(vec![
+                Span::styled("  ", Style::default()),
+                Span::styled(
+                    label,
+                    Style::default().fg(color).add_modifier(Modifier::BOLD),
+                ),
+            ]));
         }
 
-        let meta = format!(
-            "  signals: {}    sessions: {}    status: {}",
-            self.signal_count,
-            self.session_count,
-            self.status
-                .as_ref()
-                .map(|s| s.to_string())
-                .unwrap_or_else(|| "\u{2014}".to_string()),
-        );
+        lines.push(Line::from(""));
 
-        let line1 = Line::from(spans);
-        let line2 = Line::from(vec![Span::styled(meta, Style::default().fg(COLOR_DIM))]);
+        if !self.sufficient_data && self.signal_count == 0 {
+            lines.push(Line::styled(
+                "  awakening...",
+                Style::default().fg(COLOR_DIM),
+            ));
+        } else {
+            // Signal values with trend arrows
+            let signals: [(&str, f64, &Option<Trend>, ratatui::style::Color); 4] = [
+                ("vocab", self.vocabulary, &self.vocab_trend, NORD14),
+                ("curio", self.curiosity, &self.curiosity_trend, NORD13),
+                ("ground", self.grounding, &self.grounding_trend, NORD9),
+                ("life", self.lifecycle, &self.lifecycle_trend, NORD15),
+            ];
 
-        frame.render_widget(Paragraph::new(vec![line1, line2]), area);
+            for (label, value, trend, color) in &signals {
+                let trend_str = if let Some(t) = trend {
+                    match t {
+                        Trend::Improving => " \u{2197}",
+                        Trend::Stable => " \u{2192}",
+                        Trend::Declining => " \u{2198}",
+                    }
+                } else {
+                    ""
+                };
+                let trend_color = trend
+                    .as_ref()
+                    .map(|t| match t {
+                        Trend::Improving => NORD14,
+                        Trend::Stable => NORD4,
+                        Trend::Declining => NORD11,
+                    })
+                    .unwrap_or(COLOR_DIM);
+
+                lines.push(Line::from(vec![
+                    Span::styled(format!("  {:<6}", label), Style::default().fg(COLOR_DIM)),
+                    Span::styled(format!("{:.2}", value), Style::default().fg(*color)),
+                    Span::styled(trend_str, Style::default().fg(trend_color)),
+                ]));
+            }
+
+            // Meta stats
+            lines.push(Line::from(""));
+            lines.push(Line::from(vec![
+                Span::styled("  signals ", Style::default().fg(COLOR_DIM)),
+                Span::styled(
+                    self.signal_count.to_string(),
+                    Style::default().fg(COLOR_TEXT),
+                ),
+            ]));
+            lines.push(Line::from(vec![
+                Span::styled("  sessions ", Style::default().fg(COLOR_DIM)),
+                Span::styled(
+                    self.session_count.to_string(),
+                    Style::default().fg(COLOR_TEXT),
+                ),
+            ]));
+        }
+
+        frame.render_widget(Paragraph::new(lines), inner);
     }
 }
 
@@ -259,10 +297,10 @@ impl TabView for EvolutionTab {
             return;
         }
 
-        let chunks = Layout::vertical([Constraint::Min(6), Constraint::Length(2)]).split(area);
+        let chunks = Layout::horizontal([Constraint::Min(20), Constraint::Length(20)]).split(area);
 
         self.render_waveform(frame, chunks[0]);
-        self.render_summary(frame, chunks[1]);
+        self.render_panel(frame, chunks[1]);
     }
 
     fn handle_key(&mut self, key: KeyEvent, _ctx: &mut AppContext) -> ScreenAction {
