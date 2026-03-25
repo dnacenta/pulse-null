@@ -5,7 +5,7 @@ use axum::http::StatusCode;
 use axum::Json;
 use serde::{Deserialize, Serialize};
 
-use crate::events::EntityEvent;
+use crate::events::{ConversationTrust, EntityEvent, InteractionSource};
 use crate::server::trust::TrustLevel;
 use crate::server::{injection, AppState};
 use crate::session_store::SessionStore;
@@ -316,7 +316,7 @@ pub async fn chat(
     }
 }
 
-/// Emit a PostConversation event (fire-and-forget).
+/// Emit a PostInteraction event for chat conversations (fire-and-forget).
 fn emit_post_conversation(
     state: &Arc<AppState>,
     channel: &str,
@@ -331,8 +331,11 @@ fn emit_post_conversation(
         response_text.to_string()
     };
 
-    state.event_bus.emit(EntityEvent::PostConversation {
-        channel: channel.to_string(),
+    state.event_bus.emit(EntityEvent::PostInteraction {
+        source: InteractionSource::Chat {
+            channel: channel.to_string(),
+        },
+        trust: ConversationTrust::Owner,
         summary,
         input_tokens,
         output_tokens,
