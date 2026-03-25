@@ -186,13 +186,29 @@ pub async fn run(
     // Archive session
     if let (Some(rd), Some(cfg)) = (root_dir, config) {
         if let Some(ref main) = main_screen {
-            crate::session::end_session(
+            if let Some(archive_path) = crate::session::end_session(
                 rd,
                 &cfg.entity.name,
                 &main.chat.conversation,
                 "tui-v2",
                 "session-end",
-            );
+            ) {
+                if cfg.graph.enabled && cfg.graph.auto_ingest {
+                    let root = rd.to_path_buf();
+                    tokio::task::spawn_blocking(move || {
+                        let rt = match tokio::runtime::Runtime::new() {
+                            Ok(rt) => rt,
+                            Err(e) => {
+                                tracing::warn!("graph ingest: failed to create runtime: {}", e);
+                                return;
+                            }
+                        };
+                        rt.block_on(async {
+                            crate::session::graph_ingest_archive(&root, &archive_path, None).await;
+                        });
+                    });
+                }
+            }
         }
     }
 
@@ -276,13 +292,29 @@ pub async fn run_chat(
     )?;
     let _ = std::panic::take_hook();
 
-    crate::session::end_session(
+    if let Some(archive_path) = crate::session::end_session(
         root_dir,
         &config.entity.name,
         &main.chat.conversation,
         "tui-v2",
         "session-end",
-    );
+    ) {
+        if config.graph.enabled && config.graph.auto_ingest {
+            let root = root_dir.to_path_buf();
+            tokio::task::spawn_blocking(move || {
+                let rt = match tokio::runtime::Runtime::new() {
+                    Ok(rt) => rt,
+                    Err(e) => {
+                        tracing::warn!("graph ingest: failed to create runtime: {}", e);
+                        return;
+                    }
+                };
+                rt.block_on(async {
+                    crate::session::graph_ingest_archive(&root, &archive_path, None).await;
+                });
+            });
+        }
+    }
 
     Ok(())
 }
