@@ -254,10 +254,10 @@ impl EvolutionTab {
                     Span::styled(format!("{:.2}", value), Style::default().fg(*color)),
                     Span::styled(trend_str, Style::default().fg(trend_color)),
                 ]));
+                lines.push(Line::from(""));
             }
 
             // Meta stats
-            lines.push(Line::from(""));
             lines.push(Line::from(vec![
                 Span::styled("  signals ", Style::default().fg(COLOR_DIM)),
                 Span::styled(
