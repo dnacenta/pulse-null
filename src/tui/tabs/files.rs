@@ -480,36 +480,75 @@ pub fn push_bordered_section<'a>(
     ]);
     lines.push(top);
 
-    // Content lines: │ text │
+    // Content lines: │ text │ (with word-wrapping for long lines)
     let inner_width = width.saturating_sub(2);
     for line in content {
-        let mut spans = vec![Span::styled("│", border_style)];
         let text_len: usize = line.spans.iter().map(|s| s.content.len()).sum();
         if text_len <= inner_width {
+            // Fits in one row
+            let mut spans = vec![Span::styled("│", border_style)];
             spans.extend(line.spans.iter().cloned());
             let pad = inner_width.saturating_sub(text_len);
             if pad > 0 {
                 spans.push(Span::raw(" ".repeat(pad)));
             }
+            spans.push(Span::styled("│", border_style));
+            lines.push(Line::from(spans));
         } else {
-            let mut remaining = inner_width.saturating_sub(1);
+            // Wrap into multiple rows, preserving span styles
+            let mut rows: Vec<Vec<Span>> = Vec::new();
+            let mut current_row: Vec<Span> = Vec::new();
+            let mut row_len: usize = 0;
+
             for span in &line.spans {
-                if remaining == 0 {
-                    break;
-                }
-                if span.content.len() <= remaining {
-                    spans.push(span.clone());
-                    remaining -= span.content.len();
-                } else {
-                    let truncated: String = span.content.chars().take(remaining).collect();
-                    spans.push(Span::styled(truncated, span.style));
-                    remaining = 0;
+                let style = span.style;
+                let mut remaining = span.content.as_ref();
+
+                while !remaining.is_empty() {
+                    let available = inner_width.saturating_sub(row_len);
+                    if available == 0 {
+                        rows.push(std::mem::take(&mut current_row));
+                        row_len = 0;
+                        continue;
+                    }
+
+                    if remaining.len() <= available {
+                        current_row.push(Span::styled(remaining.to_string(), style));
+                        row_len += remaining.len();
+                        break;
+                    }
+
+                    // Find word boundary for break
+                    let break_at = remaining[..available]
+                        .rfind(' ')
+                        .map(|p| p + 1)
+                        .unwrap_or(available);
+
+                    let (chunk, rest) = remaining.split_at(break_at);
+                    if !chunk.is_empty() {
+                        current_row.push(Span::styled(chunk.to_string(), style));
+                    }
+                    remaining = rest;
+                    rows.push(std::mem::take(&mut current_row));
+                    row_len = 0;
                 }
             }
-            spans.push(Span::styled("\u{2026}", Style::default().fg(COLOR_DIM)));
+            if !current_row.is_empty() {
+                rows.push(current_row);
+            }
+
+            for row_spans in rows {
+                let mut spans = vec![Span::styled("│", border_style)];
+                let row_text_len: usize = row_spans.iter().map(|s| s.content.len()).sum();
+                spans.extend(row_spans);
+                let pad = inner_width.saturating_sub(row_text_len);
+                if pad > 0 {
+                    spans.push(Span::raw(" ".repeat(pad)));
+                }
+                spans.push(Span::styled("│", border_style));
+                lines.push(Line::from(spans));
+            }
         }
-        spans.push(Span::styled("│", border_style));
-        lines.push(Line::from(spans));
     }
 
     // Bottom border: ╰─────╯

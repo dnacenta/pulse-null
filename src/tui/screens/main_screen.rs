@@ -5,10 +5,10 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Paragraph};
 use ratatui::Frame;
 
-use super::{Screen, ScreenAction};
+use super::{EntityState, Screen, ScreenAction};
 use crate::tui::app::AppContext;
 use crate::tui::tabs::chat::{ChatAction, ChatTab};
-use crate::tui::tabs::comms::CommsTab;
+use crate::tui::tabs::comms::{CommsFooter, CommsTab};
 use crate::tui::tabs::entity::EntityTab;
 use crate::tui::tabs::evolution::EvolutionTab;
 use crate::tui::tabs::files::FilesTab;
@@ -137,6 +137,14 @@ impl Screen for MainScreen {
 
         if !self.fullscreen {
             // Header (logo + status + heartbeat)
+            // Use comms local state when on Comms tab with active conversation
+            let comms_state = self.comms.active_entity_state();
+            let header_state = if self.active_tab == Tab::Comms && comms_state != EntityState::Idle
+            {
+                &comms_state
+            } else {
+                &self.chat.state
+            };
             header::draw(
                 frame,
                 chunks[0],
@@ -144,7 +152,7 @@ impl Screen for MainScreen {
                 Some("HEALTHY"),
                 ctx.model_name.as_deref(),
                 &self.chat.pulse_data,
-                &self.chat.state,
+                header_state,
                 &self.chat.pulse_color,
             );
 
@@ -185,18 +193,60 @@ impl Screen for MainScreen {
                     Span::styled(" Tab ", hint_style_key),
                     Span::styled(" Next tab ", hint_style_desc),
                 ],
-                Tab::Comms => vec![
-                    Span::styled(" Enter ", hint_style_key),
-                    Span::styled(" Start  ", hint_style_desc),
-                    Span::styled(" \u{2191}\u{2193} ", hint_style_key),
-                    Span::styled(" Select  ", hint_style_desc),
-                    Span::styled(" \u{2190}\u{2192} ", hint_style_key),
-                    Span::styled(" Mode  ", hint_style_desc),
-                    Span::styled(" r ", hint_style_key),
-                    Span::styled(" Refresh  ", hint_style_desc),
-                    Span::styled(" p ", hint_style_key),
-                    Span::styled(" Peers ", hint_style_desc),
-                ],
+                Tab::Comms => match self.comms.footer_context() {
+                    CommsFooter::Setup => vec![
+                        Span::styled(" Enter ", hint_style_key),
+                        Span::styled(" Start  ", hint_style_desc),
+                        Span::styled(" \u{2191}\u{2193} ", hint_style_key),
+                        Span::styled(" Select  ", hint_style_desc),
+                        Span::styled(" \u{2190}\u{2192} ", hint_style_key),
+                        Span::styled(" Mode  ", hint_style_desc),
+                        Span::styled(" r ", hint_style_key),
+                        Span::styled(" Refresh  ", hint_style_desc),
+                        Span::styled(" p ", hint_style_key),
+                        Span::styled(" Peers ", hint_style_desc),
+                    ],
+                    CommsFooter::Conversation => vec![
+                        Span::styled(" Space ", hint_style_key),
+                        Span::styled(" Pause  ", hint_style_desc),
+                        Span::styled(" Esc ", hint_style_key),
+                        Span::styled(" Stop  ", hint_style_desc),
+                        Span::styled(" Tab ", hint_style_key),
+                        Span::styled(" Next tab ", hint_style_desc),
+                    ],
+                    CommsFooter::Finished => vec![
+                        Span::styled(" Esc ", hint_style_key),
+                        Span::styled(" Back  ", hint_style_desc),
+                        Span::styled(" Tab ", hint_style_key),
+                        Span::styled(" Next tab ", hint_style_desc),
+                    ],
+                    CommsFooter::MgmtList => vec![
+                        Span::styled(" a ", hint_style_key),
+                        Span::styled(" Add  ", hint_style_desc),
+                        Span::styled(" e ", hint_style_key),
+                        Span::styled(" Edit  ", hint_style_desc),
+                        Span::styled(" d ", hint_style_key),
+                        Span::styled(" Delete  ", hint_style_desc),
+                        Span::styled(" r ", hint_style_key),
+                        Span::styled(" Refresh  ", hint_style_desc),
+                        Span::styled(" Esc ", hint_style_key),
+                        Span::styled(" Back ", hint_style_desc),
+                    ],
+                    CommsFooter::MgmtForm => vec![
+                        Span::styled(" Tab ", hint_style_key),
+                        Span::styled(" Next field  ", hint_style_desc),
+                        Span::styled(" Enter ", hint_style_key),
+                        Span::styled(" Save  ", hint_style_desc),
+                        Span::styled(" Esc ", hint_style_key),
+                        Span::styled(" Cancel ", hint_style_desc),
+                    ],
+                    CommsFooter::MgmtDelete => vec![
+                        Span::styled(" Enter ", hint_style_key),
+                        Span::styled(" Confirm  ", hint_style_desc),
+                        Span::styled(" Esc ", hint_style_key),
+                        Span::styled(" Cancel ", hint_style_desc),
+                    ],
+                },
                 Tab::Files => vec![
                     Span::styled(" \u{2191}\u{2193} ", hint_style_key),
                     Span::styled(" Navigate  ", hint_style_desc),
@@ -207,7 +257,32 @@ impl Screen for MainScreen {
                     Span::styled(" S+\u{2191}\u{2193} ", hint_style_key),
                     Span::styled(" Scroll ", hint_style_desc),
                 ],
-                Tab::Entity | Tab::Evolution => vec![
+                Tab::Entity => {
+                    if self.entity.in_schedule_view() {
+                        vec![
+                            Span::styled(" ↑↓ ", hint_style_key),
+                            Span::styled(" Select  ", hint_style_desc),
+                            Span::styled(" e ", hint_style_key),
+                            Span::styled(" Toggle  ", hint_style_desc),
+                            Span::styled(" d ", hint_style_key),
+                            Span::styled(" Delete  ", hint_style_desc),
+                            Span::styled(" Esc ", hint_style_key),
+                            Span::styled(" Back ", hint_style_desc),
+                        ]
+                    } else {
+                        vec![
+                            Span::styled(" r ", hint_style_key),
+                            Span::styled(" Refresh  ", hint_style_desc),
+                            Span::styled(" s ", hint_style_key),
+                            Span::styled(" Schedule  ", hint_style_desc),
+                            Span::styled(" Tab ", hint_style_key),
+                            Span::styled(" Next tab  ", hint_style_desc),
+                            Span::styled(" ? ", hint_style_key),
+                            Span::styled(" Help ", hint_style_desc),
+                        ]
+                    }
+                }
+                Tab::Evolution => vec![
                     Span::styled(" r ", hint_style_key),
                     Span::styled(" Refresh  ", hint_style_desc),
                     Span::styled(" Tab ", hint_style_key),
