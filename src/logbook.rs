@@ -67,3 +67,43 @@ pub fn rotate_if_needed(root_dir: &Path, logbook_path: &Path) {
         );
     }
 }
+
+/// Write an automatic LOGBOOK entry when a session ends.
+pub fn log_session_end(
+    root_dir: &Path,
+    channel: &str,
+    message_count: usize,
+    archive_path: Option<&Path>,
+) {
+    let logbook_path = root_dir.join("journal/LOGBOOK.md");
+    rotate_if_needed(root_dir, &logbook_path);
+
+    let now = Utc::now();
+    let archive_note = match archive_path {
+        Some(p) => {
+            let name = p.file_name().and_then(|n| n.to_str()).unwrap_or("unknown");
+            format!("Archived to {}.", name)
+        }
+        None => "No archive created.".to_string(),
+    };
+
+    let entry = format!(
+        "\n### {} — Session end ({}, {} messages)\n\n{}\n",
+        now.format("%Y-%m-%d %H:%M UTC"),
+        channel,
+        message_count,
+        archive_note,
+    );
+
+    if let Err(e) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&logbook_path)
+        .and_then(|mut f| {
+            use std::io::Write;
+            f.write_all(entry.as_bytes())
+        })
+    {
+        tracing::error!("Failed to write session end to LOGBOOK: {}", e);
+    }
+}

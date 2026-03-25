@@ -187,7 +187,25 @@ pub async fn run(
     }
 
     // Archive full conversation + write EPHEMERAL summary
-    crate::session::end_session(root_dir, entity_name, &conversation, "repl", "session-end");
+    if let Some(archive_path) =
+        crate::session::end_session(root_dir, entity_name, &conversation, "repl", "session-end")
+    {
+        if config.graph.enabled && config.graph.auto_ingest {
+            let root = root_dir.to_path_buf();
+            tokio::task::spawn_blocking(move || {
+                let rt = match tokio::runtime::Runtime::new() {
+                    Ok(rt) => rt,
+                    Err(e) => {
+                        tracing::warn!("graph ingest: failed to create runtime: {}", e);
+                        return;
+                    }
+                };
+                rt.block_on(async {
+                    crate::session::graph_ingest_archive(&root, &archive_path, None).await;
+                });
+            });
+        }
+    }
 
     Ok(())
 }

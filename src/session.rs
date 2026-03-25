@@ -233,6 +233,14 @@ pub fn end_session(
     // Path 2: Write lightweight EPHEMERAL summary
     write_ephemeral_summary(root_dir, entity_name, conversation);
 
+    // Path 3: Automatic LOGBOOK entry
+    crate::logbook::log_session_end(
+        root_dir,
+        channel,
+        conversation.len(),
+        archive_path.as_deref(),
+    );
+
     archive_path
 }
 
