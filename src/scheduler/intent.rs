@@ -602,6 +602,17 @@ async fn execute_intent(
     // Log to LOGBOOK.md
     log_intent_execution(&root_dir, intent, &parsed.clean_content);
 
+    // Write full intent output for visibility
+    crate::logbook::write_task_output(
+        &root_dir,
+        &intent.id,
+        &intent.description,
+        &parsed.clean_content,
+        result.total_input_tokens,
+        result.total_output_tokens,
+        result.tool_rounds_used,
+    );
+
     // Record outcome for caliber-echo
     if let Some(ref tracker) = state.outcome_tracker {
         let outcome = tracker.build_outcome(
