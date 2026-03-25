@@ -18,7 +18,7 @@ use crate::peer::{self, PeerClient};
 use crate::streaming::StreamingProvider;
 use crate::tui::app::AppContext;
 use crate::tui::screens::{EntityState, ScreenAction};
-use crate::tui::tabs::entity::push_bordered_section;
+use crate::tui::tabs::files::push_bordered_section;
 use crate::tui::theme::*;
 use crate::tui::widgets::pulse::{self, PulseColorTransition};
 
@@ -885,7 +885,7 @@ impl CommsTab {
                 ]));
             }
         }
-        push_bordered_section(&mut lines, "phone book", NORD7, &table_lines, inner_w);
+        push_bordered_section(&mut lines, "known peers", NORD7, &table_lines, inner_w);
 
         // ── Details ──
         if let Some(peer) = self.peers.get(self.mgmt_selected) {
@@ -1141,7 +1141,7 @@ impl CommsTab {
                         .fg(COLOR_TEXT_BRIGHT)
                         .add_modifier(Modifier::BOLD),
                 ),
-                Span::styled(" from phone book?", Style::default().fg(COLOR_TEXT)),
+                Span::styled(" from known peers?", Style::default().fg(COLOR_TEXT)),
             ]),
             Line::from(""),
             Line::from(vec![
@@ -1551,6 +1551,14 @@ impl TabView for CommsTab {
             CommsState::Active { .. } | CommsState::Connecting | CommsState::Finished
         ) {
             self.tick_pulse();
+        }
+    }
+
+    fn is_capturing_input(&self) -> bool {
+        match self.state {
+            CommsState::PeerMgmt => self.mgmt_view == MgmtView::Form,
+            CommsState::Setup => self.topic_editing,
+            _ => false,
         }
     }
 }

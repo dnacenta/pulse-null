@@ -141,7 +141,7 @@ pub async fn run(
                     if current_screen == AppScreen::Main {
                         if let Some(ref mut main) = main_screen {
                             if main.active_tab == crate::tui::tabs::Tab::Chat {
-                                main.chat.textarea.insert_str(&text);
+                                main.chat.insert_paste_text(&text);
                             }
                         }
                     }
@@ -255,7 +255,7 @@ pub async fn run_chat(
                     }
                 } else if let Ok(Event::Paste(text)) = event {
                     if main.active_tab == crate::tui::tabs::Tab::Chat {
-                        main.chat.textarea.insert_str(&text);
+                        main.chat.insert_paste_text(&text);
                     }
                 } else if let Ok(Event::Mouse(mouse)) = event {
                     handle_mouse(mouse, &mut main);
@@ -292,14 +292,14 @@ fn handle_mouse(mouse: crossterm::event::MouseEvent, main: &mut MainScreen) {
     match mouse.kind {
         MouseEventKind::ScrollUp => match main.active_tab {
             tabs::Tab::Chat => main.chat.scroll_up(3),
-            tabs::Tab::Entity => main.entity.scroll_up(3),
+            tabs::Tab::Files => main.files.scroll_up(3),
             tabs::Tab::Evolution => main.evolution.scroll_up(3),
             tabs::Tab::Comms => main.comms.scroll_up(3),
             _ => {}
         },
         MouseEventKind::ScrollDown => match main.active_tab {
             tabs::Tab::Chat => main.chat.scroll_down(3),
-            tabs::Tab::Entity => main.entity.scroll_down(3),
+            tabs::Tab::Files => main.files.scroll_down(3),
             tabs::Tab::Evolution => main.evolution.scroll_down(3),
             tabs::Tab::Comms => main.comms.scroll_down(3),
             _ => {}
