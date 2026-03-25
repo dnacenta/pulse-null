@@ -1,6 +1,6 @@
 use std::path::Path;
 
-use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use crossterm::event::{KeyCode, KeyEvent};
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::Style;
 use ratatui::symbols::Marker;
@@ -12,257 +12,321 @@ use ratatui::Frame;
 use crate::tui::app::AppContext;
 use crate::tui::screens::ScreenAction;
 use crate::tui::theme::*;
+use crate::vigil::runtime::{self as vigil, CognitiveStatus, Trend};
 
 use super::TabView;
 
-// ─── Data ───
-
-#[derive(Default, serde::Deserialize)]
-struct SignalSnapshot {
-    #[serde(default)]
-    #[allow(dead_code)]
-    timestamp: String,
-    #[serde(default)]
-    signals: SignalValues,
-}
-
-#[derive(Default, serde::Deserialize)]
-struct SignalValues {
-    vocabulary_diversity: Option<f64>,
-    question_generation: Option<f64>,
-    thought_lifecycle: Option<f64>,
-    evidence_grounding: Option<f64>,
-}
-
-struct SignalChart {
-    label: &'static str,
-    color: ratatui::style::Color,
-    data: Vec<f64>,
-}
-
-// ─── Tab ───
+// ─── Evolution Tab (Living Growth Visualization) ───
 
 pub struct EvolutionTab {
-    charts: Vec<SignalChart>,
+    // Signal values (0.0-1.0) driving waveform layers
+    vocabulary: f64,
+    curiosity: f64,
+    grounding: f64,
+    lifecycle: f64,
+
+    // Trend arrows for summary strip
+    vocab_trend: Option<Trend>,
+    curiosity_trend: Option<Trend>,
+    grounding_trend: Option<Trend>,
+    lifecycle_trend: Option<Trend>,
+
+    // Meta
+    status: Option<CognitiveStatus>,
+    signal_count: usize,
+    session_count: usize,
+    sufficient_data: bool,
+
+    // Animation
+    tick: u64,
     loaded: bool,
-    scroll: u16,
 }
 
 impl EvolutionTab {
     pub fn new() -> Self {
         Self {
-            charts: Vec::new(),
+            vocabulary: 0.0,
+            curiosity: 0.0,
+            grounding: 0.0,
+            lifecycle: 0.0,
+            vocab_trend: None,
+            curiosity_trend: None,
+            grounding_trend: None,
+            lifecycle_trend: None,
+            status: None,
+            signal_count: 0,
+            session_count: 0,
+            sufficient_data: false,
+            tick: 0,
             loaded: false,
-            scroll: 0,
         }
     }
 
-    pub fn scroll_up(&mut self, amount: u16) {
-        self.scroll = self.scroll.saturating_add(amount);
-    }
+    pub fn scroll_up(&mut self, _amount: u16) {}
+    pub fn scroll_down(&mut self, _amount: u16) {}
 
-    pub fn scroll_down(&mut self, amount: u16) {
-        self.scroll = self.scroll.saturating_sub(amount);
-    }
-
-    fn load_signals(&mut self, root_dir: &Path) {
+    fn load_data(&mut self, root_dir: &Path) {
         self.loaded = true;
 
-        // Try monitoring/signals.json (init wizard path)
-        let signals_path = root_dir.join("monitoring/signals.json");
-        let content = match std::fs::read_to_string(&signals_path) {
-            Ok(c) => c,
-            Err(_) => return,
-        };
+        // Load raw signal frames
+        let frames = vigil::load_signals(root_dir);
+        self.signal_count = frames.len();
 
-        let snapshots: Vec<SignalSnapshot> = match serde_json::from_str(&content) {
-            Ok(s) => s,
-            Err(_) => return,
-        };
-
-        if snapshots.is_empty() {
-            return;
-        }
-
-        // Extract signal arrays
-        let vocab: Vec<f64> = snapshots
-            .iter()
-            .filter_map(|s| s.signals.vocabulary_diversity)
-            .collect();
-        let questions: Vec<f64> = snapshots
-            .iter()
-            .filter_map(|s| s.signals.question_generation)
-            .collect();
-        let lifecycle: Vec<f64> = snapshots
-            .iter()
-            .filter_map(|s| s.signals.thought_lifecycle)
-            .collect();
-        let grounding: Vec<f64> = snapshots
-            .iter()
-            .filter_map(|s| s.signals.evidence_grounding)
-            .collect();
-
-        self.charts = vec![
-            SignalChart {
-                label: "vocabulary",
-                color: NORD14,
-                data: vocab,
-            },
-            SignalChart {
-                label: "curiosity",
-                color: NORD13,
-                data: questions,
-            },
-            SignalChart {
-                label: "grounding",
-                color: NORD9,
-                data: grounding,
-            },
-            SignalChart {
-                label: "lifecycle",
-                color: NORD15,
-                data: lifecycle,
-            },
-        ];
-    }
-
-    fn signal_description(label: &str) -> &'static str {
-        match label {
-            "vocabulary" => "Lexical diversity in reflections. Tracks whether language stays fresh or becomes repetitive.",
-            "curiosity" => "Active question generation. Measures whether new questions are being asked across sessions.",
-            "grounding" => "Evidence-based reasoning. Checks if conclusions reference specific inputs and experiences.",
-            "lifecycle" => "Thought progression. Monitors whether ideas develop, graduate, or stagnate over time.",
-            _ => "Signal data not yet available.",
-        }
-    }
-
-    fn draw_signal_chart(frame: &mut Frame, area: Rect, chart: &SignalChart) {
-        if chart.data.is_empty() {
-            let block = Block::bordered()
-                .border_type(BorderType::Rounded)
-                .border_style(Style::default().fg(COLOR_BORDER))
-                .title(Span::styled(
-                    format!(" {} ", chart.label),
-                    Style::default().fg(chart.color),
-                ));
-            let inner = block.inner(area);
-            frame.render_widget(block, area);
-
-            let desc = Self::signal_description(chart.label);
-            let lines = vec![
-                Line::from(""),
-                Line::styled(format!("  {}", desc), Style::default().fg(COLOR_DIM)),
-                Line::from(""),
-                Line::styled(
-                    "  Populates after vigil-echo collects signals.",
-                    Style::default().fg(COLOR_DIM),
-                ),
-            ];
-            frame.render_widget(
-                Paragraph::new(lines).wrap(ratatui::widgets::Wrap { trim: false }),
-                inner,
+        if !frames.is_empty() {
+            // Use average of last 5 frames for waveform parameters
+            let window = &frames[frames.len().saturating_sub(5)..];
+            self.vocabulary = avg_f64(window.iter().map(|f| f.vocabulary_diversity));
+            self.curiosity = normalize_count(
+                window.iter().map(|f| f.question_count).sum::<usize>() / window.len(),
+                10,
             );
+            self.grounding = normalize_count(
+                window.iter().map(|f| f.evidence_references).sum::<usize>() / window.len(),
+                10,
+            );
+            self.lifecycle = if window.iter().any(|f| f.thought_progress) {
+                0.7
+            } else {
+                0.2
+            };
+
+            // Count unique session/task IDs
+            let mut task_ids: Vec<&str> = frames.iter().map(|f| f.task_id.as_str()).collect();
+            task_ids.sort();
+            task_ids.dedup();
+            self.session_count = task_ids.len();
+        }
+
+        // Load cognitive health for trends and status
+        let health = vigil::assess(root_dir, 10, 3);
+        self.status = Some(health.status);
+        self.sufficient_data = health.sufficient_data;
+        if health.sufficient_data {
+            self.vocab_trend = Some(health.vocabulary_trend);
+            self.curiosity_trend = Some(health.question_trend);
+            self.grounding_trend = Some(health.evidence_trend);
+            self.lifecycle_trend = Some(health.progress_trend);
+        }
+    }
+
+    fn render_waveform(&self, frame: &mut Frame, area: Rect) {
+        let block = Block::bordered()
+            .border_type(BorderType::Rounded)
+            .border_style(Style::default().fg(COLOR_BORDER))
+            .title(Span::styled(" evolution ", Style::default().fg(NORD15)));
+        let inner = block.inner(area);
+        frame.render_widget(block, area);
+
+        if inner.width < 4 || inner.height < 2 {
             return;
         }
 
-        let width = area.width as f64 * 2.0;
-        let height = area.height as f64 * 4.0;
-        let color = chart.color;
-        let data = chart.data.clone();
+        let w = inner.width as f64 * 2.0;
+        let h = inner.height as f64 * 4.0;
+        let center = h / 2.0;
+        let tick = self.tick as f64;
+
+        let vocab = self.vocabulary;
+        let curiosity = self.curiosity;
+        let grounding = self.grounding;
+        let lifecycle = self.lifecycle;
+        let has_data = self.signal_count > 0;
+
         let canvas = Canvas::default()
-            .block(
-                Block::bordered()
-                    .border_type(BorderType::Rounded)
-                    .border_style(Style::default().fg(COLOR_BORDER))
-                    .title(Span::styled(
-                        format!(" {} ", chart.label),
-                        Style::default().fg(chart.color),
-                    )),
-            )
             .marker(Marker::Braille)
-            .x_bounds([0.0, width])
-            .y_bounds([0.0, height])
+            .x_bounds([0.0, w])
+            .y_bounds([0.0, h])
             .paint(move |ctx| {
-                if data.len() < 2 {
+                let t = tick * 0.08;
+                let points = w as usize;
+
+                if !has_data {
+                    // Nascent: single gentle sine, muted
+                    draw_wave(ctx, points, w, center, NORD3, |x| {
+                        (x * 0.015 + t * 0.3).sin() * h * 0.08
+                    });
                     return;
                 }
-                let x_scale = width / (data.len() - 1) as f64;
-                let margin = height * 0.1;
-                let usable = height - margin * 2.0;
 
-                for i in 1..data.len() {
-                    ctx.draw(&CanvasLine {
-                        x1: (i - 1) as f64 * x_scale,
-                        y1: margin + data[i - 1] * usable,
-                        x2: i as f64 * x_scale,
-                        y2: margin + data[i] * usable,
-                        color,
+                let amplitude_scale = 0.4 + grounding * 0.4;
+
+                // Layer 1: Base wave (always present)
+                let base_color = if grounding > 0.5 { NORD8 } else { NORD7 };
+                draw_wave(ctx, points, w, center, base_color, |x| {
+                    (x * 0.02 + t * 0.3).sin() * h * 0.12 * amplitude_scale
+                });
+
+                // Layer 2: Vocabulary — texture harmonics
+                if vocab > 0.1 {
+                    draw_wave(ctx, points, w, center, NORD14, |x| {
+                        let harmonic1 = (x * 0.05 + t * 0.5).sin() * vocab * 0.08;
+                        let harmonic2 = (x * 0.11 + t * 0.7).sin() * vocab * 0.04;
+                        (harmonic1 + harmonic2) * h * amplitude_scale
+                    });
+                }
+
+                // Layer 3: Curiosity — frequency modulation
+                if curiosity > 0.1 {
+                    let freq = 0.03 * (1.0 + curiosity * 1.5);
+                    draw_wave(ctx, points, w, center, NORD13, |x| {
+                        (x * freq + t * 0.8).sin() * h * 0.06 * curiosity * amplitude_scale
+                    });
+                }
+
+                // Layer 4: Lifecycle — interference patterns
+                if lifecycle > 0.1 {
+                    draw_wave(ctx, points, w, center, NORD15, |x| {
+                        let beat = (x * 0.025 + t * 0.4).cos();
+                        let carrier = (x * 0.008 + t * 0.15).sin();
+                        beat * carrier * h * 0.05 * lifecycle * amplitude_scale
                     });
                 }
             });
 
-        frame.render_widget(canvas, area);
+        frame.render_widget(canvas, inner);
+    }
+
+    fn render_summary(&self, frame: &mut Frame, area: Rect) {
+        let mut spans: Vec<Span> = Vec::new();
+        spans.push(Span::raw("  "));
+
+        if !self.sufficient_data && self.signal_count == 0 {
+            spans.push(Span::styled("awakening...", Style::default().fg(COLOR_DIM)));
+        } else {
+            let signals: [(&str, f64, &Option<Trend>, ratatui::style::Color); 4] = [
+                ("vocabulary", self.vocabulary, &self.vocab_trend, NORD14),
+                ("curiosity", self.curiosity, &self.curiosity_trend, NORD13),
+                ("grounding", self.grounding, &self.grounding_trend, NORD9),
+                ("lifecycle", self.lifecycle, &self.lifecycle_trend, NORD15),
+            ];
+
+            for (i, (label, value, trend, color)) in signals.iter().enumerate() {
+                if i > 0 {
+                    spans.push(Span::styled("    ", Style::default()));
+                }
+                spans.push(Span::styled(
+                    format!("{} ", label),
+                    Style::default().fg(COLOR_DIM),
+                ));
+                spans.push(Span::styled(
+                    format!("{:.2}", value),
+                    Style::default().fg(*color),
+                ));
+                if let Some(t) = trend {
+                    let (arrow, arrow_color) = match t {
+                        Trend::Improving => (" \u{2197}", NORD14),
+                        Trend::Stable => (" \u{2192}", NORD4),
+                        Trend::Declining => (" \u{2198}", NORD11),
+                    };
+                    spans.push(Span::styled(arrow, Style::default().fg(arrow_color)));
+                }
+            }
+        }
+
+        let meta = format!(
+            "  signals: {}    sessions: {}    status: {}",
+            self.signal_count,
+            self.session_count,
+            self.status
+                .as_ref()
+                .map(|s| s.to_string())
+                .unwrap_or_else(|| "\u{2014}".to_string()),
+        );
+
+        let line1 = Line::from(spans);
+        let line2 = Line::from(vec![Span::styled(meta, Style::default().fg(COLOR_DIM))]);
+
+        frame.render_widget(Paragraph::new(vec![line1, line2]), area);
     }
 }
 
 impl TabView for EvolutionTab {
     fn render(&self, frame: &mut Frame, area: Rect, _ctx: &AppContext) {
-        if self.charts.is_empty() {
+        if !self.loaded {
             let block = Block::bordered()
                 .border_type(BorderType::Rounded)
                 .border_style(Style::default().fg(COLOR_BORDER))
                 .title(Span::styled(" evolution ", Style::default().fg(NORD15)));
             let inner = block.inner(area);
             frame.render_widget(block, area);
-
-            let msg = if self.loaded {
-                "  No signal data yet. Vigil collects signals after conversations."
-            } else {
-                "  Loading signal data..."
-            };
             frame.render_widget(
-                Paragraph::new(Line::styled(msg, Style::default().fg(COLOR_DIM))),
+                Paragraph::new(Line::styled(
+                    "  Loading signal data...",
+                    Style::default().fg(COLOR_DIM),
+                )),
                 inner,
             );
             return;
         }
 
-        // Split area into chart rows
-        let chart_count = self.charts.len() as u16;
-        let constraints: Vec<Constraint> = self
-            .charts
-            .iter()
-            .map(|_| Constraint::Ratio(1, chart_count as u32))
-            .collect();
-        let chunks = Layout::vertical(constraints).split(area);
+        let chunks = Layout::vertical([Constraint::Min(6), Constraint::Length(2)]).split(area);
 
-        for (i, chart) in self.charts.iter().enumerate() {
-            Self::draw_signal_chart(frame, chunks[i], chart);
-        }
+        self.render_waveform(frame, chunks[0]);
+        self.render_summary(frame, chunks[1]);
     }
 
     fn handle_key(&mut self, key: KeyEvent, _ctx: &mut AppContext) -> ScreenAction {
-        match key.code {
-            KeyCode::Up if key.modifiers.contains(KeyModifiers::SHIFT) => {
-                self.scroll = self.scroll.saturating_add(3)
-            }
-            KeyCode::Down if key.modifiers.contains(KeyModifiers::SHIFT) => {
-                self.scroll = self.scroll.saturating_sub(3)
-            }
-            KeyCode::PageUp => self.scroll = self.scroll.saturating_add(5),
-            KeyCode::PageDown => self.scroll = self.scroll.saturating_sub(5),
-            _ => {}
+        if let KeyCode::Char('r') = key.code {
+            self.loaded = false;
         }
         ScreenAction::None
     }
 
     fn handle_tick(&mut self, ctx: &mut AppContext) {
+        self.tick += 1;
         if !self.loaded {
             if let Some(ref root) = ctx.root_dir {
-                self.load_signals(root);
+                self.load_data(root);
             } else {
                 self.loaded = true;
             }
         }
     }
+}
+
+// ─── Helpers ───
+
+fn draw_wave<F>(
+    ctx: &mut ratatui::widgets::canvas::Context<'_>,
+    points: usize,
+    width: f64,
+    center: f64,
+    color: ratatui::style::Color,
+    f: F,
+) where
+    F: Fn(f64) -> f64,
+{
+    if points < 2 {
+        return;
+    }
+    let step = width / points as f64;
+    for i in 1..points {
+        let x0 = (i - 1) as f64 * step;
+        let x1 = i as f64 * step;
+        ctx.draw(&CanvasLine {
+            x1: x0,
+            y1: center + f(x0),
+            x2: x1,
+            y2: center + f(x1),
+            color,
+        });
+    }
+}
+
+fn avg_f64(iter: impl Iterator<Item = f64>) -> f64 {
+    let mut sum = 0.0;
+    let mut count = 0;
+    for v in iter {
+        sum += v;
+        count += 1;
+    }
+    if count > 0 {
+        sum / count as f64
+    } else {
+        0.0
+    }
+}
+
+fn normalize_count(value: usize, max: usize) -> f64 {
+    (value as f64 / max as f64).min(1.0)
 }

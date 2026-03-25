@@ -9,10 +9,9 @@ use super::{Screen, ScreenAction};
 use crate::tui::app::AppContext;
 use crate::tui::tabs::chat::{ChatAction, ChatTab};
 use crate::tui::tabs::comms::CommsTab;
-use crate::tui::tabs::dashboard::DashboardTab;
 use crate::tui::tabs::entity::EntityTab;
 use crate::tui::tabs::evolution::EvolutionTab;
-use crate::tui::tabs::logs::LogsTab;
+use crate::tui::tabs::files::FilesTab;
 use crate::tui::tabs::{Tab, TabView};
 use crate::tui::theme::*;
 use crate::tui::widgets::header;
@@ -20,10 +19,9 @@ use crate::tui::widgets::header;
 pub struct MainScreen {
     pub active_tab: Tab,
     pub chat: ChatTab,
-    pub dashboard: DashboardTab,
-    pub evolution: EvolutionTab,
     pub entity: EntityTab,
-    pub logs: LogsTab,
+    pub evolution: EvolutionTab,
+    pub files: FilesTab,
     pub comms: CommsTab,
     pub fullscreen: bool,
     pub show_help: bool,
@@ -34,10 +32,9 @@ impl MainScreen {
         Self {
             active_tab: Tab::Chat,
             chat: ChatTab::new(entity_name, owner_alias),
-            dashboard: DashboardTab::new(),
-            evolution: EvolutionTab::new(),
             entity: EntityTab::new(),
-            logs: LogsTab::new(),
+            evolution: EvolutionTab::new(),
+            files: FilesTab::new(),
             comms: CommsTab::new(entity_name),
             fullscreen: false,
             show_help: false,
@@ -159,24 +156,17 @@ impl Screen for MainScreen {
         match self.active_tab {
             Tab::Chat => {
                 self.chat.draw_conversation(frame, chunks[content_idx]);
-                let input_idx = if self.fullscreen {
-                    content_idx + 1
-                } else {
-                    content_idx + 1
-                };
+                let input_idx = content_idx + 1;
                 frame.render_widget(&self.chat.textarea, chunks[input_idx]);
-            }
-            Tab::Dashboard => {
-                self.dashboard.render(frame, chunks[content_idx], ctx);
-            }
-            Tab::Evolution => {
-                self.evolution.render(frame, chunks[content_idx], ctx);
             }
             Tab::Entity => {
                 self.entity.render(frame, chunks[content_idx], ctx);
             }
-            Tab::Logs => {
-                self.logs.render(frame, chunks[content_idx], ctx);
+            Tab::Evolution => {
+                self.evolution.render(frame, chunks[content_idx], ctx);
+            }
+            Tab::Files => {
+                self.files.render(frame, chunks[content_idx], ctx);
             }
             Tab::Comms => {
                 self.comms.render(frame, chunks[content_idx], ctx);
@@ -211,13 +201,23 @@ impl Screen for MainScreen {
                     Span::styled(" p ", hint_style_key),
                     Span::styled(" Peers ", hint_style_desc),
                 ],
-                _ => vec![
+                Tab::Files => vec![
+                    Span::styled(" \u{2191}\u{2193} ", hint_style_key),
+                    Span::styled(" Navigate  ", hint_style_desc),
+                    Span::styled(" Enter ", hint_style_key),
+                    Span::styled(" Open  ", hint_style_desc),
+                    Span::styled(" Esc ", hint_style_key),
+                    Span::styled(" Back  ", hint_style_desc),
+                    Span::styled(" S+\u{2191}\u{2193} ", hint_style_key),
+                    Span::styled(" Scroll ", hint_style_desc),
+                ],
+                Tab::Entity | Tab::Evolution => vec![
+                    Span::styled(" r ", hint_style_key),
+                    Span::styled(" Refresh  ", hint_style_desc),
                     Span::styled(" Tab ", hint_style_key),
                     Span::styled(" Next tab  ", hint_style_desc),
-                    Span::styled(" S+\u{2191}\u{2193} ", hint_style_key),
-                    Span::styled(" Scroll  ", hint_style_desc),
-                    Span::styled(" q ", hint_style_key),
-                    Span::styled(" Quit ", hint_style_desc),
+                    Span::styled(" ? ", hint_style_key),
+                    Span::styled(" Help ", hint_style_desc),
                 ],
             };
             frame.render_widget(Paragraph::new(Line::from(hints)), chunks[footer_idx]);
@@ -247,8 +247,12 @@ impl Screen for MainScreen {
             return ScreenAction::None;
         }
 
-        // Global tab navigation (unless typing in chat)
-        let in_chat_input = self.active_tab == Tab::Chat;
+        // Global tab navigation (suppressed when any tab is capturing text input)
+        let capturing = match self.active_tab {
+            Tab::Chat => !self.chat.input_is_empty(),
+            Tab::Comms => self.comms.is_capturing_input(),
+            _ => false,
+        };
 
         // Tab/Shift+Tab always switches tabs
         if key.code == KeyCode::Tab && key.modifiers.contains(KeyModifiers::SHIFT) {
@@ -259,23 +263,20 @@ impl Screen for MainScreen {
             self.prev_tab();
             return ScreenAction::None;
         }
-        if key.code == KeyCode::Tab
-            && !key.modifiers.contains(KeyModifiers::SHIFT)
-            && (!in_chat_input || self.chat.input_is_empty())
-        {
+        if key.code == KeyCode::Tab && !key.modifiers.contains(KeyModifiers::SHIFT) && !capturing {
             self.next_tab();
             return ScreenAction::None;
         }
 
-        // Number keys for tab jumping (only when not typing)
-        if !in_chat_input || self.chat.input_is_empty() {
+        // Number keys for tab jumping (only when not capturing input)
+        if !capturing {
             match key.code {
                 KeyCode::Char('1') => {
                     self.active_tab = Tab::Chat;
                     return ScreenAction::None;
                 }
                 KeyCode::Char('2') => {
-                    self.active_tab = Tab::Dashboard;
+                    self.active_tab = Tab::Entity;
                     return ScreenAction::None;
                 }
                 KeyCode::Char('3') => {
@@ -283,14 +284,10 @@ impl Screen for MainScreen {
                     return ScreenAction::None;
                 }
                 KeyCode::Char('4') => {
-                    self.active_tab = Tab::Entity;
+                    self.active_tab = Tab::Files;
                     return ScreenAction::None;
                 }
                 KeyCode::Char('5') => {
-                    self.active_tab = Tab::Logs;
-                    return ScreenAction::None;
-                }
-                KeyCode::Char('6') => {
                     self.active_tab = Tab::Comms;
                     return ScreenAction::None;
                 }
@@ -319,10 +316,9 @@ impl Screen for MainScreen {
                 }
                 ScreenAction::None
             }
-            Tab::Dashboard => self.dashboard.handle_key(key, ctx),
-            Tab::Evolution => self.evolution.handle_key(key, ctx),
             Tab::Entity => self.entity.handle_key(key, ctx),
-            Tab::Logs => self.logs.handle_key(key, ctx),
+            Tab::Evolution => self.evolution.handle_key(key, ctx),
+            Tab::Files => self.files.handle_key(key, ctx),
             Tab::Comms => self.comms.handle_key(key, ctx),
         }
     }
@@ -340,7 +336,7 @@ impl Screen for MainScreen {
         // Tick all tabs (lazy loading on first tick)
         self.chat.tick();
         self.evolution.handle_tick(ctx);
-        self.entity.handle_tick(ctx);
+        self.files.handle_tick(ctx);
         self.comms.handle_tick(ctx);
     }
 }
@@ -349,7 +345,7 @@ impl Screen for MainScreen {
 
 fn draw_help_overlay(frame: &mut Frame, area: Rect) {
     let width = 50u16.min(area.width.saturating_sub(4));
-    let height = 20u16.min(area.height.saturating_sub(4));
+    let height = 30u16.min(area.height.saturating_sub(4));
     let x = (area.width.saturating_sub(width)) / 2;
     let y = (area.height.saturating_sub(height)) / 2;
     let popup = Rect::new(x, y, width, height);
@@ -369,20 +365,32 @@ fn draw_help_overlay(frame: &mut Frame, area: Rect) {
 
     let bindings = vec![
         ("Tab / Shift+Tab", "Switch tabs"),
-        ("1-6", "Jump to tab"),
+        ("1-5", "Jump to tab"),
         ("Ctrl+F", "Toggle fullscreen"),
         ("F1 / ?", "Toggle this help"),
         ("Ctrl+C / Esc", "Quit (chat empty)"),
         ("", ""),
-        ("── Chat ──", ""),
+        ("\u{2500}\u{2500} Chat \u{2500}\u{2500}", ""),
         ("Enter", "Send message"),
         ("Shift+Enter", "New line"),
-        ("Shift+Up/Down", "Scroll conversation"),
+        ("Shift+\u{2191}\u{2193}", "Scroll (1 line)"),
+        ("PgUp/PgDn", "Scroll (half page)"),
         ("", ""),
-        ("── Comms ──", ""),
+        ("\u{2500}\u{2500} Entity \u{2500}\u{2500}", ""),
+        ("r", "Refresh data"),
+        ("", ""),
+        ("\u{2500}\u{2500} Evolution \u{2500}\u{2500}", ""),
+        ("r", "Reload signals"),
+        ("", ""),
+        ("\u{2500}\u{2500} Files \u{2500}\u{2500}", ""),
+        ("\u{2191}\u{2193}", "Navigate files"),
+        ("Enter", "Open file"),
+        ("Esc", "Close reader"),
+        ("j/k", "Scroll reader"),
+        ("", ""),
+        ("\u{2500}\u{2500} Comms \u{2500}\u{2500}", ""),
         ("\u{2191}\u{2193} / \u{2190}\u{2192}", "Select peer / mode"),
         ("Enter", "Start conversation"),
-        ("Space", "Pause/resume"),
         ("p", "Peer management"),
     ];
 

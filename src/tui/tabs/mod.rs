@@ -1,9 +1,8 @@
 pub mod chat;
 pub mod comms;
-pub mod dashboard;
 pub mod entity;
 pub mod evolution;
-pub mod logs;
+pub mod files;
 
 use crossterm::event::KeyEvent;
 use ratatui::layout::Rect;
@@ -15,10 +14,9 @@ use super::screens::ScreenAction;
 #[derive(Clone, Debug, PartialEq)]
 pub enum Tab {
     Chat,
-    Dashboard,
-    Evolution,
     Entity,
-    Logs,
+    Evolution,
+    Files,
     Comms,
 }
 
@@ -26,22 +24,20 @@ impl Tab {
     pub fn index(&self) -> usize {
         match self {
             Tab::Chat => 0,
-            Tab::Dashboard => 1,
+            Tab::Entity => 1,
             Tab::Evolution => 2,
-            Tab::Entity => 3,
-            Tab::Logs => 4,
-            Tab::Comms => 5,
+            Tab::Files => 3,
+            Tab::Comms => 4,
         }
     }
 
     pub fn from_index(i: usize) -> Self {
         match i {
             0 => Tab::Chat,
-            1 => Tab::Dashboard,
+            1 => Tab::Entity,
             2 => Tab::Evolution,
-            3 => Tab::Entity,
-            4 => Tab::Logs,
-            5 => Tab::Comms,
+            3 => Tab::Files,
+            4 => Tab::Comms,
             _ => Tab::Chat,
         }
     }
@@ -49,19 +45,24 @@ impl Tab {
     pub fn label(&self) -> &str {
         match self {
             Tab::Chat => "chat",
-            Tab::Dashboard => "dashboard",
-            Tab::Evolution => "evolution",
             Tab::Entity => "entity",
-            Tab::Logs => "logs",
+            Tab::Evolution => "evolution",
+            Tab::Files => "files",
             Tab::Comms => "comms",
         }
     }
 
-    pub const COUNT: usize = 6;
+    pub const COUNT: usize = 5;
 }
 
 pub trait TabView {
     fn render(&self, frame: &mut Frame, area: Rect, ctx: &AppContext);
     fn handle_key(&mut self, key: KeyEvent, ctx: &mut AppContext) -> ScreenAction;
     fn handle_tick(&mut self, ctx: &mut AppContext);
+
+    /// Whether this tab is actively capturing text input (e.g. a form field is focused).
+    /// When true, global keybindings like number-key tab switching are suppressed.
+    fn is_capturing_input(&self) -> bool {
+        false
+    }
 }

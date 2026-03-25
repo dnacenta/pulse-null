@@ -67,6 +67,7 @@ pub struct ChatTab {
     pub ui_tx: mpsc::UnboundedSender<UiEvent>,
     pub ui_rx: mpsc::UnboundedReceiver<UiEvent>,
     pub pending_tokens: Option<(u32, u32)>,
+    pub has_new_content: bool,
 }
 
 impl ChatTab {
@@ -100,6 +101,7 @@ impl ChatTab {
             ui_tx,
             ui_rx,
             pending_tokens: None,
+            has_new_content: false,
         }
     }
 
@@ -147,11 +149,64 @@ impl ChatTab {
                 if l.is_empty() || inner_width == 0 {
                     1
                 } else {
-                    (l.len() + inner_width - 1) / inner_width
+                    l.len().div_ceil(inner_width)
                 }
             })
             .sum();
         (visual_lines as u16).clamp(1, MAX_INPUT_LINES) + 2 // +2 for borders
+    }
+
+    fn get_input_inner_width(&self) -> usize {
+        crossterm::terminal::size()
+            .map(|(w, _)| w.saturating_sub(6) as usize)
+            .unwrap_or(114)
+    }
+
+    fn visible_conversation_height(&self) -> u16 {
+        let term_height = crossterm::terminal::size().map(|(_, h)| h).unwrap_or(24);
+        let input_h = self.input_height();
+        // header(8) + tab_bar(3) + input + footer(1) + conv borders(2)
+        let overhead = 8 + 3 + input_h + 1 + 2;
+        term_height.saturating_sub(overhead).max(1)
+    }
+
+    pub fn insert_paste_text(&mut self, text: &str) {
+        let width = self.get_input_inner_width();
+        if width == 0 {
+            self.textarea.insert_str(text);
+            return;
+        }
+        let mut wrapped = String::new();
+        for (i, line) in text.lines().enumerate() {
+            if i > 0 {
+                wrapped.push('\n');
+            }
+            if line.len() <= width {
+                wrapped.push_str(line);
+            } else {
+                let mut remaining = line;
+                let mut first = true;
+                while remaining.len() > width {
+                    if !first {
+                        wrapped.push('\n');
+                    }
+                    first = false;
+                    let break_at = remaining[..width]
+                        .rfind(' ')
+                        .map(|p| p + 1)
+                        .unwrap_or(width);
+                    wrapped.push_str(&remaining[..break_at]);
+                    remaining = &remaining[break_at..];
+                }
+                if !remaining.is_empty() {
+                    if !first {
+                        wrapped.push('\n');
+                    }
+                    wrapped.push_str(remaining);
+                }
+            }
+        }
+        self.textarea.insert_str(&wrapped);
     }
 
     pub fn scroll_up(&mut self, amount: u16) {
@@ -163,6 +218,7 @@ impl ChatTab {
         self.scroll = self.scroll.saturating_sub(amount);
         if self.scroll == 0 {
             self.auto_scroll = true;
+            self.has_new_content = false;
         }
     }
 
@@ -181,6 +237,9 @@ impl ChatTab {
                 }
             }
             UiEvent::TextDelta(text) => {
+                if !self.auto_scroll {
+                    self.has_new_content = true;
+                }
                 if self.state != EntityState::Streaming {
                     self.pulse_color.transition_to(&EntityState::Streaming);
                     self.state = EntityState::Streaming;
@@ -222,10 +281,11 @@ impl ChatTab {
 
     pub fn handle_key_input(&mut self, key: KeyEvent, ctx: &mut AppContext) -> Option<ChatAction> {
         // Ctrl+D on empty input: quit
-        if key.code == KeyCode::Char('d') && key.modifiers.contains(KeyModifiers::CONTROL) {
-            if self.input_is_empty() {
-                return Some(ChatAction::Quit);
-            }
+        if key.code == KeyCode::Char('d')
+            && key.modifiers.contains(KeyModifiers::CONTROL)
+            && self.input_is_empty()
+        {
+            return Some(ChatAction::Quit);
         }
 
         // Ctrl+C: cancel or clear
@@ -262,27 +322,41 @@ impl ChatTab {
                 self.textarea.insert_newline();
                 None
             }
-            // Shift+Up/Down or PgUp/PgDn: scroll conversation
+            // Shift+Up/Down: fine-grained scroll (1 line)
             KeyCode::Up if key.modifiers.contains(KeyModifiers::SHIFT) => {
-                self.scroll_up(3);
+                self.scroll_up(1);
                 None
             }
             KeyCode::Down if key.modifiers.contains(KeyModifiers::SHIFT) => {
-                self.scroll_down(3);
+                self.scroll_down(1);
                 None
             }
+            // PageUp/PageDown: half viewport
             KeyCode::PageUp => {
-                self.scroll_up(10);
+                let half = self.visible_conversation_height() / 2;
+                self.scroll_up(half.max(1));
                 None
             }
             KeyCode::PageDown => {
-                self.scroll_down(10);
+                let half = self.visible_conversation_height() / 2;
+                self.scroll_down(half.max(1));
                 None
             }
             // Tab: don't pass to textarea (let parent handle tab switching)
             KeyCode::Tab | KeyCode::BackTab => None,
-            // Everything else: delegate to textarea
+            // Everything else: delegate to textarea (with auto-wrap)
             _ => {
+                if matches!(key.code, KeyCode::Char(_)) {
+                    let inner_width = self.get_input_inner_width();
+                    let (row, col) = self.textarea.cursor();
+                    let lines = self.textarea.lines();
+                    if row < lines.len()
+                        && col >= lines[row].len()
+                        && lines[row].len() >= inner_width
+                    {
+                        self.textarea.insert_newline();
+                    }
+                }
                 self.textarea.input(key);
                 None
             }
@@ -321,6 +395,7 @@ impl ChatTab {
             text: text.clone(),
         });
         self.auto_scroll = true;
+        self.has_new_content = false;
 
         self.conversation.push(Message {
             role: Role::User,
@@ -443,6 +518,19 @@ impl ChatTab {
 
         let paragraph = paragraph.scroll((scroll, 0));
         frame.render_widget(paragraph, inner);
+
+        // New-messages indicator when scrolled up
+        if self.has_new_content && !self.auto_scroll {
+            let label = " \u{2193} new messages ";
+            let label_w = label.len() as u16;
+            let ix = inner.x + inner.width.saturating_sub(label_w + 1);
+            let iy = inner.y + inner.height.saturating_sub(1);
+            let indicator_area = Rect::new(ix, iy, label_w, 1);
+            frame.render_widget(
+                Paragraph::new(Line::styled(label, Style::default().fg(NORD0).bg(NORD13))),
+                indicator_area,
+            );
+        }
     }
 }
 
