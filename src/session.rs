@@ -244,6 +244,56 @@ pub fn end_session(
     archive_path
 }
 
+/// Archive a comms (peer-to-peer) conversation transcript.
+/// Takes (entity_name, text) pairs and writes to the shared conversation archive.
+pub fn archive_comms_conversation(
+    root_dir: &Path,
+    messages: &[(String, String)],
+    local_entity: &str,
+    peer_entity: &str,
+) -> Result<PathBuf, String> {
+    if messages.is_empty() {
+        return Err("Nothing to archive (empty comms transcript)".to_string());
+    }
+
+    let conv_dir = conversations_dir(root_dir);
+    fs::create_dir_all(&conv_dir)
+        .map_err(|e| format!("Failed to create conversations archive dir: {e}"))?;
+
+    let next_num = highest_log_number(&conv_dir) + 1;
+    let now = Utc::now();
+    let date_full = now.format("%Y-%m-%dT%H:%M:%SZ").to_string();
+    let date_short = now.format("%Y-%m-%d").to_string();
+    let message_count = messages.len();
+
+    // Build markdown with entity names as headers
+    let mut md = String::new();
+    for (i, (entity, text)) in messages.iter().enumerate() {
+        if i > 0 {
+            md.push_str("\n---\n\n");
+        }
+        md.push_str(&format!("### {}\n\n{}\n", entity, text));
+    }
+
+    let content = format!(
+        "---\nlog: {next_num}\ndate: \"{date_full}\"\ntrigger: comms-end\nchannel: comms\nentity: \"{local_entity}\"\npeer: \"{peer_entity}\"\nmessage_count: {message_count}\n---\n\n# Conversation {next_num:03}\n\n{md}",
+    );
+
+    let log_path = conv_dir.join(format!("conversation-{next_num:03}.md"));
+    fs::write(&log_path, &content).map_err(|e| format!("Failed to write comms archive: {e}"))?;
+
+    append_index(
+        root_dir,
+        next_num,
+        &date_short,
+        "comms-end",
+        "comms",
+        message_count,
+    )?;
+
+    Ok(log_path)
+}
+
 /// Ingest an archived conversation into the knowledge graph (async, non-blocking).
 ///
 /// Reads the archive file and calls recall-echo's graph bridge.

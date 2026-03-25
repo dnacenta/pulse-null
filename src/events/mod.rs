@@ -2,13 +2,32 @@ pub mod listener;
 
 use tokio::sync::broadcast;
 
+/// Source of an interaction that feeds the identity pipeline.
+#[derive(Debug, Clone)]
+pub enum InteractionSource {
+    /// Direct conversation with the owner (chat, voice, discord).
+    Chat { channel: String },
+    /// Peer-to-peer conversation between entities (comms).
+    Comms { peer: String },
+}
+
+/// Trust level for an interaction — determines what follow-up actions are appropriate.
+#[derive(Debug, Clone)]
+pub enum ConversationTrust {
+    /// Conversation with D — full trust, any follow-up is allowed.
+    Owner,
+    /// Conversation with a known local peer (same server).
+    LocalPeer,
+}
+
 /// Internal entity events that can trigger autonomous actions.
 #[derive(Debug, Clone)]
 #[allow(dead_code)]
 pub enum EntityEvent {
-    /// Emitted after a chat conversation completes.
-    PostConversation {
-        channel: String,
+    /// Emitted after any meaningful interaction completes.
+    PostInteraction {
+        source: InteractionSource,
+        trust: ConversationTrust,
         summary: String,
         input_tokens: u32,
         output_tokens: u32,
@@ -36,7 +55,10 @@ impl EntityEvent {
     /// String key for cooldown/circuit breaker tracking.
     pub fn event_type(&self) -> String {
         match self {
-            EntityEvent::PostConversation { .. } => "post_conversation".into(),
+            EntityEvent::PostInteraction { source, .. } => match source {
+                InteractionSource::Chat { .. } => "post_conversation".into(),
+                InteractionSource::Comms { peer } => format!("post_comms_{}", peer),
+            },
             EntityEvent::PipelineAlert { document, .. } => format!("pipeline_alert_{}", document),
             EntityEvent::PipelineFrozen { .. } => "pipeline_frozen".into(),
             EntityEvent::CognitiveHealthChanged { .. } => "cognitive_decline".into(),
@@ -85,19 +107,20 @@ mod tests {
         let bus = EventBus::new(16);
         let mut rx = bus.subscribe();
 
-        bus.emit(EntityEvent::PipelineAlert {
-            document: "LEARNING".to_string(),
-            count: 8,
-            hard_limit: 8,
+        bus.emit(EntityEvent::PostInteraction {
+            source: InteractionSource::Chat {
+                channel: "discord".to_string(),
+            },
+            trust: ConversationTrust::Owner,
+            summary: "test".to_string(),
+            input_tokens: 100,
+            output_tokens: 200,
         });
 
         let event = rx.recv().await.unwrap();
         match event {
-            EntityEvent::PipelineAlert {
-                document, count, ..
-            } => {
-                assert_eq!(document, "LEARNING");
-                assert_eq!(count, 8);
+            EntityEvent::PostInteraction { source, .. } => {
+                assert!(matches!(source, InteractionSource::Chat { .. }));
             }
             _ => panic!("Wrong event type"),
         }

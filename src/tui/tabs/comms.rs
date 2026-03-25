@@ -26,6 +26,15 @@ use super::TabView;
 
 // ─── Types ───
 
+pub enum CommsFooter {
+    Setup,
+    Conversation,
+    Finished,
+    MgmtList,
+    MgmtForm,
+    MgmtDelete,
+}
+
 #[derive(Clone, Debug)]
 pub enum CommsState {
     Setup,
@@ -68,6 +77,7 @@ pub enum CommsEvent {
         turn: u32,
     },
     PeerActivity(EntityState),
+    LocalActivity(EntityState),
     Error(String),
     Finished,
     TestResult(bool, Option<u64>),
@@ -110,6 +120,9 @@ pub struct CommsTab {
     paused: bool,
     pause_tx: watch::Sender<bool>,
 
+    // Local entity state during conversation
+    local_state: EntityState,
+
     // Peer pulse (remote entity heartbeat)
     peer_pulse_data: VecDeque<f64>,
     peer_pulse_tick: u64,
@@ -135,6 +148,7 @@ pub struct CommsTab {
     event_tx: mpsc::UnboundedSender<CommsEvent>,
     event_rx: mpsc::UnboundedReceiver<CommsEvent>,
     health_checked: bool,
+    archived: bool,
 }
 
 impl CommsTab {
@@ -165,6 +179,7 @@ impl CommsTab {
             max_turns: 20,
             paused: false,
             pause_tx,
+            local_state: EntityState::Idle,
             peer_pulse_data,
             peer_pulse_tick: 0,
             peer_pulse_state: EntityState::Idle,
@@ -185,10 +200,69 @@ impl CommsTab {
             event_tx,
             event_rx,
             health_checked: false,
+            archived: false,
         }
     }
 
     // ─── Event Handling ───
+
+    /// Archive the comms transcript, write LOGBOOK entry, and trigger graph ingest.
+    fn archive_comms_transcript(&self, ctx: &AppContext) {
+        let Some(root_dir) = &ctx.root_dir else {
+            return;
+        };
+
+        // Convert transcript to (entity_name, text) pairs, skip system messages
+        let messages: Vec<(String, String)> = self
+            .transcript
+            .iter()
+            .filter(|m| m.entity != "system")
+            .map(|m| (m.entity.clone(), m.text.clone()))
+            .collect();
+
+        if messages.is_empty() {
+            return;
+        }
+
+        match crate::session::archive_comms_conversation(
+            root_dir,
+            &messages,
+            &self.entity_name,
+            &self.peer_name_active,
+        ) {
+            Ok(archive_path) => {
+                tracing::info!("Comms conversation archived to {}", archive_path.display());
+
+                // LOGBOOK entry
+                crate::logbook::log_session_end(
+                    root_dir,
+                    &format!("comms/{}", self.peer_name_active),
+                    messages.len(),
+                    Some(archive_path.as_path()),
+                );
+
+                // Graph ingest if enabled
+                if let Some(config) = &ctx.config {
+                    if config.graph.enabled && config.graph.auto_ingest {
+                        let root = root_dir.clone();
+                        let path = archive_path;
+                        tokio::task::spawn_blocking(move || {
+                            let rt = match tokio::runtime::Runtime::new() {
+                                Ok(rt) => rt,
+                                Err(_) => return,
+                            };
+                            rt.block_on(async {
+                                crate::session::graph_ingest_archive(&root, &path, None).await;
+                            });
+                        });
+                    }
+                }
+            }
+            Err(e) => {
+                tracing::warn!("Failed to archive comms conversation: {}", e);
+            }
+        }
+    }
 
     fn drain_events(&mut self) {
         while let Ok(event) = self.event_rx.try_recv() {
@@ -225,6 +299,9 @@ impl CommsTab {
                     self.peer_pulse_state = new_state;
                 }
             }
+            CommsEvent::LocalActivity(new_state) => {
+                self.local_state = new_state;
+            }
             CommsEvent::Error(msg) => {
                 self.transcript.push(CommsMessage {
                     entity: "system".to_string(),
@@ -233,12 +310,14 @@ impl CommsTab {
                 });
                 self.peer_pulse_color.transition_to(&EntityState::Idle);
                 self.peer_pulse_state = EntityState::Idle;
+                self.local_state = EntityState::Idle;
                 self.task_handle = None;
             }
             CommsEvent::Finished => {
                 self.state = CommsState::Finished;
                 self.peer_pulse_color.transition_to(&EntityState::Idle);
                 self.peer_pulse_state = EntityState::Idle;
+                self.local_state = EntityState::Idle;
                 self.task_handle = None;
             }
             CommsEvent::TestResult(online, latency) => {
@@ -316,9 +395,11 @@ impl CommsTab {
         self.auto_scroll = true;
         self.turn_count = 0;
         self.paused = false;
+        self.archived = false;
         let _ = self.pause_tx.send(true);
         self.peer_pulse_state = EntityState::Idle;
         self.peer_pulse_color = PulseColorTransition::new(&EntityState::Idle);
+        self.local_state = EntityState::Idle;
 
         let provider = Arc::clone(provider);
         let peer_client = Arc::clone(peer_client);
@@ -368,6 +449,29 @@ impl CommsTab {
         self.state = CommsState::Setup;
         self.peer_pulse_color.transition_to(&EntityState::Idle);
         self.peer_pulse_state = EntityState::Idle;
+        self.local_state = EntityState::Idle;
+    }
+
+    /// Returns the local entity state during an active comms conversation.
+    pub fn active_entity_state(&self) -> EntityState {
+        match self.state {
+            CommsState::Connecting | CommsState::Active { .. } => self.local_state.clone(),
+            _ => EntityState::Idle,
+        }
+    }
+
+    /// Returns footer hint context for the current comms state.
+    pub fn footer_context(&self) -> CommsFooter {
+        match &self.state {
+            CommsState::PeerMgmt => match self.mgmt_view {
+                MgmtView::List => CommsFooter::MgmtList,
+                MgmtView::Form => CommsFooter::MgmtForm,
+                MgmtView::DeleteConfirm => CommsFooter::MgmtDelete,
+            },
+            CommsState::Active { .. } | CommsState::Connecting => CommsFooter::Conversation,
+            CommsState::Finished => CommsFooter::Finished,
+            CommsState::Setup => CommsFooter::Setup,
+        }
     }
 
     fn toggle_pause(&mut self) {
@@ -1545,6 +1649,15 @@ impl TabView for CommsTab {
         // Drain async events
         self.drain_events();
 
+        // Archive comms conversation when it finishes
+        if matches!(self.state, CommsState::Finished)
+            && !self.archived
+            && !self.transcript.is_empty()
+        {
+            self.archived = true;
+            self.archive_comms_transcript(ctx);
+        }
+
         // Tick peer pulse during conversations
         if matches!(
             self.state,
@@ -1605,9 +1718,11 @@ async fn run_conversation(
         content: MessageContent::Text(opener),
     });
 
+    let _ = tx.send(CommsEvent::LocalActivity(EntityState::Thinking));
     let a_response = provider
         .invoke(&system_prompt, &conversation, max_tokens, None)
         .await;
+    let _ = tx.send(CommsEvent::LocalActivity(EntityState::Idle));
 
     let a_text = match a_response {
         Ok(resp) => resp.text(),
@@ -1689,9 +1804,11 @@ async fn run_conversation(
                     )),
                 });
 
+                let _ = tx.send(CommsEvent::LocalActivity(EntityState::Thinking));
                 let a_response = provider
                     .invoke(&system_prompt, &conversation, max_tokens, None)
                     .await;
+                let _ = tx.send(CommsEvent::LocalActivity(EntityState::Idle));
 
                 match a_response {
                     Ok(resp) => {
