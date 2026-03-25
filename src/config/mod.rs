@@ -359,6 +359,9 @@ pub struct EventsConfig {
     pub pipeline_frozen: bool,
     /// Queue adjustment intent when cognitive health declines
     pub cognitive_decline: bool,
+    /// Queue investigation when conversations archive but pipeline docs don't update
+    #[serde(default = "default_true")]
+    pub pipeline_conversion_low: bool,
 }
 
 impl Default for EventsConfig {
@@ -368,6 +371,7 @@ impl Default for EventsConfig {
             pipeline_alert: true,
             pipeline_frozen: true,
             cognitive_decline: true,
+            pipeline_conversion_low: true,
         }
     }
 }

@@ -554,6 +554,44 @@ fn strip_system_prefixes(text: &str) -> String {
     s.to_string()
 }
 
+/// Count conversations archived in the last `days` days by parsing INDEX.md.
+/// Returns the count, or 0 if INDEX.md doesn't exist or can't be parsed.
+pub fn count_recent_conversations(root_dir: &Path, days: i64) -> u32 {
+    let index_path = root_dir
+        .join("archives")
+        .join("conversations")
+        .join("INDEX.md");
+    let content = match fs::read_to_string(&index_path) {
+        Ok(c) => c,
+        Err(_) => return 0,
+    };
+
+    let cutoff = Utc::now() - chrono::Duration::days(days);
+    let mut count = 0u32;
+
+    // INDEX.md format: "| NNN | YYYY-MM-DD HH:MM UTC | trigger | channel | N |"
+    for line in content.lines() {
+        if !line.starts_with('|') {
+            continue;
+        }
+        let cols: Vec<&str> = line.split('|').map(|s| s.trim()).collect();
+        // cols: ["", "NNN", "YYYY-MM-DD HH:MM UTC", "trigger", "channel", "N", ""]
+        if cols.len() < 4 {
+            continue;
+        }
+        // Try parsing the date column (index 2)
+        let date_str = cols[2];
+        if let Ok(dt) = chrono::NaiveDateTime::parse_from_str(date_str, "%Y-%m-%d %H:%M UTC") {
+            let dt_utc = dt.and_utc();
+            if dt_utc >= cutoff {
+                count += 1;
+            }
+        }
+    }
+
+    count
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -748,5 +786,36 @@ mod tests {
             strip_system_prefixes("[important] do this"),
             "[important] do this"
         );
+    }
+
+    #[test]
+    fn count_recent_conversations_from_index() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let conv_dir = root.join("archives/conversations");
+        fs::create_dir_all(&conv_dir).unwrap();
+
+        let now = Utc::now();
+        let recent = now.format("%Y-%m-%d %H:%M UTC");
+        let old = (now - chrono::Duration::days(10)).format("%Y-%m-%d %H:%M UTC");
+
+        let index = format!(
+            "| Log | Date | Trigger | Channel | Messages |\n\
+            |-----|------|---------|---------|----------|\n\
+            | 001 | {} | session-end | voice | 5 |\n\
+            | 002 | {} | session-end | discord | 8 |\n\
+            | 003 | {} | session-end | repl | 3 |\n",
+            recent, recent, old,
+        );
+        fs::write(conv_dir.join("INDEX.md"), &index).unwrap();
+
+        assert_eq!(count_recent_conversations(root, 7), 2);
+        assert_eq!(count_recent_conversations(root, 30), 3);
+    }
+
+    #[test]
+    fn count_recent_conversations_no_index() {
+        let tmp = tempfile::tempdir().unwrap();
+        assert_eq!(count_recent_conversations(tmp.path(), 7), 0);
     }
 }

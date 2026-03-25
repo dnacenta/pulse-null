@@ -275,6 +275,17 @@ async fn execute_task(
     // Log to LOGBOOK.md
     log_execution(&root_dir, task, &parsed.clean_content);
 
+    // Write full task output for visibility
+    crate::logbook::write_task_output(
+        &root_dir,
+        &task.id,
+        &task.name,
+        &parsed.clean_content,
+        input_tokens,
+        output_tokens,
+        tool_rounds,
+    );
+
     // Record outcome for caliber-echo
     if let Some(ref tracker) = state.outcome_tracker {
         let outcome = tracker.build_outcome(
@@ -356,6 +367,17 @@ async fn execute_task(
         let archived = monitor.check_and_archive(&root_dir, &thresholds, &health);
         for doc in &archived {
             tracing::info!("Auto-archived overflow from {}", doc);
+        }
+
+        // Pipeline conversion check: conversations vs pipeline updates over 7 days
+        if pipeline_state.sessions_without_movement >= 3 {
+            let conversations_7d = crate::session::count_recent_conversations(&root_dir, 7);
+            if conversations_7d >= 3 {
+                state.event_bus.emit(EntityEvent::PipelineConversionLow {
+                    conversations_7d,
+                    pipeline_updates_7d: 0,
+                });
+            }
         }
     }
 

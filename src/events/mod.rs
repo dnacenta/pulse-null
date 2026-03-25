@@ -49,6 +49,12 @@ pub enum EntityEvent {
         current: String,
         suggestions: Vec<String>,
     },
+
+    /// Emitted when conversations are being archived but pipeline documents aren't updating.
+    PipelineConversionLow {
+        conversations_7d: u32,
+        pipeline_updates_7d: u32,
+    },
 }
 
 impl EntityEvent {
@@ -62,6 +68,7 @@ impl EntityEvent {
             EntityEvent::PipelineAlert { document, .. } => format!("pipeline_alert_{}", document),
             EntityEvent::PipelineFrozen { .. } => "pipeline_frozen".into(),
             EntityEvent::CognitiveHealthChanged { .. } => "cognitive_decline".into(),
+            EntityEvent::PipelineConversionLow { .. } => "pipeline_conversion_low".into(),
         }
     }
 }

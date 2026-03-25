@@ -228,6 +228,45 @@ fn translate_event(event: &EntityEvent, config: &EventsConfig) -> Option<Intent>
             })
         }
 
+        EntityEvent::PipelineConversionLow {
+            conversations_7d,
+            pipeline_updates_7d,
+        } => {
+            if !config.pipeline_conversion_low {
+                return None;
+            }
+            Some(Intent {
+                id: format!(
+                    "event-conversion-low-{}",
+                    &uuid::Uuid::new_v4().to_string()[..8]
+                ),
+                description: format!(
+                    "Pipeline conversion low — {} conversations, {} pipeline updates in 7 days",
+                    conversations_7d, pipeline_updates_7d
+                ),
+                prompt: format!(
+                    "In the last 7 days, {} conversations were archived but pipeline documents \
+                    have had no updates for the last 3+ sessions. This means conversations are \
+                    happening but nothing is flowing into LEARNING.md, THOUGHTS.md, or other \
+                    pipeline documents.\n\n\
+                    Your task:\n\
+                    1. Review recent conversation archives in archives/conversations/.\n\
+                    2. Identify 1-2 topics from recent conversations that deserve pipeline capture.\n\
+                    3. Write at least one new LEARNING thread or CURIOSITY question based on \
+                    recent conversations.\n\
+                    4. If existing LEARNING threads relate to recent conversations, update them.\n\n\
+                    The pipeline only works if conversations feed into it.",
+                    conversations_7d
+                ),
+                source: IntentSource::Event("pipeline_conversion_low".to_string()),
+                priority: IntentPriority::Normal,
+                created_at: Utc::now(),
+                chain: None,
+                output_routing: IntentOutput::Silent,
+                depth: 0,
+            })
+        }
+
         EntityEvent::CognitiveHealthChanged {
             previous,
             current,
@@ -412,6 +451,21 @@ mod tests {
             suggestions: vec![],
         };
         assert!(translate_event(&event, &config).is_none());
+    }
+
+    #[test]
+    fn test_translate_pipeline_conversion_low() {
+        let config = EventsConfig {
+            pipeline_conversion_low: true,
+            ..EventsConfig::default()
+        };
+        let event = EntityEvent::PipelineConversionLow {
+            conversations_7d: 5,
+            pipeline_updates_7d: 0,
+        };
+        let intent = translate_event(&event, &config).unwrap();
+        assert!(intent.description.contains("5 conversations"));
+        assert!(intent.prompt.contains("pipeline documents"));
     }
 
     #[test]
