@@ -182,10 +182,6 @@ impl Screen for MainScreen {
                 Tab::Chat => vec![
                     Span::styled(" Enter ", hint_style_key),
                     Span::styled(" Send  ", hint_style_desc),
-                    Span::styled(" S+Enter ", hint_style_key),
-                    Span::styled(" Newline  ", hint_style_desc),
-                    Span::styled(" S+\u{2191}\u{2193} ", hint_style_key),
-                    Span::styled(" Scroll  ", hint_style_desc),
                     Span::styled(" Tab ", hint_style_key),
                     Span::styled(" Next tab ", hint_style_desc),
                 ],
@@ -335,6 +331,7 @@ impl Screen for MainScreen {
 
         // Tick all tabs (lazy loading on first tick)
         self.chat.tick();
+        self.entity.handle_tick(ctx);
         self.evolution.handle_tick(ctx);
         self.files.handle_tick(ctx);
         self.comms.handle_tick(ctx);

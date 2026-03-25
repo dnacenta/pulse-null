@@ -291,17 +291,17 @@ pub async fn run_chat(
 fn handle_mouse(mouse: crossterm::event::MouseEvent, main: &mut MainScreen) {
     match mouse.kind {
         MouseEventKind::ScrollUp => match main.active_tab {
-            tabs::Tab::Chat => main.chat.scroll_up(3),
-            tabs::Tab::Files => main.files.scroll_up(3),
-            tabs::Tab::Evolution => main.evolution.scroll_up(3),
-            tabs::Tab::Comms => main.comms.scroll_up(3),
-            _ => {}
-        },
-        MouseEventKind::ScrollDown => match main.active_tab {
             tabs::Tab::Chat => main.chat.scroll_down(3),
             tabs::Tab::Files => main.files.scroll_down(3),
             tabs::Tab::Evolution => main.evolution.scroll_down(3),
             tabs::Tab::Comms => main.comms.scroll_down(3),
+            _ => {}
+        },
+        MouseEventKind::ScrollDown => match main.active_tab {
+            tabs::Tab::Chat => main.chat.scroll_up(3),
+            tabs::Tab::Files => main.files.scroll_up(3),
+            tabs::Tab::Evolution => main.evolution.scroll_up(3),
+            tabs::Tab::Comms => main.comms.scroll_up(3),
             _ => {}
         },
         MouseEventKind::Down(crossterm::event::MouseButton::Left) => {

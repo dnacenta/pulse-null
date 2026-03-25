@@ -1,3 +1,4 @@
+use std::cell::Cell;
 use std::collections::VecDeque;
 use std::sync::Arc;
 
@@ -68,6 +69,7 @@ pub struct ChatTab {
     pub ui_rx: mpsc::UnboundedReceiver<UiEvent>,
     pub pending_tokens: Option<(u32, u32)>,
     pub has_new_content: bool,
+    last_max_scroll: Cell<u16>,
 }
 
 impl ChatTab {
@@ -102,6 +104,7 @@ impl ChatTab {
             ui_rx,
             pending_tokens: None,
             has_new_content: false,
+            last_max_scroll: Cell::new(0),
         }
     }
 
@@ -210,16 +213,27 @@ impl ChatTab {
     }
 
     pub fn scroll_up(&mut self, amount: u16) {
+        // Increase offset = viewport DOWN = see newer messages
         self.scroll = self.scroll.saturating_add(amount);
-        self.auto_scroll = false;
-    }
-
-    pub fn scroll_down(&mut self, amount: u16) {
-        self.scroll = self.scroll.saturating_sub(amount);
-        if self.scroll == 0 {
+        let max = self.last_max_scroll.get();
+        if max > 0 && self.scroll >= max {
+            self.scroll = 0;
             self.auto_scroll = true;
             self.has_new_content = false;
         }
+    }
+
+    pub fn scroll_down(&mut self, amount: u16) {
+        // Decrease offset = viewport UP = see older messages
+        let max = self.last_max_scroll.get();
+        if self.auto_scroll {
+            if max == 0 {
+                return;
+            }
+            self.scroll = max;
+            self.auto_scroll = false;
+        }
+        self.scroll = self.scroll.saturating_sub(amount);
     }
 
     pub fn drain_events(&mut self) {
@@ -324,22 +338,22 @@ impl ChatTab {
             }
             // Shift+Up/Down: fine-grained scroll (1 line)
             KeyCode::Up if key.modifiers.contains(KeyModifiers::SHIFT) => {
-                self.scroll_up(1);
+                self.scroll_down(1);
                 None
             }
             KeyCode::Down if key.modifiers.contains(KeyModifiers::SHIFT) => {
-                self.scroll_down(1);
+                self.scroll_up(1);
                 None
             }
             // PageUp/PageDown: half viewport
             KeyCode::PageUp => {
                 let half = self.visible_conversation_height() / 2;
-                self.scroll_up(half.max(1));
+                self.scroll_down(half.max(1));
                 None
             }
             KeyCode::PageDown => {
                 let half = self.visible_conversation_height() / 2;
-                self.scroll_down(half.max(1));
+                self.scroll_up(half.max(1));
                 None
             }
             // Tab: don't pass to textarea (let parent handle tab switching)
@@ -510,6 +524,7 @@ impl ChatTab {
         let content_height = paragraph.line_count(inner.width) as u16;
         let view_height = inner.height;
         let max_scroll = content_height.saturating_sub(view_height);
+        self.last_max_scroll.set(max_scroll);
         let scroll = if self.auto_scroll {
             max_scroll
         } else {
