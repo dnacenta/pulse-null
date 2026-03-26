@@ -14,6 +14,7 @@ use tui_textarea::TextArea;
 use pulse_system_types::llm::{Message, MessageContent, Role};
 
 use crate::config::PeerConfig;
+use crate::events::{ConversationTrust, EntityEvent, InteractionSource};
 use crate::peer::{self, PeerClient};
 use crate::streaming::StreamingProvider;
 use crate::tui::app::AppContext;
@@ -151,6 +152,14 @@ pub struct CommsTab {
     archived: bool,
 }
 
+/// Determine trust level for a peer based on its host address.
+fn trust_for_peer(host: &str) -> ConversationTrust {
+    match host {
+        "localhost" | "127.0.0.1" | "::1" => ConversationTrust::LocalPeer,
+        _ => ConversationTrust::RemotePeer,
+    }
+}
+
 impl CommsTab {
     pub fn new(entity_name: &str) -> Self {
         let term_width = crossterm::terminal::size()
@@ -240,6 +249,38 @@ impl CommsTab {
                     messages.len(),
                     Some(archive_path.as_path()),
                 );
+
+                // Emit PostInteraction event
+                if let Some(ref event_bus) = ctx.event_bus {
+                    let trust = ctx
+                        .config
+                        .as_ref()
+                        .and_then(|c| c.peers.get(&self.peer_name_active))
+                        .map(|p| trust_for_peer(&p.host))
+                        .unwrap_or(ConversationTrust::Public);
+
+                    // Build summary from first 300 chars of transcript
+                    let summary: String = messages
+                        .iter()
+                        .map(|(entity, text)| format!("{}: {}", entity, text))
+                        .collect::<Vec<_>>()
+                        .join(" | ");
+                    let summary = if summary.len() > 300 {
+                        format!("{}...", &summary[..300])
+                    } else {
+                        summary
+                    };
+
+                    event_bus.emit(EntityEvent::PostInteraction {
+                        source: InteractionSource::Comms {
+                            peer: self.peer_name_active.clone(),
+                        },
+                        trust,
+                        summary,
+                        input_tokens: 0,
+                        output_tokens: 0,
+                    });
+                }
 
                 // Graph ingest if enabled
                 if let Some(config) = &ctx.config {
