@@ -202,9 +202,16 @@ fn render_rules_md(entity_root: &Path) -> String {
     format!(
         r#"# recall-echo — Memory Protocol
 
-You have a persistent three-layer memory system. Use it to maintain continuity across sessions.
+You have a persistent four-layer memory system. Use it to maintain continuity across sessions.
 
 ## Memory Layers
+
+### Layer 0 — Knowledge Graph (structured, semantic)
+- Embedded SurrealDB graph database with FastEmbed local embeddings.
+- Stores entities, relationships, and conversation episodes.
+- Bayesian confidence scoring on relationships — corroborated knowledge gains confidence over time.
+- Semantic search finds memories by meaning, not just keywords.
+- Queried via `recall-echo graph search`, `graph query`, or `graph traverse`.
 
 ### Layer 1 — Curated Memory (MEMORY.md)
 - Location: `{entity_root}/memory/MEMORY.md`
@@ -247,6 +254,18 @@ current conversation.
 ### On session end:
 - The SessionEnd hook archives this conversation automatically.
 - No manual action required.
+
+## Commands
+
+- `recall-echo init` — Initialize or upgrade the memory system
+- `recall-echo consume` — Output EPHEMERAL.md at session start (PreToolUse hook)
+- `recall-echo checkpoint --trigger precompact` — Save checkpoint before context compression
+- `recall-echo archive-session` — Archive conversation from JSONL transcript (SessionEnd hook)
+- `recall-echo search <query>` — Search conversation archives
+- `recall-echo search <query> --ranked` — Ranked search with relevance scoring
+- `recall-echo graph search <query>` — Semantic search across graph entities
+- `recall-echo graph query <query>` — Hybrid search (semantic + graph expansion + episodes)
+- `recall-echo graph traverse <entity>` — Graph traversal with confidence display
 
 ## Rules
 

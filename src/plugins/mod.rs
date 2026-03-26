@@ -21,7 +21,7 @@ use std::sync::Arc;
 use crate::scheduler::ScheduledTask;
 use pulse_system_types::llm::LmProvider;
 
-// Re-export shared types from echo-system-types.
+// Re-export shared types from pulse-system-types.
 // HealthStatus is aliased as PluginHealth to preserve existing API.
 pub use pulse_system_types::HealthStatus as PluginHealth;
 pub use pulse_system_types::{PluginMeta, SetupPrompt};
