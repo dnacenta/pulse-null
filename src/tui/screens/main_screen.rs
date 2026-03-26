@@ -12,6 +12,7 @@ use crate::tui::tabs::comms::{CommsFooter, CommsTab};
 use crate::tui::tabs::entity::EntityTab;
 use crate::tui::tabs::evolution::EvolutionTab;
 use crate::tui::tabs::files::FilesTab;
+use crate::tui::tabs::recall::RecallTab;
 use crate::tui::tabs::{Tab, TabView};
 use crate::tui::theme::*;
 use crate::tui::widgets::header;
@@ -23,6 +24,7 @@ pub struct MainScreen {
     pub evolution: EvolutionTab,
     pub files: FilesTab,
     pub comms: CommsTab,
+    pub recall: RecallTab,
     pub fullscreen: bool,
     pub show_help: bool,
 }
@@ -36,6 +38,7 @@ impl MainScreen {
             evolution: EvolutionTab::new(),
             files: FilesTab::new(),
             comms: CommsTab::new(entity_name),
+            recall: RecallTab::new(),
             fullscreen: false,
             show_help: false,
         }
@@ -179,6 +182,9 @@ impl Screen for MainScreen {
             Tab::Comms => {
                 self.comms.render(frame, chunks[content_idx], ctx);
             }
+            Tab::Recall => {
+                self.recall.render(frame, chunks[content_idx], ctx);
+            }
         }
 
         // Footer hints
@@ -290,6 +296,16 @@ impl Screen for MainScreen {
                     Span::styled(" ? ", hint_style_key),
                     Span::styled(" Help ", hint_style_desc),
                 ],
+                Tab::Recall => vec![
+                    Span::styled(" j/k ", hint_style_key),
+                    Span::styled(" Scroll  ", hint_style_desc),
+                    Span::styled(" r ", hint_style_key),
+                    Span::styled(" Refresh  ", hint_style_desc),
+                    Span::styled(" Tab ", hint_style_key),
+                    Span::styled(" Next tab  ", hint_style_desc),
+                    Span::styled(" ? ", hint_style_key),
+                    Span::styled(" Help ", hint_style_desc),
+                ],
             };
             frame.render_widget(Paragraph::new(Line::from(hints)), chunks[footer_idx]);
         }
@@ -362,6 +378,10 @@ impl Screen for MainScreen {
                     self.active_tab = Tab::Comms;
                     return ScreenAction::None;
                 }
+                KeyCode::Char('6') => {
+                    self.active_tab = Tab::Recall;
+                    return ScreenAction::None;
+                }
                 // ? opens help (only when not typing)
                 KeyCode::Char('?') => {
                     self.show_help = true;
@@ -391,6 +411,7 @@ impl Screen for MainScreen {
             Tab::Evolution => self.evolution.handle_key(key, ctx),
             Tab::Files => self.files.handle_key(key, ctx),
             Tab::Comms => self.comms.handle_key(key, ctx),
+            Tab::Recall => self.recall.handle_key(key, ctx),
         }
     }
 
@@ -410,6 +431,7 @@ impl Screen for MainScreen {
         self.evolution.handle_tick(ctx);
         self.files.handle_tick(ctx);
         self.comms.handle_tick(ctx);
+        self.recall.handle_tick(ctx);
     }
 }
 
@@ -437,7 +459,7 @@ fn draw_help_overlay(frame: &mut Frame, area: Rect) {
 
     let bindings = vec![
         ("Tab / Shift+Tab", "Switch tabs"),
-        ("1-5", "Jump to tab"),
+        ("1-6", "Jump to tab"),
         ("Ctrl+F", "Toggle fullscreen"),
         ("F1 / ?", "Toggle this help"),
         ("Ctrl+C / Esc", "Quit (chat empty)"),
@@ -464,6 +486,10 @@ fn draw_help_overlay(frame: &mut Frame, area: Rect) {
         ("\u{2191}\u{2193} / \u{2190}\u{2192}", "Select peer / mode"),
         ("Enter", "Start conversation"),
         ("p", "Peer management"),
+        ("", ""),
+        ("\u{2500}\u{2500} Recall \u{2500}\u{2500}", ""),
+        ("j/k", "Scroll stale items"),
+        ("r", "Refresh graph data"),
     ];
 
     let lines: Vec<Line> = bindings
