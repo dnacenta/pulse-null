@@ -9,6 +9,10 @@ pub enum InteractionSource {
     Chat { channel: String },
     /// Peer-to-peer conversation between entities (comms).
     Comms { peer: String },
+    /// Autonomous scheduled task execution.
+    ScheduledTask { task_name: String },
+    /// Autonomous research (intent-driven).
+    Research { topic: String },
 }
 
 /// Trust level for an interaction — determines what follow-up actions are appropriate.
@@ -18,6 +22,10 @@ pub enum ConversationTrust {
     Owner,
     /// Conversation with a known local peer (same server).
     LocalPeer,
+    /// Configured remote peer — moderate trust.
+    RemotePeer,
+    /// Unknown entity — no trust.
+    Public,
 }
 
 /// Internal entity events that can trigger autonomous actions.
@@ -64,6 +72,10 @@ impl EntityEvent {
             EntityEvent::PostInteraction { source, .. } => match source {
                 InteractionSource::Chat { .. } => "post_conversation".into(),
                 InteractionSource::Comms { peer } => format!("post_comms_{}", peer),
+                InteractionSource::ScheduledTask { task_name } => {
+                    format!("post_task_{}", task_name)
+                }
+                InteractionSource::Research { topic } => format!("post_research_{}", topic),
             },
             EntityEvent::PipelineAlert { document, .. } => format!("pipeline_alert_{}", document),
             EntityEvent::PipelineFrozen { .. } => "pipeline_frozen".into(),
@@ -160,5 +172,33 @@ mod tests {
             } => assert_eq!(sessions_without_movement, 4),
             _ => panic!("Wrong event"),
         }
+    }
+
+    #[test]
+    fn test_event_type_scheduled_task() {
+        let event = EntityEvent::PostInteraction {
+            source: InteractionSource::ScheduledTask {
+                task_name: "reflection".to_string(),
+            },
+            trust: ConversationTrust::Owner,
+            summary: "test".to_string(),
+            input_tokens: 0,
+            output_tokens: 0,
+        };
+        assert_eq!(event.event_type(), "post_task_reflection");
+    }
+
+    #[test]
+    fn test_event_type_research() {
+        let event = EntityEvent::PostInteraction {
+            source: InteractionSource::Research {
+                topic: "emergence".to_string(),
+            },
+            trust: ConversationTrust::Owner,
+            summary: "test".to_string(),
+            input_tokens: 0,
+            output_tokens: 0,
+        };
+        assert_eq!(event.event_type(), "post_research_emergence");
     }
 }
