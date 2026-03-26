@@ -152,31 +152,28 @@ fn prune_task_output(dir: &Path, max: usize) {
     }
 }
 
-/// Write an automatic LOGBOOK entry when a session ends.
-pub fn log_session_end(
-    root_dir: &Path,
-    channel: &str,
-    message_count: usize,
-    archive_path: Option<&Path>,
-) {
+/// Write a structured LOGBOOK entry with consistent format.
+///
+/// All LOGBOOK entries follow: `### YYYY-MM-DD HH:MM UTC — {source} ({details})\n\n{summary}\n`
+///
+/// Summary is truncated to 500 chars if too long.
+pub fn write_entry(root_dir: &Path, source: &str, details: &str, summary: &str) {
     let logbook_path = root_dir.join("journal/LOGBOOK.md");
     rotate_if_needed(root_dir, &logbook_path);
 
     let now = Utc::now();
-    let archive_note = match archive_path {
-        Some(p) => {
-            let name = p.file_name().and_then(|n| n.to_str()).unwrap_or("unknown");
-            format!("Archived to {}.", name)
-        }
-        None => "No archive created.".to_string(),
+    let truncated = if summary.len() > 500 {
+        format!("{}...", &summary[..500])
+    } else {
+        summary.to_string()
     };
 
     let entry = format!(
-        "\n### {} — Session end ({}, {} messages)\n\n{}\n",
+        "\n### {} — {} ({})\n\n{}\n",
         now.format("%Y-%m-%d %H:%M UTC"),
-        channel,
-        message_count,
-        archive_note,
+        source,
+        details,
+        truncated,
     );
 
     if let Err(e) = std::fs::OpenOptions::new()
@@ -188,6 +185,28 @@ pub fn log_session_end(
             f.write_all(entry.as_bytes())
         })
     {
-        tracing::error!("Failed to write session end to LOGBOOK: {}", e);
+        tracing::error!("Failed to write to LOGBOOK: {}", e);
     }
+}
+
+/// Write an automatic LOGBOOK entry when a session ends.
+pub fn log_session_end(
+    root_dir: &Path,
+    channel: &str,
+    message_count: usize,
+    archive_path: Option<&Path>,
+) {
+    let archive_note = match archive_path {
+        Some(p) => {
+            let name = p.file_name().and_then(|n| n.to_str()).unwrap_or("unknown");
+            format!("Archived to {}.", name)
+        }
+        None => "No archive created.".to_string(),
+    };
+    write_entry(
+        root_dir,
+        "Session end",
+        &format!("{}, {} messages", channel, message_count),
+        &archive_note,
+    );
 }
