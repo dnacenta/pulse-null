@@ -90,7 +90,7 @@ pub struct WizardScreen {
 
     // Status
     error_msg: Option<String>,
-    created_dir: Option<PathBuf>,
+    pub created_dir: Option<PathBuf>,
 }
 
 impl WizardScreen {

@@ -61,6 +61,8 @@ pub struct PeerEntry {
     pub port: u16,
     pub online: Option<bool>,
     pub latency_ms: Option<u64>,
+    /// Auto-discovered from entity registry (not manually configured).
+    pub local: bool,
 }
 
 pub struct CommsMessage {
@@ -158,6 +160,11 @@ fn trust_for_peer(host: &str) -> ConversationTrust {
         "localhost" | "127.0.0.1" | "::1" => ConversationTrust::LocalPeer,
         _ => ConversationTrust::RemotePeer,
     }
+}
+
+/// Check if a host address is local (auto-discovered entity).
+fn is_local_host(host: &str) -> bool {
+    matches!(host, "localhost" | "127.0.0.1" | "::1")
 }
 
 impl CommsTab {
@@ -315,7 +322,7 @@ impl CommsTab {
         match event {
             CommsEvent::PeersLoaded(entries) => {
                 self.peers = entries;
-                self.peers.sort_by(|a, b| a.name.cmp(&b.name));
+                self.sort_peers();
                 if self.selected_peer >= self.peers.len() {
                     self.selected_peer = 0;
                 }
@@ -380,10 +387,17 @@ impl CommsTab {
                     port: pc.port,
                     online: None,
                     latency_ms: None,
+                    local: is_local_host(&pc.host),
                 })
                 .collect();
-            self.peers.sort_by(|a, b| a.name.cmp(&b.name));
+            self.sort_peers();
         }
+    }
+
+    /// Sort peers: local entities first, then remote, each group alphabetically.
+    fn sort_peers(&mut self) {
+        self.peers
+            .sort_by(|a, b| b.local.cmp(&a.local).then_with(|| a.name.cmp(&b.name)));
     }
 
     fn refresh_health(&self, ctx: &AppContext) {
@@ -398,12 +412,16 @@ impl CommsTab {
             let statuses = client.list_peers().await;
             let entries: Vec<PeerEntry> = statuses
                 .into_iter()
-                .map(|s| PeerEntry {
-                    name: s.name,
-                    host: s.host,
-                    port: s.port,
-                    online: Some(s.online),
-                    latency_ms: s.latency_ms,
+                .map(|s| {
+                    let local = is_local_host(&s.host);
+                    PeerEntry {
+                        name: s.name,
+                        host: s.host,
+                        port: s.port,
+                        online: Some(s.online),
+                        latency_ms: s.latency_ms,
+                        local,
+                    }
                 })
                 .collect();
             let _ = tx.send(CommsEvent::PeersLoaded(entries));
@@ -676,9 +694,10 @@ impl CommsTab {
                 port: pc.port,
                 online: None,
                 latency_ms: None,
+                local: is_local_host(&pc.host),
             })
             .collect();
-        self.peers.sort_by(|a, b| a.name.cmp(&b.name));
+        self.sort_peers();
         if self.mgmt_selected >= self.peers.len() {
             self.mgmt_selected = self.peers.len().saturating_sub(1);
         }
@@ -703,6 +722,31 @@ impl CommsTab {
 
     // ─── Rendering ───
 
+    fn render_peer_group(&self, peers: &[(usize, &PeerEntry)]) -> Vec<Line<'static>> {
+        let mut lines = Vec::new();
+        for &(i, p) in peers {
+            let sel = i == self.selected_peer;
+            let marker = if sel { "\u{25b8}" } else { " " };
+            let dot = match p.online {
+                Some(true) => Span::styled("\u{25cf}", Style::default().fg(NORD14)),
+                Some(false) => Span::styled("\u{25cb}", Style::default().fg(NORD11)),
+                None => Span::styled("?", Style::default().fg(COLOR_DIM)),
+            };
+            lines.push(Line::from(vec![
+                Span::styled(
+                    format!("  {}", marker),
+                    Style::default().fg(if sel { NORD8 } else { COLOR_DIM }),
+                ),
+                dot,
+                Span::styled(
+                    format!(" {:12} :{}", p.name, p.port),
+                    Style::default().fg(if sel { COLOR_TEXT_BRIGHT } else { COLOR_TEXT }),
+                ),
+            ]));
+        }
+        lines
+    }
+
     fn render_setup(&self, frame: &mut Frame, area: Rect, _ctx: &AppContext) {
         let outer = Block::bordered()
             .border_type(BorderType::Rounded)
@@ -717,40 +761,40 @@ impl CommsTab {
         let inner_w = cols[0].width.saturating_sub(2) as usize;
         let mut lines: Vec<Line> = Vec::new();
 
-        // ── Connect To ──
-        let mut peer_lines: Vec<Line> = Vec::new();
+        // ── Connect To (grouped: local entities / remote peers) ──
         if self.peers.is_empty() {
-            peer_lines.push(Line::styled(
-                "  No peers configured",
-                Style::default().fg(COLOR_DIM),
-            ));
-            peer_lines.push(Line::styled(
-                "  Press p to add peers",
-                Style::default().fg(COLOR_DIM),
-            ));
+            let empty_lines = vec![
+                Line::styled("  No peers configured", Style::default().fg(COLOR_DIM)),
+                Line::styled("  Press p to add peers", Style::default().fg(COLOR_DIM)),
+            ];
+            push_bordered_section(&mut lines, "connect to", NORD7, &empty_lines, inner_w);
         } else {
-            for (i, p) in self.peers.iter().enumerate() {
-                let sel = i == self.selected_peer;
-                let marker = if sel { "\u{25b8}" } else { " " };
-                let dot = match p.online {
-                    Some(true) => Span::styled("\u{25cf}", Style::default().fg(NORD14)),
-                    Some(false) => Span::styled("\u{25cb}", Style::default().fg(NORD11)),
-                    None => Span::styled("?", Style::default().fg(COLOR_DIM)),
-                };
-                peer_lines.push(Line::from(vec![
-                    Span::styled(
-                        format!("  {}", marker),
-                        Style::default().fg(if sel { NORD8 } else { COLOR_DIM }),
-                    ),
-                    dot,
-                    Span::styled(
-                        format!(" {:12} :{}", p.name, p.port),
-                        Style::default().fg(if sel { COLOR_TEXT_BRIGHT } else { COLOR_TEXT }),
-                    ),
-                ]));
+            let local_peers: Vec<(usize, &PeerEntry)> = self
+                .peers
+                .iter()
+                .enumerate()
+                .filter(|(_, p)| p.local)
+                .collect();
+            let remote_peers: Vec<(usize, &PeerEntry)> = self
+                .peers
+                .iter()
+                .enumerate()
+                .filter(|(_, p)| !p.local)
+                .collect();
+
+            if !local_peers.is_empty() {
+                let local_lines = self.render_peer_group(&local_peers);
+                push_bordered_section(&mut lines, "local entities", NORD10, &local_lines, inner_w);
+                if !remote_peers.is_empty() {
+                    lines.push(Line::from(""));
+                }
+            }
+
+            if !remote_peers.is_empty() {
+                let remote_lines = self.render_peer_group(&remote_peers);
+                push_bordered_section(&mut lines, "remote peers", NORD7, &remote_lines, inner_w);
             }
         }
-        push_bordered_section(&mut lines, "connect to", NORD7, &peer_lines, inner_w);
         lines.push(Line::from(""));
 
         // ── Mode ──
@@ -1021,13 +1065,17 @@ impl CommsTab {
                     Some(false) => NORD11,
                     None => COLOR_DIM,
                 };
-                table_lines.push(Line::from(vec![
+                let mut spans = vec![
                     Span::styled(
                         format!("{} {:14} {:20} {:6}", marker, p.name, p.host, p.port),
                         Style::default().fg(if sel { COLOR_TEXT_BRIGHT } else { COLOR_TEXT }),
                     ),
                     Span::styled(status, Style::default().fg(status_color)),
-                ]));
+                ];
+                if p.local {
+                    spans.push(Span::styled(" [local]", Style::default().fg(NORD10)));
+                }
+                table_lines.push(Line::from(spans));
             }
         }
         push_bordered_section(&mut lines, "known peers", NORD7, &table_lines, inner_w);
@@ -1447,14 +1495,18 @@ impl CommsTab {
                 self.open_add_form();
             }
             KeyCode::Char('e') => {
-                if !self.peers.is_empty() {
-                    self.open_edit_form();
+                if let Some(peer) = self.peers.get(self.mgmt_selected) {
+                    if !peer.local {
+                        self.open_edit_form();
+                    }
                 }
             }
             KeyCode::Char('d') => {
                 if let Some(peer) = self.peers.get(self.mgmt_selected) {
-                    self.delete_target = Some(peer.name.clone());
-                    self.mgmt_view = MgmtView::DeleteConfirm;
+                    if !peer.local {
+                        self.delete_target = Some(peer.name.clone());
+                        self.mgmt_view = MgmtView::DeleteConfirm;
+                    }
                 }
             }
             KeyCode::Char('r') => {

@@ -164,6 +164,18 @@ impl PeerClient {
 
     // ─── CRUD Operations ───
 
+    /// Add a local peer (auto-discovered from registry). Overwrites if exists.
+    pub fn add_local_peer(&mut self, name: String, port: u16) {
+        self.peers.insert(
+            name,
+            PeerConfig {
+                host: "127.0.0.1".to_string(),
+                port,
+                secret: None,
+            },
+        );
+    }
+
     /// Add a new peer. Returns error if name already exists.
     pub fn add_peer(&mut self, name: String, config: PeerConfig) -> Result<(), PeerError> {
         if self.peers.contains_key(&name) {
