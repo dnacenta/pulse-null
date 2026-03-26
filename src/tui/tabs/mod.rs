@@ -3,6 +3,7 @@ pub mod comms;
 pub mod entity;
 pub mod evolution;
 pub mod files;
+pub mod recall;
 
 use crossterm::event::KeyEvent;
 use ratatui::layout::Rect;
@@ -18,6 +19,7 @@ pub enum Tab {
     Evolution,
     Files,
     Comms,
+    Recall,
 }
 
 impl Tab {
@@ -28,6 +30,7 @@ impl Tab {
             Tab::Evolution => 2,
             Tab::Files => 3,
             Tab::Comms => 4,
+            Tab::Recall => 5,
         }
     }
 
@@ -38,6 +41,7 @@ impl Tab {
             2 => Tab::Evolution,
             3 => Tab::Files,
             4 => Tab::Comms,
+            5 => Tab::Recall,
             _ => Tab::Chat,
         }
     }
@@ -49,10 +53,11 @@ impl Tab {
             Tab::Evolution => "evolution",
             Tab::Files => "files",
             Tab::Comms => "comms",
+            Tab::Recall => "recall",
         }
     }
 
-    pub const COUNT: usize = 5;
+    pub const COUNT: usize = 6;
 }
 
 pub trait TabView {
