@@ -9,7 +9,7 @@ use super::executor::{self, ExecutionConfig};
 use super::intent::{self, IntentQueue, IntentSource};
 use super::output;
 use super::{Schedule, ScheduledTask};
-use crate::events::EntityEvent;
+use crate::events::{ConversationTrust, EntityEvent, InteractionSource};
 use crate::server::prompt;
 use crate::server::AppState;
 
@@ -286,6 +286,22 @@ async fn execute_task(
         tool_rounds,
     );
 
+    // Emit PostInteraction for unified intake
+    let summary = if parsed.clean_content.len() > 300 {
+        format!("{}...", &parsed.clean_content[..300])
+    } else {
+        parsed.clean_content.clone()
+    };
+    state.event_bus.emit(EntityEvent::PostInteraction {
+        source: InteractionSource::ScheduledTask {
+            task_name: task.name.clone(),
+        },
+        trust: ConversationTrust::Owner,
+        summary,
+        input_tokens,
+        output_tokens,
+    });
+
     // Record outcome for caliber-echo
     if let Some(ref tracker) = state.outcome_tracker {
         let outcome = tracker.build_outcome(
@@ -394,32 +410,7 @@ async fn execute_task(
     }
 }
 
-/// Append a task execution record to LOGBOOK.md, rotating if too long.
+/// Append a task execution record to LOGBOOK.md using the unified format.
 fn log_execution(root_dir: &std::path::Path, task: &ScheduledTask, summary: &str) {
-    let logbook_path = root_dir.join("journal/LOGBOOK.md");
-    crate::logbook::rotate_if_needed(root_dir, &logbook_path);
-
-    let now = Utc::now();
-    let entry = format!(
-        "\n### {} — {}\n\n{}\n",
-        now.format("%Y-%m-%d %H:%M UTC"),
-        task.name,
-        if summary.len() > 500 {
-            format!("{}...", &summary[..500])
-        } else {
-            summary.to_string()
-        },
-    );
-
-    if let Err(e) = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&logbook_path)
-        .and_then(|mut f| {
-            use std::io::Write;
-            f.write_all(entry.as_bytes())
-        })
-    {
-        tracing::error!("Failed to write to LOGBOOK: {}", e);
-    }
+    crate::logbook::write_entry(root_dir, "Task", &task.name, summary);
 }

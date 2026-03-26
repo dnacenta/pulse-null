@@ -10,7 +10,7 @@ use super::executor::{self, ExecutionConfig};
 use super::output;
 use super::Schedule;
 use crate::config::AutonomyConfig;
-use crate::events::EntityEvent;
+use crate::events::{ConversationTrust, EntityEvent, InteractionSource};
 use crate::server::prompt;
 use crate::server::AppState;
 
@@ -613,6 +613,31 @@ async fn execute_intent(
         result.tool_rounds_used,
     );
 
+    // Emit PostInteraction for unified intake — only for non-event-sourced intents
+    // to prevent infinite loops (event → intent → event → intent → ...)
+    if !matches!(intent.source, IntentSource::Event(_)) {
+        let source = match &intent.source {
+            IntentSource::ScheduledTask(name) => InteractionSource::ScheduledTask {
+                task_name: name.clone(),
+            },
+            _ => InteractionSource::Research {
+                topic: intent.description.clone(),
+            },
+        };
+        let summary = if parsed.clean_content.len() > 300 {
+            format!("{}...", &parsed.clean_content[..300])
+        } else {
+            parsed.clean_content.clone()
+        };
+        state.event_bus.emit(EntityEvent::PostInteraction {
+            source,
+            trust: ConversationTrust::Owner,
+            summary,
+            input_tokens: result.total_input_tokens,
+            output_tokens: result.total_output_tokens,
+        });
+    }
+
     // Record outcome for caliber-echo
     if let Some(ref tracker) = state.outcome_tracker {
         let outcome = tracker.build_outcome(
@@ -709,34 +734,9 @@ async fn execute_intent(
     Some(parsed.clean_content)
 }
 
-/// Log intent execution to LOGBOOK.md
+/// Log intent execution to LOGBOOK.md using the unified format.
 fn log_intent_execution(root_dir: &Path, intent: &Intent, summary: &str) {
-    let logbook_path = root_dir.join("journal/LOGBOOK.md");
-    crate::logbook::rotate_if_needed(root_dir, &logbook_path);
-
-    let now = Utc::now();
-    let entry = format!(
-        "\n### {} — Intent: {}\n\n{}\n",
-        now.format("%Y-%m-%d %H:%M UTC"),
-        intent.description,
-        if summary.len() > 500 {
-            format!("{}...", &summary[..500])
-        } else {
-            summary.to_string()
-        },
-    );
-
-    if let Err(e) = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&logbook_path)
-        .and_then(|mut f| {
-            use std::io::Write;
-            f.write_all(entry.as_bytes())
-        })
-    {
-        tracing::error!("Failed to write intent to LOGBOOK: {}", e);
-    }
+    crate::logbook::write_entry(root_dir, "Intent", &intent.description, summary);
 }
 
 // ---------------------------------------------------------------------------
