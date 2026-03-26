@@ -518,11 +518,22 @@ pub fn push_bordered_section<'a>(
                         break;
                     }
 
+                    // Floor to nearest char boundary
+                    let mut safe = available;
+                    while safe > 0 && !remaining.is_char_boundary(safe) {
+                        safe -= 1;
+                    }
+                    if safe == 0 {
+                        rows.push(std::mem::take(&mut current_row));
+                        row_len = 0;
+                        continue;
+                    }
+
                     // Find word boundary for break
-                    let break_at = remaining[..available]
+                    let break_at = remaining[..safe]
                         .rfind(' ')
                         .map(|p| p + 1)
-                        .unwrap_or(available);
+                        .unwrap_or(safe);
 
                     let (chunk, rest) = remaining.split_at(break_at);
                     if !chunk.is_empty() {
