@@ -70,7 +70,6 @@ libc = "0.2"
 pulse-system-types = "0.5"
 
 # Core dependencies (always included — these define an entity)
-chat-echo = "0.2"
 recall-echo = { version = "3.3", features = ["pulse-null"] }
 vigil-pulse = "0.1"
 

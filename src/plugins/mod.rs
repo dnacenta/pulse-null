@@ -2,7 +2,6 @@ pub mod manager;
 pub mod registry;
 
 // Core modules (always included)
-pub mod chat_echo;
 pub mod recall_echo;
 
 // Optional plugins (feature-gated)
