@@ -1,5 +1,6 @@
 pub mod main_screen;
 pub mod splash;
+pub mod welcome;
 pub mod wizard;
 
 use crossterm::event::KeyEvent;
@@ -24,6 +25,7 @@ pub enum EntityState {
 #[derive(Clone, Debug, PartialEq)]
 pub enum AppScreen {
     Splash,
+    Welcome,
     Wizard,
     Main,
 }
@@ -32,6 +34,7 @@ pub enum AppScreen {
 pub enum ScreenAction {
     None,
     SwitchTo(AppScreen),
+    SwitchToEntity(String),
     Quit,
 }
 

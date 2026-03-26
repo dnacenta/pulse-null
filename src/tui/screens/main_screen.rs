@@ -5,7 +5,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Paragraph};
 use ratatui::Frame;
 
-use super::{EntityState, Screen, ScreenAction};
+use super::{AppScreen, EntityState, Screen, ScreenAction};
 use crate::tui::app::AppContext;
 use crate::tui::tabs::chat::{ChatAction, ChatTab};
 use crate::tui::tabs::comms::{CommsFooter, CommsTab};
@@ -27,6 +27,7 @@ pub struct MainScreen {
     pub recall: RecallTab,
     pub fullscreen: bool,
     pub show_help: bool,
+    pub multi_entity: bool,
 }
 
 impl MainScreen {
@@ -41,7 +42,13 @@ impl MainScreen {
             recall: RecallTab::new(),
             fullscreen: false,
             show_help: false,
+            multi_entity: false,
         }
+    }
+
+    pub fn with_multi_entity(mut self, multi: bool) -> Self {
+        self.multi_entity = multi;
+        self
     }
 
     fn next_tab(&mut self) {
@@ -396,7 +403,12 @@ impl Screen for MainScreen {
             Tab::Chat => {
                 if let Some(action) = self.chat.handle_key_input(key, ctx) {
                     match action {
-                        ChatAction::Quit => return ScreenAction::Quit,
+                        ChatAction::Quit => {
+                            if self.multi_entity {
+                                return ScreenAction::SwitchTo(AppScreen::Welcome);
+                            }
+                            return ScreenAction::Quit;
+                        }
                         ChatAction::SendMessage(text) => {
                             self.chat.send_message(text, ctx);
                         }

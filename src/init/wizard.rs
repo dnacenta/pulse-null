@@ -202,6 +202,21 @@ pub async fn run(target_dir: &Path) -> Result<(), Box<dyn std::error::Error>> {
 
     // Create directory structure
     let entity_dir = target_dir.join(entity_name.to_lowercase());
+
+    // Guard against overwriting an existing entity
+    if entity_dir.join("pulse-null.toml").exists() {
+        println!();
+        println!(
+            "  {} Entity \"{}\" already exists at {}",
+            style("⚠").yellow(),
+            entity_name,
+            entity_dir.display()
+        );
+        println!("  Choose a different name or delete the existing entity first.");
+        println!();
+        return Ok(());
+    }
+
     create_directory_structure(&entity_dir)?;
 
     // Generate files
@@ -308,14 +323,15 @@ pub async fn run(target_dir: &Path) -> Result<(), Box<dyn std::error::Error>> {
         "  Entity \"{}\" is ready.",
         style(&entity_name).cyan().bold()
     );
-    println!(
-        "  Run {} to start.",
-        style(format!(
-            "cd {} && pulse-null up",
-            entity_name.to_lowercase()
-        ))
-        .green()
-    );
+
+    // Show the correct startup command based on context
+    let run_hint = if let Some(project_root) = target_dir.parent() {
+        // target_dir is entities/ — user should run from its parent
+        format!("cd {} && pulse-null up", project_root.display())
+    } else {
+        "pulse-null up".to_string()
+    };
+    println!("  Run {} to start.", style(&run_hint).green());
     println!(
         "  Manage plugins with: {}",
         style("pulse-null plugin add|remove <name>").green()

@@ -302,6 +302,11 @@ impl ChatTab {
             return Some(ChatAction::Quit);
         }
 
+        // Esc on empty input when idle: quit / return to menu
+        if key.code == KeyCode::Esc && self.input_is_empty() && self.state == EntityState::Idle {
+            return Some(ChatAction::Quit);
+        }
+
         // Ctrl+C: cancel or clear
         if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
             if self.state != EntityState::Idle {

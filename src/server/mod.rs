@@ -1,4 +1,5 @@
 pub mod auth;
+pub mod boot;
 #[cfg(test)]
 mod e2e_tests;
 mod handlers;
@@ -238,24 +239,7 @@ pub async fn start(config: Config) -> Result<(), Box<dyn std::error::Error>> {
     // Collect plugin routes (stateless — merged after .with_state())
     let plugin_routes = plugin_manager.collect_routes();
 
-    // Rate limiter (10 burst, 2/sec)
-    let limiter = rate_limit::default_limiter();
-
-    let app = Router::new()
-        .route("/health", get(handlers::health::health))
-        .route("/api/status", get(handlers::status::status))
-        .route("/api/dashboard", get(handlers::dashboard::dashboard))
-        .route("/chat", post(handlers::chat::chat))
-        .route_layer(middleware::from_fn_with_state(
-            Arc::clone(&state),
-            auth::require_auth,
-        ))
-        .with_state(Arc::clone(&state))
-        .layer(middleware::from_fn_with_state(
-            limiter,
-            rate_limit::rate_limit,
-        ))
-        .merge(plugin_routes);
+    let app = build_router(Arc::clone(&state), plugin_routes);
 
     let addr = format!("{}:{}", config.server.host, config.server.port);
     let listener = tokio::net::TcpListener::bind(&addr).await?;
@@ -300,11 +284,32 @@ pub async fn start(config: Config) -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+/// Build the Axum router from AppState and optional plugin routes.
+pub fn build_router(state: Arc<AppState>, plugin_routes: Router<()>) -> Router {
+    let limiter = rate_limit::default_limiter();
+
+    Router::new()
+        .route("/health", get(handlers::health::health))
+        .route("/api/status", get(handlers::status::status))
+        .route("/api/dashboard", get(handlers::dashboard::dashboard))
+        .route("/chat", post(handlers::chat::chat))
+        .route_layer(middleware::from_fn_with_state(
+            Arc::clone(&state),
+            auth::require_auth,
+        ))
+        .with_state(Arc::clone(&state))
+        .layer(middleware::from_fn_with_state(
+            limiter,
+            rate_limit::rate_limit,
+        ))
+        .merge(plugin_routes)
+}
+
 /// Ensure all required directories and seed files exist.
 ///
 /// Called on every startup so that entities created before certain features
 /// were added (or set up manually) get the infrastructure they need.
-fn ensure_infrastructure(root_dir: &std::path::Path) {
+pub fn ensure_infrastructure(root_dir: &std::path::Path) {
     let dirs = [
         "memory",
         "sessions",
