@@ -67,6 +67,7 @@ pub async fn run(
         provider,
         tools,
         system_prompt.map(|s| s.to_string()),
+        None, // no event bus in standalone TUI mode
     );
 
     let entity_available = config.is_some();
@@ -247,12 +248,16 @@ pub async fn run_chat(
         original_hook(info);
     }));
 
+    // Create event bus for chat mode (enables PostInteraction emission)
+    let event_bus = Arc::new(crate::events::EventBus::new(64));
+
     let mut ctx = AppContext::new(
         Some(config.clone()),
         Some(root_dir.to_path_buf()),
         Some(provider),
         Some(tools),
         Some(system_prompt.to_string()),
+        Some(Arc::clone(&event_bus)),
     );
 
     let mut main = MainScreen::new(&config.entity.name, &config.entity.owner_alias);

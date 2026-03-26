@@ -5,6 +5,7 @@ use std::time::Instant;
 use tokio::sync::Mutex;
 
 use crate::config::Config;
+use crate::events::EventBus;
 use crate::peer::PeerClient;
 use crate::streaming::StreamingProvider;
 use crate::tools::ToolRegistry;
@@ -20,6 +21,7 @@ pub struct AppContext {
     pub tools: Option<Arc<ToolRegistry>>,
     pub system_prompt: Option<String>,
     pub peer_client: Option<Arc<Mutex<PeerClient>>>,
+    pub event_bus: Option<Arc<EventBus>>,
     pub tokens_in: u32,
     pub tokens_out: u32,
     pub session_start: Instant,
@@ -32,6 +34,7 @@ impl AppContext {
         provider: Option<Arc<dyn StreamingProvider>>,
         tools: Option<Arc<ToolRegistry>>,
         system_prompt: Option<String>,
+        event_bus: Option<Arc<EventBus>>,
     ) -> Self {
         let entity_name = config.as_ref().map(|c| c.entity.name.clone());
         let model_name = config.as_ref().map(|c| c.llm.model.clone());
@@ -52,6 +55,7 @@ impl AppContext {
             tools,
             system_prompt,
             peer_client,
+            event_bus,
             tokens_in: 0,
             tokens_out: 0,
             session_start: Instant::now(),
