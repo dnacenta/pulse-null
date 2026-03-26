@@ -113,6 +113,12 @@ pub async fn start(config: Config) -> Result<(), Box<dyn std::error::Error>> {
         root_dir.clone(),
     )));
     tools.register(Box::new(crate::tools::web_fetch::WebFetchTool::new()));
+    #[cfg(feature = "graph")]
+    if config.graph.enabled {
+        tools.register(Box::new(crate::tools::graph_query::GraphQueryTool::new(
+            root_dir.clone(),
+        )));
+    }
     tracing::info!("Registered {} built-in tool(s)", tools.definitions().len());
 
     // Initialize and start plugins
@@ -168,6 +174,16 @@ pub async fn start(config: Config) -> Result<(), Box<dyn std::error::Error>> {
         outcome_tracker,
         context_buffer,
     });
+
+    // Startup pipeline health check — archive bloated documents immediately
+    if let Some(ref monitor) = state.pipeline_monitor {
+        let thresholds = config.pipeline.to_thresholds();
+        let health = monitor.calculate(&root_dir, &thresholds);
+        let archived = monitor.check_and_archive(&root_dir, &thresholds, &health);
+        for doc in &archived {
+            tracing::info!("Startup: auto-archived overflow from {}", doc);
+        }
+    }
 
     // Load schedule and intent queue, start scheduler
     let schedule = Schedule::load(&root_dir)?;
@@ -294,9 +310,15 @@ fn ensure_infrastructure(root_dir: &std::path::Path) {
         "sessions",
         "archives",
         "archives/conversations",
+        "archives/learning",
+        "archives/thoughts",
+        "archives/curiosity",
+        "archives/reflections",
+        "archives/praxis",
         "journal",
         "logs",
         "monitoring",
+        "task-output",
     ];
 
     for d in &dirs {
@@ -315,6 +337,16 @@ fn ensure_infrastructure(root_dir: &std::path::Path) {
         ("memory/MEMORY.md", ""),
         ("memory/EPHEMERAL.md", ""),
         ("memory/ARCHIVE.md", "# Archive Index\n"),
+        ("journal/LOGBOOK.md", "# LOGBOOK\n"),
+        ("journal/LEARNING.md", "# LEARNING\n"),
+        ("journal/THOUGHTS.md", "# THOUGHTS\n"),
+        ("journal/CURIOSITY.md", "# CURIOSITY\n"),
+        ("journal/REFLECTIONS.md", "# REFLECTIONS\n"),
+        ("journal/PRAXIS.md", "# PRAXIS\n"),
+        (
+            "archives/conversations/INDEX.md",
+            "# Conversation Archive Index\n\n| # | Channel | Date | File |\n|---|---------|------|------|\n",
+        ),
     ];
 
     for (path, default_content) in seed_files {
