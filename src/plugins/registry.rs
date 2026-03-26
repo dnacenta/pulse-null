@@ -19,12 +19,6 @@ pub fn known_plugins() -> Vec<RegistryEntry> {
             available: cfg!(feature = "voice"),
         },
         RegistryEntry {
-            name: "chat-echo".to_string(),
-            description: "Web chat UI for pulse-null".to_string(),
-            version: "0.1.0".to_string(),
-            available: true,
-        },
-        RegistryEntry {
             name: "discord-echo".to_string(),
             description: "Discord bot presence and voice channels".to_string(),
             version: "0.1.0".to_string(),
@@ -32,7 +26,7 @@ pub fn known_plugins() -> Vec<RegistryEntry> {
         },
         RegistryEntry {
             name: "recall-echo".to_string(),
-            description: "Three-layer persistent memory system".to_string(),
+            description: "Four-layer persistent memory with knowledge graph".to_string(),
             version: "0.6.0".to_string(),
             available: true,
         },
@@ -73,7 +67,6 @@ pub fn find_plugin(name: &str) -> Option<RegistryEntry> {
 pub fn create_plugin(name: &str) -> Option<Box<dyn Plugin>> {
     match name {
         // Core plugins (always available)
-        "chat-echo" => Some(Box::new(super::chat_echo::ChatEchoPlugin::new())),
         "recall-echo" => Some(Box::new(super::recall_echo::RecallEchoPlugin::new())),
         "praxis-echo" => Some(Box::new(crate::praxis::PraxisEchoPlugin::new())),
         "caliber-echo" => Some(Box::new(crate::caliber::CaliberEchoPlugin::new())),
@@ -123,7 +116,6 @@ mod tests {
         let plugins = known_plugins();
         let names: Vec<&str> = plugins.iter().map(|p| p.name.as_str()).collect();
         assert!(names.contains(&"voice-echo"));
-        assert!(names.contains(&"chat-echo"));
         assert!(names.contains(&"discord-echo"));
         assert!(names.contains(&"recall-echo"));
         assert!(names.contains(&"praxis-echo"));
