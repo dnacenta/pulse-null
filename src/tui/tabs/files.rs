@@ -530,10 +530,7 @@ pub fn push_bordered_section<'a>(
                     }
 
                     // Find word boundary for break
-                    let break_at = remaining[..safe]
-                        .rfind(' ')
-                        .map(|p| p + 1)
-                        .unwrap_or(safe);
+                    let break_at = remaining[..safe].rfind(' ').map(|p| p + 1).unwrap_or(safe);
 
                     let (chunk, rest) = remaining.split_at(break_at);
                     if !chunk.is_empty() {

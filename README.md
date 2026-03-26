@@ -19,7 +19,7 @@ This isn't about making the AI "smarter" in a benchmark sense. It's about creati
 
 Two core systems make this work:
 
-- **recall-echo** handles persistent memory — three-layer storage, ranked search, archival, and distillation
+- **recall-echo** handles persistent memory — four-layer storage (knowledge graph, curated facts, recent sessions, full archives), semantic and ranked search, Bayesian confidence, archival, and distillation
 - **vigil-pulse** provides metacognitive monitoring — pipeline enforcement, reflection quality tracking, and outcome measurement
 
 Together with the document pipeline, they form a self-monitoring layer — the entity doesn't just think, it watches itself think.
@@ -97,7 +97,9 @@ When signals indicate problems, it provides specific suggestions — try a new d
 
 ## Memory System
 
-Every entity gets a three-layer memory system designed around a simple principle: the entity should always have the right context without drowning in history.
+Every entity gets a four-layer memory system designed around a simple principle: the entity should always have the right context without drowning in history.
+
+**Layer 0 — Knowledge Graph**: An embedded SurrealDB graph database with FastEmbed local embeddings. Stores entities (people, projects, tools, concepts), relationships with Bayesian confidence scoring, and conversation episodes. Semantic search finds memories by meaning, not just keywords. Re-extracted relationships gain confidence through Bayesian corroboration over time.
 
 **Layer 1 — MEMORY.md** (Curated Memory): The source of truth. Distilled facts, preferences, patterns, key decisions. Always loaded into the entity's context at session start. Kept concise — under 200 lines. When it approaches capacity, older entries are distilled or promoted to the archive.
 
@@ -162,8 +164,8 @@ The init wizard walks you through naming your entity, defining its personality, 
                          │                                             │
                          │  ┌──────────────────────────────────────┐   │
                          │  │  recall-echo (Memory System)         │   │
-                         │  │  Three-layer memory, archival,       │   │
-                         │  │  ranked search, checkpointing        │   │
+                         │  │  Four-layer memory, knowledge graph, │   │
+                         │  │  Bayesian confidence, semantic search │   │
                          │  └──────────────────────────────────────┘   │
                          └─────────────────────────────────────────────┘
 ```
@@ -203,7 +205,8 @@ my-entity/
 │   ├── MEMORY.md                 # Curated knowledge (always in context)
 │   ├── EPHEMERAL.md              # Last 5 session summaries
 │   ├── ARCHIVE.md                # Long-term archive index
-│   └── conversations/            # Full conversation archives
+│   ├── conversations/            # Full conversation archives
+│   └── graph/                    # Knowledge graph (SurrealDB + embeddings)
 │
 ├── journal/
 │   ├── LEARNING.md               # Active research threads (capture)
