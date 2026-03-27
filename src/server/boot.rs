@@ -6,6 +6,7 @@ use tokio::task::JoinHandle;
 
 use crate::config::Config;
 use crate::events::EventBus;
+use crate::persist::PersistCoordinator;
 use crate::plugins::manager::PluginManager;
 use crate::scheduler::intent::IntentQueue;
 use crate::scheduler::Schedule;
@@ -21,6 +22,7 @@ pub struct BootedEntity {
     pub scheduler_handles: Vec<JoinHandle<()>>,
     pub event_bus: Arc<EventBus>,
     pub actual_port: u16,
+    pub persist_coordinator: Arc<PersistCoordinator>,
 }
 
 /// Boot an entity's HTTP server and scheduler as background tasks.
@@ -109,14 +111,19 @@ pub async fn boot_entity(
     // Event bus
     let event_bus = Arc::new(EventBus::new(64));
 
+    // Persist coordinator
+    let persist_coordinator = Arc::new(PersistCoordinator::new());
+
     // Session store
-    let session_store = SessionStore::new(&root_dir, &config.sessions).await;
+    let mut session_store = SessionStore::new(&root_dir, &config.sessions).await;
+    session_store.set_coordinator(Arc::clone(&persist_coordinator));
 
     // Context buffer
     let context_buffer = if config.context_buffer.enabled {
-        Some(
-            crate::context_buffer::ContextBufferStore::new(&root_dir, &config.context_buffer).await,
-        )
+        let mut cb =
+            crate::context_buffer::ContextBufferStore::new(&root_dir, &config.context_buffer).await;
+        cb.set_coordinator(Arc::clone(&persist_coordinator));
+        Some(cb)
     } else {
         None
     };
@@ -133,6 +140,7 @@ pub async fn boot_entity(
         cognitive_monitor,
         outcome_tracker,
         context_buffer,
+        persist_coordinator,
     });
 
     // Pipeline health check
@@ -221,5 +229,6 @@ pub async fn boot_entity(
         scheduler_handles,
         event_bus,
         actual_port,
+        persist_coordinator: Arc::clone(&state.persist_coordinator),
     })
 }

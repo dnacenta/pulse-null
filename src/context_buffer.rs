@@ -1,9 +1,12 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use tokio::sync::RwLock;
+
+use crate::persist::PersistCoordinator;
 
 /// Maximum characters to store per assistant response in the buffer.
 const MAX_ENTRY_CHARS: usize = 500;
@@ -48,6 +51,7 @@ pub struct ContextBufferStore {
     buffers: RwLock<HashMap<String, ChannelBuffer>>,
     root_dir: PathBuf,
     max_messages: usize,
+    coordinator: Option<Arc<PersistCoordinator>>,
 }
 
 impl ContextBufferStore {
@@ -57,9 +61,15 @@ impl ContextBufferStore {
             buffers: RwLock::new(HashMap::new()),
             root_dir: root_dir.to_path_buf(),
             max_messages: config.max_messages,
+            coordinator: None,
         };
         store.load_from_disk().await;
         store
+    }
+
+    /// Attach a persist coordinator for tracked writes.
+    pub fn set_coordinator(&mut self, coordinator: Arc<PersistCoordinator>) {
+        self.coordinator = Some(coordinator);
     }
 
     /// Load existing context-buffer-*.json files from the entity root.
@@ -163,13 +173,13 @@ impl ContextBufferStore {
 
     /// Persist a channel buffer to disk as both JSON and markdown.
     /// Runs on Tokio's blocking thread pool to avoid freezing the async runtime.
+    /// When a PersistCoordinator is attached, writes are tracked so shutdown can
+    /// wait for them to complete.
     fn persist_buffer(&self, buffer: &ChannelBuffer) {
         let root_dir = self.root_dir.clone();
         let buffer = buffer.clone();
 
-        // Detach the handle intentionally — persist is best-effort, fire-and-forget.
-        #[allow(clippy::let_underscore_future)]
-        let _ = tokio::task::spawn_blocking(move || {
+        let write_fn = move || {
             let safe_channel = sanitize_channel_name(&buffer.channel);
 
             // Write JSON (machine-readable, for reload)
@@ -196,7 +206,15 @@ impl ContextBufferStore {
             if let Err(e) = std::fs::write(&md_path, md) {
                 tracing::warn!("Failed to write context buffer markdown: {}", e);
             }
-        });
+        };
+
+        if let Some(ref coordinator) = self.coordinator {
+            coordinator.track(write_fn);
+        } else {
+            // Fallback: untracked spawn_blocking (for tests and CLI usage)
+            #[allow(clippy::let_underscore_future)]
+            let _ = tokio::task::spawn_blocking(write_fn);
+        }
     }
 }
 

@@ -18,6 +18,7 @@ use tokio::sync::RwLock;
 
 use crate::config::Config;
 use crate::events::EventBus;
+use crate::persist::PersistCoordinator;
 use crate::pidfile;
 use crate::plugins::manager::PluginManager;
 use crate::scheduler::intent::IntentQueue;
@@ -40,6 +41,7 @@ pub struct AppState {
     pub cognitive_monitor: Option<Arc<dyn CognitiveMonitor>>,
     pub outcome_tracker: Option<Arc<dyn OutcomeTracker>>,
     pub context_buffer: Option<crate::context_buffer::ContextBufferStore>,
+    pub persist_coordinator: Arc<PersistCoordinator>,
 }
 
 pub async fn start(config: Config) -> Result<(), Box<dyn std::error::Error>> {
@@ -143,8 +145,12 @@ pub async fn start(config: Config) -> Result<(), Box<dyn std::error::Error>> {
     // Create event bus
     let event_bus = Arc::new(EventBus::new(64));
 
+    // Create the persist coordinator (tracks fire-and-forget writes for graceful shutdown)
+    let persist_coordinator = Arc::new(PersistCoordinator::new());
+
     // Initialize session store (loads persisted sessions from disk)
-    let session_store = SessionStore::new(&root_dir, &config.sessions).await;
+    let mut session_store = SessionStore::new(&root_dir, &config.sessions).await;
+    session_store.set_coordinator(Arc::clone(&persist_coordinator));
     let loaded_count = session_store.count().await;
     if loaded_count > 0 {
         tracing::info!("{} session(s) restored from disk", loaded_count);
@@ -152,8 +158,9 @@ pub async fn start(config: Config) -> Result<(), Box<dyn std::error::Error>> {
 
     // Initialize context buffer (loads persisted buffers from disk)
     let context_buffer = if config.context_buffer.enabled {
-        let cb =
+        let mut cb =
             crate::context_buffer::ContextBufferStore::new(&root_dir, &config.context_buffer).await;
+        cb.set_coordinator(Arc::clone(&persist_coordinator));
         tracing::info!(
             "Context buffer enabled (max {} messages per channel)",
             config.context_buffer.max_messages
@@ -175,6 +182,7 @@ pub async fn start(config: Config) -> Result<(), Box<dyn std::error::Error>> {
         cognitive_monitor,
         outcome_tracker,
         context_buffer,
+        persist_coordinator,
     });
 
     // Startup pipeline health check — archive bloated documents immediately
@@ -263,6 +271,15 @@ pub async fn start(config: Config) -> Result<(), Box<dyn std::error::Error>> {
     axum::serve(listener, app)
         .with_graceful_shutdown(shutdown)
         .await?;
+
+    // Flush any in-flight persistence tasks before archiving
+    let flushed = state
+        .persist_coordinator
+        .flush(std::time::Duration::from_secs(5))
+        .await;
+    if !flushed {
+        tracing::warn!("Some persistence tasks did not complete before shutdown");
+    }
 
     // Archive all sessions on shutdown and persist to disk
     state

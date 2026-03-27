@@ -118,23 +118,25 @@ impl RecallTab {
         let (tx, rx) = mpsc::channel();
         self.pending_load = Some(rx);
 
-        std::thread::spawn(move || {
-            let result = (|| {
-                let rt = tokio::runtime::Runtime::new().map_err(|e| format!("Runtime: {e}"))?;
-                rt.block_on(async {
-                    let gm = recall_echo::graph::GraphMemory::open(&graph_dir)
-                        .await
-                        .map_err(|e| format!("Graph open: {e}"))?;
+        // Capture the current runtime handle so we can run async graph queries
+        // inside spawn_blocking without creating a nested Runtime.
+        let handle = tokio::runtime::Handle::current();
 
-                    let stats = gm.stats().await.map_err(|e| format!("Stats: {e}"))?;
-                    let pipeline = gm
-                        .pipeline_stats(7)
-                        .await
-                        .map_err(|e| format!("Pipeline: {e}"))?;
+        #[allow(clippy::let_underscore_future)]
+        let _ = tokio::task::spawn_blocking(move || {
+            let result = handle.block_on(async {
+                let gm = recall_echo::graph::GraphMemory::open(&graph_dir)
+                    .await
+                    .map_err(|e| format!("Graph open: {e}"))?;
 
-                    Ok::<_, String>((stats, pipeline))
-                })
-            })();
+                let stats = gm.stats().await.map_err(|e| format!("Stats: {e}"))?;
+                let pipeline = gm
+                    .pipeline_stats(7)
+                    .await
+                    .map_err(|e| format!("Pipeline: {e}"))?;
+
+                Ok::<_, String>((stats, pipeline))
+            });
 
             let load_result = match result {
                 Ok((stats, pipeline)) => {

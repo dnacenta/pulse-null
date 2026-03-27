@@ -479,6 +479,7 @@ async fn boot_and_enter(
             server_handle: booted.server_handle,
             scheduler_handles: booted.scheduler_handles,
             event_bus: booted.event_bus,
+            persist_coordinator: booted.persist_coordinator,
         });
 
     ctx.load_entity(&config, created_dir)?;

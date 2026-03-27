@@ -14,6 +14,7 @@ mod init;
 mod logbook;
 mod ollama_provider;
 mod peer;
+mod persist;
 mod pidfile;
 mod plugins;
 mod praxis;

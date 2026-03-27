@@ -99,6 +99,7 @@ async fn run_multi_entity(
                         server_handle: booted.server_handle,
                         scheduler_handles: booted.scheduler_handles,
                         event_bus: booted.event_bus,
+                        persist_coordinator: booted.persist_coordinator,
                     });
             }
             Err(e) => {

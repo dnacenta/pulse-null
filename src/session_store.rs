@@ -1,11 +1,14 @@
 use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use chrono::{DateTime, Utc};
 use pulse_system_types::llm::Message;
 use serde::{Deserialize, Serialize};
 use tokio::sync::RwLock;
+
+use crate::persist::PersistCoordinator;
 
 /// Serializable session state persisted to disk.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -67,6 +70,7 @@ pub struct SessionStore {
     sessions_dir: PathBuf,
     ttl_seconds: u64,
     max_sessions: usize,
+    coordinator: Option<Arc<PersistCoordinator>>,
 }
 
 impl SessionStore {
@@ -82,6 +86,7 @@ impl SessionStore {
             sessions_dir: sessions_dir.clone(),
             ttl_seconds: config.ttl_seconds,
             max_sessions: config.max_sessions,
+            coordinator: None,
         };
 
         // Load persisted sessions
@@ -140,6 +145,11 @@ impl SessionStore {
         if loaded > 0 {
             tracing::info!("Loaded {} persisted session(s)", loaded);
         }
+    }
+
+    /// Attach a persist coordinator for tracked writes.
+    pub fn set_coordinator(&mut self, coordinator: Arc<PersistCoordinator>) {
+        self.coordinator = Some(coordinator);
     }
 
     /// Derive a session key from channel and sender.
@@ -234,13 +244,13 @@ impl SessionStore {
 
     /// Write session data to disk atomically.
     /// Runs on Tokio's blocking thread pool to avoid freezing the async runtime.
+    /// When a PersistCoordinator is attached, writes are tracked so shutdown can
+    /// wait for them to complete.
     fn persist_session_data(&self, data: &SessionData) {
         let sessions_dir = self.sessions_dir.clone();
         let data = data.clone();
 
-        // Detach the handle intentionally — persist is best-effort, fire-and-forget.
-        #[allow(clippy::let_underscore_future)]
-        let _ = tokio::task::spawn_blocking(move || {
+        let write_fn = move || {
             let filename = Self::key_to_filename(&data.key);
             let path = sessions_dir.join(&filename);
             let tmp_path = sessions_dir.join(format!("{}.tmp", filename));
@@ -260,7 +270,15 @@ impl SessionStore {
                     tracing::warn!("Failed to serialize session {}: {}", data.key, e);
                 }
             }
-        });
+        };
+
+        if let Some(ref coordinator) = self.coordinator {
+            coordinator.track(write_fn);
+        } else {
+            // Fallback: untracked spawn_blocking (for tests and CLI usage)
+            #[allow(clippy::let_underscore_future)]
+            let _ = tokio::task::spawn_blocking(write_fn);
+        }
     }
 
     /// Persist all dirty sessions to disk.
