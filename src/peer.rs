@@ -53,16 +53,19 @@ impl std::fmt::Display for PeerError {
 pub struct PeerClient {
     http: reqwest::Client,
     peers: HashMap<String, PeerConfig>,
+    /// This entity's name, sent as X-Peer-Name for peer authentication.
+    entity_name: String,
 }
 
 impl PeerClient {
-    pub fn new(peers: HashMap<String, PeerConfig>) -> Self {
+    pub fn new(peers: HashMap<String, PeerConfig>, entity_name: String) -> Self {
         Self {
             http: reqwest::Client::builder()
                 .timeout(Duration::from_secs(120))
                 .build()
                 .expect("failed to build HTTP client"),
             peers,
+            entity_name,
         }
     }
 
@@ -113,6 +116,9 @@ impl PeerClient {
             "channel": channel,
             "sender": sender,
         }));
+
+        // Identify ourselves for peer authentication
+        req = req.header("X-Peer-Name", &self.entity_name);
 
         if let Some(secret) = &peer.secret {
             req = req.header("X-Echo-Secret", secret);

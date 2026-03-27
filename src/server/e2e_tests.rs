@@ -18,6 +18,7 @@ use crate::config::{
     TrustConfig,
 };
 use crate::events::EventBus;
+use crate::persist::PersistCoordinator;
 use crate::server::handlers;
 use crate::server::AppState;
 use crate::tools::ToolRegistry;
@@ -150,6 +151,7 @@ async fn build_state(provider: MockProvider, tools: ToolRegistry) -> Arc<AppStat
         cognitive_monitor: None,
         outcome_tracker: None,
         context_buffer: None,
+        persist_coordinator: Arc::new(PersistCoordinator::new()),
     })
 }
 

@@ -6,6 +6,7 @@ use tokio::task::JoinHandle;
 
 use crate::config::Config;
 use crate::events::EventBus;
+use crate::persist::PersistCoordinator;
 
 /// Runtime information about a single booted entity.
 pub struct RunningEntity {
@@ -17,6 +18,7 @@ pub struct RunningEntity {
     pub scheduler_handles: Vec<JoinHandle<()>>,
     #[allow(dead_code)]
     pub event_bus: Arc<EventBus>,
+    pub persist_coordinator: Arc<PersistCoordinator>,
 }
 
 /// Snapshot of an entity for display in the TUI (no handles, cheap to clone).
@@ -88,9 +90,33 @@ impl EntityRegistry {
     }
 
     /// Gracefully shut down all entities.
+    ///
+    /// Flushes in-flight persistence tasks before aborting server/scheduler
+    /// handles so no writes are lost on shutdown.
     pub async fn shutdown_all(&mut self) {
         for (name, entity) in self.entities.drain() {
             tracing::info!("Shutting down entity: {}", name);
+
+            // Flush any in-flight persistence tasks (5s timeout per entity)
+            let in_flight = entity.persist_coordinator.in_flight_count();
+            if in_flight > 0 {
+                tracing::info!(
+                    "{}: flushing {} in-flight persistence task(s)",
+                    name,
+                    in_flight
+                );
+            }
+            let flushed = entity
+                .persist_coordinator
+                .flush(std::time::Duration::from_secs(5))
+                .await;
+            if !flushed {
+                tracing::warn!(
+                    "{}: some persistence tasks did not complete before shutdown",
+                    name
+                );
+            }
+
             entity.server_handle.abort();
             for h in entity.scheduler_handles {
                 h.abort();

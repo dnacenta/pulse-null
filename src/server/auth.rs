@@ -8,8 +8,12 @@ use axum::response::Response;
 use super::AppState;
 
 /// Authentication middleware.
-/// If `security.secret` is set in config, requires `X-Echo-Secret` header on all
-/// routes except /health. Returns 401 if missing or incorrect.
+///
+/// Checks authentication in this order:
+/// 1. Skip auth for /health endpoint
+/// 2. If `X-Peer-Name` header is present, validate against that peer's configured secret
+/// 3. If no peer match, fall back to global `security.secret` check
+/// 4. If no global secret configured, allow all requests
 pub async fn require_auth(
     state: axum::extract::State<Arc<AppState>>,
     req: Request,
@@ -20,13 +24,49 @@ pub async fn require_auth(
         return Ok(next.run(req).await);
     }
 
-    // If no secret configured, allow all requests
+    // Check for peer authentication: if X-Peer-Name is present,
+    // validate against that peer's configured secret
+    let peer_name = req
+        .headers()
+        .get("X-Peer-Name")
+        .and_then(|v| v.to_str().ok());
+
+    if let Some(name) = peer_name {
+        if let Some(peer_config) = state.config.peers.get(name) {
+            // Peer exists in config — check if it has a secret requirement
+            if let Some(ref peer_secret) = peer_config.secret {
+                let provided = req
+                    .headers()
+                    .get("X-Echo-Secret")
+                    .and_then(|v| v.to_str().ok());
+
+                match provided {
+                    Some(value) if value == peer_secret => return Ok(next.run(req).await),
+                    _ => {
+                        tracing::warn!(
+                            "Peer auth failed: {} provided wrong or missing secret for {}",
+                            name,
+                            req.uri().path()
+                        );
+                        return Err(StatusCode::UNAUTHORIZED);
+                    }
+                }
+            } else {
+                // Peer has no secret configured — fall through to global auth.
+                // Do NOT bypass the global secret: claiming a peer identity
+                // without a per-peer secret must not grant elevated access.
+            }
+        }
+        // X-Peer-Name present but not a known peer — fall through to global auth
+    }
+
+    // Fall back to global secret check
     let secret = match &state.config.security.secret {
         Some(s) => s,
         None => return Ok(next.run(req).await),
     };
 
-    // Check X-Echo-Secret header
+    // Check X-Echo-Secret header against global secret
     let provided = req
         .headers()
         .get("X-Echo-Secret")
@@ -64,6 +104,7 @@ mod tests {
         ServerConfig, SessionConfig, TrustConfig,
     };
     use crate::events::EventBus;
+    use crate::persist::PersistCoordinator;
     use crate::tools::ToolRegistry;
 
     async fn test_state(secret: Option<String>) -> Arc<AppState> {
@@ -119,6 +160,7 @@ mod tests {
             cognitive_monitor: None,
             outcome_tracker: None,
             context_buffer: None,
+            persist_coordinator: Arc::new(PersistCoordinator::new()),
         })
     }
 
@@ -214,5 +256,234 @@ mod tests {
             .unwrap();
 
         assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    // ─── Peer authentication tests ──────────────────────────────────────────
+
+    async fn test_state_with_peers(
+        global_secret: Option<String>,
+        peers: std::collections::HashMap<String, crate::config::PeerConfig>,
+    ) -> Arc<AppState> {
+        let root_dir = std::env::temp_dir();
+        let config = Config {
+            entity: EntityConfig {
+                name: "Test".into(),
+                owner_name: "Owner".into(),
+                owner_alias: "O".into(),
+                rules_dir: None,
+            },
+            server: ServerConfig::default(),
+            llm: LlmConfig {
+                provider: "claude".into(),
+                api_key: None,
+                model: "test".into(),
+                max_tokens: 1024,
+                base_url: None,
+                claude_bin: None,
+                context_budget: 0,
+            },
+            security: SecurityConfig {
+                secret: global_secret,
+                injection_detection: true,
+            },
+            trust: TrustConfig::default(),
+            memory: MemoryConfig::default(),
+            scheduler: SchedulerConfig::default(),
+            pipeline: PipelineConfig::default(),
+            monitoring: MonitoringConfig::default(),
+            autonomy: AutonomyConfig::default(),
+            pulse: PulseConfig::default(),
+            graph: GraphConfig::default(),
+            sessions: SessionConfig::default(),
+            context_buffer: crate::context_buffer::ContextBufferConfig::default(),
+            peers,
+            plugins: std::collections::HashMap::new(),
+        };
+        let session_store =
+            crate::session_store::SessionStore::new(&root_dir, &config.sessions).await;
+        Arc::new(AppState {
+            config,
+            provider: Box::new(crate::claude_provider::ClaudeProvider::new(
+                "fake".into(),
+                "test".into(),
+            )),
+            session_store,
+            system_prompt: RwLock::new(String::new()),
+            tools: ToolRegistry::new(),
+            event_bus: Arc::new(EventBus::new(16)),
+            root_dir,
+            pipeline_monitor: None,
+            cognitive_monitor: None,
+            outcome_tracker: None,
+            context_buffer: None,
+            persist_coordinator: Arc::new(PersistCoordinator::new()),
+        })
+    }
+
+    #[tokio::test]
+    async fn test_peer_correct_secret_allows() {
+        let mut peers = std::collections::HashMap::new();
+        peers.insert(
+            "Nova".to_string(),
+            crate::config::PeerConfig {
+                host: "127.0.0.1".to_string(),
+                port: 3200,
+                secret: Some("nova-secret".to_string()),
+            },
+        );
+        let state = test_state_with_peers(Some("global-secret".into()), peers).await;
+        let app = build_app(state);
+
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/chat")
+                    .header("X-Peer-Name", "Nova")
+                    .header("X-Echo-Secret", "nova-secret")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn test_peer_wrong_secret_returns_401() {
+        let mut peers = std::collections::HashMap::new();
+        peers.insert(
+            "Nova".to_string(),
+            crate::config::PeerConfig {
+                host: "127.0.0.1".to_string(),
+                port: 3200,
+                secret: Some("nova-secret".to_string()),
+            },
+        );
+        let state = test_state_with_peers(None, peers).await;
+        let app = build_app(state);
+
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/chat")
+                    .header("X-Peer-Name", "Nova")
+                    .header("X-Echo-Secret", "wrong-secret")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn test_peer_no_secret_falls_through_to_global() {
+        let mut peers = std::collections::HashMap::new();
+        peers.insert(
+            "Nova".to_string(),
+            crate::config::PeerConfig {
+                host: "127.0.0.1".to_string(),
+                port: 3200,
+                secret: None,
+            },
+        );
+        let state = test_state_with_peers(Some("global-secret".into()), peers).await;
+        let app = build_app(state);
+
+        // Peer has no per-peer secret — must NOT bypass the global secret.
+        // Without X-Echo-Secret matching the global secret, this should be 401.
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/chat")
+                    .header("X-Peer-Name", "Nova")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn test_peer_no_secret_no_global_secret_allows() {
+        let mut peers = std::collections::HashMap::new();
+        peers.insert(
+            "Nova".to_string(),
+            crate::config::PeerConfig {
+                host: "127.0.0.1".to_string(),
+                port: 3200,
+                secret: None,
+            },
+        );
+        let state = test_state_with_peers(None, peers).await;
+        let app = build_app(state);
+
+        // No per-peer secret AND no global secret — falls through and allows
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/chat")
+                    .header("X-Peer-Name", "Nova")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn test_unknown_peer_falls_through_to_global() {
+        let peers = std::collections::HashMap::new();
+        let state = test_state_with_peers(Some("global-secret".into()), peers).await;
+        let app = build_app(state);
+
+        // Unknown peer name — should fall through to global secret check and fail
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/chat")
+                    .header("X-Peer-Name", "Unknown")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn test_peer_missing_secret_returns_401() {
+        let mut peers = std::collections::HashMap::new();
+        peers.insert(
+            "Nova".to_string(),
+            crate::config::PeerConfig {
+                host: "127.0.0.1".to_string(),
+                port: 3200,
+                secret: Some("nova-secret".to_string()),
+            },
+        );
+        let state = test_state_with_peers(None, peers).await;
+        let app = build_app(state);
+
+        // Peer claims to be Nova but doesn't send X-Echo-Secret
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/chat")
+                    .header("X-Peer-Name", "Nova")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
     }
 }

@@ -47,9 +47,12 @@ impl AppContext {
         let entity_name = config.as_ref().map(|c| c.entity.name.clone());
         let model_name = config.as_ref().map(|c| c.llm.model.clone());
 
-        let peer_client = config
-            .as_ref()
-            .map(|c| Arc::new(Mutex::new(PeerClient::new(c.peers.clone()))));
+        let peer_client = config.as_ref().map(|c| {
+            Arc::new(Mutex::new(PeerClient::new(
+                c.peers.clone(),
+                c.entity.name.clone(),
+            )))
+        });
 
         let config_path = Config::find_config().ok();
 
@@ -126,7 +129,10 @@ impl AppContext {
             )));
         }
 
-        let peer_client = Arc::new(Mutex::new(PeerClient::new(config.peers.clone())));
+        let peer_client = Arc::new(Mutex::new(PeerClient::new(
+            config.peers.clone(),
+            config.entity.name.clone(),
+        )));
 
         self.config = Some(config.clone());
         self.entity_name = Some(config.entity.name.clone());
