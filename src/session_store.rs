@@ -233,26 +233,34 @@ impl SessionStore {
     }
 
     /// Write session data to disk atomically.
+    /// Runs on Tokio's blocking thread pool to avoid freezing the async runtime.
     fn persist_session_data(&self, data: &SessionData) {
-        let filename = Self::key_to_filename(&data.key);
-        let path = self.sessions_dir.join(&filename);
-        let tmp_path = self.sessions_dir.join(format!("{}.tmp", filename));
+        let sessions_dir = self.sessions_dir.clone();
+        let data = data.clone();
 
-        match serde_json::to_string_pretty(data) {
-            Ok(json) => {
-                if let Err(e) = fs::write(&tmp_path, &json) {
-                    tracing::warn!("Failed to write session tmp file: {}", e);
-                    return;
+        // Detach the handle intentionally — persist is best-effort, fire-and-forget.
+        #[allow(clippy::let_underscore_future)]
+        let _ = tokio::task::spawn_blocking(move || {
+            let filename = Self::key_to_filename(&data.key);
+            let path = sessions_dir.join(&filename);
+            let tmp_path = sessions_dir.join(format!("{}.tmp", filename));
+
+            match serde_json::to_string_pretty(&data) {
+                Ok(json) => {
+                    if let Err(e) = fs::write(&tmp_path, &json) {
+                        tracing::warn!("Failed to write session tmp file: {}", e);
+                        return;
+                    }
+                    if let Err(e) = fs::rename(&tmp_path, &path) {
+                        tracing::warn!("Failed to rename session file: {}", e);
+                        let _ = fs::remove_file(&tmp_path);
+                    }
                 }
-                if let Err(e) = fs::rename(&tmp_path, &path) {
-                    tracing::warn!("Failed to rename session file: {}", e);
-                    let _ = fs::remove_file(&tmp_path);
+                Err(e) => {
+                    tracing::warn!("Failed to serialize session {}: {}", data.key, e);
                 }
             }
-            Err(e) => {
-                tracing::warn!("Failed to serialize session {}: {}", data.key, e);
-            }
-        }
+        });
     }
 
     /// Persist all dirty sessions to disk.

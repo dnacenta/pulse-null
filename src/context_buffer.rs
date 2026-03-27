@@ -162,39 +162,41 @@ impl ContextBufferStore {
     }
 
     /// Persist a channel buffer to disk as both JSON and markdown.
+    /// Runs on Tokio's blocking thread pool to avoid freezing the async runtime.
     fn persist_buffer(&self, buffer: &ChannelBuffer) {
-        let safe_channel = sanitize_channel_name(&buffer.channel);
+        let root_dir = self.root_dir.clone();
+        let buffer = buffer.clone();
 
-        // Write JSON (machine-readable, for reload)
-        let json_path = self
-            .root_dir
-            .join(format!("context-buffer-{}.json", safe_channel));
-        let tmp_path = self
-            .root_dir
-            .join(format!("context-buffer-{}.json.tmp", safe_channel));
-        match serde_json::to_string_pretty(buffer) {
-            Ok(json) => {
-                if let Err(e) = std::fs::write(&tmp_path, &json) {
-                    tracing::warn!("Failed to write context buffer tmp file: {}", e);
-                    return;
+        // Detach the handle intentionally — persist is best-effort, fire-and-forget.
+        #[allow(clippy::let_underscore_future)]
+        let _ = tokio::task::spawn_blocking(move || {
+            let safe_channel = sanitize_channel_name(&buffer.channel);
+
+            // Write JSON (machine-readable, for reload)
+            let json_path = root_dir.join(format!("context-buffer-{}.json", safe_channel));
+            let tmp_path = root_dir.join(format!("context-buffer-{}.json.tmp", safe_channel));
+            match serde_json::to_string_pretty(&buffer) {
+                Ok(json) => {
+                    if let Err(e) = std::fs::write(&tmp_path, &json) {
+                        tracing::warn!("Failed to write context buffer tmp file: {}", e);
+                        return;
+                    }
+                    if let Err(e) = std::fs::rename(&tmp_path, &json_path) {
+                        tracing::warn!("Failed to rename context buffer file: {}", e);
+                    }
                 }
-                if let Err(e) = std::fs::rename(&tmp_path, &json_path) {
-                    tracing::warn!("Failed to rename context buffer file: {}", e);
+                Err(e) => {
+                    tracing::warn!("Failed to serialize context buffer: {}", e);
                 }
             }
-            Err(e) => {
-                tracing::warn!("Failed to serialize context buffer: {}", e);
-            }
-        }
 
-        // Write markdown (human-readable, for inspection)
-        let md_path = self
-            .root_dir
-            .join(format!("context-buffer-{}.md", safe_channel));
-        let md = render_buffer_markdown(buffer);
-        if let Err(e) = std::fs::write(&md_path, md) {
-            tracing::warn!("Failed to write context buffer markdown: {}", e);
-        }
+            // Write markdown (human-readable, for inspection)
+            let md_path = root_dir.join(format!("context-buffer-{}.md", safe_channel));
+            let md = render_buffer_markdown(&buffer);
+            if let Err(e) = std::fs::write(&md_path, md) {
+                tracing::warn!("Failed to write context buffer markdown: {}", e);
+            }
+        });
     }
 }
 
@@ -317,6 +319,9 @@ mod tests {
                 .await;
         }
 
+        // Allow spawn_blocking persist to complete
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
         // Create a new store from the same directory — should reload
         let store2 = ContextBufferStore::new(tmp.path(), &config).await;
         let ctx = store2.get_context("discord").await.unwrap();
@@ -330,6 +335,9 @@ mod tests {
         let store = ContextBufferStore::new(tmp.path(), &config).await;
 
         store.record("discord", "Dani", "user", "hello").await;
+
+        // Allow spawn_blocking persist to complete
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
         let md_path = tmp.path().join("context-buffer-discord.md");
         assert!(md_path.exists());
