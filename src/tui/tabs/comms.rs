@@ -645,12 +645,16 @@ impl CommsTab {
 
         match result {
             Ok(()) => {
-                // Persist to TOML
+                // Persist to TOML (fire-and-forget on blocking thread pool)
                 if let Some(config_path) = &ctx.config_path {
-                    if let Err(e) = peer::save_peers_to_config(config_path, client.peers_map()) {
-                        self.form_error = Some(format!("Save failed: {}", e));
-                        return false;
-                    }
+                    let peers = client.peers_map().clone();
+                    let path = config_path.clone();
+                    #[allow(clippy::let_underscore_future)]
+                    let _ = tokio::task::spawn_blocking(move || {
+                        if let Err(e) = peer::save_peers_to_config(&path, &peers) {
+                            tracing::error!("Failed to persist peer config: {}", e);
+                        }
+                    });
                 }
                 // Reload peers
                 drop(client);
@@ -684,8 +688,16 @@ impl CommsTab {
             return false;
         }
 
+        // Persist to TOML (fire-and-forget on blocking thread pool)
         if let Some(config_path) = &ctx.config_path {
-            let _ = peer::save_peers_to_config(config_path, client.peers_map());
+            let peers = client.peers_map().clone();
+            let path = config_path.clone();
+            #[allow(clippy::let_underscore_future)]
+            let _ = tokio::task::spawn_blocking(move || {
+                if let Err(e) = peer::save_peers_to_config(&path, &peers) {
+                    tracing::error!("Failed to persist peer config: {}", e);
+                }
+            });
         }
 
         drop(client);

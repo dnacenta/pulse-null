@@ -1,4 +1,4 @@
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use pulse_system_types::monitoring::{CognitiveMonitor, PipelineMonitor};
@@ -6,6 +6,29 @@ use tracing::{info, warn};
 
 use crate::config::Config;
 use crate::scheduler::intent::IntentQueue;
+
+/// Async version of build_system_prompt — runs the blocking file I/O
+/// on tokio's blocking thread pool to avoid stalling the async runtime.
+pub async fn build_system_prompt_async(
+    root_dir: PathBuf,
+    config: Config,
+    pipeline_monitor: Option<Arc<dyn PipelineMonitor>>,
+    cognitive_monitor: Option<Arc<dyn CognitiveMonitor>>,
+) -> Result<String, Box<dyn std::error::Error>> {
+    let result = tokio::task::spawn_blocking(move || {
+        build_system_prompt(
+            &root_dir,
+            &config,
+            pipeline_monitor.as_ref(),
+            cognitive_monitor.as_ref(),
+        )
+        .map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|e| e.to_string())
+    .and_then(|r| r)?;
+    Ok(result)
+}
 
 /// Build the system prompt from entity documents
 pub fn build_system_prompt(
