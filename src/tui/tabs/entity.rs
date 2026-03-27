@@ -1,4 +1,5 @@
 use std::path::{Path, PathBuf};
+use std::sync::mpsc;
 use std::time::Instant;
 
 use crossterm::event::{KeyCode, KeyEvent};
@@ -20,6 +21,15 @@ use pulse_system_types::TaskCreator;
 
 use super::TabView;
 
+// ─── Background load result ───
+
+struct EntityLoadResult {
+    pipeline: PipelineHealth,
+    cognitive: CognitiveHealth,
+    schedule_summary: Option<ScheduleSummary>,
+    schedule_tasks: Vec<ScheduleTaskEntry>,
+}
+
 // ─── Entity Tab (Operations Hub) ───
 
 #[derive(PartialEq)]
@@ -40,6 +50,8 @@ pub struct EntityTab {
     schedule_tasks: Vec<ScheduleTaskEntry>,
     schedule_selected: usize,
     schedule_root: Option<PathBuf>,
+    // Background loading
+    pending_load: Option<mpsc::Receiver<EntityLoadResult>>,
 }
 
 struct ScheduleTaskEntry {
@@ -72,52 +84,78 @@ impl EntityTab {
             schedule_tasks: Vec::new(),
             schedule_selected: 0,
             schedule_root: None,
+            pending_load: None,
         }
     }
 
-    fn load_data(&mut self, root_dir: &Path, ctx: &AppContext) {
-        self.loaded = true;
+    /// Kick off a background load — all blocking I/O runs on a separate thread.
+    fn start_load(&mut self, root_dir: &Path, ctx: &AppContext) {
         self.last_refresh = Some(Instant::now());
         self.schedule_root = Some(root_dir.to_path_buf());
-
-        // Pipeline health
-        let thresholds = Thresholds::default();
-        self.pipeline = Some(praxis::calculate(root_dir, &thresholds));
-
-        // Cognitive health
-        self.cognitive = Some(vigil::assess(root_dir, 10, 3));
-
-        // Schedule
-        if let Ok(schedule) = Schedule::load(root_dir) {
-            let enabled = schedule.tasks.iter().filter(|t| t.enabled).count();
-            let total = schedule.tasks.len();
-            let task_names: Vec<(String, bool)> = schedule
-                .tasks
-                .iter()
-                .map(|t| (t.name.clone(), t.enabled))
-                .collect();
-            self.schedule_summary = Some(ScheduleSummary {
-                enabled,
-                total,
-                task_names,
-            });
-            // Also populate full task list for schedule management
-            self.schedule_tasks = schedule
-                .tasks
-                .iter()
-                .map(|t| ScheduleTaskEntry {
-                    id: t.id.clone(),
-                    name: t.name.clone(),
-                    cron_display: cron_to_human(&t.cron),
-                    enabled: t.enabled,
-                    created_by: t.created_by.clone(),
-                    prompt: t.prompt.clone(),
-                })
-                .collect();
-        }
-
-        // Peer count from config
         self.peer_count = ctx.config.as_ref().map(|c| c.peers.len()).unwrap_or(0);
+
+        let root = root_dir.to_path_buf();
+        let (tx, rx) = mpsc::channel();
+        self.pending_load = Some(rx);
+
+        #[allow(clippy::let_underscore_future)]
+        let _ = tokio::task::spawn_blocking(move || {
+            // Pipeline health
+            let thresholds = Thresholds::default();
+            let pipeline = praxis::calculate(&root, &thresholds);
+
+            // Cognitive health
+            let cognitive = vigil::assess(&root, 10, 3);
+
+            // Schedule
+            let (schedule_summary, schedule_tasks) = if let Ok(schedule) = Schedule::load(&root) {
+                let enabled = schedule.tasks.iter().filter(|t| t.enabled).count();
+                let total = schedule.tasks.len();
+                let task_names: Vec<(String, bool)> = schedule
+                    .tasks
+                    .iter()
+                    .map(|t| (t.name.clone(), t.enabled))
+                    .collect();
+                let summary = ScheduleSummary {
+                    enabled,
+                    total,
+                    task_names,
+                };
+                let tasks: Vec<ScheduleTaskEntry> = schedule
+                    .tasks
+                    .iter()
+                    .map(|t| ScheduleTaskEntry {
+                        id: t.id.clone(),
+                        name: t.name.clone(),
+                        cron_display: cron_to_human(&t.cron),
+                        enabled: t.enabled,
+                        created_by: t.created_by.clone(),
+                        prompt: t.prompt.clone(),
+                    })
+                    .collect();
+                (Some(summary), tasks)
+            } else {
+                (None, Vec::new())
+            };
+
+            let _ = tx.send(EntityLoadResult {
+                pipeline,
+                cognitive,
+                schedule_summary,
+                schedule_tasks,
+            });
+        });
+    }
+
+    /// Apply results from a completed background load.
+    fn apply_load_result(&mut self, result: EntityLoadResult) {
+        self.pipeline = Some(result.pipeline);
+        self.cognitive = Some(result.cognitive);
+        if result.schedule_summary.is_some() {
+            self.schedule_summary = result.schedule_summary;
+            self.schedule_tasks = result.schedule_tasks;
+        }
+        self.loaded = true;
     }
 
     fn needs_refresh(&self) -> bool {
@@ -664,9 +702,18 @@ impl TabView for EntityTab {
     }
 
     fn handle_tick(&mut self, ctx: &mut AppContext) {
-        if !self.loaded || self.needs_refresh() {
+        // Check for completed background load
+        if let Some(ref rx) = self.pending_load {
+            if let Ok(result) = rx.try_recv() {
+                self.apply_load_result(result);
+                self.pending_load = None;
+            }
+        }
+
+        // Start a new load if needed and none is in flight
+        if (!self.loaded || self.needs_refresh()) && self.pending_load.is_none() {
             if let Some(ref root) = ctx.root_dir {
-                self.load_data(root, ctx);
+                self.start_load(root, ctx);
             } else {
                 self.loaded = true;
             }

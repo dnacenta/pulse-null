@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::mpsc;
 use std::time::Instant;
 
 use crossterm::event::{KeyCode, KeyEvent};
@@ -58,6 +59,14 @@ pub struct RecallTab {
     last_refresh: Option<Instant>,
     scroll_offset: usize,
     stale_count: usize,
+    // Background loading
+    pending_load: Option<mpsc::Receiver<Result<GraphLoadResult, String>>>,
+}
+
+struct GraphLoadResult {
+    health: GraphHealthData,
+    pipeline: PipelineFlowData,
+    stale_count: usize,
 }
 
 impl RecallTab {
@@ -68,6 +77,7 @@ impl RecallTab {
             last_refresh: None,
             scroll_offset: 0,
             stale_count: 0,
+            pending_load: None,
         }
     }
 
@@ -77,8 +87,8 @@ impl RecallTab {
             .unwrap_or(true)
     }
 
-    fn load_data(&mut self, root_dir: &Path, ctx: &AppContext) {
-        self.loaded = true;
+    /// Kick off a background load — graph queries run on a separate thread.
+    fn start_load(&mut self, root_dir: &Path, ctx: &AppContext) {
         self.last_refresh = Some(Instant::now());
 
         let graph_enabled = ctx
@@ -89,108 +99,116 @@ impl RecallTab {
 
         if !graph_enabled {
             self.state = GraphState::NotEnabled;
+            self.loaded = true;
             return;
         }
 
         let graph_dir = root_dir.join("memory").join("graph");
         if !graph_dir.exists() {
             self.state = GraphState::Empty;
+            self.loaded = true;
             return;
         }
 
-        self.fetch_graph_data(graph_dir);
+        self.start_graph_fetch(graph_dir);
     }
 
     #[cfg(feature = "graph")]
-    fn fetch_graph_data(&mut self, graph_dir: PathBuf) {
-        let result = std::thread::spawn(move || {
-            let rt = tokio::runtime::Runtime::new().map_err(|e| format!("Runtime: {e}"))?;
-            rt.block_on(async {
-                let gm = recall_echo::graph::GraphMemory::open(&graph_dir)
-                    .await
-                    .map_err(|e| format!("Graph open: {e}"))?;
+    fn start_graph_fetch(&mut self, graph_dir: PathBuf) {
+        let (tx, rx) = mpsc::channel();
+        self.pending_load = Some(rx);
 
-                let stats = gm.stats().await.map_err(|e| format!("Stats: {e}"))?;
-                let pipeline = gm
-                    .pipeline_stats(7)
-                    .await
-                    .map_err(|e| format!("Pipeline: {e}"))?;
+        std::thread::spawn(move || {
+            let result = (|| {
+                let rt = tokio::runtime::Runtime::new().map_err(|e| format!("Runtime: {e}"))?;
+                rt.block_on(async {
+                    let gm = recall_echo::graph::GraphMemory::open(&graph_dir)
+                        .await
+                        .map_err(|e| format!("Graph open: {e}"))?;
 
-                Ok::<_, String>((stats, pipeline))
-            })
-        })
-        .join();
+                    let stats = gm.stats().await.map_err(|e| format!("Stats: {e}"))?;
+                    let pipeline = gm
+                        .pipeline_stats(7)
+                        .await
+                        .map_err(|e| format!("Pipeline: {e}"))?;
 
-        match result {
-            Ok(Ok((stats, pipeline))) => {
-                let mut type_counts: Vec<(String, u64)> =
-                    stats.entity_type_counts.into_iter().collect();
-                type_counts.sort_by(|a, b| b.1.cmp(&a.1));
+                    Ok::<_, String>((stats, pipeline))
+                })
+            })();
 
-                let health = GraphHealthData {
-                    entity_count: stats.entity_count,
-                    relationship_count: stats.relationship_count,
-                    episode_count: stats.episode_count,
-                    entity_type_counts: type_counts,
-                };
+            let load_result = match result {
+                Ok((stats, pipeline)) => {
+                    let mut type_counts: Vec<(String, u64)> =
+                        stats.entity_type_counts.into_iter().collect();
+                    type_counts.sort_by(|a, b| b.1.cmp(&a.1));
 
-                let mut stale: Vec<StaleEntry> = Vec::new();
-                for e in &pipeline.stale_thoughts {
-                    stale.push(StaleEntry {
-                        name: e.name.clone(),
-                        kind: "thought",
-                    });
-                }
-                for e in &pipeline.stale_questions {
-                    stale.push(StaleEntry {
-                        name: e.name.clone(),
-                        kind: "question",
-                    });
-                }
-                self.stale_count = stale.len();
+                    let health = GraphHealthData {
+                        entity_count: stats.entity_count,
+                        relationship_count: stats.relationship_count,
+                        episode_count: stats.episode_count,
+                        entity_type_counts: type_counts,
+                    };
 
-                let stale_thoughts = pipeline
-                    .stale_thoughts
-                    .iter()
-                    .map(|e| StaleEntry {
-                        name: e.name.clone(),
-                        kind: "thought",
+                    let stale_thoughts: Vec<StaleEntry> = pipeline
+                        .stale_thoughts
+                        .iter()
+                        .map(|e| StaleEntry {
+                            name: e.name.clone(),
+                            kind: "thought",
+                        })
+                        .collect();
+                    let stale_questions: Vec<StaleEntry> = pipeline
+                        .stale_questions
+                        .iter()
+                        .map(|e| StaleEntry {
+                            name: e.name.clone(),
+                            kind: "question",
+                        })
+                        .collect();
+                    let stale_count = stale_thoughts.len() + stale_questions.len();
+
+                    let flow = PipelineFlowData {
+                        by_stage: pipeline.by_stage,
+                        stale_thoughts,
+                        stale_questions,
+                        total_entities: pipeline.total_entities,
+                        last_movement: pipeline.last_movement,
+                    };
+
+                    Ok(GraphLoadResult {
+                        health,
+                        pipeline: flow,
+                        stale_count,
                     })
-                    .collect();
-                let stale_questions = pipeline
-                    .stale_questions
-                    .iter()
-                    .map(|e| StaleEntry {
-                        name: e.name.clone(),
-                        kind: "question",
-                    })
-                    .collect();
+                }
+                Err(e) => Err(e),
+            };
 
-                let flow = PipelineFlowData {
-                    by_stage: pipeline.by_stage,
-                    stale_thoughts,
-                    stale_questions,
-                    total_entities: pipeline.total_entities,
-                    last_movement: pipeline.last_movement,
-                };
-
-                self.state = GraphState::Loaded {
-                    health,
-                    pipeline: flow,
-                };
-            }
-            Ok(Err(e)) => {
-                self.state = GraphState::Error(e);
-            }
-            Err(_) => {
-                self.state = GraphState::Error("Graph query thread panicked".into());
-            }
-        }
+            let _ = tx.send(load_result);
+        });
     }
 
     #[cfg(not(feature = "graph"))]
-    fn fetch_graph_data(&mut self, _graph_dir: PathBuf) {
+    fn start_graph_fetch(&mut self, _graph_dir: PathBuf) {
         self.state = GraphState::NotEnabled;
+        self.loaded = true;
+    }
+
+    /// Apply results from a completed background graph load.
+    fn apply_graph_result(&mut self, result: Result<GraphLoadResult, String>) {
+        match result {
+            Ok(data) => {
+                self.stale_count = data.stale_count;
+                self.state = GraphState::Loaded {
+                    health: data.health,
+                    pipeline: data.pipeline,
+                };
+            }
+            Err(e) => {
+                self.state = GraphState::Error(e);
+            }
+        }
+        self.loaded = true;
     }
 
     // ─── Rendering ──────────────────────────────────────────────────────────
@@ -513,9 +531,18 @@ impl TabView for RecallTab {
     }
 
     fn handle_tick(&mut self, ctx: &mut AppContext) {
-        if !self.loaded || self.needs_refresh() {
+        // Check for completed background graph load
+        if let Some(ref rx) = self.pending_load {
+            if let Ok(result) = rx.try_recv() {
+                self.apply_graph_result(result);
+                self.pending_load = None;
+            }
+        }
+
+        // Start a new load if needed and none is in flight
+        if (!self.loaded || self.needs_refresh()) && self.pending_load.is_none() {
             if let Some(ref root) = ctx.root_dir {
-                self.load_data(root, ctx);
+                self.start_load(root, ctx);
             } else {
                 self.loaded = true;
             }

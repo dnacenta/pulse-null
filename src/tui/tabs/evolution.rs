@@ -1,4 +1,5 @@
 use std::path::Path;
+use std::sync::mpsc;
 
 use crossterm::event::{KeyCode, KeyEvent};
 use ratatui::layout::{Constraint, Layout, Rect};
@@ -15,6 +16,23 @@ use crate::tui::theme::*;
 use crate::vigil::runtime::{self as vigil, CognitiveStatus, Trend};
 
 use super::TabView;
+
+// ─── Background load result ───
+
+struct EvolutionLoadResult {
+    vocabulary: f64,
+    curiosity: f64,
+    grounding: f64,
+    lifecycle: f64,
+    vocab_trend: Option<Trend>,
+    curiosity_trend: Option<Trend>,
+    grounding_trend: Option<Trend>,
+    lifecycle_trend: Option<Trend>,
+    status: Option<CognitiveStatus>,
+    signal_count: usize,
+    session_count: usize,
+    sufficient_data: bool,
+}
 
 // ─── Evolution Tab (Living Growth Visualization) ───
 
@@ -40,6 +58,9 @@ pub struct EvolutionTab {
     // Animation
     tick: u64,
     loaded: bool,
+
+    // Background loading
+    pending_load: Option<mpsc::Receiver<EvolutionLoadResult>>,
 }
 
 impl EvolutionTab {
@@ -59,54 +80,93 @@ impl EvolutionTab {
             sufficient_data: false,
             tick: 0,
             loaded: false,
+            pending_load: None,
         }
     }
 
     pub fn scroll_up(&mut self, _amount: u16) {}
     pub fn scroll_down(&mut self, _amount: u16) {}
 
-    fn load_data(&mut self, root_dir: &Path) {
-        self.loaded = true;
+    /// Kick off a background load — all blocking I/O runs on a separate thread.
+    fn start_load(&mut self, root_dir: &Path) {
+        let root = root_dir.to_path_buf();
+        let (tx, rx) = mpsc::channel();
+        self.pending_load = Some(rx);
 
-        // Load raw signal frames
-        let frames = vigil::load_signals(root_dir);
-        self.signal_count = frames.len();
-
-        if !frames.is_empty() {
-            // Use average of last 5 frames for waveform parameters
-            let window = &frames[frames.len().saturating_sub(5)..];
-            self.vocabulary = avg_f64(window.iter().map(|f| f.vocabulary_diversity));
-            self.curiosity = normalize_count(
-                window.iter().map(|f| f.question_count).sum::<usize>() / window.len(),
-                10,
-            );
-            self.grounding = normalize_count(
-                window.iter().map(|f| f.evidence_references).sum::<usize>() / window.len(),
-                10,
-            );
-            self.lifecycle = if window.iter().any(|f| f.thought_progress) {
-                0.7
-            } else {
-                0.2
+        #[allow(clippy::let_underscore_future)]
+        let _ = tokio::task::spawn_blocking(move || {
+            let mut result = EvolutionLoadResult {
+                vocabulary: 0.0,
+                curiosity: 0.0,
+                grounding: 0.0,
+                lifecycle: 0.0,
+                vocab_trend: None,
+                curiosity_trend: None,
+                grounding_trend: None,
+                lifecycle_trend: None,
+                status: None,
+                signal_count: 0,
+                session_count: 0,
+                sufficient_data: false,
             };
 
-            // Count unique session/task IDs
-            let mut task_ids: Vec<&str> = frames.iter().map(|f| f.task_id.as_str()).collect();
-            task_ids.sort();
-            task_ids.dedup();
-            self.session_count = task_ids.len();
-        }
+            // Load raw signal frames
+            let frames = vigil::load_signals(&root);
+            result.signal_count = frames.len();
 
-        // Load cognitive health for trends and status
-        let health = vigil::assess(root_dir, 10, 3);
-        self.status = Some(health.status);
-        self.sufficient_data = health.sufficient_data;
-        if health.sufficient_data {
-            self.vocab_trend = Some(health.vocabulary_trend);
-            self.curiosity_trend = Some(health.question_trend);
-            self.grounding_trend = Some(health.evidence_trend);
-            self.lifecycle_trend = Some(health.progress_trend);
-        }
+            if !frames.is_empty() {
+                let window = &frames[frames.len().saturating_sub(5)..];
+                result.vocabulary = avg_f64(window.iter().map(|f| f.vocabulary_diversity));
+                result.curiosity = normalize_count(
+                    window.iter().map(|f| f.question_count).sum::<usize>() / window.len(),
+                    10,
+                );
+                result.grounding = normalize_count(
+                    window.iter().map(|f| f.evidence_references).sum::<usize>() / window.len(),
+                    10,
+                );
+                result.lifecycle = if window.iter().any(|f| f.thought_progress) {
+                    0.7
+                } else {
+                    0.2
+                };
+
+                let mut task_ids: Vec<&str> = frames.iter().map(|f| f.task_id.as_str()).collect();
+                task_ids.sort();
+                task_ids.dedup();
+                result.session_count = task_ids.len();
+            }
+
+            // Load cognitive health for trends and status
+            let health = vigil::assess(&root, 10, 3);
+            result.status = Some(health.status);
+            result.sufficient_data = health.sufficient_data;
+            if health.sufficient_data {
+                result.vocab_trend = Some(health.vocabulary_trend);
+                result.curiosity_trend = Some(health.question_trend);
+                result.grounding_trend = Some(health.evidence_trend);
+                result.lifecycle_trend = Some(health.progress_trend);
+            }
+
+            let _ = tx.send(result);
+        });
+    }
+
+    /// Apply results from a completed background load.
+    fn apply_load_result(&mut self, result: EvolutionLoadResult) {
+        self.vocabulary = result.vocabulary;
+        self.curiosity = result.curiosity;
+        self.grounding = result.grounding;
+        self.lifecycle = result.lifecycle;
+        self.vocab_trend = result.vocab_trend;
+        self.curiosity_trend = result.curiosity_trend;
+        self.grounding_trend = result.grounding_trend;
+        self.lifecycle_trend = result.lifecycle_trend;
+        self.status = result.status;
+        self.signal_count = result.signal_count;
+        self.session_count = result.session_count;
+        self.sufficient_data = result.sufficient_data;
+        self.loaded = true;
     }
 
     fn render_waveform(&self, frame: &mut Frame, area: Rect) {
@@ -312,9 +372,19 @@ impl TabView for EvolutionTab {
 
     fn handle_tick(&mut self, ctx: &mut AppContext) {
         self.tick += 1;
-        if !self.loaded {
+
+        // Check for completed background load
+        if let Some(ref rx) = self.pending_load {
+            if let Ok(result) = rx.try_recv() {
+                self.apply_load_result(result);
+                self.pending_load = None;
+            }
+        }
+
+        // Start a new load if needed and none is in flight
+        if !self.loaded && self.pending_load.is_none() {
             if let Some(ref root) = ctx.root_dir {
-                self.load_data(root);
+                self.start_load(root);
             } else {
                 self.loaded = true;
             }
