@@ -1,4 +1,5 @@
 use std::path::{Path, PathBuf};
+use std::sync::mpsc;
 
 use crossterm::event::{KeyCode, KeyEvent};
 use ratatui::layout::{Constraint, Layout, Rect};
@@ -37,6 +38,8 @@ pub struct FilesTab {
     reader_scroll: u16,
     focus: Focus,
     loaded: bool,
+    // Background file reading
+    pending_content: Option<mpsc::Receiver<(String, String)>>,
 }
 
 impl FilesTab {
@@ -49,6 +52,7 @@ impl FilesTab {
             reader_scroll: 0,
             focus: Focus::Tree,
             loaded: false,
+            pending_content: None,
         }
     }
 
@@ -167,12 +171,21 @@ impl FilesTab {
                 return;
             }
             if let Some(ref path) = entry.path {
-                if let Ok(content) = std::fs::read_to_string(path) {
-                    self.content_title = entry.name.clone();
-                    self.content = Some(content);
-                    self.reader_scroll = 0;
-                    self.focus = Focus::Reader;
-                }
+                let title = entry.name.clone();
+                let path = path.clone();
+                let (tx, rx) = mpsc::channel();
+                self.pending_content = Some(rx);
+                self.content_title = title.clone();
+                self.reader_scroll = 0;
+                self.focus = Focus::Reader;
+                self.content = Some("Loading...".to_string());
+
+                #[allow(clippy::let_underscore_future)]
+                let _ = tokio::task::spawn_blocking(move || {
+                    if let Ok(content) = std::fs::read_to_string(&path) {
+                        let _ = tx.send((title, content));
+                    }
+                });
             }
         }
     }
@@ -332,9 +345,17 @@ impl TabView for FilesTab {
                 KeyCode::Char('r') => {
                     if let Some(entry) = self.files.get(self.selected) {
                         if let Some(ref path) = entry.path {
-                            if let Ok(content) = std::fs::read_to_string(path) {
-                                self.content = Some(content);
-                            }
+                            let title = entry.name.clone();
+                            let path = path.clone();
+                            let (tx, rx) = mpsc::channel();
+                            self.pending_content = Some(rx);
+
+                            #[allow(clippy::let_underscore_future)]
+                            let _ = tokio::task::spawn_blocking(move || {
+                                if let Ok(content) = std::fs::read_to_string(&path) {
+                                    let _ = tx.send((title, content));
+                                }
+                            });
                         }
                     }
                 }
@@ -345,6 +366,15 @@ impl TabView for FilesTab {
     }
 
     fn handle_tick(&mut self, ctx: &mut AppContext) {
+        // Check for completed background file read
+        if let Some(ref rx) = self.pending_content {
+            if let Ok((title, content)) = rx.try_recv() {
+                self.content_title = title;
+                self.content = Some(content);
+                self.pending_content = None;
+            }
+        }
+
         if !self.loaded {
             if let Some(ref root) = ctx.root_dir {
                 self.load_file_tree(root);
