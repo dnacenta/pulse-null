@@ -57,12 +57,13 @@ pub async fn boot_entity(
     };
 
     // System prompt
-    let system_prompt = super::prompt::build_system_prompt(
-        &root_dir,
-        &config,
-        pipeline_monitor.as_ref(),
-        cognitive_monitor.as_ref(),
-    )?;
+    let system_prompt = super::prompt::build_system_prompt_async(
+        root_dir.clone(),
+        config.clone(),
+        pipeline_monitor.clone(),
+        cognitive_monitor.clone(),
+    )
+    .await?;
 
     // Tools
     let mut tools = ToolRegistry::new();

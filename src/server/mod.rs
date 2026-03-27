@@ -92,12 +92,13 @@ pub async fn start(config: Config) -> Result<(), Box<dyn std::error::Error>> {
     };
 
     // Build system prompt from SELF.md + CLAUDE.md + MEMORY.md
-    let system_prompt = prompt::build_system_prompt(
-        &root_dir,
-        &config,
-        pipeline_monitor.as_ref(),
-        cognitive_monitor.as_ref(),
-    )?;
+    let system_prompt = prompt::build_system_prompt_async(
+        root_dir.clone(),
+        config.clone(),
+        pipeline_monitor.clone(),
+        cognitive_monitor.clone(),
+    )
+    .await?;
 
     // Register built-in tools
     let mut tools = ToolRegistry::new();

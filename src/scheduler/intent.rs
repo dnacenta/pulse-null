@@ -428,12 +428,14 @@ async fn execute_intent(
     };
 
     // Build system prompt
-    let system_prompt = match prompt::build_system_prompt(
-        &root_dir,
-        &state.config,
-        state.pipeline_monitor.as_ref(),
-        state.cognitive_monitor.as_ref(),
-    ) {
+    let system_prompt = match prompt::build_system_prompt_async(
+        root_dir.clone(),
+        state.config.clone(),
+        state.pipeline_monitor.clone(),
+        state.cognitive_monitor.clone(),
+    )
+    .await
+    {
         Ok(p) => p,
         Err(e) => {
             tracing::error!(
