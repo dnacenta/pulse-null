@@ -17,6 +17,8 @@ use crate::config::PeerConfig;
 use crate::events::{ConversationTrust, EntityEvent, InteractionSource};
 use crate::peer::{self, PeerClient};
 use crate::streaming::StreamingProvider;
+use crate::tool_loop;
+use crate::tools::ToolRegistry;
 use crate::tui::app::AppContext;
 use crate::tui::screens::{EntityState, ScreenAction};
 use crate::tui::tabs::files::push_bordered_section;
@@ -462,7 +464,22 @@ impl CommsTab {
 
         let provider = Arc::clone(provider);
         let peer_client = Arc::clone(peer_client);
-        let system_prompt = system_prompt.clone();
+        let tools = ctx
+            .tools
+            .clone()
+            .unwrap_or_else(|| Arc::new(ToolRegistry::new()));
+
+        // Enrich system prompt with peer identity context
+        let system_prompt = format!(
+            "{}\n\n## Peer Conversation Context\n\
+             You are {}. You are having a direct conversation with {}.\n\
+             {} is a trusted peer entity — a sibling in the same pulse-null network, \
+             managed by the same owner. This is an internal conversation between entities, \
+             not a user-facing interaction.\n\
+             Speak freely and collaboratively. Share knowledge, insights, and observations openly.\n\
+             If you have graph memory available, use it to recall past interactions with {}.",
+            system_prompt, self.entity_name, peer.name, peer.name, peer.name
+        );
         let peer_name = peer.name.clone();
         let local_name = self.entity_name.clone();
         let mode = self.mode.clone();
@@ -485,6 +502,7 @@ impl CommsTab {
         let handle = tokio::spawn(async move {
             run_conversation(
                 provider,
+                tools,
                 system_prompt,
                 peer_client,
                 peer_name,
@@ -1774,6 +1792,7 @@ impl TabView for CommsTab {
 #[allow(clippy::too_many_arguments)]
 async fn run_conversation(
     provider: Arc<dyn StreamingProvider>,
+    tools: Arc<ToolRegistry>,
     system_prompt: String,
     peer_client: Arc<Mutex<PeerClient>>,
     peer_name: String,
@@ -1812,13 +1831,19 @@ async fn run_conversation(
     });
 
     let _ = tx.send(CommsEvent::LocalActivity(EntityState::Thinking));
-    let a_response = provider
-        .invoke(&system_prompt, &conversation, max_tokens, None)
-        .await;
+    let a_result = tool_loop::invoke_with_tool_loop(
+        provider.as_ref(),
+        &tools,
+        &system_prompt,
+        &mut conversation,
+        max_tokens,
+        tool_loop::DEFAULT_MAX_TOOL_ROUNDS,
+    )
+    .await;
     let _ = tx.send(CommsEvent::LocalActivity(EntityState::Idle));
 
-    let a_text = match a_response {
-        Ok(resp) => resp.text(),
+    let a_text = match a_result {
+        Ok(result) => result.text,
         Err(e) => {
             let _ = tx.send(CommsEvent::Error(e.to_string()));
             return;
@@ -1826,10 +1851,7 @@ async fn run_conversation(
     };
 
     turn += 1;
-    conversation.push(Message {
-        role: Role::Assistant,
-        content: MessageContent::Text(a_text.clone()),
-    });
+    // Note: invoke_with_tool_loop already appended the assistant message(s) to conversation
     let _ = tx.send(CommsEvent::MessageReceived {
         entity: local_name.clone(),
         text: a_text.clone(),
@@ -1898,19 +1920,22 @@ async fn run_conversation(
                 });
 
                 let _ = tx.send(CommsEvent::LocalActivity(EntityState::Thinking));
-                let a_response = provider
-                    .invoke(&system_prompt, &conversation, max_tokens, None)
-                    .await;
+                let a_result = tool_loop::invoke_with_tool_loop(
+                    provider.as_ref(),
+                    &tools,
+                    &system_prompt,
+                    &mut conversation,
+                    max_tokens,
+                    tool_loop::DEFAULT_MAX_TOOL_ROUNDS,
+                )
+                .await;
                 let _ = tx.send(CommsEvent::LocalActivity(EntityState::Idle));
 
-                match a_response {
-                    Ok(resp) => {
-                        let text = resp.text();
+                match a_result {
+                    Ok(result) => {
+                        let text = result.text;
                         turn += 1;
-                        conversation.push(Message {
-                            role: Role::Assistant,
-                            content: MessageContent::Text(text.clone()),
-                        });
+                        // Note: invoke_with_tool_loop already appended assistant message(s)
                         let _ = tx.send(CommsEvent::MessageReceived {
                             entity: local_name.clone(),
                             text: text.clone(),

@@ -119,6 +119,12 @@ impl AppContext {
             root_dir.to_path_buf(),
         )));
         tools.register(Box::new(crate::tools::web_fetch::WebFetchTool::new()));
+        #[cfg(feature = "graph")]
+        if config.graph.enabled {
+            tools.register(Box::new(crate::tools::graph_query::GraphQueryTool::new(
+                root_dir.to_path_buf(),
+            )));
+        }
 
         let peer_client = Arc::new(Mutex::new(PeerClient::new(config.peers.clone())));
 

@@ -24,6 +24,7 @@ mod server;
 mod session;
 mod session_store;
 mod streaming;
+mod tool_loop;
 mod tools;
 mod tui;
 mod vigil;

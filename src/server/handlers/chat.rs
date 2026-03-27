@@ -9,7 +9,8 @@ use crate::events::{ConversationTrust, EntityEvent, InteractionSource};
 use crate::server::trust::TrustLevel;
 use crate::server::{injection, AppState};
 use crate::session_store::SessionStore;
-use pulse_system_types::llm::{ContentBlock, Message, MessageContent, Role, StopReason};
+use crate::tool_loop;
+use pulse_system_types::llm::{Message, MessageContent, Role};
 
 #[derive(Deserialize)]
 #[allow(dead_code)]
@@ -44,8 +45,9 @@ pub async fn chat(
 ) -> Result<Json<ChatResponse>, (StatusCode, String)> {
     // Auth is enforced by middleware (server/auth.rs)
 
-    // Determine trust level
-    let trust = TrustLevel::from_channel(&req.channel, &state.config);
+    // Determine trust level (peer-aware: comms from known peers get elevated trust)
+    let trust =
+        TrustLevel::from_channel_and_sender(&req.channel, req.sender.as_deref(), &state.config);
 
     // Build the user message with security context
     let mut user_message = String::new();
@@ -56,6 +58,12 @@ pub async fn chat(
         TrustLevel::Trusted => format!(
             "[Channel: {} | Trust: TRUSTED | Sender: {}]\n",
             req.channel, sender_label
+        ),
+        TrustLevel::Peer => format!(
+            "[Channel: comms | Trust: PEER — This is a trusted peer conversation with {}. \
+             {} is a known entity in your network. \
+             Speak openly and collaboratively. Share knowledge freely.]\n",
+            sender_label, sender_label
         ),
         TrustLevel::Verified => format!(
             "[Channel: {} | Trust: VERIFIED — input from an authenticated channel. \
@@ -74,8 +82,9 @@ pub async fn chat(
     };
     user_message.push_str(&trust_tag);
 
-    // Check for injection on non-trusted channels
+    // Check for injection on non-trusted channels (peers are trusted)
     if trust != TrustLevel::Trusted
+        && trust != TrustLevel::Peer
         && state.config.security.injection_detection
         && injection::scan(&req.message)
     {
@@ -132,188 +141,55 @@ pub async fn chat(
     )
     .await;
 
-    // Build tool definitions (only if provider supports tools)
-    let tool_defs = if state.provider.supports_tools() && !state.tools.is_empty() {
-        Some(state.tools.definitions())
-    } else {
-        None
-    };
-    let tool_defs_ref = tool_defs.as_deref();
-
-    // Accumulate total token usage across rounds
-    let mut total_input_tokens: Option<u32> = None;
-    let mut total_output_tokens: Option<u32> = None;
-    let mut final_model: String;
-
+    // Invoke LLM with tool loop
     let channel = req.channel.clone();
     let system_prompt = state.system_prompt.read().await;
-    let mut rounds: u32 = 0;
 
-    loop {
-        // Invoke LLM
-        let result = state
-            .provider
-            .invoke(
-                &system_prompt,
-                &session.data.messages,
-                state.config.llm.max_tokens,
-                tool_defs_ref,
-            )
-            .await
-            .map_err(|e: Box<dyn std::error::Error + Send + Sync>| {
-                tracing::error!("LLM invocation failed: {}", e);
-                (StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
-            })?;
+    let result = tool_loop::invoke_with_tool_loop(
+        state.provider.as_ref(),
+        &state.tools,
+        &system_prompt,
+        &mut session.data.messages,
+        state.config.llm.max_tokens,
+        MAX_TOOL_ROUNDS,
+    )
+    .await
+    .map_err(|e| {
+        tracing::error!("LLM invocation failed: {}", e);
+        (StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
+    })?;
 
-        // Accumulate token counts
-        total_input_tokens =
-            Some(total_input_tokens.unwrap_or(0) + result.input_tokens.unwrap_or(0));
-        total_output_tokens =
-            Some(total_output_tokens.unwrap_or(0) + result.output_tokens.unwrap_or(0));
-        final_model = result.model.clone();
+    let text = result.text;
 
-        // Add assistant response to session
-        session.data.messages.push(Message {
-            role: Role::Assistant,
-            content: MessageContent::Blocks(result.content.clone()),
-        });
-
-        match result.stop_reason {
-            StopReason::EndTurn | StopReason::MaxTokens | StopReason::StopSequence => {
-                // Done — extract text and return
-                let text = result.text();
-
-                // Record entity response to context buffer
-                if let Some(ref cb) = state.context_buffer {
-                    cb.record(&channel, &state.config.entity.name, "assistant", &text)
-                        .await;
-                }
-
-                // Mark session dirty and persist asynchronously
-                session.mark_dirty();
-                let persist_key = session_key.clone();
-                let persist_store = &state.session_store;
-                // Drop the session lock before persisting to avoid deadlock
-                drop(session);
-                persist_store.persist(&persist_key).await;
-
-                // Emit PostConversation event
-                emit_post_conversation(
-                    &state,
-                    &channel,
-                    &text,
-                    total_input_tokens.unwrap_or(0),
-                    total_output_tokens.unwrap_or(0),
-                );
-
-                return Ok(Json(ChatResponse {
-                    response: text,
-                    model: final_model,
-                    input_tokens: total_input_tokens,
-                    output_tokens: total_output_tokens,
-                }));
-            }
-            StopReason::ToolUse => {
-                rounds += 1;
-                if rounds > MAX_TOOL_ROUNDS {
-                    tracing::warn!(
-                        "Tool loop exceeded {} rounds, forcing response",
-                        MAX_TOOL_ROUNDS
-                    );
-                    let text = result.text();
-
-                    // Record entity response to context buffer
-                    if let Some(ref cb) = state.context_buffer {
-                        cb.record(&channel, &state.config.entity.name, "assistant", &text)
-                            .await;
-                    }
-
-                    session.mark_dirty();
-                    let persist_key = session_key.clone();
-                    let persist_store = &state.session_store;
-                    drop(session);
-                    persist_store.persist(&persist_key).await;
-
-                    emit_post_conversation(
-                        &state,
-                        &channel,
-                        &text,
-                        total_input_tokens.unwrap_or(0),
-                        total_output_tokens.unwrap_or(0),
-                    );
-                    return Ok(Json(ChatResponse {
-                        response: text,
-                        model: final_model,
-                        input_tokens: total_input_tokens,
-                        output_tokens: total_output_tokens,
-                    }));
-                }
-
-                // Execute all tool_use blocks and collect results
-                let mut tool_results = Vec::new();
-                for block in &result.content {
-                    if let ContentBlock::ToolUse { id, name, input } = block {
-                        let tool_result = match state.tools.get(name) {
-                            Some(tool) => match tool.execute(input.clone()).await {
-                                Ok(output) => ContentBlock::ToolResult {
-                                    tool_use_id: id.clone(),
-                                    content: output,
-                                    is_error: None,
-                                },
-                                Err(e) => ContentBlock::ToolResult {
-                                    tool_use_id: id.clone(),
-                                    content: format!("Error: {}", e),
-                                    is_error: Some(true),
-                                },
-                            },
-                            None => ContentBlock::ToolResult {
-                                tool_use_id: id.clone(),
-                                content: format!("Error: Unknown tool '{}'", name),
-                                is_error: Some(true),
-                            },
-                        };
-                        tool_results.push(tool_result);
-                    }
-                }
-
-                // Add tool results as a user message and loop
-                session.data.messages.push(Message {
-                    role: Role::User,
-                    content: MessageContent::Blocks(tool_results),
-                });
-            }
-            StopReason::Other(ref reason) => {
-                tracing::warn!("Unexpected stop reason: {}", reason);
-                let text = result.text();
-
-                // Record entity response to context buffer
-                if let Some(ref cb) = state.context_buffer {
-                    cb.record(&channel, &state.config.entity.name, "assistant", &text)
-                        .await;
-                }
-
-                session.mark_dirty();
-                let persist_key = session_key.clone();
-                let persist_store = &state.session_store;
-                drop(session);
-                persist_store.persist(&persist_key).await;
-
-                emit_post_conversation(
-                    &state,
-                    &channel,
-                    &text,
-                    total_input_tokens.unwrap_or(0),
-                    total_output_tokens.unwrap_or(0),
-                );
-                return Ok(Json(ChatResponse {
-                    response: text,
-                    model: final_model,
-                    input_tokens: total_input_tokens,
-                    output_tokens: total_output_tokens,
-                }));
-            }
-        }
+    // Record entity response to context buffer
+    if let Some(ref cb) = state.context_buffer {
+        cb.record(&channel, &state.config.entity.name, "assistant", &text)
+            .await;
     }
+
+    // Mark session dirty and persist asynchronously
+    session.mark_dirty();
+    let persist_key = session_key.clone();
+    let persist_store = &state.session_store;
+    // Drop the session lock before persisting to avoid deadlock
+    drop(session);
+    persist_store.persist(&persist_key).await;
+
+    // Emit PostConversation event
+    emit_post_conversation(
+        &state,
+        &channel,
+        &text,
+        result.input_tokens,
+        result.output_tokens,
+    );
+
+    Ok(Json(ChatResponse {
+        response: text,
+        model: result.model,
+        input_tokens: Some(result.input_tokens),
+        output_tokens: Some(result.output_tokens),
+    }))
 }
 
 /// Emit a PostInteraction event for chat conversations (fire-and-forget).
