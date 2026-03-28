@@ -264,10 +264,31 @@ pub async fn start(config: Config) -> Result<(), Box<dyn std::error::Error>> {
     }
 
     // Archive all sessions on shutdown and persist to disk
-    state
+    let archived_paths = state
         .session_store
         .archive_all(&root_dir, &config.entity.name)
         .await;
+
+    // Ingest shutdown archives into the knowledge graph
+    // Uses spawn_blocking + dedicated runtime because SurrealDB types are not Send.
+    if config.graph.enabled && config.graph.auto_ingest && !archived_paths.is_empty() {
+        let graph_root = root_dir.clone();
+        let _ = tokio::task::spawn_blocking(move || {
+            let rt = match tokio::runtime::Runtime::new() {
+                Ok(rt) => rt,
+                Err(e) => {
+                    tracing::warn!("graph ingest: failed to create runtime: {}", e);
+                    return;
+                }
+            };
+            rt.block_on(async {
+                for path in &archived_paths {
+                    crate::session::graph_ingest_archive(&graph_root, path, None).await;
+                }
+            });
+        })
+        .await;
+    }
 
     // Clean up plugins on shutdown
     state.plugin_manager.lock().await.stop_all().await;

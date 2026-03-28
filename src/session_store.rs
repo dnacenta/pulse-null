@@ -112,6 +112,7 @@ impl SessionStore {
     }
 
     /// Load sessions from the sessions/ directory.
+    /// Expired sessions are archived before being removed from disk.
     async fn load_persisted(&self) {
         let entries = match fs::read_dir(&self.sessions_dir) {
             Ok(e) => e,
@@ -133,9 +134,32 @@ impl SessionStore {
                             dirty: false,
                         };
 
-                        // Skip expired sessions
+                        // Archive and remove expired sessions
                         if session.is_expired(self.ttl_seconds) {
-                            tracing::debug!("Skipping expired session: {}", data.key);
+                            tracing::debug!("Archiving expired session: {}", data.key);
+
+                            // Archive the conversation before discarding
+                            if !data.messages.is_empty() {
+                                let root_dir = self.sessions_dir.parent().unwrap_or(Path::new("."));
+                                let meta = crate::session::ArchiveMeta {
+                                    trigger: "session-expired-on-load".to_string(),
+                                    channel: data.channel.clone(),
+                                    entity_name: String::new(),
+                                    session_key: Some(data.key.clone()),
+                                };
+                                if let Err(e) = crate::session::archive_conversation(
+                                    root_dir,
+                                    &data.messages,
+                                    &meta,
+                                ) {
+                                    tracing::warn!(
+                                        "Failed to archive expired session {}: {}",
+                                        data.key,
+                                        e
+                                    );
+                                }
+                            }
+
                             // Clean up the file
                             if let Err(e) = fs::remove_file(&path) {
                                 tracing::warn!(
@@ -314,7 +338,8 @@ impl SessionStore {
     }
 
     /// Clean up expired sessions, archiving them first.
-    pub async fn cleanup_expired(&self, root_dir: &Path, entity_name: &str) {
+    /// Returns the paths of any archived conversations (for graph ingestion).
+    pub async fn cleanup_expired(&self, root_dir: &Path, entity_name: &str) -> Vec<PathBuf> {
         let mut expired_keys = Vec::new();
 
         {
@@ -328,9 +353,10 @@ impl SessionStore {
         }
 
         if expired_keys.is_empty() {
-            return;
+            return Vec::new();
         }
 
+        let mut archived_paths = Vec::new();
         let mut sessions = self.sessions.write().await;
         for key in &expired_keys {
             if let Some(session_arc) = sessions.remove(key) {
@@ -343,12 +369,15 @@ impl SessionStore {
                         entity_name: entity_name.to_string(),
                         session_key: Some(key.clone()),
                     };
-                    if let Err(e) = crate::session::archive_conversation(
+                    match crate::session::archive_conversation(
                         root_dir,
                         &session.data.messages,
                         &meta,
                     ) {
-                        tracing::warn!("Failed to archive expired session {}: {}", key, e);
+                        Ok(path) => archived_paths.push(path),
+                        Err(e) => {
+                            tracing::warn!("Failed to archive expired session {}: {}", key, e);
+                        }
                     }
                 }
 
@@ -360,12 +389,15 @@ impl SessionStore {
                 tracing::info!("Cleaned up expired session: {}", key);
             }
         }
+
+        archived_paths
     }
 
     /// Archive all sessions (for shutdown).
-    pub async fn archive_all(&self, root_dir: &Path, entity_name: &str) {
+    /// Returns the paths of archived conversations (for graph ingestion).
+    pub async fn archive_all(&self, root_dir: &Path, entity_name: &str) -> Vec<PathBuf> {
         let sessions = self.sessions.read().await;
-        let mut archived = 0u32;
+        let mut archived_paths = Vec::new();
 
         for (key, session_arc) in sessions.iter() {
             let session = session_arc.read().await;
@@ -383,24 +415,23 @@ impl SessionStore {
             match crate::session::archive_conversation(root_dir, &session.data.messages, &meta) {
                 Ok(path) => {
                     tracing::info!("Archived session {} to {}", key, path.display());
-                    archived += 1;
+                    archived_paths.push(path);
                 }
                 Err(e) => {
                     tracing::warn!("Failed to archive session {}: {}", key, e);
                 }
             }
-
-            // Write ephemeral summary for the most recent session
-            // (last active gets the summary)
         }
 
         // Persist all to disk so they can be restored on restart
         drop(sessions); // Release read lock
         self.persist_all().await;
 
-        if archived > 0 {
-            tracing::info!("Archived {} session(s) on shutdown", archived);
+        if !archived_paths.is_empty() {
+            tracing::info!("Archived {} session(s) on shutdown", archived_paths.len());
         }
+
+        archived_paths
     }
 
     /// Get lightweight session info for the status endpoint.
