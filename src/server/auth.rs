@@ -140,6 +140,7 @@ mod tests {
             graph: GraphConfig::default(),
             sessions: SessionConfig::default(),
             context_buffer: crate::context_buffer::ContextBufferConfig::default(),
+            platform: crate::config::PlatformConfig::default(),
             peers: std::collections::HashMap::new(),
             plugins: std::collections::HashMap::new(),
         };
@@ -296,6 +297,7 @@ mod tests {
             graph: GraphConfig::default(),
             sessions: SessionConfig::default(),
             context_buffer: crate::context_buffer::ContextBufferConfig::default(),
+            platform: crate::config::PlatformConfig::default(),
             peers,
             plugins: std::collections::HashMap::new(),
         };

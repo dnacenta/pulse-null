@@ -63,6 +63,15 @@ pub enum EntityEvent {
         conversations_7d: u32,
         pipeline_updates_7d: u32,
     },
+
+    /// Emitted when a plugin's state changes (failure or recovery).
+    /// Triggers an AWARENESS.md rebuild so the entity's capability inventory
+    /// stays in sync with reality.
+    PluginStateChanged {
+        plugin_name: String,
+        /// "failed" or "recovered"
+        new_state: String,
+    },
 }
 
 impl EntityEvent {
@@ -81,6 +90,9 @@ impl EntityEvent {
             EntityEvent::PipelineFrozen { .. } => "pipeline_frozen".into(),
             EntityEvent::CognitiveHealthChanged { .. } => "cognitive_decline".into(),
             EntityEvent::PipelineConversionLow { .. } => "pipeline_conversion_low".into(),
+            EntityEvent::PluginStateChanged { plugin_name, .. } => {
+                format!("plugin_state_{}", plugin_name)
+            }
         }
     }
 }

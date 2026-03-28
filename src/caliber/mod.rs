@@ -140,6 +140,16 @@ impl Plugin for CaliberEchoPlugin {
     fn setup_prompts(&self) -> Vec<SetupPrompt> {
         CaliberEcho::get_setup_prompts()
     }
+
+    fn platform_description(&self) -> Option<String> {
+        Some(
+            "Outcome tracking and operational self-model. Records success, \
+             failure, partial, and skipped outcomes after task and intent \
+             execution. Builds a calibrated view of your operational \
+             strengths and weaknesses over time."
+                .to_string(),
+        )
+    }
 }
 
 #[cfg(test)]

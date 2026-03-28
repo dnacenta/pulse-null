@@ -268,6 +268,17 @@ impl Plugin for VigilEchoPlugin {
                 .unwrap_or_default()
         }
     }
+
+    fn platform_description(&self) -> Option<String> {
+        Some(
+            "Metacognitive monitoring system. Tracks vocabulary diversity, \
+             question generation, thought lifecycle, and evidence grounding \
+             across your reflective output. Injects cognitive health \
+             assessment at session start. Flags declining signals and \
+             suggests corrective action."
+                .to_string(),
+        )
+    }
 }
 
 // Implement setup_prompts on VigilEcho instances (delegates to the static method)

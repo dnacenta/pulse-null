@@ -155,6 +155,19 @@ impl PluginManager {
         tools
     }
 
+    /// Collect platform awareness descriptions from all loaded plugins.
+    /// Returns (plugin_name, description) pairs for plugins that provide one.
+    pub fn collect_platform_descriptions(&self) -> Vec<(String, String)> {
+        let mut descriptions = Vec::new();
+        for plugin in &self.plugins {
+            let meta = plugin.meta();
+            if let Some(desc) = plugin.platform_description() {
+                descriptions.push((meta.name, desc));
+            }
+        }
+        descriptions
+    }
+
     /// Get health status of all plugins
     #[allow(dead_code)]
     pub async fn health_all(&self) -> Vec<PluginStatus> {
@@ -184,8 +197,8 @@ mod tests {
     use super::*;
     use crate::config::{
         AutonomyConfig, Config, EntityConfig, GraphConfig, LlmConfig, MemoryConfig,
-        MonitoringConfig, PipelineConfig, PulseConfig, SchedulerConfig, SecurityConfig,
-        ServerConfig, SessionConfig, TrustConfig,
+        MonitoringConfig, PipelineConfig, PlatformConfig, PulseConfig, SchedulerConfig,
+        SecurityConfig, ServerConfig, SessionConfig, TrustConfig,
     };
 
     fn test_config() -> Config {
@@ -223,6 +236,7 @@ mod tests {
             graph: GraphConfig::default(),
             sessions: SessionConfig::default(),
             context_buffer: crate::context_buffer::ContextBufferConfig::default(),
+            platform: PlatformConfig::default(),
             peers: std::collections::HashMap::new(),
             plugins: std::collections::HashMap::new(),
         }
