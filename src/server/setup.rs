@@ -191,21 +191,46 @@ pub fn spawn_event_listener(
 }
 
 /// Spawn the background session cleanup task.
+/// When sessions expire, they are archived and then ingested into the knowledge
+/// graph (if enabled), ensuring server-side conversations flow into recall.
 pub fn spawn_session_cleanup(config: &Config, state: &Arc<super::AppState>) {
     if config.sessions.persist {
         let cleanup_state = Arc::clone(state);
         let cleanup_interval = config.sessions.cleanup_interval_seconds;
+        let graph_enabled = config.graph.enabled && config.graph.auto_ingest;
         tokio::spawn(async move {
             let mut interval =
                 tokio::time::interval(std::time::Duration::from_secs(cleanup_interval));
             interval.tick().await; // Skip first immediate tick
             loop {
                 interval.tick().await;
-                cleanup_state
+                let archived_paths = cleanup_state
                     .session_store
                     .cleanup_expired(&cleanup_state.root_dir, &cleanup_state.config.entity.name)
                     .await;
                 cleanup_state.session_store.persist_all().await;
+
+                // Ingest expired session archives into the knowledge graph
+                // Uses spawn_blocking + dedicated runtime because SurrealDB
+                // types are not Send.
+                if graph_enabled && !archived_paths.is_empty() {
+                    let root = cleanup_state.root_dir.clone();
+                    let _ = tokio::task::spawn_blocking(move || {
+                        let rt = match tokio::runtime::Runtime::new() {
+                            Ok(rt) => rt,
+                            Err(e) => {
+                                tracing::warn!("graph ingest: failed to create runtime: {}", e);
+                                return;
+                            }
+                        };
+                        rt.block_on(async {
+                            for path in &archived_paths {
+                                crate::session::graph_ingest_archive(&root, path, None).await;
+                            }
+                        });
+                    })
+                    .await;
+                }
             }
         });
         tracing::info!("Session cleanup task started (every {}s)", cleanup_interval);
