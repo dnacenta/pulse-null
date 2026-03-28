@@ -6,7 +6,7 @@ use axum::Router;
 use super::registry;
 use super::{Plugin, PluginContext, PluginHealth, PluginMeta};
 use crate::config::Config;
-use crate::events::{EntityEvent, EventBus};
+use crate::events::{EntityEvent, EventBus, PluginStateChange};
 use crate::scheduler::ScheduledTask;
 use pulse_system_types::llm::LmProvider;
 
@@ -170,7 +170,7 @@ impl PluginManager {
                     if let Some(ref bus) = self.event_bus {
                         bus.emit(EntityEvent::PluginStateChanged {
                             plugin_name: meta.name.clone(),
-                            new_state: "failed".into(),
+                            new_state: PluginStateChange::Failed,
                         });
                     }
                 }
@@ -183,7 +183,7 @@ impl PluginManager {
                     if let Some(ref bus) = self.event_bus {
                         bus.emit(EntityEvent::PluginStateChanged {
                             plugin_name: meta.name.clone(),
-                            new_state: "recovered".into(),
+                            new_state: PluginStateChange::Recovered,
                         });
                     }
                 }

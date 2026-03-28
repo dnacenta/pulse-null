@@ -28,6 +28,24 @@ pub enum ConversationTrust {
     Public,
 }
 
+/// State change direction for a plugin — used in PluginStateChanged events.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PluginStateChange {
+    /// Plugin was running and is now down.
+    Failed,
+    /// Plugin was failed and has recovered.
+    Recovered,
+}
+
+impl std::fmt::Display for PluginStateChange {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Failed => write!(f, "failed"),
+            Self::Recovered => write!(f, "recovered"),
+        }
+    }
+}
+
 /// Internal entity events that can trigger autonomous actions.
 #[derive(Debug, Clone)]
 #[allow(dead_code)]
@@ -69,8 +87,7 @@ pub enum EntityEvent {
     /// stays in sync with reality.
     PluginStateChanged {
         plugin_name: String,
-        /// "failed" or "recovered"
-        new_state: String,
+        new_state: PluginStateChange,
     },
 }
 

@@ -424,19 +424,37 @@ impl Default for SessionConfig {
     }
 }
 
+/// Awareness document generation mode.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum AwarenessMode {
+    /// Full mode: conceptual framing template + capabilities manifest.
+    Full,
+    /// Compact mode: capabilities manifest only (saves ~2k tokens).
+    Compact,
+}
+
+impl std::fmt::Display for AwarenessMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Full => write!(f, "full"),
+            Self::Compact => write!(f, "compact"),
+        }
+    }
+}
+
 /// Configuration for platform awareness (AWARENESS.md generation)
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct PlatformConfig {
-    /// Platform awareness mode: "full" includes conceptual framing + capabilities,
-    /// "compact" includes capabilities only (saves ~2k tokens).
-    pub mode: String,
+    /// Platform awareness mode.
+    pub mode: AwarenessMode,
 }
 
 impl Default for PlatformConfig {
     fn default() -> Self {
         Self {
-            mode: "full".to_string(),
+            mode: AwarenessMode::Full,
         }
     }
 }
