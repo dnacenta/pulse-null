@@ -155,8 +155,11 @@ async fn execute_entity_lookup(gm: &GraphMemory, name: &str) -> Result<String, S
                 e.name, e.entity_type, e.abstract_text, e.overview,
             );
             if let Some(ref content) = e.content {
-                let display = if content.len() > 2000 {
-                    format!("{}...", &content[..2000])
+                let display = if content.len() > crate::utils::CONTENT_TRUNCATE_LEN {
+                    format!(
+                        "{}...",
+                        crate::utils::safe_truncate(content, crate::utils::CONTENT_TRUNCATE_LEN)
+                    )
                 } else {
                     content.clone()
                 };

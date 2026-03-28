@@ -70,8 +70,11 @@ fn build_summary_prompt(messages: &[Message]) -> String {
         let text = message_to_text(msg);
         if !text.is_empty() {
             // Truncate extremely long messages in the summarization input
-            let truncated = if text.len() > 2000 {
-                format!("{}...", &text[..1997])
+            let truncated = if text.len() > crate::utils::CONTENT_TRUNCATE_LEN {
+                format!(
+                    "{}...",
+                    crate::utils::safe_truncate(&text, crate::utils::CONTENT_TRUNCATE_LEN - 3)
+                )
             } else {
                 text
             };

@@ -28,6 +28,7 @@ mod streaming;
 mod tool_loop;
 mod tools;
 mod tui;
+mod utils;
 mod vigil;
 
 #[derive(Parser)]

@@ -26,7 +26,10 @@ pub fn rotate_if_needed(root_dir: &Path, logbook_path: &Path) {
 
     // Archive the full logbook
     let archive_dir = root_dir.join("archives");
-    let _ = std::fs::create_dir_all(&archive_dir);
+    if let Err(e) = std::fs::create_dir_all(&archive_dir) {
+        tracing::warn!("Failed to create archive directory: {}", e);
+        return;
+    }
     let now = Utc::now().format("%Y-%m-%d-%H%M");
     let archive_name = format!("LOGBOOK-rotated-{}.md", now);
     let archive_path = archive_dir.join(&archive_name);
@@ -162,8 +165,11 @@ pub fn write_entry(root_dir: &Path, source: &str, details: &str, summary: &str) 
     rotate_if_needed(root_dir, &logbook_path);
 
     let now = Utc::now();
-    let truncated = if summary.len() > 500 {
-        format!("{}...", &summary[..500])
+    let truncated = if summary.len() > crate::utils::LOGBOOK_TRUNCATE_LEN {
+        format!(
+            "{}...",
+            crate::utils::safe_truncate(summary, crate::utils::LOGBOOK_TRUNCATE_LEN)
+        )
     } else {
         summary.to_string()
     };

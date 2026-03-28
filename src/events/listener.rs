@@ -67,7 +67,9 @@ pub async fn event_listener(
                     let mut q = intent_queue.write().await;
                     if q.push(intent.clone(), max_queue_size) {
                         tracing::info!("Event → intent queued: '{}'", intent.description);
-                        let _ = q.save();
+                        if let Err(e) = q.save() {
+                            tracing::error!("Failed to persist intent queue: {}", e);
+                        }
 
                         // Update cooldown tracking
                         let entry = cooldowns.entry(event_type).or_insert((Utc::now(), 0));

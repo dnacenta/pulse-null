@@ -274,8 +274,14 @@ impl CommsTab {
                         .map(|(entity, text)| format!("{}: {}", entity, text))
                         .collect::<Vec<_>>()
                         .join(" | ");
-                    let summary = if summary.len() > 300 {
-                        format!("{}...", &summary[..300])
+                    let summary = if summary.len() > crate::utils::SUMMARY_TRUNCATE_LEN {
+                        format!(
+                            "{}...",
+                            crate::utils::safe_truncate(
+                                &summary,
+                                crate::utils::SUMMARY_TRUNCATE_LEN
+                            )
+                        )
                     } else {
                         summary
                     };

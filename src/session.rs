@@ -59,10 +59,13 @@ pub fn conversation_to_markdown(conversation: &[Message]) -> String {
                             } else {
                                 ""
                             };
-                            let display = if content.len() > 2000 {
+                            let display = if content.len() > crate::utils::CONTENT_TRUNCATE_LEN {
                                 format!(
                                     "{}...\n\n[truncated, {} bytes total]",
-                                    &content[..2000],
+                                    crate::utils::safe_truncate(
+                                        content,
+                                        crate::utils::CONTENT_TRUNCATE_LEN
+                                    ),
                                     content.len()
                                 )
                             } else {
@@ -504,8 +507,11 @@ fn write_ephemeral_summary(root_dir: &Path, entity_name: &str, conversation: &[M
     ));
     content.push_str("### Topics discussed\n\n");
     for topic in &topics {
-        let display = if topic.len() > 80 {
-            format!("{}...", &topic[..77])
+        let display = if topic.len() > crate::utils::TOPIC_TRUNCATE_LEN {
+            format!(
+                "{}...",
+                crate::utils::safe_truncate(topic, crate::utils::TOPIC_TRUNCATE_LEN - 3)
+            )
         } else {
             topic.to_string()
         };
