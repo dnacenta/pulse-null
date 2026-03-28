@@ -8,11 +8,13 @@ use axum::response::Response;
 use tokio::sync::Mutex;
 
 /// Simple token-bucket rate limiter. Shared across all requests.
+///
+/// Tokens and last-refill timestamp are stored in a single mutex to
+/// eliminate any theoretical ordering / deadlock risk.
 pub struct RateLimiter {
-    tokens: Mutex<f64>,
+    state: Mutex<(f64, Instant)>,
     max_tokens: f64,
     refill_rate: f64, // tokens per second
-    last_refill: Mutex<Instant>,
 }
 
 impl RateLimiter {
@@ -21,16 +23,15 @@ impl RateLimiter {
     /// `per_second` — sustained rate (requests per second).
     pub fn new(max_burst: u32, per_second: f64) -> Self {
         Self {
-            tokens: Mutex::new(max_burst as f64),
+            state: Mutex::new((max_burst as f64, Instant::now())),
             max_tokens: max_burst as f64,
             refill_rate: per_second,
-            last_refill: Mutex::new(Instant::now()),
         }
     }
 
     async fn try_acquire(&self) -> bool {
-        let mut tokens = self.tokens.lock().await;
-        let mut last_refill = self.last_refill.lock().await;
+        let mut state = self.state.lock().await;
+        let (ref mut tokens, ref mut last_refill) = *state;
 
         // Refill tokens based on elapsed time
         let now = Instant::now();

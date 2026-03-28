@@ -10,6 +10,10 @@ use tokio::sync::RwLock;
 
 use crate::persist::PersistCoordinator;
 
+/// Hard cap on messages stored per session.
+/// When exceeded, the oldest messages are drained to keep the most recent ones.
+pub const MAX_MESSAGES_PER_SESSION: usize = 200;
+
 /// Serializable session state persisted to disk.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SessionData {
@@ -20,6 +24,16 @@ pub struct SessionData {
     pub created_at: DateTime<Utc>,
     pub last_active: DateTime<Utc>,
     pub message_count: usize,
+}
+
+impl SessionData {
+    /// Enforce the hard message cap, draining the oldest messages when exceeded.
+    pub fn enforce_message_cap(&mut self) {
+        if self.messages.len() > MAX_MESSAGES_PER_SESSION {
+            let excess = self.messages.len() - MAX_MESSAGES_PER_SESSION;
+            self.messages.drain(..excess);
+        }
+    }
 }
 
 /// Runtime session wrapper with tracking metadata.
@@ -123,7 +137,13 @@ impl SessionStore {
                         if session.is_expired(self.ttl_seconds) {
                             tracing::debug!("Skipping expired session: {}", data.key);
                             // Clean up the file
-                            let _ = fs::remove_file(&path);
+                            if let Err(e) = fs::remove_file(&path) {
+                                tracing::warn!(
+                                    "Failed to remove expired session file {}: {}",
+                                    path.display(),
+                                    e
+                                );
+                            }
                             continue;
                         }
 

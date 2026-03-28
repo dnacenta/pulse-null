@@ -234,7 +234,9 @@ async fn execute_task(
                     );
                     let mut q = intent_queue.write().await;
                     q.push(new_intent, state.config.autonomy.max_queue_size);
-                    let _ = q.save();
+                    if let Err(e) = q.save() {
+                        tracing::error!("Failed to persist intent queue: {}", e);
+                    }
                 }
                 Err(e) => tracing::warn!("Invalid [INTENT:] marker: {}", e),
             }
@@ -267,7 +269,9 @@ async fn execute_task(
                     );
                     let mut q = intent_queue.write().await;
                     q.push(chain_intent, state.config.autonomy.max_queue_size);
-                    let _ = q.save();
+                    if let Err(e) = q.save() {
+                        tracing::error!("Failed to persist intent queue: {}", e);
+                    }
                 }
                 Err(e) => tracing::warn!("Invalid [CHAIN:] marker: {}", e),
             }
@@ -289,8 +293,11 @@ async fn execute_task(
     );
 
     // Emit PostInteraction for unified intake
-    let summary = if parsed.clean_content.len() > 300 {
-        format!("{}...", &parsed.clean_content[..300])
+    let summary = if parsed.clean_content.len() > crate::utils::SUMMARY_TRUNCATE_LEN {
+        format!(
+            "{}...",
+            crate::utils::safe_truncate(&parsed.clean_content, crate::utils::SUMMARY_TRUNCATE_LEN)
+        )
     } else {
         parsed.clean_content.clone()
     };

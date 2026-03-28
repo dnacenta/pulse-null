@@ -190,7 +190,10 @@ fn append_history_snapshot(
     timestamp: &str,
 ) {
     let praxis_dir = claude_dir.join("praxis");
-    let _ = fs::create_dir_all(&praxis_dir);
+    if let Err(e) = fs::create_dir_all(&praxis_dir) {
+        tracing::warn!("Failed to create praxis directory: {}", e);
+        return;
+    }
     let history_path = praxis_dir.join("pipeline-history.jsonl");
 
     let line = format!(
@@ -209,7 +212,9 @@ fn append_history_snapshot(
         .append(true)
         .open(&history_path)
     {
-        let _ = writeln!(file, "{}", line);
+        if let Err(e) = writeln!(file, "{}", line) {
+            tracing::warn!("Failed to append pipeline history: {}", e);
+        }
     }
 
     // Trim to MAX_HISTORY_LINES if needed
@@ -218,7 +223,9 @@ fn append_history_snapshot(
         let lines: Vec<String> = reader.lines().map_while(Result::ok).collect();
         if lines.len() > MAX_HISTORY_LINES {
             let trimmed = &lines[lines.len() - MAX_HISTORY_LINES..];
-            let _ = fs::write(&history_path, trimmed.join("\n") + "\n");
+            if let Err(e) = fs::write(&history_path, trimmed.join("\n") + "\n") {
+                tracing::warn!("Failed to trim pipeline history: {}", e);
+            }
         }
     }
 }

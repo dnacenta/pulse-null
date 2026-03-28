@@ -39,10 +39,57 @@ fn default_channel() -> String {
 /// Maximum number of tool-use round trips before we force a text response.
 const MAX_TOOL_ROUNDS: u32 = 25;
 
+const MAX_MESSAGE_LEN: usize = 100_000;
+const MAX_CHANNEL_LEN: usize = 64;
+const MAX_SENDER_LEN: usize = 64;
+
 pub async fn chat(
     State(state): State<Arc<AppState>>,
     Json(req): Json<ChatRequest>,
 ) -> Result<Json<ChatResponse>, (StatusCode, String)> {
+    // Input validation
+    if req.message.len() > MAX_MESSAGE_LEN {
+        return Err((
+            StatusCode::PAYLOAD_TOO_LARGE,
+            format!(
+                "Message too large: {} bytes (max {})",
+                req.message.len(),
+                MAX_MESSAGE_LEN
+            ),
+        ));
+    }
+
+    if req.channel.len() > MAX_CHANNEL_LEN {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            format!(
+                "Channel name too long: {} bytes (max {})",
+                req.channel.len(),
+                MAX_CHANNEL_LEN
+            ),
+        ));
+    }
+
+    if req.channel.contains("..") || req.channel.contains('/') {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "Channel name contains invalid characters".to_string(),
+        ));
+    }
+
+    if let Some(ref sender) = req.sender {
+        if sender.len() > MAX_SENDER_LEN {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                format!(
+                    "Sender name too long: {} bytes (max {})",
+                    sender.len(),
+                    MAX_SENDER_LEN
+                ),
+            ));
+        }
+    }
+
     // Auth is enforced by middleware (server/auth.rs)
 
     // Determine trust level (peer-aware: comms from known peers get elevated trust)
@@ -161,6 +208,9 @@ pub async fn chat(
 
     let text = result.text;
 
+    // Enforce hard cap on stored messages
+    session.data.enforce_message_cap();
+
     // Record entity response to context buffer
     if let Some(ref cb) = state.context_buffer {
         cb.record(&channel, &state.config.entity.name, "assistant", &text)
@@ -201,8 +251,11 @@ fn emit_post_conversation(
     output_tokens: u32,
 ) {
     // Truncate summary for the event (first 300 chars)
-    let summary = if response_text.len() > 300 {
-        format!("{}...", &response_text[..300])
+    let summary = if response_text.len() > crate::utils::SUMMARY_TRUNCATE_LEN {
+        format!(
+            "{}...",
+            crate::utils::safe_truncate(response_text, crate::utils::SUMMARY_TRUNCATE_LEN)
+        )
     } else {
         response_text.to_string()
     };

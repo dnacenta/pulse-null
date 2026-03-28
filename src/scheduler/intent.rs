@@ -375,7 +375,9 @@ pub async fn drain_loop(
             );
             let mut q = queue.write().await;
             q.push(intent, config.max_queue_size);
-            let _ = q.save();
+            if let Err(e) = q.save() {
+                tracing::error!("Failed to persist intent queue: {}", e);
+            }
             // Sleep for a full interval before checking again
             tokio::time::sleep(poll_interval).await;
             continue;
@@ -626,8 +628,14 @@ async fn execute_intent(
                 topic: intent.description.clone(),
             },
         };
-        let summary = if parsed.clean_content.len() > 300 {
-            format!("{}...", &parsed.clean_content[..300])
+        let summary = if parsed.clean_content.len() > crate::utils::SUMMARY_TRUNCATE_LEN {
+            format!(
+                "{}...",
+                crate::utils::safe_truncate(
+                    &parsed.clean_content,
+                    crate::utils::SUMMARY_TRUNCATE_LEN
+                )
+            )
         } else {
             parsed.clean_content.clone()
         };
