@@ -522,8 +522,12 @@ fn write_ephemeral_summary(root_dir: &Path, entity_name: &str, conversation: &[M
 
 /// Strip system-injected prefixes from user messages for clean summarization.
 /// Removes `[Security context: ...]`, `[Channel: ... | Trust: ...]`, and similar
-/// bracketed system tags that appear at the start of messages.
-fn strip_system_prefixes(text: &str) -> String {
+/// bracketed system tags that appear at the start of messages. Also strips
+/// `[Recent channel activity]...[End channel activity]` blocks and the
+/// `User message:` prefix injected by the chat handler.
+///
+/// Messages that don't contain these patterns pass through unchanged.
+pub(crate) fn strip_system_prefixes(text: &str) -> String {
     let mut s = text.trim();
 
     // Strip all leading bracketed system tags (may be multiple)
@@ -541,6 +545,14 @@ fn strip_system_prefixes(text: &str) -> String {
             }
         } else {
             break;
+        }
+    }
+
+    // Strip [Recent channel activity]...[End channel activity] block
+    if s.starts_with("[Recent channel activity]") {
+        if let Some(end_pos) = s.find("[End channel activity]") {
+            let after = &s[end_pos + "[End channel activity]".len()..];
+            s = after.trim_start_matches('\n').trim();
         }
     }
 
@@ -786,6 +798,26 @@ mod tests {
             strip_system_prefixes("[important] do this"),
             "[important] do this"
         );
+    }
+
+    #[test]
+    fn strip_full_composite_message() {
+        let msg = "[Channel: discord | Trust: VERIFIED — D. is likely the sender.]\n\n\
+                   [Recent channel activity]\n\
+                   D.: hey echo\n\
+                   Echo: hey what's up\n\
+                   [End channel activity]\n\n\
+                   User message: fix the bug";
+        assert_eq!(strip_system_prefixes(msg), "fix the bug");
+    }
+
+    #[test]
+    fn strip_channel_activity_without_trust_tag() {
+        let msg = "[Recent channel activity]\n\
+                   D.: hello\n\
+                   [End channel activity]\n\n\
+                   User message: do the thing";
+        assert_eq!(strip_system_prefixes(msg), "do the thing");
     }
 
     #[test]
