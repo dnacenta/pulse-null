@@ -86,6 +86,15 @@ impl Plugin for DiscordEchoPlugin {
     fn setup_prompts(&self) -> Vec<SetupPrompt> {
         discord_voice_echo::DiscordEcho::setup_prompts()
     }
+
+    fn platform_description(&self) -> Option<String> {
+        Some(
+            "Discord voice channel integration. Enables real-time voice \
+             conversations through Discord with speech-to-text and \
+             text-to-speech processing."
+                .to_string(),
+        )
+    }
 }
 
 #[cfg(test)]

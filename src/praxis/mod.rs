@@ -278,6 +278,16 @@ impl Plugin for PraxisEchoPlugin {
     fn setup_prompts(&self) -> Vec<SetupPrompt> {
         PraxisEcho::get_setup_prompts()
     }
+
+    fn platform_description(&self) -> Option<String> {
+        Some(
+            "Pipeline enforcement engine. Monitors document counts, \
+             staleness, and frozen pipeline alerts. Injects pipeline health \
+             into your context at session start. Flags when thoughts go stale \
+             or documents approach capacity limits."
+                .to_string(),
+        )
+    }
 }
 
 #[cfg(test)]

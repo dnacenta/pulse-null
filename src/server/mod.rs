@@ -142,6 +142,23 @@ pub async fn start(config: Config) -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
+    // Generate AWARENESS.md — platform awareness for this entity.
+    // Written to disk so Claude Code entities pick it up via @import,
+    // and loaded into the system prompt for API/Ollama entities.
+    {
+        let plugin_descriptions = plugin_manager.collect_platform_descriptions();
+        let tool_names: Vec<String> = tools
+            .definitions()
+            .iter()
+            .filter_map(|d| d.get("name").and_then(|n| n.as_str()).map(String::from))
+            .collect();
+        if let Err(e) =
+            prompt::write_awareness_file(&root_dir, &config, &plugin_descriptions, &tool_names)
+        {
+            tracing::warn!("Failed to generate AWARENESS.md: {}", e);
+        }
+    }
+
     // Create event bus
     let event_bus = Arc::new(EventBus::new(64));
 

@@ -119,6 +119,7 @@ fn test_config() -> Config {
         graph: GraphConfig::default(),
         sessions: SessionConfig::default(),
         context_buffer: crate::context_buffer::ContextBufferConfig::default(),
+        platform: crate::config::PlatformConfig::default(),
         peers: HashMap::new(),
         plugins: HashMap::new(),
     }

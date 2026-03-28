@@ -70,6 +70,16 @@ impl Plugin for RecallEchoPlugin {
                 .unwrap_or_default()
         }
     }
+
+    fn platform_description(&self) -> Option<String> {
+        Some(
+            "Three-layer persistent memory system with session archival. \
+             Manages MEMORY.md (curated), EPHEMERAL.md (session summaries), \
+             and full conversation archives. Handles checkpoint saves before \
+             context compaction and automatic session archiving on exit."
+                .to_string(),
+        )
+    }
 }
 
 #[cfg(test)]

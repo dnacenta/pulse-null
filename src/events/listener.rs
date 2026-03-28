@@ -291,6 +291,10 @@ fn translate_event(event: &EntityEvent, config: &EventsConfig) -> Option<Intent>
             })
         }
 
+        // PluginStateChanged triggers AWARENESS.md rebuild — handled externally,
+        // no intent needed from the event listener.
+        EntityEvent::PluginStateChanged { .. } => return None,
+
         EntityEvent::CognitiveHealthChanged {
             previous,
             current,

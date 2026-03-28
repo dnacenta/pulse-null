@@ -34,6 +34,8 @@ pub struct Config {
     #[serde(default)]
     pub context_buffer: crate::context_buffer::ContextBufferConfig,
     #[serde(default)]
+    pub platform: PlatformConfig,
+    #[serde(default)]
     pub peers: HashMap<String, PeerConfig>,
     #[serde(default)]
     pub plugins: HashMap<String, toml::Value>,
@@ -418,6 +420,23 @@ impl Default for SessionConfig {
             max_sessions: 50,
             cleanup_interval_seconds: 300,
             persist: true,
+        }
+    }
+}
+
+/// Configuration for platform awareness (AWARENESS.md generation)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct PlatformConfig {
+    /// Platform awareness mode: "full" includes conceptual framing + capabilities,
+    /// "compact" includes capabilities only (saves ~2k tokens).
+    pub mode: String,
+}
+
+impl Default for PlatformConfig {
+    fn default() -> Self {
+        Self {
+            mode: "full".to_string(),
         }
     }
 }

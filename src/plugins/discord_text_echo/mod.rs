@@ -106,6 +106,15 @@ impl Plugin for DiscordTextEchoPlugin {
             None => vec![],
         }
     }
+
+    fn platform_description(&self) -> Option<String> {
+        Some(
+            "Discord text channel integration. Reads messages from \
+             configured channels and can post messages via the discord_post \
+             tool. Messages from Discord arrive as verified-trust input."
+                .to_string(),
+        )
+    }
 }
 
 /// Wraps discord-echo's DiscordPostTool to implement pulse-null's Tool trait.

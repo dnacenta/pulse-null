@@ -91,6 +91,16 @@ impl Plugin for VoiceEchoPlugin {
     fn setup_prompts(&self) -> Vec<SetupPrompt> {
         voice_echo::VoiceEcho::setup_prompts()
     }
+
+    fn platform_description(&self) -> Option<String> {
+        Some(
+            "Phone call integration via Twilio. Handles inbound and \
+             outbound voice calls with speech-to-text (Groq Whisper) and \
+             text-to-speech (ElevenLabs). Voice input arrives as \
+             verified-trust with caller identification."
+                .to_string(),
+        )
+    }
 }
 
 #[cfg(test)]

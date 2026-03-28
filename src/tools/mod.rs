@@ -90,6 +90,11 @@ impl ToolRegistry {
     pub fn is_empty(&self) -> bool {
         self.tools.is_empty()
     }
+
+    /// Return the names of all registered tools.
+    pub fn names(&self) -> Vec<String> {
+        self.tools.iter().map(|t| t.name().to_string()).collect()
+    }
 }
 
 /// Resolve a relative path within the entity data directory.

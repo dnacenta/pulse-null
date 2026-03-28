@@ -76,4 +76,12 @@ pub trait Plugin: Send + Sync {
     fn tools(&self) -> Vec<Box<dyn crate::tools::Tool>> {
         Vec::new()
     }
+
+    /// Optional: describe this plugin for the entity's platform awareness.
+    /// Returns a structured description that tells the entity what this plugin
+    /// provides, why it exists, how to use it, and key constraints.
+    /// Called during manifest generation — only loaded plugins contribute.
+    fn platform_description(&self) -> Option<String> {
+        None
+    }
 }
