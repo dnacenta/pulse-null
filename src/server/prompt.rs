@@ -4,7 +4,8 @@ use std::sync::Arc;
 use pulse_system_types::monitoring::{CognitiveMonitor, PipelineMonitor};
 use tracing::{info, warn};
 
-use crate::config::Config;
+use super::capability::{self, Capability};
+use crate::config::{AwarenessMode, Config};
 use crate::scheduler::intent::IntentQueue;
 
 /// Async version of build_system_prompt — runs the blocking file I/O
@@ -230,42 +231,9 @@ fn load_rule_files(rules_dir: &str) -> Result<Vec<(String, String)>, Box<dyn std
 // Platform Awareness — AWARENESS.md manifest generation
 // ---------------------------------------------------------------------------
 
-/// A capability entry in the generated manifest.
-struct Capability {
-    name: String,
-    what: String,
-    why: String,
-    how: String,
-    constraints: Option<String>,
-}
-
-impl Capability {
-    fn render(&self) -> String {
-        let mut out = format!(
-            "### {}\n**What:** {}\n**Why:** {}\n**How:** {}",
-            self.name, self.what, self.why, self.how
-        );
-        if let Some(ref c) = self.constraints {
-            out.push_str(&format!("\n**Constraints:** {}", c));
-        }
-        out
-    }
-}
-
-/// Build the platform awareness manifest from config and runtime state.
-///
-/// This is the single rebuild function called from:
-/// - Startup (initial build)
-/// - Plugin failure handler (capability removed)
-/// - Plugin recovery handler (capability restored)
-pub fn rebuild_platform_manifest(
-    config: &Config,
-    plugin_descriptions: &[(String, String)],
-    tool_names: &[String],
-) -> String {
-    let mut sections = Vec::new();
-
-    // --- Core capabilities from config ---
+/// Build core capabilities from the entity's config.
+/// Each enabled subsystem produces a Capability entry.
+fn build_capabilities(config: &Config) -> Vec<Capability> {
     let mut capabilities = Vec::new();
 
     // Memory system (always on)
@@ -387,30 +355,35 @@ pub fn rebuild_platform_manifest(
         });
     }
 
-    if !capabilities.is_empty() {
-        let rendered: Vec<String> = capabilities.iter().map(|c| c.render()).collect();
-        sections.push(format!("## Capabilities\n\n{}", rendered.join("\n\n")));
-    }
+    capabilities
+}
 
-    // --- Tools ---
-    if !tool_names.is_empty() {
-        let tool_list: Vec<String> = tool_names.iter().map(|t| format!("- {}", t)).collect();
-        sections.push(format!(
-            "## Available Tools\n\nYou have these tools registered:\n{}",
-            tool_list.join("\n")
-        ));
+/// Build the "## Available Tools" section from registered tool names.
+fn build_tools_section(tool_names: &[String]) -> Option<String> {
+    if tool_names.is_empty() {
+        return None;
     }
+    let tool_list: Vec<String> = tool_names.iter().map(|t| format!("- {}", t)).collect();
+    Some(format!(
+        "## Available Tools\n\nYou have these tools registered:\n{}",
+        tool_list.join("\n")
+    ))
+}
 
-    // --- Plugin descriptions ---
-    if !plugin_descriptions.is_empty() {
-        let plugin_blocks: Vec<String> = plugin_descriptions
-            .iter()
-            .map(|(name, desc)| format!("### {}\n{}", name, desc))
-            .collect();
-        sections.push(format!("## Plugins\n\n{}", plugin_blocks.join("\n\n")));
+/// Build the "## Plugins" section from running plugin descriptions.
+fn build_plugins_section(plugin_descriptions: &[(String, String)]) -> Option<String> {
+    if plugin_descriptions.is_empty() {
+        return None;
     }
+    let plugin_blocks: Vec<String> = plugin_descriptions
+        .iter()
+        .map(|(name, desc)| format!("### {}\n{}", name, desc))
+        .collect();
+    Some(format!("## Plugins\n\n{}", plugin_blocks.join("\n\n")))
+}
 
-    // --- Communication channels ---
+/// Build the "## Communication Channels" section from config and active plugins.
+fn build_channels_section(config: &Config, plugin_descriptions: &[(String, String)]) -> String {
     let mut channels = Vec::new();
     channels.push(format!(
         "- HTTP server on {}:{}",
@@ -429,31 +402,61 @@ pub fn rebuild_platform_manifest(
 
     // Peers
     if !config.peers.is_empty() {
-        channels.push(format!(
-            "\n**Peers** (other entities you can communicate with):"
-        ));
+        channels.push("\n**Peers** (other entities you can communicate with):".into());
         for (name, peer) in &config.peers {
             channels.push(format!("- {} at {}:{}", name, peer.host, peer.port));
         }
     }
 
-    sections.push(format!(
-        "## Communication Channels\n\n{}",
-        channels.join("\n")
-    ));
+    format!("## Communication Channels\n\n{}", channels.join("\n"))
+}
 
-    // --- Entity info ---
-    sections.insert(
-        0,
-        format!(
-            "# {} — Platform Awareness\n\nYou are **{}**, running on **pulse-null** v{}.\nProvider: {} (model: {})",
-            config.entity.name,
-            config.entity.name,
-            env!("CARGO_PKG_VERSION"),
-            config.llm.provider,
-            config.llm.model,
-        ),
-    );
+/// Build the entity header that opens the manifest.
+fn build_entity_header(config: &Config) -> String {
+    format!(
+        "# {} — Platform Awareness\n\nYou are **{}**, running on **pulse-null** v{}.\nProvider: {} (model: {})",
+        config.entity.name,
+        config.entity.name,
+        env!("CARGO_PKG_VERSION"),
+        config.llm.provider,
+        config.llm.model,
+    )
+}
+
+/// Build the platform awareness manifest from config and runtime state.
+///
+/// This is the single rebuild function called from:
+/// - Startup (initial build)
+/// - Plugin failure handler (capability removed)
+/// - Plugin recovery handler (capability restored)
+pub fn rebuild_platform_manifest(
+    config: &Config,
+    plugin_descriptions: &[(String, String)],
+    tool_names: &[String],
+) -> String {
+    let mut sections = Vec::new();
+
+    // Entity header (always first)
+    sections.push(build_entity_header(config));
+
+    // Core capabilities from config
+    let capabilities = build_capabilities(config);
+    if let Some(cap_section) = capability::render_section(&capabilities) {
+        sections.push(cap_section);
+    }
+
+    // Tools
+    if let Some(tools_section) = build_tools_section(tool_names) {
+        sections.push(tools_section);
+    }
+
+    // Plugins
+    if let Some(plugins_section) = build_plugins_section(plugin_descriptions) {
+        sections.push(plugins_section);
+    }
+
+    // Communication channels
+    sections.push(build_channels_section(config, plugin_descriptions));
 
     sections.join("\n\n")
 }
@@ -478,13 +481,9 @@ pub fn generate_awareness_document(
 ) -> String {
     let manifest = rebuild_platform_manifest(config, plugin_descriptions, tool_names);
 
-    if config.platform.mode == "compact" {
-        // Compact mode: manifest only, no conceptual framing.
-        // Saves ~2k tokens for entities on tight context budgets.
-        manifest
-    } else {
-        // Full mode: conceptual template + manifest
-        format!("{}\n\n{}", PLATFORM_TEMPLATE.trim(), manifest)
+    match config.platform.mode {
+        AwarenessMode::Compact => manifest,
+        AwarenessMode::Full => format!("{}\n\n{}", PLATFORM_TEMPLATE.trim(), manifest),
     }
 }
 
@@ -512,7 +511,7 @@ pub fn write_awareness_file(
 
 /// Build context block for autonomous sessions (scheduled tasks and intents).
 /// Includes: tool list, output markers, queue status, cost status.
-pub fn build_autonomy_context(root_dir: &Path, config: &Config) -> String {
+pub fn build_autonomy_context(root_dir: &Path, _config: &Config) -> String {
     let mut sections = Vec::new();
 
     // Tool documentation
@@ -738,9 +737,63 @@ mod tests {
     #[test]
     fn awareness_document_compact_mode() {
         let mut config = minimal_config();
-        config.platform.mode = "compact".to_string();
+        config.platform.mode = AwarenessMode::Compact;
         let doc = generate_awareness_document(&config, &[], &[]);
         assert!(!doc.contains("What You Are"));
         assert!(doc.contains("Memory System"));
+    }
+
+    // --- Edge case tests ---
+
+    #[test]
+    fn manifest_with_empty_plugins_and_tools() {
+        let mut config = minimal_config();
+        config.pipeline.enabled = false;
+        config.monitoring.enabled = false;
+        config.autonomy.enabled = false;
+        config.pulse.enabled = false;
+        config.sessions.persist = false;
+        config.context_buffer.enabled = false;
+        config.graph.enabled = false;
+        let manifest = rebuild_platform_manifest(&config, &[], &[]);
+        // Should still have header, memory capability, and channels
+        assert!(manifest.contains("TestEntity"));
+        assert!(manifest.contains("Memory System"));
+        assert!(manifest.contains("Communication Channels"));
+        // Should NOT have tools or plugins sections
+        assert!(!manifest.contains("## Available Tools"));
+        assert!(!manifest.contains("## Plugins"));
+    }
+
+    #[test]
+    fn build_capabilities_returns_memory_when_all_disabled() {
+        let mut config = minimal_config();
+        config.pipeline.enabled = false;
+        config.monitoring.enabled = false;
+        config.autonomy.enabled = false;
+        config.pulse.enabled = false;
+        config.sessions.persist = false;
+        config.context_buffer.enabled = false;
+        config.graph.enabled = false;
+        let caps = build_capabilities(&config);
+        assert_eq!(caps.len(), 1);
+        assert_eq!(caps[0].name, "Memory System");
+    }
+
+    #[test]
+    fn build_tools_section_returns_none_when_empty() {
+        assert!(build_tools_section(&[]).is_none());
+    }
+
+    #[test]
+    fn build_plugins_section_returns_none_when_empty() {
+        assert!(build_plugins_section(&[]).is_none());
+    }
+
+    #[test]
+    fn entity_header_always_first_in_manifest() {
+        let config = minimal_config();
+        let manifest = rebuild_platform_manifest(&config, &[], &[]);
+        assert!(manifest.starts_with("# TestEntity — Platform Awareness"));
     }
 }

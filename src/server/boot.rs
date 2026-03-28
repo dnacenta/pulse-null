@@ -7,12 +7,9 @@ use tokio::task::JoinHandle;
 use crate::config::Config;
 use crate::events::EventBus;
 use crate::persist::PersistCoordinator;
-use crate::plugins::manager::PluginManager;
 use crate::scheduler::intent::IntentQueue;
 use crate::scheduler::Schedule;
 use crate::session_store::SessionStore;
-use crate::tools::ToolRegistry;
-use pulse_system_types::monitoring::{CognitiveMonitor, OutcomeTracker, PipelineMonitor};
 
 use super::AppState;
 
@@ -40,85 +37,26 @@ pub async fn boot_entity(
     let provider = crate::providers::create_provider(&config)?;
 
     // Monitoring
-    let pipeline_monitor: Option<Arc<dyn PipelineMonitor>> = if config.pipeline.enabled {
-        Some(Arc::new(crate::praxis::runtime::PraxisMonitor::new()))
-    } else {
-        None
-    };
-
-    let cognitive_monitor: Option<Arc<dyn CognitiveMonitor>> = if config.monitoring.enabled {
-        Some(Arc::new(crate::vigil::runtime::VigilMonitor::new()))
-    } else {
-        None
-    };
-
-    let outcome_tracker: Option<Arc<dyn OutcomeTracker>> = if config.pulse.enabled {
-        Some(Arc::new(crate::caliber::runtime::CaliberTracker::new()))
-    } else {
-        None
-    };
+    let monitors = super::setup::create_monitors(&config);
 
     // Tools
-    let mut tools = ToolRegistry::new();
-    tools.register(Box::new(crate::tools::file_read::FileReadTool::new(
-        root_dir.clone(),
-    )));
-    tools.register(Box::new(crate::tools::file_write::FileWriteTool::new(
-        root_dir.clone(),
-    )));
-    tools.register(Box::new(crate::tools::file_list::FileListTool::new(
-        root_dir.clone(),
-    )));
-    tools.register(Box::new(crate::tools::grep::GrepTool::new(
-        root_dir.clone(),
-    )));
-    tools.register(Box::new(crate::tools::web_fetch::WebFetchTool::new()));
-    #[cfg(feature = "graph")]
-    if config.graph.enabled {
-        tools.register(Box::new(crate::tools::graph_query::GraphQueryTool::new(
-            root_dir.clone(),
-        )));
-    }
+    let mut tools = super::setup::register_builtin_tools(&root_dir, &config);
 
-    // Plugins
-    let mut plugin_manager = PluginManager::new(&config);
-    if plugin_manager.count() > 0 {
-        let plugin_provider = crate::providers::create_provider_arc(&config)?;
-        plugin_manager
-            .init_all(&config, &root_dir, plugin_provider)
-            .await?;
-        plugin_manager.start_all().await?;
-        tracing::info!(
-            "{}: {} plugin(s) started",
-            config.entity.name,
-            plugin_manager.count()
-        );
-
-        for tool in plugin_manager.collect_tools() {
-            tools.register(tool);
-        }
-    }
+    // Plugins (init, start, collect tools + routes)
+    let (plugin_manager, plugin_routes) =
+        super::setup::init_and_start_plugins(&config, &root_dir, &mut tools).await?;
 
     // Platform awareness — generate AWARENESS.md from config + runtime state
-    let plugin_descriptions = plugin_manager.collect_platform_descriptions();
-    let tool_names = tools.names();
-    if let Err(e) =
-        super::prompt::write_awareness_file(&root_dir, &config, &plugin_descriptions, &tool_names)
-    {
-        tracing::warn!("Failed to generate AWARENESS.md: {}", e);
-    }
+    super::setup::generate_awareness(&root_dir, &config, &plugin_manager, &tools);
 
     // System prompt (built after tools/plugins so awareness is available)
     let system_prompt = super::prompt::build_system_prompt_async(
         root_dir.clone(),
         config.clone(),
-        pipeline_monitor.clone(),
-        cognitive_monitor.clone(),
+        monitors.pipeline.clone(),
+        monitors.cognitive.clone(),
     )
     .await?;
-
-    // Collect plugin routes before plugin_manager moves into AppState
-    let plugin_routes = plugin_manager.collect_routes();
 
     // Event bus
     let event_bus = Arc::new(EventBus::new(64));
@@ -148,27 +86,16 @@ pub async fn boot_entity(
         tools,
         event_bus: Arc::clone(&event_bus),
         root_dir: root_dir.clone(),
-        pipeline_monitor,
-        cognitive_monitor,
-        outcome_tracker,
+        pipeline_monitor: monitors.pipeline,
+        cognitive_monitor: monitors.cognitive,
+        outcome_tracker: monitors.outcome,
         context_buffer,
         persist_coordinator,
         plugin_manager: tokio::sync::Mutex::new(plugin_manager),
     });
 
     // Pipeline health check
-    if let Some(ref monitor) = state.pipeline_monitor {
-        let thresholds = config.pipeline.to_thresholds();
-        let health = monitor.calculate(&root_dir, &thresholds);
-        let archived = monitor.check_and_archive(&root_dir, &thresholds, &health);
-        for doc in &archived {
-            tracing::info!(
-                "{}: startup auto-archived overflow from {}",
-                config.entity.name,
-                doc
-            );
-        }
-    }
+    super::setup::startup_pipeline_check(&root_dir, &config, &state.pipeline_monitor);
 
     // Scheduler
     let schedule = Schedule::load(&root_dir)?;
@@ -182,50 +109,17 @@ pub async fn boot_entity(
     )
     .await?;
 
-    // Event listener
-    if config.autonomy.enabled {
-        let listener_rx = event_bus.subscribe();
-        let listener_queue = Arc::clone(&intent_queue);
-        let events_config = config.autonomy.events.clone();
-        let max_queue_size = config.autonomy.max_queue_size;
-        tokio::spawn(async move {
-            crate::events::listener::event_listener(
-                listener_rx,
-                listener_queue,
-                events_config,
-                max_queue_size,
-            )
-            .await;
-        });
-    }
-
-    // Session cleanup
-    if config.sessions.persist {
-        let cleanup_state = Arc::clone(&state);
-        let cleanup_interval = config.sessions.cleanup_interval_seconds;
-        tokio::spawn(async move {
-            let mut interval =
-                tokio::time::interval(std::time::Duration::from_secs(cleanup_interval));
-            interval.tick().await;
-            loop {
-                interval.tick().await;
-                cleanup_state
-                    .session_store
-                    .cleanup_expired(&cleanup_state.root_dir, &cleanup_state.config.entity.name)
-                    .await;
-                cleanup_state.session_store.persist_all().await;
-            }
-        });
-    }
-
-    // Awareness refresh listener — rebuilds AWARENESS.md on plugin state changes
+    // Give the plugin manager access to the event bus for runtime state-change events
     {
-        let awareness_rx = event_bus.subscribe();
-        let awareness_state = Arc::clone(&state);
-        tokio::spawn(async move {
-            crate::server::awareness_listener(awareness_rx, awareness_state).await;
-        });
+        let mut pm = state.plugin_manager.lock().await;
+        pm.set_event_bus(Arc::clone(&event_bus));
     }
+
+    // Spawn background tasks
+    super::setup::spawn_event_listener(&config, &event_bus, &intent_queue);
+    super::setup::spawn_session_cleanup(&config, &state);
+    super::setup::spawn_awareness_listener(&event_bus, &state);
+    super::setup::spawn_health_monitor(&config, &state);
 
     // Build router (plugin_routes collected before AppState construction)
     let app = super::build_router(Arc::clone(&state), plugin_routes);

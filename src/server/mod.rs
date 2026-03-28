@@ -1,11 +1,13 @@
 pub mod auth;
 pub mod boot;
+pub mod capability;
 #[cfg(test)]
 mod e2e_tests;
 mod handlers;
 pub mod injection;
 pub mod prompt;
 pub mod rate_limit;
+pub mod setup;
 pub mod trust;
 
 use std::path::PathBuf;
@@ -45,6 +47,26 @@ pub struct AppState {
     pub plugin_manager: tokio::sync::Mutex<PluginManager>,
 }
 
+/// Rebuild AWARENESS.md from the current plugin and tool state.
+///
+/// Shared by both the event-driven rebuild and the lagged-channel fallback
+/// to eliminate logic duplication.
+async fn rebuild_awareness(state: &Arc<AppState>) {
+    let pm = state.plugin_manager.lock().await;
+    let plugin_descriptions = pm.collect_platform_descriptions();
+    let tool_names = state.tools.names();
+    drop(pm); // release lock before I/O
+
+    if let Err(e) = prompt::write_awareness_file(
+        &state.root_dir,
+        &state.config,
+        &plugin_descriptions,
+        &tool_names,
+    ) {
+        tracing::error!("Failed to rebuild AWARENESS.md: {}", e);
+    }
+}
+
 /// Background listener that rebuilds AWARENESS.md when plugin state changes.
 ///
 /// Listens for PluginStateChanged events on the event bus and triggers a
@@ -64,23 +86,15 @@ pub async fn awareness_listener(
                     plugin_name,
                     new_state
                 );
-                let pm = state.plugin_manager.lock().await;
-                let plugin_descriptions = pm.collect_platform_descriptions();
-                let tool_names = state.tools.names();
-                drop(pm); // release lock before I/O
-
-                if let Err(e) = prompt::write_awareness_file(
-                    &state.root_dir,
-                    &state.config,
-                    &plugin_descriptions,
-                    &tool_names,
-                ) {
-                    tracing::error!("Failed to rebuild AWARENESS.md: {}", e);
-                }
+                rebuild_awareness(&state).await;
             }
             Ok(_) => {} // ignore other events
             Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
-                tracing::warn!("Awareness listener lagged by {} events", n);
+                tracing::warn!(
+                    "Awareness listener lagged by {} events — triggering full rebuild",
+                    n
+                );
+                rebuild_awareness(&state).await;
             }
             Err(tokio::sync::broadcast::error::RecvError::Closed) => {
                 tracing::info!("Event bus closed, awareness listener stopping");
@@ -120,90 +134,28 @@ pub async fn start(config: Config) -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
-    // Construct monitoring trait objects based on config
-    let pipeline_monitor: Option<Arc<dyn PipelineMonitor>> = if config.pipeline.enabled {
-        Some(Arc::new(crate::praxis::runtime::PraxisMonitor::new()))
-    } else {
-        None
-    };
-
-    let cognitive_monitor: Option<Arc<dyn CognitiveMonitor>> = if config.monitoring.enabled {
-        Some(Arc::new(crate::vigil::runtime::VigilMonitor::new()))
-    } else {
-        None
-    };
-
-    let outcome_tracker: Option<Arc<dyn OutcomeTracker>> = if config.pulse.enabled {
-        Some(Arc::new(crate::caliber::runtime::CaliberTracker::new()))
-    } else {
-        None
-    };
+    // Construct monitoring trait objects
+    let monitors = setup::create_monitors(&config);
 
     // Build system prompt from SELF.md + CLAUDE.md + MEMORY.md
     let system_prompt = prompt::build_system_prompt_async(
         root_dir.clone(),
         config.clone(),
-        pipeline_monitor.clone(),
-        cognitive_monitor.clone(),
+        monitors.pipeline.clone(),
+        monitors.cognitive.clone(),
     )
     .await?;
 
     // Register built-in tools
-    let mut tools = ToolRegistry::new();
-    tools.register(Box::new(crate::tools::file_read::FileReadTool::new(
-        root_dir.clone(),
-    )));
-    tools.register(Box::new(crate::tools::file_write::FileWriteTool::new(
-        root_dir.clone(),
-    )));
-    tools.register(Box::new(crate::tools::file_list::FileListTool::new(
-        root_dir.clone(),
-    )));
-    tools.register(Box::new(crate::tools::grep::GrepTool::new(
-        root_dir.clone(),
-    )));
-    tools.register(Box::new(crate::tools::web_fetch::WebFetchTool::new()));
-    #[cfg(feature = "graph")]
-    if config.graph.enabled {
-        tools.register(Box::new(crate::tools::graph_query::GraphQueryTool::new(
-            root_dir.clone(),
-        )));
-    }
+    let mut tools = setup::register_builtin_tools(&root_dir, &config);
     tracing::info!("Registered {} built-in tool(s)", tools.definitions().len());
 
-    // Initialize and start plugins
-    let mut plugin_manager = PluginManager::new(&config);
-    if plugin_manager.count() > 0 {
-        let plugin_provider = crate::providers::create_provider_arc(&config)?;
-        plugin_manager
-            .init_all(&config, &root_dir, plugin_provider)
-            .await?;
-        plugin_manager.start_all().await?;
-        tracing::info!("{} plugin(s) started", plugin_manager.count());
+    // Initialize and start plugins, collecting contributed tools
+    let (plugin_manager, plugin_routes) =
+        setup::init_and_start_plugins(&config, &root_dir, &mut tools).await?;
 
-        // Collect plugin-contributed tools
-        for tool in plugin_manager.collect_tools() {
-            tracing::info!("Registered plugin tool: {}", tool.name());
-            tools.register(tool);
-        }
-    }
-
-    // Generate AWARENESS.md — platform awareness for this entity.
-    // Written to disk so Claude Code entities pick it up via @import,
-    // and loaded into the system prompt for API/Ollama entities.
-    {
-        let plugin_descriptions = plugin_manager.collect_platform_descriptions();
-        let tool_names: Vec<String> = tools
-            .definitions()
-            .iter()
-            .filter_map(|d| d.get("name").and_then(|n| n.as_str()).map(String::from))
-            .collect();
-        if let Err(e) =
-            prompt::write_awareness_file(&root_dir, &config, &plugin_descriptions, &tool_names)
-        {
-            tracing::warn!("Failed to generate AWARENESS.md: {}", e);
-        }
-    }
+    // Generate AWARENESS.md
+    setup::generate_awareness(&root_dir, &config, &plugin_manager, &tools);
 
     // Create event bus
     let event_bus = Arc::new(EventBus::new(64));
@@ -233,9 +185,6 @@ pub async fn start(config: Config) -> Result<(), Box<dyn std::error::Error>> {
         None
     };
 
-    // Collect plugin routes before moving plugin_manager into AppState
-    let plugin_routes = plugin_manager.collect_routes();
-
     let state = Arc::new(AppState {
         config: config.clone(),
         provider,
@@ -244,23 +193,16 @@ pub async fn start(config: Config) -> Result<(), Box<dyn std::error::Error>> {
         tools,
         event_bus: Arc::clone(&event_bus),
         root_dir: root_dir.clone(),
-        pipeline_monitor,
-        cognitive_monitor,
-        outcome_tracker,
+        pipeline_monitor: monitors.pipeline,
+        cognitive_monitor: monitors.cognitive,
+        outcome_tracker: monitors.outcome,
         context_buffer,
         persist_coordinator,
         plugin_manager: tokio::sync::Mutex::new(plugin_manager),
     });
 
-    // Startup pipeline health check — archive bloated documents immediately
-    if let Some(ref monitor) = state.pipeline_monitor {
-        let thresholds = config.pipeline.to_thresholds();
-        let health = monitor.calculate(&root_dir, &thresholds);
-        let archived = monitor.check_and_archive(&root_dir, &thresholds, &health);
-        for doc in &archived {
-            tracing::info!("Startup: auto-archived overflow from {}", doc);
-        }
-    }
+    // Startup pipeline health check
+    setup::startup_pipeline_check(&root_dir, &config, &state.pipeline_monitor);
 
     // Load schedule and intent queue, start scheduler
     let schedule = Schedule::load(&root_dir)?;
@@ -274,43 +216,9 @@ pub async fn start(config: Config) -> Result<(), Box<dyn std::error::Error>> {
     )
     .await?;
 
-    // Start event listener (translates events → intents)
-    if config.autonomy.enabled {
-        let listener_rx = event_bus.subscribe();
-        let listener_queue = Arc::clone(&intent_queue);
-        let events_config = config.autonomy.events.clone();
-        let max_queue_size = config.autonomy.max_queue_size;
-        tokio::spawn(async move {
-            crate::events::listener::event_listener(
-                listener_rx,
-                listener_queue,
-                events_config,
-                max_queue_size,
-            )
-            .await;
-        });
-        tracing::info!("Event listener started");
-    }
-
-    // Start background session cleanup task
-    if config.sessions.persist {
-        let cleanup_state = Arc::clone(&state);
-        let cleanup_interval = config.sessions.cleanup_interval_seconds;
-        tokio::spawn(async move {
-            let mut interval =
-                tokio::time::interval(std::time::Duration::from_secs(cleanup_interval));
-            interval.tick().await; // Skip first immediate tick
-            loop {
-                interval.tick().await;
-                cleanup_state
-                    .session_store
-                    .cleanup_expired(&cleanup_state.root_dir, &cleanup_state.config.entity.name)
-                    .await;
-                cleanup_state.session_store.persist_all().await;
-            }
-        });
-        tracing::info!("Session cleanup task started (every {}s)", cleanup_interval);
-    }
+    // Spawn background tasks
+    setup::spawn_event_listener(&config, &event_bus, &intent_queue);
+    setup::spawn_session_cleanup(&config, &state);
 
     // Give the plugin manager access to the event bus for runtime state-change events
     {
@@ -318,33 +226,10 @@ pub async fn start(config: Config) -> Result<(), Box<dyn std::error::Error>> {
         pm.set_event_bus(Arc::clone(&event_bus));
     }
 
-    // Awareness refresh listener — rebuilds AWARENESS.md on plugin state changes
-    {
-        let awareness_rx = event_bus.subscribe();
-        let awareness_state = Arc::clone(&state);
-        tokio::spawn(async move {
-            awareness_listener(awareness_rx, awareness_state).await;
-        });
-    }
+    // Awareness refresh listener and plugin health monitor
+    setup::spawn_awareness_listener(&event_bus, &state);
+    setup::spawn_health_monitor(&config, &state);
 
-    // Plugin health monitor — periodically checks plugin health and emits
-    // PluginStateChanged events when plugins fail or recover. The awareness
-    // listener above reacts to these events and rebuilds AWARENESS.md.
-    if config.plugins.len() > 0 {
-        let health_state = Arc::clone(&state);
-        tokio::spawn(async move {
-            let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
-            interval.tick().await; // skip first immediate tick
-            loop {
-                interval.tick().await;
-                let mut pm = health_state.plugin_manager.lock().await;
-                pm.check_health_and_emit().await;
-            }
-        });
-        tracing::info!("Plugin health monitor started (60s interval)");
-    }
-
-    // plugin_routes collected before AppState construction (line ~237)
     let app = build_router(Arc::clone(&state), plugin_routes);
 
     let addr = format!("{}:{}", config.server.host, config.server.port);
