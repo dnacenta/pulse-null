@@ -146,6 +146,7 @@ mod tests {
         };
         let session_store =
             crate::session_store::SessionStore::new(&root_dir, &config.sessions).await;
+        let plugin_manager = crate::plugins::manager::PluginManager::new(&config);
         Arc::new(AppState {
             config,
             provider: Box::new(crate::claude_provider::ClaudeProvider::new(
@@ -162,6 +163,7 @@ mod tests {
             outcome_tracker: None,
             context_buffer: None,
             persist_coordinator: Arc::new(PersistCoordinator::new()),
+            plugin_manager: tokio::sync::Mutex::new(plugin_manager),
         })
     }
 
@@ -303,6 +305,7 @@ mod tests {
         };
         let session_store =
             crate::session_store::SessionStore::new(&root_dir, &config.sessions).await;
+        let plugin_manager = crate::plugins::manager::PluginManager::new(&config);
         Arc::new(AppState {
             config,
             provider: Box::new(crate::claude_provider::ClaudeProvider::new(
@@ -319,6 +322,7 @@ mod tests {
             outcome_tracker: None,
             context_buffer: None,
             persist_coordinator: Arc::new(PersistCoordinator::new()),
+            plugin_manager: tokio::sync::Mutex::new(plugin_manager),
         })
     }
 

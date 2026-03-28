@@ -140,6 +140,7 @@ async fn build_state(provider: MockProvider, tools: ToolRegistry) -> Arc<AppStat
     let root_dir = std::env::temp_dir();
     let config = test_config();
     let session_store = crate::session_store::SessionStore::new(&root_dir, &config.sessions).await;
+    let plugin_manager = crate::plugins::manager::PluginManager::new(&config);
     Arc::new(AppState {
         config,
         provider: Box::new(provider),
@@ -153,6 +154,7 @@ async fn build_state(provider: MockProvider, tools: ToolRegistry) -> Arc<AppStat
         outcome_tracker: None,
         context_buffer: None,
         persist_coordinator: Arc::new(PersistCoordinator::new()),
+        plugin_manager: tokio::sync::Mutex::new(plugin_manager),
     })
 }
 

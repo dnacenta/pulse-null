@@ -42,6 +42,52 @@ pub struct AppState {
     pub outcome_tracker: Option<Arc<dyn OutcomeTracker>>,
     pub context_buffer: Option<crate::context_buffer::ContextBufferStore>,
     pub persist_coordinator: Arc<PersistCoordinator>,
+    pub plugin_manager: tokio::sync::Mutex<PluginManager>,
+}
+
+/// Background listener that rebuilds AWARENESS.md when plugin state changes.
+///
+/// Listens for PluginStateChanged events on the event bus and triggers a
+/// manifest rebuild so the entity's capability inventory stays in sync.
+pub async fn awareness_listener(
+    mut rx: tokio::sync::broadcast::Receiver<crate::events::EntityEvent>,
+    state: Arc<AppState>,
+) {
+    loop {
+        match rx.recv().await {
+            Ok(crate::events::EntityEvent::PluginStateChanged {
+                ref plugin_name,
+                ref new_state,
+            }) => {
+                tracing::info!(
+                    "Plugin '{}' state changed to '{}' — rebuilding AWARENESS.md",
+                    plugin_name,
+                    new_state
+                );
+                let pm = state.plugin_manager.lock().await;
+                let plugin_descriptions = pm.collect_platform_descriptions();
+                let tool_names = state.tools.names();
+                drop(pm); // release lock before I/O
+
+                if let Err(e) = prompt::write_awareness_file(
+                    &state.root_dir,
+                    &state.config,
+                    &plugin_descriptions,
+                    &tool_names,
+                ) {
+                    tracing::error!("Failed to rebuild AWARENESS.md: {}", e);
+                }
+            }
+            Ok(_) => {} // ignore other events
+            Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                tracing::warn!("Awareness listener lagged by {} events", n);
+            }
+            Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                tracing::info!("Event bus closed, awareness listener stopping");
+                break;
+            }
+        }
+    }
 }
 
 pub async fn start(config: Config) -> Result<(), Box<dyn std::error::Error>> {
@@ -187,6 +233,9 @@ pub async fn start(config: Config) -> Result<(), Box<dyn std::error::Error>> {
         None
     };
 
+    // Collect plugin routes before moving plugin_manager into AppState
+    let plugin_routes = plugin_manager.collect_routes();
+
     let state = Arc::new(AppState {
         config: config.clone(),
         provider,
@@ -200,6 +249,7 @@ pub async fn start(config: Config) -> Result<(), Box<dyn std::error::Error>> {
         outcome_tracker,
         context_buffer,
         persist_coordinator,
+        plugin_manager: tokio::sync::Mutex::new(plugin_manager),
     });
 
     // Startup pipeline health check — archive bloated documents immediately
@@ -262,9 +312,39 @@ pub async fn start(config: Config) -> Result<(), Box<dyn std::error::Error>> {
         tracing::info!("Session cleanup task started (every {}s)", cleanup_interval);
     }
 
-    // Collect plugin routes (stateless — merged after .with_state())
-    let plugin_routes = plugin_manager.collect_routes();
+    // Give the plugin manager access to the event bus for runtime state-change events
+    {
+        let mut pm = state.plugin_manager.lock().await;
+        pm.set_event_bus(Arc::clone(&event_bus));
+    }
 
+    // Awareness refresh listener — rebuilds AWARENESS.md on plugin state changes
+    {
+        let awareness_rx = event_bus.subscribe();
+        let awareness_state = Arc::clone(&state);
+        tokio::spawn(async move {
+            awareness_listener(awareness_rx, awareness_state).await;
+        });
+    }
+
+    // Plugin health monitor — periodically checks plugin health and emits
+    // PluginStateChanged events when plugins fail or recover. The awareness
+    // listener above reacts to these events and rebuilds AWARENESS.md.
+    if config.plugins.len() > 0 {
+        let health_state = Arc::clone(&state);
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
+            interval.tick().await; // skip first immediate tick
+            loop {
+                interval.tick().await;
+                let mut pm = health_state.plugin_manager.lock().await;
+                pm.check_health_and_emit().await;
+            }
+        });
+        tracing::info!("Plugin health monitor started (60s interval)");
+    }
+
+    // plugin_routes collected before AppState construction (line ~237)
     let app = build_router(Arc::clone(&state), plugin_routes);
 
     let addr = format!("{}:{}", config.server.host, config.server.port);
@@ -305,7 +385,7 @@ pub async fn start(config: Config) -> Result<(), Box<dyn std::error::Error>> {
         .await;
 
     // Clean up plugins on shutdown
-    plugin_manager.stop_all().await;
+    state.plugin_manager.lock().await.stop_all().await;
 
     // Clean up scheduler tasks on shutdown
     for handle in scheduler_handles {
