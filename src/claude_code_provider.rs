@@ -4,6 +4,7 @@ use pulse_system_types::llm::{
     ContentBlock, LlmResponse, LlmResult, LmProvider, Message, MessageContent, Role, StopReason,
 };
 
+use crate::session::strip_system_prefixes;
 use crate::streaming::{self, StreamResult, StreamingProvider};
 
 pub struct ClaudeCodeProvider {
@@ -103,6 +104,10 @@ impl StreamingProvider for ClaudeCodeProvider {
 }
 
 /// Serialize a message history into a single prompt string.
+///
+/// User messages are passed through [`strip_system_prefixes`] to remove
+/// internal metadata (trust tags, channel context, "User message:" prefix)
+/// that should never reach the LLM.
 fn serialize_messages(messages: &[Message]) -> String {
     let mut parts = Vec::new();
     for msg in messages {
@@ -121,6 +126,12 @@ fn serialize_messages(messages: &[Message]) -> String {
                 })
                 .collect::<Vec<_>>()
                 .join("\n"),
+        };
+        // Strip internal metadata from user messages before sending to LLM
+        let text = if matches!(msg.role, Role::User) {
+            strip_system_prefixes(&text)
+        } else {
+            text
         };
         parts.push(format!("[{}]: {}", role, text));
     }

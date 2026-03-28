@@ -4,6 +4,7 @@ use pulse_system_types::llm::{
 use reqwest::header;
 use tokio_stream::StreamExt;
 
+use crate::session::strip_system_prefixes;
 use crate::streaming::{self, StreamEvent, StreamResult, StreamingProvider};
 
 pub struct ClaudeProvider {
@@ -33,12 +34,18 @@ impl ClaudeProvider {
         let api_messages: Vec<serde_json::Value> = messages
             .iter()
             .map(|m| {
-                let role = match m.role {
-                    pulse_system_types::llm::Role::User => "user",
-                    pulse_system_types::llm::Role::Assistant => "assistant",
-                };
+                let is_user = matches!(m.role, pulse_system_types::llm::Role::User);
+                let role = if is_user { "user" } else { "assistant" };
                 let content = match &m.content {
-                    MessageContent::Text(s) => serde_json::Value::String(s.clone()),
+                    MessageContent::Text(s) => {
+                        // Strip internal metadata from user messages
+                        let text = if is_user {
+                            strip_system_prefixes(s)
+                        } else {
+                            s.clone()
+                        };
+                        serde_json::Value::String(text)
+                    }
                     MessageContent::Blocks(blocks) => {
                         serde_json::to_value(blocks).unwrap_or(serde_json::Value::Null)
                     }

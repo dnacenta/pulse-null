@@ -3,6 +3,7 @@ use pulse_system_types::llm::{
 };
 use tokio_stream::StreamExt;
 
+use crate::session::strip_system_prefixes;
 use crate::streaming::{self, StreamEvent, StreamResult, StreamingProvider};
 
 pub struct OllamaProvider {
@@ -31,28 +32,35 @@ impl OllamaProvider {
         }));
 
         for msg in messages {
+            let is_user = matches!(msg.role, pulse_system_types::llm::Role::User);
             match &msg.content {
                 MessageContent::Text(text) => {
-                    let role = match msg.role {
-                        pulse_system_types::llm::Role::User => "user",
-                        pulse_system_types::llm::Role::Assistant => "assistant",
+                    let role = if is_user { "user" } else { "assistant" };
+                    // Strip internal metadata from user messages
+                    let content = if is_user {
+                        strip_system_prefixes(text)
+                    } else {
+                        text.clone()
                     };
                     ollama_messages.push(serde_json::json!({
                         "role": role,
-                        "content": text,
+                        "content": content,
                     }));
                 }
                 MessageContent::Blocks(blocks) => {
                     for block in blocks {
                         match block {
                             ContentBlock::Text { text } => {
-                                let role = match msg.role {
-                                    pulse_system_types::llm::Role::User => "user",
-                                    pulse_system_types::llm::Role::Assistant => "assistant",
+                                let role = if is_user { "user" } else { "assistant" };
+                                // Strip internal metadata from user messages
+                                let content = if is_user {
+                                    strip_system_prefixes(text)
+                                } else {
+                                    text.clone()
                                 };
                                 ollama_messages.push(serde_json::json!({
                                     "role": role,
-                                    "content": text,
+                                    "content": content,
                                 }));
                             }
                             ContentBlock::ToolUse { id, name, input } => {
