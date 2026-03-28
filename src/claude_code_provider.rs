@@ -108,6 +108,10 @@ impl StreamingProvider for ClaudeCodeProvider {
 /// User messages are passed through [`strip_system_prefixes`] to remove
 /// internal metadata (trust tags, channel context, "User message:" prefix)
 /// that should never reach the LLM.
+///
+/// The output always ends with a bare `[Assistant]:` stop boundary to signal
+/// that only assistant content should be generated. This prevents Claude Code
+/// from pattern-matching and reproducing internal tags in its output.
 fn serialize_messages(messages: &[Message]) -> String {
     let mut parts = Vec::new();
     for msg in messages {
@@ -135,7 +139,15 @@ fn serialize_messages(messages: &[Message]) -> String {
         };
         parts.push(format!("[{}]: {}", role, text));
     }
-    parts.join("\n\n")
+
+    let mut output = parts.join("\n\n");
+
+    // Append a stop boundary: a bare [Assistant]: marker signals that only
+    // assistant content should follow. This prevents Claude Code from
+    // pattern-matching conversation structure and reproducing internal tags.
+    output.push_str("\n\n[Assistant]:");
+
+    output
 }
 
 /// Parse the JSON response from `claude -p --output-format json`.
@@ -210,7 +222,10 @@ mod tests {
             },
         ];
         let result = serialize_messages(&messages);
-        assert_eq!(result, "[User]: hello\n\n[Assistant]: hi there");
+        assert_eq!(
+            result,
+            "[User]: hello\n\n[Assistant]: hi there\n\n[Assistant]:"
+        );
     }
 
     #[test]
@@ -227,7 +242,37 @@ mod tests {
             ]),
         }];
         let result = serialize_messages(&messages);
-        assert_eq!(result, "[User]: first\nsecond");
+        assert_eq!(result, "[User]: first\nsecond\n\n[Assistant]:");
+    }
+
+    #[test]
+    fn serialize_ends_with_stop_boundary() {
+        let messages = vec![Message {
+            role: Role::User,
+            content: MessageContent::Text("test".into()),
+        }];
+        let result = serialize_messages(&messages);
+        assert!(
+            result.ends_with("\n\n[Assistant]:"),
+            "serialized output must end with stop boundary"
+        );
+    }
+
+    #[test]
+    fn serialize_strips_trust_tags() {
+        let messages = vec![Message {
+            role: Role::User,
+            content: MessageContent::Text(
+                "[Channel: discord | Trust: VERIFIED — input from an authenticated channel.]\nfix the bug".into(),
+            ),
+        }];
+        let result = serialize_messages(&messages);
+        assert!(
+            result.starts_with("[User]: fix the bug"),
+            "trust tags should be stripped from serialized user messages, got: {result}"
+        );
+        assert!(!result.contains("Trust:"));
+        assert!(!result.contains("Channel:"));
     }
 
     #[test]
