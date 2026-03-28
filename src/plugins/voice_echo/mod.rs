@@ -77,9 +77,12 @@ impl Plugin for VoiceEchoPlugin {
 
     fn health(&self) -> Pin<Box<dyn Future<Output = PluginHealth> + Send + '_>> {
         Box::pin(async move {
-            match &self.inner {
-                Some(inner) => inner.health(),
-                None => PluginHealth::Down("not initialized".to_string()),
+            if self.started {
+                PluginHealth::Healthy
+            } else if self.inner.is_some() {
+                PluginHealth::Degraded("initialized but not started".into())
+            } else {
+                PluginHealth::Down("not initialized".into())
             }
         })
     }
@@ -89,7 +92,36 @@ impl Plugin for VoiceEchoPlugin {
     }
 
     fn setup_prompts(&self) -> Vec<SetupPrompt> {
-        voice_echo::VoiceEcho::setup_prompts()
+        vec![
+            SetupPrompt {
+                key: "external_url".into(),
+                question: "External URL (where Twilio can reach this server):".into(),
+                required: true,
+                secret: false,
+                default: None,
+            },
+            SetupPrompt {
+                key: "twilio_account_sid".into(),
+                question: "Twilio Account SID:".into(),
+                required: true,
+                secret: false,
+                default: None,
+            },
+            SetupPrompt {
+                key: "twilio_auth_token".into(),
+                question: "Twilio Auth Token:".into(),
+                required: true,
+                secret: true,
+                default: None,
+            },
+            SetupPrompt {
+                key: "twilio_phone_number".into(),
+                question: "Twilio Phone Number (E.164 format, e.g. +1234567890):".into(),
+                required: true,
+                secret: false,
+                default: None,
+            },
+        ]
     }
 
     fn platform_description(&self) -> Option<String> {

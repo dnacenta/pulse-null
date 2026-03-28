@@ -229,6 +229,15 @@ Your growth pipeline lives in the journal/ directory:
 
 Ideas flow: LEARNING → THOUGHTS → REFLECTIONS → SELF.md / PRAXIS.md
 
+## Platform Awareness
+
+@AWARENESS.md
+
+AWARENESS.md is generated automatically by pulse-null at startup. It tells you what
+subsystems, tools, and capabilities you have access to. If a plugin crashes, it will
+be removed from that document. If it recovers, it comes back. Trust what it says —
+it reflects your actual runtime state.
+
 ## Protocols
 
 Shared protocols may be loaded into your context from a rules directory.

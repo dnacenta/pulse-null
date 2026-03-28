@@ -58,15 +58,6 @@ pub async fn boot_entity(
         None
     };
 
-    // System prompt
-    let system_prompt = super::prompt::build_system_prompt_async(
-        root_dir.clone(),
-        config.clone(),
-        pipeline_monitor.clone(),
-        cognitive_monitor.clone(),
-    )
-    .await?;
-
     // Tools
     let mut tools = ToolRegistry::new();
     tools.register(Box::new(crate::tools::file_read::FileReadTool::new(
@@ -108,6 +99,27 @@ pub async fn boot_entity(
         }
     }
 
+    // Platform awareness — generate AWARENESS.md from config + runtime state
+    let plugin_descriptions = plugin_manager.collect_platform_descriptions();
+    let tool_names = tools.names();
+    if let Err(e) =
+        super::prompt::write_awareness_file(&root_dir, &config, &plugin_descriptions, &tool_names)
+    {
+        tracing::warn!("Failed to generate AWARENESS.md: {}", e);
+    }
+
+    // System prompt (built after tools/plugins so awareness is available)
+    let system_prompt = super::prompt::build_system_prompt_async(
+        root_dir.clone(),
+        config.clone(),
+        pipeline_monitor.clone(),
+        cognitive_monitor.clone(),
+    )
+    .await?;
+
+    // Collect plugin routes before plugin_manager moves into AppState
+    let plugin_routes = plugin_manager.collect_routes();
+
     // Event bus
     let event_bus = Arc::new(EventBus::new(64));
 
@@ -141,6 +153,7 @@ pub async fn boot_entity(
         outcome_tracker,
         context_buffer,
         persist_coordinator,
+        plugin_manager: tokio::sync::Mutex::new(plugin_manager),
     });
 
     // Pipeline health check
@@ -205,8 +218,16 @@ pub async fn boot_entity(
         });
     }
 
-    // Build router
-    let plugin_routes = plugin_manager.collect_routes();
+    // Awareness refresh listener — rebuilds AWARENESS.md on plugin state changes
+    {
+        let awareness_rx = event_bus.subscribe();
+        let awareness_state = Arc::clone(&state);
+        tokio::spawn(async move {
+            crate::server::awareness_listener(awareness_rx, awareness_state).await;
+        });
+    }
+
+    // Build router (plugin_routes collected before AppState construction)
     let app = super::build_router(Arc::clone(&state), plugin_routes);
 
     // Bind to the overridden port
