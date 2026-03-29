@@ -8,6 +8,7 @@ use pulse_system_types::llm::{
 use crate::chat;
 use crate::config::Config;
 use crate::tools::ToolRegistry;
+use crate::wal::{WalMeta, WalWriter};
 
 /// Maximum tool-use round trips per user message.
 const MAX_TOOL_ROUNDS: u32 = 25;
@@ -24,6 +25,26 @@ pub async fn run(
     let stdin = io::stdin();
     let entity_name = &config.entity.name;
     let plugin_count = config.plugins.len();
+
+    // Initialize WAL for the REPL session
+    let sessions_dir = root_dir.join("sessions");
+    let wal = if config.sessions.wal_enabled {
+        match WalWriter::new(&sessions_dir, config.sessions.wal_fsync) {
+            Ok(w) => Some(w),
+            Err(e) => {
+                eprintln!(
+                    "  \x1b[33mwarning\x1b[0m  WAL init failed: {} (continuing without WAL)",
+                    e
+                );
+                None
+            }
+        }
+    } else {
+        None
+    };
+
+    let session_key = "repl:local";
+    let mut wal_seq: u64 = 0;
 
     loop {
         // Prompt
@@ -56,10 +77,30 @@ pub async fn run(
             continue;
         }
 
+        // Build user message content
+        let user_content = MessageContent::Text(input.to_string());
+
+        // WAL: append user message BEFORE adding to conversation (write-ahead)
+        if let Some(ref wal) = wal {
+            wal_seq += 1;
+            if let Err(e) = wal.append(
+                session_key,
+                wal_seq,
+                Role::User,
+                &user_content,
+                Some(WalMeta {
+                    channel: Some("repl".into()),
+                    sender: Some("local".into()),
+                }),
+            ) {
+                tracing::warn!("REPL WAL append failed for user message: {}", e);
+            }
+        }
+
         // Add user message to conversation
         conversation.push(Message {
             role: Role::User,
-            content: MessageContent::Text(input.to_string()),
+            content: user_content,
         });
 
         // Compact conversation if approaching context budget
@@ -105,10 +146,23 @@ pub async fn run(
                 }
             };
 
+            // Build assistant content
+            let assistant_content = MessageContent::Blocks(result.content.clone());
+
+            // WAL: append assistant response
+            if let Some(ref wal) = wal {
+                wal_seq += 1;
+                if let Err(e) =
+                    wal.append(session_key, wal_seq, Role::Assistant, &assistant_content, None)
+                {
+                    tracing::warn!("REPL WAL append failed for assistant message: {}", e);
+                }
+            }
+
             // Add assistant response to conversation
             conversation.push(Message {
                 role: Role::Assistant,
-                content: MessageContent::Blocks(result.content.clone()),
+                content: assistant_content,
             });
 
             match result.stop_reason {
@@ -167,10 +221,23 @@ pub async fn run(
                         }
                     }
 
+                    // Build tool results content
+                    let tool_content = MessageContent::Blocks(tool_results);
+
+                    // WAL: append tool results
+                    if let Some(ref wal) = wal {
+                        wal_seq += 1;
+                        if let Err(e) =
+                            wal.append(session_key, wal_seq, Role::User, &tool_content, None)
+                        {
+                            tracing::warn!("REPL WAL append failed for tool results: {}", e);
+                        }
+                    }
+
                     // Add tool results and loop
                     conversation.push(Message {
                         role: Role::User,
-                        content: MessageContent::Blocks(tool_results),
+                        content: tool_content,
                     });
                 }
                 StopReason::Other(ref reason) => {
@@ -209,6 +276,16 @@ pub async fn run(
                     crate::session::graph_ingest_archive(&root, &archive_path, None).await;
                 });
             });
+        }
+    }
+
+    // Clean up WAL on clean exit (conversation is archived, WAL no longer needed)
+    if let Some(ref wal) = wal {
+        if let Err(e) = wal.remove(session_key) {
+            tracing::warn!("REPL: failed to remove WAL: {}", e);
+        }
+        if let Err(e) = wal.remove_checkpoint(session_key) {
+            tracing::warn!("REPL: failed to remove checkpoint: {}", e);
         }
     }
 

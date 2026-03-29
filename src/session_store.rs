@@ -24,6 +24,15 @@ pub struct SessionData {
     pub created_at: DateTime<Utc>,
     pub last_active: DateTime<Utc>,
     pub message_count: usize,
+    /// WAL sequence counter (increments with each message written to WAL).
+    #[serde(default)]
+    pub wal_seq: u64,
+    /// Messages since last checkpoint.
+    #[serde(default)]
+    pub messages_since_checkpoint: u64,
+    /// Timestamp of the last checkpoint (or session creation if no checkpoint yet).
+    #[serde(default = "Utc::now")]
+    pub last_checkpoint_time: DateTime<Utc>,
 }
 
 impl SessionData {
@@ -54,6 +63,9 @@ impl Session {
                 created_at: now,
                 last_active: now,
                 message_count: 0,
+                wal_seq: 0,
+                messages_since_checkpoint: 0,
+                last_checkpoint_time: now,
             },
             dirty: false,
         }
@@ -447,6 +459,11 @@ impl SessionStore {
     /// Get the total number of active sessions.
     pub async fn count(&self) -> usize {
         self.sessions.read().await.len()
+    }
+
+    /// Check if a session exists (for WAL orphan detection).
+    pub async fn has_session(&self, key: &str) -> bool {
+        self.sessions.read().await.contains_key(key)
     }
 }
 
