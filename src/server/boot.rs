@@ -93,6 +93,7 @@ pub async fn boot_entity(
         context_buffer,
         persist_coordinator,
         plugin_manager: tokio::sync::Mutex::new(plugin_manager),
+        wal: None,
     });
 
     // Pipeline health check

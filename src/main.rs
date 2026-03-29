@@ -30,6 +30,7 @@ mod tools;
 mod tui;
 mod utils;
 mod vigil;
+mod wal;
 
 #[derive(Parser)]
 #[command(name = "pulse-null")]

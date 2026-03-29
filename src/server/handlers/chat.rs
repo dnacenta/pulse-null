@@ -3,6 +3,7 @@ use std::sync::Arc;
 use axum::extract::State;
 use axum::http::StatusCode;
 use axum::Json;
+use chrono::Utc;
 use serde::{Deserialize, Serialize};
 
 use crate::events::{ConversationTrust, EntityEvent, InteractionSource};
@@ -168,12 +169,33 @@ pub async fn chat(
     let mut session = session_arc.write().await;
     session.touch();
 
+    // Build user message content
+    let user_content = MessageContent::Text(user_message);
+
+    // WAL: append user message BEFORE adding to session (write-ahead)
+    if let Some(ref wal) = state.wal {
+        session.data.wal_seq += 1;
+        if let Err(e) = wal.append(
+            &session_key,
+            session.data.wal_seq,
+            Role::User,
+            &user_content,
+            Some(crate::wal::WalMeta {
+                channel: Some(req.channel.clone()),
+                sender: req.sender.clone(),
+            }),
+        ) {
+            tracing::warn!("WAL append failed for user message: {}", e);
+        }
+    }
+
     // Add user message to session
     session.data.messages.push(Message {
         role: Role::User,
-        content: MessageContent::Text(user_message),
+        content: user_content,
     });
     session.data.message_count += 1;
+    session.data.messages_since_checkpoint += 1;
 
     // Compact conversation if approaching context budget
     crate::context::compact_if_needed(
@@ -208,8 +230,25 @@ pub async fn chat(
 
     let text = result.text;
 
+    // WAL: append assistant response
+    if let Some(ref wal) = state.wal {
+        session.data.wal_seq += 1;
+        if let Err(e) = wal.append(
+            &session_key,
+            session.data.wal_seq,
+            Role::Assistant,
+            &MessageContent::Text(text.clone()),
+            None,
+        ) {
+            tracing::warn!("WAL append failed for assistant message: {}", e);
+        }
+    }
+
     // Enforce hard cap on stored messages
     session.data.enforce_message_cap();
+
+    // Incremental checkpoint (if conditions met)
+    maybe_checkpoint(&state, &session_key, &mut session.data, &channel).await;
 
     // Record entity response to context buffer
     if let Some(ref cb) = state.context_buffer {
@@ -269,4 +308,81 @@ fn emit_post_conversation(
         input_tokens,
         output_tokens,
     });
+}
+
+/// Check if checkpoint conditions are met and create an incremental checkpoint
+/// archive if needed. This runs after a successful response and persist.
+///
+/// Checkpoint fires when ANY of:
+/// - Messages since last checkpoint ≥ checkpoint_interval
+/// - Time since last checkpoint ≥ checkpoint_time
+/// - WAL file size exceeds wal_max_size
+async fn maybe_checkpoint(
+    state: &Arc<AppState>,
+    session_key: &str,
+    session_data: &mut crate::session_store::SessionData,
+    channel: &str,
+) {
+    if !state.config.sessions.checkpoint_enabled {
+        return;
+    }
+
+    let wal = match state.wal {
+        Some(ref w) => w,
+        None => return,
+    };
+
+    let checkpoint_interval = state.config.sessions.checkpoint_interval;
+    let checkpoint_time_secs = state.config.sessions.checkpoint_time;
+    let wal_max_size = state.config.sessions.wal_max_size;
+
+    // Check message count condition
+    let msg_condition = session_data.messages_since_checkpoint >= checkpoint_interval;
+
+    // Check time condition
+    let elapsed = Utc::now()
+        .signed_duration_since(session_data.last_checkpoint_time)
+        .num_seconds();
+    let time_condition = elapsed >= checkpoint_time_secs as i64;
+
+    // Check WAL size condition
+    let size_condition = match wal.file_size(session_key) {
+        Ok(size) => size >= wal_max_size,
+        Err(_) => false,
+    };
+
+    if !msg_condition && !time_condition && !size_condition {
+        return;
+    }
+
+    // Create checkpoint archive
+    let meta = crate::session::ArchiveMeta {
+        trigger: "checkpoint".to_string(),
+        channel: channel.to_string(),
+        entity_name: state.config.entity.name.clone(),
+        session_key: Some(session_key.to_string()),
+    };
+
+    match crate::session::archive_conversation(&state.root_dir, &session_data.messages, &meta) {
+        Ok(path) => {
+            tracing::info!(
+                "WAL checkpoint: archived {} ({} messages) → {}",
+                session_key,
+                session_data.messages.len(),
+                path.display()
+            );
+
+            // Record the checkpoint seq in the marker file
+            if let Err(e) = wal.write_checkpoint(session_key, session_data.wal_seq) {
+                tracing::warn!("WAL: failed to write checkpoint marker: {}", e);
+            }
+
+            // Reset counters
+            session_data.last_checkpoint_time = Utc::now();
+            session_data.messages_since_checkpoint = 0;
+        }
+        Err(e) => {
+            tracing::warn!("WAL checkpoint: failed to archive {}: {}", session_key, e);
+        }
+    }
 }

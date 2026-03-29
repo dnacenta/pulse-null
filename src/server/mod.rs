@@ -45,6 +45,7 @@ pub struct AppState {
     pub context_buffer: Option<crate::context_buffer::ContextBufferStore>,
     pub persist_coordinator: Arc<PersistCoordinator>,
     pub plugin_manager: tokio::sync::Mutex<PluginManager>,
+    pub wal: Option<crate::wal::WalWriter>,
 }
 
 /// Rebuild AWARENESS.md from the current plugin and tool state.
@@ -186,6 +187,23 @@ pub async fn start(config: Config) -> Result<(), Box<dyn std::error::Error>> {
         None
     };
 
+    // Initialize WAL for crash-resilient conversation persistence
+    let wal = if config.sessions.wal_enabled {
+        let sessions_dir = root_dir.join("sessions");
+        match crate::wal::WalWriter::new(&sessions_dir, config.sessions.wal_fsync) {
+            Ok(w) => {
+                tracing::info!("WAL enabled (fsync: {:?})", config.sessions.wal_fsync);
+                Some(w)
+            }
+            Err(e) => {
+                tracing::warn!("Failed to initialize WAL: {} (continuing without WAL)", e);
+                None
+            }
+        }
+    } else {
+        None
+    };
+
     let state = Arc::new(AppState {
         config: config.clone(),
         provider,
@@ -200,6 +218,7 @@ pub async fn start(config: Config) -> Result<(), Box<dyn std::error::Error>> {
         context_buffer,
         persist_coordinator,
         plugin_manager: tokio::sync::Mutex::new(plugin_manager),
+        wal,
     });
 
     // Startup pipeline health check
@@ -216,6 +235,17 @@ pub async fn start(config: Config) -> Result<(), Box<dyn std::error::Error>> {
         Arc::clone(&intent_queue),
     )
     .await?;
+
+    // Recover orphaned conversations from WAL (post-init: provider + plugins ready)
+    if let Some(ref wal) = state.wal {
+        crate::wal::recover_orphans(
+            wal,
+            &state.session_store,
+            &state.root_dir,
+            &config.entity.name,
+        )
+        .await;
+    }
 
     // Spawn background tasks
     setup::spawn_event_listener(&config, &event_bus, &intent_queue);
@@ -310,7 +340,27 @@ pub async fn start(config: Config) -> Result<(), Box<dyn std::error::Error>> {
         .archive_all(&root_dir, &config.entity.name)
         .await;
 
-    // 6. Ingest shutdown archives into the knowledge graph
+    // 6. Clean up WAL and checkpoint files for archived sessions
+    if let Some(ref wal) = state.wal {
+        match wal.list_active() {
+            Ok(keys) => {
+                for key in &keys {
+                    if let Err(e) = wal.remove(key) {
+                        tracing::warn!("Failed to remove WAL for {}: {}", key, e);
+                    }
+                    if let Err(e) = wal.remove_checkpoint(key) {
+                        tracing::warn!("Failed to remove checkpoint for {}: {}", key, e);
+                    }
+                }
+                if !keys.is_empty() {
+                    tracing::info!("Cleaned up {} WAL file(s) on shutdown", keys.len());
+                }
+            }
+            Err(e) => tracing::warn!("Failed to list WAL files: {}", e),
+        }
+    }
+
+    // 7. Ingest shutdown archives into the knowledge graph
     // Uses spawn_blocking + dedicated runtime because SurrealDB types are not Send.
     if config.graph.enabled && config.graph.auto_ingest && !archived_paths.is_empty() {
         let state_for_graph = Arc::clone(&state);
@@ -372,6 +422,7 @@ pub fn ensure_infrastructure(root_dir: &std::path::Path) {
     let dirs = [
         "memory",
         "sessions",
+        "sessions/wal",
         "archives",
         "archives/conversations",
         "archives/learning",

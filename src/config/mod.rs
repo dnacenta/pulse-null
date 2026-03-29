@@ -411,6 +411,18 @@ pub struct SessionConfig {
     pub cleanup_interval_seconds: u64,
     /// Whether to persist sessions to disk
     pub persist: bool,
+    /// Enable write-ahead logging for crash resilience
+    pub wal_enabled: bool,
+    /// Fsync policy for WAL writes: "user_only", "all", or "none"
+    pub wal_fsync: crate::wal::WalFsync,
+    /// Enable incremental checkpoints during long conversations
+    pub checkpoint_enabled: bool,
+    /// Messages between checkpoints (default: 20)
+    pub checkpoint_interval: u64,
+    /// Seconds between checkpoints (default: 600 = 10 min)
+    pub checkpoint_time: u64,
+    /// Max WAL size in bytes before forced checkpoint (default: 512KB)
+    pub wal_max_size: u64,
 }
 
 impl Default for SessionConfig {
@@ -420,6 +432,12 @@ impl Default for SessionConfig {
             max_sessions: 50,
             cleanup_interval_seconds: 300,
             persist: true,
+            wal_enabled: true,
+            wal_fsync: crate::wal::WalFsync::UserOnly,
+            checkpoint_enabled: true,
+            checkpoint_interval: 20,
+            checkpoint_time: 600,
+            wal_max_size: 524288,
         }
     }
 }

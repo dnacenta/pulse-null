@@ -168,6 +168,7 @@ mod tests {
             context_buffer: None,
             persist_coordinator: Arc::new(PersistCoordinator::new()),
             plugin_manager: tokio::sync::Mutex::new(plugin_manager),
+            wal: None,
         })
     }
 
@@ -331,6 +332,7 @@ mod tests {
             context_buffer: None,
             persist_coordinator: Arc::new(PersistCoordinator::new()),
             plugin_manager: tokio::sync::Mutex::new(plugin_manager),
+            wal: None,
         })
     }
 
