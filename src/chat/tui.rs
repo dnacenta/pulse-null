@@ -864,6 +864,7 @@ pub async fn run(
         &app.conversation,
         "tui",
         "session-end",
+        None,
     ) {
         if config.graph.enabled && config.graph.auto_ingest {
             let root = root_dir.to_path_buf();

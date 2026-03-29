@@ -164,7 +164,8 @@ pub async fn start(config: Config) -> Result<(), Box<dyn std::error::Error>> {
     let persist_coordinator = Arc::new(PersistCoordinator::new());
 
     // Initialize session store (loads persisted sessions from disk)
-    let mut session_store = SessionStore::new(&root_dir, &config.sessions).await;
+    let mut session_store =
+        SessionStore::new(&root_dir, &config.sessions, &config.entity.name).await;
     session_store.set_coordinator(Arc::clone(&persist_coordinator));
     let loaded_count = session_store.count().await;
     if loaded_count > 0 {
@@ -239,8 +240,18 @@ pub async fn start(config: Config) -> Result<(), Box<dyn std::error::Error>> {
     pidfile::write(&root_dir)?;
     tracing::info!("Listening on {}", addr);
 
-    // Graceful shutdown on SIGTERM or SIGINT
-    let shutdown = async {
+    // === Graceful shutdown ===
+    //
+    // Architecture: use a watch channel so we can react to SIGTERM in multiple places.
+    // When the signal fires, we immediately abort scheduler tasks and stop plugins
+    // (which may be generating in-flight HTTP requests), THEN let axum drain with
+    // a timeout, THEN archive sessions.
+    let (shutdown_tx, _) = tokio::sync::watch::channel(false);
+    let mut shutdown_rx_axum = shutdown_tx.subscribe();
+    let mut shutdown_rx_main = shutdown_tx.subscribe();
+
+    // Signal handler: fires once on SIGTERM or SIGINT
+    tokio::spawn(async move {
         let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
             .expect("failed to install SIGTERM handler");
         let sigint = tokio::signal::ctrl_c();
@@ -248,13 +259,43 @@ pub async fn start(config: Config) -> Result<(), Box<dyn std::error::Error>> {
             _ = sigterm.recv() => tracing::info!("Received SIGTERM"),
             _ = sigint => tracing::info!("Received SIGINT"),
         }
-    };
+        let _ = shutdown_tx.send(true);
+    });
 
-    axum::serve(listener, app)
-        .with_graceful_shutdown(shutdown)
-        .await?;
+    // Spawn the server as a task so we can control its lifetime
+    let server_handle = tokio::spawn(async move {
+        axum::serve(listener, app)
+            .with_graceful_shutdown(async move {
+                let _ = shutdown_rx_axum.changed().await;
+            })
+            .await
+    });
 
-    // Flush any in-flight persistence tasks before archiving
+    // Wait for the shutdown signal
+    let _ = shutdown_rx_main.changed().await;
+
+    // === Post-signal sequence ===
+    // These run immediately after SIGTERM, while axum is still draining.
+
+    // 1. Abort scheduler tasks — they call the provider directly and may hold
+    //    long-running LLM requests that block the runtime.
+    tracing::info!("Aborting {} scheduler task(s)", scheduler_handles.len());
+    for handle in scheduler_handles {
+        handle.abort();
+    }
+
+    // 2. Stop plugins (Discord bot, etc.) so they stop generating new requests.
+    state.plugin_manager.lock().await.stop_all().await;
+
+    // 3. Give axum up to 30s to drain remaining in-flight requests.
+    match tokio::time::timeout(std::time::Duration::from_secs(30), server_handle).await {
+        Ok(Ok(Ok(()))) => tracing::info!("Server drained cleanly"),
+        Ok(Ok(Err(e))) => tracing::warn!("Server error during drain: {}", e),
+        Ok(Err(e)) => tracing::warn!("Server task panicked: {}", e),
+        Err(_) => tracing::warn!("Server drain timed out after 30s, proceeding with shutdown"),
+    }
+
+    // 4. Flush any in-flight persistence tasks before archiving
     let flushed = state
         .persist_coordinator
         .flush(std::time::Duration::from_secs(5))
@@ -263,16 +304,16 @@ pub async fn start(config: Config) -> Result<(), Box<dyn std::error::Error>> {
         tracing::warn!("Some persistence tasks did not complete before shutdown");
     }
 
-    // Archive all sessions on shutdown and persist to disk
+    // 5. Archive all sessions on shutdown and persist to disk
     let archived_paths = state
         .session_store
         .archive_all(&root_dir, &config.entity.name)
         .await;
 
-    // Ingest shutdown archives into the knowledge graph
+    // 6. Ingest shutdown archives into the knowledge graph
     // Uses spawn_blocking + dedicated runtime because SurrealDB types are not Send.
     if config.graph.enabled && config.graph.auto_ingest && !archived_paths.is_empty() {
-        let graph_root = root_dir.clone();
+        let state_for_graph = Arc::clone(&state);
         let _ = tokio::task::spawn_blocking(move || {
             let rt = match tokio::runtime::Runtime::new() {
                 Ok(rt) => rt,
@@ -283,19 +324,16 @@ pub async fn start(config: Config) -> Result<(), Box<dyn std::error::Error>> {
             };
             rt.block_on(async {
                 for path in &archived_paths {
-                    crate::session::graph_ingest_archive(&graph_root, path, None).await;
+                    crate::session::graph_ingest_archive(
+                        &state_for_graph.root_dir,
+                        path,
+                        Some(state_for_graph.provider.as_ref()),
+                    )
+                    .await;
                 }
             });
         })
         .await;
-    }
-
-    // Clean up plugins on shutdown
-    state.plugin_manager.lock().await.stop_all().await;
-
-    // Clean up scheduler tasks on shutdown
-    for handle in scheduler_handles {
-        handle.abort();
     }
 
     // Remove PID file

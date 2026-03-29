@@ -211,6 +211,7 @@ pub fn end_session(
     conversation: &[Message],
     channel: &str,
     trigger: &str,
+    session_key: Option<&str>,
 ) -> Option<PathBuf> {
     if conversation.is_empty() {
         return None;
@@ -221,7 +222,7 @@ pub fn end_session(
         trigger: trigger.to_string(),
         channel: channel.to_string(),
         entity_name: entity_name.to_string(),
-        session_key: None,
+        session_key: session_key.map(|s| s.to_string()),
     };
 
     let archive_path = match archive_conversation(root_dir, conversation, &meta) {

@@ -214,7 +214,7 @@ pub fn spawn_session_cleanup(config: &Config, state: &Arc<super::AppState>) {
                 // Uses spawn_blocking + dedicated runtime because SurrealDB
                 // types are not Send.
                 if graph_enabled && !archived_paths.is_empty() {
-                    let root = cleanup_state.root_dir.clone();
+                    let state_for_graph = Arc::clone(&cleanup_state);
                     let _ = tokio::task::spawn_blocking(move || {
                         let rt = match tokio::runtime::Runtime::new() {
                             Ok(rt) => rt,
@@ -225,7 +225,12 @@ pub fn spawn_session_cleanup(config: &Config, state: &Arc<super::AppState>) {
                         };
                         rt.block_on(async {
                             for path in &archived_paths {
-                                crate::session::graph_ingest_archive(&root, path, None).await;
+                                crate::session::graph_ingest_archive(
+                                    &state_for_graph.root_dir,
+                                    path,
+                                    Some(state_for_graph.provider.as_ref()),
+                                )
+                                .await;
                             }
                         });
                     })
