@@ -82,6 +82,8 @@ impl Session {
 pub struct SessionStore {
     sessions: RwLock<HashMap<String, std::sync::Arc<RwLock<Session>>>>,
     sessions_dir: PathBuf,
+    root_dir: PathBuf,
+    entity_name: String,
     ttl_seconds: u64,
     max_sessions: usize,
     coordinator: Option<Arc<PersistCoordinator>>,
@@ -89,7 +91,11 @@ pub struct SessionStore {
 
 impl SessionStore {
     /// Create a new SessionStore, loading any persisted sessions from disk.
-    pub async fn new(root_dir: &Path, config: &crate::config::SessionConfig) -> Self {
+    pub async fn new(
+        root_dir: &Path,
+        config: &crate::config::SessionConfig,
+        entity_name: &str,
+    ) -> Self {
         let sessions_dir = root_dir.join("sessions");
         if let Err(e) = fs::create_dir_all(&sessions_dir) {
             tracing::warn!("Failed to create sessions dir: {}", e);
@@ -98,6 +104,8 @@ impl SessionStore {
         let store = Self {
             sessions: RwLock::new(HashMap::new()),
             sessions_dir: sessions_dir.clone(),
+            root_dir: root_dir.to_path_buf(),
+            entity_name: entity_name.to_string(),
             ttl_seconds: config.ttl_seconds,
             max_sessions: config.max_sessions,
             coordinator: None,
@@ -138,26 +146,16 @@ impl SessionStore {
                         if session.is_expired(self.ttl_seconds) {
                             tracing::debug!("Archiving expired session: {}", data.key);
 
-                            // Archive the conversation before discarding
+                            // Full session end: archive + EPHEMERAL + LOGBOOK
                             if !data.messages.is_empty() {
-                                let root_dir = self.sessions_dir.parent().unwrap_or(Path::new("."));
-                                let meta = crate::session::ArchiveMeta {
-                                    trigger: "session-expired-on-load".to_string(),
-                                    channel: data.channel.clone(),
-                                    entity_name: String::new(),
-                                    session_key: Some(data.key.clone()),
-                                };
-                                if let Err(e) = crate::session::archive_conversation(
-                                    root_dir,
+                                crate::session::end_session(
+                                    &self.root_dir,
+                                    &self.entity_name,
                                     &data.messages,
-                                    &meta,
-                                ) {
-                                    tracing::warn!(
-                                        "Failed to archive expired session {}: {}",
-                                        data.key,
-                                        e
-                                    );
-                                }
+                                    &data.channel,
+                                    "session-expired-on-load",
+                                    Some(&data.key),
+                                );
                             }
 
                             // Clean up the file
@@ -362,22 +360,16 @@ impl SessionStore {
             if let Some(session_arc) = sessions.remove(key) {
                 let session = session_arc.read().await;
                 if !session.data.messages.is_empty() {
-                    // Archive before removing
-                    let meta = crate::session::ArchiveMeta {
-                        trigger: "session-expired".to_string(),
-                        channel: session.data.channel.clone(),
-                        entity_name: entity_name.to_string(),
-                        session_key: Some(key.clone()),
-                    };
-                    match crate::session::archive_conversation(
+                    // Full session end: archive + EPHEMERAL + LOGBOOK
+                    if let Some(path) = crate::session::end_session(
                         root_dir,
+                        entity_name,
                         &session.data.messages,
-                        &meta,
+                        &session.data.channel,
+                        "session-expired",
+                        Some(key),
                     ) {
-                        Ok(path) => archived_paths.push(path),
-                        Err(e) => {
-                            tracing::warn!("Failed to archive expired session {}: {}", key, e);
-                        }
+                        archived_paths.push(path);
                     }
                 }
 
@@ -405,21 +397,17 @@ impl SessionStore {
                 continue;
             }
 
-            let meta = crate::session::ArchiveMeta {
-                trigger: "server-shutdown".to_string(),
-                channel: session.data.channel.clone(),
-                entity_name: entity_name.to_string(),
-                session_key: Some(key.clone()),
-            };
-
-            match crate::session::archive_conversation(root_dir, &session.data.messages, &meta) {
-                Ok(path) => {
-                    tracing::info!("Archived session {} to {}", key, path.display());
-                    archived_paths.push(path);
-                }
-                Err(e) => {
-                    tracing::warn!("Failed to archive session {}: {}", key, e);
-                }
+            // Full session end: archive + EPHEMERAL + LOGBOOK
+            if let Some(path) = crate::session::end_session(
+                root_dir,
+                entity_name,
+                &session.data.messages,
+                &session.data.channel,
+                "server-shutdown",
+                Some(key),
+            ) {
+                tracing::info!("Archived session {} to {}", key, path.display());
+                archived_paths.push(path);
             }
         }
 

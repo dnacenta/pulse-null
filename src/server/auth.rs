@@ -144,8 +144,12 @@ mod tests {
             peers: std::collections::HashMap::new(),
             plugins: std::collections::HashMap::new(),
         };
-        let session_store =
-            crate::session_store::SessionStore::new(&root_dir, &config.sessions).await;
+        let session_store = crate::session_store::SessionStore::new(
+            &root_dir,
+            &config.sessions,
+            &config.entity.name,
+        )
+        .await;
         let plugin_manager = crate::plugins::manager::PluginManager::new(&config);
         Arc::new(AppState {
             config,
@@ -303,8 +307,12 @@ mod tests {
             peers,
             plugins: std::collections::HashMap::new(),
         };
-        let session_store =
-            crate::session_store::SessionStore::new(&root_dir, &config.sessions).await;
+        let session_store = crate::session_store::SessionStore::new(
+            &root_dir,
+            &config.sessions,
+            &config.entity.name,
+        )
+        .await;
         let plugin_manager = crate::plugins::manager::PluginManager::new(&config);
         Arc::new(AppState {
             config,

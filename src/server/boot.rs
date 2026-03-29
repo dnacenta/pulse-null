@@ -65,7 +65,8 @@ pub async fn boot_entity(
     let persist_coordinator = Arc::new(PersistCoordinator::new());
 
     // Session store
-    let mut session_store = SessionStore::new(&root_dir, &config.sessions).await;
+    let mut session_store =
+        SessionStore::new(&root_dir, &config.sessions, &config.entity.name).await;
     session_store.set_coordinator(Arc::clone(&persist_coordinator));
 
     // Context buffer

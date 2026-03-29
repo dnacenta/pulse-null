@@ -39,7 +39,7 @@ impl LmProvider for ClaudeCodeProvider {
 
             let mut cmd = tokio::process::Command::new(&claude_bin);
             cmd.arg("-p")
-                .arg(&prompt)
+                .arg("-")
                 .arg("--model")
                 .arg(&model)
                 .arg("--output-format")
@@ -49,13 +49,33 @@ impl LmProvider for ClaudeCodeProvider {
                 .arg("--no-session-persistence")
                 .arg("--dangerously-skip-permissions")
                 .env_remove("CLAUDECODE")
+                .stdin(Stdio::piped())
                 .stdout(Stdio::piped())
                 .stderr(Stdio::piped());
 
-            let output = cmd.output().await.map_err(|e| {
+            let mut child = cmd.spawn().map_err(|e| {
                 Box::new(std::io::Error::new(
                     e.kind(),
                     format!("failed to spawn claude: {e}"),
+                )) as Box<dyn std::error::Error + Send + Sync>
+            })?;
+
+            // Write prompt via stdin to avoid ARG_MAX limits
+            if let Some(mut stdin) = child.stdin.take() {
+                use tokio::io::AsyncWriteExt;
+                stdin.write_all(prompt.as_bytes()).await.map_err(|e| {
+                    Box::new(std::io::Error::new(
+                        e.kind(),
+                        format!("failed to write to claude stdin: {e}"),
+                    )) as Box<dyn std::error::Error + Send + Sync>
+                })?;
+                // Drop stdin to close it and signal EOF
+            }
+
+            let output = child.wait_with_output().await.map_err(|e| {
+                Box::new(std::io::Error::new(
+                    e.kind(),
+                    format!("failed to wait for claude: {e}"),
                 )) as Box<dyn std::error::Error + Send + Sync>
             })?;
 

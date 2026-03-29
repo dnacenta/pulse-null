@@ -1,7 +1,8 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::mpsc;
 use std::time::Instant;
+
+use tokio::sync::mpsc;
 
 use crossterm::event::{KeyCode, KeyEvent};
 use ratatui::layout::{Constraint, Layout, Rect};
@@ -61,6 +62,7 @@ pub struct RecallTab {
     stale_count: usize,
     // Background loading
     pending_load: Option<mpsc::Receiver<Result<GraphLoadResult, String>>>,
+    _pending_handle: Option<tokio::task::JoinHandle<()>>,
 }
 
 struct GraphLoadResult {
@@ -78,6 +80,7 @@ impl RecallTab {
             scroll_offset: 0,
             stale_count: 0,
             pending_load: None,
+            _pending_handle: None,
         }
     }
 
@@ -115,16 +118,11 @@ impl RecallTab {
 
     #[cfg(feature = "graph")]
     fn start_graph_fetch(&mut self, graph_dir: PathBuf) {
-        let (tx, rx) = mpsc::channel();
-        self.pending_load = Some(rx);
+        let (tx, rx) = mpsc::channel(1);
+        // Swap to unbounded-style: we only ever send one message, so capacity 1 is fine.
 
-        // Capture the current runtime handle so we can run async graph queries
-        // inside spawn_blocking without creating a nested Runtime.
-        let handle = tokio::runtime::Handle::current();
-
-        #[allow(clippy::let_underscore_future)]
-        let _ = tokio::task::spawn_blocking(move || {
-            let result = handle.block_on(async {
+        self._pending_handle = Some(tokio::spawn(async move {
+            let result = async {
                 let gm = recall_echo::graph::GraphMemory::open(&graph_dir)
                     .await
                     .map_err(|e| format!("Graph open: {e}"))?;
@@ -136,7 +134,8 @@ impl RecallTab {
                     .map_err(|e| format!("Pipeline: {e}"))?;
 
                 Ok::<_, String>((stats, pipeline))
-            });
+            }
+            .await;
 
             let load_result = match result {
                 Ok((stats, pipeline)) => {
@@ -186,8 +185,12 @@ impl RecallTab {
                 Err(e) => Err(e),
             };
 
-            let _ = tx.send(load_result);
-        });
+            let _ = tx.send(load_result).await;
+        }));
+
+        // Convert to a blocking try_recv-compatible receiver by wrapping
+        // We need to store the receiver for polling in handle_tick
+        self.pending_load = Some(rx);
     }
 
     #[cfg(not(feature = "graph"))]
@@ -534,10 +537,11 @@ impl TabView for RecallTab {
 
     fn handle_tick(&mut self, ctx: &mut AppContext) {
         // Check for completed background graph load
-        if let Some(ref rx) = self.pending_load {
+        if let Some(ref mut rx) = self.pending_load {
             if let Ok(result) = rx.try_recv() {
                 self.apply_graph_result(result);
                 self.pending_load = None;
+                self._pending_handle = None;
             }
         }
 

@@ -196,9 +196,11 @@ pub async fn run(
                 &main.chat.conversation,
                 "tui-v2",
                 "session-end",
+                None,
             ) {
                 if cfg.graph.enabled && cfg.graph.auto_ingest {
                     let root = rd.to_path_buf();
+                    let provider_clone = ctx.provider.clone();
                     tokio::task::spawn_blocking(move || {
                         let rt = match tokio::runtime::Runtime::new() {
                             Ok(rt) => rt,
@@ -208,7 +210,16 @@ pub async fn run(
                             }
                         };
                         rt.block_on(async {
-                            crate::session::graph_ingest_archive(&root, &archive_path, None).await;
+                            let provider_ref: Option<&dyn pulse_system_types::llm::LmProvider> =
+                                provider_clone.as_ref().map(|p| {
+                                    p.as_ref() as &dyn pulse_system_types::llm::LmProvider
+                                });
+                            crate::session::graph_ingest_archive(
+                                &root,
+                                &archive_path,
+                                provider_ref,
+                            )
+                            .await;
                         });
                     });
                 }
@@ -440,15 +451,39 @@ pub async fn run_multi(
 }
 
 /// Archive the current entity's chat session before switching.
+/// Also triggers graph ingestion when enabled.
 fn archive_current_session(ctx: &AppContext, main_screen: &Option<MainScreen>) {
     if let (Some(rd), Some(cfg), Some(ref main)) = (&ctx.root_dir, &ctx.config, main_screen) {
-        crate::session::end_session(
+        if let Some(archive_path) = crate::session::end_session(
             rd,
             &cfg.entity.name,
             &main.chat.conversation,
             "tui-v2",
             "entity-switch",
-        );
+            None,
+        ) {
+            if cfg.graph.enabled && cfg.graph.auto_ingest {
+                let root = rd.to_path_buf();
+                let provider_clone = ctx.provider.clone();
+                tokio::task::spawn_blocking(move || {
+                    let rt = match tokio::runtime::Runtime::new() {
+                        Ok(rt) => rt,
+                        Err(e) => {
+                            tracing::warn!("graph ingest: failed to create runtime: {}", e);
+                            return;
+                        }
+                    };
+                    rt.block_on(async {
+                        let provider_ref: Option<&dyn pulse_system_types::llm::LmProvider> =
+                            provider_clone
+                                .as_ref()
+                                .map(|p| p.as_ref() as &dyn pulse_system_types::llm::LmProvider);
+                        crate::session::graph_ingest_archive(&root, &archive_path, provider_ref)
+                            .await;
+                    });
+                });
+            }
+        }
     }
 }
 
@@ -596,9 +631,11 @@ pub async fn run_chat(
         &main.chat.conversation,
         "tui-v2",
         "session-end",
+        None,
     ) {
         if config.graph.enabled && config.graph.auto_ingest {
             let root = root_dir.to_path_buf();
+            let provider_clone = ctx.provider.clone();
             tokio::task::spawn_blocking(move || {
                 let rt = match tokio::runtime::Runtime::new() {
                     Ok(rt) => rt,
@@ -608,7 +645,11 @@ pub async fn run_chat(
                     }
                 };
                 rt.block_on(async {
-                    crate::session::graph_ingest_archive(&root, &archive_path, None).await;
+                    let provider_ref: Option<&dyn pulse_system_types::llm::LmProvider> =
+                        provider_clone
+                            .as_ref()
+                            .map(|p| p.as_ref() as &dyn pulse_system_types::llm::LmProvider);
+                    crate::session::graph_ingest_archive(&root, &archive_path, provider_ref).await;
                 });
             });
         }
