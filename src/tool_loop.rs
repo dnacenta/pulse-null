@@ -48,6 +48,9 @@ pub async fn invoke_with_tool_loop(
     let mut final_model = String::new(); // overwritten each round
     let mut rounds: u32 = 0;
     let mut tools_used: Vec<String> = Vec::new();
+    // Accumulate text from ALL rounds so signal extraction sees full reasoning,
+    // not just the final wrap-up summary. Fixes GitHub issue #55.
+    let mut accumulated_text: Vec<String> = Vec::new();
 
     loop {
         let result = provider
@@ -61,6 +64,15 @@ pub async fn invoke_with_tool_loop(
         // Validate response for hallucinated turn markers before storing
         let (sanitized_content, was_truncated, _detected_marker) =
             response_validator::validate_content_blocks(&result.content);
+
+        // Capture text from this round for signal extraction (issue #55)
+        for block in &sanitized_content {
+            if let ContentBlock::Text { text } = block {
+                if !text.trim().is_empty() {
+                    accumulated_text.push(text.clone());
+                }
+            }
+        }
 
         // Add sanitized assistant response to conversation
         messages.push(Message {
@@ -76,16 +88,8 @@ pub async fn invoke_with_tool_loop(
                 rounds,
                 "Hallucination guard: response validator truncated hallucinated turns, forcing loop exit"
             );
-            let text = sanitized_content
-                .iter()
-                .filter_map(|b| match b {
-                    ContentBlock::Text { text } => Some(text.as_str()),
-                    _ => None,
-                })
-                .collect::<Vec<_>>()
-                .join("");
             return Ok(ToolLoopResult {
-                text,
+                text: accumulated_text.join("\n\n"),
                 model: final_model,
                 input_tokens: total_input_tokens,
                 output_tokens: total_output_tokens,
@@ -114,7 +118,7 @@ pub async fn invoke_with_tool_loop(
                 }
 
                 return Ok(ToolLoopResult {
-                    text: result.text(),
+                    text: accumulated_text.join("\n\n"),
                     model: final_model,
                     input_tokens: total_input_tokens,
                     output_tokens: total_output_tokens,
@@ -134,7 +138,7 @@ pub async fn invoke_with_tool_loop(
                         max_rounds
                     );
                     return Ok(ToolLoopResult {
-                        text: result.text(),
+                        text: accumulated_text.join("\n\n"),
                         model: final_model,
                         input_tokens: total_input_tokens,
                         output_tokens: total_output_tokens,
@@ -194,7 +198,7 @@ pub async fn invoke_with_tool_loop(
             StopReason::Other(ref reason) => {
                 tracing::warn!("Unexpected stop reason: {}", reason);
                 return Ok(ToolLoopResult {
-                    text: result.text(),
+                    text: accumulated_text.join("\n\n"),
                     model: final_model,
                     input_tokens: total_input_tokens,
                     output_tokens: total_output_tokens,
