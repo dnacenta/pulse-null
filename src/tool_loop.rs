@@ -2,8 +2,70 @@ use pulse_system_types::llm::{
     ContentBlock, LmProvider, Message, MessageContent, MessageSource, Role, StopReason,
 };
 
-use crate::response_validator;
 use crate::tools::ToolRegistry;
+
+// Re-export ActionClaim from the external crate for ToolLoopResult consumers
+pub use response_validator::ActionClaim;
+
+/// Convert a pulse_system_types ContentBlock to a response-validator ContentBlock.
+fn convert_to_rv(block: &ContentBlock) -> response_validator::ContentBlock {
+    match block {
+        ContentBlock::Text { text } => {
+            response_validator::ContentBlock::Text { text: text.clone() }
+        }
+        ContentBlock::ToolUse { id, name, input } => response_validator::ContentBlock::ToolUse {
+            id: id.clone(),
+            name: name.clone(),
+            input: input.clone(),
+        },
+        ContentBlock::ToolResult {
+            tool_use_id,
+            content,
+            ..
+        } => response_validator::ContentBlock::ToolResult {
+            tool_use_id: tool_use_id.clone(),
+            content: content.clone(),
+        },
+    }
+}
+
+/// Convert a response-validator ContentBlock back to pulse_system_types.
+fn convert_from_rv(block: response_validator::ContentBlock) -> ContentBlock {
+    match block {
+        response_validator::ContentBlock::Text { text } => ContentBlock::Text { text },
+        response_validator::ContentBlock::ToolUse { id, name, input } => {
+            ContentBlock::ToolUse { id, name, input }
+        }
+        response_validator::ContentBlock::ToolResult {
+            tool_use_id,
+            content,
+        } => ContentBlock::ToolResult {
+            tool_use_id,
+            content,
+            is_error: None,
+        },
+    }
+}
+
+/// Adapter: validate pulse_system_types ContentBlocks using the response-validator crate.
+pub fn validate_content_blocks_adapter(
+    blocks: &[ContentBlock],
+) -> (Vec<ContentBlock>, bool, Option<String>) {
+    let rv_blocks: Vec<_> = blocks.iter().map(convert_to_rv).collect();
+    let (sanitized, was_truncated, marker) =
+        response_validator::validate_content_blocks(&rv_blocks);
+    let result_blocks: Vec<_> = sanitized.into_iter().map(convert_from_rv).collect();
+    (result_blocks, was_truncated, marker)
+}
+
+/// Adapter: validate action claims from pulse_system_types ContentBlocks.
+pub fn validate_action_claims_adapter(
+    blocks: &[ContentBlock],
+    tools_used: &[String],
+) -> response_validator::ActionClaimValidation {
+    let rv_blocks: Vec<_> = blocks.iter().map(convert_to_rv).collect();
+    response_validator::validate_action_claims(&rv_blocks, tools_used)
+}
 
 /// Maximum tool-use round trips before forcing a text response (default).
 pub const DEFAULT_MAX_TOOL_ROUNDS: u32 = 25;
@@ -20,7 +82,7 @@ pub struct ToolLoopResult {
     /// True if the tool loop was forcibly stopped because it exceeded max rounds.
     pub circuit_breaker_fired: bool,
     /// Action claims in the final response that had no matching tool use (Phase 3).
-    pub action_claim_warnings: Vec<response_validator::ActionClaim>,
+    pub action_claim_warnings: Vec<ActionClaim>,
 }
 
 /// Invoke an LLM provider with automatic tool execution.
@@ -63,7 +125,7 @@ pub async fn invoke_with_tool_loop(
 
         // Validate response for hallucinated turn markers before storing
         let (sanitized_content, was_truncated, _detected_marker) =
-            response_validator::validate_content_blocks(&result.content);
+            validate_content_blocks_adapter(&result.content);
 
         // Capture text from this round for signal extraction (issue #55)
         for block in &sanitized_content {
@@ -104,7 +166,7 @@ pub async fn invoke_with_tool_loop(
             StopReason::EndTurn | StopReason::MaxTokens | StopReason::StopSequence => {
                 // Phase 3: Check for action claim hallucinations
                 let claim_validation =
-                    response_validator::validate_action_claims(&sanitized_content, &tools_used);
+                    validate_action_claims_adapter(&sanitized_content, &tools_used);
                 if claim_validation.has_warnings() {
                     for w in &claim_validation.unmatched_claims {
                         tracing::warn!(
