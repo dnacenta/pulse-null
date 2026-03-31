@@ -198,7 +198,7 @@ impl StreamingProvider for OllamaProvider {
         &self,
         system_prompt: &str,
         messages: &[Message],
-        max_tokens: u32,
+        _max_tokens: u32,
         tools: Option<&[serde_json::Value]>,
     ) -> StreamResult<'_> {
         let system_prompt = system_prompt.to_string();
