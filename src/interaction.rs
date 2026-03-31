@@ -158,8 +158,8 @@ impl InteractionRecord {
         task_name: &str,
         entity_name: &str,
         messages: Vec<Message>,
-        input_tokens: u32,
-        output_tokens: u32,
+        started_at: DateTime<Utc>,
+        metadata: InteractionMetadata,
     ) -> Self {
         let summary = summarize_messages(&messages);
 
@@ -169,16 +169,12 @@ impl InteractionRecord {
                 task_name: task_name.to_string(),
             },
             trust: ConversationTrust::Owner,
-            started_at: Utc::now(),
+            started_at,
             ended_at: Some(Utc::now()),
             entity_name: entity_name.to_string(),
             summary,
             messages,
-            metadata: InteractionMetadata {
-                input_tokens,
-                output_tokens,
-                ..Default::default()
-            },
+            metadata,
         }
     }
 
@@ -187,8 +183,8 @@ impl InteractionRecord {
         topic: &str,
         entity_name: &str,
         messages: Vec<Message>,
-        input_tokens: u32,
-        output_tokens: u32,
+        started_at: DateTime<Utc>,
+        metadata: InteractionMetadata,
     ) -> Self {
         let summary = summarize_messages(&messages);
 
@@ -198,16 +194,12 @@ impl InteractionRecord {
                 topic: topic.to_string(),
             },
             trust: ConversationTrust::Owner,
-            started_at: Utc::now(),
+            started_at,
             ended_at: Some(Utc::now()),
             entity_name: entity_name.to_string(),
             summary,
             messages,
-            metadata: InteractionMetadata {
-                input_tokens,
-                output_tokens,
-                ..Default::default()
-            },
+            metadata,
         }
     }
 
@@ -358,8 +350,18 @@ mod tests {
 
     #[test]
     fn from_task_produces_correct_source() {
-        let record =
-            InteractionRecord::from_task("morning_orientation", "Echo", make_messages(4), 100, 200);
+        let meta = InteractionMetadata {
+            input_tokens: 100,
+            output_tokens: 200,
+            ..Default::default()
+        };
+        let record = InteractionRecord::from_task(
+            "morning_orientation",
+            "Echo",
+            make_messages(4),
+            Utc::now(),
+            meta,
+        );
 
         assert!(matches!(
             record.source,
@@ -373,8 +375,18 @@ mod tests {
 
     #[test]
     fn from_research_produces_correct_source() {
-        let record =
-            InteractionRecord::from_research("emergence", "Echo", make_messages(2), 50, 150);
+        let meta = InteractionMetadata {
+            input_tokens: 50,
+            output_tokens: 150,
+            ..Default::default()
+        };
+        let record = InteractionRecord::from_research(
+            "emergence",
+            "Echo",
+            make_messages(2),
+            Utc::now(),
+            meta,
+        );
 
         assert!(matches!(
             record.source,
@@ -405,8 +417,18 @@ mod tests {
 
     #[test]
     fn to_event_preserves_source_and_trust() {
-        let record =
-            InteractionRecord::from_research("emergence", "Echo", make_messages(2), 50, 150);
+        let meta = InteractionMetadata {
+            input_tokens: 50,
+            output_tokens: 150,
+            ..Default::default()
+        };
+        let record = InteractionRecord::from_research(
+            "emergence",
+            "Echo",
+            make_messages(2),
+            Utc::now(),
+            meta,
+        );
 
         let event = record.to_event();
         match event {
