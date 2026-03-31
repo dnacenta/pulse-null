@@ -96,6 +96,7 @@ mod tests {
             graph: GraphConfig::default(),
             sessions: SessionConfig::default(),
             context_buffer: crate::context_buffer::ContextBufferConfig::default(),
+            session_health: crate::session_health::SessionHealthConfig::default(),
             platform: crate::config::PlatformConfig::default(),
             peers: std::collections::HashMap::new(),
             plugins: std::collections::HashMap::new(),

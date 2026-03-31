@@ -24,6 +24,7 @@ mod response_validator;
 mod scheduler;
 mod server;
 mod session;
+mod session_health;
 mod session_store;
 mod streaming;
 mod tool_loop;

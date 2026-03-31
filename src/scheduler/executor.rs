@@ -31,6 +31,8 @@ pub struct ExecutionResult {
     pub was_truncated: bool,
     /// True if the circuit breaker fired (exceeded max rounds)
     pub circuit_breaker_fired: bool,
+    /// Number of action claims with no matching tool use (Phase 3).
+    pub action_claim_count: u32,
 }
 
 impl From<ToolLoopResult> for ExecutionResult {
@@ -43,6 +45,7 @@ impl From<ToolLoopResult> for ExecutionResult {
             model: r.model,
             was_truncated: r.was_truncated,
             circuit_breaker_fired: r.circuit_breaker_fired,
+            action_claim_count: r.action_claim_warnings.len() as u32,
         }
     }
 }

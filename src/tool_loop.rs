@@ -19,6 +19,8 @@ pub struct ToolLoopResult {
     pub was_truncated: bool,
     /// True if the tool loop was forcibly stopped because it exceeded max rounds.
     pub circuit_breaker_fired: bool,
+    /// Action claims in the final response that had no matching tool use (Phase 3).
+    pub action_claim_warnings: Vec<response_validator::ActionClaim>,
 }
 
 /// Invoke an LLM provider with automatic tool execution.
@@ -45,6 +47,7 @@ pub async fn invoke_with_tool_loop(
     let mut total_output_tokens: u32 = 0;
     let mut final_model = String::new(); // overwritten each round
     let mut rounds: u32 = 0;
+    let mut tools_used: Vec<String> = Vec::new();
 
     loop {
         let result = provider
@@ -56,7 +59,7 @@ pub async fn invoke_with_tool_loop(
         final_model = result.model.clone();
 
         // Validate response for hallucinated turn markers before storing
-        let (sanitized_content, was_truncated) =
+        let (sanitized_content, was_truncated, _detected_marker) =
             response_validator::validate_content_blocks(&result.content);
 
         // Add sanitized assistant response to conversation
@@ -89,11 +92,27 @@ pub async fn invoke_with_tool_loop(
                 tool_rounds: rounds,
                 was_truncated: true,
                 circuit_breaker_fired: false,
+                action_claim_warnings: Vec::new(),
             });
         }
 
         match result.stop_reason {
             StopReason::EndTurn | StopReason::MaxTokens | StopReason::StopSequence => {
+                // Phase 3: Check for action claim hallucinations
+                let claim_validation =
+                    response_validator::validate_action_claims(&sanitized_content, &tools_used);
+                if claim_validation.has_warnings() {
+                    for w in &claim_validation.unmatched_claims {
+                        tracing::warn!(
+                            claim = %w.matched_text,
+                            category = %w.category,
+                            confidence = w.confidence,
+                            "Action hallucination: model claims '{}' without matching tool use",
+                            w.matched_text,
+                        );
+                    }
+                }
+
                 return Ok(ToolLoopResult {
                     text: result.text(),
                     model: final_model,
@@ -102,6 +121,7 @@ pub async fn invoke_with_tool_loop(
                     tool_rounds: rounds,
                     was_truncated: false,
                     circuit_breaker_fired: false,
+                    action_claim_warnings: claim_validation.unmatched_claims,
                 });
             }
             StopReason::ToolUse => {
@@ -121,6 +141,7 @@ pub async fn invoke_with_tool_loop(
                         tool_rounds: rounds,
                         was_truncated: false,
                         circuit_breaker_fired: true,
+                        action_claim_warnings: Vec::new(),
                     });
                 }
 
@@ -128,6 +149,7 @@ pub async fn invoke_with_tool_loop(
                 let mut tool_results = Vec::new();
                 for block in &result.content {
                     if let ContentBlock::ToolUse { id, name, input } = block {
+                        tools_used.push(name.clone());
                         let tool_result = match tools.get(name) {
                             Some(tool) => match tool.execute(input.clone()).await {
                                 Ok(output) => ContentBlock::ToolResult {
@@ -179,6 +201,7 @@ pub async fn invoke_with_tool_loop(
                     tool_rounds: rounds,
                     was_truncated: false,
                     circuit_breaker_fired: false,
+                    action_claim_warnings: Vec::new(),
                 });
             }
         }
