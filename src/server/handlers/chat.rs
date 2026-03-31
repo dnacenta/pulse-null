@@ -11,7 +11,7 @@ use crate::server::trust::TrustLevel;
 use crate::server::{injection, AppState};
 use crate::session_store::SessionStore;
 use crate::tool_loop;
-use pulse_system_types::llm::{Message, MessageContent, Role};
+use pulse_system_types::llm::{Message, MessageContent, MessageSource, Role};
 
 #[derive(Deserialize)]
 #[allow(dead_code)]
@@ -171,6 +171,7 @@ pub async fn chat(
 
     // Build user message content
     let user_content = MessageContent::Text(user_message);
+    let sender_for_source = req.sender.as_deref().unwrap_or("unknown").to_string();
 
     // WAL: append user message BEFORE adding to session (write-ahead)
     if let Some(ref wal) = state.wal {
@@ -189,13 +190,19 @@ pub async fn chat(
         }
     }
 
-    // Add user message to session
+    // Add user message to session and reset hallucination guard counter
     session.data.messages.push(Message {
         role: Role::User,
         content: user_content,
+        source: Some(MessageSource::Human {
+            channel: req.channel.clone(),
+            sender: sender_for_source,
+        }),
     });
     session.data.message_count += 1;
     session.data.messages_since_checkpoint += 1;
+    // Real human message arrived — reset the autonomous round counter
+    session.data.rounds_since_human_input = 0;
 
     // Compact conversation if approaching context budget
     crate::context::compact_if_needed(
@@ -244,6 +251,25 @@ pub async fn chat(
         }
     }
 
+    // Track hallucination guard metrics on the session
+    session.data.rounds_since_human_input += 1;
+    if result.was_truncated {
+        session.data.hallucination_count += 1;
+        tracing::warn!(
+            session_key = %session_key,
+            hallucination_count = session.data.hallucination_count,
+            "Hallucination guard: response was truncated (session total: {})",
+            session.data.hallucination_count
+        );
+    }
+    if result.circuit_breaker_fired {
+        tracing::warn!(
+            session_key = %session_key,
+            tool_rounds = result.tool_rounds,
+            "Hallucination guard: circuit breaker fired in chat session"
+        );
+    }
+
     // Enforce hard cap on stored messages
     session.data.enforce_message_cap();
 
@@ -260,9 +286,16 @@ pub async fn chat(
     session.mark_dirty();
     let persist_key = session_key.clone();
     let persist_store = &state.session_store;
+    tracing::debug!(
+        "[chat] persisting session key={} channel={} sender={:?}",
+        persist_key,
+        channel,
+        req.sender
+    );
     // Drop the session lock before persisting to avoid deadlock
     drop(session);
     persist_store.persist(&persist_key).await;
+    tracing::debug!("[chat] persist call returned for key={}", persist_key);
 
     // Emit PostConversation event
     emit_post_conversation(

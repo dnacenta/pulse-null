@@ -1,6 +1,8 @@
 use std::path::Path;
 
-use pulse_system_types::llm::{ContentBlock, LmProvider, Message, MessageContent, Role};
+use pulse_system_types::llm::{
+    ContentBlock, LmProvider, Message, MessageContent, MessageSource, Role,
+};
 
 /// Default context budget in estimated tokens (leaves room for system prompt + response).
 const DEFAULT_CONTEXT_BUDGET: usize = 150_000;
@@ -158,6 +160,7 @@ pub async fn compact_if_needed(
     let summary_messages = vec![Message {
         role: Role::User,
         content: MessageContent::Text(summarize_prompt),
+        source: Some(MessageSource::System),
     }];
 
     // Use the same provider to generate the summary
@@ -192,6 +195,7 @@ pub async fn compact_if_needed(
                 "[Context summary of earlier conversation]\n{}",
                 summary_text
             )),
+            source: Some(MessageSource::System),
         },
     );
 

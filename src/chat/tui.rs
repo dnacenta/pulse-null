@@ -18,7 +18,9 @@ use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tokio_stream::StreamExt;
 
-use pulse_system_types::llm::{ContentBlock, Message, MessageContent, Role, StopReason};
+use pulse_system_types::llm::{
+    ContentBlock, Message, MessageContent, MessageSource, Role, StopReason,
+};
 
 use crate::config::Config;
 use crate::streaming::{StreamEvent, StreamingProvider};
@@ -697,6 +699,7 @@ async fn conversation_task(
         conversation.push(Message {
             role: Role::Assistant,
             content: MessageContent::Blocks(resp.content.clone()),
+            source: Some(MessageSource::Assistant),
         });
 
         match resp.stop_reason {
@@ -733,9 +736,19 @@ async fn conversation_task(
                     }
                 }
 
+                let first_tool_id = tool_results
+                    .iter()
+                    .find_map(|b| match b {
+                        ContentBlock::ToolResult { tool_use_id, .. } => Some(tool_use_id.clone()),
+                        _ => None,
+                    })
+                    .unwrap_or_default();
                 conversation.push(Message {
                     role: Role::User,
                     content: MessageContent::Blocks(tool_results),
+                    source: Some(MessageSource::ToolResult {
+                        tool_use_id: first_tool_id,
+                    }),
                 });
 
                 let _ = tx.send(UiEvent::StateChange(EntityState::Thinking));
@@ -799,6 +812,10 @@ pub async fn run(
                                 app.conversation.push(Message {
                                     role: Role::User,
                                     content: MessageContent::Text(text),
+                                    source: Some(MessageSource::Human {
+                                        channel: "tui".into(),
+                                        sender: "local".into(),
+                                    }),
                                 });
 
                                 let provider = Arc::clone(&provider);

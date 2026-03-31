@@ -2,7 +2,7 @@ use tracing::Instrument;
 
 use crate::tool_loop::{self, ToolLoopResult};
 use crate::tools::ToolRegistry;
-use pulse_system_types::llm::{LmProvider, Message, MessageContent, Role};
+use pulse_system_types::llm::{LmProvider, Message, MessageContent, MessageSource, Role};
 
 /// Configuration for an autonomous execution session.
 pub struct ExecutionConfig {
@@ -27,6 +27,10 @@ pub struct ExecutionResult {
     pub tool_rounds_used: u32,
     /// Model that was used
     pub model: String,
+    /// True if the response validator truncated hallucinated turns
+    pub was_truncated: bool,
+    /// True if the circuit breaker fired (exceeded max rounds)
+    pub circuit_breaker_fired: bool,
 }
 
 impl From<ToolLoopResult> for ExecutionResult {
@@ -37,6 +41,8 @@ impl From<ToolLoopResult> for ExecutionResult {
             total_output_tokens: r.output_tokens,
             tool_rounds_used: r.tool_rounds,
             model: r.model,
+            was_truncated: r.was_truncated,
+            circuit_breaker_fired: r.circuit_breaker_fired,
         }
     }
 }
@@ -61,6 +67,9 @@ pub async fn execute_with_tools(
     let mut messages = vec![Message {
         role: Role::User,
         content: MessageContent::Text(user_message.to_string()),
+        source: Some(MessageSource::ScheduledTask {
+            task_name: config.task_id.clone(),
+        }),
     }];
 
     let span = tracing::info_span!("autonomous_task", task_id = %config.task_id);

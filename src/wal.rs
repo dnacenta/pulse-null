@@ -199,6 +199,7 @@ impl WalWriter {
             .map(|e| Message {
                 role: e.role.clone(),
                 content: e.content.clone(),
+                source: None,
             })
             .collect()
     }

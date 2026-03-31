@@ -11,7 +11,7 @@ use tokio::sync::{mpsc, watch, Mutex};
 use tokio::task::JoinHandle;
 use tui_textarea::TextArea;
 
-use pulse_system_types::llm::{Message, MessageContent, Role};
+use pulse_system_types::llm::{Message, MessageContent, MessageSource, Role};
 
 use crate::config::PeerConfig;
 use crate::events::{ConversationTrust, EntityEvent, InteractionSource};
@@ -1846,6 +1846,10 @@ async fn run_conversation(
     conversation.push(Message {
         role: Role::User,
         content: MessageContent::Text(opener),
+        source: Some(MessageSource::Human {
+            channel: "comms".into(),
+            sender: peer_name.clone(),
+        }),
     });
 
     let _ = tx.send(CommsEvent::LocalActivity(EntityState::Thinking));
@@ -1935,6 +1939,10 @@ async fn run_conversation(
                         "[{} says]: {}",
                         peer_name, b_resp.response
                     )),
+                    source: Some(MessageSource::Human {
+                        channel: "comms".into(),
+                        sender: peer_name.clone(),
+                    }),
                 });
 
                 let _ = tx.send(CommsEvent::LocalActivity(EntityState::Thinking));
