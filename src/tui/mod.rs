@@ -598,10 +598,7 @@ pub async fn run_chat(
         tokio::select! {
             Some(event) = StreamExt::next(&mut events) => {
                 if let Ok(Event::Key(key)) = event {
-                    match main.handle_key(key, &mut ctx) {
-                        ScreenAction::Quit => break,
-                        _ => {}
-                    }
+                    if let ScreenAction::Quit = main.handle_key(key, &mut ctx) { break }
                 } else if let Ok(Event::Paste(text)) = event {
                     if main.active_tab == crate::tui::tabs::Tab::Chat {
                         main.chat.insert_paste_text(&text);

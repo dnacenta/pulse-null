@@ -521,10 +521,7 @@ mod tests {
         let text = "Here is the analysis of the codebase structure and dependencies.<|user|>Now check the tests.";
         let result = validate_text(text);
         assert!(result.was_truncated);
-        assert_eq!(
-            result.detected_marker.unwrap(),
-            "ChatML <|user|> marker"
-        );
+        assert_eq!(result.detected_marker.unwrap(), "ChatML <|user|> marker");
     }
 
     #[test]
@@ -543,10 +540,7 @@ mod tests {
         let text = "I looked into the issue and found the root cause of the problem.<assistant>Here's what I would recommend...";
         let result = validate_text(text);
         assert!(result.was_truncated);
-        assert_eq!(
-            result.detected_marker.unwrap(),
-            "XML <assistant> marker"
-        );
+        assert_eq!(result.detected_marker.unwrap(), "XML <assistant> marker");
     }
 
     #[test]
@@ -561,10 +555,7 @@ mod tests {
         let text = "The infrastructure review is complete and everything looks stable.\n> User: What about the backup schedule?";
         let result = validate_text(text);
         assert!(result.was_truncated);
-        assert_eq!(
-            result.detected_marker.unwrap(),
-            "Blockquote > User: marker"
-        );
+        assert_eq!(result.detected_marker.unwrap(), "Blockquote > User: marker");
     }
 
     #[test]

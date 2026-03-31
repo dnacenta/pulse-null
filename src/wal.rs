@@ -41,8 +41,10 @@ impl WalMeta {
 /// Fsync policy for WAL writes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[derive(Default)]
 pub enum WalFsync {
     /// Only fsync user messages (the irreplaceable data).
+    #[default]
     UserOnly,
     /// Fsync every entry.
     All,
@@ -50,11 +52,6 @@ pub enum WalFsync {
     None,
 }
 
-impl Default for WalFsync {
-    fn default() -> Self {
-        Self::UserOnly
-    }
-}
 
 /// Write-ahead log writer for crash-resilient conversation persistence.
 ///
@@ -107,10 +104,7 @@ impl WalWriter {
         line.push('\n');
 
         let path = self.wal_path(session_key);
-        let mut file = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&path)?;
+        let mut file = OpenOptions::new().create(true).append(true).open(&path)?;
 
         file.write_all(line.as_bytes())?;
 
@@ -259,7 +253,10 @@ impl WalWriter {
     pub fn read_after_checkpoint(&self, session_key: &str) -> io::Result<Vec<WalEntry>> {
         let checkpoint_seq = self.read_checkpoint(session_key);
         let entries = self.read(session_key)?;
-        Ok(entries.into_iter().filter(|e| e.seq > checkpoint_seq).collect())
+        Ok(entries
+            .into_iter()
+            .filter(|e| e.seq > checkpoint_seq)
+            .collect())
     }
 }
 

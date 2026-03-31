@@ -1321,12 +1321,13 @@ dependencies = [
 
 [[package]]
 name = "discord-echo"
-version = "0.1.0"
+version = "0.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2925c4eaf6ad8c7a656f472aca920e546e801edd639636bfb581724ee315b674"
+checksum = "f789b01a5aaf64a8430a58140db6abb260fb987e461b7d15bc7d3d82eaa0f7be"
 dependencies = [
+ "chrono",
  "futures-util",
- "pulse-system-types 0.5.0 (registry+https://github.com/rust-lang/crates.io-index)",
+ "pulse-system-types 0.6.1",
  "reqwest",
  "serde",
  "serde_json",
@@ -3995,7 +3996,7 @@ dependencies = [
 
 [[package]]
 name = "pulse-null"
-version = "0.20.0"
+version = "0.20.1"
 dependencies = [
  "async-stream",
  "axum",
@@ -4011,7 +4012,7 @@ dependencies = [
  "globset",
  "libc",
  "owo-colors",
- "pulse-system-types 0.5.0",
+ "pulse-system-types 0.6.1",
  "ratatui",
  "recall-echo",
  "regex",
@@ -4035,6 +4036,8 @@ dependencies = [
 [[package]]
 name = "pulse-system-types"
 version = "0.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5093e2dc0ea828fec5ddee62acab60302df5732c331c3553a0e0c0c0adfc7536"
 dependencies = [
  "serde",
  "serde_json",
@@ -4042,9 +4045,9 @@ dependencies = [
 
 [[package]]
 name = "pulse-system-types"
-version = "0.5.0"
+version = "0.6.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5093e2dc0ea828fec5ddee62acab60302df5732c331c3553a0e0c0c0adfc7536"
+checksum = "f3a0f3566f3d0f7a120236352842d0c88c30886a03bba9e3488a93b25a36dd54"
 dependencies = [
  "serde",
  "serde_json",
@@ -4296,7 +4299,9 @@ checksum = "bbc4a4ea2a66a41a1152c4b3d86e8954dc087bdf33af35446e6e176db4e73c8c"
 
 [[package]]
 name = "recall-echo"
-version = "3.3.0"
+version = "3.4.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ba2ea0439881e760cc8a581583bcae5553b6aeb58ca21d515e07af146cf0872b"
 dependencies = [
  "async-trait",
  "chrono",
@@ -4304,7 +4309,7 @@ dependencies = [
  "dirs",
  "fastembed",
  "futures",
- "pulse-system-types 0.5.0",
+ "pulse-system-types 0.6.1",
  "regex",
  "serde",
  "serde_json",
@@ -6376,7 +6381,7 @@ checksum = "924c54aa7e44e562dd4b99c3d5ce34b9a949250ded224759d2aae03dd3fd0b05"
 dependencies = [
  "chrono",
  "owo-colors",
- "pulse-system-types 0.5.0 (registry+https://github.com/rust-lang/crates.io-index)",
+ "pulse-system-types 0.5.0",
  "serde",
  "serde_json",
 ]
@@ -6393,7 +6398,7 @@ dependencies = [
  "chrono",
  "dotenvy",
  "hound",
- "pulse-system-types 0.5.0 (registry+https://github.com/rust-lang/crates.io-index)",
+ "pulse-system-types 0.5.0",
  "rand 0.8.5",
  "reqwest",
  "rpassword",

@@ -156,9 +156,13 @@ pub async fn run(
             // WAL: append assistant response
             if let Some(ref wal) = wal {
                 wal_seq += 1;
-                if let Err(e) =
-                    wal.append(session_key, wal_seq, Role::Assistant, &assistant_content, None)
-                {
+                if let Err(e) = wal.append(
+                    session_key,
+                    wal_seq,
+                    Role::Assistant,
+                    &assistant_content,
+                    None,
+                ) {
                     tracing::warn!("REPL WAL append failed for assistant message: {}", e);
                 }
             }
