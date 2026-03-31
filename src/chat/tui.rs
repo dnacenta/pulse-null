@@ -133,10 +133,12 @@ impl App {
 
     fn handle_key(&mut self, key: crossterm::event::KeyEvent) -> Option<Action> {
         // Ctrl+D on empty input: quit
-        if key.code == KeyCode::Char('d') && key.modifiers.contains(KeyModifiers::CONTROL)
-            && self.input.is_empty() {
-                return Some(Action::Quit);
-            }
+        if key.code == KeyCode::Char('d')
+            && key.modifiers.contains(KeyModifiers::CONTROL)
+            && self.input.is_empty()
+        {
+            return Some(Action::Quit);
+        }
 
         // Ctrl+C: cancel or clear
         if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {

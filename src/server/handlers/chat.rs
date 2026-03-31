@@ -263,11 +263,50 @@ pub async fn chat(
         );
     }
     if result.circuit_breaker_fired {
+        session.data.circuit_breaker_count += 1;
         tracing::warn!(
             session_key = %session_key,
             tool_rounds = result.tool_rounds,
-            "Hallucination guard: circuit breaker fired in chat session"
+            circuit_breaker_count = session.data.circuit_breaker_count,
+            "Hallucination guard: circuit breaker fired in chat session (session total: {})",
+            session.data.circuit_breaker_count
         );
+    }
+    if !result.action_claim_warnings.is_empty() {
+        session.data.action_claim_count += result.action_claim_warnings.len() as u32;
+        tracing::warn!(
+            session_key = %session_key,
+            count = result.action_claim_warnings.len(),
+            session_total = session.data.action_claim_count,
+            "Action hallucination: {} unmatched action claim(s) in chat response (session total: {})",
+            result.action_claim_warnings.len(),
+            session.data.action_claim_count
+        );
+    }
+
+    // Session health check — warn on degradation
+    if state.config.session_health.enabled {
+        let health =
+            crate::session_health::assess_session(&session.data, &state.config.session_health);
+        match health.status {
+            crate::session_health::SessionHealthStatus::Degraded => {
+                tracing::warn!(
+                    session_key = %session_key,
+                    status = %health.status,
+                    risk_factors = ?health.risk_factors,
+                    "Session health DEGRADED"
+                );
+            }
+            crate::session_health::SessionHealthStatus::Critical => {
+                tracing::error!(
+                    session_key = %session_key,
+                    status = %health.status,
+                    risk_factors = ?health.risk_factors,
+                    "Session health CRITICAL — consider restarting session"
+                );
+            }
+            _ => {}
+        }
     }
 
     // Enforce hard cap on stored messages

@@ -189,9 +189,12 @@ pub fn validate_text(text: &str) -> ValidationResult {
 ///
 /// Scans all Text blocks for hallucinated turn markers. If found, truncates
 /// the offending block and returns sanitized content blocks.
-pub fn validate_content_blocks(blocks: &[ContentBlock]) -> (Vec<ContentBlock>, bool) {
+pub fn validate_content_blocks(
+    blocks: &[ContentBlock],
+) -> (Vec<ContentBlock>, bool, Option<String>) {
     let mut sanitized = Vec::with_capacity(blocks.len());
     let mut any_truncated = false;
+    let mut first_marker = None;
 
     for block in blocks {
         match block {
@@ -199,6 +202,9 @@ pub fn validate_content_blocks(blocks: &[ContentBlock]) -> (Vec<ContentBlock>, b
                 let result = validate_text(text);
                 if result.was_truncated {
                     any_truncated = true;
+                    if first_marker.is_none() {
+                        first_marker = result.detected_marker;
+                    }
                 }
                 // Only include the text block if there's content left
                 if !result.text.is_empty() {
@@ -210,7 +216,271 @@ pub fn validate_content_blocks(blocks: &[ContentBlock]) -> (Vec<ContentBlock>, b
         }
     }
 
-    (sanitized, any_truncated)
+    (sanitized, any_truncated, first_marker)
+}
+
+// ===== Phase 3: Action Hallucination Detection =====
+//
+// Detects when the model claims to have performed actions (file writes,
+// command execution) without corresponding tool calls. Unlike turn markers
+// which truncate the response, action claims are annotated with warnings —
+// the response content is preserved.
+
+/// Category of action an LLM claims to have performed.
+#[derive(Debug, Clone, PartialEq)]
+pub enum ActionCategory {
+    /// File write/update/modify/create/delete.
+    FileOperation,
+    /// Shell command execution.
+    CommandExecution,
+    /// General completion claim ("Done! I've ...").
+    GeneralCompletion,
+}
+
+impl ActionCategory {
+    /// Check whether a tool name is consistent with this action category.
+    pub fn matches_tool(&self, tool_name: &str) -> bool {
+        let lower = tool_name.to_lowercase();
+        match self {
+            Self::FileOperation => {
+                lower.contains("write")
+                    || lower.contains("edit")
+                    || lower.contains("notebook")
+                    || lower.contains("file")
+            }
+            Self::CommandExecution => {
+                lower.contains("bash")
+                    || lower.contains("shell")
+                    || lower.contains("exec")
+                    || lower.contains("command")
+            }
+            Self::GeneralCompletion => true,
+        }
+    }
+}
+
+impl std::fmt::Display for ActionCategory {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::FileOperation => write!(f, "file_operation"),
+            Self::CommandExecution => write!(f, "command_execution"),
+            Self::GeneralCompletion => write!(f, "general_completion"),
+        }
+    }
+}
+
+/// A detected action claim in response text.
+#[derive(Debug, Clone)]
+pub struct ActionClaim {
+    /// The matched text fragment.
+    pub matched_text: String,
+    /// Human-readable description of the pattern that matched.
+    pub description: &'static str,
+    /// Category of the claimed action.
+    pub category: ActionCategory,
+    /// Confidence score (0.0–1.0).
+    pub confidence: f32,
+    /// Character offset in the source text.
+    pub offset: usize,
+}
+
+/// Result of validating action claims against actual tool usage.
+#[derive(Debug, Clone, Default)]
+pub struct ActionClaimValidation {
+    /// All detected action claims.
+    pub claims: Vec<ActionClaim>,
+    /// Claims with no matching tool usage (potential hallucinations).
+    pub unmatched_claims: Vec<ActionClaim>,
+}
+
+impl ActionClaimValidation {
+    /// Whether any unmatched (potentially hallucinated) claims were found.
+    pub fn has_warnings(&self) -> bool {
+        !self.unmatched_claims.is_empty()
+    }
+}
+
+struct ActionClaimPattern {
+    regex: Regex,
+    category: ActionCategory,
+    confidence: f32,
+    description: &'static str,
+}
+
+impl ActionClaimPattern {
+    fn new(
+        pattern: &str,
+        category: ActionCategory,
+        confidence: f32,
+        description: &'static str,
+    ) -> Self {
+        Self {
+            regex: Regex::new(pattern).expect("invalid action claim regex"),
+            category,
+            confidence,
+            description,
+        }
+    }
+}
+
+/// Patterns that detect claimed actions in response text.
+///
+/// Ordered by specificity: more specific patterns first to improve dedup quality.
+/// All patterns target past-tense claims ("I've done X"), not future intent ("I'll do X").
+static ACTION_CLAIM_PATTERNS: LazyLock<Vec<ActionClaimPattern>> = LazyLock::new(|| {
+    vec![
+        // File operation with explicit filename (extension-based detection)
+        ActionClaimPattern::new(
+            r"(?i)\bI(?:'ve| have| just)?\s+(?:just\s+)?(?:updated|modified|changed|edited|saved|written\s+to|overwritten|created|wrote|generated|deleted|removed)\s+(?:the\s+|a\s+|your\s+|an?\s+)?(?:`[^`]+`|[\w./~-]+\.(?:md|rs|toml|json|yaml|yml|txt|py|js|ts|css|html|sh|cfg|conf|ini|lock)\b)",
+            ActionCategory::FileOperation,
+            0.9,
+            "File operation with specific filename",
+        ),
+        // File operation with path (contains /)
+        ActionClaimPattern::new(
+            r"(?i)\bI(?:'ve| have| just)?\s+(?:just\s+)?(?:updated|modified|changed|edited|saved|written\s+to|overwritten|created|wrote|generated|deleted|removed)\s+(?:the\s+|a\s+|your\s+|an?\s+)?(?:[/~.][\w./-]+|[\w.-]+/[\w./-]+)",
+            ActionCategory::FileOperation,
+            0.85,
+            "File operation with file path",
+        ),
+        // Command execution with specific command
+        ActionClaimPattern::new(
+            r"(?i)\bI(?:'ve| have| just)?\s+(?:just\s+)?(?:ran|run|executed)\s+(?:`[^`]+`|cargo\s+\w+|npm\s+\w+|git\s+\w+|systemctl\s+\w+|docker\s+\w+|make\b|rustup\s+\w+)",
+            ActionCategory::CommandExecution,
+            0.85,
+            "Command execution with specific command",
+        ),
+        // "Done!" + past-tense action verb
+        ActionClaimPattern::new(
+            r"(?i)\bDone[!.,;:]?\s+I(?:'ve| have)\s+(?:just\s+)?(?:updated|modified|changed|edited|saved|written|created|deleted|removed|moved|renamed|committed|pushed|deployed|installed|published|tagged|released)\b",
+            ActionCategory::GeneralCompletion,
+            0.75,
+            "Completion claim with action verb",
+        ),
+    ]
+});
+
+/// Cognitive/non-tool contexts that superficially resemble action claims.
+/// Used to filter false positives (e.g. "I've updated my understanding").
+static COGNITIVE_EXCLUSION: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(
+        r"(?i)\bI(?:'ve| have| just)?\s+(?:just\s+)?(?:updated|modified|changed|created)\s+(?:the\s+|a\s+|my\s+|an?\s+)?(?:understanding|analysis|assessment|plan|approach|thinking|perspective|view|opinion|summary|overview|recommendation|suggestion|estimate|picture|strategy|outline|list|response|answer|thought|idea|concept|impression|model)\b"
+    ).expect("invalid cognitive exclusion regex")
+});
+
+/// Detect action claims in a text string.
+///
+/// Returns deduplicated claims sorted by offset (highest confidence wins on overlap).
+pub fn detect_action_claims(text: &str) -> Vec<ActionClaim> {
+    if text.is_empty() {
+        return Vec::new();
+    }
+
+    let mut claims = Vec::new();
+
+    for pattern in ACTION_CLAIM_PATTERNS.iter() {
+        for m in pattern.regex.find_iter(text) {
+            let matched = m.as_str().to_string();
+            let offset = m.start();
+
+            // Skip if the match region is actually a cognitive/non-tool context
+            let check_start = offset.saturating_sub(10);
+            let check_end = (m.end() + 30).min(text.len());
+            let check_region = &text[check_start..check_end];
+
+            if COGNITIVE_EXCLUSION.is_match(check_region) {
+                continue;
+            }
+
+            claims.push(ActionClaim {
+                matched_text: matched,
+                description: pattern.description,
+                category: pattern.category.clone(),
+                confidence: pattern.confidence,
+                offset,
+            });
+        }
+    }
+
+    // Sort by offset, deduplicate overlapping matches (keep highest confidence)
+    claims.sort_by(|a, b| a.offset.cmp(&b.offset));
+
+    let mut deduped: Vec<ActionClaim> = Vec::new();
+    for claim in claims {
+        if let Some(last) = deduped.last() {
+            if claim.offset < last.offset + last.matched_text.len() {
+                if claim.confidence > last.confidence {
+                    deduped.pop();
+                    deduped.push(claim);
+                }
+                continue;
+            }
+        }
+        deduped.push(claim);
+    }
+
+    deduped
+}
+
+/// Validate action claims in a response against actual tool usage.
+///
+/// `blocks` — content blocks of the current LLM response.
+/// `tools_used` — tool names invoked in previous rounds of the tool loop.
+pub fn validate_action_claims(
+    blocks: &[ContentBlock],
+    tools_used: &[String],
+) -> ActionClaimValidation {
+    let text: String = blocks
+        .iter()
+        .filter_map(|b| match b {
+            ContentBlock::Text { text } => Some(text.as_str()),
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    let current_tools: Vec<String> = blocks
+        .iter()
+        .filter_map(|b| match b {
+            ContentBlock::ToolUse { name, .. } => Some(name.clone()),
+            _ => None,
+        })
+        .collect();
+
+    let all_tools: Vec<&str> = tools_used
+        .iter()
+        .chain(current_tools.iter())
+        .map(|s| s.as_str())
+        .collect();
+
+    let claims = detect_action_claims(&text);
+
+    if claims.is_empty() {
+        return ActionClaimValidation::default();
+    }
+
+    if all_tools.is_empty() {
+        let unmatched = claims.clone();
+        return ActionClaimValidation {
+            claims,
+            unmatched_claims: unmatched,
+        };
+    }
+
+    let mut unmatched = Vec::new();
+    for claim in &claims {
+        let matched = all_tools
+            .iter()
+            .any(|tool| claim.category.matches_tool(tool));
+        if !matched {
+            unmatched.push(claim.clone());
+        }
+    }
+
+    ActionClaimValidation {
+        claims,
+        unmatched_claims: unmatched,
+    }
 }
 
 #[cfg(test)]
@@ -326,7 +596,7 @@ mod tests {
             },
         ];
 
-        let (sanitized, truncated) = validate_content_blocks(&blocks);
+        let (sanitized, truncated, _marker) = validate_content_blocks(&blocks);
         assert!(truncated);
         assert_eq!(sanitized.len(), 2); // text block + tool_use block
         if let ContentBlock::Text { text } = &sanitized[0] {
@@ -578,5 +848,217 @@ mod tests {
         let result = validate_text(text);
         // "AI:" only matches at start of line (after \n), not mid-sentence
         assert!(!result.was_truncated);
+    }
+
+    // ===== Phase 3: Action Claim Detection Tests =====
+
+    #[test]
+    fn action_claim_file_with_extension() {
+        let claims = detect_action_claims("I've updated MEMORY.md with the new information.");
+        assert_eq!(claims.len(), 1);
+        assert_eq!(claims[0].category, ActionCategory::FileOperation);
+        assert!(claims[0].confidence >= 0.9);
+    }
+
+    #[test]
+    fn action_claim_file_with_path() {
+        let claims =
+            detect_action_claims("I've updated /home/echo/entity/SELF.md with the growth log.");
+        assert_eq!(claims.len(), 1);
+        assert_eq!(claims[0].category, ActionCategory::FileOperation);
+    }
+
+    #[test]
+    fn action_claim_relative_path() {
+        let claims = detect_action_claims("I created entity/journal/THOUGHTS.md for you.");
+        assert_eq!(claims.len(), 1);
+        assert_eq!(claims[0].category, ActionCategory::FileOperation);
+    }
+
+    #[test]
+    fn action_claim_command_execution() {
+        let claims = detect_action_claims("I've run cargo clippy and there are no warnings.");
+        assert_eq!(claims.len(), 1);
+        assert_eq!(claims[0].category, ActionCategory::CommandExecution);
+    }
+
+    #[test]
+    fn action_claim_backtick_command() {
+        let claims =
+            detect_action_claims("I ran `cargo build --release` and it compiled successfully.");
+        assert_eq!(claims.len(), 1);
+        assert_eq!(claims[0].category, ActionCategory::CommandExecution);
+    }
+
+    #[test]
+    fn action_claim_done_completion() {
+        let claims = detect_action_claims("Done! I've updated the spec with the new design.");
+        assert!(!claims.is_empty());
+        // Should detect at least the GeneralCompletion pattern
+        assert!(claims
+            .iter()
+            .any(|c| c.category == ActionCategory::GeneralCompletion));
+    }
+
+    #[test]
+    fn action_claim_cognitive_excluded() {
+        let claims = detect_action_claims("I've updated my understanding of the architecture.");
+        assert!(claims.is_empty());
+    }
+
+    #[test]
+    fn action_claim_cognitive_plan_excluded() {
+        let claims = detect_action_claims("I've created a plan for the implementation.");
+        assert!(claims.is_empty());
+    }
+
+    #[test]
+    fn action_claim_normal_text_no_match() {
+        let claims =
+            detect_action_claims("The system is running well and all services are healthy.");
+        assert!(claims.is_empty());
+    }
+
+    #[test]
+    fn action_claim_future_intent_no_match() {
+        let claims = detect_action_claims("I'll update the file with the new configuration.");
+        assert!(claims.is_empty());
+    }
+
+    #[test]
+    fn action_claim_just_variant() {
+        let claims = detect_action_claims("I've just updated config.toml with the new settings.");
+        assert_eq!(claims.len(), 1);
+        assert_eq!(claims[0].category, ActionCategory::FileOperation);
+    }
+
+    #[test]
+    fn action_claim_have_variant() {
+        let claims = detect_action_claims("I have updated PRAXIS.md with the new policy.");
+        assert_eq!(claims.len(), 1);
+        assert_eq!(claims[0].category, ActionCategory::FileOperation);
+    }
+
+    #[test]
+    fn action_claim_backtick_filename() {
+        let claims =
+            detect_action_claims("I've edited `response_validator.rs` to add the new patterns.");
+        assert_eq!(claims.len(), 1);
+        assert_eq!(claims[0].category, ActionCategory::FileOperation);
+    }
+
+    #[test]
+    fn validate_unmatched_no_tools() {
+        let blocks = vec![ContentBlock::Text {
+            text: "I've updated MEMORY.md with the session notes.".to_string(),
+        }];
+        let result = validate_action_claims(&blocks, &[]);
+        assert!(result.has_warnings());
+        assert_eq!(result.unmatched_claims.len(), 1);
+    }
+
+    #[test]
+    fn validate_matched_write_tool() {
+        let blocks = vec![ContentBlock::Text {
+            text: "I've updated MEMORY.md with the session notes.".to_string(),
+        }];
+        let tools = vec!["Write".to_string()];
+        let result = validate_action_claims(&blocks, &tools);
+        assert!(!result.has_warnings());
+    }
+
+    #[test]
+    fn validate_matched_edit_tool() {
+        let blocks = vec![ContentBlock::Text {
+            text: "I've edited config.toml to fix the port number.".to_string(),
+        }];
+        let tools = vec!["Edit".to_string()];
+        let result = validate_action_claims(&blocks, &tools);
+        assert!(!result.has_warnings());
+    }
+
+    #[test]
+    fn validate_unmatched_wrong_tool_category() {
+        // Bash doesn't satisfy FileOperation (by design — reduces false negatives)
+        let blocks = vec![ContentBlock::Text {
+            text: "I've updated MEMORY.md with the session notes.".to_string(),
+        }];
+        let tools = vec!["Bash".to_string()];
+        let result = validate_action_claims(&blocks, &tools);
+        assert!(result.has_warnings());
+    }
+
+    #[test]
+    fn validate_command_matched_bash() {
+        let blocks = vec![ContentBlock::Text {
+            text: "I ran cargo build and it succeeded.".to_string(),
+        }];
+        let tools = vec!["Bash".to_string()];
+        let result = validate_action_claims(&blocks, &tools);
+        assert!(!result.has_warnings());
+    }
+
+    #[test]
+    fn validate_general_completion_any_tool() {
+        // GeneralCompletion matches any tool
+        let blocks = vec![ContentBlock::Text {
+            text: "Done! I've updated everything as requested.".to_string(),
+        }];
+        let tools = vec!["Read".to_string()];
+        let result = validate_action_claims(&blocks, &tools);
+        assert!(!result.has_warnings());
+    }
+
+    #[test]
+    fn validate_no_claims_no_warnings() {
+        let blocks = vec![ContentBlock::Text {
+            text: "The configuration looks correct and everything is running.".to_string(),
+        }];
+        let result = validate_action_claims(&blocks, &[]);
+        assert!(!result.has_warnings());
+        assert!(result.claims.is_empty());
+    }
+
+    #[test]
+    fn validate_current_response_tools_counted() {
+        // ToolUse in the same response satisfies the claim
+        let blocks = vec![
+            ContentBlock::Text {
+                text: "I've updated MEMORY.md with the new entry.".to_string(),
+            },
+            ContentBlock::ToolUse {
+                id: "tool_1".to_string(),
+                name: "Write".to_string(),
+                input: serde_json::json!({"path": "MEMORY.md"}),
+            },
+        ];
+        let result = validate_action_claims(&blocks, &[]);
+        assert!(!result.has_warnings());
+    }
+
+    #[test]
+    fn action_category_matches_file_write() {
+        assert!(ActionCategory::FileOperation.matches_tool("Write"));
+        assert!(ActionCategory::FileOperation.matches_tool("Edit"));
+        assert!(ActionCategory::FileOperation.matches_tool("file_write"));
+        assert!(ActionCategory::FileOperation.matches_tool("NotebookEdit"));
+        assert!(!ActionCategory::FileOperation.matches_tool("Bash"));
+        assert!(!ActionCategory::FileOperation.matches_tool("Read"));
+    }
+
+    #[test]
+    fn action_category_matches_command() {
+        assert!(ActionCategory::CommandExecution.matches_tool("Bash"));
+        assert!(ActionCategory::CommandExecution.matches_tool("execute_command"));
+        assert!(!ActionCategory::CommandExecution.matches_tool("Write"));
+        assert!(!ActionCategory::CommandExecution.matches_tool("Read"));
+    }
+
+    #[test]
+    fn action_category_general_matches_any() {
+        assert!(ActionCategory::GeneralCompletion.matches_tool("Write"));
+        assert!(ActionCategory::GeneralCompletion.matches_tool("Bash"));
+        assert!(ActionCategory::GeneralCompletion.matches_tool("Read"));
+        assert!(ActionCategory::GeneralCompletion.matches_tool("anything"));
     }
 }

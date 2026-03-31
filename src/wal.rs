@@ -52,7 +52,6 @@ pub enum WalFsync {
     None,
 }
 
-
 /// Write-ahead log writer for crash-resilient conversation persistence.
 ///
 /// Each session gets its own JSONL file at `{dir}/{session_key}.jsonl`.

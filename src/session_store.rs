@@ -40,6 +40,12 @@ pub struct SessionData {
     /// Number of times the response validator detected hallucinated turns in this session.
     #[serde(default)]
     pub hallucination_count: u32,
+    /// Number of unmatched action claims detected in this session (Phase 3).
+    #[serde(default)]
+    pub action_claim_count: u32,
+    /// Number of times the circuit breaker fired in this session.
+    #[serde(default)]
+    pub circuit_breaker_count: u32,
 }
 
 impl SessionData {
@@ -75,6 +81,8 @@ impl Session {
                 last_checkpoint_time: now,
                 rounds_since_human_input: 0,
                 hallucination_count: 0,
+                action_claim_count: 0,
+                circuit_breaker_count: 0,
             },
             dirty: false,
         }
@@ -477,6 +485,10 @@ impl SessionStore {
 
         for (key, session_arc) in sessions.iter() {
             let session = session_arc.read().await;
+            let health = crate::session_health::assess_session(
+                &session.data,
+                &crate::session_health::SessionHealthConfig::default(),
+            );
             info.push(SessionInfo {
                 key: key.clone(),
                 channel: session.data.channel.clone(),
@@ -484,12 +496,32 @@ impl SessionStore {
                 message_count: session.data.messages.len(),
                 created_at: session.data.created_at.to_rfc3339(),
                 last_active: session.data.last_active.to_rfc3339(),
+                health_status: health.status.to_string(),
+                hallucination_count: session.data.hallucination_count,
+                action_claim_count: session.data.action_claim_count,
+                circuit_breaker_count: session.data.circuit_breaker_count,
             });
         }
 
         // Sort by last_active descending
         info.sort_by(|a, b| b.last_active.cmp(&a.last_active));
         info
+    }
+
+    /// Get health snapshots for all active sessions.
+    pub async fn session_health(
+        &self,
+        config: &crate::session_health::SessionHealthConfig,
+    ) -> Vec<crate::session_health::SessionHealthSnapshot> {
+        let sessions = self.sessions.read().await;
+        let mut snapshots = Vec::new();
+
+        for session_arc in sessions.values() {
+            let session = session_arc.read().await;
+            snapshots.push(crate::session_health::assess_session(&session.data, config));
+        }
+
+        snapshots
     }
 
     /// Get the total number of active sessions.
@@ -512,6 +544,10 @@ pub struct SessionInfo {
     pub message_count: usize,
     pub created_at: String,
     pub last_active: String,
+    pub health_status: String,
+    pub hallucination_count: u32,
+    pub action_claim_count: u32,
+    pub circuit_breaker_count: u32,
 }
 
 #[cfg(test)]
@@ -524,6 +560,8 @@ mod tests {
         let session = Session::new("test:user".into(), "test".into(), "user".into());
         assert_eq!(session.data.rounds_since_human_input, 0);
         assert_eq!(session.data.hallucination_count, 0);
+        assert_eq!(session.data.action_claim_count, 0);
+        assert_eq!(session.data.circuit_breaker_count, 0);
     }
 
     #[test]
@@ -561,6 +599,8 @@ mod tests {
         let json = serde_json::to_string(&session.data).unwrap();
         assert!(json.contains("rounds_since_human_input"));
         assert!(json.contains("hallucination_count"));
+        assert!(json.contains("action_claim_count"));
+        assert!(json.contains("circuit_breaker_count"));
     }
 
     #[test]
@@ -578,5 +618,7 @@ mod tests {
         let data: SessionData = serde_json::from_str(json).unwrap();
         assert_eq!(data.rounds_since_human_input, 0);
         assert_eq!(data.hallucination_count, 0);
+        assert_eq!(data.action_claim_count, 0);
+        assert_eq!(data.circuit_breaker_count, 0);
     }
 }

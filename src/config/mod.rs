@@ -34,6 +34,8 @@ pub struct Config {
     #[serde(default)]
     pub context_buffer: crate::context_buffer::ContextBufferConfig,
     #[serde(default)]
+    pub session_health: crate::session_health::SessionHealthConfig,
+    #[serde(default)]
     pub platform: PlatformConfig,
     #[serde(default)]
     pub peers: HashMap<String, PeerConfig>,

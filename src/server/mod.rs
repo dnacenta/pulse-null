@@ -399,6 +399,7 @@ pub fn build_router(state: Arc<AppState>, plugin_routes: Router<()>) -> Router {
 
     Router::new()
         .route("/health", get(handlers::health::health))
+        .route("/api/session-health", get(handlers::health::session_health))
         .route("/api/status", get(handlers::status::status))
         .route("/api/dashboard", get(handlers::dashboard::dashboard))
         .route("/chat", post(handlers::chat::chat))
