@@ -20,7 +20,6 @@ mod plugins;
 mod praxis;
 mod providers;
 mod registry;
-mod response_validator;
 mod scheduler;
 mod server;
 mod session;

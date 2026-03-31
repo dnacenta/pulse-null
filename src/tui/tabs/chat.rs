@@ -17,8 +17,8 @@ use pulse_system_types::llm::{
     ContentBlock, Message, MessageContent, MessageSource, Role, StopReason,
 };
 
-use crate::response_validator;
 use crate::streaming::{StreamEvent, StreamingProvider};
+use crate::tool_loop::{validate_action_claims_adapter, validate_content_blocks_adapter};
 use crate::tools::ToolRegistry;
 use crate::tui::app::AppContext;
 use crate::tui::screens::EntityState;
@@ -657,7 +657,7 @@ async fn conversation_task(
 
         // Validate response for hallucinated turn markers before storing
         let (sanitized_content, was_truncated, detected_marker) =
-            response_validator::validate_content_blocks(&resp.content);
+            validate_content_blocks_adapter(&resp.content);
 
         if was_truncated {
             tracing::warn!(
@@ -757,7 +757,7 @@ async fn conversation_task(
 
     // Phase 3: Check for action claim hallucinations on the final response
     if let Some(ref content) = final_resp_content {
-        let validation = response_validator::validate_action_claims(content, &tools_used);
+        let validation = validate_action_claims_adapter(content, &tools_used);
         if validation.has_warnings() {
             let claim_texts: Vec<String> = validation
                 .unmatched_claims

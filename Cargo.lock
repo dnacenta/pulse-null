@@ -3996,7 +3996,7 @@ dependencies = [
 
 [[package]]
 name = "pulse-null"
-version = "0.21.1"
+version = "0.22.0"
 dependencies = [
  "async-stream",
  "axum",
@@ -4017,6 +4017,7 @@ dependencies = [
  "recall-echo",
  "regex",
  "reqwest",
+ "response-validator",
  "serde",
  "serde_json",
  "tempfile",
@@ -4434,6 +4435,18 @@ dependencies = [
  "wasm-bindgen-futures",
  "wasm-streams",
  "web-sys",
+]
+
+[[package]]
+name = "response-validator"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4972cb1f35abcc86293d1b879655c49c735e77643e32fc173df0eb6e3e5e5d67"
+dependencies = [
+ "regex",
+ "serde",
+ "serde_json",
+ "tracing",
 ]
 
 [[package]]
