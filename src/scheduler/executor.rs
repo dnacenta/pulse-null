@@ -33,10 +33,13 @@ pub struct ExecutionResult {
     pub circuit_breaker_fired: bool,
     /// Number of action claims with no matching tool use (Phase 3).
     pub action_claim_count: u32,
+    /// Full message transcript from the tool loop (user + assistant + tool rounds).
+    pub messages: Vec<Message>,
 }
 
-impl From<ToolLoopResult> for ExecutionResult {
-    fn from(r: ToolLoopResult) -> Self {
+impl ExecutionResult {
+    /// Build from a ToolLoopResult plus the message transcript.
+    fn from_tool_loop(r: ToolLoopResult, messages: Vec<Message>) -> Self {
         Self {
             response_text: r.text,
             total_input_tokens: r.input_tokens,
@@ -46,6 +49,7 @@ impl From<ToolLoopResult> for ExecutionResult {
             was_truncated: r.was_truncated,
             circuit_breaker_fired: r.circuit_breaker_fired,
             action_claim_count: r.action_claim_warnings.len() as u32,
+            messages,
         }
     }
 }
@@ -87,5 +91,5 @@ pub async fn execute_with_tools(
     .instrument(span)
     .await?;
 
-    Ok(result.into())
+    Ok(ExecutionResult::from_tool_loop(result, messages))
 }

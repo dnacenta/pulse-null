@@ -9,7 +9,8 @@ use super::executor::{self, ExecutionConfig};
 use super::intent::{self, IntentQueue, IntentSource};
 use super::output;
 use super::{Schedule, ScheduledTask};
-use crate::events::{ConversationTrust, EntityEvent, InteractionSource};
+use crate::events::EntityEvent;
+use crate::interaction::{InteractionMetadata, InteractionRecord};
 use crate::server::prompt;
 use crate::server::AppState;
 
@@ -119,6 +120,9 @@ async fn execute_task(
         autonomy_context,
     );
 
+    // Capture start time for accurate duration tracking in InteractionRecord
+    let started_at = Utc::now();
+
     // Execute with or without tools based on autonomy config
     let (
         response_text,
@@ -127,6 +131,8 @@ async fn execute_task(
         tool_rounds,
         was_truncated,
         circuit_breaker_fired,
+        action_claim_count,
+        transcript,
     ) = if state.config.autonomy.enabled {
         let exec_config = ExecutionConfig {
             max_tool_rounds: state.config.autonomy.max_tool_rounds,
@@ -150,6 +156,8 @@ async fn execute_task(
                 result.tool_rounds_used,
                 result.was_truncated,
                 result.circuit_breaker_fired,
+                result.action_claim_count,
+                result.messages,
             ),
             Err(e) => {
                 tracing::error!("LLM invocation failed for task '{}': {}", task.id, e);
@@ -159,7 +167,7 @@ async fn execute_task(
     } else {
         // Legacy path: no tools
         use pulse_system_types::llm::{Message, MessageContent, MessageSource, Role};
-        let messages = vec![Message {
+        let mut messages = vec![Message {
             role: Role::User,
             content: MessageContent::Text(user_message),
             source: Some(MessageSource::ScheduledTask {
@@ -172,14 +180,25 @@ async fn execute_task(
             .invoke(&system_prompt, &messages, state.config.llm.max_tokens, None)
             .await
         {
-            Ok(result) => (
-                result.text(),
-                result.input_tokens.unwrap_or(0),
-                result.output_tokens.unwrap_or(0),
-                0u32,
-                false,
-                false,
-            ),
+            Ok(result) => {
+                let text = result.text();
+                // Append assistant response to transcript
+                messages.push(Message {
+                    role: Role::Assistant,
+                    content: MessageContent::Text(text.clone()),
+                    source: None,
+                });
+                (
+                    text,
+                    result.input_tokens.unwrap_or(0),
+                    result.output_tokens.unwrap_or(0),
+                    0u32,
+                    false,
+                    false,
+                    0u32,
+                    messages,
+                )
+            }
             Err(e) => {
                 tracing::error!("LLM invocation failed for task '{}': {}", task.id, e);
                 return;
@@ -323,24 +342,42 @@ async fn execute_task(
         tool_rounds,
     );
 
-    // Emit PostInteraction for unified intake
-    let summary = if parsed.clean_content.len() > crate::utils::SUMMARY_TRUNCATE_LEN {
-        format!(
-            "{}...",
-            crate::utils::safe_truncate(&parsed.clean_content, crate::utils::SUMMARY_TRUNCATE_LEN)
-        )
-    } else {
-        parsed.clean_content.clone()
-    };
-    state.event_bus.emit(EntityEvent::PostInteraction {
-        source: InteractionSource::ScheduledTask {
-            task_name: task.name.clone(),
+    // Build InteractionRecord for unified intake — archives, emits event, enables graph ingestion
+    let duration = (Utc::now() - started_at).num_seconds().max(0) as f64;
+    let interaction = InteractionRecord::from_task(
+        &task.name,
+        &state.config.entity.name,
+        transcript,
+        started_at,
+        InteractionMetadata {
+            input_tokens,
+            output_tokens,
+            tool_rounds,
+            duration_secs: Some(duration),
+            session_key: None,
+            hallucination_count: if was_truncated { 1 } else { 0 },
+            action_claim_count,
+            circuit_breaker_fires: if circuit_breaker_fired { 1 } else { 0 },
         },
-        trust: ConversationTrust::Owner,
-        summary,
-        input_tokens,
-        output_tokens,
-    });
+    );
+
+    // Archive the task conversation (closes the "task output not captured" gap)
+    if let Some(archive_path) = interaction.archive(&root_dir) {
+        tracing::info!(
+            "Task '{}' conversation archived to {}",
+            task.id,
+            archive_path.display()
+        );
+
+        // Graph auto-ingest if enabled
+        #[cfg(feature = "graph")]
+        if state.config.graph.enabled && state.config.graph.auto_ingest {
+            crate::session::graph_ingest_archive(&root_dir, &archive_path, None).await;
+        }
+    }
+
+    // Emit PostInteraction event
+    state.event_bus.emit(interaction.to_event());
 
     // Record outcome for caliber-echo
     if let Some(ref tracker) = state.outcome_tracker {

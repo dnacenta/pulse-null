@@ -10,7 +10,8 @@ use super::executor::{self, ExecutionConfig};
 use super::output;
 use super::Schedule;
 use crate::config::AutonomyConfig;
-use crate::events::{ConversationTrust, EntityEvent, InteractionSource};
+use crate::events::EntityEvent;
+use crate::interaction::{InteractionMetadata, InteractionRecord};
 use crate::server::prompt;
 use crate::server::AppState;
 
@@ -456,6 +457,9 @@ async fn execute_intent(
         intent.description, intent.priority, intent.source, intent.prompt, autonomy_context
     );
 
+    // Capture start time for accurate duration tracking
+    let started_at = Utc::now();
+
     let exec_config = ExecutionConfig {
         max_tool_rounds: config.max_tool_rounds,
         max_tokens: state.config.llm.max_tokens,
@@ -617,35 +621,55 @@ async fn execute_intent(
         result.tool_rounds_used,
     );
 
-    // Emit PostInteraction for unified intake — only for non-event-sourced intents
+    // Build InteractionRecord for unified intake — only for non-event-sourced intents
     // to prevent infinite loops (event → intent → event → intent → ...)
     if !matches!(intent.source, IntentSource::Event(_)) {
-        let source = match &intent.source {
-            IntentSource::ScheduledTask(name) => InteractionSource::ScheduledTask {
-                task_name: name.clone(),
-            },
-            _ => InteractionSource::Research {
-                topic: intent.description.clone(),
-            },
-        };
-        let summary = if parsed.clean_content.len() > crate::utils::SUMMARY_TRUNCATE_LEN {
-            format!(
-                "{}...",
-                crate::utils::safe_truncate(
-                    &parsed.clean_content,
-                    crate::utils::SUMMARY_TRUNCATE_LEN
-                )
-            )
-        } else {
-            parsed.clean_content.clone()
-        };
-        state.event_bus.emit(EntityEvent::PostInteraction {
-            source,
-            trust: ConversationTrust::Owner,
-            summary,
+        let duration = (Utc::now() - started_at).num_seconds().max(0) as f64;
+        let meta = InteractionMetadata {
             input_tokens: result.total_input_tokens,
             output_tokens: result.total_output_tokens,
-        });
+            tool_rounds: result.tool_rounds_used,
+            duration_secs: Some(duration),
+            session_key: None,
+            hallucination_count: if result.was_truncated { 1 } else { 0 },
+            action_claim_count: result.action_claim_count,
+            circuit_breaker_fires: if result.circuit_breaker_fired { 1 } else { 0 },
+        };
+
+        let interaction = match &intent.source {
+            IntentSource::ScheduledTask(name) => InteractionRecord::from_task(
+                name,
+                &state.config.entity.name,
+                result.messages.clone(),
+                started_at,
+                meta,
+            ),
+            _ => InteractionRecord::from_research(
+                &intent.description,
+                &state.config.entity.name,
+                result.messages.clone(),
+                started_at,
+                meta,
+            ),
+        };
+
+        // Archive the intent conversation
+        if let Some(archive_path) = interaction.archive(&root_dir) {
+            tracing::info!(
+                "Intent '{}' conversation archived to {}",
+                intent.id,
+                archive_path.display()
+            );
+
+            // Graph auto-ingest if enabled
+            #[cfg(feature = "graph")]
+            if state.config.graph.enabled && state.config.graph.auto_ingest {
+                crate::session::graph_ingest_conversation(&root_dir, &archive_path).await;
+            }
+        }
+
+        // Emit PostInteraction event
+        state.event_bus.emit(interaction.to_event());
     }
 
     // Record outcome for caliber-echo
