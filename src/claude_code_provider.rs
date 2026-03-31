@@ -235,10 +235,12 @@ mod tests {
             Message {
                 role: Role::User,
                 content: MessageContent::Text("hello".into()),
+                source: None,
             },
             Message {
                 role: Role::Assistant,
                 content: MessageContent::Text("hi there".into()),
+                source: None,
             },
         ];
         let result = serialize_messages(&messages);
@@ -260,6 +262,7 @@ mod tests {
                     text: "second".into(),
                 },
             ]),
+            source: None,
         }];
         let result = serialize_messages(&messages);
         assert_eq!(result, "[User]: first\nsecond\n\n[Assistant]:");
@@ -270,6 +273,7 @@ mod tests {
         let messages = vec![Message {
             role: Role::User,
             content: MessageContent::Text("test".into()),
+            source: None,
         }];
         let result = serialize_messages(&messages);
         assert!(
@@ -285,6 +289,7 @@ mod tests {
             content: MessageContent::Text(
                 "[Channel: discord | Trust: VERIFIED — input from an authenticated channel.]\nfix the bug".into(),
             ),
+            source: None,
         }];
         let result = serialize_messages(&messages);
         assert!(

@@ -120,8 +120,14 @@ async fn execute_task(
     );
 
     // Execute with or without tools based on autonomy config
-    let (response_text, input_tokens, output_tokens, tool_rounds) = if state.config.autonomy.enabled
-    {
+    let (
+        response_text,
+        input_tokens,
+        output_tokens,
+        tool_rounds,
+        was_truncated,
+        circuit_breaker_fired,
+    ) = if state.config.autonomy.enabled {
         let exec_config = ExecutionConfig {
             max_tool_rounds: state.config.autonomy.max_tool_rounds,
             max_tokens: state.config.llm.max_tokens,
@@ -142,6 +148,8 @@ async fn execute_task(
                 result.total_input_tokens,
                 result.total_output_tokens,
                 result.tool_rounds_used,
+                result.was_truncated,
+                result.circuit_breaker_fired,
             ),
             Err(e) => {
                 tracing::error!("LLM invocation failed for task '{}': {}", task.id, e);
@@ -150,10 +158,13 @@ async fn execute_task(
         }
     } else {
         // Legacy path: no tools
-        use pulse_system_types::llm::{Message, MessageContent, Role};
+        use pulse_system_types::llm::{Message, MessageContent, MessageSource, Role};
         let messages = vec![Message {
             role: Role::User,
             content: MessageContent::Text(user_message),
+            source: Some(MessageSource::ScheduledTask {
+                task_name: task.id.clone(),
+            }),
         }];
 
         match state
@@ -166,6 +177,8 @@ async fn execute_task(
                 result.input_tokens.unwrap_or(0),
                 result.output_tokens.unwrap_or(0),
                 0u32,
+                false,
+                false,
             ),
             Err(e) => {
                 tracing::error!("LLM invocation failed for task '{}': {}", task.id, e);
@@ -173,6 +186,24 @@ async fn execute_task(
             }
         }
     };
+
+    // Log hallucination guard events for autonomous tasks
+    if was_truncated {
+        tracing::warn!(
+            task_id = %task.id,
+            "Hallucination guard: autonomous task '{}' had response truncated due to hallucinated turns",
+            task.name
+        );
+    }
+    if circuit_breaker_fired {
+        tracing::warn!(
+            task_id = %task.id,
+            tool_rounds,
+            "Hallucination guard: autonomous task '{}' hit circuit breaker after {} tool rounds",
+            task.name,
+            tool_rounds
+        );
+    }
 
     let tool_info = if tool_rounds > 0 {
         format!(", {} tool rounds", tool_rounds)

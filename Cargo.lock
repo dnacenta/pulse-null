@@ -1326,7 +1326,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2925c4eaf6ad8c7a656f472aca920e546e801edd639636bfb581724ee315b674"
 dependencies = [
  "futures-util",
- "pulse-system-types",
+ "pulse-system-types 0.5.0 (registry+https://github.com/rust-lang/crates.io-index)",
  "reqwest",
  "serde",
  "serde_json",
@@ -3995,7 +3995,7 @@ dependencies = [
 
 [[package]]
 name = "pulse-null"
-version = "0.19.0"
+version = "0.20.0"
 dependencies = [
  "async-stream",
  "axum",
@@ -4011,7 +4011,7 @@ dependencies = [
  "globset",
  "libc",
  "owo-colors",
- "pulse-system-types",
+ "pulse-system-types 0.5.0",
  "ratatui",
  "recall-echo",
  "regex",
@@ -4030,6 +4030,14 @@ dependencies = [
  "vigil-pulse",
  "voice-echo",
  "walkdir",
+]
+
+[[package]]
+name = "pulse-system-types"
+version = "0.5.0"
+dependencies = [
+ "serde",
+ "serde_json",
 ]
 
 [[package]]
@@ -4289,8 +4297,6 @@ checksum = "bbc4a4ea2a66a41a1152c4b3d86e8954dc087bdf33af35446e6e176db4e73c8c"
 [[package]]
 name = "recall-echo"
 version = "3.3.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ba59dd6b78cefb9ee1f286e18bd61b3427b9a62bd1813fc1a640b47fb00f35b1"
 dependencies = [
  "async-trait",
  "chrono",
@@ -4298,7 +4304,7 @@ dependencies = [
  "dirs",
  "fastembed",
  "futures",
- "pulse-system-types",
+ "pulse-system-types 0.5.0",
  "regex",
  "serde",
  "serde_json",
@@ -6370,7 +6376,7 @@ checksum = "924c54aa7e44e562dd4b99c3d5ce34b9a949250ded224759d2aae03dd3fd0b05"
 dependencies = [
  "chrono",
  "owo-colors",
- "pulse-system-types",
+ "pulse-system-types 0.5.0 (registry+https://github.com/rust-lang/crates.io-index)",
  "serde",
  "serde_json",
 ]
@@ -6387,7 +6393,7 @@ dependencies = [
  "chrono",
  "dotenvy",
  "hound",
- "pulse-system-types",
+ "pulse-system-types 0.5.0 (registry+https://github.com/rust-lang/crates.io-index)",
  "rand 0.8.5",
  "reqwest",
  "rpassword",

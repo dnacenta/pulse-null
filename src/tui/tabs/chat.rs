@@ -13,7 +13,9 @@ use tokio::task::JoinHandle;
 use tokio_stream::StreamExt;
 use tui_textarea::TextArea;
 
-use pulse_system_types::llm::{ContentBlock, Message, MessageContent, Role, StopReason};
+use pulse_system_types::llm::{
+    ContentBlock, Message, MessageContent, MessageSource, Role, StopReason,
+};
 
 use crate::streaming::{StreamEvent, StreamingProvider};
 use crate::tools::ToolRegistry;
@@ -419,6 +421,10 @@ impl ChatTab {
         self.conversation.push(Message {
             role: Role::User,
             content: MessageContent::Text(text),
+            source: Some(MessageSource::Human {
+                channel: "tui-chat".into(),
+                sender: "local".into(),
+            }),
         });
 
         if let (Some(provider), Some(tools), Some(system_prompt)) =
@@ -615,6 +621,7 @@ async fn conversation_task(
         conversation.push(Message {
             role: Role::Assistant,
             content: MessageContent::Blocks(resp.content.clone()),
+            source: Some(MessageSource::Assistant),
         });
 
         match resp.stop_reason {
@@ -650,9 +657,19 @@ async fn conversation_task(
                     }
                 }
 
+                let first_tool_id = tool_results
+                    .iter()
+                    .find_map(|b| match b {
+                        ContentBlock::ToolResult { tool_use_id, .. } => Some(tool_use_id.clone()),
+                        _ => None,
+                    })
+                    .unwrap_or_default();
                 conversation.push(Message {
                     role: Role::User,
                     content: MessageContent::Blocks(tool_results),
+                    source: Some(MessageSource::ToolResult {
+                        tool_use_id: first_tool_id,
+                    }),
                 });
 
                 let _ = tx.send(UiEvent::StateChange(EntityState::Thinking));

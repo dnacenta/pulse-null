@@ -1,7 +1,8 @@
 use pulse_system_types::llm::{
-    ContentBlock, LmProvider, Message, MessageContent, Role, StopReason,
+    ContentBlock, LmProvider, Message, MessageContent, MessageSource, Role, StopReason,
 };
 
+use crate::response_validator;
 use crate::tools::ToolRegistry;
 
 /// Maximum tool-use round trips before forcing a text response (default).
@@ -14,6 +15,10 @@ pub struct ToolLoopResult {
     pub input_tokens: u32,
     pub output_tokens: u32,
     pub tool_rounds: u32,
+    /// True if the response validator detected and truncated hallucinated turn markers.
+    pub was_truncated: bool,
+    /// True if the tool loop was forcibly stopped because it exceeded max rounds.
+    pub circuit_breaker_fired: bool,
 }
 
 /// Invoke an LLM provider with automatic tool execution.
@@ -50,11 +55,42 @@ pub async fn invoke_with_tool_loop(
         total_output_tokens += result.output_tokens.unwrap_or(0);
         final_model = result.model.clone();
 
-        // Add assistant response to conversation
+        // Validate response for hallucinated turn markers before storing
+        let (sanitized_content, was_truncated) =
+            response_validator::validate_content_blocks(&result.content);
+
+        // Add sanitized assistant response to conversation
         messages.push(Message {
             role: Role::Assistant,
-            content: MessageContent::Blocks(result.content.clone()),
+            content: MessageContent::Blocks(sanitized_content.clone()),
+            source: Some(MessageSource::Assistant),
         });
+
+        // If hallucinated turns were detected, force end — don't continue the loop
+        // with potentially poisoned content
+        if was_truncated {
+            tracing::warn!(
+                rounds,
+                "Hallucination guard: response validator truncated hallucinated turns, forcing loop exit"
+            );
+            let text = sanitized_content
+                .iter()
+                .filter_map(|b| match b {
+                    ContentBlock::Text { text } => Some(text.as_str()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+                .join("");
+            return Ok(ToolLoopResult {
+                text,
+                model: final_model,
+                input_tokens: total_input_tokens,
+                output_tokens: total_output_tokens,
+                tool_rounds: rounds,
+                was_truncated: true,
+                circuit_breaker_fired: false,
+            });
+        }
 
         match result.stop_reason {
             StopReason::EndTurn | StopReason::MaxTokens | StopReason::StopSequence => {
@@ -64,18 +100,27 @@ pub async fn invoke_with_tool_loop(
                     input_tokens: total_input_tokens,
                     output_tokens: total_output_tokens,
                     tool_rounds: rounds,
+                    was_truncated: false,
+                    circuit_breaker_fired: false,
                 });
             }
             StopReason::ToolUse => {
                 rounds += 1;
                 if rounds > max_rounds {
-                    tracing::warn!("Tool loop exceeded {} rounds, forcing response", max_rounds);
+                    tracing::warn!(
+                        rounds,
+                        max_rounds,
+                        "Hallucination guard: circuit breaker fired — tool loop exceeded {} rounds",
+                        max_rounds
+                    );
                     return Ok(ToolLoopResult {
                         text: result.text(),
                         model: final_model,
                         input_tokens: total_input_tokens,
                         output_tokens: total_output_tokens,
                         tool_rounds: rounds,
+                        was_truncated: false,
+                        circuit_breaker_fired: true,
                     });
                 }
 
@@ -107,9 +152,21 @@ pub async fn invoke_with_tool_loop(
                 }
 
                 // Add tool results as a user message and loop
+                // Tag each result with its tool_use_id for traceability.
+                // The overall message source uses the first tool_use_id as representative.
+                let first_tool_id = tool_results
+                    .iter()
+                    .find_map(|b| match b {
+                        ContentBlock::ToolResult { tool_use_id, .. } => Some(tool_use_id.clone()),
+                        _ => None,
+                    })
+                    .unwrap_or_default();
                 messages.push(Message {
                     role: Role::User,
                     content: MessageContent::Blocks(tool_results),
+                    source: Some(MessageSource::ToolResult {
+                        tool_use_id: first_tool_id,
+                    }),
                 });
             }
             StopReason::Other(ref reason) => {
@@ -120,6 +177,8 @@ pub async fn invoke_with_tool_loop(
                     input_tokens: total_input_tokens,
                     output_tokens: total_output_tokens,
                     tool_rounds: rounds,
+                    was_truncated: false,
+                    circuit_breaker_fired: false,
                 });
             }
         }

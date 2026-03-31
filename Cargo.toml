@@ -67,10 +67,10 @@ chrono = { version = "0.4", features = ["serde"] }
 libc = "0.2"
 
 # Shared types
-pulse-system-types = "0.5"
+pulse-system-types = { path = "../pulse-system-types" }
 
 # Core dependencies (always included — these define an entity)
-recall-echo = { version = "3.3", features = ["pulse-null"] }
+recall-echo = { path = "../recall-echo", features = ["pulse-null"] }
 vigil-pulse = "0.1"
 
 # Plugins (optional — different interfaces to speak through)

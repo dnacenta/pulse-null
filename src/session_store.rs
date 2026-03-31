@@ -33,6 +33,13 @@ pub struct SessionData {
     /// Timestamp of the last checkpoint (or session creation if no checkpoint yet).
     #[serde(default = "Utc::now")]
     pub last_checkpoint_time: DateTime<Utc>,
+    /// Consecutive LLM invocations without a real human message.
+    /// Reset to 0 when a MessageSource::Human message is added.
+    #[serde(default)]
+    pub rounds_since_human_input: u32,
+    /// Number of times the response validator detected hallucinated turns in this session.
+    #[serde(default)]
+    pub hallucination_count: u32,
 }
 
 impl SessionData {
@@ -66,6 +73,8 @@ impl Session {
                 wal_seq: 0,
                 messages_since_checkpoint: 0,
                 last_checkpoint_time: now,
+                rounds_since_human_input: 0,
+                hallucination_count: 0,
             },
             dirty: false,
         }
@@ -289,10 +298,19 @@ impl SessionStore {
         let sessions = self.sessions.read().await;
         if let Some(session_arc) = sessions.get(key) {
             let mut session = session_arc.write().await;
+            tracing::debug!(
+                "[persist] key={} dirty={} msgs={}",
+                key,
+                session.dirty,
+                session.data.messages.len()
+            );
             if session.dirty {
                 self.persist_session_data(&session.data);
                 session.dirty = false;
+                tracing::debug!("[persist] wrote session to disk: {}", key);
             }
+        } else {
+            tracing::warn!("[persist] session key not found in map: {}", key);
         }
     }
 
@@ -309,15 +327,33 @@ impl SessionStore {
             let path = sessions_dir.join(&filename);
             let tmp_path = sessions_dir.join(format!("{}.tmp", filename));
 
+            tracing::debug!(
+                "[persist_write] key={} file={} msgs={}",
+                data.key,
+                path.display(),
+                data.messages.len()
+            );
+
             match serde_json::to_string_pretty(&data) {
                 Ok(json) => {
                     if let Err(e) = fs::write(&tmp_path, &json) {
-                        tracing::warn!("Failed to write session tmp file: {}", e);
+                        tracing::warn!(
+                            "Failed to write session tmp file {}: {}",
+                            tmp_path.display(),
+                            e
+                        );
                         return;
                     }
                     if let Err(e) = fs::rename(&tmp_path, &path) {
-                        tracing::warn!("Failed to rename session file: {}", e);
+                        tracing::warn!(
+                            "Failed to rename session file {} -> {}: {}",
+                            tmp_path.display(),
+                            path.display(),
+                            e
+                        );
                         let _ = fs::remove_file(&tmp_path);
+                    } else {
+                        tracing::debug!("[persist_write] success: {}", path.display());
                     }
                 }
                 Err(e) => {
@@ -476,4 +512,71 @@ pub struct SessionInfo {
     pub message_count: usize,
     pub created_at: String,
     pub last_active: String,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use pulse_system_types::llm::{MessageContent, MessageSource, Role};
+
+    #[test]
+    fn new_session_has_zero_hallucination_counters() {
+        let session = Session::new("test:user".into(), "test".into(), "user".into());
+        assert_eq!(session.data.rounds_since_human_input, 0);
+        assert_eq!(session.data.hallucination_count, 0);
+    }
+
+    #[test]
+    fn hallucination_counters_track_correctly() {
+        let mut session = Session::new("test:user".into(), "test".into(), "user".into());
+
+        // Simulate human message — counter stays at 0
+        session.data.messages.push(Message {
+            role: Role::User,
+            content: MessageContent::Text("hello".into()),
+            source: Some(MessageSource::Human {
+                channel: "test".into(),
+                sender: "user".into(),
+            }),
+        });
+        session.data.rounds_since_human_input = 0; // reset on human
+
+        // Simulate an LLM invocation round
+        session.data.rounds_since_human_input += 1;
+        assert_eq!(session.data.rounds_since_human_input, 1);
+
+        // Simulate a truncation detection
+        session.data.hallucination_count += 1;
+        assert_eq!(session.data.hallucination_count, 1);
+
+        // Another human message resets rounds counter but NOT hallucination count
+        session.data.rounds_since_human_input = 0;
+        assert_eq!(session.data.rounds_since_human_input, 0);
+        assert_eq!(session.data.hallucination_count, 1); // persists across resets
+    }
+
+    #[test]
+    fn session_data_serializes_with_new_fields() {
+        let session = Session::new("test:user".into(), "test".into(), "user".into());
+        let json = serde_json::to_string(&session.data).unwrap();
+        assert!(json.contains("rounds_since_human_input"));
+        assert!(json.contains("hallucination_count"));
+    }
+
+    #[test]
+    fn session_data_deserializes_without_new_fields() {
+        // Legacy sessions won't have the new fields — they should default to 0
+        let json = r#"{
+            "key": "test:user",
+            "channel": "test",
+            "sender": "user",
+            "messages": [],
+            "created_at": "2026-03-31T00:00:00Z",
+            "last_active": "2026-03-31T00:00:00Z",
+            "message_count": 0
+        }"#;
+        let data: SessionData = serde_json::from_str(json).unwrap();
+        assert_eq!(data.rounds_since_human_input, 0);
+        assert_eq!(data.hallucination_count, 0);
+    }
 }

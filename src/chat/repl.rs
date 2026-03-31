@@ -2,7 +2,7 @@ use std::io::{self, BufRead, Write};
 use std::path::Path;
 
 use pulse_system_types::llm::{
-    ContentBlock, LmProvider, Message, MessageContent, Role, StopReason,
+    ContentBlock, LmProvider, Message, MessageContent, MessageSource, Role, StopReason,
 };
 
 use crate::chat;
@@ -101,6 +101,10 @@ pub async fn run(
         conversation.push(Message {
             role: Role::User,
             content: user_content,
+            source: Some(MessageSource::Human {
+                channel: "repl".into(),
+                sender: "local".into(),
+            }),
         });
 
         // Compact conversation if approaching context budget
@@ -163,6 +167,7 @@ pub async fn run(
             conversation.push(Message {
                 role: Role::Assistant,
                 content: assistant_content,
+                source: Some(MessageSource::Assistant),
             });
 
             match result.stop_reason {
@@ -221,6 +226,17 @@ pub async fn run(
                         }
                     }
 
+                    // Extract first tool ID before moving tool_results
+                    let first_tool_id = tool_results
+                        .iter()
+                        .find_map(|b| match b {
+                            ContentBlock::ToolResult { tool_use_id, .. } => {
+                                Some(tool_use_id.clone())
+                            }
+                            _ => None,
+                        })
+                        .unwrap_or_default();
+
                     // Build tool results content
                     let tool_content = MessageContent::Blocks(tool_results);
 
@@ -233,11 +249,12 @@ pub async fn run(
                             tracing::warn!("REPL WAL append failed for tool results: {}", e);
                         }
                     }
-
-                    // Add tool results and loop
                     conversation.push(Message {
                         role: Role::User,
                         content: tool_content,
+                        source: Some(MessageSource::ToolResult {
+                            tool_use_id: first_tool_id,
+                        }),
                     });
                 }
                 StopReason::Other(ref reason) => {

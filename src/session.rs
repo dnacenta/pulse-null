@@ -659,10 +659,12 @@ mod tests {
             Message {
                 role: Role::User,
                 content: MessageContent::Text("Hello".into()),
+                source: None,
             },
             Message {
                 role: Role::Assistant,
                 content: MessageContent::Text("Hi there".into()),
+                source: None,
             },
         ];
         let md = conversation_to_markdown(&conversation);
@@ -681,6 +683,7 @@ mod tests {
                 name: "file_read".into(),
                 input: serde_json::json!({"path": "SELF.md"}),
             }]),
+            source: None,
         }];
         let md = conversation_to_markdown(&conversation);
         assert!(md.contains("**Tool: file_read**"));
@@ -696,6 +699,7 @@ mod tests {
                 content: "file contents here".into(),
                 is_error: None,
             }]),
+            source: None,
         }];
         let md = conversation_to_markdown(&conversation);
         assert!(md.contains("**Tool Result**"));
@@ -712,6 +716,7 @@ mod tests {
                 content: large_content,
                 is_error: None,
             }]),
+            source: None,
         }];
         let md = conversation_to_markdown(&conversation);
         assert!(md.contains("[truncated, 3000 bytes total]"));
@@ -726,6 +731,7 @@ mod tests {
                 content: "not found".into(),
                 is_error: Some(true),
             }]),
+            source: None,
         }];
         let md = conversation_to_markdown(&conversation);
         assert!(md.contains("[ERROR]"));
@@ -740,6 +746,7 @@ mod tests {
         let conversation = vec![Message {
             role: Role::User,
             content: MessageContent::Text("test".into()),
+            source: None,
         }];
         let meta = ArchiveMeta {
             trigger: "session-end".into(),
@@ -779,6 +786,7 @@ mod tests {
         let conversation = vec![Message {
             role: Role::User,
             content: MessageContent::Text("test".into()),
+            source: None,
         }];
         let meta = ArchiveMeta {
             trigger: "session-end".into(),
