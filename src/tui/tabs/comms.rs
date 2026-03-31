@@ -15,6 +15,7 @@ use pulse_system_types::llm::{Message, MessageContent, MessageSource, Role};
 
 use crate::config::PeerConfig;
 use crate::events::{ConversationTrust, EntityEvent, InteractionSource};
+use crate::interaction::InteractionRecord;
 use crate::peer::{self, PeerClient};
 use crate::streaming::StreamingProvider;
 use crate::tool_loop;
@@ -225,6 +226,9 @@ impl CommsTab {
     // ─── Event Handling ───
 
     /// Archive the comms transcript, write LOGBOOK entry, and trigger graph ingest.
+    ///
+    /// Builds an InteractionRecord from the transcript, then uses it to drive
+    /// archiving and event emission through the unified intake path.
     fn archive_comms_transcript(&self, ctx: &AppContext) {
         let Some(root_dir) = &ctx.root_dir else {
             return;
@@ -242,6 +246,23 @@ impl CommsTab {
             return;
         }
 
+        // Determine trust from peer config
+        let trust = ctx
+            .config
+            .as_ref()
+            .and_then(|c| c.peers.get(&self.peer_name_active))
+            .map(|p| trust_for_peer(&p.host))
+            .unwrap_or(ConversationTrust::Public);
+
+        // Build InteractionRecord — single source of truth for this interaction
+        let interaction = InteractionRecord::from_comms(
+            &messages,
+            &self.entity_name,
+            &self.peer_name_active,
+            trust,
+        );
+
+        // Archive using the existing comms archive path (preserves peer: field in frontmatter)
         match crate::session::archive_comms_conversation(
             root_dir,
             &messages,
@@ -259,42 +280,9 @@ impl CommsTab {
                     Some(archive_path.as_path()),
                 );
 
-                // Emit PostInteraction event
+                // Emit PostInteraction event from the InteractionRecord
                 if let Some(ref event_bus) = ctx.event_bus {
-                    let trust = ctx
-                        .config
-                        .as_ref()
-                        .and_then(|c| c.peers.get(&self.peer_name_active))
-                        .map(|p| trust_for_peer(&p.host))
-                        .unwrap_or(ConversationTrust::Public);
-
-                    // Build summary from first 300 chars of transcript
-                    let summary: String = messages
-                        .iter()
-                        .map(|(entity, text)| format!("{}: {}", entity, text))
-                        .collect::<Vec<_>>()
-                        .join(" | ");
-                    let summary = if summary.len() > crate::utils::SUMMARY_TRUNCATE_LEN {
-                        format!(
-                            "{}...",
-                            crate::utils::safe_truncate(
-                                &summary,
-                                crate::utils::SUMMARY_TRUNCATE_LEN
-                            )
-                        )
-                    } else {
-                        summary
-                    };
-
-                    event_bus.emit(EntityEvent::PostInteraction {
-                        source: InteractionSource::Comms {
-                            peer: self.peer_name_active.clone(),
-                        },
-                        trust,
-                        summary,
-                        input_tokens: 0,
-                        output_tokens: 0,
-                    });
+                    event_bus.emit(interaction.to_event());
                 }
 
                 // Graph ingest if enabled

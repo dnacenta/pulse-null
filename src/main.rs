@@ -11,6 +11,7 @@ mod context_buffer;
 mod discovery;
 mod events;
 mod init;
+mod interaction;
 mod logbook;
 mod ollama_provider;
 mod peer;

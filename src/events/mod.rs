@@ -3,7 +3,7 @@ pub mod listener;
 use tokio::sync::broadcast;
 
 /// Source of an interaction that feeds the identity pipeline.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub enum InteractionSource {
     /// Direct conversation with the owner (chat, voice, discord).
     Chat { channel: String },
@@ -16,7 +16,7 @@ pub enum InteractionSource {
 }
 
 /// Trust level for an interaction — determines what follow-up actions are appropriate.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub enum ConversationTrust {
     /// Conversation with D — full trust, any follow-up is allowed.
     Owner,
