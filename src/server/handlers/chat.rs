@@ -6,7 +6,7 @@ use axum::Json;
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
 
-use crate::events::{ConversationTrust, EntityEvent, InteractionSource};
+use crate::interaction::InteractionRecord;
 use crate::server::trust::TrustLevel;
 use crate::server::{injection, AppState};
 use crate::session_store::SessionStore;
@@ -321,6 +321,17 @@ pub async fn chat(
             .await;
     }
 
+    // Build InteractionRecord from the session before dropping the lock.
+    // This captures the full session state including health metrics.
+    let conversation_trust = trust.to_conversation_trust();
+    let interaction = InteractionRecord::from_session(
+        &session.data,
+        &state.config.entity.name,
+        conversation_trust,
+        result.input_tokens,
+        result.output_tokens,
+    );
+
     // Mark session dirty and persist asynchronously
     session.mark_dirty();
     let persist_key = session_key.clone();
@@ -336,14 +347,8 @@ pub async fn chat(
     persist_store.persist(&persist_key).await;
     tracing::debug!("[chat] persist call returned for key={}", persist_key);
 
-    // Emit PostConversation event
-    emit_post_conversation(
-        &state,
-        &channel,
-        &text,
-        result.input_tokens,
-        result.output_tokens,
-    );
+    // Emit PostInteraction event from the InteractionRecord
+    state.event_bus.emit(interaction.to_event());
 
     Ok(Json(ChatResponse {
         response: text,
@@ -351,35 +356,6 @@ pub async fn chat(
         input_tokens: Some(result.input_tokens),
         output_tokens: Some(result.output_tokens),
     }))
-}
-
-/// Emit a PostInteraction event for chat conversations (fire-and-forget).
-fn emit_post_conversation(
-    state: &Arc<AppState>,
-    channel: &str,
-    response_text: &str,
-    input_tokens: u32,
-    output_tokens: u32,
-) {
-    // Truncate summary for the event (first 300 chars)
-    let summary = if response_text.len() > crate::utils::SUMMARY_TRUNCATE_LEN {
-        format!(
-            "{}...",
-            crate::utils::safe_truncate(response_text, crate::utils::SUMMARY_TRUNCATE_LEN)
-        )
-    } else {
-        response_text.to_string()
-    };
-
-    state.event_bus.emit(EntityEvent::PostInteraction {
-        source: InteractionSource::Chat {
-            channel: channel.to_string(),
-        },
-        trust: ConversationTrust::Owner,
-        summary,
-        input_tokens,
-        output_tokens,
-    });
 }
 
 /// Check if checkpoint conditions are met and create an incremental checkpoint
