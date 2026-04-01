@@ -17,6 +17,7 @@ pub fn default_tasks() -> Vec<ScheduledTask> {
             output_routing: super::OutputRouting::Silent,
             enabled: true,
             created_by: super::TaskCreator::System,
+            evaluator: Some("pipeline".to_string()),
         },
         ScheduledTask {
             id: "research-session".to_string(),
@@ -32,6 +33,7 @@ pub fn default_tasks() -> Vec<ScheduledTask> {
             output_routing: super::OutputRouting::Silent,
             enabled: true,
             created_by: super::TaskCreator::System,
+            evaluator: None,
         },
         ScheduledTask {
             id: "reflection-window".to_string(),
@@ -48,6 +50,7 @@ pub fn default_tasks() -> Vec<ScheduledTask> {
             output_routing: super::OutputRouting::Silent,
             enabled: true,
             created_by: super::TaskCreator::System,
+            evaluator: Some("pipeline".to_string()),
         },
         ScheduledTask {
             id: "health-check".to_string(),
@@ -63,6 +66,7 @@ pub fn default_tasks() -> Vec<ScheduledTask> {
             output_routing: super::OutputRouting::Silent,
             enabled: true,
             created_by: super::TaskCreator::System,
+            evaluator: None,
         },
         ScheduledTask {
             id: "night-reflection".to_string(),
@@ -78,6 +82,7 @@ pub fn default_tasks() -> Vec<ScheduledTask> {
             output_routing: super::OutputRouting::Silent,
             enabled: true,
             created_by: super::TaskCreator::System,
+            evaluator: Some("pipeline".to_string()),
         },
         ScheduledTask {
             id: "weekly-synthesis".to_string(),
@@ -96,6 +101,7 @@ pub fn default_tasks() -> Vec<ScheduledTask> {
             output_routing: super::OutputRouting::Silent,
             enabled: true,
             created_by: super::TaskCreator::System,
+            evaluator: Some("pipeline".to_string()),
         },
     ]
 }

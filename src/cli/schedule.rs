@@ -82,6 +82,7 @@ pub async fn add(
         output_routing: OutputRouting::Silent,
         enabled: true,
         created_by: TaskCreator::User,
+        evaluator: None,
     };
 
     schedule.add_task(task);

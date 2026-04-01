@@ -52,6 +52,7 @@ pub fn create_task_from_marker(
         output_routing,
         enabled: true,
         created_by: TaskCreator::Entity,
+        evaluator: None,
     })
 }
 
