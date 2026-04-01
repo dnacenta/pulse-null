@@ -361,7 +361,35 @@ async fn execute_task(
         },
     );
 
+    // Log health warnings if any
+    let health_warnings = interaction.health_warnings();
+    if !health_warnings.is_empty() {
+        tracing::warn!(
+            "Task '{}' interaction had health issues: {}",
+            task.id,
+            health_warnings.join(", ")
+        );
+    }
+
+    // Audit: interaction created
+    crate::intake_audit::log(
+        &root_dir,
+        &crate::intake_audit::entry(
+            &interaction.id,
+            &interaction.source_label(),
+            interaction.trust_label(),
+            crate::intake_audit::AuditStage::Created,
+            if health_warnings.is_empty() {
+                None
+            } else {
+                Some(format!("health: {}", health_warnings.join(", ")))
+            },
+        ),
+    );
+
     // Archive the task conversation (closes the "task output not captured" gap)
+    // Only emit PostInteraction if archive succeeds — no point triggering
+    // self-assessment on a conversation that wasn't persisted.
     if let Some(archive_path) = interaction.archive(&root_dir) {
         tracing::info!(
             "Task '{}' conversation archived to {}",
@@ -369,15 +397,61 @@ async fn execute_task(
             archive_path.display()
         );
 
+        // Audit: archive succeeded
+        crate::intake_audit::log(
+            &root_dir,
+            &crate::intake_audit::entry(
+                &interaction.id,
+                &interaction.source_label(),
+                interaction.trust_label(),
+                crate::intake_audit::AuditStage::Archived,
+                Some(archive_path.display().to_string()),
+            ),
+        );
+
         // Graph auto-ingest if enabled
         #[cfg(feature = "graph")]
         if state.config.graph.enabled && state.config.graph.auto_ingest {
             crate::session::graph_ingest_archive(&root_dir, &archive_path, None).await;
         }
-    }
 
-    // Emit PostInteraction event
-    state.event_bus.emit(interaction.to_event());
+        // Emit PostInteraction event — archive verified
+        let receivers = state.event_bus.emit(interaction.to_event());
+        tracing::debug!(
+            "Task '{}' PostInteraction emitted to {} receivers",
+            task.id,
+            receivers
+        );
+
+        // Audit: event emitted
+        crate::intake_audit::log(
+            &root_dir,
+            &crate::intake_audit::entry(
+                &interaction.id,
+                &interaction.source_label(),
+                interaction.trust_label(),
+                crate::intake_audit::AuditStage::EventEmitted,
+                Some(format!("{} receivers", receivers)),
+            ),
+        );
+    } else {
+        tracing::warn!(
+            "Task '{}' archive returned None (empty messages?) — PostInteraction NOT emitted",
+            task.id
+        );
+
+        // Audit: archive failed
+        crate::intake_audit::log(
+            &root_dir,
+            &crate::intake_audit::entry(
+                &interaction.id,
+                &interaction.source_label(),
+                interaction.trust_label(),
+                crate::intake_audit::AuditStage::ArchiveFailed,
+                Some("empty messages".to_string()),
+            ),
+        );
+    }
 
     // Record outcome for caliber-echo
     if let Some(ref tracker) = state.outcome_tracker {
@@ -427,10 +501,19 @@ async fn execute_task(
         let new_counts = monitor.counts_from_health(&health);
 
         let mut pipeline_state = monitor.load_state(&root_dir);
+        let old_counts = pipeline_state.last_counts.clone();
         pipeline_state.update_counts(&new_counts, &Utc::now().to_rfc3339());
         if let Err(e) = monitor.save_state(&root_dir, &pipeline_state) {
             tracing::error!("Failed to save pipeline state: {}", e);
         }
+
+        // Pipeline change journal — log what changed
+        crate::session::log_pipeline_change(
+            &root_dir,
+            &old_counts,
+            &new_counts,
+            &format!("task:{}", task.name),
+        );
 
         // Emit PipelineAlert for any document at hard limit
         let docs = [
@@ -465,10 +548,11 @@ async fn execute_task(
         // Pipeline conversion check: conversations vs pipeline updates over 7 days
         if pipeline_state.sessions_without_movement >= 3 {
             let conversations_7d = crate::session::count_recent_conversations(&root_dir, 7);
-            if conversations_7d >= 3 {
+            let pipeline_updates_7d = crate::session::count_pipeline_updates(&root_dir, 7);
+            if conversations_7d >= 3 && pipeline_updates_7d < 2 {
                 state.event_bus.emit(EntityEvent::PipelineConversionLow {
                     conversations_7d,
-                    pipeline_updates_7d: 0,
+                    pipeline_updates_7d,
                 });
             }
         }

@@ -76,10 +76,19 @@ pub async fn event_listener(
                         entry.0 = Utc::now();
                         entry.1 += 1;
                     } else {
-                        tracing::debug!(
-                            "Event intent not queued (full or duplicate): '{}'",
-                            intent.description
-                        );
+                        // PostInteraction rejections are more significant — a real
+                        // conversation's self-assessment didn't queue.
+                        if is_post_conversation {
+                            tracing::warn!(
+                                "PostInteraction intent rejected (queue full or duplicate): '{}'",
+                                intent.description
+                            );
+                        } else {
+                            tracing::debug!(
+                                "Event intent not queued (full or duplicate): '{}'",
+                                intent.description
+                            );
+                        }
                     }
                 }
             }
