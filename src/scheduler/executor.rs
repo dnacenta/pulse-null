@@ -33,6 +33,8 @@ pub struct ExecutionResult {
     pub circuit_breaker_fired: bool,
     /// Number of action claims with no matching tool use (Phase 3).
     pub action_claim_count: u32,
+    /// True if tool degraded state was triggered (Layer 4).
+    pub tool_degraded: bool,
     /// Full message transcript from the tool loop (user + assistant + tool rounds).
     pub messages: Vec<Message>,
 }
@@ -49,6 +51,7 @@ impl ExecutionResult {
             was_truncated: r.was_truncated,
             circuit_breaker_fired: r.circuit_breaker_fired,
             action_claim_count: r.action_claim_warnings.len() as u32,
+            tool_degraded: r.tool_degraded,
             messages,
         }
     }
