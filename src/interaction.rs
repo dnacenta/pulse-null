@@ -290,6 +290,42 @@ impl InteractionRecord {
         let has_messages = self.messages.len() >= 2;
         has_content || has_messages
     }
+
+    /// Check if this interaction exhibited health issues.
+    /// Returns a list of warnings (empty = healthy).
+    pub fn health_warnings(&self) -> Vec<String> {
+        let mut warnings = Vec::new();
+
+        if self.metadata.hallucination_count > 0 {
+            warnings.push(format!(
+                "{} hallucinated turn(s) detected",
+                self.metadata.hallucination_count
+            ));
+        }
+
+        if self.metadata.action_claim_count > 0 {
+            warnings.push(format!(
+                "{} unmatched action claim(s)",
+                self.metadata.action_claim_count
+            ));
+        }
+
+        if self.metadata.circuit_breaker_fires > 0 {
+            warnings.push(format!(
+                "{} circuit breaker fire(s)",
+                self.metadata.circuit_breaker_fires
+            ));
+        }
+
+        warnings
+    }
+
+    /// Whether this interaction had any health issues.
+    pub fn is_healthy(&self) -> bool {
+        self.metadata.hallucination_count == 0
+            && self.metadata.action_claim_count == 0
+            && self.metadata.circuit_breaker_fires == 0
+    }
 }
 
 /// Extract a summary from the last assistant message in a conversation.
@@ -616,5 +652,51 @@ mod tests {
     fn summarize_empty_returns_empty() {
         let summary = summarize_messages(&[]);
         assert!(summary.is_empty());
+    }
+
+    #[test]
+    fn health_warnings_empty_when_healthy() {
+        let record = InteractionRecord {
+            id: "test".into(),
+            source: InteractionSource::Chat {
+                channel: "test".into(),
+            },
+            trust: ConversationTrust::Owner,
+            started_at: Utc::now(),
+            ended_at: None,
+            entity_name: "Echo".into(),
+            summary: String::new(),
+            messages: vec![],
+            metadata: InteractionMetadata::default(),
+        };
+        assert!(record.health_warnings().is_empty());
+        assert!(record.is_healthy());
+    }
+
+    #[test]
+    fn health_warnings_reports_issues() {
+        let record = InteractionRecord {
+            id: "test".into(),
+            source: InteractionSource::Chat {
+                channel: "test".into(),
+            },
+            trust: ConversationTrust::Owner,
+            started_at: Utc::now(),
+            ended_at: None,
+            entity_name: "Echo".into(),
+            summary: String::new(),
+            messages: vec![],
+            metadata: InteractionMetadata {
+                hallucination_count: 2,
+                action_claim_count: 1,
+                circuit_breaker_fires: 0,
+                ..Default::default()
+            },
+        };
+        let warnings = record.health_warnings();
+        assert_eq!(warnings.len(), 2);
+        assert!(warnings[0].contains("hallucinated"));
+        assert!(warnings[1].contains("action claim"));
+        assert!(!record.is_healthy());
     }
 }

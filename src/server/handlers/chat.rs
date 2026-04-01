@@ -351,7 +351,45 @@ pub async fn chat(
     tracing::debug!("[chat] persist call returned for key={}", persist_key);
 
     // Emit PostInteraction event from the InteractionRecord
-    state.event_bus.emit(interaction.to_event());
+    // Chat sessions are persisted separately (session store), so we emit
+    // on every request for real-time assessment. Only assessable interactions
+    // are worth emitting — trivial health-checks get skipped.
+    if interaction.is_assessable() {
+        let receivers = state.event_bus.emit(interaction.to_event());
+        tracing::debug!(
+            "[chat] PostInteraction emitted to {} receivers (source={})",
+            receivers,
+            interaction.source_label()
+        );
+
+        // Audit: event emitted for chat interaction
+        if let Ok(root_dir) = state.config.root_dir() {
+            crate::intake_audit::log(
+                &root_dir,
+                &crate::intake_audit::entry(
+                    &interaction.id,
+                    &interaction.source_label(),
+                    interaction.trust_label(),
+                    crate::intake_audit::AuditStage::EventEmitted,
+                    Some(format!("{} receivers", receivers)),
+                ),
+            );
+        }
+    } else {
+        // Audit: event skipped (not assessable)
+        if let Ok(root_dir) = state.config.root_dir() {
+            crate::intake_audit::log(
+                &root_dir,
+                &crate::intake_audit::entry(
+                    &interaction.id,
+                    &interaction.source_label(),
+                    interaction.trust_label(),
+                    crate::intake_audit::AuditStage::EventSkipped,
+                    Some("not assessable".to_string()),
+                ),
+            );
+        }
+    }
 
     Ok(Json(ChatResponse {
         response: text,

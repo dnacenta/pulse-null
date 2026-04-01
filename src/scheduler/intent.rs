@@ -653,7 +653,35 @@ async fn execute_intent(
             ),
         };
 
+        // Log health warnings if any
+        let health_warnings = interaction.health_warnings();
+        if !health_warnings.is_empty() {
+            tracing::warn!(
+                "Intent '{}' interaction had health issues: {}",
+                intent.id,
+                health_warnings.join(", ")
+            );
+        }
+
+        // Audit: interaction created
+        crate::intake_audit::log(
+            &root_dir,
+            &crate::intake_audit::entry(
+                &interaction.id,
+                &interaction.source_label(),
+                interaction.trust_label(),
+                crate::intake_audit::AuditStage::Created,
+                if health_warnings.is_empty() {
+                    None
+                } else {
+                    Some(format!("health: {}", health_warnings.join(", ")))
+                },
+            ),
+        );
+
         // Archive the intent conversation
+        // Only emit PostInteraction if archive succeeds — no point triggering
+        // self-assessment on a conversation that wasn't persisted.
         if let Some(archive_path) = interaction.archive(&root_dir) {
             tracing::info!(
                 "Intent '{}' conversation archived to {}",
@@ -661,15 +689,73 @@ async fn execute_intent(
                 archive_path.display()
             );
 
+            // Audit: archive succeeded
+            crate::intake_audit::log(
+                &root_dir,
+                &crate::intake_audit::entry(
+                    &interaction.id,
+                    &interaction.source_label(),
+                    interaction.trust_label(),
+                    crate::intake_audit::AuditStage::Archived,
+                    Some(archive_path.display().to_string()),
+                ),
+            );
+
             // Graph auto-ingest if enabled
             #[cfg(feature = "graph")]
             if state.config.graph.enabled && state.config.graph.auto_ingest {
                 crate::session::graph_ingest_archive(&root_dir, &archive_path, None).await;
             }
-        }
 
-        // Emit PostInteraction event
-        state.event_bus.emit(interaction.to_event());
+            // Emit PostInteraction event — archive verified
+            let receivers = state.event_bus.emit(interaction.to_event());
+            tracing::debug!(
+                "Intent '{}' PostInteraction emitted to {} receivers",
+                intent.id,
+                receivers
+            );
+
+            // Audit: event emitted
+            crate::intake_audit::log(
+                &root_dir,
+                &crate::intake_audit::entry(
+                    &interaction.id,
+                    &interaction.source_label(),
+                    interaction.trust_label(),
+                    crate::intake_audit::AuditStage::EventEmitted,
+                    Some(format!("{} receivers", receivers)),
+                ),
+            );
+        } else {
+            tracing::warn!(
+                "Intent '{}' archive returned None (empty messages?) — PostInteraction NOT emitted",
+                intent.id
+            );
+
+            // Audit: archive failed
+            crate::intake_audit::log(
+                &root_dir,
+                &crate::intake_audit::entry(
+                    &interaction.id,
+                    &interaction.source_label(),
+                    interaction.trust_label(),
+                    crate::intake_audit::AuditStage::ArchiveFailed,
+                    Some("empty messages".to_string()),
+                ),
+            );
+        }
+    } else {
+        // Event-sourced intent — suppressed to prevent feedback loops.
+        // Log for visibility so suppressed intents are trackable.
+        let event_source = match &intent.source {
+            IntentSource::Event(name) => name.clone(),
+            _ => "unknown".to_string(),
+        };
+        tracing::debug!(
+            "Intent '{}' PostInteraction suppressed (event-sourced: {}) — prevents feedback loop",
+            intent.id,
+            event_source
+        );
     }
 
     // Record outcome for caliber-echo
@@ -717,10 +803,19 @@ async fn execute_intent(
         let health = monitor.calculate(&root_dir, &thresholds);
         let new_counts = monitor.counts_from_health(&health);
         let mut pipeline_state = monitor.load_state(&root_dir);
+        let old_counts = pipeline_state.last_counts.clone();
         pipeline_state.update_counts(&new_counts, &chrono::Utc::now().to_rfc3339());
         if let Err(e) = monitor.save_state(&root_dir, &pipeline_state) {
             tracing::error!("Failed to save pipeline state: {}", e);
         }
+
+        // Pipeline change journal — log what changed
+        crate::session::log_pipeline_change(
+            &root_dir,
+            &old_counts,
+            &new_counts,
+            &format!("intent:{}", intent.description),
+        );
 
         // Emit PipelineAlert for documents at hard limit
         let docs = [
