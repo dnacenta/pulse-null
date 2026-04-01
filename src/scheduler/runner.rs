@@ -112,7 +112,51 @@ pub async fn run_task_loop(
         }
 
         tracing::info!("Executing scheduled task: {}", task.name);
+
+        // Check for built-in deterministic handlers first
+        if run_builtin_handler(&task, &state, &root_dir).await {
+            continue;
+        }
+
         execute_task(&task, &state, &schedule, &intent_queue, &mut eval_state).await;
+    }
+}
+
+/// Run a built-in deterministic handler if one exists for this task.
+///
+/// Returns true if the task was handled (no LLM call needed).
+/// Returns false if the task should proceed through the normal LLM path.
+async fn run_builtin_handler(
+    task: &ScheduledTask,
+    state: &Arc<AppState>,
+    root_dir: &std::path::Path,
+) -> bool {
+    match task.id.as_str() {
+        "trajectory-mining" => {
+            tracing::info!("Running built-in trajectory mining handler");
+            let docs_dir = resolve_docs_dir(root_dir);
+            let summary = crate::caliber::runtime::mine_and_update(&docs_dir);
+            tracing::info!("Trajectory mining complete: {}", summary);
+
+            // Record outcome for caliber-echo itself
+            if let Some(ref tracker) = state.outcome_tracker {
+                let outcome = tracker.build_outcome(
+                    &task.id, &task.name, &summary, 0, // no tool rounds — deterministic
+                    0, 0,
+                );
+                if let Err(e) =
+                    tracker.record_outcome(root_dir, outcome, state.config.pulse.max_outcomes)
+                {
+                    tracing::error!("Failed to record trajectory-mining outcome: {}", e);
+                }
+            }
+
+            // Log to LOGBOOK
+            log_execution(root_dir, task, &summary);
+
+            true
+        }
+        _ => false,
     }
 }
 

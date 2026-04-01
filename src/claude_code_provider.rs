@@ -186,12 +186,17 @@ fn parse_response(
         return Err("claude -p returned empty result".into());
     }
 
+    // Extract token usage from Claude Code JSON response.
+    // Claude Code returns: { "usage": { "input_tokens": N, "output_tokens": N, ... }, ... }
+    let input_tokens = parsed["usage"]["input_tokens"].as_u64().map(|v| v as u32);
+    let output_tokens = parsed["usage"]["output_tokens"].as_u64().map(|v| v as u32);
+
     Ok(LlmResponse {
         content: vec![ContentBlock::Text { text }],
         stop_reason: StopReason::EndTurn,
         model: model.to_string(),
-        input_tokens: None,
-        output_tokens: None,
+        input_tokens,
+        output_tokens,
     })
 }
 
@@ -298,6 +303,23 @@ mod tests {
         );
         assert!(!result.contains("Trust:"));
         assert!(!result.contains("Channel:"));
+    }
+
+    #[test]
+    fn parse_response_extracts_tokens() {
+        let json = r#"{"result": "Hello!", "session_id": "abc", "usage": {"input_tokens": 150, "output_tokens": 42, "cache_read_input_tokens": 0}}"#;
+        let resp = parse_response(json, "opus").unwrap();
+        assert_eq!(resp.text(), "Hello!");
+        assert_eq!(resp.input_tokens, Some(150));
+        assert_eq!(resp.output_tokens, Some(42));
+    }
+
+    #[test]
+    fn parse_response_missing_usage_returns_none() {
+        let json = r#"{"result": "Hello!", "session_id": "abc"}"#;
+        let resp = parse_response(json, "opus").unwrap();
+        assert!(resp.input_tokens.is_none());
+        assert!(resp.output_tokens.is_none());
     }
 
     #[test]

@@ -9,7 +9,7 @@ use chrono::Utc;
 
 use super::outcome::{
     build_task_prediction, infer_domain, infer_outcome, infer_task_type, infer_valence, Outcome,
-    OutcomeRecord,
+    OutcomeRecord, Valence,
 };
 use super::state::CaliberState;
 
@@ -129,6 +129,31 @@ pub fn render(docs_dir: &Path) -> String {
         lines.push(format!("Success rate: {:.0}%", rate));
     }
 
+    // Prediction accuracy rate
+    let predictions_with_outcomes: Vec<_> = state
+        .outcomes
+        .iter()
+        .filter(|o| o.prediction.is_some() && o.valence.is_some())
+        .collect();
+    if !predictions_with_outcomes.is_empty() {
+        let prediction_errors = predictions_with_outcomes
+            .iter()
+            .filter(|o| {
+                matches!(o.outcome, Outcome::Failed | Outcome::Surprising)
+                    || matches!(o.valence, Some(Valence::Negative | Valence::Surprising))
+            })
+            .count();
+        let accuracy = ((predictions_with_outcomes.len() - prediction_errors) as f64
+            / predictions_with_outcomes.len() as f64)
+            * 100.0;
+        lines.push(format!(
+            "Prediction accuracy: {:.0}% ({}/{} matched expectations)",
+            accuracy,
+            predictions_with_outcomes.len() - prediction_errors,
+            predictions_with_outcomes.len()
+        ));
+    }
+
     let domain_counts = state.domain_counts();
     if !domain_counts.is_empty() {
         lines.push(String::new());
@@ -152,6 +177,58 @@ pub fn render(docs_dir: &Path) -> String {
                 "  {}: {} tasks ({:.0}% success)",
                 domain, count, domain_rate
             ));
+        }
+    }
+
+    // Today's trajectory summary
+    let today = chrono::Utc::now().date_naive();
+    let today_outcomes: Vec<_> = state
+        .outcomes
+        .iter()
+        .filter(|o| o.timestamp.date_naive() == today)
+        .collect();
+    if !today_outcomes.is_empty() {
+        lines.push(String::new());
+        lines.push(format!("Today ({}):", today));
+        let today_success = today_outcomes
+            .iter()
+            .filter(|o| o.outcome == Outcome::Success)
+            .count();
+        lines.push(format!(
+            "  {}/{} successful",
+            today_success,
+            today_outcomes.len()
+        ));
+    }
+
+    // Recent prediction errors
+    let recent_pred_errors: Vec<_> = state
+        .outcomes
+        .iter()
+        .rev()
+        .filter(|o| {
+            o.prediction.is_some() && matches!(o.outcome, Outcome::Failed | Outcome::Surprising)
+        })
+        .take(3)
+        .collect();
+    if !recent_pred_errors.is_empty() {
+        lines.push(String::new());
+        lines.push("Recent prediction errors:".to_string());
+        for pe in &recent_pred_errors {
+            if let Some(ref pred) = pe.prediction {
+                // Truncate long predictions
+                let short_pred = if pred.len() > 60 {
+                    format!("{}...", &pred[..57])
+                } else {
+                    pred.clone()
+                };
+                lines.push(format!(
+                    "  [{}] \"{}\" → actual: {}",
+                    pe.timestamp.format("%m-%d"),
+                    short_pred,
+                    pe.outcome,
+                ));
+            }
         }
     }
 
@@ -197,6 +274,49 @@ pub fn render(docs_dir: &Path) -> String {
     lines.join("\n")
 }
 
+/// Run trajectory mining for today and update CALIBER.md.
+///
+/// This is the main entry point for the scheduled trajectory-mining task.
+/// It's pure computation — no LLM calls. Returns a human-readable summary.
+pub fn mine_and_update(docs_dir: &Path) -> String {
+    let today = chrono::Utc::now().date_naive();
+    let report = super::trajectory::mine_trajectories(docs_dir, today);
+
+    if report.total_outcomes == 0 {
+        return format!(
+            "Trajectory mining for {}: no outcomes recorded today.",
+            today
+        );
+    }
+
+    let summary = super::trajectory::render_trajectory(&report);
+
+    match super::document::update_caliber_md(docs_dir, &report) {
+        Ok(true) => {
+            tracing::info!(
+                "Trajectory mining: CALIBER.md updated with {} outcomes across {} domains",
+                report.total_outcomes,
+                report.domain_reports.len()
+            );
+            format!("{}\n\nCALIBER.md updated successfully.", summary)
+        }
+        Ok(false) => {
+            tracing::info!(
+                "Trajectory mining: {} outcomes analyzed, no score changes needed",
+                report.total_outcomes
+            );
+            format!(
+                "{}\n\nNo score changes needed (insufficient samples or insignificant deltas).",
+                summary
+            )
+        }
+        Err(e) => {
+            tracing::error!("Trajectory mining: failed to update CALIBER.md: {}", e);
+            format!("{}\n\nERROR: Failed to update CALIBER.md: {}", summary, e)
+        }
+    }
+}
+
 /// Render a brief outcome line for logging purposes.
 pub fn render_outcome_line(outcome: &OutcomeRecord) -> String {
     let valence_tag = outcome
@@ -214,6 +334,136 @@ pub fn render_outcome_line(outcome: &OutcomeRecord) -> String {
         outcome.tool_rounds,
         valence_tag,
     )
+}
+
+/// Render a concise caliber summary for system prompt injection (~50 lines max).
+///
+/// Combines CALIBER.md capability map with outcome statistics to give the
+/// entity self-knowledge about its operational strengths and weaknesses.
+/// This is the Phase 5 prompt injection entry point.
+pub fn render_for_prompt(docs_dir: &Path) -> Option<String> {
+    let mut lines = Vec::new();
+
+    // Read CALIBER.md capability map
+    let caliber_path = super::caliber_md(docs_dir);
+    if let Ok(content) = std::fs::read_to_string(&caliber_path) {
+        let doc = super::document::parse_caliber_md(&content);
+
+        if !doc.capabilities.is_empty() {
+            lines.push("Capability scores (domain: confidence, samples):".to_string());
+            for cap in &doc.capabilities {
+                lines.push(format!(
+                    "  {}: {:.2} ({} samples, last: {})",
+                    cap.domain, cap.confidence, cap.sample_count, cap.last_calibrated
+                ));
+            }
+            lines.push(String::new());
+        }
+
+        // Extract known limitations (compact form)
+        if doc.middle_sections.contains("Known Limitations") {
+            let limitations: Vec<&str> = doc
+                .middle_sections
+                .lines()
+                .filter(|l| l.trim_start().starts_with("- **"))
+                .take(5)
+                .collect();
+            if !limitations.is_empty() {
+                lines.push("Known limitations:".to_string());
+                for lim in &limitations {
+                    // Strip markdown bold markers for cleaner prompt
+                    let clean = lim.replace("**", "");
+                    lines.push(format!("  {}", clean.trim()));
+                }
+                lines.push(String::new());
+            }
+        }
+
+        // Recent calibration errors (last 3)
+        if !doc.calibration_records.is_empty() {
+            let recent: Vec<_> = doc.calibration_records.iter().rev().take(3).collect();
+            lines.push("Recent prediction errors:".to_string());
+            for row in recent.iter().rev() {
+                // Parse table row: | Date | Prediction | Actual | Error |
+                let cells: Vec<&str> = row.split('|').collect();
+                if cells.len() >= 5 {
+                    lines.push(format!(
+                        "  [{}] {} → {} ({})",
+                        cells[1].trim(),
+                        cells[2].trim(),
+                        cells[3].trim(),
+                        cells[4].trim()
+                    ));
+                }
+            }
+            lines.push(String::new());
+        }
+    }
+
+    // Add outcome statistics
+    let state = CaliberState::load(docs_dir);
+    if !state.outcomes.is_empty() {
+        let total = state.outcomes.len();
+        let (success, partial, failed, surprising) = state.outcome_counts();
+        let success_rate = (success as f64 / total as f64) * 100.0;
+        lines.push(format!(
+            "Outcome history ({} records): {:.0}% success, {} partial, {} failed, {} surprising",
+            total, success_rate, partial, failed, surprising
+        ));
+
+        // Prediction accuracy
+        let with_predictions: Vec<_> = state
+            .outcomes
+            .iter()
+            .filter(|o| o.prediction.is_some() && o.valence.is_some())
+            .collect();
+        if !with_predictions.is_empty() {
+            let errors = with_predictions
+                .iter()
+                .filter(|o| {
+                    matches!(o.outcome, Outcome::Failed | Outcome::Surprising)
+                        || matches!(o.valence, Some(Valence::Negative | Valence::Surprising))
+                })
+                .count();
+            let accuracy =
+                ((with_predictions.len() - errors) as f64 / with_predictions.len() as f64) * 100.0;
+            lines.push(format!("Prediction accuracy: {:.0}%", accuracy));
+        }
+
+        // Today's summary
+        let today = chrono::Utc::now().date_naive();
+        let today_outcomes: Vec<_> = state
+            .outcomes
+            .iter()
+            .filter(|o| o.timestamp.date_naive() == today)
+            .collect();
+        if !today_outcomes.is_empty() {
+            let today_success = today_outcomes
+                .iter()
+                .filter(|o| o.outcome == Outcome::Success)
+                .count();
+            lines.push(format!(
+                "Today: {}/{} successful",
+                today_success,
+                today_outcomes.len()
+            ));
+        }
+
+        // Valence distribution
+        let (pos, neg, neu, sur) = state.valence_counts();
+        if pos + neg + neu + sur > 0 {
+            lines.push(format!(
+                "Valence: {} positive, {} negative, {} neutral, {} surprising",
+                pos, neg, neu, sur
+            ));
+        }
+    }
+
+    if lines.is_empty() {
+        None
+    } else {
+        Some(lines.join("\n"))
+    }
 }
 
 /// Get recent outcomes for a specific domain.
@@ -471,6 +721,98 @@ mod tests {
         let rate = domain_success_rate(dir.path(), domain);
         assert!(rate.is_some());
         assert!((rate.unwrap() - 0.5).abs() < 0.01);
+    }
+
+    #[test]
+    fn render_for_prompt_empty_returns_none() {
+        let dir = TempDir::new().unwrap();
+        assert!(render_for_prompt(dir.path()).is_none());
+    }
+
+    #[test]
+    fn render_for_prompt_with_caliber_md() {
+        let dir = TempDir::new().unwrap();
+        // Write a minimal CALIBER.md
+        std::fs::write(
+            dir.path().join("CALIBER.md"),
+            r#"# Caliber
+
+## Capability Map
+
+| Domain | Confidence | Evidence | Sample | Last Calibrated |
+|---|---|---|---|---|
+| Research | 0.85 | Good at finding connections | 10 | 2026-04-01 |
+| Rust coding | 0.70 | Can implement features | 8 | 2026-04-01 |
+
+## Known Limitations
+
+- **Silent failure blindness**: Doesn't notice when things break quietly
+- **Verbosity drift**: Tends to over-explain
+
+## Calibration Record
+
+| Date | Prediction | Actual | Error |
+|---|---|---|---|
+| 2026-03-15 | Will succeed | Failed | Overconfident |
+"#,
+        )
+        .unwrap();
+
+        let result = render_for_prompt(dir.path());
+        assert!(result.is_some());
+        let text = result.unwrap();
+        assert!(text.contains("Research: 0.85"));
+        assert!(text.contains("Rust coding: 0.70"));
+        assert!(text.contains("Silent failure blindness"));
+        assert!(text.contains("Overconfident"));
+    }
+
+    #[test]
+    fn render_for_prompt_with_outcomes() {
+        let dir = TempDir::new().unwrap();
+        // Add some outcomes
+        record_outcome(
+            dir.path(),
+            build_outcome("r1", "Research", "Good output.", 2, 300, 100),
+            200,
+        )
+        .unwrap();
+        record_outcome(
+            dir.path(),
+            build_outcome("r2", "Reflection", "Deep thought here.", 1, 200, 100),
+            200,
+        )
+        .unwrap();
+
+        let result = render_for_prompt(dir.path());
+        assert!(result.is_some());
+        let text = result.unwrap();
+        assert!(text.contains("2 records"));
+        assert!(text.contains("100% success"));
+    }
+
+    #[test]
+    fn render_for_prompt_combined() {
+        let dir = TempDir::new().unwrap();
+        // CALIBER.md + outcomes
+        std::fs::write(
+            dir.path().join("CALIBER.md"),
+            "# Caliber\n\n## Capability Map\n\n| Domain | Confidence | Evidence | Sample | Last Calibrated |\n|---|---|---|---|---|\n| Testing | 0.90 | Tests pass | 5 | 2026-04-01 |\n",
+        )
+        .unwrap();
+        record_outcome(
+            dir.path(),
+            build_outcome("t1", "Test", "Test output is good enough.", 1, 100, 50),
+            200,
+        )
+        .unwrap();
+
+        let result = render_for_prompt(dir.path());
+        assert!(result.is_some());
+        let text = result.unwrap();
+        // Should have both capability scores and outcome stats
+        assert!(text.contains("Testing: 0.90"));
+        assert!(text.contains("1 records"));
     }
 
     #[test]
