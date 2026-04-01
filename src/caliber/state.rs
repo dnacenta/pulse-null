@@ -69,6 +69,24 @@ impl CaliberState {
         }
         (success, partial, failed, surprising)
     }
+
+    /// Count outcomes by valence (positive, negative, neutral, surprising).
+    pub fn valence_counts(&self) -> (usize, usize, usize, usize) {
+        let mut positive = 0;
+        let mut negative = 0;
+        let mut neutral = 0;
+        let mut surprising = 0;
+        for o in &self.outcomes {
+            match &o.valence {
+                Some(super::outcome::Valence::Positive) => positive += 1,
+                Some(super::outcome::Valence::Negative) => negative += 1,
+                Some(super::outcome::Valence::Neutral) => neutral += 1,
+                Some(super::outcome::Valence::Surprising) => surprising += 1,
+                None => {} // legacy records without valence
+            }
+        }
+        (positive, negative, neutral, surprising)
+    }
 }
 
 #[cfg(test)]
@@ -88,6 +106,8 @@ mod tests {
             outcome,
             tokens_used: 100,
             tool_rounds: 2,
+            prediction: None,
+            valence: None,
         }
     }
 

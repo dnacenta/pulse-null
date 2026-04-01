@@ -1,6 +1,6 @@
 [package]
 name = "pulse-null"
-version = "0.23.4"
+version = "0.24.0"
 edition = "2021"
 rust-version = "1.80"
 license = "AGPL-3.0-only"
@@ -70,7 +70,7 @@ chrono = { version = "0.4", features = ["serde"] }
 libc = "0.2"
 
 # Shared types
-pulse-system-types = "0.6.2"
+pulse-system-types = "0.6.3"
 
 # Core dependencies (always included — these define an entity)
 recall-echo = { version = "3.4", features = ["pulse-null"] }

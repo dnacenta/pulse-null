@@ -22,6 +22,37 @@ pub struct OutcomeRecord {
     pub tokens_used: u32,
     /// Number of tool rounds used
     pub tool_rounds: u32,
+    /// Self-prediction before execution ("I predict this session will...")
+    #[serde(default)]
+    pub prediction: Option<String>,
+    /// Affective valence tag after execution
+    #[serde(default)]
+    pub valence: Option<Valence>,
+}
+
+/// Affective valence — how the execution felt relative to expectations.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum Valence {
+    /// Went well, as expected or better
+    Positive,
+    /// Went poorly, below expectations
+    Negative,
+    /// Standard execution, nothing notable
+    Neutral,
+    /// Unexpected result (positive or negative)
+    Surprising,
+}
+
+impl std::fmt::Display for Valence {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Valence::Positive => write!(f, "positive"),
+            Valence::Negative => write!(f, "negative"),
+            Valence::Neutral => write!(f, "neutral"),
+            Valence::Surprising => write!(f, "surprising"),
+        }
+    }
 }
 
 /// Classification of the task type.
@@ -107,6 +138,77 @@ pub fn infer_outcome(response_text: &str, tool_rounds: u32) -> Outcome {
         return Outcome::Partial;
     }
     Outcome::Success
+}
+
+/// Infer valence from outcome and execution metrics.
+///
+/// For scheduled tasks and intents:
+/// - Failed → Negative
+/// - Partial → Neutral (something happened, not great)
+/// - Surprising → Surprising
+/// - Success with high token efficiency → Positive
+/// - Success with very high token usage (>10k) → Neutral (worked but expensive)
+pub fn infer_valence(outcome: &Outcome, tokens_used: u32, tool_rounds: u32) -> Valence {
+    match outcome {
+        Outcome::Failed => Valence::Negative,
+        Outcome::Surprising => Valence::Surprising,
+        Outcome::Partial => Valence::Neutral,
+        Outcome::Success => {
+            // High token usage with few tool rounds suggests verbose/inefficient
+            if tokens_used > 10_000 && tool_rounds <= 1 {
+                Valence::Neutral
+            } else {
+                Valence::Positive
+            }
+        }
+    }
+}
+
+/// Infer valence for a conversation session from health metrics.
+pub fn infer_conversation_valence(
+    hallucination_count: u32,
+    circuit_breaker_count: u32,
+    message_count: u32,
+) -> Valence {
+    if hallucination_count > 0 || circuit_breaker_count > 0 {
+        Valence::Negative
+    } else if message_count < 2 {
+        Valence::Neutral
+    } else {
+        Valence::Positive
+    }
+}
+
+/// Build a prediction string for a scheduled task based on its type.
+pub fn build_task_prediction(task_type: &TaskType, task_name: &str) -> String {
+    match task_type {
+        TaskType::Research => format!(
+            "Research session '{}' will surface new connections or deepen existing threads",
+            task_name
+        ),
+        TaskType::Reflection => format!(
+            "Reflection '{}' will process recent experiences into observations",
+            task_name
+        ),
+        TaskType::Synthesis => format!(
+            "Synthesis '{}' will consolidate patterns from recent sessions",
+            task_name
+        ),
+        TaskType::Orientation => format!(
+            "Orientation '{}' will set intentional direction for the day",
+            task_name
+        ),
+        TaskType::HealthCheck => format!("Health check '{}' will verify system status", task_name),
+        TaskType::Technical => format!(
+            "Technical task '{}' will complete implementation work",
+            task_name
+        ),
+        TaskType::Conversation => format!(
+            "Conversation '{}' will be productive and coherent",
+            task_name
+        ),
+        TaskType::Intent => format!("Intent '{}' will produce actionable output", task_name),
+    }
 }
 
 /// Infer domain from task type and task name.
@@ -220,5 +322,75 @@ mod tests {
             infer_domain(&TaskType::Intent, "intent-something-else"),
             "autonomous_initiative"
         );
+    }
+
+    #[test]
+    fn infer_valence_failed_is_negative() {
+        assert_eq!(infer_valence(&Outcome::Failed, 100, 0), Valence::Negative);
+    }
+
+    #[test]
+    fn infer_valence_surprising_is_surprising() {
+        assert_eq!(
+            infer_valence(&Outcome::Surprising, 500, 2),
+            Valence::Surprising
+        );
+    }
+
+    #[test]
+    fn infer_valence_partial_is_neutral() {
+        assert_eq!(infer_valence(&Outcome::Partial, 100, 0), Valence::Neutral);
+    }
+
+    #[test]
+    fn infer_valence_success_normal_is_positive() {
+        assert_eq!(infer_valence(&Outcome::Success, 500, 3), Valence::Positive);
+    }
+
+    #[test]
+    fn infer_valence_success_expensive_is_neutral() {
+        assert_eq!(infer_valence(&Outcome::Success, 15000, 1), Valence::Neutral);
+    }
+
+    #[test]
+    fn infer_conversation_valence_clean_is_positive() {
+        assert_eq!(infer_conversation_valence(0, 0, 5), Valence::Positive);
+    }
+
+    #[test]
+    fn infer_conversation_valence_hallucination_is_negative() {
+        assert_eq!(infer_conversation_valence(1, 0, 5), Valence::Negative);
+    }
+
+    #[test]
+    fn infer_conversation_valence_circuit_breaker_is_negative() {
+        assert_eq!(infer_conversation_valence(0, 1, 5), Valence::Negative);
+    }
+
+    #[test]
+    fn infer_conversation_valence_trivial_is_neutral() {
+        assert_eq!(infer_conversation_valence(0, 0, 1), Valence::Neutral);
+    }
+
+    #[test]
+    fn build_task_prediction_research() {
+        let pred = build_task_prediction(&TaskType::Research, "daily-research");
+        assert!(pred.contains("daily-research"));
+        assert!(pred.contains("connections"));
+    }
+
+    #[test]
+    fn build_task_prediction_health_check() {
+        let pred = build_task_prediction(&TaskType::HealthCheck, "health-check");
+        assert!(pred.contains("health-check"));
+        assert!(pred.contains("verify"));
+    }
+
+    #[test]
+    fn valence_display() {
+        assert_eq!(Valence::Positive.to_string(), "positive");
+        assert_eq!(Valence::Negative.to_string(), "negative");
+        assert_eq!(Valence::Neutral.to_string(), "neutral");
+        assert_eq!(Valence::Surprising.to_string(), "surprising");
     }
 }

@@ -7,7 +7,10 @@ use std::path::Path;
 
 use chrono::Utc;
 
-use super::outcome::{infer_domain, infer_outcome, infer_task_type, Outcome, OutcomeRecord};
+use super::outcome::{
+    build_task_prediction, infer_domain, infer_outcome, infer_task_type, infer_valence, Outcome,
+    OutcomeRecord,
+};
 use super::state::CaliberState;
 
 /// Build an outcome record from task execution results.
@@ -22,6 +25,9 @@ pub fn build_outcome(
     let task_type = infer_task_type(task_id);
     let outcome = infer_outcome(response_text, tool_rounds);
     let domain = infer_domain(&task_type, task_id);
+    let total_tokens = input_tokens + output_tokens;
+    let valence = infer_valence(&outcome, total_tokens, tool_rounds);
+    let prediction = build_task_prediction(&task_type, task_name);
 
     OutcomeRecord {
         task_id: task_id.to_string(),
@@ -30,8 +36,56 @@ pub fn build_outcome(
         task_type,
         description: task_name.to_string(),
         outcome,
-        tokens_used: input_tokens + output_tokens,
+        tokens_used: total_tokens,
         tool_rounds,
+        prediction: Some(prediction),
+        valence: Some(valence),
+    }
+}
+
+/// Build an outcome record for a conversation session (chat/voice).
+///
+/// Called at checkpoint time or session end to track conversation quality.
+pub fn build_conversation_outcome(
+    session_key: &str,
+    channel: &str,
+    message_count: u32,
+    hallucination_count: u32,
+    circuit_breaker_count: u32,
+    total_input_tokens: u32,
+    total_output_tokens: u32,
+) -> OutcomeRecord {
+    use super::outcome::{infer_conversation_valence, TaskType};
+
+    let total_tokens = total_input_tokens + total_output_tokens;
+    let valence =
+        infer_conversation_valence(hallucination_count, circuit_breaker_count, message_count);
+
+    // Determine outcome based on session health
+    let outcome = if hallucination_count > 0 || circuit_breaker_count > 0 {
+        Outcome::Partial
+    } else if message_count < 2 {
+        Outcome::Partial
+    } else {
+        Outcome::Success
+    };
+
+    let description = format!("Conversation on {} ({} messages)", channel, message_count);
+
+    OutcomeRecord {
+        task_id: format!("conversation-{}", session_key),
+        timestamp: Utc::now(),
+        domain: "conversation".to_string(),
+        task_type: TaskType::Conversation,
+        description,
+        outcome,
+        tokens_used: total_tokens,
+        tool_rounds: 0,
+        prediction: Some(format!(
+            "Conversation on {} will be productive and coherent",
+            channel
+        )),
+        valence: Some(valence),
     }
 }
 
@@ -122,6 +176,16 @@ pub fn render(docs_dir: &Path) -> String {
         }
     }
 
+    // Valence distribution
+    let valence_counts = state.valence_counts();
+    if valence_counts.0 + valence_counts.1 + valence_counts.2 + valence_counts.3 > 0 {
+        lines.push(String::new());
+        lines.push(format!(
+            "Valence: {} positive, {} negative, {} neutral, {} surprising",
+            valence_counts.0, valence_counts.1, valence_counts.2, valence_counts.3
+        ));
+    }
+
     let total_tokens: u32 = state.outcomes.iter().map(|o| o.tokens_used).sum();
     let avg_tokens = total_tokens / total as u32;
     lines.push(String::new());
@@ -135,14 +199,20 @@ pub fn render(docs_dir: &Path) -> String {
 
 /// Render a brief outcome line for logging purposes.
 pub fn render_outcome_line(outcome: &OutcomeRecord) -> String {
+    let valence_tag = outcome
+        .valence
+        .as_ref()
+        .map(|v| format!(" [{}]", v))
+        .unwrap_or_default();
     format!(
-        "[{}] {} — {} ({}, {} tokens, {} tool rounds)",
+        "[{}] {} — {} ({}, {} tokens, {} tool rounds){}",
         outcome.timestamp.format("%Y-%m-%d %H:%M UTC"),
         outcome.description,
         outcome.outcome,
         outcome.domain,
         outcome.tokens_used,
         outcome.tool_rounds,
+        valence_tag,
     )
 }
 
@@ -229,6 +299,8 @@ impl shared::OutcomeTracker for CaliberTracker {
             outcome: internal.outcome.to_string(),
             tokens_used: internal.tokens_used,
             tool_rounds: internal.tool_rounds,
+            prediction: internal.prediction,
+            valence: internal.valence.map(|v| v.to_string()),
         }
     }
 
@@ -251,6 +323,14 @@ impl shared::OutcomeTracker for CaliberTracker {
             .parse::<chrono::DateTime<Utc>>()
             .unwrap_or_else(|_| Utc::now());
 
+        let internal_valence = outcome.valence.as_deref().and_then(|v| match v {
+            "positive" => Some(super::outcome::Valence::Positive),
+            "negative" => Some(super::outcome::Valence::Negative),
+            "neutral" => Some(super::outcome::Valence::Neutral),
+            "surprising" => Some(super::outcome::Valence::Surprising),
+            _ => None,
+        });
+
         let internal = super::outcome::OutcomeRecord {
             task_id: outcome.task_id,
             timestamp,
@@ -260,6 +340,8 @@ impl shared::OutcomeTracker for CaliberTracker {
             outcome: internal_outcome,
             tokens_used: outcome.tokens_used,
             tool_rounds: outcome.tool_rounds,
+            prediction: outcome.prediction,
+            valence: internal_valence,
         };
 
         record_outcome(docs_dir, internal, max_outcomes)

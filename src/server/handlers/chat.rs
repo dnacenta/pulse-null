@@ -321,6 +321,28 @@ pub async fn chat(
     // Enforce hard cap on stored messages
     session.data.enforce_message_cap();
 
+    // Record conversation outcome for caliber-echo
+    if let Some(ref tracker) = state.outcome_tracker {
+        if let Ok(root_dir) = state.config.root_dir() {
+            let conv_outcome = crate::caliber::runtime::build_conversation_outcome(
+                &session_key,
+                &channel,
+                session.data.message_count as u32,
+                session.data.hallucination_count,
+                session.data.circuit_breaker_count,
+                result.input_tokens,
+                result.output_tokens,
+            );
+            if let Err(e) = crate::caliber::runtime::record_outcome(
+                &root_dir,
+                conv_outcome,
+                state.config.pulse.max_outcomes,
+            ) {
+                tracing::warn!("Failed to record conversation outcome: {}", e);
+            }
+        }
+    }
+
     // Incremental checkpoint (if conditions met)
     maybe_checkpoint(&state, &session_key, &mut session.data, &channel).await;
 
