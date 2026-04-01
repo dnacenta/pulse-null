@@ -70,6 +70,18 @@ pub fn validate_action_claims_adapter(
 /// Maximum tool-use round trips before forcing a text response (default).
 pub const DEFAULT_MAX_TOOL_ROUNDS: u32 = 25;
 
+/// Consecutive tool failures before injecting a degraded-state warning.
+const TOOL_FAILURE_THRESHOLD: u32 = 3;
+
+/// System message injected when tools are failing consecutively.
+const TOOL_DEGRADED_WARNING: &str = "\
+[SYSTEM — Tool Degraded State] \
+Multiple consecutive tool calls have failed. Tools are currently unreliable. \
+CRITICAL: Do NOT claim that any file operations, memory updates, or code changes \
+have been completed. Do NOT narrate successful outcomes. If you cannot accomplish \
+a task because tools are failing, say so explicitly. You may continue conversing \
+but must not assert that work has been done unless a tool call succeeds.";
+
 /// Result of an LLM invocation with tool loop.
 pub struct ToolLoopResult {
     pub text: String,
@@ -83,6 +95,8 @@ pub struct ToolLoopResult {
     pub circuit_breaker_fired: bool,
     /// Action claims in the final response that had no matching tool use (Phase 3).
     pub action_claim_warnings: Vec<ActionClaim>,
+    /// True if tool degraded state was triggered (consecutive tool failures).
+    pub tool_degraded: bool,
 }
 
 /// Invoke an LLM provider with automatic tool execution.
@@ -113,6 +127,9 @@ pub async fn invoke_with_tool_loop(
     // Accumulate text from ALL rounds so signal extraction sees full reasoning,
     // not just the final wrap-up summary. Fixes GitHub issue #55.
     let mut accumulated_text: Vec<String> = Vec::new();
+    // Layer 4: Track consecutive tool failures for degraded state injection
+    let mut consecutive_tool_failures: u32 = 0;
+    let mut tool_degraded = false;
 
     loop {
         let result = provider
@@ -159,6 +176,7 @@ pub async fn invoke_with_tool_loop(
                 was_truncated: true,
                 circuit_breaker_fired: false,
                 action_claim_warnings: Vec::new(),
+                tool_degraded,
             });
         }
 
@@ -188,6 +206,7 @@ pub async fn invoke_with_tool_loop(
                     was_truncated: false,
                     circuit_breaker_fired: false,
                     action_claim_warnings: claim_validation.unmatched_claims,
+                    tool_degraded,
                 });
             }
             StopReason::ToolUse => {
@@ -208,35 +227,71 @@ pub async fn invoke_with_tool_loop(
                         was_truncated: false,
                         circuit_breaker_fired: true,
                         action_claim_warnings: Vec::new(),
+                        tool_degraded,
                     });
                 }
 
                 // Execute all tool_use blocks and collect results
                 let mut tool_results = Vec::new();
+                let mut round_had_failure = false;
+                let mut round_had_success = false;
                 for block in &result.content {
                     if let ContentBlock::ToolUse { id, name, input } = block {
                         tools_used.push(name.clone());
                         let tool_result = match tools.get(name) {
                             Some(tool) => match tool.execute(input.clone()).await {
-                                Ok(output) => ContentBlock::ToolResult {
+                                Ok(output) => {
+                                    round_had_success = true;
+                                    ContentBlock::ToolResult {
+                                        tool_use_id: id.clone(),
+                                        content: output,
+                                        is_error: None,
+                                    }
+                                }
+                                Err(e) => {
+                                    round_had_failure = true;
+                                    ContentBlock::ToolResult {
+                                        tool_use_id: id.clone(),
+                                        content: format!("Error: {}", e),
+                                        is_error: Some(true),
+                                    }
+                                }
+                            },
+                            None => {
+                                round_had_failure = true;
+                                ContentBlock::ToolResult {
                                     tool_use_id: id.clone(),
-                                    content: output,
-                                    is_error: None,
-                                },
-                                Err(e) => ContentBlock::ToolResult {
-                                    tool_use_id: id.clone(),
-                                    content: format!("Error: {}", e),
+                                    content: format!("Error: Unknown tool '{}'", name),
                                     is_error: Some(true),
-                                },
-                            },
-                            None => ContentBlock::ToolResult {
-                                tool_use_id: id.clone(),
-                                content: format!("Error: Unknown tool '{}'", name),
-                                is_error: Some(true),
-                            },
+                                }
+                            }
                         };
                         tool_results.push(tool_result);
                     }
+                }
+
+                // Layer 4: Track consecutive tool failures
+                if round_had_success {
+                    // Any success resets the failure counter
+                    consecutive_tool_failures = 0;
+                }
+                if round_had_failure && !round_had_success {
+                    // Only count if ALL tools in the round failed
+                    consecutive_tool_failures += 1;
+                }
+
+                // Inject degraded-state warning when threshold is reached
+                if consecutive_tool_failures >= TOOL_FAILURE_THRESHOLD && !tool_degraded {
+                    tool_degraded = true;
+                    tracing::warn!(
+                        consecutive_failures = consecutive_tool_failures,
+                        "Hallucination guard: tool degraded state triggered — injecting warning"
+                    );
+                    // Inject the warning as a system-level user message
+                    // so the model sees it before generating its next response
+                    tool_results.push(ContentBlock::Text {
+                        text: TOOL_DEGRADED_WARNING.to_string(),
+                    });
                 }
 
                 // Add tool results as a user message and loop
@@ -268,6 +323,7 @@ pub async fn invoke_with_tool_loop(
                     was_truncated: false,
                     circuit_breaker_fired: false,
                     action_claim_warnings: Vec::new(),
+                    tool_degraded,
                 });
             }
         }

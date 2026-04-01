@@ -286,6 +286,12 @@ pub async fn chat(
             session.data.action_claim_count
         );
     }
+    if result.tool_degraded {
+        tracing::warn!(
+            session_key = %session_key,
+            "Hallucination guard: tool degraded state active — consecutive tool failures exceeded threshold"
+        );
+    }
 
     // Session health check — warn on degradation
     if state.config.session_health.enabled {
