@@ -446,9 +446,11 @@ async fn execute_task(
     );
 
     // Archive the task conversation (closes the "task output not captured" gap)
+    // Uses archive_without_ephemeral — task EPHEMERAL entries are consolidated
+    // into a daily digest instead of flooding EPHEMERAL with one entry per task.
     // Only emit PostInteraction if archive succeeds — no point triggering
     // self-assessment on a conversation that wasn't persisted.
-    if let Some(archive_path) = interaction.archive(&root_dir) {
+    if let Some(archive_path) = interaction.archive_without_ephemeral(&root_dir) {
         tracing::info!(
             "Task '{}' conversation archived to {}",
             task.id,
@@ -614,6 +616,12 @@ async fn execute_task(
                 });
             }
         }
+    }
+
+    // Daily task digest: consolidate today's task outputs into a single EPHEMERAL entry.
+    // Idempotent — needs_digest() returns false if today's digest already exists.
+    if super::digest::needs_digest(&root_dir) {
+        super::digest::write_task_digest(&root_dir, &state.config.entity.name);
     }
 
     // Graph pipeline sync (if enabled)
