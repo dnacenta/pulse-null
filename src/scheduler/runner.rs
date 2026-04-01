@@ -5,6 +5,10 @@ use chrono::Utc;
 use cron::Schedule as CronSchedule;
 use tokio::sync::RwLock;
 
+use super::evaluator::{
+    evaluate_pipeline_conversion_low, evaluate_pipeline_frozen, resolve_docs_dir, EvalDecision,
+    SchedulerState,
+};
 use super::executor::{self, ExecutionConfig};
 use super::intent::{self, IntentQueue, IntentSource};
 use super::output;
@@ -32,6 +36,17 @@ pub async fn run_task_loop(
     };
 
     tracing::info!("Scheduled task '{}' ({})", task.name, task.cron);
+
+    // Load evaluator state for structural precondition checks
+    let root_dir = match state.config.root_dir() {
+        Ok(d) => d,
+        Err(e) => {
+            tracing::error!("Cannot resolve root dir for task '{}': {}", task.id, e);
+            return;
+        }
+    };
+    let mut eval_state = SchedulerState::load(&root_dir);
+    let docs_dir = resolve_docs_dir(&root_dir);
 
     loop {
         // Calculate next fire time in the configured timezone
@@ -65,8 +80,39 @@ pub async fn run_task_loop(
             }
         }
 
+        // Evaluator precondition check — suppress if nothing has changed
+        if let Some(ref evaluator_type) = task.evaluator {
+            // Reload state from disk in case another task updated it
+            eval_state = SchedulerState::load(&root_dir);
+
+            let decision = match evaluator_type.as_str() {
+                "pipeline" => evaluate_pipeline_frozen(&eval_state, &docs_dir),
+                "pipeline_conversion" => evaluate_pipeline_conversion_low(&eval_state, &docs_dir),
+                other => {
+                    tracing::warn!(
+                        "Unknown evaluator type '{}' for task '{}' — firing anyway",
+                        other,
+                        task.id
+                    );
+                    EvalDecision::Fire
+                }
+            };
+
+            if decision == EvalDecision::Suppress {
+                tracing::debug!(
+                    "Evaluator suppressed task '{}': no document changes since last fire",
+                    task.id
+                );
+                eval_state.record_suppression(&task.id);
+                if let Err(e) = eval_state.save(&root_dir) {
+                    tracing::error!("Failed to persist evaluator state: {}", e);
+                }
+                continue;
+            }
+        }
+
         tracing::info!("Executing scheduled task: {}", task.name);
-        execute_task(&task, &state, &schedule, &intent_queue).await;
+        execute_task(&task, &state, &schedule, &intent_queue, &mut eval_state).await;
     }
 }
 
@@ -76,6 +122,7 @@ async fn execute_task(
     state: &Arc<AppState>,
     schedule: &Arc<RwLock<Schedule>>,
     intent_queue: &Arc<RwLock<IntentQueue>>,
+    eval_state: &mut SchedulerState,
 ) {
     // Build a fresh system prompt (re-reads documents each time)
     let root_dir = match state.config.root_dir() {
@@ -236,6 +283,17 @@ async fn execute_task(
         output_tokens,
         tool_info,
     );
+
+    // Record fire in evaluator state — tracks timestamps so future
+    // evaluator checks know what changed since this task last ran.
+    if task.evaluator.is_some() {
+        let docs_dir = resolve_docs_dir(&root_dir);
+        eval_state.record_fire(&task.id, &docs_dir);
+        eval_state.record_response_quality(&task.id, tool_rounds > 0);
+        if let Err(e) = eval_state.save(&root_dir) {
+            tracing::error!("Failed to persist evaluator state: {}", e);
+        }
+    }
 
     // Parse and route output
     let parsed = output::parse_output(&response_text);

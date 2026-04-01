@@ -1327,7 +1327,7 @@ checksum = "f789b01a5aaf64a8430a58140db6abb260fb987e461b7d15bc7d3d82eaa0f7be"
 dependencies = [
  "chrono",
  "futures-util",
- "pulse-system-types 0.6.1",
+ "pulse-system-types 0.6.2",
  "reqwest",
  "serde",
  "serde_json",
@@ -3996,7 +3996,7 @@ dependencies = [
 
 [[package]]
 name = "pulse-null"
-version = "0.23.1"
+version = "0.23.2"
 dependencies = [
  "async-stream",
  "axum",
@@ -4012,7 +4012,7 @@ dependencies = [
  "globset",
  "libc",
  "owo-colors",
- "pulse-system-types 0.6.1",
+ "pulse-system-types 0.6.2",
  "ratatui",
  "recall-echo",
  "regex",
@@ -4046,9 +4046,9 @@ dependencies = [
 
 [[package]]
 name = "pulse-system-types"
-version = "0.6.1"
+version = "0.6.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f3a0f3566f3d0f7a120236352842d0c88c30886a03bba9e3488a93b25a36dd54"
+checksum = "1ddd99e19cf9886109a2f84f9f35b96484dd5a14cf546366ee8fdfc86859b10c"
 dependencies = [
  "serde",
  "serde_json",
@@ -4310,7 +4310,7 @@ dependencies = [
  "dirs",
  "fastembed",
  "futures",
- "pulse-system-types 0.6.1",
+ "pulse-system-types 0.6.2",
  "regex",
  "serde",
  "serde_json",
