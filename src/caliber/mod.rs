@@ -4,9 +4,11 @@
 //! Records what was attempted, what happened, and how predictions
 //! compared to reality.
 
+pub mod document;
 pub mod outcome;
 pub mod runtime;
 pub mod state;
+pub mod trajectory;
 
 use std::future::Future;
 use std::path::{Path, PathBuf};

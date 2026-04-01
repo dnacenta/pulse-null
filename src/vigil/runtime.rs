@@ -311,6 +311,11 @@ pub fn assess(root_dir: &Path, window_size: usize, min_samples: usize) -> Cognit
         );
     }
 
+    // Caliber integration: check for calibration gap
+    if let Some(gap_suggestion) = check_calibration_gap(root_dir) {
+        suggestions.push(gap_suggestion);
+    }
+
     CognitiveHealth {
         status,
         vocabulary_trend,
@@ -355,6 +360,99 @@ pub fn render(health: &CognitiveHealth) -> String {
     }
 
     lines.join("\n")
+}
+
+// ---------------------------------------------------------------------------
+// Caliber integration — calibration gap detection
+// ---------------------------------------------------------------------------
+
+/// Check for calibration gaps between CALIBER.md confidence scores and actual outcomes.
+///
+/// Returns a suggestion string if a significant gap is detected (>0.20 average),
+/// None otherwise.
+fn check_calibration_gap(root_dir: &Path) -> Option<String> {
+    // Read CALIBER.md capabilities
+    let caliber_path = root_dir.join("CALIBER.md");
+    let caliber_content = std::fs::read_to_string(&caliber_path).ok()?;
+    let doc = crate::caliber::document::parse_caliber_md(&caliber_content);
+
+    if doc.capabilities.is_empty() {
+        return None;
+    }
+
+    // Read recent outcomes
+    let outcomes = crate::caliber::runtime::load_outcomes(root_dir);
+    if outcomes.len() < 3 {
+        return None; // Not enough data for meaningful comparison
+    }
+
+    // Group outcomes by domain and compute actual success rates
+    let mut domain_rates: std::collections::HashMap<String, (usize, usize)> =
+        std::collections::HashMap::new();
+    for o in &outcomes {
+        let entry = domain_rates
+            .entry(normalize_domain_for_comparison(&o.domain))
+            .or_insert((0, 0));
+        entry.1 += 1; // total
+        if o.outcome == crate::caliber::outcome::Outcome::Success {
+            entry.0 += 1; // successes
+        }
+    }
+
+    // Compare each CALIBER.md capability against actual rates
+    let mut gaps = Vec::new();
+    let mut large_gaps = Vec::new();
+
+    for cap in &doc.capabilities {
+        let norm_domain = normalize_domain_for_comparison(&cap.domain);
+        if let Some(&(successes, total)) = domain_rates.get(&norm_domain) {
+            if total >= 3 {
+                let actual_rate = successes as f64 / total as f64;
+                let gap = (cap.confidence - actual_rate).abs();
+                gaps.push(gap);
+                if gap > 0.20 {
+                    let direction = if cap.confidence > actual_rate {
+                        "overconfident"
+                    } else {
+                        "underconfident"
+                    };
+                    large_gaps.push(format!(
+                        "{} ({}: claimed {:.0}%, actual {:.0}%)",
+                        cap.domain,
+                        direction,
+                        cap.confidence * 100.0,
+                        actual_rate * 100.0
+                    ));
+                }
+            }
+        }
+    }
+
+    if gaps.is_empty() {
+        return None;
+    }
+
+    let avg_gap: f64 = gaps.iter().sum::<f64>() / gaps.len() as f64;
+
+    if avg_gap > 0.15 || !large_gaps.is_empty() {
+        let mut msg = format!(
+            "Calibration gap detected (avg {:.0}% deviation). ",
+            avg_gap * 100.0
+        );
+        if !large_gaps.is_empty() {
+            msg.push_str("Domains: ");
+            msg.push_str(&large_gaps.join(", "));
+            msg.push('.');
+        }
+        Some(msg)
+    } else {
+        None
+    }
+}
+
+/// Normalize domain names for comparison between CALIBER.md and outcomes.
+fn normalize_domain_for_comparison(domain: &str) -> String {
+    domain.to_lowercase().replace('_', " ")
 }
 
 // ---------------------------------------------------------------------------
@@ -696,6 +794,81 @@ mod tests {
             calc_float_trend(&frames, |f| f.vocabulary_diversity),
             Trend::Stable
         );
+    }
+
+    #[test]
+    fn test_calibration_gap_no_data() {
+        let dir = tempfile::TempDir::new().unwrap();
+        assert!(check_calibration_gap(dir.path()).is_none());
+    }
+
+    #[test]
+    fn test_calibration_gap_well_calibrated() {
+        let dir = tempfile::TempDir::new().unwrap();
+        // Create CALIBER.md with 0.80 confidence for research
+        std::fs::write(
+            dir.path().join("CALIBER.md"),
+            "# Caliber\n\n## Capability Map\n\n| Domain | Confidence | Evidence | Sample | Last Calibrated |\n|---|---|---|---|---|\n| Research synthesis | 0.80 | Good | 10 | 2026-04-01 |\n",
+        ).unwrap();
+
+        // Create outcomes with ~80% success rate (matching the confidence)
+        std::fs::create_dir_all(dir.path().join("caliber")).unwrap();
+        let mut state = crate::caliber::state::CaliberState::default();
+        for i in 0..10 {
+            let mut outcome = crate::caliber::runtime::build_outcome(
+                &format!("research-{}", i),
+                "Research",
+                "Good output for research.",
+                1,
+                100,
+                50,
+            );
+            outcome.domain = "research_synthesis".to_string();
+            if i >= 8 {
+                outcome.outcome = crate::caliber::outcome::Outcome::Failed;
+            }
+            state.record(outcome, 200);
+        }
+        state.save(dir.path()).unwrap();
+
+        // Gap should be small (~0% since 80% claimed, 80% actual)
+        let result = check_calibration_gap(dir.path());
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_calibration_gap_overconfident() {
+        let dir = tempfile::TempDir::new().unwrap();
+        // Claim 0.90 confidence but only 40% actual success
+        std::fs::write(
+            dir.path().join("CALIBER.md"),
+            "# Caliber\n\n## Capability Map\n\n| Domain | Confidence | Evidence | Sample | Last Calibrated |\n|---|---|---|---|---|\n| Research synthesis | 0.90 | High confidence | 10 | 2026-04-01 |\n",
+        ).unwrap();
+
+        std::fs::create_dir_all(dir.path().join("caliber")).unwrap();
+        let mut state = crate::caliber::state::CaliberState::default();
+        for i in 0..5 {
+            let mut outcome = crate::caliber::runtime::build_outcome(
+                &format!("research-{}", i),
+                "Research",
+                "Some output here.",
+                1,
+                100,
+                50,
+            );
+            outcome.domain = "research_synthesis".to_string();
+            if i >= 2 {
+                outcome.outcome = crate::caliber::outcome::Outcome::Failed;
+            }
+            state.record(outcome, 200);
+        }
+        state.save(dir.path()).unwrap();
+
+        let result = check_calibration_gap(dir.path());
+        assert!(result.is_some());
+        let msg = result.unwrap();
+        assert!(msg.contains("overconfident"));
+        assert!(msg.contains("Research synthesis"));
     }
 
     #[test]

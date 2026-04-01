@@ -170,6 +170,13 @@ pub fn build_system_prompt(
         ));
     }
 
+    // Caliber — operational self-model (capability scores, outcomes, limitations)
+    if config.pulse.enabled {
+        if let Some(caliber_text) = crate::caliber::runtime::render_for_prompt(root_dir) {
+            parts.push(format!("<caliber>\n{}\n</caliber>", caliber_text));
+        }
+    }
+
     Ok(parts.join("\n\n"))
 }
 
