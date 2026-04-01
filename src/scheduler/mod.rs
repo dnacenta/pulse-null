@@ -1,3 +1,4 @@
+pub mod digest;
 pub mod dynamic;
 pub mod evaluator;
 pub mod executor;

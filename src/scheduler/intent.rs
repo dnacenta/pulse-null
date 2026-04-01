@@ -679,10 +679,11 @@ async fn execute_intent(
             ),
         );
 
-        // Archive the intent conversation
+        // Archive the intent conversation — uses archive_without_ephemeral
+        // to avoid flooding EPHEMERAL with one entry per intent execution.
         // Only emit PostInteraction if archive succeeds — no point triggering
         // self-assessment on a conversation that wasn't persisted.
-        if let Some(archive_path) = interaction.archive(&root_dir) {
+        if let Some(archive_path) = interaction.archive_without_ephemeral(&root_dir) {
             tracing::info!(
                 "Intent '{}' conversation archived to {}",
                 intent.id,

@@ -13,7 +13,7 @@ use pulse_system_types::llm::{Message, MessageContent, Role};
 use serde::{Deserialize, Serialize};
 
 use crate::events::{ConversationTrust, EntityEvent, InteractionSource};
-use crate::session::{end_session, ArchiveMeta};
+use crate::session::{archive_conversation, end_session, ArchiveMeta};
 use crate::session_store::SessionData;
 use crate::utils;
 
@@ -261,6 +261,38 @@ impl InteractionRecord {
             &self.to_archive_meta().trigger,
             self.metadata.session_key.as_deref(),
         )
+    }
+
+    /// Archive this interaction WITHOUT writing an EPHEMERAL summary.
+    ///
+    /// Used for scheduled tasks and intents — their EPHEMERAL entries are
+    /// consolidated into a daily digest instead of one per execution.
+    /// Still writes the conversation archive and LOGBOOK entry.
+    pub fn archive_without_ephemeral(&self, root_dir: &Path) -> Option<PathBuf> {
+        if self.messages.is_empty() {
+            return None;
+        }
+
+        let meta = self.to_archive_meta();
+        match archive_conversation(root_dir, &self.messages, &meta) {
+            Ok(path) => {
+                tracing::info!("Conversation archived to {}", path.display());
+
+                // Still log to LOGBOOK (session-end style entry)
+                crate::logbook::log_session_end(
+                    root_dir,
+                    &meta.channel,
+                    self.messages.len(),
+                    Some(&path),
+                );
+
+                Some(path)
+            }
+            Err(e) => {
+                tracing::warn!("Failed to archive conversation: {}", e);
+                None
+            }
+        }
     }
 
     /// Source label for display (logs, assessments, etc.).
