@@ -118,7 +118,7 @@ pub async fn boot_entity(
     }
 
     // Spawn background tasks
-    super::setup::spawn_event_listener(&config, &event_bus, &intent_queue);
+    super::setup::spawn_event_listener(&config, &event_bus, &intent_queue, &root_dir);
     super::setup::spawn_session_cleanup(&config, &state);
     super::setup::spawn_awareness_listener(&event_bus, &state);
     super::setup::spawn_health_monitor(&config, &state);

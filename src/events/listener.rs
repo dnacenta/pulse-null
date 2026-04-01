@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use chrono::{DateTime, Duration, Utc};
@@ -6,6 +7,10 @@ use tokio::sync::RwLock;
 
 use super::{ConversationTrust, EntityEvent, InteractionSource};
 use crate::config::EventsConfig;
+use crate::scheduler::evaluator::{
+    evaluate_cognitive_decline, evaluate_pipeline_conversion_low, evaluate_pipeline_frozen,
+    resolve_docs_dir, EvalDecision, SchedulerState,
+};
 use crate::scheduler::intent::{Intent, IntentOutput, IntentPriority, IntentQueue, IntentSource};
 
 /// Cooldown period for event-sourced intents (prevents death spirals).
@@ -20,11 +25,16 @@ pub async fn event_listener(
     intent_queue: Arc<RwLock<IntentQueue>>,
     events_config: EventsConfig,
     max_queue_size: usize,
+    root_dir: PathBuf,
 ) {
     tracing::info!("Event listener started");
 
     // Circuit breaker state: event_type → (last_queued, consecutive_fires)
     let mut cooldowns: HashMap<String, (DateTime<Utc>, u32)> = HashMap::new();
+
+    // Load evaluator state for structural precondition checks
+    let mut eval_state = SchedulerState::load(&root_dir);
+    let docs_dir = resolve_docs_dir(&root_dir);
 
     loop {
         match rx.recv().await {
@@ -63,12 +73,44 @@ pub async fn event_listener(
                     }
                 }
 
+                // Structural precondition check — evaluate before involving LLM
+                let eval_decision = match &event {
+                    EntityEvent::PipelineFrozen { .. } => {
+                        evaluate_pipeline_frozen(&eval_state, &docs_dir)
+                    }
+                    EntityEvent::PipelineConversionLow { .. } => {
+                        evaluate_pipeline_conversion_low(&eval_state, &docs_dir)
+                    }
+                    EntityEvent::CognitiveHealthChanged { .. } => {
+                        evaluate_cognitive_decline(&eval_state)
+                    }
+                    _ => EvalDecision::Fire, // No evaluator for other events yet
+                };
+
+                if eval_decision == EvalDecision::Suppress {
+                    tracing::debug!(
+                        "Evaluator suppressed '{}' — no document changes since last fire",
+                        event_type
+                    );
+                    eval_state.record_suppression(&event_type);
+                    if let Err(e) = eval_state.save(&root_dir) {
+                        tracing::error!("Failed to persist evaluator state: {}", e);
+                    }
+                    continue;
+                }
+
                 if let Some(intent) = translate_event(&event, &events_config) {
                     let mut q = intent_queue.write().await;
                     if q.push(intent.clone(), max_queue_size) {
                         tracing::info!("Event → intent queued: '{}'", intent.description);
                         if let Err(e) = q.save() {
                             tracing::error!("Failed to persist intent queue: {}", e);
+                        }
+
+                        // Record fire in evaluator state
+                        eval_state.record_fire(&event_type, &docs_dir);
+                        if let Err(e) = eval_state.save(&root_dir) {
+                            tracing::error!("Failed to persist evaluator state: {}", e);
                         }
 
                         // Update cooldown tracking

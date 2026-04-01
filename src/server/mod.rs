@@ -248,7 +248,7 @@ pub async fn start(config: Config) -> Result<(), Box<dyn std::error::Error>> {
     }
 
     // Spawn background tasks
-    setup::spawn_event_listener(&config, &event_bus, &intent_queue);
+    setup::spawn_event_listener(&config, &event_bus, &intent_queue, &root_dir);
     setup::spawn_session_cleanup(&config, &state);
 
     // Give the plugin manager access to the event bus for runtime state-change events
