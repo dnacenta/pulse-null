@@ -22,7 +22,7 @@ pub fn known_plugins() -> Vec<RegistryEntry> {
             name: "discord-echo".to_string(),
             description: "Discord bot presence and voice channels".to_string(),
             version: "0.1.0".to_string(),
-            available: cfg!(feature = "discord"),
+            available: cfg!(feature = "discord-text"),
         },
         RegistryEntry {
             name: "recall-echo".to_string(),
@@ -74,7 +74,7 @@ pub fn create_plugin(name: &str) -> Option<Box<dyn Plugin>> {
         // Optional plugins (feature-gated)
         #[cfg(feature = "voice")]
         "voice-echo" => Some(Box::new(super::voice_echo::VoiceEchoPlugin::new())),
-        #[cfg(feature = "discord")]
+        #[cfg(feature = "discord-text")]
         "discord-echo" => Some(Box::new(super::discord_echo::DiscordEchoPlugin::new())),
         #[cfg(feature = "discord-text")]
         "discord-text-echo" => Some(Box::new(

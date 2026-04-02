@@ -13,9 +13,12 @@ use tokio::task::JoinHandle;
 use tokio_stream::StreamExt;
 use tui_textarea::TextArea;
 
-use pulse_system_types::llm::{ContentBlock, Message, MessageContent, Role, StopReason};
+use pulse_system_types::llm::{
+    ContentBlock, Message, MessageContent, MessageSource, Role, StopReason,
+};
 
 use crate::streaming::{StreamEvent, StreamingProvider};
+use crate::tool_loop::{validate_action_claims_adapter, validate_content_blocks_adapter};
 use crate::tools::ToolRegistry;
 use crate::tui::app::AppContext;
 use crate::tui::screens::EntityState;
@@ -34,6 +37,13 @@ pub struct ChatMessage {
 pub enum UiEvent {
     StateChange(EntityState),
     TextDelta(String),
+    HallucinationDetected {
+        sanitized_text: String,
+        marker: String,
+    },
+    ActionClaimWarning {
+        claims: Vec<String>,
+    },
     Complete {
         conversation: Vec<Message>,
         input_tokens: u32,
@@ -269,6 +279,33 @@ impl ChatTab {
                     text,
                 });
             }
+            UiEvent::HallucinationDetected {
+                sanitized_text,
+                marker,
+            } => {
+                // Replace the last assistant message with the sanitized version
+                if let Some(last) = self.messages.last_mut() {
+                    if !last.is_user {
+                        last.text = sanitized_text;
+                    }
+                }
+                // Show a warning to the user
+                self.messages.push(ChatMessage {
+                    is_user: false,
+                    text: format!("[hallucination detected: {}. response truncated.]", marker),
+                });
+            }
+            UiEvent::ActionClaimWarning { claims } => {
+                for claim in claims {
+                    self.messages.push(ChatMessage {
+                        is_user: false,
+                        text: format!(
+                            "[action claim: \"{}\" — no matching tool call detected]",
+                            claim
+                        ),
+                    });
+                }
+            }
             UiEvent::Complete {
                 conversation,
                 input_tokens,
@@ -419,6 +456,10 @@ impl ChatTab {
         self.conversation.push(Message {
             role: Role::User,
             content: MessageContent::Text(text),
+            source: Some(MessageSource::Human {
+                channel: "tui-chat".into(),
+                sender: "local".into(),
+            }),
         });
 
         if let (Some(provider), Some(tools), Some(system_prompt)) =
@@ -576,6 +617,8 @@ async fn conversation_task(
     let mut rounds: u32 = 0;
     let mut total_input_tokens: u32 = 0;
     let mut total_output_tokens: u32 = 0;
+    let mut tools_used: Vec<String> = Vec::new();
+    let mut final_resp_content: Option<Vec<ContentBlock>> = None;
 
     loop {
         let stream =
@@ -612,9 +655,46 @@ async fn conversation_task(
         total_input_tokens += resp.input_tokens.unwrap_or(0);
         total_output_tokens += resp.output_tokens.unwrap_or(0);
 
+        // Validate response for hallucinated turn markers before storing
+        let (sanitized_content, was_truncated, detected_marker) =
+            validate_content_blocks_adapter(&resp.content);
+
+        if was_truncated {
+            tracing::warn!(
+                marker = ?detected_marker,
+                rounds,
+                "TUI hallucination guard: response truncated, forcing loop exit"
+            );
+
+            let sanitized_text = sanitized_content
+                .iter()
+                .filter_map(|b| match b {
+                    ContentBlock::Text { text } => Some(text.as_str()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+                .join("");
+
+            let _ = tx.send(UiEvent::HallucinationDetected {
+                sanitized_text,
+                marker: detected_marker.unwrap_or_else(|| "unknown marker".into()),
+            });
+
+            // Push sanitized version to conversation
+            conversation.push(Message {
+                role: Role::Assistant,
+                content: MessageContent::Blocks(sanitized_content),
+                source: Some(MessageSource::Assistant),
+            });
+
+            // Break out — don't continue with poisoned context
+            break;
+        }
+
         conversation.push(Message {
             role: Role::Assistant,
             content: MessageContent::Blocks(resp.content.clone()),
+            source: Some(MessageSource::Assistant),
         });
 
         match resp.stop_reason {
@@ -627,6 +707,7 @@ async fn conversation_task(
                 let mut tool_results = Vec::new();
                 for block in &resp.content {
                     if let ContentBlock::ToolUse { id, name, input } = block {
+                        tools_used.push(name.clone());
                         let result = match tools.get(name) {
                             Some(tool) => match tool.execute(input.clone()).await {
                                 Ok(output) => ContentBlock::ToolResult {
@@ -650,14 +731,42 @@ async fn conversation_task(
                     }
                 }
 
+                let first_tool_id = tool_results
+                    .iter()
+                    .find_map(|b| match b {
+                        ContentBlock::ToolResult { tool_use_id, .. } => Some(tool_use_id.clone()),
+                        _ => None,
+                    })
+                    .unwrap_or_default();
                 conversation.push(Message {
                     role: Role::User,
                     content: MessageContent::Blocks(tool_results),
+                    source: Some(MessageSource::ToolResult {
+                        tool_use_id: first_tool_id,
+                    }),
                 });
 
                 let _ = tx.send(UiEvent::StateChange(EntityState::Thinking));
             }
-            _ => break,
+            _ => {
+                final_resp_content = Some(resp.content.clone());
+                break;
+            }
+        }
+    }
+
+    // Phase 3: Check for action claim hallucinations on the final response
+    if let Some(ref content) = final_resp_content {
+        let validation = validate_action_claims_adapter(content, &tools_used);
+        if validation.has_warnings() {
+            let claim_texts: Vec<String> = validation
+                .unmatched_claims
+                .iter()
+                .map(|c| c.matched_text.clone())
+                .collect();
+            let _ = tx.send(UiEvent::ActionClaimWarning {
+                claims: claim_texts,
+            });
         }
     }
 

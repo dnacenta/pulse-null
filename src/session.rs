@@ -640,6 +640,107 @@ pub fn count_recent_conversations(root_dir: &Path, days: i64) -> u32 {
     count
 }
 
+/// Log a pipeline state change to the pipeline change journal.
+/// Each entry records the old and new counts along with what changed.
+pub fn log_pipeline_change(
+    root_dir: &Path,
+    old_counts: &pulse_system_types::monitoring::DocumentCounts,
+    new_counts: &pulse_system_types::monitoring::DocumentCounts,
+    trigger: &str,
+) {
+    // Only log if something actually changed
+    if old_counts == new_counts {
+        return;
+    }
+
+    let journal_path = root_dir.join("pipeline-changes.jsonl");
+
+    let mut changes = Vec::new();
+    if old_counts.learning != new_counts.learning {
+        changes.push(format!(
+            "LEARNING: {} → {}",
+            old_counts.learning, new_counts.learning
+        ));
+    }
+    if old_counts.thoughts != new_counts.thoughts {
+        changes.push(format!(
+            "THOUGHTS: {} → {}",
+            old_counts.thoughts, new_counts.thoughts
+        ));
+    }
+    if old_counts.curiosity != new_counts.curiosity {
+        changes.push(format!(
+            "CURIOSITY: {} → {}",
+            old_counts.curiosity, new_counts.curiosity
+        ));
+    }
+    if old_counts.reflections != new_counts.reflections {
+        changes.push(format!(
+            "REFLECTIONS: {} → {}",
+            old_counts.reflections, new_counts.reflections
+        ));
+    }
+    if old_counts.praxis != new_counts.praxis {
+        changes.push(format!(
+            "PRAXIS: {} → {}",
+            old_counts.praxis, new_counts.praxis
+        ));
+    }
+
+    let entry = serde_json::json!({
+        "timestamp": Utc::now().to_rfc3339(),
+        "trigger": trigger,
+        "changes": changes,
+    });
+
+    if let Ok(mut file) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&journal_path)
+    {
+        use std::io::Write;
+        let _ = writeln!(file, "{}", entry);
+    }
+
+    tracing::info!(
+        "Pipeline state changed (trigger: {}): {}",
+        trigger,
+        changes.join(", ")
+    );
+}
+
+/// Count how many pipeline documents were modified in the last `days` days.
+/// Checks modification times of LEARNING.md, THOUGHTS.md, CURIOSITY.md,
+/// REFLECTIONS.md, and PRAXIS.md in the journal directory.
+/// Returns a count from 0–5.
+pub fn count_pipeline_updates(root_dir: &Path, days: i64) -> u32 {
+    let journal = root_dir.join("journal");
+    let docs = [
+        "LEARNING.md",
+        "THOUGHTS.md",
+        "CURIOSITY.md",
+        "REFLECTIONS.md",
+        "PRAXIS.md",
+    ];
+
+    let cutoff =
+        std::time::SystemTime::now() - std::time::Duration::from_secs((days * 86400) as u64);
+
+    let mut count = 0u32;
+    for doc in &docs {
+        let path = journal.join(doc);
+        if let Ok(metadata) = fs::metadata(&path) {
+            if let Ok(modified) = metadata.modified() {
+                if modified >= cutoff {
+                    count += 1;
+                }
+            }
+        }
+    }
+
+    count
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -657,10 +758,12 @@ mod tests {
             Message {
                 role: Role::User,
                 content: MessageContent::Text("Hello".into()),
+                source: None,
             },
             Message {
                 role: Role::Assistant,
                 content: MessageContent::Text("Hi there".into()),
+                source: None,
             },
         ];
         let md = conversation_to_markdown(&conversation);
@@ -679,6 +782,7 @@ mod tests {
                 name: "file_read".into(),
                 input: serde_json::json!({"path": "SELF.md"}),
             }]),
+            source: None,
         }];
         let md = conversation_to_markdown(&conversation);
         assert!(md.contains("**Tool: file_read**"));
@@ -694,6 +798,7 @@ mod tests {
                 content: "file contents here".into(),
                 is_error: None,
             }]),
+            source: None,
         }];
         let md = conversation_to_markdown(&conversation);
         assert!(md.contains("**Tool Result**"));
@@ -710,6 +815,7 @@ mod tests {
                 content: large_content,
                 is_error: None,
             }]),
+            source: None,
         }];
         let md = conversation_to_markdown(&conversation);
         assert!(md.contains("[truncated, 3000 bytes total]"));
@@ -724,6 +830,7 @@ mod tests {
                 content: "not found".into(),
                 is_error: Some(true),
             }]),
+            source: None,
         }];
         let md = conversation_to_markdown(&conversation);
         assert!(md.contains("[ERROR]"));
@@ -738,6 +845,7 @@ mod tests {
         let conversation = vec![Message {
             role: Role::User,
             content: MessageContent::Text("test".into()),
+            source: None,
         }];
         let meta = ArchiveMeta {
             trigger: "session-end".into(),
@@ -777,6 +885,7 @@ mod tests {
         let conversation = vec![Message {
             role: Role::User,
             content: MessageContent::Text("test".into()),
+            source: None,
         }];
         let meta = ArchiveMeta {
             trigger: "session-end".into(),

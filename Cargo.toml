@@ -1,6 +1,6 @@
 [package]
 name = "pulse-null"
-version = "0.20.0"
+version = "0.25.3"
 edition = "2021"
 rust-version = "1.80"
 license = "AGPL-3.0-only"
@@ -31,6 +31,9 @@ reqwest = { version = "0.12", features = ["json", "stream"] }
 
 # Security
 regex = "1"
+
+# Response validation (hallucination detection)
+response-validator = "0.1"
 
 # File tools
 walkdir = "2"
@@ -67,10 +70,10 @@ chrono = { version = "0.4", features = ["serde"] }
 libc = "0.2"
 
 # Shared types
-pulse-system-types = "0.5"
+pulse-system-types = "0.6.3"
 
 # Core dependencies (always included — these define an entity)
-recall-echo = { version = "3.3", features = ["pulse-null"] }
+recall-echo = { version = "3.4", features = ["pulse-null"] }
 vigil-pulse = "0.1"
 
 # Plugins (optional — different interfaces to speak through)

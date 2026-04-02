@@ -2,7 +2,7 @@ use tracing::Instrument;
 
 use crate::tool_loop::{self, ToolLoopResult};
 use crate::tools::ToolRegistry;
-use pulse_system_types::llm::{LmProvider, Message, MessageContent, Role};
+use pulse_system_types::llm::{LmProvider, Message, MessageContent, MessageSource, Role};
 
 /// Configuration for an autonomous execution session.
 pub struct ExecutionConfig {
@@ -27,16 +27,32 @@ pub struct ExecutionResult {
     pub tool_rounds_used: u32,
     /// Model that was used
     pub model: String,
+    /// True if the response validator truncated hallucinated turns
+    pub was_truncated: bool,
+    /// True if the circuit breaker fired (exceeded max rounds)
+    pub circuit_breaker_fired: bool,
+    /// Number of action claims with no matching tool use (Phase 3).
+    pub action_claim_count: u32,
+    /// True if tool degraded state was triggered (Layer 4).
+    pub tool_degraded: bool,
+    /// Full message transcript from the tool loop (user + assistant + tool rounds).
+    pub messages: Vec<Message>,
 }
 
-impl From<ToolLoopResult> for ExecutionResult {
-    fn from(r: ToolLoopResult) -> Self {
+impl ExecutionResult {
+    /// Build from a ToolLoopResult plus the message transcript.
+    fn from_tool_loop(r: ToolLoopResult, messages: Vec<Message>) -> Self {
         Self {
             response_text: r.text,
             total_input_tokens: r.input_tokens,
             total_output_tokens: r.output_tokens,
             tool_rounds_used: r.tool_rounds,
             model: r.model,
+            was_truncated: r.was_truncated,
+            circuit_breaker_fired: r.circuit_breaker_fired,
+            action_claim_count: r.action_claim_warnings.len() as u32,
+            tool_degraded: r.tool_degraded,
+            messages,
         }
     }
 }
@@ -61,6 +77,9 @@ pub async fn execute_with_tools(
     let mut messages = vec![Message {
         role: Role::User,
         content: MessageContent::Text(user_message.to_string()),
+        source: Some(MessageSource::ScheduledTask {
+            task_name: config.task_id.clone(),
+        }),
     }];
 
     let span = tracing::info_span!("autonomous_task", task_id = %config.task_id);
@@ -75,5 +94,5 @@ pub async fn execute_with_tools(
     .instrument(span)
     .await?;
 
-    Ok(result.into())
+    Ok(ExecutionResult::from_tool_loop(result, messages))
 }

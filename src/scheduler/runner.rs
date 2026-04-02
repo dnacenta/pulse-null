@@ -5,11 +5,13 @@ use chrono::Utc;
 use cron::Schedule as CronSchedule;
 use tokio::sync::RwLock;
 
+use super::evaluator::{resolve_docs_dir, resolve_task_evaluator, EvalDecision, SchedulerState};
 use super::executor::{self, ExecutionConfig};
 use super::intent::{self, IntentQueue, IntentSource};
 use super::output;
 use super::{Schedule, ScheduledTask};
-use crate::events::{ConversationTrust, EntityEvent, InteractionSource};
+use crate::events::EntityEvent;
+use crate::interaction::{InteractionMetadata, InteractionRecord};
 use crate::server::prompt;
 use crate::server::AppState;
 
@@ -31,6 +33,17 @@ pub async fn run_task_loop(
     };
 
     tracing::info!("Scheduled task '{}' ({})", task.name, task.cron);
+
+    // Load evaluator state for structural precondition checks
+    let root_dir = match state.config.root_dir() {
+        Ok(d) => d,
+        Err(e) => {
+            tracing::error!("Cannot resolve root dir for task '{}': {}", task.id, e);
+            return;
+        }
+    };
+    let mut eval_state = SchedulerState::load(&root_dir);
+    let docs_dir = resolve_docs_dir(&root_dir);
 
     loop {
         // Calculate next fire time in the configured timezone
@@ -64,8 +77,83 @@ pub async fn run_task_loop(
             }
         }
 
+        // Evaluator precondition check — suppress if nothing has changed.
+        // Uses trait-based evaluators resolved from the task's evaluator type string.
+        if let Some(ref evaluator_type) = task.evaluator {
+            // Reload state from disk in case another task updated it
+            eval_state = SchedulerState::load(&root_dir);
+
+            let decision = match resolve_task_evaluator(evaluator_type, &docs_dir) {
+                Some(eval) => eval.evaluate(&eval_state),
+                None => {
+                    tracing::warn!(
+                        "Unknown evaluator type '{}' for task '{}' — firing anyway",
+                        evaluator_type,
+                        task.id
+                    );
+                    EvalDecision::Fire
+                }
+            };
+
+            if decision == EvalDecision::Suppress {
+                tracing::debug!(
+                    "Evaluator suppressed task '{}': preconditions not met",
+                    task.id
+                );
+                eval_state.record_suppression(&task.id);
+                if let Err(e) = eval_state.save(&root_dir) {
+                    tracing::error!("Failed to persist evaluator state: {}", e);
+                }
+                continue;
+            }
+        }
+
         tracing::info!("Executing scheduled task: {}", task.name);
-        execute_task(&task, &state, &schedule, &intent_queue).await;
+
+        // Check for built-in deterministic handlers first
+        if run_builtin_handler(&task, &state, &root_dir).await {
+            continue;
+        }
+
+        execute_task(&task, &state, &schedule, &intent_queue, &mut eval_state).await;
+    }
+}
+
+/// Run a built-in deterministic handler if one exists for this task.
+///
+/// Returns true if the task was handled (no LLM call needed).
+/// Returns false if the task should proceed through the normal LLM path.
+async fn run_builtin_handler(
+    task: &ScheduledTask,
+    state: &Arc<AppState>,
+    root_dir: &std::path::Path,
+) -> bool {
+    match task.id.as_str() {
+        "trajectory-mining" => {
+            tracing::info!("Running built-in trajectory mining handler");
+            let docs_dir = resolve_docs_dir(root_dir);
+            let summary = crate::caliber::runtime::mine_and_update(&docs_dir);
+            tracing::info!("Trajectory mining complete: {}", summary);
+
+            // Record outcome for caliber-echo itself
+            if let Some(ref tracker) = state.outcome_tracker {
+                let outcome = tracker.build_outcome(
+                    &task.id, &task.name, &summary, 0, // no tool rounds — deterministic
+                    0, 0,
+                );
+                if let Err(e) =
+                    tracker.record_outcome(root_dir, outcome, state.config.pulse.max_outcomes)
+                {
+                    tracing::error!("Failed to record trajectory-mining outcome: {}", e);
+                }
+            }
+
+            // Log to LOGBOOK
+            log_execution(root_dir, task, &summary);
+
+            true
+        }
+        _ => false,
     }
 }
 
@@ -75,6 +163,7 @@ async fn execute_task(
     state: &Arc<AppState>,
     schedule: &Arc<RwLock<Schedule>>,
     intent_queue: &Arc<RwLock<IntentQueue>>,
+    eval_state: &mut SchedulerState,
 ) {
     // Build a fresh system prompt (re-reads documents each time)
     let root_dir = match state.config.root_dir() {
@@ -119,9 +208,20 @@ async fn execute_task(
         autonomy_context,
     );
 
+    // Capture start time for accurate duration tracking in InteractionRecord
+    let started_at = Utc::now();
+
     // Execute with or without tools based on autonomy config
-    let (response_text, input_tokens, output_tokens, tool_rounds) = if state.config.autonomy.enabled
-    {
+    let (
+        response_text,
+        input_tokens,
+        output_tokens,
+        tool_rounds,
+        was_truncated,
+        circuit_breaker_fired,
+        action_claim_count,
+        transcript,
+    ) = if state.config.autonomy.enabled {
         let exec_config = ExecutionConfig {
             max_tool_rounds: state.config.autonomy.max_tool_rounds,
             max_tokens: state.config.llm.max_tokens,
@@ -142,6 +242,10 @@ async fn execute_task(
                 result.total_input_tokens,
                 result.total_output_tokens,
                 result.tool_rounds_used,
+                result.was_truncated,
+                result.circuit_breaker_fired,
+                result.action_claim_count,
+                result.messages,
             ),
             Err(e) => {
                 tracing::error!("LLM invocation failed for task '{}': {}", task.id, e);
@@ -150,10 +254,13 @@ async fn execute_task(
         }
     } else {
         // Legacy path: no tools
-        use pulse_system_types::llm::{Message, MessageContent, Role};
-        let messages = vec![Message {
+        use pulse_system_types::llm::{Message, MessageContent, MessageSource, Role};
+        let mut messages = vec![Message {
             role: Role::User,
             content: MessageContent::Text(user_message),
+            source: Some(MessageSource::ScheduledTask {
+                task_name: task.id.clone(),
+            }),
         }];
 
         match state
@@ -161,18 +268,49 @@ async fn execute_task(
             .invoke(&system_prompt, &messages, state.config.llm.max_tokens, None)
             .await
         {
-            Ok(result) => (
-                result.text(),
-                result.input_tokens.unwrap_or(0),
-                result.output_tokens.unwrap_or(0),
-                0u32,
-            ),
+            Ok(result) => {
+                let text = result.text();
+                // Append assistant response to transcript
+                messages.push(Message {
+                    role: Role::Assistant,
+                    content: MessageContent::Text(text.clone()),
+                    source: None,
+                });
+                (
+                    text,
+                    result.input_tokens.unwrap_or(0),
+                    result.output_tokens.unwrap_or(0),
+                    0u32,
+                    false,
+                    false,
+                    0u32,
+                    messages,
+                )
+            }
             Err(e) => {
                 tracing::error!("LLM invocation failed for task '{}': {}", task.id, e);
                 return;
             }
         }
     };
+
+    // Log hallucination guard events for autonomous tasks
+    if was_truncated {
+        tracing::warn!(
+            task_id = %task.id,
+            "Hallucination guard: autonomous task '{}' had response truncated due to hallucinated turns",
+            task.name
+        );
+    }
+    if circuit_breaker_fired {
+        tracing::warn!(
+            task_id = %task.id,
+            tool_rounds,
+            "Hallucination guard: autonomous task '{}' hit circuit breaker after {} tool rounds",
+            task.name,
+            tool_rounds
+        );
+    }
 
     let tool_info = if tool_rounds > 0 {
         format!(", {} tool rounds", tool_rounds)
@@ -186,6 +324,17 @@ async fn execute_task(
         output_tokens,
         tool_info,
     );
+
+    // Record fire in evaluator state — tracks timestamps so future
+    // evaluator checks know what changed since this task last ran.
+    if task.evaluator.is_some() {
+        let docs_dir = resolve_docs_dir(&root_dir);
+        eval_state.record_fire(&task.id, &docs_dir);
+        eval_state.record_response_quality(&task.id, tool_rounds > 0);
+        if let Err(e) = eval_state.save(&root_dir) {
+            tracing::error!("Failed to persist evaluator state: {}", e);
+        }
+    }
 
     // Parse and route output
     let parsed = output::parse_output(&response_text);
@@ -292,24 +441,118 @@ async fn execute_task(
         tool_rounds,
     );
 
-    // Emit PostInteraction for unified intake
-    let summary = if parsed.clean_content.len() > crate::utils::SUMMARY_TRUNCATE_LEN {
-        format!(
-            "{}...",
-            crate::utils::safe_truncate(&parsed.clean_content, crate::utils::SUMMARY_TRUNCATE_LEN)
-        )
-    } else {
-        parsed.clean_content.clone()
-    };
-    state.event_bus.emit(EntityEvent::PostInteraction {
-        source: InteractionSource::ScheduledTask {
-            task_name: task.name.clone(),
+    // Build InteractionRecord for unified intake — archives, emits event, enables graph ingestion
+    let duration = (Utc::now() - started_at).num_seconds().max(0) as f64;
+    let interaction = InteractionRecord::from_task(
+        &task.id,
+        &state.config.entity.name,
+        transcript,
+        started_at,
+        InteractionMetadata {
+            input_tokens,
+            output_tokens,
+            tool_rounds,
+            duration_secs: Some(duration),
+            session_key: None,
+            hallucination_count: if was_truncated { 1 } else { 0 },
+            action_claim_count,
+            circuit_breaker_fires: if circuit_breaker_fired { 1 } else { 0 },
         },
-        trust: ConversationTrust::Owner,
-        summary,
-        input_tokens,
-        output_tokens,
-    });
+    );
+
+    // Log health warnings if any
+    let health_warnings = interaction.health_warnings();
+    if !health_warnings.is_empty() {
+        tracing::warn!(
+            "Task '{}' interaction had health issues: {}",
+            task.id,
+            health_warnings.join(", ")
+        );
+    }
+
+    // Audit: interaction created
+    crate::intake_audit::log(
+        &root_dir,
+        &crate::intake_audit::entry(
+            &interaction.id,
+            &interaction.source_label(),
+            interaction.trust_label(),
+            crate::intake_audit::AuditStage::Created,
+            if health_warnings.is_empty() {
+                None
+            } else {
+                Some(format!("health: {}", health_warnings.join(", ")))
+            },
+        ),
+    );
+
+    // Archive the task conversation (closes the "task output not captured" gap)
+    // Uses archive_without_ephemeral — task EPHEMERAL entries are consolidated
+    // into a daily digest instead of flooding EPHEMERAL with one entry per task.
+    // Only emit PostInteraction if archive succeeds — no point triggering
+    // self-assessment on a conversation that wasn't persisted.
+    if let Some(archive_path) = interaction.archive_without_ephemeral(&root_dir) {
+        tracing::info!(
+            "Task '{}' conversation archived to {}",
+            task.id,
+            archive_path.display()
+        );
+
+        // Audit: archive succeeded
+        crate::intake_audit::log(
+            &root_dir,
+            &crate::intake_audit::entry(
+                &interaction.id,
+                &interaction.source_label(),
+                interaction.trust_label(),
+                crate::intake_audit::AuditStage::Archived,
+                Some(archive_path.display().to_string()),
+            ),
+        );
+
+        // Graph auto-ingest if enabled
+        #[cfg(feature = "graph")]
+        if state.config.graph.enabled && state.config.graph.auto_ingest {
+            crate::session::graph_ingest_archive(&root_dir, &archive_path, None).await;
+        }
+
+        // Emit PostInteraction event — archive verified
+        let receivers = state.event_bus.emit(interaction.to_event());
+        tracing::debug!(
+            "Task '{}' PostInteraction emitted to {} receivers",
+            task.id,
+            receivers
+        );
+
+        // Audit: event emitted
+        crate::intake_audit::log(
+            &root_dir,
+            &crate::intake_audit::entry(
+                &interaction.id,
+                &interaction.source_label(),
+                interaction.trust_label(),
+                crate::intake_audit::AuditStage::EventEmitted,
+                Some(format!("{} receivers", receivers)),
+            ),
+        );
+    } else {
+        tracing::warn!(
+            "Task '{}' archive returned None (empty messages?) — PostInteraction NOT emitted",
+            task.id
+        );
+
+        // Audit: archive failed
+        crate::intake_audit::log(
+            &root_dir,
+            &crate::intake_audit::entry(
+                &interaction.id,
+                &interaction.source_label(),
+                interaction.trust_label(),
+                crate::intake_audit::AuditStage::ArchiveFailed,
+                Some("empty messages".to_string()),
+            ),
+        );
+    }
 
     // Record outcome for caliber-echo
     if let Some(ref tracker) = state.outcome_tracker {
@@ -359,10 +602,19 @@ async fn execute_task(
         let new_counts = monitor.counts_from_health(&health);
 
         let mut pipeline_state = monitor.load_state(&root_dir);
+        let old_counts = pipeline_state.last_counts.clone();
         pipeline_state.update_counts(&new_counts, &Utc::now().to_rfc3339());
         if let Err(e) = monitor.save_state(&root_dir, &pipeline_state) {
             tracing::error!("Failed to save pipeline state: {}", e);
         }
+
+        // Pipeline change journal — log what changed
+        crate::session::log_pipeline_change(
+            &root_dir,
+            &old_counts,
+            &new_counts,
+            &format!("task:{}", task.name),
+        );
 
         // Emit PipelineAlert for any document at hard limit
         let docs = [
@@ -397,13 +649,20 @@ async fn execute_task(
         // Pipeline conversion check: conversations vs pipeline updates over 7 days
         if pipeline_state.sessions_without_movement >= 3 {
             let conversations_7d = crate::session::count_recent_conversations(&root_dir, 7);
-            if conversations_7d >= 3 {
+            let pipeline_updates_7d = crate::session::count_pipeline_updates(&root_dir, 7);
+            if conversations_7d >= 3 && pipeline_updates_7d < 2 {
                 state.event_bus.emit(EntityEvent::PipelineConversionLow {
                     conversations_7d,
-                    pipeline_updates_7d: 0,
+                    pipeline_updates_7d,
                 });
             }
         }
+    }
+
+    // Daily task digest: consolidate today's task outputs into a single EPHEMERAL entry.
+    // Idempotent — needs_digest() returns false if today's digest already exists.
+    if super::digest::needs_digest(&root_dir) {
+        super::digest::write_task_digest(&root_dir, &state.config.entity.name);
     }
 
     // Graph pipeline sync (if enabled)

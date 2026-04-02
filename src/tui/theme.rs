@@ -10,6 +10,7 @@ pub const NORD3: Color = Color::Rgb(76, 86, 106);
 // ─── Snow Storm (foreground, text) ───
 
 pub const NORD4: Color = Color::Rgb(216, 222, 233);
+#[allow(dead_code)]
 pub const NORD5: Color = Color::Rgb(229, 233, 240);
 pub const NORD6: Color = Color::Rgb(236, 239, 244);
 
@@ -30,15 +31,18 @@ pub const NORD15: Color = Color::Rgb(180, 142, 173);
 
 // ─── Semantic aliases ───
 
+#[allow(dead_code)]
 pub const COLOR_BRAND: Color = NORD8;
 pub const COLOR_ENTITY: Color = NORD7;
 pub const COLOR_TEXT: Color = NORD4;
 pub const COLOR_TEXT_BRIGHT: Color = NORD6;
 pub const COLOR_DIM: Color = NORD3;
 pub const COLOR_BORDER: Color = NORD2;
+#[allow(dead_code)]
 pub const COLOR_BORDER_ACTIVE: Color = NORD8;
 pub const COLOR_ERROR: Color = NORD11;
 pub const COLOR_WARNING: Color = NORD12;
+#[allow(dead_code)]
 pub const COLOR_SUCCESS: Color = NORD14;
 pub const COLOR_HEALTHY: Color = NORD14;
 pub const COLOR_WATCH: Color = NORD13;
@@ -56,12 +60,14 @@ pub fn state_color_rgb(state: &super::screens::EntityState) -> (u8, u8, u8) {
     }
 }
 
+#[allow(dead_code)]
 pub fn state_color(state: &super::screens::EntityState) -> Color {
     let (r, g, b) = state_color_rgb(state);
     Color::Rgb(r, g, b)
 }
 
 /// Interpolate between two RGB colors.
+#[allow(dead_code)]
 pub fn lerp_color(from: (u8, u8, u8), to: (u8, u8, u8), t: f64) -> Color {
     let t = t.clamp(0.0, 1.0);
     let r = from.0 as f64 + (to.0 as f64 - from.0 as f64) * t;

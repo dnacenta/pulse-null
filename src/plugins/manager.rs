@@ -274,6 +274,7 @@ impl PluginManager {
     }
 
     /// Get health status of all plugins
+    #[allow(dead_code)]
     pub async fn health_all(&self) -> Vec<PluginStatus> {
         let mut statuses = Vec::new();
         for entry in &self.entries {
@@ -294,6 +295,7 @@ impl PluginManager {
     }
 
     /// Number of plugins currently running
+    #[allow(dead_code)]
     pub fn running_count(&self) -> usize {
         self.entries
             .iter()
@@ -352,6 +354,7 @@ mod tests {
             graph: GraphConfig::default(),
             sessions: SessionConfig::default(),
             context_buffer: crate::context_buffer::ContextBufferConfig::default(),
+            session_health: crate::session_health::SessionHealthConfig::default(),
             platform: PlatformConfig::default(),
             peers: std::collections::HashMap::new(),
             plugins: std::collections::HashMap::new(),
