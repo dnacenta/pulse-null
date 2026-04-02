@@ -8,8 +8,8 @@ use tokio::sync::RwLock;
 use super::{ConversationTrust, EntityEvent, InteractionSource};
 use crate::config::EventsConfig;
 use crate::scheduler::evaluator::{
-    evaluate_cognitive_decline, evaluate_pipeline_conversion_low, evaluate_pipeline_frozen,
-    resolve_docs_dir, EvalDecision, SchedulerState,
+    resolve_docs_dir, CognitiveEval, EvalDecision, Evaluator, PipelineDocEval, PostInteractionEval,
+    SchedulerState,
 };
 use crate::scheduler::intent::{Intent, IntentOutput, IntentPriority, IntentQueue, IntentSource};
 
@@ -73,30 +73,43 @@ pub async fn event_listener(
                     }
                 }
 
-                // Structural precondition check — evaluate before involving LLM
-                let eval_decision = match &event {
-                    EntityEvent::PipelineFrozen { .. } => {
-                        evaluate_pipeline_frozen(&eval_state, &docs_dir)
-                    }
-                    EntityEvent::PipelineConversionLow { .. } => {
-                        evaluate_pipeline_conversion_low(&eval_state, &docs_dir)
-                    }
-                    EntityEvent::CognitiveHealthChanged { .. } => {
-                        evaluate_cognitive_decline(&eval_state, &root_dir)
-                    }
-                    _ => EvalDecision::Fire, // No evaluator for other events yet
+                // Structural precondition check — evaluate before involving LLM.
+                // Each event type has a trait-based evaluator that performs mechanical
+                // checks (timestamps, token counts, signal deltas) without LLM calls.
+                let evaluator: Option<Box<dyn Evaluator>> = match &event {
+                    EntityEvent::PipelineFrozen { .. } => Some(Box::new(PipelineDocEval::new(
+                        "pipeline_frozen",
+                        docs_dir.clone(),
+                    ))),
+                    EntityEvent::PipelineConversionLow { .. } => Some(Box::new(
+                        PipelineDocEval::new("pipeline_conversion_low", docs_dir.clone()),
+                    )),
+                    EntityEvent::CognitiveHealthChanged { .. } => Some(Box::new(
+                        CognitiveEval::new(root_dir.clone(), docs_dir.clone()),
+                    )),
+                    EntityEvent::PostInteraction {
+                        input_tokens,
+                        output_tokens,
+                        ..
+                    } => Some(Box::new(PostInteractionEval::new(
+                        *input_tokens,
+                        *output_tokens,
+                    ))),
+                    _ => None, // No evaluator — always fire
                 };
 
-                if eval_decision == EvalDecision::Suppress {
-                    tracing::debug!(
-                        "Evaluator suppressed '{}' — no document changes since last fire",
-                        event_type
-                    );
-                    eval_state.record_suppression(&event_type);
-                    if let Err(e) = eval_state.save(&root_dir) {
-                        tracing::error!("Failed to persist evaluator state: {}", e);
+                if let Some(ref eval) = evaluator {
+                    if eval.evaluate(&eval_state) == EvalDecision::Suppress {
+                        tracing::debug!(
+                            "Evaluator suppressed '{}' — preconditions not met",
+                            event_type
+                        );
+                        eval_state.record_suppression(&event_type);
+                        if let Err(e) = eval_state.save(&root_dir) {
+                            tracing::error!("Failed to persist evaluator state: {}", e);
+                        }
+                        continue;
                     }
-                    continue;
                 }
 
                 if let Some(intent) = translate_event(&event, &events_config) {
@@ -107,15 +120,9 @@ pub async fn event_listener(
                             tracing::error!("Failed to persist intent queue: {}", e);
                         }
 
-                        // Record fire in evaluator state
-                        // For cognitive_decline, also track signal count
-                        if event_type == "cognitive_decline" {
-                            let signal_count = crate::vigil::runtime::load_signals(&root_dir).len();
-                            eval_state.record_fire_with_signals(
-                                &event_type,
-                                &docs_dir,
-                                signal_count,
-                            );
+                        // Record fire in evaluator state via trait
+                        if let Some(ref eval) = evaluator {
+                            eval.record_fire(&mut eval_state);
                         } else {
                             eval_state.record_fire(&event_type, &docs_dir);
                         }

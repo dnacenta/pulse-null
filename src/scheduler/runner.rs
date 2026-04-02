@@ -5,10 +5,7 @@ use chrono::Utc;
 use cron::Schedule as CronSchedule;
 use tokio::sync::RwLock;
 
-use super::evaluator::{
-    evaluate_pipeline_conversion_low, evaluate_pipeline_frozen, resolve_docs_dir, EvalDecision,
-    SchedulerState,
-};
+use super::evaluator::{resolve_docs_dir, resolve_task_evaluator, EvalDecision, SchedulerState};
 use super::executor::{self, ExecutionConfig};
 use super::intent::{self, IntentQueue, IntentSource};
 use super::output;
@@ -80,18 +77,18 @@ pub async fn run_task_loop(
             }
         }
 
-        // Evaluator precondition check — suppress if nothing has changed
+        // Evaluator precondition check — suppress if nothing has changed.
+        // Uses trait-based evaluators resolved from the task's evaluator type string.
         if let Some(ref evaluator_type) = task.evaluator {
             // Reload state from disk in case another task updated it
             eval_state = SchedulerState::load(&root_dir);
 
-            let decision = match evaluator_type.as_str() {
-                "pipeline" => evaluate_pipeline_frozen(&eval_state, &docs_dir),
-                "pipeline_conversion" => evaluate_pipeline_conversion_low(&eval_state, &docs_dir),
-                other => {
+            let decision = match resolve_task_evaluator(evaluator_type, &docs_dir) {
+                Some(eval) => eval.evaluate(&eval_state),
+                None => {
                     tracing::warn!(
                         "Unknown evaluator type '{}' for task '{}' — firing anyway",
-                        other,
+                        evaluator_type,
                         task.id
                     );
                     EvalDecision::Fire
@@ -100,7 +97,7 @@ pub async fn run_task_loop(
 
             if decision == EvalDecision::Suppress {
                 tracing::debug!(
-                    "Evaluator suppressed task '{}': no document changes since last fire",
+                    "Evaluator suppressed task '{}': preconditions not met",
                     task.id
                 );
                 eval_state.record_suppression(&task.id);
