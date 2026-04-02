@@ -511,7 +511,6 @@ async fn execute_task(
         );
 
         // Graph auto-ingest if enabled
-        #[cfg(feature = "graph")]
         if state.config.graph.enabled && state.config.graph.auto_ingest {
             crate::session::graph_ingest_archive(&root_dir, &archive_path, None).await;
         }
