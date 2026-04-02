@@ -198,11 +198,13 @@ impl WalWriter {
     }
 
     /// Check if a WAL file exists for a session.
+    #[allow(dead_code)]
     pub fn exists(&self, session_key: &str) -> bool {
         self.wal_path(session_key).exists()
     }
 
     /// Get the WAL directory path.
+    #[allow(dead_code)]
     pub fn dir(&self) -> &Path {
         &self.dir
     }

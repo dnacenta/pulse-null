@@ -304,6 +304,7 @@ impl RecallTab {
         self.render_pipeline_flow(frame, chunks[1], pipeline);
     }
 
+    #[allow(clippy::vec_init_then_push)]
     fn render_graph_health(&self, frame: &mut Frame, area: Rect, health: &GraphHealthData) {
         let block = Block::bordered()
             .border_type(BorderType::Rounded)

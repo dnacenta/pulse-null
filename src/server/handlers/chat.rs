@@ -322,7 +322,7 @@ pub async fn chat(
     session.data.enforce_message_cap();
 
     // Record conversation outcome for caliber-echo
-    if let Some(ref tracker) = state.outcome_tracker {
+    if let Some(ref _tracker) = state.outcome_tracker {
         if let Ok(root_dir) = state.config.root_dir() {
             let conv_outcome = crate::caliber::runtime::build_conversation_outcome(
                 &session_key,

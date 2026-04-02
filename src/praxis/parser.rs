@@ -203,6 +203,7 @@ fn count_log_entries(content: &str) -> (usize, Option<String>, Option<String>) {
 const DEFAULT_STALENESS_DAYS: u32 = 7;
 
 /// Perform a full scan of all pipeline documents.
+#[allow(dead_code)]
 pub fn scan(
     learning_path: &Path,
     thoughts_path: &Path,

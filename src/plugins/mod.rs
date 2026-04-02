@@ -5,7 +5,7 @@ pub mod registry;
 pub mod recall_echo;
 
 // Optional plugins (feature-gated)
-#[cfg(feature = "discord")]
+#[cfg(feature = "discord-text")]
 pub mod discord_echo;
 #[cfg(feature = "discord-text")]
 pub mod discord_text_echo;

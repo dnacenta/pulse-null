@@ -100,6 +100,7 @@ pub fn self_file() -> Result<PathBuf, String> {
 /// The vigil-echo core. Manages metacognitive monitoring.
 pub struct VigilEcho {
     claude_dir: PathBuf,
+    #[allow(dead_code)]
     docs_dir: PathBuf,
 }
 
@@ -122,11 +123,13 @@ impl VigilEcho {
     }
 
     /// Base directory for config and state.
+    #[allow(dead_code)]
     pub fn claude_dir(&self) -> &PathBuf {
         &self.claude_dir
     }
 
     /// Base directory for identity documents.
+    #[allow(dead_code)]
     pub fn docs_dir(&self) -> &PathBuf {
         &self.docs_dir
     }

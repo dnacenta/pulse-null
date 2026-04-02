@@ -45,6 +45,7 @@ impl TrustLevel {
         }
     }
 
+    #[allow(dead_code)]
     pub fn security_context(&self) -> &'static str {
         match self {
             TrustLevel::Trusted => "",

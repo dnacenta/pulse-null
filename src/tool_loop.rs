@@ -121,7 +121,7 @@ pub async fn invoke_with_tool_loop(
 
     let mut total_input_tokens: u32 = 0;
     let mut total_output_tokens: u32 = 0;
-    let mut final_model = String::new(); // overwritten each round
+    let mut final_model; // overwritten each round
     let mut rounds: u32 = 0;
     let mut tools_used: Vec<String> = Vec::new();
     // Accumulate text from ALL rounds so signal extraction sees full reasoning,

@@ -145,6 +145,7 @@ impl PipelineState {
     }
 
     /// Update state with new counts — detects movement (or lack thereof).
+    #[allow(dead_code)]
     pub fn update_counts(&mut self, new_counts: &DocumentCounts) {
         if *new_counts == self.last_counts {
             self.sessions_without_movement += 1;
@@ -274,6 +275,7 @@ pub fn calculate(root_dir: &Path, thresholds: &Thresholds) -> PipelineHealth {
 }
 
 /// Extract counts from health for state tracking.
+#[allow(dead_code)]
 pub fn counts_from_health(health: &PipelineHealth) -> DocumentCounts {
     DocumentCounts {
         learning: health.learning.count,

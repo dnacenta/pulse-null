@@ -388,6 +388,7 @@ pub trait Evaluator: Send {
     /// Record that this event fired — updates evaluator state.
     fn record_fire(&self, state: &mut SchedulerState);
     /// The key used for state tracking in SchedulerState.
+    #[allow(dead_code)]
     fn event_key(&self) -> &str;
 }
 

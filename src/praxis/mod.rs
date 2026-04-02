@@ -5,9 +5,11 @@
 //! Integrated as a core plugin within pulse-null.
 
 pub mod archive;
+#[allow(dead_code)]
 pub mod calibrate;
 pub mod checkpoint;
 pub mod init;
+#[allow(dead_code)]
 pub mod nudge;
 pub mod parser;
 pub mod pulse;
@@ -18,7 +20,7 @@ pub mod state;
 pub mod status;
 
 use std::future::Future;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::pin::Pin;
 
 use crate::plugins::{Plugin, PluginContext, PluginHealth, PluginMeta, PluginResult, SetupPrompt};
@@ -29,66 +31,67 @@ use crate::plugins::{Plugin, PluginContext, PluginHealth, PluginMeta, PluginResu
 // pulse-null passes paths directly via config, so no env var resolution needed.
 // These helpers operate on a PraxisConfig's claude_dir / docs_dir.
 
-pub fn praxis_dir(claude_dir: &PathBuf) -> PathBuf {
+pub fn praxis_dir(claude_dir: &Path) -> PathBuf {
     claude_dir.join("praxis")
 }
 
-pub fn state_file(claude_dir: &PathBuf) -> PathBuf {
+pub fn state_file(claude_dir: &Path) -> PathBuf {
     praxis_dir(claude_dir).join("state.json")
 }
 
-pub fn checkpoints_dir(claude_dir: &PathBuf) -> PathBuf {
+pub fn checkpoints_dir(claude_dir: &Path) -> PathBuf {
     praxis_dir(claude_dir).join("checkpoints")
 }
 
-pub fn settings_file(claude_dir: &PathBuf) -> PathBuf {
+pub fn settings_file(claude_dir: &Path) -> PathBuf {
     claude_dir.join("settings.json")
 }
 
-pub fn rules_dir(claude_dir: &PathBuf) -> PathBuf {
+pub fn rules_dir(claude_dir: &Path) -> PathBuf {
     claude_dir.join("rules")
 }
 
-pub fn protocol_file(claude_dir: &PathBuf) -> PathBuf {
+pub fn protocol_file(claude_dir: &Path) -> PathBuf {
     rules_dir(claude_dir).join("vigil-pulse.md")
 }
 
 // Document paths
-pub fn learning_file(docs_dir: &PathBuf) -> PathBuf {
+pub fn learning_file(docs_dir: &Path) -> PathBuf {
     docs_dir.join("LEARNING.md")
 }
 
-pub fn thoughts_file(docs_dir: &PathBuf) -> PathBuf {
+pub fn thoughts_file(docs_dir: &Path) -> PathBuf {
     docs_dir.join("THOUGHTS.md")
 }
 
-pub fn curiosity_file(docs_dir: &PathBuf) -> PathBuf {
+pub fn curiosity_file(docs_dir: &Path) -> PathBuf {
     docs_dir.join("CURIOSITY.md")
 }
 
-pub fn reflections_file(docs_dir: &PathBuf) -> PathBuf {
+pub fn reflections_file(docs_dir: &Path) -> PathBuf {
     docs_dir.join("REFLECTIONS.md")
 }
 
-pub fn praxis_file(docs_dir: &PathBuf) -> PathBuf {
+pub fn praxis_file(docs_dir: &Path) -> PathBuf {
     docs_dir.join("PRAXIS.md")
 }
 
-pub fn self_file(docs_dir: &PathBuf) -> PathBuf {
+pub fn self_file(docs_dir: &Path) -> PathBuf {
     docs_dir.join("SELF.md")
 }
 
-pub fn session_log_file(docs_dir: &PathBuf) -> PathBuf {
+pub fn session_log_file(docs_dir: &Path) -> PathBuf {
     docs_dir.join("SESSION-LOG.md")
 }
 
 // Archive directories
-pub fn archives_dir(docs_dir: &PathBuf) -> PathBuf {
+pub fn archives_dir(docs_dir: &Path) -> PathBuf {
     docs_dir.join("archives")
 }
 
 // Intent queue
-pub fn intent_queue_file(docs_dir: &PathBuf) -> PathBuf {
+#[allow(dead_code)]
+pub fn intent_queue_file(docs_dir: &Path) -> PathBuf {
     docs_dir.join("intent-queue.json")
 }
 
@@ -102,6 +105,7 @@ pub struct PraxisConfig {
     pub claude_dir: PathBuf,
     pub docs_dir: PathBuf,
     pub thoughts_staleness_days: u32,
+    #[allow(dead_code)]
     pub curiosity_staleness_days: u32,
     pub freeze_threshold: u32,
     pub pulse_cooldown_secs: u64,
@@ -136,16 +140,19 @@ impl PraxisEcho {
     }
 
     /// The plugin's configuration.
+    #[allow(dead_code)]
     pub fn config(&self) -> &PraxisConfig {
         &self.config
     }
 
     /// Base directory for config and state.
+    #[allow(dead_code)]
     pub fn claude_dir(&self) -> &PathBuf {
         &self.config.claude_dir
     }
 
     /// Base directory for identity documents.
+    #[allow(dead_code)]
     pub fn docs_dir(&self) -> &PathBuf {
         &self.config.docs_dir
     }
