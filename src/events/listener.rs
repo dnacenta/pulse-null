@@ -82,7 +82,7 @@ pub async fn event_listener(
                         evaluate_pipeline_conversion_low(&eval_state, &docs_dir)
                     }
                     EntityEvent::CognitiveHealthChanged { .. } => {
-                        evaluate_cognitive_decline(&eval_state)
+                        evaluate_cognitive_decline(&eval_state, &root_dir)
                     }
                     _ => EvalDecision::Fire, // No evaluator for other events yet
                 };
@@ -108,7 +108,17 @@ pub async fn event_listener(
                         }
 
                         // Record fire in evaluator state
-                        eval_state.record_fire(&event_type, &docs_dir);
+                        // For cognitive_decline, also track signal count
+                        if event_type == "cognitive_decline" {
+                            let signal_count = crate::vigil::runtime::load_signals(&root_dir).len();
+                            eval_state.record_fire_with_signals(
+                                &event_type,
+                                &docs_dir,
+                                signal_count,
+                            );
+                        } else {
+                            eval_state.record_fire(&event_type, &docs_dir);
+                        }
                         if let Err(e) = eval_state.save(&root_dir) {
                             tracing::error!("Failed to persist evaluator state: {}", e);
                         }
