@@ -353,6 +353,151 @@ pub fn resolve_docs_dir(root_dir: &Path) -> PathBuf {
     root_dir.to_path_buf()
 }
 
+// --- Post-interaction token threshold ---
+
+/// Minimum total tokens (input + output) for a PostInteraction event to warrant
+/// self-assessment. Trivial exchanges ("ok", "thanks") don't need LLM analysis.
+pub const MIN_INTERACTION_TOKENS: u32 = 100;
+
+/// Evaluate whether a PostInteraction event is substantial enough to warrant
+/// self-assessment. Trivial exchanges (under MIN_INTERACTION_TOKENS) are suppressed.
+pub fn evaluate_post_interaction(input_tokens: u32, output_tokens: u32) -> EvalDecision {
+    let total = input_tokens.saturating_add(output_tokens);
+    if total < MIN_INTERACTION_TOKENS {
+        tracing::debug!(
+            "post_interaction: suppressed — {} total tokens below minimum {}",
+            total,
+            MIN_INTERACTION_TOKENS
+        );
+        EvalDecision::Suppress
+    } else {
+        EvalDecision::Fire
+    }
+}
+
+// --- Evaluator Trait ---
+
+/// Trait for structural precondition evaluators.
+///
+/// Evaluators gate event/task execution by checking mechanical preconditions
+/// (timestamps, token counts, signal deltas) without involving the LLM.
+/// New event types implement this trait to register their own gating logic.
+pub trait Evaluator: Send {
+    /// Check whether this event/task should fire.
+    fn evaluate(&self, state: &SchedulerState) -> EvalDecision;
+    /// Record that this event fired — updates evaluator state.
+    fn record_fire(&self, state: &mut SchedulerState);
+    /// The key used for state tracking in SchedulerState.
+    fn event_key(&self) -> &str;
+}
+
+/// Pipeline document change evaluator.
+/// Used for both pipeline_frozen and pipeline_conversion_low events.
+pub struct PipelineDocEval {
+    event_key: String,
+    docs_dir: PathBuf,
+}
+
+impl PipelineDocEval {
+    pub fn new(event_key: &str, docs_dir: PathBuf) -> Self {
+        Self {
+            event_key: event_key.to_string(),
+            docs_dir,
+        }
+    }
+}
+
+impl Evaluator for PipelineDocEval {
+    fn evaluate(&self, state: &SchedulerState) -> EvalDecision {
+        match self.event_key.as_str() {
+            "pipeline_frozen" => evaluate_pipeline_frozen(state, &self.docs_dir),
+            "pipeline_conversion_low" => evaluate_pipeline_conversion_low(state, &self.docs_dir),
+            _ => EvalDecision::Fire,
+        }
+    }
+
+    fn record_fire(&self, state: &mut SchedulerState) {
+        state.record_fire(&self.event_key, &self.docs_dir);
+    }
+
+    fn event_key(&self) -> &str {
+        &self.event_key
+    }
+}
+
+/// Cognitive health signal evaluator.
+pub struct CognitiveEval {
+    root_dir: PathBuf,
+    docs_dir: PathBuf,
+}
+
+impl CognitiveEval {
+    pub fn new(root_dir: PathBuf, docs_dir: PathBuf) -> Self {
+        Self { root_dir, docs_dir }
+    }
+}
+
+impl Evaluator for CognitiveEval {
+    fn evaluate(&self, state: &SchedulerState) -> EvalDecision {
+        evaluate_cognitive_decline(state, &self.root_dir)
+    }
+
+    fn record_fire(&self, state: &mut SchedulerState) {
+        let signal_count = count_signal_frames(&self.root_dir);
+        state.record_fire_with_signals("cognitive_decline", &self.docs_dir, signal_count);
+    }
+
+    fn event_key(&self) -> &str {
+        "cognitive_decline"
+    }
+}
+
+/// Post-interaction token threshold evaluator.
+/// Suppresses self-assessment for trivial interactions below the minimum token count.
+pub struct PostInteractionEval {
+    input_tokens: u32,
+    output_tokens: u32,
+}
+
+impl PostInteractionEval {
+    pub fn new(input_tokens: u32, output_tokens: u32) -> Self {
+        Self {
+            input_tokens,
+            output_tokens,
+        }
+    }
+}
+
+impl Evaluator for PostInteractionEval {
+    fn evaluate(&self, _state: &SchedulerState) -> EvalDecision {
+        evaluate_post_interaction(self.input_tokens, self.output_tokens)
+    }
+
+    fn record_fire(&self, _state: &mut SchedulerState) {
+        // PostInteraction is unique per interaction — no persistent state needed.
+    }
+
+    fn event_key(&self) -> &str {
+        "post_interaction"
+    }
+}
+
+/// Resolve the evaluator for a scheduled task's evaluator type string.
+/// Returns None for unknown types (task fires without gating).
+pub fn resolve_task_evaluator(evaluator_type: &str, docs_dir: &Path) -> Option<Box<dyn Evaluator>> {
+    match evaluator_type {
+        "pipeline" => Some(Box::new(PipelineDocEval::new(
+            "pipeline_frozen",
+            docs_dir.to_path_buf(),
+        ))),
+        "pipeline_conversion" => Some(Box::new(PipelineDocEval::new(
+            "pipeline_conversion_low",
+            docs_dir.to_path_buf(),
+        ))),
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -662,5 +807,102 @@ mod tests {
         let signals = r#"[{"a":1},{"b":2},{"c":3}]"#;
         fs::write(tmp.path().join("monitoring/signals.json"), signals).unwrap();
         assert_eq!(count_signal_frames(tmp.path()), 3);
+    }
+
+    // --- Post-interaction evaluator tests ---
+
+    #[test]
+    fn post_interaction_suppress_trivial() {
+        // 50 + 30 = 80 tokens, below 100 threshold
+        assert_eq!(evaluate_post_interaction(50, 30), EvalDecision::Suppress);
+    }
+
+    #[test]
+    fn post_interaction_fire_substantial() {
+        // 100 + 200 = 300 tokens, above threshold
+        assert_eq!(evaluate_post_interaction(100, 200), EvalDecision::Fire);
+    }
+
+    #[test]
+    fn post_interaction_fire_at_threshold() {
+        // Exactly 100 tokens — should fire (not strictly less)
+        assert_eq!(evaluate_post_interaction(50, 50), EvalDecision::Fire);
+    }
+
+    #[test]
+    fn post_interaction_suppress_zero_tokens() {
+        assert_eq!(evaluate_post_interaction(0, 0), EvalDecision::Suppress);
+    }
+
+    // --- Evaluator trait tests ---
+
+    #[test]
+    fn trait_pipeline_doc_eval_delegates() {
+        let tmp = TempDir::new().unwrap();
+        setup_docs(tmp.path());
+
+        let eval = PipelineDocEval::new("pipeline_frozen", tmp.path().to_path_buf());
+        let state = SchedulerState::default();
+
+        // First fire — should fire
+        assert_eq!(eval.evaluate(&state), EvalDecision::Fire);
+        assert_eq!(eval.event_key(), "pipeline_frozen");
+    }
+
+    #[test]
+    fn trait_pipeline_doc_eval_record_fire() {
+        let tmp = TempDir::new().unwrap();
+        setup_docs(tmp.path());
+
+        let eval = PipelineDocEval::new("pipeline_frozen", tmp.path().to_path_buf());
+        let mut state = SchedulerState::default();
+
+        eval.record_fire(&mut state);
+        assert!(state.events.contains_key("pipeline_frozen"));
+
+        // After recording, should suppress (no changes)
+        assert_eq!(eval.evaluate(&state), EvalDecision::Suppress);
+    }
+
+    #[test]
+    fn trait_cognitive_eval_delegates() {
+        let tmp = TempDir::new().unwrap();
+        let eval = CognitiveEval::new(tmp.path().to_path_buf(), tmp.path().to_path_buf());
+        let state = SchedulerState::default();
+
+        assert_eq!(eval.evaluate(&state), EvalDecision::Fire);
+        assert_eq!(eval.event_key(), "cognitive_decline");
+    }
+
+    #[test]
+    fn trait_post_interaction_eval() {
+        let state = SchedulerState::default();
+
+        let trivial = PostInteractionEval::new(20, 30);
+        assert_eq!(trivial.evaluate(&state), EvalDecision::Suppress);
+        assert_eq!(trivial.event_key(), "post_interaction");
+
+        let substantial = PostInteractionEval::new(500, 1000);
+        assert_eq!(substantial.evaluate(&state), EvalDecision::Fire);
+    }
+
+    #[test]
+    fn resolve_task_evaluator_known_types() {
+        let tmp = TempDir::new().unwrap();
+        setup_docs(tmp.path());
+
+        let pipeline = resolve_task_evaluator("pipeline", tmp.path());
+        assert!(pipeline.is_some());
+        assert_eq!(pipeline.unwrap().event_key(), "pipeline_frozen");
+
+        let conversion = resolve_task_evaluator("pipeline_conversion", tmp.path());
+        assert!(conversion.is_some());
+        assert_eq!(conversion.unwrap().event_key(), "pipeline_conversion_low");
+    }
+
+    #[test]
+    fn resolve_task_evaluator_unknown_type() {
+        let tmp = TempDir::new().unwrap();
+        assert!(resolve_task_evaluator("nonexistent", tmp.path()).is_none());
     }
 }
