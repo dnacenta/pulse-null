@@ -11,6 +11,7 @@ use pulse_system_types::llm::{ContentBlock, LlmResponse, LmProvider, Message, St
 
 /// Events emitted during a streaming LLM response.
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub enum StreamEvent {
     /// A chunk of text content.
     TextDelta(String),
@@ -38,6 +39,7 @@ pub type StreamResult<'a> = Pin<Box<dyn Stream<Item = StreamEvent> + Send + 'a>>
 /// default implementation that calls `invoke()` and emits a single TextDelta + Done.
 pub trait StreamingProvider: LmProvider {
     /// Whether this provider supports native streaming.
+    #[allow(dead_code)]
     fn supports_streaming(&self) -> bool {
         false
     }

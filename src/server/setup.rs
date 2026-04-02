@@ -168,18 +168,21 @@ pub fn spawn_event_listener(
     config: &Config,
     event_bus: &Arc<crate::events::EventBus>,
     intent_queue: &Arc<tokio::sync::RwLock<crate::scheduler::intent::IntentQueue>>,
+    root_dir: &std::path::Path,
 ) {
     if config.autonomy.enabled {
         let listener_rx = event_bus.subscribe();
         let listener_queue = Arc::clone(intent_queue);
         let events_config = config.autonomy.events.clone();
         let max_queue_size = config.autonomy.max_queue_size;
+        let root_dir = root_dir.to_path_buf();
         tokio::spawn(async move {
             crate::events::listener::event_listener(
                 listener_rx,
                 listener_queue,
                 events_config,
                 max_queue_size,
+                root_dir,
             )
             .await;
         });

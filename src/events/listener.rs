@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use chrono::{DateTime, Duration, Utc};
@@ -6,6 +7,10 @@ use tokio::sync::RwLock;
 
 use super::{ConversationTrust, EntityEvent, InteractionSource};
 use crate::config::EventsConfig;
+use crate::scheduler::evaluator::{
+    resolve_docs_dir, CognitiveEval, EvalDecision, Evaluator, PipelineDocEval, PostInteractionEval,
+    SchedulerState,
+};
 use crate::scheduler::intent::{Intent, IntentOutput, IntentPriority, IntentQueue, IntentSource};
 
 /// Cooldown period for event-sourced intents (prevents death spirals).
@@ -20,11 +25,16 @@ pub async fn event_listener(
     intent_queue: Arc<RwLock<IntentQueue>>,
     events_config: EventsConfig,
     max_queue_size: usize,
+    root_dir: PathBuf,
 ) {
     tracing::info!("Event listener started");
 
     // Circuit breaker state: event_type → (last_queued, consecutive_fires)
     let mut cooldowns: HashMap<String, (DateTime<Utc>, u32)> = HashMap::new();
+
+    // Load evaluator state for structural precondition checks
+    let mut eval_state = SchedulerState::load(&root_dir);
+    let docs_dir = resolve_docs_dir(&root_dir);
 
     loop {
         match rx.recv().await {
@@ -63,6 +73,45 @@ pub async fn event_listener(
                     }
                 }
 
+                // Structural precondition check — evaluate before involving LLM.
+                // Each event type has a trait-based evaluator that performs mechanical
+                // checks (timestamps, token counts, signal deltas) without LLM calls.
+                let evaluator: Option<Box<dyn Evaluator>> = match &event {
+                    EntityEvent::PipelineFrozen { .. } => Some(Box::new(PipelineDocEval::new(
+                        "pipeline_frozen",
+                        docs_dir.clone(),
+                    ))),
+                    EntityEvent::PipelineConversionLow { .. } => Some(Box::new(
+                        PipelineDocEval::new("pipeline_conversion_low", docs_dir.clone()),
+                    )),
+                    EntityEvent::CognitiveHealthChanged { .. } => Some(Box::new(
+                        CognitiveEval::new(root_dir.clone(), docs_dir.clone()),
+                    )),
+                    EntityEvent::PostInteraction {
+                        input_tokens,
+                        output_tokens,
+                        ..
+                    } => Some(Box::new(PostInteractionEval::new(
+                        *input_tokens,
+                        *output_tokens,
+                    ))),
+                    _ => None, // No evaluator — always fire
+                };
+
+                if let Some(ref eval) = evaluator {
+                    if eval.evaluate(&eval_state) == EvalDecision::Suppress {
+                        tracing::debug!(
+                            "Evaluator suppressed '{}' — preconditions not met",
+                            event_type
+                        );
+                        eval_state.record_suppression(&event_type);
+                        if let Err(e) = eval_state.save(&root_dir) {
+                            tracing::error!("Failed to persist evaluator state: {}", e);
+                        }
+                        continue;
+                    }
+                }
+
                 if let Some(intent) = translate_event(&event, &events_config) {
                     let mut q = intent_queue.write().await;
                     if q.push(intent.clone(), max_queue_size) {
@@ -71,15 +120,34 @@ pub async fn event_listener(
                             tracing::error!("Failed to persist intent queue: {}", e);
                         }
 
+                        // Record fire in evaluator state via trait
+                        if let Some(ref eval) = evaluator {
+                            eval.record_fire(&mut eval_state);
+                        } else {
+                            eval_state.record_fire(&event_type, &docs_dir);
+                        }
+                        if let Err(e) = eval_state.save(&root_dir) {
+                            tracing::error!("Failed to persist evaluator state: {}", e);
+                        }
+
                         // Update cooldown tracking
                         let entry = cooldowns.entry(event_type).or_insert((Utc::now(), 0));
                         entry.0 = Utc::now();
                         entry.1 += 1;
                     } else {
-                        tracing::debug!(
-                            "Event intent not queued (full or duplicate): '{}'",
-                            intent.description
-                        );
+                        // PostInteraction rejections are more significant — a real
+                        // conversation's self-assessment didn't queue.
+                        if is_post_conversation {
+                            tracing::warn!(
+                                "PostInteraction intent rejected (queue full or duplicate): '{}'",
+                                intent.description
+                            );
+                        } else {
+                            tracing::debug!(
+                                "Event intent not queued (full or duplicate): '{}'",
+                                intent.description
+                            );
+                        }
                     }
                 }
             }
@@ -295,7 +363,7 @@ fn translate_event(event: &EntityEvent, config: &EventsConfig) -> Option<Intent>
 
         // PluginStateChanged triggers AWARENESS.md rebuild — handled externally,
         // no intent needed from the event listener.
-        EntityEvent::PluginStateChanged { .. } => return None,
+        EntityEvent::PluginStateChanged { .. } => None,
 
         EntityEvent::CognitiveHealthChanged {
             previous,

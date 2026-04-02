@@ -198,7 +198,7 @@ impl StreamingProvider for OllamaProvider {
         &self,
         system_prompt: &str,
         messages: &[Message],
-        max_tokens: u32,
+        _max_tokens: u32,
         tools: Option<&[serde_json::Value]>,
     ) -> StreamResult<'_> {
         let system_prompt = system_prompt.to_string();
@@ -303,9 +303,6 @@ impl StreamingProvider for OllamaProvider {
             let mut byte_stream = response.bytes_stream();
             let mut buffer = String::new();
             let mut text_parts: Vec<String> = Vec::new();
-            let mut model = self.model.clone();
-            let mut input_tokens: Option<u32> = None;
-            let mut output_tokens: Option<u32> = None;
 
             while let Some(chunk) = byte_stream.next().await {
                 let chunk = match chunk {
@@ -342,9 +339,9 @@ impl StreamingProvider for OllamaProvider {
                     }
 
                     if done {
-                        model = json["model"].as_str().unwrap_or(&self.model).to_string();
-                        input_tokens = json["prompt_eval_count"].as_u64().map(|v| v as u32);
-                        output_tokens = json["eval_count"].as_u64().map(|v| v as u32);
+                        let model = json["model"].as_str().unwrap_or(&self.model).to_string();
+                        let input_tokens = json["prompt_eval_count"].as_u64().map(|v| v as u32);
+                        let output_tokens = json["eval_count"].as_u64().map(|v| v as u32);
 
                         let stop_reason = match json["done_reason"].as_str() {
                             Some("length") => StopReason::MaxTokens,

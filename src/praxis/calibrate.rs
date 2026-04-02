@@ -488,6 +488,8 @@ mod tests {
             outcome: result.to_string(),
             tokens_used: 100,
             tool_rounds: 1,
+            prediction: None,
+            valence: None,
         }
     }
 

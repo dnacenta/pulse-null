@@ -32,6 +32,20 @@ impl TrustLevel {
         Self::from_channel(channel, config)
     }
 
+    /// Convert to the event system's ConversationTrust.
+    ///
+    /// Trusted and Verified both map to Owner (D via different channels).
+    /// Peer maps to LocalPeer. Untrusted maps to Public.
+    pub fn to_conversation_trust(&self) -> crate::events::ConversationTrust {
+        match self {
+            TrustLevel::Trusted => crate::events::ConversationTrust::Owner,
+            TrustLevel::Verified => crate::events::ConversationTrust::Owner,
+            TrustLevel::Peer => crate::events::ConversationTrust::LocalPeer,
+            TrustLevel::Untrusted => crate::events::ConversationTrust::Public,
+        }
+    }
+
+    #[allow(dead_code)]
     pub fn security_context(&self) -> &'static str {
         match self {
             TrustLevel::Trusted => "",
@@ -96,6 +110,7 @@ mod tests {
             graph: GraphConfig::default(),
             sessions: SessionConfig::default(),
             context_buffer: crate::context_buffer::ContextBufferConfig::default(),
+            session_health: crate::session_health::SessionHealthConfig::default(),
             platform: crate::config::PlatformConfig::default(),
             peers: std::collections::HashMap::new(),
             plugins: std::collections::HashMap::new(),

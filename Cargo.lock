@@ -1321,12 +1321,13 @@ dependencies = [
 
 [[package]]
 name = "discord-echo"
-version = "0.1.0"
+version = "0.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2925c4eaf6ad8c7a656f472aca920e546e801edd639636bfb581724ee315b674"
+checksum = "f789b01a5aaf64a8430a58140db6abb260fb987e461b7d15bc7d3d82eaa0f7be"
 dependencies = [
+ "chrono",
  "futures-util",
- "pulse-system-types",
+ "pulse-system-types 0.6.3",
  "reqwest",
  "serde",
  "serde_json",
@@ -3995,7 +3996,7 @@ dependencies = [
 
 [[package]]
 name = "pulse-null"
-version = "0.20.0"
+version = "0.25.3"
 dependencies = [
  "async-stream",
  "axum",
@@ -4011,11 +4012,12 @@ dependencies = [
  "globset",
  "libc",
  "owo-colors",
- "pulse-system-types",
+ "pulse-system-types 0.6.3",
  "ratatui",
  "recall-echo",
  "regex",
  "reqwest",
+ "response-validator",
  "serde",
  "serde_json",
  "tempfile",
@@ -4037,6 +4039,16 @@ name = "pulse-system-types"
 version = "0.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "5093e2dc0ea828fec5ddee62acab60302df5732c331c3553a0e0c0c0adfc7536"
+dependencies = [
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "pulse-system-types"
+version = "0.6.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "497484670f2bb673be80340ac2ead8f0107e19f029d1f68dcdf33643788389d0"
 dependencies = [
  "serde",
  "serde_json",
@@ -4288,9 +4300,9 @@ checksum = "bbc4a4ea2a66a41a1152c4b3d86e8954dc087bdf33af35446e6e176db4e73c8c"
 
 [[package]]
 name = "recall-echo"
-version = "3.3.0"
+version = "3.4.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ba59dd6b78cefb9ee1f286e18bd61b3427b9a62bd1813fc1a640b47fb00f35b1"
+checksum = "ba2ea0439881e760cc8a581583bcae5553b6aeb58ca21d515e07af146cf0872b"
 dependencies = [
  "async-trait",
  "chrono",
@@ -4298,7 +4310,7 @@ dependencies = [
  "dirs",
  "fastembed",
  "futures",
- "pulse-system-types",
+ "pulse-system-types 0.6.3",
  "regex",
  "serde",
  "serde_json",
@@ -4423,6 +4435,18 @@ dependencies = [
  "wasm-bindgen-futures",
  "wasm-streams",
  "web-sys",
+]
+
+[[package]]
+name = "response-validator"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4972cb1f35abcc86293d1b879655c49c735e77643e32fc173df0eb6e3e5e5d67"
+dependencies = [
+ "regex",
+ "serde",
+ "serde_json",
+ "tracing",
 ]
 
 [[package]]
@@ -6370,7 +6394,7 @@ checksum = "924c54aa7e44e562dd4b99c3d5ce34b9a949250ded224759d2aae03dd3fd0b05"
 dependencies = [
  "chrono",
  "owo-colors",
- "pulse-system-types",
+ "pulse-system-types 0.5.0",
  "serde",
  "serde_json",
 ]
@@ -6387,7 +6411,7 @@ dependencies = [
  "chrono",
  "dotenvy",
  "hound",
- "pulse-system-types",
+ "pulse-system-types 0.5.0",
  "rand 0.8.5",
  "reqwest",
  "rpassword",

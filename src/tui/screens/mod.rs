@@ -17,6 +17,7 @@ pub enum EntityState {
     Thinking,
     Streaming,
     UsingTools,
+    #[allow(dead_code)]
     Research,
 }
 

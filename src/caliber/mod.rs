@@ -4,9 +4,11 @@
 //! Records what was attempted, what happened, and how predictions
 //! compared to reality.
 
+pub mod document;
 pub mod outcome;
 pub mod runtime;
 pub mod state;
+pub mod trajectory;
 
 use std::future::Future;
 use std::path::{Path, PathBuf};
@@ -47,6 +49,7 @@ impl CaliberEcho {
         Self { docs_dir }
     }
 
+    #[allow(dead_code)]
     pub fn docs_dir(&self) -> &Path {
         &self.docs_dir
     }

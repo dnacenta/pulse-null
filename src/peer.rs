@@ -11,6 +11,7 @@ use crate::config::PeerConfig;
 /// Response from a peer's /chat endpoint.
 /// Defined here to avoid circular dependency with server::handlers::chat.
 #[derive(Debug, Deserialize)]
+#[allow(dead_code)]
 pub struct PeerChatResponse {
     pub response: String,
     pub model: String,
@@ -31,6 +32,7 @@ pub struct PeerStatus {
 pub enum PeerError {
     NotFound(String),
     AlreadyExists(String),
+    #[allow(dead_code)]
     Offline(String),
     RequestFailed(reqwest::Error),
     BadResponse(String),
@@ -92,6 +94,7 @@ impl PeerClient {
     }
 
     /// Check if a peer is online (simple bool).
+    #[allow(dead_code)]
     pub async fn is_online(&self, name: &str) -> bool {
         self.check_health(name).await.0
     }
@@ -152,11 +155,13 @@ impl PeerClient {
     }
 
     /// Number of configured peers.
+    #[allow(dead_code)]
     pub fn count(&self) -> usize {
         self.peers.len()
     }
 
     /// Get peer names.
+    #[allow(dead_code)]
     pub fn names(&self) -> Vec<String> {
         let mut names: Vec<String> = self.peers.keys().cloned().collect();
         names.sort();
@@ -164,6 +169,7 @@ impl PeerClient {
     }
 
     /// Get a reference to a peer config.
+    #[allow(dead_code)]
     pub fn get(&self, name: &str) -> Option<&PeerConfig> {
         self.peers.get(name)
     }

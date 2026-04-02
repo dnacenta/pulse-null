@@ -10,7 +10,8 @@ use super::executor::{self, ExecutionConfig};
 use super::output;
 use super::Schedule;
 use crate::config::AutonomyConfig;
-use crate::events::{ConversationTrust, EntityEvent, InteractionSource};
+use crate::events::EntityEvent;
+use crate::interaction::{InteractionMetadata, InteractionRecord};
 use crate::server::prompt;
 use crate::server::AppState;
 
@@ -456,6 +457,9 @@ async fn execute_intent(
         intent.description, intent.priority, intent.source, intent.prompt, autonomy_context
     );
 
+    // Capture start time for accurate duration tracking
+    let started_at = Utc::now();
+
     let exec_config = ExecutionConfig {
         max_tool_rounds: config.max_tool_rounds,
         max_tokens: state.config.llm.max_tokens,
@@ -617,35 +621,142 @@ async fn execute_intent(
         result.tool_rounds_used,
     );
 
-    // Emit PostInteraction for unified intake — only for non-event-sourced intents
+    // Build InteractionRecord for unified intake — only for non-event-sourced intents
     // to prevent infinite loops (event → intent → event → intent → ...)
     if !matches!(intent.source, IntentSource::Event(_)) {
-        let source = match &intent.source {
-            IntentSource::ScheduledTask(name) => InteractionSource::ScheduledTask {
-                task_name: name.clone(),
-            },
-            _ => InteractionSource::Research {
-                topic: intent.description.clone(),
-            },
-        };
-        let summary = if parsed.clean_content.len() > crate::utils::SUMMARY_TRUNCATE_LEN {
-            format!(
-                "{}...",
-                crate::utils::safe_truncate(
-                    &parsed.clean_content,
-                    crate::utils::SUMMARY_TRUNCATE_LEN
-                )
-            )
-        } else {
-            parsed.clean_content.clone()
-        };
-        state.event_bus.emit(EntityEvent::PostInteraction {
-            source,
-            trust: ConversationTrust::Owner,
-            summary,
+        let duration = (Utc::now() - started_at).num_seconds().max(0) as f64;
+        let meta = InteractionMetadata {
             input_tokens: result.total_input_tokens,
             output_tokens: result.total_output_tokens,
-        });
+            tool_rounds: result.tool_rounds_used,
+            duration_secs: Some(duration),
+            session_key: None,
+            hallucination_count: if result.was_truncated { 1 } else { 0 },
+            action_claim_count: result.action_claim_count,
+            circuit_breaker_fires: if result.circuit_breaker_fired { 1 } else { 0 },
+        };
+
+        let interaction = match &intent.source {
+            IntentSource::ScheduledTask(name) => InteractionRecord::from_task(
+                name,
+                &state.config.entity.name,
+                result.messages.clone(),
+                started_at,
+                meta,
+            ),
+            _ => InteractionRecord::from_research(
+                &intent.description,
+                &state.config.entity.name,
+                result.messages.clone(),
+                started_at,
+                meta,
+            ),
+        };
+
+        // Log health warnings if any
+        let health_warnings = interaction.health_warnings();
+        if !health_warnings.is_empty() {
+            tracing::warn!(
+                "Intent '{}' interaction had health issues: {}",
+                intent.id,
+                health_warnings.join(", ")
+            );
+        }
+
+        // Audit: interaction created
+        crate::intake_audit::log(
+            &root_dir,
+            &crate::intake_audit::entry(
+                &interaction.id,
+                &interaction.source_label(),
+                interaction.trust_label(),
+                crate::intake_audit::AuditStage::Created,
+                if health_warnings.is_empty() {
+                    None
+                } else {
+                    Some(format!("health: {}", health_warnings.join(", ")))
+                },
+            ),
+        );
+
+        // Archive the intent conversation — uses archive_without_ephemeral
+        // to avoid flooding EPHEMERAL with one entry per intent execution.
+        // Only emit PostInteraction if archive succeeds — no point triggering
+        // self-assessment on a conversation that wasn't persisted.
+        if let Some(archive_path) = interaction.archive_without_ephemeral(&root_dir) {
+            tracing::info!(
+                "Intent '{}' conversation archived to {}",
+                intent.id,
+                archive_path.display()
+            );
+
+            // Audit: archive succeeded
+            crate::intake_audit::log(
+                &root_dir,
+                &crate::intake_audit::entry(
+                    &interaction.id,
+                    &interaction.source_label(),
+                    interaction.trust_label(),
+                    crate::intake_audit::AuditStage::Archived,
+                    Some(archive_path.display().to_string()),
+                ),
+            );
+
+            // Graph auto-ingest if enabled
+            #[cfg(feature = "graph")]
+            if state.config.graph.enabled && state.config.graph.auto_ingest {
+                crate::session::graph_ingest_archive(&root_dir, &archive_path, None).await;
+            }
+
+            // Emit PostInteraction event — archive verified
+            let receivers = state.event_bus.emit(interaction.to_event());
+            tracing::debug!(
+                "Intent '{}' PostInteraction emitted to {} receivers",
+                intent.id,
+                receivers
+            );
+
+            // Audit: event emitted
+            crate::intake_audit::log(
+                &root_dir,
+                &crate::intake_audit::entry(
+                    &interaction.id,
+                    &interaction.source_label(),
+                    interaction.trust_label(),
+                    crate::intake_audit::AuditStage::EventEmitted,
+                    Some(format!("{} receivers", receivers)),
+                ),
+            );
+        } else {
+            tracing::warn!(
+                "Intent '{}' archive returned None (empty messages?) — PostInteraction NOT emitted",
+                intent.id
+            );
+
+            // Audit: archive failed
+            crate::intake_audit::log(
+                &root_dir,
+                &crate::intake_audit::entry(
+                    &interaction.id,
+                    &interaction.source_label(),
+                    interaction.trust_label(),
+                    crate::intake_audit::AuditStage::ArchiveFailed,
+                    Some("empty messages".to_string()),
+                ),
+            );
+        }
+    } else {
+        // Event-sourced intent — suppressed to prevent feedback loops.
+        // Log for visibility so suppressed intents are trackable.
+        let event_source = match &intent.source {
+            IntentSource::Event(name) => name.clone(),
+            _ => "unknown".to_string(),
+        };
+        tracing::debug!(
+            "Intent '{}' PostInteraction suppressed (event-sourced: {}) — prevents feedback loop",
+            intent.id,
+            event_source
+        );
     }
 
     // Record outcome for caliber-echo
@@ -693,10 +804,19 @@ async fn execute_intent(
         let health = monitor.calculate(&root_dir, &thresholds);
         let new_counts = monitor.counts_from_health(&health);
         let mut pipeline_state = monitor.load_state(&root_dir);
+        let old_counts = pipeline_state.last_counts.clone();
         pipeline_state.update_counts(&new_counts, &chrono::Utc::now().to_rfc3339());
         if let Err(e) = monitor.save_state(&root_dir, &pipeline_state) {
             tracing::error!("Failed to save pipeline state: {}", e);
         }
+
+        // Pipeline change journal — log what changed
+        crate::session::log_pipeline_change(
+            &root_dir,
+            &old_counts,
+            &new_counts,
+            &format!("intent:{}", intent.description),
+        );
 
         // Emit PipelineAlert for documents at hard limit
         let docs = [

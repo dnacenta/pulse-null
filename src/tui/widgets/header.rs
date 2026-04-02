@@ -12,6 +12,7 @@ use crate::tui::screens::EntityState;
 use crate::tui::theme::*;
 use crate::tui::widgets::pulse::PulseColorTransition;
 
+#[allow(clippy::too_many_arguments)]
 pub fn draw(
     frame: &mut Frame,
     area: Rect,

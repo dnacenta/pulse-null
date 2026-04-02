@@ -137,7 +137,7 @@ fn prune_task_output(dir: &Path, max: usize) {
     let mut entries: Vec<_> = match std::fs::read_dir(dir) {
         Ok(rd) => rd
             .flatten()
-            .filter(|e| e.path().extension().map_or(false, |ext| ext == "md"))
+            .filter(|e| e.path().extension().is_some_and(|ext| ext == "md"))
             .collect(),
         Err(_) => return,
     };
