@@ -45,7 +45,7 @@ pub fn write_task_digest_for_date(root_dir: &Path, entity_name: &str, date: &str
     let task_entries: Vec<TaskEntry> = index_content
         .lines()
         .filter(|line| line.starts_with('|') && line.contains(date))
-        .filter_map(|line| parse_index_line(line))
+        .filter_map(parse_index_line)
         .filter(|entry| is_task_trigger(&entry.trigger))
         .collect();
 
@@ -204,7 +204,7 @@ pub fn needs_digest(root_dir: &Path) -> bool {
         return content
             .lines()
             .filter(|line| line.starts_with('|') && line.contains(&today))
-            .filter_map(|line| parse_index_line(line))
+            .filter_map(parse_index_line)
             .any(|entry| is_task_trigger(&entry.trigger));
     }
 
