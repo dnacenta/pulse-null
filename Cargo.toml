@@ -79,7 +79,6 @@ discord-echo = { version = "0.1", optional = true }
 
 [features]
 default = []
-graph = ["recall-echo/graph"]
 voice = ["dep:voice-echo"]
 discord-text = ["dep:discord-echo"]
 all-plugins = ["voice", "discord-text"]

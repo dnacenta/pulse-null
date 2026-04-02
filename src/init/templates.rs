@@ -115,6 +115,11 @@ pipeline_alert = true
 pipeline_frozen = true
 cognitive_decline = true
 
+[graph]
+enabled = true
+auto_ingest = true
+pipeline_sync = true
+
 {plugins_section}
 "#,
         entity_name = data.entity_name,

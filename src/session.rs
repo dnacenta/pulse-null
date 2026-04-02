@@ -362,7 +362,6 @@ pub async fn graph_ingest_archive(
 /// Reads LEARNING.md, THOUGHTS.md, CURIOSITY.md, REFLECTIONS.md, PRAXIS.md
 /// from root_dir/journal/ and syncs them to the graph store in root_dir/memory/graph/.
 /// Uses spawn_blocking + dedicated runtime since SurrealDB types aren't Send.
-#[cfg(feature = "graph")]
 pub async fn graph_sync_pipeline(root_dir: &Path) {
     let graph_dir = root_dir.join("memory").join("graph");
     if !graph_dir.exists() {
@@ -418,7 +417,6 @@ pub async fn graph_sync_pipeline(root_dir: &Path) {
 ///
 /// Reads monitoring/signals.json and caliber/outcomes.json from root_dir
 /// and syncs them to the graph store in root_dir/memory/graph/.
-#[cfg(feature = "graph")]
 pub async fn graph_sync_vigil(root_dir: &Path) {
     let graph_dir = root_dir.join("memory").join("graph");
     if !graph_dir.exists() {
