@@ -62,9 +62,7 @@ pub fn build_conversation_outcome(
         infer_conversation_valence(hallucination_count, circuit_breaker_count, message_count);
 
     // Determine outcome based on session health
-    let outcome = if hallucination_count > 0 || circuit_breaker_count > 0 {
-        Outcome::Partial
-    } else if message_count < 2 {
+    let outcome = if hallucination_count > 0 || circuit_breaker_count > 0 || message_count < 2 {
         Outcome::Partial
     } else {
         Outcome::Success
@@ -106,6 +104,7 @@ pub fn load_outcomes(docs_dir: &Path) -> Vec<OutcomeRecord> {
 }
 
 /// Render a summary of the operational self-model for prompt injection.
+#[allow(dead_code)]
 pub fn render(docs_dir: &Path) -> String {
     let state = CaliberState::load(docs_dir);
     let total = state.outcomes.len();
@@ -318,6 +317,7 @@ pub fn mine_and_update(docs_dir: &Path) -> String {
 }
 
 /// Render a brief outcome line for logging purposes.
+#[allow(dead_code)]
 pub fn render_outcome_line(outcome: &OutcomeRecord) -> String {
     let valence_tag = outcome
         .valence
@@ -467,6 +467,7 @@ pub fn render_for_prompt(docs_dir: &Path) -> Option<String> {
 }
 
 /// Get recent outcomes for a specific domain.
+#[allow(dead_code)]
 pub fn domain_history(docs_dir: &Path, domain: &str, limit: usize) -> Vec<OutcomeRecord> {
     let state = CaliberState::load(docs_dir);
     state
@@ -479,6 +480,7 @@ pub fn domain_history(docs_dir: &Path, domain: &str, limit: usize) -> Vec<Outcom
 }
 
 /// Calculate success rate for a domain. Returns None if no data.
+#[allow(dead_code)]
 pub fn domain_success_rate(docs_dir: &Path, domain: &str) -> Option<f64> {
     let state = CaliberState::load(docs_dir);
     let domain_outcomes: Vec<_> = state

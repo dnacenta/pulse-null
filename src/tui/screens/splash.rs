@@ -65,6 +65,7 @@ pub struct SplashScreen {
     title_progress: usize,
     aurora_waves: [AuroraWave; 3],
     tick: u64,
+    #[allow(dead_code)]
     entity_available: bool,
 }
 

@@ -43,6 +43,7 @@ impl CaliberState {
     }
 
     /// Count outcomes by domain.
+    #[allow(dead_code)]
     pub fn domain_counts(&self) -> Vec<(String, usize)> {
         let mut counts: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
         for o in &self.outcomes {

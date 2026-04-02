@@ -14,6 +14,7 @@ use chrono::Utc;
 use serde::Serialize;
 
 const AUDIT_FILE: &str = "intake-audit.jsonl";
+#[allow(dead_code)]
 const MAX_AUDIT_LINES: usize = 500;
 
 /// A single audit entry recording an interaction's pipeline flow.
@@ -96,6 +97,7 @@ pub fn entry(
 
 /// Rotate the audit file if it exceeds MAX_AUDIT_LINES.
 /// Keeps the most recent half of entries.
+#[allow(dead_code)]
 pub fn rotate_if_needed(root_dir: &Path) {
     let audit_path = root_dir.join(AUDIT_FILE);
 

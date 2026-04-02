@@ -3996,7 +3996,7 @@ dependencies = [
 
 [[package]]
 name = "pulse-null"
-version = "0.25.1"
+version = "0.25.2"
 dependencies = [
  "async-stream",
  "axum",

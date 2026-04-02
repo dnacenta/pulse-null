@@ -49,6 +49,7 @@ impl CaliberEcho {
         Self { docs_dir }
     }
 
+    #[allow(dead_code)]
     pub fn docs_dir(&self) -> &Path {
         &self.docs_dir
     }
