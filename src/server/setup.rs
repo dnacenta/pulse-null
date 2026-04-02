@@ -61,14 +61,11 @@ pub fn register_builtin_tools(root_dir: &Path, config: &Config) -> ToolRegistry 
         root_dir.to_path_buf(),
     )));
     tools.register(Box::new(crate::tools::web_fetch::WebFetchTool::new()));
-    #[cfg(feature = "graph")]
     if config.graph.enabled {
         tools.register(Box::new(crate::tools::graph_query::GraphQueryTool::new(
             root_dir.to_path_buf(),
         )));
     }
-    // Suppress unused variable warning when graph feature is disabled
-    let _ = config;
     tools
 }
 

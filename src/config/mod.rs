@@ -383,7 +383,7 @@ impl Default for EventsConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct GraphConfig {
-    /// Enable graph memory (requires recall-graph)
+    /// Enable graph memory
     pub enabled: bool,
     /// Auto-ingest conversation archives into the graph
     pub auto_ingest: bool,
@@ -394,7 +394,7 @@ pub struct GraphConfig {
 impl Default for GraphConfig {
     fn default() -> Self {
         Self {
-            enabled: false,
+            enabled: true,
             auto_ingest: true,
             pipeline_sync: true,
         }
