@@ -5,6 +5,7 @@
 //! the task is suppressed — no tokens wasted, no redundant diagnosis.
 //!
 //! Phase 1: pipeline_frozen evaluator (timestamp-based document change detection).
+//! Phase 2: cognitive_decline evaluator (signal-based gating) + response quality feedback.
 
 use std::collections::HashMap;
 use std::fs;
@@ -26,6 +27,10 @@ const PIPELINE_DOCS: &[&str] = &[
 /// Safety net: always fire after this many hours of suppression.
 const SAFETY_NET_HOURS: i64 = 48;
 
+/// Extended cooldown multiplier when last response had no tool calls.
+/// If the entity did nothing useful, wait longer before trying again.
+const NO_TOOLS_COOLDOWN_MULTIPLIER: i64 = 2;
+
 /// Per-event tracking state.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EventState {
@@ -40,6 +45,9 @@ pub struct EventState {
     /// How many times this event was suppressed since last fire.
     #[serde(default)]
     pub suppression_count: u32,
+    /// Number of signal frames at the time of last fire (for cognitive_decline).
+    #[serde(default)]
+    pub signal_count_at_fire: Option<usize>,
 }
 
 /// Persistent evaluator state — saved to scheduler_state.json.
@@ -70,9 +78,15 @@ impl SchedulerState {
         }
     }
 
-    /// Save to disk.
+    /// Save to disk. Creates parent directory if it doesn't exist.
     pub fn save(&self, root_dir: &Path) -> Result<(), Box<dyn std::error::Error>> {
         let path = root_dir.join("scheduler_state.json");
+        // Ensure parent directory exists (fixes persistence bug on first boot)
+        if let Some(parent) = path.parent() {
+            if !parent.exists() {
+                fs::create_dir_all(parent)?;
+            }
+        }
         let content = serde_json::to_string_pretty(self)?;
         fs::write(&path, content)?;
         Ok(())
@@ -88,6 +102,27 @@ impl SchedulerState {
                 doc_timestamps,
                 last_response_had_tools: false,
                 suppression_count: 0,
+                signal_count_at_fire: None,
+            },
+        );
+    }
+
+    /// Record that an event fired with signal count tracking (for cognitive_decline).
+    pub fn record_fire_with_signals(
+        &mut self,
+        event_type: &str,
+        docs_dir: &Path,
+        signal_count: usize,
+    ) {
+        let doc_timestamps = read_doc_timestamps(docs_dir);
+        self.events.insert(
+            event_type.to_string(),
+            EventState {
+                last_fired: Utc::now(),
+                doc_timestamps,
+                last_response_had_tools: false,
+                suppression_count: 0,
+                signal_count_at_fire: Some(signal_count),
             },
         );
     }
@@ -135,11 +170,19 @@ pub fn evaluate_pipeline_frozen(state: &SchedulerState, docs_dir: &Path) -> Eval
     };
 
     // Safety net: always fire after SAFETY_NET_HOURS
+    // Extended if last response produced no tool calls.
+    let effective_safety_net = if event_state.last_response_had_tools {
+        SAFETY_NET_HOURS
+    } else {
+        SAFETY_NET_HOURS * NO_TOOLS_COOLDOWN_MULTIPLIER
+    };
+
     let elapsed = Utc::now() - event_state.last_fired;
-    if elapsed.num_hours() >= SAFETY_NET_HOURS {
+    if elapsed.num_hours() >= effective_safety_net {
         tracing::debug!(
-            "pipeline_frozen: safety net triggered ({}h since last fire)",
-            elapsed.num_hours()
+            "pipeline_frozen: safety net triggered ({}h since last fire, threshold: {}h)",
+            elapsed.num_hours(),
+            effective_safety_net
         );
         return EvalDecision::Fire;
     }
@@ -167,13 +210,66 @@ pub fn evaluate_pipeline_frozen(state: &SchedulerState, docs_dir: &Path) -> Eval
 }
 
 /// Evaluate whether a cognitive_decline event should fire.
-/// For now, always fires — Phase 2 will add signal-based gating.
-pub fn evaluate_cognitive_decline(_state: &SchedulerState) -> EvalDecision {
-    EvalDecision::Fire
+///
+/// Returns `Fire` if:
+/// - This event has never fired before
+/// - New signal frames have been recorded since the last fire
+/// - The safety net has elapsed
+///
+/// Returns `Suppress` if:
+/// - No new signal data since the last fire
+/// - The last response produced no tool calls (extended cooldown)
+pub fn evaluate_cognitive_decline(state: &SchedulerState, root_dir: &Path) -> EvalDecision {
+    let event_type = "cognitive_decline";
+
+    let event_state = match state.events.get(event_type) {
+        Some(s) => s,
+        None => return EvalDecision::Fire, // Never fired before
+    };
+
+    let elapsed = Utc::now() - event_state.last_fired;
+
+    // Safety net: always fire after threshold (extended if last response had no tools)
+    let effective_safety_net = if event_state.last_response_had_tools {
+        SAFETY_NET_HOURS
+    } else {
+        SAFETY_NET_HOURS * NO_TOOLS_COOLDOWN_MULTIPLIER
+    };
+    if elapsed.num_hours() >= effective_safety_net {
+        tracing::debug!(
+            "cognitive_decline: safety net triggered ({}h since last fire, threshold: {}h)",
+            elapsed.num_hours(),
+            effective_safety_net
+        );
+        return EvalDecision::Fire;
+    }
+
+    // Check if new signal frames have been added since last fire.
+    // New data always triggers evaluation, regardless of response quality.
+    let current_signal_count = count_signal_frames(root_dir);
+    let last_count = event_state.signal_count_at_fire.unwrap_or(0);
+
+    if current_signal_count > last_count {
+        tracing::debug!(
+            "cognitive_decline: {} new signal frames since last fire ({} → {})",
+            current_signal_count - last_count,
+            last_count,
+            current_signal_count
+        );
+        return EvalDecision::Fire;
+    }
+
+    tracing::debug!(
+        "cognitive_decline: suppressed — no new signals since last fire (count: {}, suppression #{})",
+        current_signal_count,
+        event_state.suppression_count + 1
+    );
+    EvalDecision::Suppress
 }
 
 /// Evaluate whether a pipeline_conversion_low event should fire.
 /// Same timestamp logic as pipeline_frozen — suppress if nothing changed.
+/// Extended cooldown if last response had no tool calls.
 pub fn evaluate_pipeline_conversion_low(state: &SchedulerState, docs_dir: &Path) -> EvalDecision {
     let event_type = "pipeline_conversion_low";
 
@@ -182,9 +278,15 @@ pub fn evaluate_pipeline_conversion_low(state: &SchedulerState, docs_dir: &Path)
         None => return EvalDecision::Fire,
     };
 
-    // Safety net
+    // Safety net — extended if last response had no tools
+    let effective_safety_net = if event_state.last_response_had_tools {
+        SAFETY_NET_HOURS
+    } else {
+        SAFETY_NET_HOURS * NO_TOOLS_COOLDOWN_MULTIPLIER
+    };
+
     let elapsed = Utc::now() - event_state.last_fired;
-    if elapsed.num_hours() >= SAFETY_NET_HOURS {
+    if elapsed.num_hours() >= effective_safety_net {
         return EvalDecision::Fire;
     }
 
@@ -219,6 +321,24 @@ fn read_doc_timestamps(docs_dir: &Path) -> HashMap<String, i64> {
         }
     }
     timestamps
+}
+
+/// Count signal frames in the monitoring signals file.
+/// Used by the cognitive_decline evaluator to check for new data.
+fn count_signal_frames(root_dir: &Path) -> usize {
+    let path = root_dir.join("monitoring/signals.json");
+    if !path.exists() {
+        return 0;
+    }
+    match fs::read_to_string(&path) {
+        Ok(content) => {
+            // Parse as JSON array and count elements
+            serde_json::from_str::<Vec<serde_json::Value>>(&content)
+                .map(|v| v.len())
+                .unwrap_or(0)
+        }
+        Err(_) => 0,
+    }
 }
 
 /// Get the docs_dir for pipeline documents from root_dir.
@@ -297,9 +417,10 @@ mod tests {
         let mut state = SchedulerState::default();
         state.record_fire("pipeline_frozen", tmp.path());
 
-        // Manually set last_fired to 49 hours ago
+        // Manually set last_fired to 49 hours ago with tools used (standard 48h safety net)
         if let Some(es) = state.events.get_mut("pipeline_frozen") {
             es.last_fired = Utc::now() - chrono::Duration::hours(49);
+            es.last_response_had_tools = true;
         }
 
         assert_eq!(
@@ -368,5 +489,178 @@ mod tests {
             evaluate_pipeline_conversion_low(&state, tmp.path()),
             EvalDecision::Suppress
         );
+    }
+
+    // --- Phase 2 tests ---
+
+    #[test]
+    fn cognitive_decline_first_fire() {
+        let state = SchedulerState::default();
+        let tmp = TempDir::new().unwrap();
+        assert_eq!(
+            evaluate_cognitive_decline(&state, tmp.path()),
+            EvalDecision::Fire
+        );
+    }
+
+    #[test]
+    fn cognitive_decline_suppress_no_new_signals() {
+        let tmp = TempDir::new().unwrap();
+        // Create monitoring dir with empty signals
+        fs::create_dir_all(tmp.path().join("monitoring")).unwrap();
+        fs::write(tmp.path().join("monitoring/signals.json"), "[]").unwrap();
+
+        let mut state = SchedulerState::default();
+        state.record_fire_with_signals("cognitive_decline", tmp.path(), 0);
+
+        // No new signals — should suppress
+        assert_eq!(
+            evaluate_cognitive_decline(&state, tmp.path()),
+            EvalDecision::Suppress
+        );
+    }
+
+    #[test]
+    fn cognitive_decline_fire_on_new_signals() {
+        let tmp = TempDir::new().unwrap();
+        fs::create_dir_all(tmp.path().join("monitoring")).unwrap();
+
+        // Start with 0 signals at last fire
+        let mut state = SchedulerState::default();
+        state.record_fire_with_signals("cognitive_decline", tmp.path(), 0);
+
+        // Add 2 signal frames
+        let signals = r#"[{"timestamp":"2026-04-02T10:00:00Z","task_id":"test","vocabulary_diversity":0.7,"question_count":3,"evidence_references":2,"thought_progress":true},{"timestamp":"2026-04-02T11:00:00Z","task_id":"test","vocabulary_diversity":0.6,"question_count":1,"evidence_references":1,"thought_progress":false}]"#;
+        fs::write(tmp.path().join("monitoring/signals.json"), signals).unwrap();
+
+        // New signals available — should fire
+        assert_eq!(
+            evaluate_cognitive_decline(&state, tmp.path()),
+            EvalDecision::Fire
+        );
+    }
+
+    #[test]
+    fn cognitive_decline_safety_net() {
+        let tmp = TempDir::new().unwrap();
+        fs::create_dir_all(tmp.path().join("monitoring")).unwrap();
+        fs::write(tmp.path().join("monitoring/signals.json"), "[]").unwrap();
+
+        let mut state = SchedulerState::default();
+        state.record_fire_with_signals("cognitive_decline", tmp.path(), 0);
+
+        // Set last_fired to 49 hours ago
+        if let Some(es) = state.events.get_mut("cognitive_decline") {
+            es.last_fired = Utc::now() - chrono::Duration::hours(49);
+            es.last_response_had_tools = true; // Standard safety net (48h)
+        }
+
+        assert_eq!(
+            evaluate_cognitive_decline(&state, tmp.path()),
+            EvalDecision::Fire
+        );
+    }
+
+    #[test]
+    fn cognitive_decline_extended_cooldown_no_tools() {
+        let tmp = TempDir::new().unwrap();
+        fs::create_dir_all(tmp.path().join("monitoring")).unwrap();
+        fs::write(tmp.path().join("monitoring/signals.json"), "[]").unwrap();
+
+        let mut state = SchedulerState::default();
+        state.record_fire_with_signals("cognitive_decline", tmp.path(), 0);
+
+        // Set last_fired to 49 hours ago but last response had no tools
+        if let Some(es) = state.events.get_mut("cognitive_decline") {
+            es.last_fired = Utc::now() - chrono::Duration::hours(49);
+            es.last_response_had_tools = false; // Extended cooldown (96h)
+        }
+
+        // 49h < 96h extended cooldown — should still suppress
+        assert_eq!(
+            evaluate_cognitive_decline(&state, tmp.path()),
+            EvalDecision::Suppress
+        );
+    }
+
+    #[test]
+    fn pipeline_frozen_extended_cooldown_no_tools() {
+        let tmp = TempDir::new().unwrap();
+        setup_docs(tmp.path());
+
+        let mut state = SchedulerState::default();
+        state.record_fire("pipeline_frozen", tmp.path());
+
+        // Set last response had no tools and 49 hours elapsed
+        if let Some(es) = state.events.get_mut("pipeline_frozen") {
+            es.last_fired = Utc::now() - chrono::Duration::hours(49);
+            es.last_response_had_tools = false; // Extended to 96h
+        }
+
+        // 49h < 96h extended safety net — should still suppress
+        assert_eq!(
+            evaluate_pipeline_frozen(&state, tmp.path()),
+            EvalDecision::Suppress
+        );
+    }
+
+    #[test]
+    fn pipeline_frozen_normal_cooldown_with_tools() {
+        let tmp = TempDir::new().unwrap();
+        setup_docs(tmp.path());
+
+        let mut state = SchedulerState::default();
+        state.record_fire("pipeline_frozen", tmp.path());
+
+        // Set last response had tools and 49 hours elapsed
+        if let Some(es) = state.events.get_mut("pipeline_frozen") {
+            es.last_fired = Utc::now() - chrono::Duration::hours(49);
+            es.last_response_had_tools = true; // Standard 48h
+        }
+
+        // 49h > 48h standard safety net — should fire
+        assert_eq!(
+            evaluate_pipeline_frozen(&state, tmp.path()),
+            EvalDecision::Fire
+        );
+    }
+
+    #[test]
+    fn record_fire_with_signals_tracks_count() {
+        let tmp = TempDir::new().unwrap();
+        setup_docs(tmp.path());
+
+        let mut state = SchedulerState::default();
+        state.record_fire_with_signals("cognitive_decline", tmp.path(), 42);
+
+        let es = state.events.get("cognitive_decline").unwrap();
+        assert_eq!(es.signal_count_at_fire, Some(42));
+        assert_eq!(es.suppression_count, 0);
+    }
+
+    #[test]
+    fn save_creates_parent_directories() {
+        let tmp = TempDir::new().unwrap();
+        let nested = tmp.path().join("deep/nested/dir");
+
+        let state = SchedulerState::default();
+        // Should not fail even though directories don't exist
+        assert!(state.save(&nested).is_ok());
+        assert!(nested.join("scheduler_state.json").exists());
+    }
+
+    #[test]
+    fn count_signal_frames_empty() {
+        let tmp = TempDir::new().unwrap();
+        assert_eq!(count_signal_frames(tmp.path()), 0);
+    }
+
+    #[test]
+    fn count_signal_frames_with_data() {
+        let tmp = TempDir::new().unwrap();
+        fs::create_dir_all(tmp.path().join("monitoring")).unwrap();
+        let signals = r#"[{"a":1},{"b":2},{"c":3}]"#;
+        fs::write(tmp.path().join("monitoring/signals.json"), signals).unwrap();
+        assert_eq!(count_signal_frames(tmp.path()), 3);
     }
 }
