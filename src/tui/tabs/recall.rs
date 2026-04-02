@@ -116,7 +116,6 @@ impl RecallTab {
         self.start_graph_fetch(graph_dir);
     }
 
-    #[cfg(feature = "graph")]
     fn start_graph_fetch(&mut self, graph_dir: PathBuf) {
         let (tx, rx) = mpsc::channel(1);
         // Swap to unbounded-style: we only ever send one message, so capacity 1 is fine.
@@ -191,12 +190,6 @@ impl RecallTab {
         // Convert to a blocking try_recv-compatible receiver by wrapping
         // We need to store the receiver for polling in handle_tick
         self.pending_load = Some(rx);
-    }
-
-    #[cfg(not(feature = "graph"))]
-    fn start_graph_fetch(&mut self, _graph_dir: PathBuf) {
-        self.state = GraphState::NotEnabled;
-        self.loaded = true;
     }
 
     /// Apply results from a completed background graph load.

@@ -1,7 +1,6 @@
 pub mod file_list;
 pub mod file_read;
 pub mod file_write;
-#[cfg(feature = "graph")]
 pub mod graph_query;
 pub mod grep;
 pub mod web_fetch;
