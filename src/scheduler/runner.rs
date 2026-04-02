@@ -447,7 +447,7 @@ async fn execute_task(
     // Build InteractionRecord for unified intake — archives, emits event, enables graph ingestion
     let duration = (Utc::now() - started_at).num_seconds().max(0) as f64;
     let interaction = InteractionRecord::from_task(
-        &task.name,
+        &task.id,
         &state.config.entity.name,
         transcript,
         started_at,

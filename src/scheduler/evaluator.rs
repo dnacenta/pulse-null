@@ -51,11 +51,22 @@ pub struct SchedulerState {
 
 impl SchedulerState {
     /// Load from disk, or return default if file doesn't exist.
+    /// Creates the state file on first boot so subsequent saves always have a target.
     pub fn load(root_dir: &Path) -> Self {
         let path = root_dir.join("scheduler_state.json");
         match fs::read_to_string(&path) {
             Ok(content) => serde_json::from_str(&content).unwrap_or_default(),
-            Err(_) => Self::default(),
+            Err(_) => {
+                tracing::info!(
+                    "No scheduler_state.json found at {} — initializing default state",
+                    path.display()
+                );
+                let state = Self::default();
+                if let Err(e) = state.save(root_dir) {
+                    tracing::warn!("Failed to create initial scheduler_state.json: {}", e);
+                }
+                state
+            }
         }
     }
 
