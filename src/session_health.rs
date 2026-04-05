@@ -85,6 +85,9 @@ pub struct SessionHealthSnapshot {
     pub hallucination_rate: f64,
     /// Risk factors contributing to current status.
     pub risk_factors: Vec<String>,
+    /// Context quality score (ratio of fresh content to total context).
+    /// 1.0 = all fresh, <0.5 = dominated by compressed history.
+    pub context_quality_score: f64,
 }
 
 /// Compute health status and snapshot for a session.
@@ -146,6 +149,16 @@ pub fn assess_session(data: &SessionData, config: &SessionHealthConfig) -> Sessi
         severity = severity.max(1);
     }
 
+    // Context quality score — low quality means context is dominated by compressed history
+    let quality_score = data.compaction.context_quality_score;
+    if quality_score > 0.0 && quality_score < 0.5 {
+        risk_factors.push(format!(
+            "Context quality score: {:.2} — dominated by compressed history",
+            quality_score
+        ));
+        severity = severity.max(1);
+    }
+
     // Compound escalation: multiple indicators active simultaneously
     let indicator_count = [
         data.health.hallucination_count > 0,
@@ -191,6 +204,7 @@ pub fn assess_session(data: &SessionData, config: &SessionHealthConfig) -> Sessi
         message_count: data.messages.len(),
         hallucination_rate,
         risk_factors,
+        context_quality_score: data.compaction.context_quality_score,
     }
 }
 
