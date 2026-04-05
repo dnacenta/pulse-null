@@ -24,6 +24,7 @@ const STRIP_MIN_CONTENT_BYTES: usize = 200;
 
 /// Result of a MicroCompact pass.
 #[derive(Debug, Clone, Default)]
+#[allow(dead_code)]
 pub struct MicroCompactResult {
     /// Estimated tokens saved by this compaction pass.
     pub tokens_saved: usize,

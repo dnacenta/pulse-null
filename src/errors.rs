@@ -1,3 +1,7 @@
+#![allow(dead_code)]
+// Error types defined for incremental migration from Box<dyn Error>.
+// Not all variants are wired in yet — suppress dead_code until migration completes.
+
 use thiserror::Error;
 
 /// Configuration errors — loading, parsing, validation.

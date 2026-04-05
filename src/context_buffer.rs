@@ -166,6 +166,7 @@ impl ContextBufferStore {
     }
 
     /// Get the current buffer contents for a channel, formatted for LLM injection.
+    #[allow(dead_code)]
     pub async fn get_context(&self, channel: &str) -> Option<String> {
         let buffers = self.buffers.read().await;
         let buffer = buffers.get(channel)?;

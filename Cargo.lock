@@ -4363,7 +4363,7 @@ checksum = "bbc4a4ea2a66a41a1152c4b3d86e8954dc087bdf33af35446e6e176db4e73c8c"
 [[package]]
 name = "recall-echo"
 version = "3.5.1"
-source = "git+https://github.com/dnacenta/recall-echo.git?branch=fix/drop-openssl-use-rustls#c28ddf5c7603cd056ed0c1b356e54120d46f2224"
+source = "git+https://github.com/dnacenta/recall-echo.git?tag=v3.5.1#165d0f3b471088f34cf5797fae56f68b58485ac6"
 dependencies = [
  "async-trait",
  "chrono",

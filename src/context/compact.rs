@@ -13,7 +13,8 @@ use super::tokens::{
 use crate::session_store::RecentFile;
 
 /// Result of a Tier 2 AutoCompact pass.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
+#[allow(dead_code)]
 pub struct CompactionResult {
     /// Whether compaction actually occurred.
     pub compacted: bool,
@@ -31,19 +32,6 @@ pub struct CompactionResult {
     pub compaction_failures: u32,
 }
 
-impl Default for CompactionResult {
-    fn default() -> Self {
-        Self {
-            compacted: false,
-            tokens_before: 0,
-            tokens_after: 0,
-            messages_summarized: 0,
-            circuit_breaker_fired: false,
-            files_reinjected: 0,
-            compaction_failures: 0,
-        }
-    }
-}
 
 /// The structured summarization prompt for Tier 2 AutoCompact.
 ///

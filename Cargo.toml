@@ -76,7 +76,7 @@ libc = "0.2"
 pulse-system-types = "0.6.3"
 
 # Core dependencies (always included — these define an entity)
-recall-echo = { git = "https://github.com/dnacenta/recall-echo.git", branch = "fix/drop-openssl-use-rustls", features = ["pulse-null"] }
+recall-echo = { git = "https://github.com/dnacenta/recall-echo.git", tag = "v3.5.1", features = ["pulse-null"] }
 vigil-pulse = "0.1"
 
 # Plugins (optional — different interfaces to speak through)

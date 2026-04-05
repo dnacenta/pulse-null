@@ -103,11 +103,11 @@ pub async fn run_task_loop(
                 eval_state.record_suppression(&task.id);
                 let state_clone = eval_state.clone();
                 let rd = root_dir.clone();
-                let _ = tokio::task::spawn_blocking(move || {
+                drop(tokio::task::spawn_blocking(move || {
                     if let Err(e) = state_clone.save(&rd) {
                         tracing::error!("Failed to persist evaluator state: {}", e);
                     }
-                });
+                }));
                 continue;
             }
         }
@@ -332,11 +332,11 @@ async fn execute_task(
         eval_state.record_response_quality(&task.id, tool_rounds > 0);
         let state_clone = eval_state.clone();
         let rd = root_dir.clone();
-        let _ = tokio::task::spawn_blocking(move || {
+        drop(tokio::task::spawn_blocking(move || {
             if let Err(e) = state_clone.save(&rd) {
                 tracing::error!("Failed to persist evaluator state: {}", e);
             }
-        });
+        }));
     }
 
     // Parse and route output markers

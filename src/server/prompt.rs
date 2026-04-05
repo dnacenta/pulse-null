@@ -66,6 +66,7 @@ struct PromptComponent {
 
 /// Result of system prompt assembly, including the prompt text and metrics.
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub struct SystemPromptResult {
     /// The assembled system prompt text.
     pub prompt: String,
