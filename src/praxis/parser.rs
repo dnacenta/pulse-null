@@ -354,8 +354,7 @@ fn parse_date_to_days(date: &str) -> Option<i64> {
     let year: i64 = date[..4].parse().ok()?;
     let month: i64 = date[5..7].parse().ok()?;
     let day: i64 = date[8..10].parse().ok()?;
-    // Rough approximation
-    Some(year * 365 + month * 30 + day)
+    Some(super::state::date_to_days(year, month, day))
 }
 
 /// Convenience: scan using config paths.
@@ -435,17 +434,14 @@ mod tests {
         let thoughts_path = dir.path().join("THOUGHTS.md");
         let today = super::super::state::today_iso(); // "YYYY-MM-DD"
         let five_days_ago = {
-            // Subtract ~5 days using rough date math
             let y: i64 = today[..4].parse().unwrap();
             let m: i64 = today[5..7].parse().unwrap();
             let d: i64 = today[8..10].parse().unwrap();
-            let new_d = d - 5;
-            if new_d > 0 {
-                format!("{:04}-{:02}-{:02}", y, m, new_d)
-            } else {
-                // Roll back month (rough, good enough for test)
-                format!("{:04}-{:02}-{:02}", y, m - 1, 25)
-            }
+            // Use accurate date_to_days/days_to_date to subtract exactly 5 days
+            let today_days = super::super::state::date_to_days(y, m, d);
+            let target_days = (today_days - 5) as u64;
+            let (ty, tm, td) = super::super::state::days_to_date(target_days);
+            format!("{:04}-{:02}-{:02}", ty, tm, td)
         };
         let mut f = std::fs::File::create(&thoughts_path).unwrap();
         writeln!(

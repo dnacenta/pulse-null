@@ -112,7 +112,7 @@ pub fn today_iso() -> String {
     ts[..10].to_string()
 }
 
-fn days_to_date(days_since_epoch: u64) -> (u64, u64, u64) {
+pub(crate) fn days_to_date(days_since_epoch: u64) -> (u64, u64, u64) {
     // Algorithm from http://howardhinnant.github.io/date_algorithms.html
     let z = days_since_epoch + 719468;
     let era = z / 146097;
@@ -125,4 +125,16 @@ fn days_to_date(days_since_epoch: u64) -> (u64, u64, u64) {
     let m = if mp < 10 { mp + 3 } else { mp - 9 };
     let year = if m <= 2 { y + 1 } else { y };
     (year, m, d)
+}
+
+/// Inverse of days_to_date: convert (year, month, day) to days since Unix epoch.
+/// Algorithm from http://howardhinnant.github.io/date_algorithms.html (days_from_civil)
+pub(crate) fn date_to_days(year: i64, month: i64, day: i64) -> i64 {
+    let y = if month <= 2 { year - 1 } else { year };
+    let era = if y >= 0 { y } else { y - 399 } / 400;
+    let yoe = (y - era * 400) as u64;
+    let mp = if month > 2 { month - 3 } else { month + 9 } as u64;
+    let doy = (153 * mp + 2) / 5 + day as u64 - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    era * 146097 + doe as i64 - 719468
 }
