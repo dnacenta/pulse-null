@@ -121,6 +121,7 @@ fn test_config() -> Config {
         context_buffer: crate::context_buffer::ContextBufferConfig::default(),
         session_health: crate::session_health::SessionHealthConfig::default(),
         platform: crate::config::PlatformConfig::default(),
+        system_prompt_budget: crate::config::SystemPromptBudgetConfig::default(),
         peers: HashMap::new(),
         plugins: HashMap::new(),
     }
@@ -144,6 +145,7 @@ async fn build_state(provider: MockProvider, tools: ToolRegistry) -> Arc<AppStat
         crate::session_store::SessionStore::new(&root_dir, &config.sessions, &config.entity.name)
             .await;
     let plugin_manager = crate::plugins::manager::PluginManager::new(&config);
+    let alert_queue = crate::scheduler::alerts::AlertQueue::load(&root_dir);
     Arc::new(AppState {
         config,
         provider: Box::new(provider),
@@ -159,6 +161,7 @@ async fn build_state(provider: MockProvider, tools: ToolRegistry) -> Arc<AppStat
         persist_coordinator: Arc::new(PersistCoordinator::new()),
         plugin_manager: tokio::sync::Mutex::new(plugin_manager),
         wal: None,
+        alert_queue: tokio::sync::Mutex::new(alert_queue),
     })
 }
 

@@ -12,13 +12,20 @@ pub struct OllamaProvider {
     client: reqwest::Client,
 }
 
+/// Default timeout for Ollama API requests (2 minutes).
+const API_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
+
 impl OllamaProvider {
     pub fn new(model: String, base_url: Option<String>) -> Self {
         let base_url = base_url.unwrap_or_else(|| "http://localhost:11434".to_string());
+        let client = reqwest::Client::builder()
+            .timeout(API_TIMEOUT)
+            .build()
+            .unwrap_or_else(|_| reqwest::Client::new());
         Self {
             base_url,
             model,
-            client: reqwest::Client::new(),
+            client,
         }
     }
 

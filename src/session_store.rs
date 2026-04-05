@@ -4,26 +4,37 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use chrono::{DateTime, Utc};
-use pulse_system_types::llm::Message;
+use pulse_system_types::llm::{Message, MessageContent, MessageSource, Role};
 use serde::{Deserialize, Serialize};
 use tokio::sync::RwLock;
 
 use crate::persist::PersistCoordinator;
 
+/// A recently accessed file tracked for post-compaction re-injection.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RecentFile {
+    /// Absolute path of the file.
+    pub path: String,
+    /// Brief content snippet (first N bytes) for re-injection.
+    /// Capped at `MAX_REINJECTION_FILE_BYTES` per file.
+    pub snippet: String,
+    /// When this file was last accessed in the session.
+    pub accessed_at: DateTime<Utc>,
+}
+
+/// Maximum number of recently accessed files to track.
+pub const MAX_RECENT_FILES: usize = 5;
+
+/// Maximum bytes per file snippet for re-injection (5K tokens ~ 20K chars).
+pub const MAX_REINJECTION_FILE_BYTES: usize = 20_000;
+
 /// Hard cap on messages stored per session.
 /// When exceeded, the oldest messages are drained to keep the most recent ones.
 pub const MAX_MESSAGES_PER_SESSION: usize = 200;
 
-/// Serializable session state persisted to disk.
+/// WAL (write-ahead log) tracking state for a session.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SessionData {
-    pub key: String,
-    pub channel: String,
-    pub sender: String,
-    pub messages: Vec<Message>,
-    pub created_at: DateTime<Utc>,
-    pub last_active: DateTime<Utc>,
-    pub message_count: usize,
+pub struct WalState {
     /// WAL sequence counter (increments with each message written to WAL).
     #[serde(default)]
     pub wal_seq: u64,
@@ -33,6 +44,21 @@ pub struct SessionData {
     /// Timestamp of the last checkpoint (or session creation if no checkpoint yet).
     #[serde(default = "Utc::now")]
     pub last_checkpoint_time: DateTime<Utc>,
+}
+
+impl Default for WalState {
+    fn default() -> Self {
+        Self {
+            wal_seq: 0,
+            messages_since_checkpoint: 0,
+            last_checkpoint_time: Utc::now(),
+        }
+    }
+}
+
+/// Session health counters tracking hallucination and degradation signals.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct HealthCounters {
     /// Consecutive LLM invocations without a real human message.
     /// Reset to 0 when a MessageSource::Human message is added.
     #[serde(default)]
@@ -48,6 +74,63 @@ pub struct SessionData {
     pub circuit_breaker_count: u32,
 }
 
+/// Compaction metrics tracking token recovery and context management.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct CompactionMetrics {
+    /// Estimated total tokens in the current conversation (system prompt + messages).
+    /// Updated after each message add, compaction, or reset.
+    #[serde(default)]
+    pub estimated_tokens: usize,
+    /// Number of compaction events in this session's lifetime.
+    #[serde(default)]
+    pub compaction_count: u32,
+    /// Cumulative tokens recovered by MicroCompact (Tier 1) in this session.
+    #[serde(default)]
+    pub micro_compact_savings: usize,
+    /// Total tokens recovered by AutoCompact (Tier 2) in this session.
+    #[serde(default)]
+    pub total_tokens_recovered_compact: usize,
+    /// Timestamp of the last successful compaction.
+    #[serde(default)]
+    pub last_compaction_at: Option<DateTime<Utc>>,
+    /// Consecutive compaction failures (circuit breaker counter).
+    /// Reset to 0 on success. At 3, compaction is frozen.
+    #[serde(default)]
+    pub compaction_failures: u32,
+    /// File paths recently accessed during tool use (for post-compaction re-injection).
+    /// Capped at a small number of entries; oldest evicted on overflow.
+    #[serde(default)]
+    pub recently_accessed_files: Vec<RecentFile>,
+    /// Estimated token count of the system prompt at last measurement.
+    /// Updated when the system prompt is built for this session's LLM call.
+    /// Phase 6: System Prompt Budgeting.
+    #[serde(default)]
+    pub system_prompt_tokens: usize,
+}
+
+/// Serializable session state persisted to disk.
+///
+/// Sub-structs use `#[serde(flatten)]` so the serialized JSON remains flat —
+/// backward compatible with existing session files on disk.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SessionData {
+    pub key: String,
+    pub channel: String,
+    pub sender: String,
+    pub messages: Vec<Message>,
+    pub created_at: DateTime<Utc>,
+    pub last_active: DateTime<Utc>,
+    /// Historical message counter — only increments, never decremented by compaction.
+    /// For the *current* message count, use `messages.len()`.
+    pub message_count: usize,
+    #[serde(flatten)]
+    pub wal: WalState,
+    #[serde(flatten)]
+    pub health: HealthCounters,
+    #[serde(flatten)]
+    pub compaction: CompactionMetrics,
+}
+
 impl SessionData {
     /// Enforce the hard message cap, draining the oldest messages when exceeded.
     pub fn enforce_message_cap(&mut self) {
@@ -56,6 +139,210 @@ impl SessionData {
             self.messages.drain(..excess);
         }
     }
+
+    /// Record a recently accessed file for post-compaction re-injection.
+    ///
+    /// Keeps at most `MAX_RECENT_FILES` entries. If the file is already tracked,
+    /// its snippet and timestamp are updated. Otherwise the oldest entry is evicted.
+    pub fn record_file_access(&mut self, path: &str, content: &str) {
+        let snippet = if content.len() > MAX_REINJECTION_FILE_BYTES {
+            crate::utils::safe_truncate(content, MAX_REINJECTION_FILE_BYTES).to_string()
+        } else {
+            content.to_string()
+        };
+
+        // Update existing entry if the path matches
+        if let Some(entry) = self
+            .compaction
+            .recently_accessed_files
+            .iter_mut()
+            .find(|f| f.path == path)
+        {
+            entry.snippet = snippet;
+            entry.accessed_at = Utc::now();
+            return;
+        }
+
+        // Evict oldest if at capacity
+        if self.compaction.recently_accessed_files.len() >= MAX_RECENT_FILES {
+            // Find index of oldest entry
+            if let Some(oldest_idx) = self
+                .compaction
+                .recently_accessed_files
+                .iter()
+                .enumerate()
+                .min_by_key(|(_, f)| f.accessed_at)
+                .map(|(i, _)| i)
+            {
+                self.compaction.recently_accessed_files.remove(oldest_idx);
+            }
+        }
+
+        self.compaction.recently_accessed_files.push(RecentFile {
+            path: path.to_string(),
+            snippet,
+            accessed_at: Utc::now(),
+        });
+    }
+
+    /// Check if session limits are exceeded and a reset should be triggered.
+    ///
+    /// Returns true if the session should be reset based on:
+    /// - Message count exceeding the channel's message cap
+    /// - Session duration exceeding the channel's time cap
+    /// - Hallucination count exceeding threshold (default: 3)
+    pub fn should_reset(&self, limits: &crate::config::ChannelLimits) -> bool {
+        // Message cap check
+        if limits.message_cap > 0 && self.messages.len() >= limits.message_cap {
+            return true;
+        }
+
+        // Time cap check
+        if limits.time_cap_seconds > 0 {
+            let elapsed = Utc::now()
+                .signed_duration_since(self.created_at)
+                .num_seconds();
+            if elapsed >= limits.time_cap_seconds as i64 {
+                return true;
+            }
+        }
+
+        // Hallucination threshold (hardcoded at 3 for Phase 1)
+        if self.health.hallucination_count >= 3 {
+            return true;
+        }
+
+        false
+    }
+
+    /// Build a structured handoff summary from the current session state.
+    ///
+    /// The handoff captures the essential context needed to continue the
+    /// conversation in a fresh session: what the user last asked, what was
+    /// being worked on, and key session metadata.
+    pub fn build_handoff(&self) -> Option<String> {
+        if self.messages.is_empty() {
+            return None;
+        }
+
+        let mut handoff = String::from(
+            "[Session handoff — this is a continuation from a previous session \
+             that was automatically reset to maintain context quality]\n\n",
+        );
+
+        // Find the last human message (strip system prefixes for clean handoff)
+        let last_human = self
+            .messages
+            .iter()
+            .rev()
+            .find(|m| matches!(m.source, Some(MessageSource::Human { .. })));
+
+        if let Some(human_msg) = last_human {
+            let text = match &human_msg.content {
+                MessageContent::Text(t) => crate::session::strip_system_prefixes(t),
+                MessageContent::Blocks(_) => String::from("[complex message]"),
+            };
+            if !text.is_empty() {
+                handoff.push_str(&format!("**Last user message:** {}\n\n", text));
+            }
+        }
+
+        // Include the last assistant message (truncated) for continuity
+        let last_assistant = self
+            .messages
+            .iter()
+            .rev()
+            .find(|m| matches!(m.role, Role::Assistant));
+
+        if let Some(asst_msg) = last_assistant {
+            let text = match &asst_msg.content {
+                MessageContent::Text(t) => {
+                    if t.len() > 500 {
+                        format!("{}...", crate::utils::safe_truncate(t, 497))
+                    } else {
+                        t.clone()
+                    }
+                }
+                MessageContent::Blocks(_) => String::from("[complex response]"),
+            };
+            handoff.push_str(&format!(
+                "**Last assistant response (truncated):** {}\n\n",
+                text
+            ));
+        }
+
+        handoff.push_str(&format!(
+            "Previous session: {} messages, {} compaction(s), {} hallucination(s) detected.\n",
+            self.messages.len(),
+            self.compaction.compaction_count,
+            self.health.hallucination_count,
+        ));
+
+        Some(handoff)
+    }
+}
+
+/// Reset a session with a structured handoff.
+///
+/// Archives the current conversation (via end_session), clears the session,
+/// and inserts a handoff summary as the first message of the new session.
+/// Returns the archive path if archiving succeeded.
+pub fn reset_session(
+    data: &mut SessionData,
+    root_dir: &Path,
+    entity_name: &str,
+) -> Option<PathBuf> {
+    if data.messages.is_empty() {
+        return None;
+    }
+
+    // Build handoff before clearing
+    let handoff = data.build_handoff();
+
+    let msg_count = data.messages.len();
+    let compactions = data.compaction.compaction_count;
+
+    // Archive current session (full end: archive + EPHEMERAL + LOGBOOK)
+    let archive_path = crate::session::end_session(
+        root_dir,
+        entity_name,
+        &data.messages,
+        &data.channel,
+        "session-reset",
+        Some(&data.key),
+    );
+
+    tracing::info!(
+        "[session-reset] key={} msgs={} compactions={} hallucinations={} → fresh session",
+        data.key,
+        msg_count,
+        compactions,
+        data.health.hallucination_count,
+    );
+
+    // Clear messages and reset counters
+    data.messages.clear();
+    data.message_count = 0;
+    data.created_at = Utc::now();
+    data.last_active = Utc::now();
+    // Note: wal_seq is NOT reset — it continues incrementing for WAL consistency
+    data.wal.messages_since_checkpoint = 0;
+    data.wal.last_checkpoint_time = Utc::now();
+    data.health = HealthCounters::default();
+    data.compaction = CompactionMetrics::default();
+
+    // Insert handoff as first message of the new session
+    if let Some(handoff_text) = handoff {
+        let msg = Message {
+            role: Role::User,
+            content: MessageContent::Text(handoff_text),
+            source: Some(MessageSource::System),
+        };
+        data.compaction.estimated_tokens = crate::context::estimate_message_tokens(&msg);
+        data.messages.push(msg);
+    }
+
+    archive_path
 }
 
 /// Runtime session wrapper with tracking metadata.
@@ -76,13 +363,13 @@ impl Session {
                 created_at: now,
                 last_active: now,
                 message_count: 0,
-                wal_seq: 0,
-                messages_since_checkpoint: 0,
-                last_checkpoint_time: now,
-                rounds_since_human_input: 0,
-                hallucination_count: 0,
-                action_claim_count: 0,
-                circuit_breaker_count: 0,
+                wal: WalState {
+                    wal_seq: 0,
+                    messages_since_checkpoint: 0,
+                    last_checkpoint_time: now,
+                },
+                health: HealthCounters::default(),
+                compaction: CompactionMetrics::default(),
             },
             dirty: false,
         }
@@ -233,6 +520,18 @@ impl SessionStore {
     fn key_to_filename(key: &str) -> String {
         // Replace : with -- for filesystem safety
         format!("{}.json", key.replace(':', "--"))
+    }
+
+    /// Get an existing session without creating a new one.
+    /// Returns None if no session exists for this channel/sender.
+    pub async fn get_existing(
+        &self,
+        channel: &str,
+        sender: Option<&str>,
+    ) -> Option<std::sync::Arc<RwLock<Session>>> {
+        let key = Self::session_key(channel, sender);
+        let sessions = self.sessions.read().await;
+        sessions.get(&key).map(std::sync::Arc::clone)
     }
 
     /// Get or create a session for the given channel and sender.
@@ -497,9 +796,23 @@ impl SessionStore {
                 created_at: session.data.created_at.to_rfc3339(),
                 last_active: session.data.last_active.to_rfc3339(),
                 health_status: health.status.to_string(),
-                hallucination_count: session.data.hallucination_count,
-                action_claim_count: session.data.action_claim_count,
-                circuit_breaker_count: session.data.circuit_breaker_count,
+                hallucination_count: session.data.health.hallucination_count,
+                action_claim_count: session.data.health.action_claim_count,
+                circuit_breaker_count: session.data.health.circuit_breaker_count,
+                estimated_tokens: session.data.compaction.estimated_tokens,
+                compaction_count: session.data.compaction.compaction_count,
+                micro_compact_savings: session.data.compaction.micro_compact_savings,
+                total_tokens_recovered_compact: session
+                    .data
+                    .compaction
+                    .total_tokens_recovered_compact,
+                compaction_failures: session.data.compaction.compaction_failures,
+                last_compaction_at: session
+                    .data
+                    .compaction
+                    .last_compaction_at
+                    .map(|t| t.to_rfc3339()),
+                system_prompt_tokens: session.data.compaction.system_prompt_tokens,
             });
         }
 
@@ -533,6 +846,12 @@ impl SessionStore {
     pub async fn has_session(&self, key: &str) -> bool {
         self.sessions.read().await.contains_key(key)
     }
+
+    /// Get a read-only snapshot of the sessions map (for API endpoints that need
+    /// to look up a session by key).
+    pub async fn sessions_map(&self) -> HashMap<String, std::sync::Arc<RwLock<Session>>> {
+        self.sessions.read().await.clone()
+    }
 }
 
 /// Lightweight session info for API responses.
@@ -548,6 +867,13 @@ pub struct SessionInfo {
     pub hallucination_count: u32,
     pub action_claim_count: u32,
     pub circuit_breaker_count: u32,
+    pub estimated_tokens: usize,
+    pub compaction_count: u32,
+    pub micro_compact_savings: usize,
+    pub total_tokens_recovered_compact: usize,
+    pub compaction_failures: u32,
+    pub last_compaction_at: Option<String>,
+    pub system_prompt_tokens: usize,
 }
 
 #[cfg(test)]
@@ -558,10 +884,12 @@ mod tests {
     #[test]
     fn new_session_has_zero_hallucination_counters() {
         let session = Session::new("test:user".into(), "test".into(), "user".into());
-        assert_eq!(session.data.rounds_since_human_input, 0);
-        assert_eq!(session.data.hallucination_count, 0);
-        assert_eq!(session.data.action_claim_count, 0);
-        assert_eq!(session.data.circuit_breaker_count, 0);
+        assert_eq!(session.data.health.rounds_since_human_input, 0);
+        assert_eq!(session.data.health.hallucination_count, 0);
+        assert_eq!(session.data.health.action_claim_count, 0);
+        assert_eq!(session.data.health.circuit_breaker_count, 0);
+        assert_eq!(session.data.compaction.estimated_tokens, 0);
+        assert_eq!(session.data.compaction.compaction_count, 0);
     }
 
     #[test]
@@ -577,20 +905,20 @@ mod tests {
                 sender: "user".into(),
             }),
         });
-        session.data.rounds_since_human_input = 0; // reset on human
+        session.data.health.rounds_since_human_input = 0; // reset on human
 
         // Simulate an LLM invocation round
-        session.data.rounds_since_human_input += 1;
-        assert_eq!(session.data.rounds_since_human_input, 1);
+        session.data.health.rounds_since_human_input += 1;
+        assert_eq!(session.data.health.rounds_since_human_input, 1);
 
         // Simulate a truncation detection
-        session.data.hallucination_count += 1;
-        assert_eq!(session.data.hallucination_count, 1);
+        session.data.health.hallucination_count += 1;
+        assert_eq!(session.data.health.hallucination_count, 1);
 
         // Another human message resets rounds counter but NOT hallucination count
-        session.data.rounds_since_human_input = 0;
-        assert_eq!(session.data.rounds_since_human_input, 0);
-        assert_eq!(session.data.hallucination_count, 1); // persists across resets
+        session.data.health.rounds_since_human_input = 0;
+        assert_eq!(session.data.health.rounds_since_human_input, 0);
+        assert_eq!(session.data.health.hallucination_count, 1); // persists across resets
     }
 
     #[test]
@@ -601,6 +929,8 @@ mod tests {
         assert!(json.contains("hallucination_count"));
         assert!(json.contains("action_claim_count"));
         assert!(json.contains("circuit_breaker_count"));
+        assert!(json.contains("estimated_tokens"));
+        assert!(json.contains("compaction_count"));
     }
 
     #[test]
@@ -616,9 +946,185 @@ mod tests {
             "message_count": 0
         }"#;
         let data: SessionData = serde_json::from_str(json).unwrap();
-        assert_eq!(data.rounds_since_human_input, 0);
-        assert_eq!(data.hallucination_count, 0);
-        assert_eq!(data.action_claim_count, 0);
-        assert_eq!(data.circuit_breaker_count, 0);
+        assert_eq!(data.health.rounds_since_human_input, 0);
+        assert_eq!(data.health.hallucination_count, 0);
+        assert_eq!(data.health.action_claim_count, 0);
+        assert_eq!(data.health.circuit_breaker_count, 0);
+        assert_eq!(data.compaction.estimated_tokens, 0);
+        assert_eq!(data.compaction.compaction_count, 0);
+    }
+
+    #[test]
+    fn should_reset_on_message_cap() {
+        let mut session = Session::new("test:user".into(), "test".into(), "user".into());
+        let limits = crate::config::ChannelLimits {
+            message_cap: 5,
+            time_cap_seconds: 0,
+        };
+
+        // Under cap — no reset
+        for _ in 0..4 {
+            session.data.messages.push(Message {
+                role: Role::User,
+                content: MessageContent::Text("msg".into()),
+                source: None,
+            });
+        }
+        assert!(!session.data.should_reset(&limits));
+
+        // At cap — reset
+        session.data.messages.push(Message {
+            role: Role::User,
+            content: MessageContent::Text("msg".into()),
+            source: None,
+        });
+        assert!(session.data.should_reset(&limits));
+    }
+
+    #[test]
+    fn should_reset_on_hallucination_threshold() {
+        let mut session = Session::new("test:user".into(), "test".into(), "user".into());
+        let limits = crate::config::ChannelLimits {
+            message_cap: 0, // no message cap
+            time_cap_seconds: 0,
+        };
+
+        session.data.health.hallucination_count = 2;
+        assert!(!session.data.should_reset(&limits));
+
+        session.data.health.hallucination_count = 3;
+        assert!(session.data.should_reset(&limits));
+    }
+
+    #[test]
+    fn build_handoff_empty_session() {
+        let session = Session::new("test:user".into(), "test".into(), "user".into());
+        assert!(session.data.build_handoff().is_none());
+    }
+
+    #[test]
+    fn build_handoff_captures_last_messages() {
+        let mut session = Session::new("test:user".into(), "test".into(), "user".into());
+        session.data.messages.push(Message {
+            role: Role::User,
+            content: MessageContent::Text("User message: fix the bug".into()),
+            source: Some(MessageSource::Human {
+                channel: "test".into(),
+                sender: "user".into(),
+            }),
+        });
+        session.data.messages.push(Message {
+            role: Role::Assistant,
+            content: MessageContent::Text("I'll look into that bug now.".into()),
+            source: None,
+        });
+
+        let handoff = session.data.build_handoff().unwrap();
+        assert!(handoff.contains("Session handoff"));
+        assert!(handoff.contains("fix the bug"));
+        assert!(handoff.contains("look into that bug"));
+    }
+
+    // === Phase 3 field tests ===
+
+    #[test]
+    fn new_session_has_phase3_defaults() {
+        let session = Session::new("test:user".into(), "test".into(), "user".into());
+        assert_eq!(session.data.compaction.total_tokens_recovered_compact, 0);
+        assert!(session.data.compaction.last_compaction_at.is_none());
+        assert_eq!(session.data.compaction.compaction_failures, 0);
+        assert!(session.data.compaction.recently_accessed_files.is_empty());
+    }
+
+    #[test]
+    fn session_data_serializes_phase3_fields() {
+        let session = Session::new("test:user".into(), "test".into(), "user".into());
+        let json = serde_json::to_string(&session.data).unwrap();
+        assert!(json.contains("total_tokens_recovered_compact"));
+        assert!(json.contains("compaction_failures"));
+        assert!(json.contains("recently_accessed_files"));
+    }
+
+    #[test]
+    fn session_data_deserializes_without_phase3_fields() {
+        // Legacy sessions without Phase 3 fields should default gracefully
+        let json = r#"{
+            "key": "test:user",
+            "channel": "test",
+            "sender": "user",
+            "messages": [],
+            "created_at": "2026-03-31T00:00:00Z",
+            "last_active": "2026-03-31T00:00:00Z",
+            "message_count": 0
+        }"#;
+        let data: SessionData = serde_json::from_str(json).unwrap();
+        assert_eq!(data.compaction.total_tokens_recovered_compact, 0);
+        assert!(data.compaction.last_compaction_at.is_none());
+        assert_eq!(data.compaction.compaction_failures, 0);
+        assert!(data.compaction.recently_accessed_files.is_empty());
+    }
+
+    #[test]
+    fn record_file_access_basic() {
+        let mut session = Session::new("test:user".into(), "test".into(), "user".into());
+        session
+            .data
+            .record_file_access("/tmp/foo.rs", "fn foo() {}");
+        assert_eq!(session.data.compaction.recently_accessed_files.len(), 1);
+        assert_eq!(
+            session.data.compaction.recently_accessed_files[0].path,
+            "/tmp/foo.rs"
+        );
+        assert_eq!(
+            session.data.compaction.recently_accessed_files[0].snippet,
+            "fn foo() {}"
+        );
+    }
+
+    #[test]
+    fn record_file_access_deduplicates() {
+        let mut session = Session::new("test:user".into(), "test".into(), "user".into());
+        session.data.record_file_access("/tmp/foo.rs", "version 1");
+        session
+            .data
+            .record_file_access("/tmp/bar.rs", "bar content");
+        session.data.record_file_access("/tmp/foo.rs", "version 2");
+        assert_eq!(session.data.compaction.recently_accessed_files.len(), 2);
+        let foo = session
+            .data
+            .compaction
+            .recently_accessed_files
+            .iter()
+            .find(|f| f.path == "/tmp/foo.rs")
+            .unwrap();
+        assert_eq!(foo.snippet, "version 2", "Should update to latest content");
+    }
+
+    #[test]
+    fn record_file_access_caps_at_max() {
+        let mut session = Session::new("test:user".into(), "test".into(), "user".into());
+        for i in 0..MAX_RECENT_FILES + 3 {
+            session
+                .data
+                .record_file_access(&format!("/file_{}.rs", i), &format!("content {}", i));
+        }
+        assert_eq!(
+            session.data.compaction.recently_accessed_files.len(),
+            MAX_RECENT_FILES,
+            "Should be capped at MAX_RECENT_FILES"
+        );
+    }
+
+    #[test]
+    fn recent_file_serialization_roundtrip() {
+        let file = RecentFile {
+            path: "/test/path.rs".to_string(),
+            snippet: "fn test() {}".to_string(),
+            accessed_at: Utc::now(),
+        };
+        let json = serde_json::to_string(&file).unwrap();
+        let back: RecentFile = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.path, file.path);
+        assert_eq!(back.snippet, file.snippet);
     }
 }

@@ -294,6 +294,19 @@ pub async fn invoke_with_tool_loop(
                     });
                 }
 
+                // MicroCompact Tier 1: truncate large tool results before they
+                // enter the conversation history. This prevents a single large
+                // file read or search result from bloating the context.
+                let truncated_count =
+                    crate::context::truncate_tool_result_blocks(&mut tool_results);
+                if truncated_count > 0 {
+                    tracing::debug!(
+                        "[micro-compact] truncated {} tool result(s) in tool loop round {}",
+                        truncated_count,
+                        rounds,
+                    );
+                }
+
                 // Add tool results as a user message and loop
                 // Tag each result with its tool_use_id for traceability.
                 // The overall message source uses the first tool_use_id as representative.

@@ -93,65 +93,65 @@ pub fn assess_session(data: &SessionData, config: &SessionHealthConfig) -> Sessi
     let mut severity: u8 = 0; // 0=healthy, 1=warning, 2=degraded, 3=critical
 
     // Turn marker hallucinations
-    if data.hallucination_count >= config.max_turn_marker_hallucinations {
+    if data.health.hallucination_count >= config.max_turn_marker_hallucinations {
         risk_factors.push(format!(
             "Turn marker hallucinations: {} (threshold: {})",
-            data.hallucination_count, config.max_turn_marker_hallucinations
+            data.health.hallucination_count, config.max_turn_marker_hallucinations
         ));
         severity = severity.max(2);
-    } else if data.hallucination_count > 0 {
+    } else if data.health.hallucination_count > 0 {
         risk_factors.push(format!(
             "Turn marker hallucinations: {} (approaching threshold: {})",
-            data.hallucination_count, config.max_turn_marker_hallucinations
+            data.health.hallucination_count, config.max_turn_marker_hallucinations
         ));
         severity = severity.max(1);
     }
 
     // Action claim warnings
-    if data.action_claim_count >= config.max_action_claim_warnings {
+    if data.health.action_claim_count >= config.max_action_claim_warnings {
         risk_factors.push(format!(
             "Unmatched action claims: {} (threshold: {})",
-            data.action_claim_count, config.max_action_claim_warnings
+            data.health.action_claim_count, config.max_action_claim_warnings
         ));
         severity = severity.max(2);
-    } else if data.action_claim_count > 0 {
+    } else if data.health.action_claim_count > 0 {
         risk_factors.push(format!(
             "Unmatched action claims: {} (approaching threshold: {})",
-            data.action_claim_count, config.max_action_claim_warnings
+            data.health.action_claim_count, config.max_action_claim_warnings
         ));
         severity = severity.max(1);
     }
 
     // Circuit breaker fires
-    if data.circuit_breaker_count >= config.max_circuit_breaker_fires {
+    if data.health.circuit_breaker_count >= config.max_circuit_breaker_fires {
         risk_factors.push(format!(
             "Circuit breaker fires: {} (threshold: {})",
-            data.circuit_breaker_count, config.max_circuit_breaker_fires
+            data.health.circuit_breaker_count, config.max_circuit_breaker_fires
         ));
         severity = severity.max(3);
     }
 
     // Rounds without human input
-    if data.rounds_since_human_input >= config.max_rounds_without_human {
+    if data.health.rounds_since_human_input >= config.max_rounds_without_human {
         risk_factors.push(format!(
             "Consecutive LLM rounds without human input: {} (threshold: {})",
-            data.rounds_since_human_input, config.max_rounds_without_human
+            data.health.rounds_since_human_input, config.max_rounds_without_human
         ));
         severity = severity.max(2);
-    } else if data.rounds_since_human_input > config.max_rounds_without_human / 2 {
+    } else if data.health.rounds_since_human_input > config.max_rounds_without_human / 2 {
         risk_factors.push(format!(
             "Rounds without human input: {} (half of threshold: {})",
-            data.rounds_since_human_input, config.max_rounds_without_human
+            data.health.rounds_since_human_input, config.max_rounds_without_human
         ));
         severity = severity.max(1);
     }
 
     // Compound escalation: multiple indicators active simultaneously
     let indicator_count = [
-        data.hallucination_count > 0,
-        data.action_claim_count > 0,
-        data.circuit_breaker_count > 0,
-        data.rounds_since_human_input > config.max_rounds_without_human / 2,
+        data.health.hallucination_count > 0,
+        data.health.action_claim_count > 0,
+        data.health.circuit_breaker_count > 0,
+        data.health.rounds_since_human_input > config.max_rounds_without_human / 2,
     ]
     .iter()
     .filter(|&&x| x)
@@ -170,9 +170,12 @@ pub fn assess_session(data: &SessionData, config: &SessionHealthConfig) -> Sessi
     };
 
     // Compute hallucination rate
-    let total_events = data.hallucination_count + data.action_claim_count;
-    let hallucination_rate = if data.message_count > 0 {
-        total_events as f64 / data.message_count as f64
+    let total_events = data.health.hallucination_count + data.health.action_claim_count;
+    // Use messages.len() (actual current count) instead of message_count
+    // (historical counter that only increments, never decremented by compaction).
+    let current_message_count = data.messages.len();
+    let hallucination_rate = if current_message_count > 0 {
+        total_events as f64 / current_message_count as f64
     } else {
         0.0
     };
@@ -181,10 +184,10 @@ pub fn assess_session(data: &SessionData, config: &SessionHealthConfig) -> Sessi
         session_key: data.key.clone(),
         status,
         timestamp: Utc::now().to_rfc3339(),
-        turn_marker_count: data.hallucination_count,
-        action_claim_count: data.action_claim_count,
-        circuit_breaker_count: data.circuit_breaker_count,
-        rounds_since_human_input: data.rounds_since_human_input,
+        turn_marker_count: data.health.hallucination_count,
+        action_claim_count: data.health.action_claim_count,
+        circuit_breaker_count: data.health.circuit_breaker_count,
+        rounds_since_human_input: data.health.rounds_since_human_input,
         message_count: data.messages.len(),
         hallucination_rate,
         risk_factors,
@@ -209,6 +212,7 @@ mod tests {
     use pulse_system_types::llm::Message;
 
     fn make_session() -> SessionData {
+        use crate::session_store::{CompactionMetrics, HealthCounters, WalState};
         SessionData {
             key: "test:user".into(),
             channel: "test".into(),
@@ -217,13 +221,9 @@ mod tests {
             created_at: Utc::now(),
             last_active: Utc::now(),
             message_count: 10,
-            wal_seq: 0,
-            messages_since_checkpoint: 0,
-            last_checkpoint_time: Utc::now(),
-            rounds_since_human_input: 0,
-            hallucination_count: 0,
-            action_claim_count: 0,
-            circuit_breaker_count: 0,
+            wal: WalState::default(),
+            health: HealthCounters::default(),
+            compaction: CompactionMetrics::default(),
         }
     }
 
@@ -253,7 +253,7 @@ mod tests {
     #[test]
     fn warning_on_single_turn_marker() {
         let mut data = make_session();
-        data.hallucination_count = 1;
+        data.health.hallucination_count = 1;
         let config = SessionHealthConfig::default();
         let snapshot = assess_session(&data, &config);
         assert_eq!(snapshot.status, SessionHealthStatus::Warning);
@@ -263,7 +263,7 @@ mod tests {
     #[test]
     fn degraded_on_turn_marker_threshold() {
         let mut data = make_session();
-        data.hallucination_count = 2;
+        data.health.hallucination_count = 2;
         let config = SessionHealthConfig::default();
         let snapshot = assess_session(&data, &config);
         assert_eq!(snapshot.status, SessionHealthStatus::Degraded);
@@ -274,7 +274,7 @@ mod tests {
     #[test]
     fn degraded_on_action_claim_threshold() {
         let mut data = make_session();
-        data.action_claim_count = 3;
+        data.health.action_claim_count = 3;
         let config = SessionHealthConfig::default();
         let snapshot = assess_session(&data, &config);
         assert_eq!(snapshot.status, SessionHealthStatus::Degraded);
@@ -283,7 +283,7 @@ mod tests {
     #[test]
     fn warning_on_single_action_claim() {
         let mut data = make_session();
-        data.action_claim_count = 1;
+        data.health.action_claim_count = 1;
         let config = SessionHealthConfig::default();
         let snapshot = assess_session(&data, &config);
         assert_eq!(snapshot.status, SessionHealthStatus::Warning);
@@ -292,7 +292,7 @@ mod tests {
     #[test]
     fn critical_on_circuit_breaker() {
         let mut data = make_session();
-        data.circuit_breaker_count = 1;
+        data.health.circuit_breaker_count = 1;
         let config = SessionHealthConfig::default();
         let snapshot = assess_session(&data, &config);
         assert_eq!(snapshot.status, SessionHealthStatus::Critical);
@@ -301,9 +301,9 @@ mod tests {
     #[test]
     fn critical_on_compound_indicators() {
         let mut data = make_session();
-        data.hallucination_count = 1;
-        data.action_claim_count = 1;
-        data.rounds_since_human_input = 6; // > 10/2
+        data.health.hallucination_count = 1;
+        data.health.action_claim_count = 1;
+        data.health.rounds_since_human_input = 6; // > 10/2
         let config = SessionHealthConfig::default();
         let snapshot = assess_session(&data, &config);
         assert_eq!(snapshot.status, SessionHealthStatus::Critical);
@@ -316,7 +316,7 @@ mod tests {
     #[test]
     fn degraded_on_rounds_without_human() {
         let mut data = make_session();
-        data.rounds_since_human_input = 10;
+        data.health.rounds_since_human_input = 10;
         let config = SessionHealthConfig::default();
         let snapshot = assess_session(&data, &config);
         assert_eq!(snapshot.status, SessionHealthStatus::Degraded);
@@ -325,7 +325,7 @@ mod tests {
     #[test]
     fn warning_on_half_rounds_threshold() {
         let mut data = make_session();
-        data.rounds_since_human_input = 6; // > 10/2
+        data.health.rounds_since_human_input = 6; // > 10/2
         let config = SessionHealthConfig::default();
         let snapshot = assess_session(&data, &config);
         assert_eq!(snapshot.status, SessionHealthStatus::Warning);
@@ -333,20 +333,21 @@ mod tests {
 
     #[test]
     fn hallucination_rate_computed_correctly() {
-        let mut data = make_session();
-        data.hallucination_count = 2;
-        data.action_claim_count = 1;
-        data.message_count = 10;
+        // Rate = (hallucination_count + action_claim_count) / messages.len()
+        let mut data = make_session_with_messages(10);
+        data.health.hallucination_count = 2;
+        data.health.action_claim_count = 1;
         let config = SessionHealthConfig::default();
         let snapshot = assess_session(&data, &config);
+        // 3 events / 10 messages = 0.3
         assert!((snapshot.hallucination_rate - 0.3).abs() < 0.01);
     }
 
     #[test]
     fn hallucination_rate_zero_messages() {
         let mut data = make_session();
-        data.message_count = 0;
-        data.hallucination_count = 1;
+        // messages vec is empty, so rate should be 0.0
+        data.health.hallucination_count = 1;
         let config = SessionHealthConfig::default();
         let snapshot = assess_session(&data, &config);
         assert_eq!(snapshot.hallucination_rate, 0.0);
@@ -355,7 +356,7 @@ mod tests {
     #[test]
     fn custom_thresholds() {
         let mut data = make_session();
-        data.hallucination_count = 5;
+        data.health.hallucination_count = 5;
         let config = SessionHealthConfig {
             max_turn_marker_hallucinations: 10,
             ..Default::default()
@@ -371,6 +372,24 @@ mod tests {
         let config = SessionHealthConfig::default();
         let snapshot = assess_session(&data, &config);
         assert_eq!(snapshot.message_count, 5);
+    }
+
+    #[test]
+    fn hallucination_rate_uses_vec_len_not_message_count() {
+        // Regression test: message_count is a historical counter that only increments.
+        // After compaction drains messages, messages.len() < message_count.
+        // The hallucination rate must use messages.len() to avoid a stale denominator.
+        let mut data = make_session_with_messages(5);
+        data.message_count = 100; // Historical counter says 100 messages ever sent
+        data.health.hallucination_count = 1;
+        let config = SessionHealthConfig::default();
+        let snapshot = assess_session(&data, &config);
+        // Rate should be 1/5 = 0.2, NOT 1/100 = 0.01
+        assert!(
+            (snapshot.hallucination_rate - 0.2).abs() < 0.01,
+            "Expected rate ~0.2 (1/5 messages.len()), got {} (would be 0.01 with stale message_count)",
+            snapshot.hallucination_rate
+        );
     }
 
     #[test]

@@ -1,3 +1,4 @@
+pub mod alerts;
 pub mod digest;
 pub mod dynamic;
 pub mod evaluator;
@@ -26,7 +27,7 @@ pub struct Schedule {
 
 impl Schedule {
     /// Load schedule from schedule.json in the entity root
-    pub fn load(root_dir: &Path) -> Result<Self, Box<dyn std::error::Error>> {
+    pub fn load(root_dir: &Path) -> Result<Self, crate::errors::SchedulerError> {
         let path = root_dir.join("schedule.json");
         if !path.exists() {
             // No schedule file — create with defaults
@@ -47,7 +48,7 @@ impl Schedule {
     }
 
     /// Save schedule to schedule.json
-    pub fn save(&self, root_dir: &Path) -> Result<(), Box<dyn std::error::Error>> {
+    pub fn save(&self, root_dir: &Path) -> Result<(), crate::errors::SchedulerError> {
         let path = root_dir.join("schedule.json");
         let content = serde_json::to_string_pretty(self)?;
         std::fs::write(&path, content)?;
@@ -94,18 +95,18 @@ pub async fn start(
     state: Arc<AppState>,
     schedule: Arc<RwLock<Schedule>>,
     intent_queue: Arc<RwLock<intent::IntentQueue>>,
-) -> Result<Vec<tokio::task::JoinHandle<()>>, Box<dyn std::error::Error>> {
+) -> Result<Vec<tokio::task::JoinHandle<()>>, crate::errors::SchedulerError> {
     if !state.config.scheduler.enabled {
         tracing::info!("Scheduler disabled in config");
         return Ok(vec![]);
     }
 
-    let tz: chrono_tz::Tz = state
-        .config
-        .scheduler
-        .timezone
-        .parse()
-        .map_err(|_| format!("Invalid timezone: {}", state.config.scheduler.timezone))?;
+    let tz: chrono_tz::Tz = state.config.scheduler.timezone.parse().map_err(|_| {
+        crate::errors::SchedulerError::CronParse(format!(
+            "Invalid timezone: {}",
+            state.config.scheduler.timezone
+        ))
+    })?;
 
     let tasks = schedule.read().await;
     let enabled_tasks: Vec<ScheduledTask> =

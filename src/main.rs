@@ -9,6 +9,7 @@ mod config;
 mod context;
 mod context_buffer;
 mod discovery;
+mod errors;
 mod events;
 mod init;
 mod intake_audit;

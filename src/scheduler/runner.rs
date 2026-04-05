@@ -34,15 +34,12 @@ pub async fn run_task_loop(
 
     tracing::info!("Scheduled task '{}' ({})", task.name, task.cron);
 
-    // Load evaluator state for structural precondition checks
-    let root_dir = match state.config.root_dir() {
-        Ok(d) => d,
-        Err(e) => {
-            tracing::error!("Cannot resolve root dir for task '{}': {}", task.id, e);
-            return;
-        }
-    };
-    let mut eval_state = SchedulerState::load(&root_dir);
+    // Use cached root_dir from AppState (avoids re-walking filesystem every task execution)
+    let root_dir = state.root_dir.clone();
+    let rd = root_dir.clone();
+    let mut eval_state = tokio::task::spawn_blocking(move || SchedulerState::load(&rd))
+        .await
+        .unwrap_or_default();
     let docs_dir = resolve_docs_dir(&root_dir);
 
     loop {
@@ -81,7 +78,10 @@ pub async fn run_task_loop(
         // Uses trait-based evaluators resolved from the task's evaluator type string.
         if let Some(ref evaluator_type) = task.evaluator {
             // Reload state from disk in case another task updated it
-            eval_state = SchedulerState::load(&root_dir);
+            let rd = root_dir.clone();
+            eval_state = tokio::task::spawn_blocking(move || SchedulerState::load(&rd))
+                .await
+                .unwrap_or_default();
 
             let decision = match resolve_task_evaluator(evaluator_type, &docs_dir) {
                 Some(eval) => eval.evaluate(&eval_state),
@@ -101,9 +101,13 @@ pub async fn run_task_loop(
                     task.id
                 );
                 eval_state.record_suppression(&task.id);
-                if let Err(e) = eval_state.save(&root_dir) {
-                    tracing::error!("Failed to persist evaluator state: {}", e);
-                }
+                let state_clone = eval_state.clone();
+                let rd = root_dir.clone();
+                drop(tokio::task::spawn_blocking(move || {
+                    if let Err(e) = state_clone.save(&rd) {
+                        tracing::error!("Failed to persist evaluator state: {}", e);
+                    }
+                }));
                 continue;
             }
         }
@@ -165,20 +169,15 @@ async fn execute_task(
     intent_queue: &Arc<RwLock<IntentQueue>>,
     eval_state: &mut SchedulerState,
 ) {
-    // Build a fresh system prompt (re-reads documents each time)
-    let root_dir = match state.config.root_dir() {
-        Ok(d) => d,
-        Err(e) => {
-            tracing::error!("Cannot resolve root dir for task '{}': {}", task.id, e);
-            return;
-        }
-    };
+    // Use cached root_dir from AppState
+    let root_dir = state.root_dir.clone();
 
-    let system_prompt = match prompt::build_system_prompt_async(
+    // Phase 5: Use minimal task system prompt (identity only, no MEMORY.md
+    // or monitoring data). This keeps the task context small and focused,
+    // preventing context pollution between scheduled tasks and interactive sessions.
+    let system_prompt = match prompt::build_task_system_prompt_async(
         root_dir.clone(),
         state.config.clone(),
-        state.pipeline_monitor.clone(),
-        state.cognitive_monitor.clone(),
     )
     .await
     {
@@ -331,101 +330,18 @@ async fn execute_task(
         let docs_dir = resolve_docs_dir(&root_dir);
         eval_state.record_fire(&task.id, &docs_dir);
         eval_state.record_response_quality(&task.id, tool_rounds > 0);
-        if let Err(e) = eval_state.save(&root_dir) {
-            tracing::error!("Failed to persist evaluator state: {}", e);
-        }
+        let state_clone = eval_state.clone();
+        let rd = root_dir.clone();
+        drop(tokio::task::spawn_blocking(move || {
+            if let Err(e) = state_clone.save(&rd) {
+                tracing::error!("Failed to persist evaluator state: {}", e);
+            }
+        }));
     }
 
-    // Parse and route output
+    // Parse and route output markers
     let parsed = output::parse_output(&response_text);
-
-    // Handle [SCHEDULE:] markers — create new dynamic tasks
-    for schedule_json in &parsed.schedule_requests {
-        match super::dynamic::create_task_from_marker(schedule_json) {
-            Ok(new_task) => {
-                tracing::info!(
-                    "Entity self-scheduled task: '{}' ({})",
-                    new_task.name,
-                    new_task.cron
-                );
-                let mut sched = schedule.write().await;
-                sched.add_task(new_task);
-                if let Err(e) = sched.save(&root_dir) {
-                    tracing::error!("Failed to persist schedule: {}", e);
-                }
-            }
-            Err(e) => {
-                tracing::warn!("Invalid [SCHEDULE:] marker: {}", e);
-            }
-        }
-    }
-
-    // Handle [SHARE:] content
-    for content in &parsed.share_content {
-        output::route_share(content, &state.config, &task.name).await;
-    }
-
-    // Handle [CALL:] content
-    for content in &parsed.call_content {
-        output::route_call(content, &state.config, &task.name).await;
-    }
-
-    // Handle [INTENT:] markers — queue one-shot intents
-    if state.config.autonomy.enabled {
-        for intent_json in &parsed.intent_requests {
-            let source = IntentSource::ScheduledTask(task.id.clone());
-            match intent::create_intent_from_marker(intent_json, source) {
-                Ok(new_intent) => {
-                    tracing::info!(
-                        "Task '{}' queued intent: '{}'",
-                        task.id,
-                        new_intent.description
-                    );
-                    let mut q = intent_queue.write().await;
-                    q.push(new_intent, state.config.autonomy.max_queue_size);
-                    if let Err(e) = q.save() {
-                        tracing::error!("Failed to persist intent queue: {}", e);
-                    }
-                }
-                Err(e) => tracing::warn!("Invalid [INTENT:] marker: {}", e),
-            }
-        }
-
-        // Handle [CHAIN:] markers — queue follow-up intent with {result} substitution
-        if let Some(chain_json) = parsed.chain_requests.first() {
-            match intent::create_chain_from_marker(chain_json) {
-                Ok(chain) => {
-                    let chain_prompt = chain.prompt.replace("{result}", &parsed.clean_content);
-                    let chain_intent = intent::Intent {
-                        id: format!(
-                            "chain-{}-{}",
-                            task.id,
-                            &uuid::Uuid::new_v4().to_string()[..8]
-                        ),
-                        description: chain.description,
-                        prompt: chain_prompt,
-                        source: IntentSource::ScheduledTask(task.id.clone()),
-                        priority: intent::IntentPriority::Normal,
-                        created_at: Utc::now(),
-                        chain: None,
-                        output_routing: chain.output_routing,
-                        depth: 0,
-                    };
-                    tracing::info!(
-                        "Task '{}' queued chain: '{}'",
-                        task.id,
-                        chain_intent.description
-                    );
-                    let mut q = intent_queue.write().await;
-                    q.push(chain_intent, state.config.autonomy.max_queue_size);
-                    if let Err(e) = q.save() {
-                        tracing::error!("Failed to persist intent queue: {}", e);
-                    }
-                }
-                Err(e) => tracing::warn!("Invalid [CHAIN:] marker: {}", e),
-            }
-        }
-    }
+    route_output_markers(&parsed, task, state, schedule, intent_queue, &root_dir).await;
 
     // Log to LOGBOOK.md
     log_execution(&root_dir, task, &parsed.clean_content);
@@ -672,6 +588,108 @@ async fn execute_task(
     // Graph vigil sync (if enabled)
     if state.config.graph.enabled {
         crate::session::graph_sync_vigil(&root_dir).await;
+    }
+}
+
+/// Route parsed output markers to their respective handlers.
+///
+/// Handles [SCHEDULE:], [SHARE:], [CALL:], [INTENT:], and [CHAIN:] markers
+/// extracted from the LLM response.
+async fn route_output_markers(
+    parsed: &output::ParsedOutput,
+    task: &ScheduledTask,
+    state: &Arc<AppState>,
+    schedule: &Arc<RwLock<Schedule>>,
+    intent_queue: &Arc<RwLock<IntentQueue>>,
+    root_dir: &std::path::Path,
+) {
+    // [SCHEDULE:] — create new dynamic tasks
+    for schedule_json in &parsed.schedule_requests {
+        match super::dynamic::create_task_from_marker(schedule_json) {
+            Ok(new_task) => {
+                tracing::info!(
+                    "Entity self-scheduled task: '{}' ({})",
+                    new_task.name,
+                    new_task.cron
+                );
+                let mut sched = schedule.write().await;
+                sched.add_task(new_task);
+                if let Err(e) = sched.save(root_dir) {
+                    tracing::error!("Failed to persist schedule: {}", e);
+                }
+            }
+            Err(e) => {
+                tracing::warn!("Invalid [SCHEDULE:] marker: {}", e);
+            }
+        }
+    }
+
+    // [SHARE:] — route via alert queue + legacy webhook
+    for content in &parsed.share_content {
+        let alert = super::alerts::alert_from_share(&task.name, content);
+        state.alert_queue.lock().await.push(alert);
+        output::route_share(content, &state.config, &task.name).await;
+    }
+
+    // [CALL:]
+    for content in &parsed.call_content {
+        output::route_call(content, &state.config, &task.name).await;
+    }
+
+    // [INTENT:] and [CHAIN:] — only if autonomy is enabled
+    if state.config.autonomy.enabled {
+        for intent_json in &parsed.intent_requests {
+            let source = IntentSource::ScheduledTask(task.id.clone());
+            match intent::create_intent_from_marker(intent_json, source) {
+                Ok(new_intent) => {
+                    tracing::info!(
+                        "Task '{}' queued intent: '{}'",
+                        task.id,
+                        new_intent.description
+                    );
+                    let mut q = intent_queue.write().await;
+                    q.push(new_intent, state.config.autonomy.max_queue_size);
+                    if let Err(e) = q.save() {
+                        tracing::error!("Failed to persist intent queue: {}", e);
+                    }
+                }
+                Err(e) => tracing::warn!("Invalid [INTENT:] marker: {}", e),
+            }
+        }
+
+        if let Some(chain_json) = parsed.chain_requests.first() {
+            match intent::create_chain_from_marker(chain_json) {
+                Ok(chain) => {
+                    let chain_prompt = chain.prompt.replace("{result}", &parsed.clean_content);
+                    let chain_intent = intent::Intent {
+                        id: format!(
+                            "chain-{}-{}",
+                            task.id,
+                            &uuid::Uuid::new_v4().to_string()[..8]
+                        ),
+                        description: chain.description,
+                        prompt: chain_prompt,
+                        source: IntentSource::ScheduledTask(task.id.clone()),
+                        priority: intent::IntentPriority::Normal,
+                        created_at: Utc::now(),
+                        chain: None,
+                        output_routing: chain.output_routing,
+                        depth: 0,
+                    };
+                    tracing::info!(
+                        "Task '{}' queued chain: '{}'",
+                        task.id,
+                        chain_intent.description
+                    );
+                    let mut q = intent_queue.write().await;
+                    q.push(chain_intent, state.config.autonomy.max_queue_size);
+                    if let Err(e) = q.save() {
+                        tracing::error!("Failed to persist intent queue: {}", e);
+                    }
+                }
+                Err(e) => tracing::warn!("Invalid [CHAIN:] marker: {}", e),
+            }
+        }
     }
 }
 

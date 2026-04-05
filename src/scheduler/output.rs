@@ -1,7 +1,11 @@
 use regex::Regex;
 use std::sync::LazyLock;
+use std::time::Duration;
 
 use crate::config::Config;
+
+/// Timeout for webhook/endpoint calls (15 seconds).
+const WEBHOOK_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// Parsed output from an LLM response
 #[derive(Debug)]
@@ -91,7 +95,10 @@ pub async fn route_share(content: &str, config: &Config, task_name: &str) {
         }
     };
 
-    let client = reqwest::Client::new();
+    let client = reqwest::Client::builder()
+        .timeout(WEBHOOK_TIMEOUT)
+        .build()
+        .unwrap_or_else(|_| reqwest::Client::new());
     let body = serde_json::json!({
         "content": format!("**{}**\n{}", task_name, content),
     });
@@ -124,7 +131,10 @@ pub async fn route_call(content: &str, config: &Config, task_name: &str) {
         }
     };
 
-    let client = reqwest::Client::new();
+    let client = reqwest::Client::builder()
+        .timeout(WEBHOOK_TIMEOUT)
+        .build()
+        .unwrap_or_else(|_| reqwest::Client::new());
     let body = serde_json::json!({
         "reason": content,
         "context": format!("Scheduled task '{}' requested a call.", task_name),

@@ -2229,7 +2229,6 @@ dependencies = [
  "indicatif",
  "libc",
  "log",
- "native-tls",
  "rand 0.9.2",
  "reqwest",
  "serde",
@@ -2362,6 +2361,7 @@ dependencies = [
  "tokio",
  "tokio-rustls",
  "tower-service",
+ "webpki-roots 1.0.6",
 ]
 
 [[package]]
@@ -2925,6 +2925,12 @@ checksum = "234cf4f4a04dc1f57e24b96cc0cd600cf2af460d4161ac5ecdd0af8e1f3b2a38"
 dependencies = [
  "hashbrown 0.15.5",
 ]
+
+[[package]]
+name = "lru-slab"
+version = "0.1.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "112b39cec0b298b6c1999fee3e31427f74f676e4cb9879ed1a121b43661a4154"
 
 [[package]]
 name = "lz4_flex"
@@ -3996,7 +4002,7 @@ dependencies = [
 
 [[package]]
 name = "pulse-null"
-version = "0.25.4"
+version = "0.26.0"
 dependencies = [
  "async-stream",
  "axum",
@@ -4021,6 +4027,7 @@ dependencies = [
  "serde",
  "serde_json",
  "tempfile",
+ "thiserror 2.0.18",
  "tokio",
  "tokio-stream",
  "toml",
@@ -4085,6 +4092,61 @@ dependencies = [
  "equivalent",
  "hashbrown 0.16.1",
  "parking_lot",
+]
+
+[[package]]
+name = "quinn"
+version = "0.11.9"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b9e20a958963c291dc322d98411f541009df2ced7b5a4f2bd52337638cfccf20"
+dependencies = [
+ "bytes",
+ "cfg_aliases",
+ "pin-project-lite",
+ "quinn-proto",
+ "quinn-udp",
+ "rustc-hash",
+ "rustls",
+ "socket2",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
+ "web-time",
+]
+
+[[package]]
+name = "quinn-proto"
+version = "0.11.14"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "434b42fec591c96ef50e21e886936e66d3cc3f737104fdb9b737c40ffb94c098"
+dependencies = [
+ "bytes",
+ "getrandom 0.3.4",
+ "lru-slab",
+ "rand 0.9.2",
+ "ring",
+ "rustc-hash",
+ "rustls",
+ "rustls-pki-types",
+ "slab",
+ "thiserror 2.0.18",
+ "tinyvec",
+ "tracing",
+ "web-time",
+]
+
+[[package]]
+name = "quinn-udp"
+version = "0.5.14"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "addec6a0dcad8a8d96a771f815f0eaf55f9d1805756410b39f5fa81332574cbd"
+dependencies = [
+ "cfg_aliases",
+ "libc",
+ "once_cell",
+ "socket2",
+ "tracing",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -4300,9 +4362,8 @@ checksum = "bbc4a4ea2a66a41a1152c4b3d86e8954dc087bdf33af35446e6e176db4e73c8c"
 
 [[package]]
 name = "recall-echo"
-version = "3.4.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ba2ea0439881e760cc8a581583bcae5553b6aeb58ca21d515e07af146cf0872b"
+version = "3.5.1"
+source = "git+https://github.com/dnacenta/recall-echo.git?tag=v3.5.1#165d0f3b471088f34cf5797fae56f68b58485ac6"
 dependencies = [
  "async-trait",
  "chrono",
@@ -4419,6 +4480,8 @@ dependencies = [
  "native-tls",
  "percent-encoding",
  "pin-project-lite",
+ "quinn",
+ "rustls",
  "rustls-pki-types",
  "serde",
  "serde_json",
@@ -4426,6 +4489,7 @@ dependencies = [
  "sync_wrapper",
  "tokio",
  "tokio-native-tls",
+ "tokio-rustls",
  "tokio-util",
  "tower",
  "tower-http",
@@ -4435,6 +4499,7 @@ dependencies = [
  "wasm-bindgen-futures",
  "wasm-streams",
  "web-sys",
+ "webpki-roots 1.0.6",
 ]
 
 [[package]]
@@ -4727,6 +4792,12 @@ dependencies = [
  "serde",
  "serde_json",
 ]
+
+[[package]]
+name = "rustc-hash"
+version = "2.1.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "94300abf3f1ae2e2b8ffb7b58043de3d399c73fa6f4b73826402a5c457614dbe"
 
 [[package]]
 name = "rustc_version"
@@ -6292,7 +6363,6 @@ dependencies = [
  "base64 0.22.1",
  "flate2",
  "log",
- "native-tls",
  "once_cell",
  "rustls",
  "rustls-pki-types",

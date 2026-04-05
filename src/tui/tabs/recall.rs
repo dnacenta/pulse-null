@@ -563,12 +563,5 @@ fn format_count(n: u64) -> String {
 }
 
 fn truncate_str(s: &str, max: usize) -> &str {
-    if s.len() <= max {
-        return s;
-    }
-    let mut end = max;
-    while end > 0 && !s.is_char_boundary(end) {
-        end -= 1;
-    }
-    &s[..end]
+    crate::utils::safe_truncate(s, max)
 }

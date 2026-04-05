@@ -46,6 +46,9 @@ pub struct AppState {
     pub persist_coordinator: Arc<PersistCoordinator>,
     pub plugin_manager: tokio::sync::Mutex<PluginManager>,
     pub wal: Option<crate::wal::WalWriter>,
+    /// Alert queue for scheduled task output (Phase 5: Task Isolation).
+    /// Tasks push alerts here; consumers (Discord plugin, API) drain them.
+    pub alert_queue: tokio::sync::Mutex<crate::scheduler::alerts::AlertQueue>,
 }
 
 /// Rebuild AWARENESS.md from the current plugin and tool state.
@@ -204,6 +207,9 @@ pub async fn start(config: Config) -> Result<(), Box<dyn std::error::Error>> {
         None
     };
 
+    // Initialize alert queue (Phase 5: Task Isolation)
+    let alert_queue = crate::scheduler::alerts::AlertQueue::load(&root_dir);
+
     let state = Arc::new(AppState {
         config: config.clone(),
         provider,
@@ -219,6 +225,7 @@ pub async fn start(config: Config) -> Result<(), Box<dyn std::error::Error>> {
         persist_coordinator,
         plugin_manager: tokio::sync::Mutex::new(plugin_manager),
         wal,
+        alert_queue: tokio::sync::Mutex::new(alert_queue),
     });
 
     // Startup pipeline health check
@@ -403,6 +410,12 @@ pub fn build_router(state: Arc<AppState>, plugin_routes: Router<()>) -> Router {
         .route("/api/status", get(handlers::status::status))
         .route("/api/dashboard", get(handlers::dashboard::dashboard))
         .route("/chat", post(handlers::chat::chat))
+        .route(
+            "/api/sessions/reset",
+            post(handlers::sessions::reset_session),
+        )
+        .route("/api/alerts/drain", post(handlers::alerts::drain_alerts))
+        .route("/api/alerts/peek", get(handlers::alerts::peek_alerts))
         .route_layer(middleware::from_fn_with_state(
             Arc::clone(&state),
             auth::require_auth,

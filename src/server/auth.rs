@@ -142,6 +142,7 @@ mod tests {
             context_buffer: crate::context_buffer::ContextBufferConfig::default(),
             session_health: crate::session_health::SessionHealthConfig::default(),
             platform: crate::config::PlatformConfig::default(),
+            system_prompt_budget: crate::config::SystemPromptBudgetConfig::default(),
             peers: std::collections::HashMap::new(),
             plugins: std::collections::HashMap::new(),
         };
@@ -152,6 +153,7 @@ mod tests {
         )
         .await;
         let plugin_manager = crate::plugins::manager::PluginManager::new(&config);
+        let alert_queue = crate::scheduler::alerts::AlertQueue::load(&root_dir);
         Arc::new(AppState {
             config,
             provider: Box::new(crate::claude_provider::ClaudeProvider::new(
@@ -170,6 +172,7 @@ mod tests {
             persist_coordinator: Arc::new(PersistCoordinator::new()),
             plugin_manager: tokio::sync::Mutex::new(plugin_manager),
             wal: None,
+            alert_queue: tokio::sync::Mutex::new(alert_queue),
         })
     }
 
@@ -307,6 +310,7 @@ mod tests {
             context_buffer: crate::context_buffer::ContextBufferConfig::default(),
             session_health: crate::session_health::SessionHealthConfig::default(),
             platform: crate::config::PlatformConfig::default(),
+            system_prompt_budget: crate::config::SystemPromptBudgetConfig::default(),
             peers,
             plugins: std::collections::HashMap::new(),
         };
@@ -317,6 +321,7 @@ mod tests {
         )
         .await;
         let plugin_manager = crate::plugins::manager::PluginManager::new(&config);
+        let alert_queue = crate::scheduler::alerts::AlertQueue::load(&root_dir);
         Arc::new(AppState {
             config,
             provider: Box::new(crate::claude_provider::ClaudeProvider::new(
@@ -335,6 +340,7 @@ mod tests {
             persist_coordinator: Arc::new(PersistCoordinator::new()),
             plugin_manager: tokio::sync::Mutex::new(plugin_manager),
             wal: None,
+            alert_queue: tokio::sync::Mutex::new(alert_queue),
         })
     }
 
