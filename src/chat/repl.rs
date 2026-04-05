@@ -1,9 +1,7 @@
 use std::io::{self, BufRead, Write};
 use std::path::Path;
 
-use pulse_system_types::llm::{
-    ContentBlock, LmProvider, Message, MessageContent, MessageSource, Role, StopReason,
-};
+use pulse_system_types::llm::{LmProvider, Message, MessageContent, MessageSource, Role};
 
 use crate::chat;
 use crate::config::Config;
@@ -80,12 +78,13 @@ pub async fn run(
         // Build user message content
         let user_content = MessageContent::Text(input.to_string());
 
-        // WAL: append user message BEFORE adding to conversation (write-ahead)
+        // WAL: append user message BEFORE adding to conversation (write-ahead).
+        // Only increment wal_seq on success to keep it in sync with the WAL file.
         if let Some(ref wal) = wal {
-            wal_seq += 1;
-            if let Err(e) = wal.append(
+            let next_seq = wal_seq + 1;
+            match wal.append(
                 session_key,
-                wal_seq,
+                next_seq,
                 Role::User,
                 &user_content,
                 Some(WalMeta {
@@ -93,7 +92,8 @@ pub async fn run(
                     sender: Some("local".into()),
                 }),
             ) {
-                tracing::warn!("REPL WAL append failed for user message: {}", e);
+                Ok(()) => wal_seq = next_seq,
+                Err(e) => tracing::warn!("REPL WAL append failed for user message: {}", e),
             }
         }
 
@@ -108,6 +108,8 @@ pub async fn run(
         });
 
         // Compact conversation if approaching context budget
+        // REPL doesn't track compaction failures or recent files — pass defaults
+        let empty_files: Vec<crate::session_store::RecentFile> = Vec::new();
         crate::context::compact_if_needed(
             &mut conversation,
             provider,
@@ -117,159 +119,64 @@ pub async fn run(
             entity_name,
             "repl",
             None,
+            0,
+            &empty_files,
         )
         .await;
 
-        // Tool definitions
-        let tool_defs = if provider.supports_tools() && !tools.is_empty() {
-            Some(tools.definitions())
-        } else {
-            None
-        };
-        let tool_defs_ref = tool_defs.as_deref();
-
-        let mut rounds: u32 = 0;
         println!();
 
-        loop {
-            // Invoke LLM
-            let result = match provider
-                .invoke(
-                    system_prompt,
-                    &conversation,
-                    config.llm.max_tokens,
-                    tool_defs_ref,
-                )
-                .await
-            {
-                Ok(r) => r,
-                Err(e) => {
-                    eprintln!("  \x1b[31merror\x1b[0m  {}", e);
-                    println!();
-                    break;
+        // Invoke LLM with shared tool loop (hallucination guard, action claim
+        // validation, consecutive failure tracking, micro-compact — all included).
+        let msg_count_before = conversation.len();
+        let result = crate::tool_loop::invoke_with_tool_loop(
+            provider,
+            tools,
+            system_prompt,
+            &mut conversation,
+            config.llm.max_tokens,
+            MAX_TOOL_ROUNDS,
+        )
+        .await;
+
+        match result {
+            Ok(result) => {
+                // WAL: log all new messages added by the tool loop
+                if let Some(ref wal) = wal {
+                    for msg in &conversation[msg_count_before..] {
+                        let next_seq = wal_seq + 1;
+                        match wal.append(
+                            session_key,
+                            next_seq,
+                            msg.role.clone(),
+                            &msg.content,
+                            None,
+                        ) {
+                            Ok(()) => wal_seq = next_seq,
+                            Err(e) => tracing::warn!("REPL WAL append failed: {}", e),
+                        }
+                    }
                 }
-            };
 
-            // Build assistant content
-            let assistant_content = MessageContent::Blocks(result.content.clone());
+                // Print the response
+                if !result.text.is_empty() {
+                    print_response(entity_name, &result.text);
+                }
 
-            // WAL: append assistant response
-            if let Some(ref wal) = wal {
-                wal_seq += 1;
-                if let Err(e) = wal.append(
-                    session_key,
-                    wal_seq,
-                    Role::Assistant,
-                    &assistant_content,
-                    None,
-                ) {
-                    tracing::warn!("REPL WAL append failed for assistant message: {}", e);
+                // Surface hallucination guard warnings to the terminal
+                if result.was_truncated {
+                    eprintln!("  \x1b[33mwarning\x1b[0m  response truncated (hallucination guard)");
+                }
+                if result.circuit_breaker_fired {
+                    eprintln!(
+                        "  \x1b[33mwarning\x1b[0m  tool loop stopped after {} rounds (circuit breaker)",
+                        result.tool_rounds
+                    );
                 }
             }
-
-            // Add assistant response to conversation
-            conversation.push(Message {
-                role: Role::Assistant,
-                content: assistant_content,
-                source: Some(MessageSource::Assistant),
-            });
-
-            match result.stop_reason {
-                StopReason::EndTurn | StopReason::MaxTokens | StopReason::StopSequence => {
-                    // Print the response
-                    let text = result.text();
-                    if !text.is_empty() {
-                        print_response(entity_name, &text);
-                    }
-                    break;
-                }
-                StopReason::ToolUse => {
-                    rounds += 1;
-                    if rounds > MAX_TOOL_ROUNDS {
-                        let text = result.text();
-                        if !text.is_empty() {
-                            print_response(entity_name, &text);
-                        }
-                        break;
-                    }
-
-                    // Execute tools and show indicators
-                    let mut tool_results = Vec::new();
-                    for block in &result.content {
-                        if let ContentBlock::ToolUse { id, name, input } = block {
-                            // Print tool indicator
-                            print_tool_indicator(name, input);
-
-                            let tool_result = match tools.get(name) {
-                                Some(tool) => match tool.execute(input.clone()).await {
-                                    Ok(output) => ContentBlock::ToolResult {
-                                        tool_use_id: id.clone(),
-                                        content: output,
-                                        is_error: None,
-                                    },
-                                    Err(e) => ContentBlock::ToolResult {
-                                        tool_use_id: id.clone(),
-                                        content: format!("Error: {}", e),
-                                        is_error: Some(true),
-                                    },
-                                },
-                                None => ContentBlock::ToolResult {
-                                    tool_use_id: id.clone(),
-                                    content: format!("Error: Unknown tool '{}'", name),
-                                    is_error: Some(true),
-                                },
-                            };
-                            tool_results.push(tool_result);
-                        }
-
-                        // Also print any text blocks that come with tool use
-                        if let ContentBlock::Text { text } = block {
-                            if !text.is_empty() {
-                                print_response(entity_name, text);
-                            }
-                        }
-                    }
-
-                    // Extract first tool ID before moving tool_results
-                    let first_tool_id = tool_results
-                        .iter()
-                        .find_map(|b| match b {
-                            ContentBlock::ToolResult { tool_use_id, .. } => {
-                                Some(tool_use_id.clone())
-                            }
-                            _ => None,
-                        })
-                        .unwrap_or_default();
-
-                    // Build tool results content
-                    let tool_content = MessageContent::Blocks(tool_results);
-
-                    // WAL: append tool results
-                    if let Some(ref wal) = wal {
-                        wal_seq += 1;
-                        if let Err(e) =
-                            wal.append(session_key, wal_seq, Role::User, &tool_content, None)
-                        {
-                            tracing::warn!("REPL WAL append failed for tool results: {}", e);
-                        }
-                    }
-                    conversation.push(Message {
-                        role: Role::User,
-                        content: tool_content,
-                        source: Some(MessageSource::ToolResult {
-                            tool_use_id: first_tool_id,
-                        }),
-                    });
-                }
-                StopReason::Other(ref reason) => {
-                    let text = result.text();
-                    if !text.is_empty() {
-                        print_response(entity_name, &text);
-                    } else {
-                        eprintln!("  \x1b[33mwarning\x1b[0m  unexpected stop: {}", reason);
-                    }
-                    break;
-                }
+            Err(e) => {
+                eprintln!("  \x1b[31merror\x1b[0m  {}", e);
+                println!();
             }
         }
     }
@@ -311,40 +218,6 @@ pub async fn run(
     }
 
     Ok(())
-}
-
-/// Print a tool execution indicator (dimmed).
-fn print_tool_indicator(name: &str, input: &serde_json::Value) {
-    let detail = match name {
-        "file_read" => input
-            .get("path")
-            .and_then(|v| v.as_str())
-            .map(|p| format!("reading {}...", p))
-            .unwrap_or_else(|| "reading file...".into()),
-        "file_write" => input
-            .get("path")
-            .and_then(|v| v.as_str())
-            .map(|p| format!("writing {}...", p))
-            .unwrap_or_else(|| "writing file...".into()),
-        "file_list" => input
-            .get("path")
-            .and_then(|v| v.as_str())
-            .map(|p| format!("listing {}...", p))
-            .unwrap_or_else(|| "listing files...".into()),
-        "grep" => input
-            .get("pattern")
-            .and_then(|v| v.as_str())
-            .map(|p| format!("searching for \"{}\"...", p))
-            .unwrap_or_else(|| "searching...".into()),
-        "web_fetch" => input
-            .get("url")
-            .and_then(|v| v.as_str())
-            .map(|u| format!("fetching {}...", u))
-            .unwrap_or_else(|| "fetching web page...".into()),
-        _ => format!("{}...", name),
-    };
-    // Dim gray
-    println!("  \x1b[2m[{}]\x1b[0m", detail);
 }
 
 /// Print entity response with name label.

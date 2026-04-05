@@ -303,11 +303,17 @@ pub fn archive_comms_conversation(
 /// Ingest an archived conversation into the knowledge graph (async, non-blocking).
 ///
 /// Reads the archive file and calls recall-echo's graph bridge.
+/// Uses spawn_blocking + dedicated runtime since SurrealDB types aren't Send.
 /// Logs on failure but never panics or returns errors to the caller.
+///
+/// Note: the LLM provider parameter is dropped in the spawn_blocking path
+/// because `dyn LmProvider` can't cross the thread boundary. Graph ingestion
+/// still works (episode-level only, no entity extraction). Full entity
+/// extraction requires the LLM HTTP provider path in recall-echo.
 pub async fn graph_ingest_archive(
     root_dir: &Path,
     archive_path: &Path,
-    provider: Option<&dyn pulse_system_types::llm::LmProvider>,
+    _provider: Option<&dyn pulse_system_types::llm::LmProvider>,
 ) {
     let memory_dir = root_dir.join("memory");
 
@@ -327,22 +333,32 @@ pub async fn graph_ingest_archive(
     let filename = archive_path
         .file_stem()
         .and_then(|s| s.to_str())
-        .unwrap_or("unknown");
+        .unwrap_or("unknown")
+        .to_string();
     let log_number: Option<u32> = filename
         .strip_prefix("conversation-")
         .and_then(|s| s.parse().ok());
-    let session_id = filename;
 
-    match recall_echo::graph_bridge::ingest_into_graph_with_llm(
-        &memory_dir,
-        &archive_content,
-        session_id,
-        log_number,
-        provider,
-    )
-    .await
-    {
-        Ok(report) => {
+    let filename_clone = filename.clone();
+    let result = tokio::task::spawn_blocking(move || {
+        let rt = match tokio::runtime::Runtime::new() {
+            Ok(rt) => rt,
+            Err(e) => return Err(format!("failed to create runtime: {e}")),
+        };
+        rt.block_on(async {
+            let graph_dir = memory_dir.join("graph");
+            let gm = recall_echo::graph::GraphMemory::open(&graph_dir)
+                .await
+                .map_err(|e| format!("graph open: {e}"))?;
+            gm.ingest_archive(&archive_content, &filename_clone, log_number, None)
+                .await
+                .map_err(|e| format!("ingest: {e}"))
+        })
+    })
+    .await;
+
+    match result {
+        Ok(Ok(report)) => {
             tracing::info!(
                 "graph: ingested archive {} — {} episodes, {} entities, {} relationships",
                 filename,
@@ -351,9 +367,8 @@ pub async fn graph_ingest_archive(
                 report.relationships_created,
             );
         }
-        Err(e) => {
-            tracing::warn!("graph: ingestion failed for {}: {}", filename, e);
-        }
+        Ok(Err(e)) => tracing::warn!("graph: ingestion failed for {}: {}", filename, e),
+        Err(e) => tracing::warn!("graph: ingestion task panicked for {}: {}", filename, e),
     }
 }
 

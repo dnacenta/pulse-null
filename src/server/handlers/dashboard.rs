@@ -23,52 +23,44 @@ pub async fn dashboard(State(state): State<Arc<AppState>>) -> Json<serde_json::V
 
     // Pipeline health
     let pipeline_data = if let Some(ref monitor) = state.pipeline_monitor {
-        if let Ok(root_dir) = config.root_dir() {
-            let thresholds = config.pipeline.to_thresholds();
-            let health = monitor.calculate(&root_dir, &thresholds);
-            serde_json::json!({
-                "learning": doc_json(&health.learning),
-                "thoughts": doc_json(&health.thoughts),
-                "curiosity": doc_json(&health.curiosity),
-                "reflections": doc_json(&health.reflections),
-                "praxis": doc_json(&health.praxis),
-                "warnings": health.warnings,
-            })
-        } else {
-            serde_json::Value::Null
-        }
+        let thresholds = config.pipeline.to_thresholds();
+        let health = monitor.calculate(&state.root_dir, &thresholds);
+        serde_json::json!({
+            "learning": doc_json(&health.learning),
+            "thoughts": doc_json(&health.thoughts),
+            "curiosity": doc_json(&health.curiosity),
+            "reflections": doc_json(&health.reflections),
+            "praxis": doc_json(&health.praxis),
+            "warnings": health.warnings,
+        })
     } else {
         serde_json::Value::Null
     };
 
     // Cognitive health
     let cognitive_data = if let Some(ref monitor) = state.cognitive_monitor {
-        if let Ok(root_dir) = config.root_dir() {
-            let health = monitor.assess(
-                &root_dir,
-                config.monitoring.window_size,
-                config.monitoring.min_samples,
-            );
-            if health.sufficient_data {
-                serde_json::json!({
-                    "status": status_string(&health.status),
-                    "sufficient_data": true,
-                    "signals": {
-                        "vocabulary": trend_string(&health.vocabulary_trend),
-                        "questions": trend_string(&health.question_trend),
-                        "grounding": trend_string(&health.evidence_trend),
-                        "lifecycle": trend_string(&health.progress_trend),
-                    },
-                    "suggestions": health.suggestions,
-                })
-            } else {
-                serde_json::json!({
-                    "status": "healthy",
-                    "sufficient_data": false,
-                })
-            }
+        let health = monitor.assess(
+            &state.root_dir,
+            config.monitoring.window_size,
+            config.monitoring.min_samples,
+        );
+        if health.sufficient_data {
+            serde_json::json!({
+                "status": status_string(&health.status),
+                "sufficient_data": true,
+                "signals": {
+                    "vocabulary": trend_string(&health.vocabulary_trend),
+                    "questions": trend_string(&health.question_trend),
+                    "grounding": trend_string(&health.evidence_trend),
+                    "lifecycle": trend_string(&health.progress_trend),
+                },
+                "suggestions": health.suggestions,
+            })
         } else {
-            serde_json::Value::Null
+            serde_json::json!({
+                "status": "healthy",
+                "sufficient_data": false,
+            })
         }
     } else {
         serde_json::Value::Null

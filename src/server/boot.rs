@@ -79,6 +79,8 @@ pub async fn boot_entity(
         None
     };
 
+    let alert_queue = crate::scheduler::alerts::AlertQueue::load(&root_dir);
+
     let state = Arc::new(AppState {
         config: config.clone(),
         provider,
@@ -94,6 +96,7 @@ pub async fn boot_entity(
         persist_coordinator,
         plugin_manager: tokio::sync::Mutex::new(plugin_manager),
         wal: None,
+        alert_queue: tokio::sync::Mutex::new(alert_queue),
     });
 
     // Pipeline health check

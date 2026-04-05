@@ -84,7 +84,7 @@ impl PluginManager {
         config: &Config,
         entity_root: &Path,
         provider: Arc<Box<dyn LmProvider>>,
-    ) -> Result<(), Box<dyn std::error::Error>> {
+    ) -> Result<(), crate::errors::PluginError> {
         let ctx = PluginContext {
             entity_root: entity_root.to_path_buf(),
             entity_name: config.entity.name.clone(),
@@ -100,11 +100,12 @@ impl PluginManager {
                 .unwrap_or(toml::Value::Table(toml::value::Table::new()));
 
             tracing::info!("Initializing plugin: {} v{}", meta.name, meta.version);
-            entry
-                .plugin
-                .init(&plugin_config, &ctx)
-                .await
-                .map_err(|e| format!("Failed to initialize plugin '{}': {}", meta.name, e))?;
+            entry.plugin.init(&plugin_config, &ctx).await.map_err(|e| {
+                crate::errors::PluginError::Failed {
+                    name: meta.name.clone(),
+                    reason: e.to_string(),
+                }
+            })?;
         }
 
         Ok(())
@@ -113,7 +114,7 @@ impl PluginManager {
     /// Start all plugins. Individual plugin failures are logged but do not
     /// abort the startup — the entity continues with reduced capabilities.
     /// Failed plugins are tracked and excluded from platform awareness.
-    pub async fn start_all(&mut self) -> Result<(), Box<dyn std::error::Error>> {
+    pub async fn start_all(&mut self) -> Result<(), crate::errors::PluginError> {
         for entry in &mut self.entries {
             let meta = entry.plugin.meta();
             tracing::info!("Starting plugin: {}", meta.name);
@@ -356,6 +357,7 @@ mod tests {
             context_buffer: crate::context_buffer::ContextBufferConfig::default(),
             session_health: crate::session_health::SessionHealthConfig::default(),
             platform: PlatformConfig::default(),
+            system_prompt_budget: crate::config::SystemPromptBudgetConfig::default(),
             peers: std::collections::HashMap::new(),
             plugins: std::collections::HashMap::new(),
         }

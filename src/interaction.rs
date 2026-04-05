@@ -103,9 +103,9 @@ impl InteractionRecord {
                 tool_rounds: 0,
                 duration_secs: Some(duration),
                 session_key: Some(session.key.clone()),
-                hallucination_count: session.hallucination_count,
-                action_claim_count: session.action_claim_count,
-                circuit_breaker_fires: session.circuit_breaker_count,
+                hallucination_count: session.health.hallucination_count,
+                action_claim_count: session.health.action_claim_count,
+                circuit_breaker_fires: session.health.circuit_breaker_count,
             },
         }
     }

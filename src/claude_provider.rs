@@ -13,12 +13,19 @@ pub struct ClaudeProvider {
     client: reqwest::Client,
 }
 
+/// Default timeout for Claude API requests (2 minutes).
+const API_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
+
 impl ClaudeProvider {
     pub fn new(api_key: String, model: String) -> Self {
+        let client = reqwest::Client::builder()
+            .timeout(API_TIMEOUT)
+            .build()
+            .unwrap_or_else(|_| reqwest::Client::new());
         Self {
             api_key,
             model,
-            client: reqwest::Client::new(),
+            client,
         }
     }
 

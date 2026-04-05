@@ -1,6 +1,6 @@
 [package]
 name = "pulse-null"
-version = "0.25.4"
+version = "0.26.0"
 edition = "2021"
 rust-version = "1.80"
 license = "AGPL-3.0-only"
@@ -25,6 +25,9 @@ axum = "0.8"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 toml = "0.8"
+
+# Error handling
+thiserror = "2"
 
 # HTTP client (for Claude API, streaming)
 reqwest = { version = "0.12", features = ["json", "stream"] }
@@ -73,7 +76,7 @@ libc = "0.2"
 pulse-system-types = "0.6.3"
 
 # Core dependencies (always included — these define an entity)
-recall-echo = { version = "3.4", features = ["pulse-null"] }
+recall-echo = { path = "/home/nova/projects/recall-echo", features = ["pulse-null"] }
 vigil-pulse = "0.1"
 
 # Plugins (optional — different interfaces to speak through)

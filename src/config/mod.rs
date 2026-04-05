@@ -38,6 +38,8 @@ pub struct Config {
     #[serde(default)]
     pub platform: PlatformConfig,
     #[serde(default)]
+    pub system_prompt_budget: SystemPromptBudgetConfig,
+    #[serde(default)]
     pub peers: HashMap<String, PeerConfig>,
     #[serde(default)]
     pub plugins: HashMap<String, toml::Value>,
@@ -154,7 +156,7 @@ impl Default for ServerConfig {
 
 impl Config {
     /// Load config from echo-system.toml in the current directory
-    pub fn load() -> Result<Self, Box<dyn std::error::Error>> {
+    pub fn load() -> Result<Self, crate::errors::ConfigError> {
         let path = Self::find_config()?;
         let content = std::fs::read_to_string(&path)?;
         let config: Config = toml::from_str(&content)?;
@@ -163,7 +165,7 @@ impl Config {
     }
 
     /// Load config from a specific directory
-    pub fn load_from(dir: &std::path::Path) -> Result<Self, Box<dyn std::error::Error>> {
+    pub fn load_from(dir: &std::path::Path) -> Result<Self, crate::errors::ConfigError> {
         let path = dir.join(CONFIG_FILENAME);
         let content = std::fs::read_to_string(&path)?;
         let config: Config = toml::from_str(&content)?;
@@ -172,7 +174,7 @@ impl Config {
     }
 
     /// Find pulse-null.toml by walking up from current directory
-    pub fn find_config() -> Result<PathBuf, Box<dyn std::error::Error>> {
+    pub fn find_config() -> Result<PathBuf, crate::errors::ConfigError> {
         let mut dir = std::env::current_dir()?;
         loop {
             let candidate = dir.join(CONFIG_FILENAME);
@@ -180,17 +182,21 @@ impl Config {
                 return Ok(candidate);
             }
             if !dir.pop() {
-                return Err(
-                    format!("No {} found. Run `pulse-null init` first.", CONFIG_FILENAME).into(),
-                );
+                return Err(crate::errors::ConfigError::NotFound(format!(
+                    "No {} found. Run `pulse-null init` first.",
+                    CONFIG_FILENAME
+                )));
             }
         }
     }
 
     /// Get the entity root directory (where pulse-null.toml lives)
-    pub fn root_dir(&self) -> Result<PathBuf, Box<dyn std::error::Error>> {
+    pub fn root_dir(&self) -> Result<PathBuf, crate::errors::ConfigError> {
         let path = Self::find_config()?;
-        Ok(path.parent().ok_or("Invalid config path")?.to_path_buf())
+        Ok(path
+            .parent()
+            .ok_or_else(|| crate::errors::ConfigError::Validation("Invalid config path".into()))?
+            .to_path_buf())
     }
 
     /// Resolve the API key from config or environment
@@ -425,6 +431,48 @@ pub struct SessionConfig {
     pub checkpoint_time: u64,
     /// Max WAL size in bytes before forced checkpoint (default: 512KB)
     pub wal_max_size: u64,
+    /// Default message cap for channels without specific limits (0 = no limit).
+    pub default_message_cap: usize,
+    /// Default session time limit in seconds for channels without specific limits (0 = no limit).
+    pub default_time_cap_seconds: u64,
+    /// Per-channel overrides for session limits.
+    /// Built-in defaults exist for "discord" (50 msgs / 2h), "voice" (30 msgs / 30min),
+    /// and "comms" (30 msgs / 1h). Explicit config here overrides built-in defaults.
+    pub channel_limits: HashMap<String, ChannelLimits>,
+}
+
+impl SessionConfig {
+    /// Get channel limits for a given channel, with built-in defaults for known channel types.
+    ///
+    /// Lookup order:
+    /// 1. Explicit `channel_limits` from TOML config
+    /// 2. Built-in defaults for known channels (discord, voice, comms)
+    /// 3. `default_message_cap` / `default_time_cap_seconds`
+    pub fn get_channel_limits(&self, channel: &str) -> ChannelLimits {
+        // Explicit config takes priority
+        if let Some(limits) = self.channel_limits.get(channel) {
+            return limits.clone();
+        }
+        // Built-in defaults for known channel types
+        match channel {
+            "discord" => ChannelLimits {
+                message_cap: 50,
+                time_cap_seconds: 7200,
+            },
+            "voice" => ChannelLimits {
+                message_cap: 30,
+                time_cap_seconds: 1800,
+            },
+            "comms" => ChannelLimits {
+                message_cap: 30,
+                time_cap_seconds: 3600,
+            },
+            _ => ChannelLimits {
+                message_cap: self.default_message_cap,
+                time_cap_seconds: self.default_time_cap_seconds,
+            },
+        }
+    }
 }
 
 impl Default for SessionConfig {
@@ -440,6 +488,9 @@ impl Default for SessionConfig {
             checkpoint_interval: 20,
             checkpoint_time: 600,
             wal_max_size: 524288,
+            default_message_cap: 100,
+            default_time_cap_seconds: 14400,
+            channel_limits: HashMap::new(),
         }
     }
 }
@@ -486,6 +537,85 @@ pub struct PeerConfig {
     pub port: u16,
     #[serde(default)]
     pub secret: Option<String>,
+}
+
+/// Per-channel session limits for automatic reset.
+///
+/// When a session exceeds its message cap or time cap, the session is
+/// automatically reset: the current conversation is archived, a structured
+/// handoff summary is created, and a fresh session starts.
+///
+/// Configure in TOML as:
+/// ```toml
+/// [sessions.channel_limits.discord]
+/// message_cap = 50
+/// time_cap_seconds = 7200
+/// ```
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ChannelLimits {
+    /// Maximum messages before session auto-reset (0 = no limit).
+    pub message_cap: usize,
+    /// Maximum session duration in seconds before auto-reset (0 = no limit).
+    pub time_cap_seconds: u64,
+}
+
+impl Default for ChannelLimits {
+    fn default() -> Self {
+        Self {
+            message_cap: 100,
+            time_cap_seconds: 14400, // 4 hours
+        }
+    }
+}
+
+/// Configuration for system prompt budgeting (Phase 6: Context Management).
+///
+/// Controls the maximum token budget for the system prompt and per-component
+/// caps. When the assembled system prompt exceeds the budget, lower-priority
+/// components are progressively trimmed.
+///
+/// Priority tiers (highest to lowest):
+/// 1. CLAUDE.md + rules/protocol files (essential — never trimmed)
+/// 2. SELF.md, MEMORY.md (high priority — trimmed only as last resort)
+/// 3. EPHEMERAL.md, FINDINGS.md, pipeline health, cognitive health, caliber (trimmable)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct SystemPromptBudgetConfig {
+    /// Enable system prompt budgeting. When false, the prompt is assembled
+    /// without any size limits (legacy behavior).
+    pub enabled: bool,
+    /// Maximum estimated tokens for the entire system prompt.
+    pub token_budget: usize,
+    /// Per-component token caps. Components exceeding their cap are truncated.
+    /// Set to 0 to use the default for that component.
+    pub claude_md_cap: usize,
+    pub rules_cap: usize,
+    pub self_md_cap: usize,
+    pub memory_cap: usize,
+    pub ephemeral_cap: usize,
+    pub findings_cap: usize,
+    pub pipeline_health_cap: usize,
+    pub cognitive_health_cap: usize,
+    pub caliber_cap: usize,
+}
+
+impl Default for SystemPromptBudgetConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            token_budget: 17_000,
+            claude_md_cap: 5_000,
+            rules_cap: 3_000,
+            self_md_cap: 4_000,
+            memory_cap: 4_000,
+            ephemeral_cap: 2_000,
+            findings_cap: 1_500,
+            pipeline_health_cap: 500,
+            cognitive_health_cap: 300,
+            caliber_cap: 200,
+        }
+    }
 }
 
 /// Configuration for caliber-echo outcome tracking

@@ -8,6 +8,75 @@ use super::capability::{self, Capability};
 use crate::config::{AwarenessMode, Config};
 use crate::scheduler::intent::IntentQueue;
 
+// ---------------------------------------------------------------------------
+// System Prompt Budget (Phase 6)
+// ---------------------------------------------------------------------------
+
+/// Rough chars-per-token estimate (same constant used in context.rs).
+const CHARS_PER_TOKEN: usize = 4;
+
+/// Estimate tokens for a text blob.
+fn estimate_tokens(text: &str) -> usize {
+    text.len() / CHARS_PER_TOKEN
+}
+
+/// Truncate text to fit within a token cap, preserving the beginning.
+/// Returns the truncated text with a marker if truncation occurred.
+fn truncate_to_token_cap(text: &str, token_cap: usize) -> String {
+    let estimated = estimate_tokens(text);
+    if estimated <= token_cap {
+        return text.to_string();
+    }
+    let char_budget = token_cap * CHARS_PER_TOKEN;
+    let truncated = crate::utils::safe_truncate(text, char_budget);
+    format!(
+        "{}...\n[truncated — exceeded {} token cap]",
+        truncated, token_cap
+    )
+}
+
+/// Priority tier for a system prompt component.
+/// Lower number = higher priority = trimmed last.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum PromptTier {
+    /// Essential: CLAUDE.md, rules/protocol files, memory curation instructions.
+    /// Never trimmed.
+    Essential = 0,
+    /// High priority: SELF.md, MEMORY.md. Truncated only as last resort.
+    High = 1,
+    /// Lower priority: EPHEMERAL.md, FINDINGS.md, pipeline health, cognitive
+    /// health, caliber. Progressively compressed or dropped when over budget.
+    Low = 2,
+}
+
+/// A named component of the system prompt with its content and metadata.
+#[allow(dead_code)]
+struct PromptComponent {
+    /// Human-readable name for logging.
+    name: &'static str,
+    /// The rendered text content.
+    content: String,
+    /// Estimated token count.
+    tokens: usize,
+    /// Priority tier.
+    tier: PromptTier,
+    /// Per-component token cap from config.
+    cap: usize,
+}
+
+/// Result of system prompt assembly, including the prompt text and metrics.
+#[derive(Debug, Clone)]
+pub struct SystemPromptResult {
+    /// The assembled system prompt text.
+    pub prompt: String,
+    /// Estimated token count of the assembled prompt.
+    pub estimated_tokens: usize,
+    /// Whether any components were trimmed to fit the budget.
+    pub was_trimmed: bool,
+    /// Components that were dropped entirely (name + original tokens).
+    pub dropped_components: Vec<(String, usize)>,
+}
+
 /// Async version of build_system_prompt — runs the blocking file I/O
 /// on tokio's blocking thread pool to avoid stalling the async runtime.
 pub async fn build_system_prompt_async(
@@ -15,7 +84,7 @@ pub async fn build_system_prompt_async(
     config: Config,
     pipeline_monitor: Option<Arc<dyn PipelineMonitor>>,
     cognitive_monitor: Option<Arc<dyn CognitiveMonitor>>,
-) -> Result<String, Box<dyn std::error::Error>> {
+) -> Result<String, crate::errors::PromptError> {
     let result = tokio::task::spawn_blocking(move || {
         build_system_prompt(
             &root_dir,
@@ -26,21 +95,492 @@ pub async fn build_system_prompt_async(
         .map_err(|e| e.to_string())
     })
     .await
-    .map_err(|e| e.to_string())
-    .and_then(|r| r)?;
+    .map_err(|e| crate::errors::PromptError::Assembly(e.to_string()))
+    .and_then(|r| r.map_err(crate::errors::PromptError::Assembly))?;
     Ok(result)
 }
 
-/// Build the system prompt from entity documents
+/// Build the system prompt from entity documents.
+///
+/// When `config.system_prompt_budget.enabled` is true, components are
+/// budget-aware: each is capped individually, and if the total exceeds
+/// the budget, lower-priority components are progressively trimmed or
+/// dropped. Use [`build_system_prompt_budgeted`] to get the full
+/// [`SystemPromptResult`] with metrics.
 pub fn build_system_prompt(
     root_dir: &Path,
     config: &Config,
     pipeline_monitor: Option<&Arc<dyn PipelineMonitor>>,
     cognitive_monitor: Option<&Arc<dyn CognitiveMonitor>>,
-) -> Result<String, Box<dyn std::error::Error>> {
+) -> Result<String, crate::errors::PromptError> {
+    let result =
+        build_system_prompt_budgeted(root_dir, config, pipeline_monitor, cognitive_monitor)?;
+    Ok(result.prompt)
+}
+
+/// Build the system prompt with full budget metrics returned.
+///
+/// This is the budget-aware assembly path. It loads each component,
+/// enforces per-component caps, then trims lower-priority content
+/// until the total fits within the configured token budget.
+pub fn build_system_prompt_budgeted(
+    root_dir: &Path,
+    config: &Config,
+    pipeline_monitor: Option<&Arc<dyn PipelineMonitor>>,
+    cognitive_monitor: Option<&Arc<dyn CognitiveMonitor>>,
+) -> Result<SystemPromptResult, crate::errors::PromptError> {
+    let budget_cfg = &config.system_prompt_budget;
+    let budget_enabled = budget_cfg.enabled;
+
+    // Collect all components with their metadata.
+    let mut components = Vec::new();
+
+    // --- Tier 0 (Essential): CLAUDE.md ---
+    let claude_path = root_dir.join("CLAUDE.md");
+    if claude_path.exists() {
+        let content = std::fs::read_to_string(&claude_path)?;
+        let capped = if budget_enabled && budget_cfg.claude_md_cap > 0 {
+            truncate_to_token_cap(&content, budget_cfg.claude_md_cap)
+        } else {
+            content
+        };
+        let tokens = estimate_tokens(&capped);
+        components.push(PromptComponent {
+            name: "CLAUDE.md",
+            content: capped,
+            tokens,
+            tier: PromptTier::Essential,
+            cap: budget_cfg.claude_md_cap,
+        });
+    }
+
+    // --- Tier 0 (Essential): Rule/protocol files ---
+    if let Some(ref rules_dir) = config.entity.rules_dir {
+        match load_rule_files(rules_dir) {
+            Ok(rules) => {
+                let mut rules_text = String::new();
+                for (name, content) in rules {
+                    if !rules_text.is_empty() {
+                        rules_text.push_str("\n\n");
+                    }
+                    rules_text.push_str(&format!(
+                        "<protocol name=\"{}\">\n{}\n</protocol>",
+                        name, content
+                    ));
+                }
+                if !rules_text.is_empty() {
+                    let capped = if budget_enabled && budget_cfg.rules_cap > 0 {
+                        truncate_to_token_cap(&rules_text, budget_cfg.rules_cap)
+                    } else {
+                        rules_text
+                    };
+                    let tokens = estimate_tokens(&capped);
+                    components.push(PromptComponent {
+                        name: "rules",
+                        content: capped,
+                        tokens,
+                        tier: PromptTier::Essential,
+                        cap: budget_cfg.rules_cap,
+                    });
+                }
+            }
+            Err(e) => {
+                warn!("Failed to load rule files from '{}': {}", rules_dir, e);
+            }
+        }
+    }
+
+    // --- Tier 1 (High): SELF.md ---
+    let self_path = root_dir.join("SELF.md");
+    if self_path.exists() {
+        let content = std::fs::read_to_string(&self_path)?;
+        let wrapped = format!("<identity>\n{}\n</identity>", content);
+        let capped = if budget_enabled && budget_cfg.self_md_cap > 0 {
+            truncate_to_token_cap(&wrapped, budget_cfg.self_md_cap)
+        } else {
+            wrapped
+        };
+        let tokens = estimate_tokens(&capped);
+        components.push(PromptComponent {
+            name: "SELF.md",
+            content: capped,
+            tokens,
+            tier: PromptTier::High,
+            cap: budget_cfg.self_md_cap,
+        });
+    }
+
+    // --- AWARENESS.md (for non-Claude-Code providers) ---
+    // This is part of the essential identity for API entities.
+    if config.llm.provider != "claude-code" {
+        let awareness_path = root_dir.join("AWARENESS.md");
+        if awareness_path.exists() {
+            let content = std::fs::read_to_string(&awareness_path)?;
+            if !content.trim().is_empty() {
+                let wrapped = format!("<platform>\n{}\n</platform>", content);
+                let tokens = estimate_tokens(&wrapped);
+                components.push(PromptComponent {
+                    name: "AWARENESS.md",
+                    content: wrapped,
+                    tokens,
+                    tier: PromptTier::High,
+                    cap: 0, // no separate cap
+                });
+            }
+        }
+    }
+
+    // --- Tier 1 (High): MEMORY.md ---
+    let memory_path = root_dir.join("memory/MEMORY.md");
+    if memory_path.exists() {
+        let content = std::fs::read_to_string(&memory_path)?;
+        let limited: String = content
+            .lines()
+            .take(config.memory.memory_max_lines)
+            .collect::<Vec<_>>()
+            .join("\n");
+        let wrapped = format!("<memory>\n{}\n</memory>", limited);
+        let capped = if budget_enabled && budget_cfg.memory_cap > 0 {
+            truncate_to_token_cap(&wrapped, budget_cfg.memory_cap)
+        } else {
+            wrapped
+        };
+        let tokens = estimate_tokens(&capped);
+        components.push(PromptComponent {
+            name: "MEMORY.md",
+            content: capped,
+            tokens,
+            tier: PromptTier::High,
+            cap: budget_cfg.memory_cap,
+        });
+    }
+
+    // --- Tier 0 (Essential): Memory curation instructions ---
+    // Small, static, always included.
+    let memory_curation = "<memory-curation>\n\
+        You have a file_write tool. Use it to maintain your memory/MEMORY.md file.\n\
+        When you learn something stable about D, their preferences, projects, or \
+        recurring patterns — or when a conversation produces a decision worth \
+        remembering — write it to MEMORY.md using file_write.\n\n\
+        Rules:\n\
+        - Only write confirmed, stable information. Not session-specific or speculative.\n\
+        - Read MEMORY.md first to avoid duplicates. Update existing entries rather than adding new ones.\n\
+        - Keep it concise. MEMORY.md is loaded into every conversation — bloat costs context.\n\
+        - Do not write secrets, API keys, or credentials to MEMORY.md.\n\
+        - You do not need to write memory on every conversation. Only when something genuinely worth remembering comes up.\n\
+        </memory-curation>"
+        .to_string();
+    let tokens = estimate_tokens(&memory_curation);
+    components.push(PromptComponent {
+        name: "memory-curation",
+        content: memory_curation,
+        tokens,
+        tier: PromptTier::Essential,
+        cap: 0,
+    });
+
+    // --- Tier 2 (Low): EPHEMERAL.md ---
+    let ephemeral_path = root_dir.join("memory/EPHEMERAL.md");
+    if ephemeral_path.exists() {
+        let content = std::fs::read_to_string(&ephemeral_path)?;
+        if !content.trim().is_empty() {
+            let wrapped = format!("<last-session>\n{}\n</last-session>", content);
+            let capped = if budget_enabled && budget_cfg.ephemeral_cap > 0 {
+                truncate_to_token_cap(&wrapped, budget_cfg.ephemeral_cap)
+            } else {
+                wrapped
+            };
+            let tokens = estimate_tokens(&capped);
+            components.push(PromptComponent {
+                name: "EPHEMERAL.md",
+                content: capped,
+                tokens,
+                tier: PromptTier::Low,
+                cap: budget_cfg.ephemeral_cap,
+            });
+        }
+    }
+
+    // --- Tier 2 (Low): FINDINGS.md ---
+    let findings_path = root_dir.join("FINDINGS.md");
+    if findings_path.exists() {
+        let content = std::fs::read_to_string(&findings_path)?;
+        if !content.trim().is_empty() {
+            let wrapped = format!(
+                "<autonomous-findings>\n\
+                Between conversations, you did some research on your own. Here is what you found. \
+                Bring these findings up naturally in conversation when relevant — don't dump them \
+                all at once, but mention them when the topic connects. After you've shared a finding \
+                with the user, you can remove it from FINDINGS.md using file_write.\n\n\
+                {}\n</autonomous-findings>",
+                content
+            );
+            let capped = if budget_enabled && budget_cfg.findings_cap > 0 {
+                truncate_to_token_cap(&wrapped, budget_cfg.findings_cap)
+            } else {
+                wrapped
+            };
+            let tokens = estimate_tokens(&capped);
+            components.push(PromptComponent {
+                name: "FINDINGS.md",
+                content: capped,
+                tokens,
+                tier: PromptTier::Low,
+                cap: budget_cfg.findings_cap,
+            });
+        }
+    }
+
+    // --- Tier 2 (Low): Pipeline health ---
+    if let Some(monitor) = pipeline_monitor {
+        let thresholds = config.pipeline.to_thresholds();
+        let pipeline_state = monitor.load_state(root_dir);
+        let pipeline_health = monitor.calculate(root_dir, &thresholds);
+        let pipeline_text = monitor.render_for_prompt(
+            &pipeline_health,
+            pipeline_state.sessions_without_movement,
+            config.pipeline.freeze_threshold,
+        );
+        let wrapped = format!("<pipeline-health>\n{}\n</pipeline-health>", pipeline_text);
+        let capped = if budget_enabled && budget_cfg.pipeline_health_cap > 0 {
+            truncate_to_token_cap(&wrapped, budget_cfg.pipeline_health_cap)
+        } else {
+            wrapped
+        };
+        let tokens = estimate_tokens(&capped);
+        components.push(PromptComponent {
+            name: "pipeline-health",
+            content: capped,
+            tokens,
+            tier: PromptTier::Low,
+            cap: budget_cfg.pipeline_health_cap,
+        });
+    }
+
+    // --- Tier 2 (Low): Cognitive health ---
+    if let Some(monitor) = cognitive_monitor {
+        let cognitive_health = monitor.assess(
+            root_dir,
+            config.monitoring.window_size,
+            config.monitoring.min_samples,
+        );
+        let cognitive_text = monitor.render_for_prompt(&cognitive_health);
+        let wrapped = format!(
+            "<cognitive-health>\n{}\n</cognitive-health>",
+            cognitive_text
+        );
+        let capped = if budget_enabled && budget_cfg.cognitive_health_cap > 0 {
+            truncate_to_token_cap(&wrapped, budget_cfg.cognitive_health_cap)
+        } else {
+            wrapped
+        };
+        let tokens = estimate_tokens(&capped);
+        components.push(PromptComponent {
+            name: "cognitive-health",
+            content: capped,
+            tokens,
+            tier: PromptTier::Low,
+            cap: budget_cfg.cognitive_health_cap,
+        });
+    }
+
+    // --- Tier 2 (Low): Caliber ---
+    if config.pulse.enabled {
+        if let Some(caliber_text) = crate::caliber::runtime::render_for_prompt(root_dir) {
+            let wrapped = format!("<caliber>\n{}\n</caliber>", caliber_text);
+            let capped = if budget_enabled && budget_cfg.caliber_cap > 0 {
+                truncate_to_token_cap(&wrapped, budget_cfg.caliber_cap)
+            } else {
+                wrapped
+            };
+            let tokens = estimate_tokens(&capped);
+            components.push(PromptComponent {
+                name: "caliber",
+                content: capped,
+                tokens,
+                tier: PromptTier::Low,
+                cap: budget_cfg.caliber_cap,
+            });
+        }
+    }
+
+    // --- Budget enforcement ---
+    let total_before: usize = components.iter().map(|c| c.tokens).sum();
+    let mut was_trimmed = false;
+    let mut dropped_components = Vec::new();
+
+    if budget_enabled && total_before > budget_cfg.token_budget {
+        // Progressive trimming: drop Low-tier components from lowest priority
+        // (reverse order = caliber, cognitive, pipeline, findings, ephemeral).
+        // Within a tier, we drop in reverse insertion order (last added = least important).
+        let budget = budget_cfg.token_budget;
+        let mut current_total: usize = components.iter().map(|c| c.tokens).sum();
+
+        // Pass 1: Compress Low-tier components to one-line summaries
+        for component in components.iter_mut().rev() {
+            if current_total <= budget {
+                break;
+            }
+            if component.tier != PromptTier::Low {
+                continue;
+            }
+            let original_tokens = component.tokens;
+            let compressed = compress_to_one_liner(component.name, &component.content);
+            let compressed_tokens = estimate_tokens(&compressed);
+            if compressed_tokens < original_tokens {
+                was_trimmed = true;
+                current_total = current_total - original_tokens + compressed_tokens;
+                component.content = compressed;
+                component.tokens = compressed_tokens;
+                info!(
+                    "[system-prompt-budget] compressed {} from ~{} to ~{} tokens",
+                    component.name, original_tokens, compressed_tokens
+                );
+            }
+        }
+
+        // Pass 2: Drop Low-tier components entirely if still over budget
+        if current_total > budget {
+            // Collect indices of Low-tier components in reverse order
+            let low_indices: Vec<usize> = components
+                .iter()
+                .enumerate()
+                .filter(|(_, c)| c.tier == PromptTier::Low)
+                .map(|(i, _)| i)
+                .rev()
+                .collect();
+
+            for idx in low_indices {
+                if current_total <= budget {
+                    break;
+                }
+                let dropped_tokens = components[idx].tokens;
+                let dropped_name = components[idx].name.to_string();
+                info!(
+                    "[system-prompt-budget] dropped {} (~{} tokens) to fit budget",
+                    dropped_name, dropped_tokens
+                );
+                dropped_components.push((dropped_name, dropped_tokens));
+                current_total -= dropped_tokens;
+                components[idx].content.clear();
+                components[idx].tokens = 0;
+                was_trimmed = true;
+            }
+        }
+
+        // Pass 3: Truncate High-tier components if STILL over budget (rare, means
+        // essential + high alone exceed the budget — log a warning).
+        if current_total > budget {
+            warn!(
+                "[system-prompt-budget] essential + high-priority components ({} tokens) exceed \
+                 budget ({} tokens) — core documents may be too large",
+                current_total, budget
+            );
+        }
+    }
+
+    // Assemble final prompt from non-empty components (preserving original order)
+    let parts: Vec<&str> = components
+        .iter()
+        .filter(|c| !c.content.is_empty())
+        .map(|c| c.content.as_str())
+        .collect();
+    let prompt = parts.join("\n\n");
+    let estimated_tokens = estimate_tokens(&prompt);
+
+    if budget_enabled {
+        info!(
+            "[system-prompt-budget] assembled {} tokens (budget: {}, trimmed: {}, dropped: {})",
+            estimated_tokens,
+            budget_cfg.token_budget,
+            was_trimmed,
+            dropped_components.len()
+        );
+    }
+
+    Ok(SystemPromptResult {
+        prompt,
+        estimated_tokens,
+        was_trimmed,
+        dropped_components,
+    })
+}
+
+/// Compress a system prompt component to a single-line status summary.
+/// Used when the system prompt is over budget and low-priority components
+/// need to shrink before being dropped entirely.
+fn compress_to_one_liner(name: &str, content: &str) -> String {
+    match name {
+        "EPHEMERAL.md" => {
+            // Extract just the first meaningful line from the session summary
+            let first_line = content
+                .lines()
+                .find(|l| {
+                    let trimmed = l.trim();
+                    !trimmed.is_empty() && !trimmed.starts_with('<') && !trimmed.starts_with("##")
+                })
+                .unwrap_or("[session summary available]");
+            format!(
+                "<last-session>[compressed] {}</last-session>",
+                first_line.trim()
+            )
+        }
+        "FINDINGS.md" => {
+            // Count findings and emit a one-liner
+            let finding_count = content.matches("- ").count().max(1);
+            format!(
+                "<autonomous-findings>[compressed] {} finding(s) available — ask to see them</autonomous-findings>",
+                finding_count
+            )
+        }
+        "pipeline-health" => {
+            // Extract key numbers if possible, otherwise generic status
+            if content.contains("healthy") || content.contains("Healthy") {
+                "<pipeline-health>[compressed] Pipeline healthy</pipeline-health>".to_string()
+            } else if content.contains("stale") || content.contains("frozen") {
+                "<pipeline-health>[compressed] Pipeline needs attention — stale or frozen documents</pipeline-health>".to_string()
+            } else {
+                "<pipeline-health>[compressed] Pipeline status available</pipeline-health>"
+                    .to_string()
+            }
+        }
+        "cognitive-health" => {
+            if content.contains("healthy")
+                || content.contains("Healthy")
+                || content.contains("stable")
+            {
+                "<cognitive-health>[compressed] Cognitive health stable</cognitive-health>"
+                    .to_string()
+            } else {
+                "<cognitive-health>[compressed] Cognitive health needs review</cognitive-health>"
+                    .to_string()
+            }
+        }
+        "caliber" => {
+            "<caliber>[compressed] Caliber data available — outcome history on file</caliber>"
+                .to_string()
+        }
+        _ => {
+            // Generic: first line of content
+            let first_line = content.lines().next().unwrap_or("[content available]");
+            format!("[compressed] {}", first_line.trim())
+        }
+    }
+}
+
+/// Build a minimal system prompt for scheduled tasks (Phase 5: Task Isolation).
+///
+/// Includes only the identity core: CLAUDE.md + rules + SELF.md.
+/// Excludes: MEMORY.md, EPHEMERAL.md, FINDINGS.md, pipeline health,
+/// cognitive health, and caliber data. This keeps the task's context
+/// small and focused, leaving more room for the task prompt and tool output.
+pub fn build_task_system_prompt(
+    root_dir: &Path,
+    config: &Config,
+) -> Result<String, crate::errors::PromptError> {
     let mut parts = Vec::new();
 
-    // CLAUDE.md — behavioral instructions
+    // CLAUDE.md — behavioral instructions (core identity)
     let claude_path = root_dir.join("CLAUDE.md");
     if claude_path.exists() {
         let content = std::fs::read_to_string(&claude_path)?;
@@ -71,118 +611,38 @@ pub fn build_system_prompt(
         parts.push(format!("<identity>\n{}\n</identity>", content));
     }
 
-    // AWARENESS.md — platform awareness (for API/Ollama entities)
-    // Claude Code entities pick this up via @import in their CLAUDE.md,
-    // so we only inject it into the system prompt for non-Claude-Code providers.
-    if config.llm.provider != "claude-code" {
-        let awareness_path = root_dir.join("AWARENESS.md");
-        if awareness_path.exists() {
-            let content = std::fs::read_to_string(&awareness_path)?;
-            if !content.trim().is_empty() {
-                parts.push(format!("<platform>\n{}\n</platform>", content));
-            }
-        }
-    }
-
-    // MEMORY.md — curated memory
-    let memory_path = root_dir.join("memory/MEMORY.md");
-    if memory_path.exists() {
-        let content = std::fs::read_to_string(&memory_path)?;
-        // Limit to configured max lines
-        let limited: String = content
-            .lines()
-            .take(config.memory.memory_max_lines)
-            .collect::<Vec<_>>()
-            .join("\n");
-        parts.push(format!("<memory>\n{}\n</memory>", limited));
-    }
-
-    // Memory curation instructions — tell the entity how to maintain MEMORY.md
+    // Task isolation notice — tell the model this is an isolated task context
     parts.push(
-        "<memory-curation>\n\
-        You have a file_write tool. Use it to maintain your memory/MEMORY.md file.\n\
-        When you learn something stable about D, their preferences, projects, or \
-        recurring patterns — or when a conversation produces a decision worth \
-        remembering — write it to MEMORY.md using file_write.\n\n\
-        Rules:\n\
-        - Only write confirmed, stable information. Not session-specific or speculative.\n\
-        - Read MEMORY.md first to avoid duplicates. Update existing entries rather than adding new ones.\n\
-        - Keep it concise. MEMORY.md is loaded into every conversation — bloat costs context.\n\
-        - Do not write secrets, API keys, or credentials to MEMORY.md.\n\
-        - You do not need to write memory on every conversation. Only when something genuinely worth remembering comes up.\n\
-        </memory-curation>"
+        "<task-context>\n\
+        This is an isolated scheduled task execution. You have a minimal system prompt \
+        (identity only — no MEMORY.md, EPHEMERAL.md, or monitoring data). \
+        Focus on the task prompt. Do not reference memory or session context that \
+        is not present in this context window.\n\
+        </task-context>"
             .to_string(),
     );
-
-    // EPHEMERAL.md — last session summary
-    let ephemeral_path = root_dir.join("memory/EPHEMERAL.md");
-    if ephemeral_path.exists() {
-        let content = std::fs::read_to_string(&ephemeral_path)?;
-        if !content.trim().is_empty() {
-            parts.push(format!("<last-session>\n{}\n</last-session>", content));
-        }
-    }
-
-    // FINDINGS.md — autonomous research findings to surface in next conversation
-    let findings_path = root_dir.join("FINDINGS.md");
-    if findings_path.exists() {
-        let content = std::fs::read_to_string(&findings_path)?;
-        if !content.trim().is_empty() {
-            parts.push(format!(
-                "<autonomous-findings>\n\
-                Between conversations, you did some research on your own. Here is what you found. \
-                Bring these findings up naturally in conversation when relevant — don't dump them \
-                all at once, but mention them when the topic connects. After you've shared a finding \
-                with the user, you can remove it from FINDINGS.md using file_write.\n\n\
-                {}\n</autonomous-findings>",
-                content
-            ));
-        }
-    }
-
-    // Pipeline health — document counts and threshold status
-    if let Some(monitor) = pipeline_monitor {
-        let thresholds = config.pipeline.to_thresholds();
-        let pipeline_state = monitor.load_state(root_dir);
-        let pipeline_health = monitor.calculate(root_dir, &thresholds);
-        let pipeline_text = monitor.render_for_prompt(
-            &pipeline_health,
-            pipeline_state.sessions_without_movement,
-            config.pipeline.freeze_threshold,
-        );
-        parts.push(format!(
-            "<pipeline-health>\n{}\n</pipeline-health>",
-            pipeline_text
-        ));
-    }
-
-    // Cognitive health — metacognitive monitoring assessment
-    if let Some(monitor) = cognitive_monitor {
-        let cognitive_health = monitor.assess(
-            root_dir,
-            config.monitoring.window_size,
-            config.monitoring.min_samples,
-        );
-        let cognitive_text = monitor.render_for_prompt(&cognitive_health);
-        parts.push(format!(
-            "<cognitive-health>\n{}\n</cognitive-health>",
-            cognitive_text
-        ));
-    }
-
-    // Caliber — operational self-model (capability scores, outcomes, limitations)
-    if config.pulse.enabled {
-        if let Some(caliber_text) = crate::caliber::runtime::render_for_prompt(root_dir) {
-            parts.push(format!("<caliber>\n{}\n</caliber>", caliber_text));
-        }
-    }
 
     Ok(parts.join("\n\n"))
 }
 
+/// Async version of [`build_task_system_prompt`] — runs blocking file I/O
+/// on tokio's blocking thread pool.
+pub async fn build_task_system_prompt_async(
+    root_dir: PathBuf,
+    config: Config,
+) -> Result<String, crate::errors::PromptError> {
+    let result = tokio::task::spawn_blocking(move || {
+        build_task_system_prompt(&root_dir, &config).map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|e| crate::errors::PromptError::Assembly(e.to_string()))
+    .and_then(|r| r.map_err(crate::errors::PromptError::Assembly))?;
+    Ok(result)
+}
+
 /// Load shared rule/protocol files from the configured rules directory.
 /// Returns (protocol_name, content) tuples sorted alphabetically by filename.
-fn load_rule_files(rules_dir: &str) -> Result<Vec<(String, String)>, Box<dyn std::error::Error>> {
+fn load_rule_files(rules_dir: &str) -> Result<Vec<(String, String)>, crate::errors::PromptError> {
     let dir = Path::new(rules_dir);
     if !dir.exists() || !dir.is_dir() {
         return Ok(Vec::new());
@@ -504,7 +964,7 @@ pub fn write_awareness_file(
     config: &Config,
     plugin_descriptions: &[(String, String)],
     tool_names: &[String],
-) -> Result<(), Box<dyn std::error::Error>> {
+) -> Result<(), crate::errors::PromptError> {
     let content = generate_awareness_document(config, plugin_descriptions, tool_names);
     let awareness_path = root_dir.join("AWARENESS.md");
     std::fs::write(&awareness_path, &content)?;
@@ -604,6 +1064,7 @@ mod tests {
             context_buffer: crate::context_buffer::ContextBufferConfig::default(),
             session_health: crate::session_health::SessionHealthConfig::default(),
             platform: PlatformConfig::default(),
+            system_prompt_budget: crate::config::SystemPromptBudgetConfig::default(),
             peers: std::collections::HashMap::new(),
             plugins: std::collections::HashMap::new(),
         }
@@ -803,5 +1264,229 @@ mod tests {
         let config = minimal_config();
         let manifest = rebuild_platform_manifest(&config, &[], &[]);
         assert!(manifest.starts_with("# TestEntity — Platform Awareness"));
+    }
+
+    // --- Phase 6: System Prompt Budget tests ---
+
+    #[test]
+    fn estimate_tokens_basic() {
+        assert_eq!(estimate_tokens(""), 0);
+        assert_eq!(estimate_tokens("abcd"), 1); // 4 chars / 4 = 1
+        assert_eq!(estimate_tokens("abcdefgh"), 2); // 8 chars / 4 = 2
+    }
+
+    #[test]
+    fn truncate_to_token_cap_noop_when_under() {
+        let text = "short text";
+        let result = truncate_to_token_cap(text, 1000);
+        assert_eq!(result, text);
+    }
+
+    #[test]
+    fn truncate_to_token_cap_truncates_when_over() {
+        // 400 chars = ~100 tokens. Cap at 10 tokens = 40 chars.
+        let text = "a".repeat(400);
+        let result = truncate_to_token_cap(&text, 10);
+        assert!(result.len() < 400);
+        assert!(result.contains("[truncated"));
+        assert!(result.contains("10 token cap"));
+    }
+
+    #[test]
+    fn build_system_prompt_budgeted_returns_result() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = minimal_config();
+
+        // Write a CLAUDE.md
+        std::fs::write(
+            dir.path().join("CLAUDE.md"),
+            "# Test Entity\nYou are a test.",
+        )
+        .unwrap();
+
+        let result = build_system_prompt_budgeted(dir.path(), &config, None, None).unwrap();
+
+        assert!(result.prompt.contains("# Test Entity"));
+        assert!(result.estimated_tokens > 0);
+        assert!(!result.was_trimmed);
+        assert!(result.dropped_components.is_empty());
+    }
+
+    #[test]
+    fn budget_disabled_loads_everything() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = minimal_config();
+        config.system_prompt_budget.enabled = false;
+
+        // Write large files
+        std::fs::write(dir.path().join("CLAUDE.md"), "x".repeat(80_000)).unwrap();
+        std::fs::create_dir_all(dir.path().join("memory")).unwrap();
+        std::fs::write(dir.path().join("memory/MEMORY.md"), "y".repeat(40_000)).unwrap();
+
+        let result = build_system_prompt_budgeted(dir.path(), &config, None, None).unwrap();
+
+        // Everything loaded, no trimming
+        assert!(!result.was_trimmed);
+        assert!(result.estimated_tokens > 25_000);
+    }
+
+    #[test]
+    fn budget_enforces_per_component_caps() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = minimal_config();
+        config.system_prompt_budget.enabled = true;
+        config.system_prompt_budget.claude_md_cap = 50; // 50 tokens ~ 200 chars
+
+        // Write a big CLAUDE.md (1000 chars ~ 250 tokens)
+        std::fs::write(dir.path().join("CLAUDE.md"), "x".repeat(1000)).unwrap();
+
+        let result = build_system_prompt_budgeted(dir.path(), &config, None, None).unwrap();
+
+        // CLAUDE.md should be truncated to ~50 tokens
+        // The prompt will contain the truncation marker
+        assert!(result.prompt.contains("[truncated"));
+    }
+
+    #[test]
+    fn budget_trims_low_priority_components() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = minimal_config();
+        config.system_prompt_budget.enabled = true;
+        // Set a very tight budget
+        config.system_prompt_budget.token_budget = 200;
+        // Per-component caps are generous (so individual components aren't pre-trimmed)
+        config.system_prompt_budget.claude_md_cap = 5000;
+        config.system_prompt_budget.ephemeral_cap = 5000;
+        config.system_prompt_budget.findings_cap = 5000;
+
+        // Write essential and low-priority files
+        std::fs::write(dir.path().join("CLAUDE.md"), "# Entity\nCore identity.").unwrap();
+        std::fs::create_dir_all(dir.path().join("memory")).unwrap();
+        std::fs::write(
+            dir.path().join("memory/EPHEMERAL.md"),
+            "Session summary: lots of details about recent work ".repeat(20),
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("FINDINGS.md"),
+            "- Finding 1\n- Finding 2\n- Finding 3",
+        )
+        .unwrap();
+
+        let result = build_system_prompt_budgeted(dir.path(), &config, None, None).unwrap();
+
+        // Should have trimmed something
+        assert!(result.was_trimmed);
+        // Essential content should still be present
+        assert!(result.prompt.contains("# Entity"));
+        assert!(result.prompt.contains("memory-curation"));
+    }
+
+    #[test]
+    fn budget_drops_lowest_priority_first() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = minimal_config();
+        config.system_prompt_budget.enabled = true;
+        config.pulse.enabled = true;
+        // Very tight budget — should force drops
+        config.system_prompt_budget.token_budget = 100;
+        config.system_prompt_budget.ephemeral_cap = 5000;
+        config.system_prompt_budget.findings_cap = 5000;
+
+        std::fs::write(dir.path().join("CLAUDE.md"), "# Identity").unwrap();
+        std::fs::create_dir_all(dir.path().join("memory")).unwrap();
+        std::fs::write(
+            dir.path().join("memory/EPHEMERAL.md"),
+            "Recent session summary with lots of content ".repeat(10),
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("FINDINGS.md"),
+            "- Research finding with details ".repeat(10),
+        )
+        .unwrap();
+
+        let result = build_system_prompt_budgeted(dir.path(), &config, None, None).unwrap();
+
+        // Low-priority components should be compressed or dropped
+        assert!(result.was_trimmed);
+        // If dropped, they appear in the dropped list
+        // The essential content survives
+        assert!(result.prompt.contains("# Identity"));
+    }
+
+    #[test]
+    fn compress_to_one_liner_ephemeral() {
+        let content = "<last-session>\n\
+            ## Task Digest — 2026-04-04 04:02 UTC\n\
+            Nova completed 5 task(s)\n\
+            ### Key outputs\n\
+            - Research Session: Good session with lots of detail about the work done.\n\
+            - Weekly Synthesis: Weekly synthesis complete with summary.\n\
+            - Health Check: All systems operational.\n\
+            - Reflection Window: The piece is written and worth sharing.\n\
+            - Night Reflection: The reflection is done.\n\
+            </last-session>";
+        let compressed = compress_to_one_liner("EPHEMERAL.md", content);
+        assert!(compressed.contains("[compressed]"));
+        // Should extract the first non-tag, non-header line
+        assert!(compressed.contains("Nova completed 5 task(s)"));
+        assert!(compressed.len() < content.len());
+    }
+
+    #[test]
+    fn compress_to_one_liner_findings() {
+        let content =
+            "<autonomous-findings>\n- Finding 1\n- Finding 2\n- Finding 3\n</autonomous-findings>";
+        let compressed = compress_to_one_liner("FINDINGS.md", content);
+        assert!(compressed.contains("[compressed]"));
+        assert!(compressed.contains("3 finding(s)"));
+    }
+
+    #[test]
+    fn compress_to_one_liner_pipeline_healthy() {
+        let content = "<pipeline-health>\nPipeline: healthy\nAll documents within thresholds.\n</pipeline-health>";
+        let compressed = compress_to_one_liner("pipeline-health", content);
+        assert!(compressed.contains("[compressed]"));
+        assert!(compressed.contains("healthy"));
+    }
+
+    #[test]
+    fn compress_to_one_liner_caliber() {
+        let content = "<caliber>\nSuccess: 85%, Partial: 10%, Fail: 5%\n</caliber>";
+        let compressed = compress_to_one_liner("caliber", content);
+        assert!(compressed.contains("[compressed]"));
+        assert!(compressed.contains("Caliber data available"));
+    }
+
+    #[test]
+    fn system_prompt_budget_config_defaults() {
+        let cfg = SystemPromptBudgetConfig::default();
+        assert!(cfg.enabled);
+        assert_eq!(cfg.token_budget, 17_000);
+        assert_eq!(cfg.claude_md_cap, 5_000);
+        assert_eq!(cfg.self_md_cap, 4_000);
+        assert_eq!(cfg.memory_cap, 4_000);
+        assert_eq!(cfg.ephemeral_cap, 2_000);
+        assert_eq!(cfg.findings_cap, 1_500);
+        assert_eq!(cfg.pipeline_health_cap, 500);
+        assert_eq!(cfg.cognitive_health_cap, 300);
+        assert_eq!(cfg.caliber_cap, 200);
+    }
+
+    #[test]
+    fn system_prompt_result_includes_token_count() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = minimal_config();
+
+        // Write a known-size CLAUDE.md
+        let content = "x".repeat(400); // ~100 tokens
+        std::fs::write(dir.path().join("CLAUDE.md"), &content).unwrap();
+
+        let result = build_system_prompt_budgeted(dir.path(), &config, None, None).unwrap();
+
+        // Token count should be reasonable (CLAUDE.md ~100 tokens + memory-curation ~100 tokens)
+        assert!(result.estimated_tokens > 50);
+        assert!(result.estimated_tokens < 1000);
     }
 }

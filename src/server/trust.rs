@@ -112,6 +112,7 @@ mod tests {
             context_buffer: crate::context_buffer::ContextBufferConfig::default(),
             session_health: crate::session_health::SessionHealthConfig::default(),
             platform: crate::config::PlatformConfig::default(),
+            system_prompt_budget: crate::config::SystemPromptBudgetConfig::default(),
             peers: std::collections::HashMap::new(),
             plugins: std::collections::HashMap::new(),
         }

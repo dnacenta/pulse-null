@@ -422,13 +422,7 @@ async fn execute_intent(
     schedule: &Arc<RwLock<Schedule>>,
     config: &AutonomyConfig,
 ) -> Option<String> {
-    let root_dir = match state.config.root_dir() {
-        Ok(d) => d,
-        Err(e) => {
-            tracing::error!("Cannot resolve root dir for intent '{}': {}", intent.id, e);
-            return None;
-        }
-    };
+    let root_dir = state.root_dir.clone();
 
     // Build system prompt
     let system_prompt = match prompt::build_system_prompt_async(

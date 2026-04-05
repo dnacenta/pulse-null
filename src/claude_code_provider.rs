@@ -1,8 +1,14 @@
 use std::process::Stdio;
+use std::time::Duration;
 
 use pulse_system_types::llm::{
-    ContentBlock, LlmResponse, LlmResult, LmProvider, Message, MessageContent, Role, StopReason,
+    ContentBlock, LlmResponse, LlmResult, LmProvider, Message, MessageContent, MessageSource, Role,
+    StopReason,
 };
+
+/// Default timeout for Claude Code subprocess (5 minutes).
+/// Claude Code runs tools and may take longer than a direct API call.
+const SUBPROCESS_TIMEOUT: Duration = Duration::from_secs(300);
 
 use crate::session::strip_system_prefixes;
 use crate::streaming::{self, StreamResult, StreamingProvider};
@@ -53,6 +59,9 @@ impl LmProvider for ClaudeCodeProvider {
                 .stdout(Stdio::piped())
                 .stderr(Stdio::piped());
 
+            // Ensure the subprocess is killed if the timeout fires and drops the future.
+            cmd.kill_on_drop(true);
+
             let mut child = cmd.spawn().map_err(|e| {
                 Box::new(std::io::Error::new(
                     e.kind(),
@@ -72,12 +81,21 @@ impl LmProvider for ClaudeCodeProvider {
                 // Drop stdin to close it and signal EOF
             }
 
-            let output = child.wait_with_output().await.map_err(|e| {
-                Box::new(std::io::Error::new(
-                    e.kind(),
-                    format!("failed to wait for claude: {e}"),
-                )) as Box<dyn std::error::Error + Send + Sync>
-            })?;
+            let output = tokio::time::timeout(SUBPROCESS_TIMEOUT, child.wait_with_output())
+                .await
+                .map_err(|_| -> Box<dyn std::error::Error + Send + Sync> {
+                    format!(
+                        "claude -p timed out after {}s",
+                        SUBPROCESS_TIMEOUT.as_secs()
+                    )
+                    .into()
+                })?
+                .map_err(|e| {
+                    Box::new(std::io::Error::new(
+                        e.kind(),
+                        format!("failed to wait for claude: {e}"),
+                    )) as Box<dyn std::error::Error + Send + Sync>
+                })?;
 
             if !output.status.success() {
                 let stderr = String::from_utf8_lossy(&output.stderr);
@@ -136,7 +154,16 @@ fn serialize_messages(messages: &[Message]) -> String {
     let mut parts = Vec::new();
     for msg in messages {
         let role = match msg.role {
-            Role::User => "User",
+            Role::User => {
+                // Use [Task]: for scheduled task messages to break the
+                // User/Assistant alternation pattern that trains hallucination.
+                // Phase 5: Scheduled Task Isolation.
+                if matches!(msg.source, Some(MessageSource::ScheduledTask { .. })) {
+                    "Task"
+                } else {
+                    "User"
+                }
+            }
             Role::Assistant => "Assistant",
         };
         let text = match &msg.content {
@@ -201,12 +228,7 @@ fn parse_response(
 }
 
 fn truncate(s: &str, max: usize) -> &str {
-    let end = s.len().min(max);
-    let mut i = end;
-    while i > 0 && !s.is_char_boundary(i) {
-        i -= 1;
-    }
-    &s[..i]
+    crate::utils::safe_truncate(s, max)
 }
 
 #[cfg(test)]
@@ -320,6 +342,65 @@ mod tests {
         let resp = parse_response(json, "opus").unwrap();
         assert!(resp.input_tokens.is_none());
         assert!(resp.output_tokens.is_none());
+    }
+
+    #[test]
+    fn serialize_scheduled_task_uses_task_tag() {
+        let messages = vec![
+            Message {
+                role: Role::User,
+                content: MessageContent::Text("do the thing".into()),
+                source: Some(MessageSource::ScheduledTask {
+                    task_name: "morning-check".into(),
+                }),
+            },
+            Message {
+                role: Role::Assistant,
+                content: MessageContent::Text("done".into()),
+                source: None,
+            },
+        ];
+        let result = serialize_messages(&messages);
+        assert!(
+            result.starts_with("[Task]: do the thing"),
+            "ScheduledTask messages should serialize as [Task]:, got: {result}"
+        );
+        assert!(
+            !result.contains("[User]:"),
+            "ScheduledTask messages should NOT contain [User]:, got: {result}"
+        );
+        assert!(result.contains("[Assistant]: done"));
+    }
+
+    #[test]
+    fn serialize_human_still_uses_user_tag() {
+        let messages = vec![Message {
+            role: Role::User,
+            content: MessageContent::Text("hello".into()),
+            source: Some(MessageSource::Human {
+                channel: "discord".into(),
+                sender: "h0ck3y".into(),
+            }),
+        }];
+        let result = serialize_messages(&messages);
+        assert!(
+            result.starts_with("[User]: hello"),
+            "Human messages should serialize as [User]:, got: {result}"
+        );
+    }
+
+    #[test]
+    fn serialize_no_source_uses_user_tag() {
+        let messages = vec![Message {
+            role: Role::User,
+            content: MessageContent::Text("hello".into()),
+            source: None,
+        }];
+        let result = serialize_messages(&messages);
+        assert!(
+            result.starts_with("[User]: hello"),
+            "Messages with no source should serialize as [User]:, got: {result}"
+        );
     }
 
     #[test]

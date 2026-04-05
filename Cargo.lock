@@ -3996,7 +3996,7 @@ dependencies = [
 
 [[package]]
 name = "pulse-null"
-version = "0.25.4"
+version = "0.26.0"
 dependencies = [
  "async-stream",
  "axum",
@@ -4021,6 +4021,7 @@ dependencies = [
  "serde",
  "serde_json",
  "tempfile",
+ "thiserror 2.0.18",
  "tokio",
  "tokio-stream",
  "toml",
@@ -4300,9 +4301,7 @@ checksum = "bbc4a4ea2a66a41a1152c4b3d86e8954dc087bdf33af35446e6e176db4e73c8c"
 
 [[package]]
 name = "recall-echo"
-version = "3.4.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ba2ea0439881e760cc8a581583bcae5553b6aeb58ca21d515e07af146cf0872b"
+version = "3.5.0"
 dependencies = [
  "async-trait",
  "chrono",
