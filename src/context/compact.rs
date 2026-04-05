@@ -32,7 +32,6 @@ pub struct CompactionResult {
     pub compaction_failures: u32,
 }
 
-
 /// The structured summarization prompt for Tier 2 AutoCompact.
 ///
 /// This replaces the generic "summarize concisely" prompt with a structured format
