@@ -106,6 +106,18 @@ pub struct CompactionMetrics {
     /// Phase 6: System Prompt Budgeting.
     #[serde(default)]
     pub system_prompt_tokens: usize,
+    /// Currently active plan or task description.
+    /// Survives compaction — re-injected into post-compaction context.
+    /// Set when the entity commits to a multi-step task; cleared on
+    /// session reset or when the entity completes/abandons the plan.
+    #[serde(default)]
+    pub active_plan: Option<String>,
+    /// Context quality score: ratio of high-quality tokens (recent window +
+    /// system prompt) to total estimated tokens. Higher = more of the context
+    /// is fresh content. Lower = dominated by compacted/compressed history.
+    /// Updated after each turn.
+    #[serde(default)]
+    pub context_quality_score: f64,
 }
 
 /// Serializable session state persisted to disk.
@@ -183,6 +195,21 @@ impl SessionData {
             snippet,
             accessed_at: Utc::now(),
         });
+    }
+
+    /// Set the active plan for this session.
+    ///
+    /// The plan survives compaction and is re-injected into post-compaction
+    /// context so the entity always knows what it's working on.
+    #[allow(dead_code)]
+    pub fn set_active_plan(&mut self, plan: &str) {
+        self.compaction.active_plan = Some(plan.to_string());
+    }
+
+    /// Clear the active plan (task completed or abandoned).
+    #[allow(dead_code)]
+    pub fn clear_active_plan(&mut self) {
+        self.compaction.active_plan = None;
     }
 
     /// Check if session limits are exceeded and a reset should be triggered.
@@ -269,6 +296,11 @@ impl SessionData {
                 "**Last assistant response (truncated):** {}\n\n",
                 text
             ));
+        }
+
+        // Include active plan if one exists — this is critical context
+        if let Some(ref plan) = self.compaction.active_plan {
+            handoff.push_str(&format!("**Active plan:** {}\n\n", plan));
         }
 
         handoff.push_str(&format!(
@@ -813,6 +845,8 @@ impl SessionStore {
                     .last_compaction_at
                     .map(|t| t.to_rfc3339()),
                 system_prompt_tokens: session.data.compaction.system_prompt_tokens,
+                active_plan: session.data.compaction.active_plan.clone(),
+                context_quality_score: session.data.compaction.context_quality_score,
             });
         }
 
@@ -874,6 +908,8 @@ pub struct SessionInfo {
     pub compaction_failures: u32,
     pub last_compaction_at: Option<String>,
     pub system_prompt_tokens: usize,
+    pub active_plan: Option<String>,
+    pub context_quality_score: f64,
 }
 
 #[cfg(test)]

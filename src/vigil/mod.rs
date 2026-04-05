@@ -7,6 +7,7 @@
 
 pub mod analyze;
 pub mod collect;
+pub mod compaction_signals;
 pub mod init;
 pub mod parser;
 pub mod pulse;
