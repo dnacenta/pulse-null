@@ -214,6 +214,8 @@ pub struct CompactionParams<'a> {
     pub compaction_failures: u32,
     /// Files to consider for re-injection after compaction.
     pub recently_accessed_files: &'a [RecentFile],
+    /// Active plan to re-inject after compaction (survives summarization).
+    pub active_plan: Option<&'a str>,
 }
 
 /// Compact a conversation by summarizing older messages using a structured prompt.
@@ -237,6 +239,7 @@ pub async fn compact_if_needed(
     session_key: Option<&str>,
     compaction_failures: u32,
     recently_accessed_files: &[RecentFile],
+    active_plan: Option<&str>,
 ) -> CompactionResult {
     compact_with_params(
         conversation,
@@ -250,6 +253,7 @@ pub async fn compact_if_needed(
             session_key,
             compaction_failures,
             recently_accessed_files,
+            active_plan,
         },
     )
     .await
@@ -408,7 +412,32 @@ async fn compact_with_params(
         },
     );
 
-    // Re-inject recently accessed files after the summary
+    // Re-inject active plan after the summary (before files and recent window).
+    // The plan is the highest-priority re-injection — the entity must know what
+    // it's supposed to be doing after compaction.
+    if let Some(plan) = params.active_plan {
+        let plan_msg = format!(
+            "[Active plan — re-injected after compaction]\n\n{}\n\n[End active plan]",
+            plan
+        );
+        let plan_tokens = plan_msg.len() / CHARS_PER_TOKEN;
+        let current_tokens = estimate_conversation_tokens(conversation);
+        if current_tokens + plan_tokens < budget {
+            conversation.insert(
+                1, // After summary, before everything else
+                Message {
+                    role: Role::User,
+                    content: MessageContent::Text(plan_msg),
+                    source: Some(MessageSource::System),
+                },
+            );
+        }
+    }
+
+    // Re-inject recently accessed files after the summary and plan.
+    // Insert position depends on how many re-injection messages already exist:
+    // [0: summary, 1: plan (maybe), ...files, ...recent window]
+    let file_insert_pos = if params.active_plan.is_some() { 2 } else { 1 };
     let files_reinjected =
         if let Some(file_content) = build_file_reinjection(params.recently_accessed_files) {
             let file_tokens = file_content.len() / CHARS_PER_TOKEN;
@@ -416,7 +445,7 @@ async fn compact_with_params(
             let current_tokens = estimate_conversation_tokens(conversation);
             if current_tokens + file_tokens < budget {
                 conversation.insert(
-                    1, // After the summary, before the recent window
+                    file_insert_pos.min(conversation.len()), // After summary+plan, before recent window
                     Message {
                         role: Role::User,
                         content: MessageContent::Text(file_content),

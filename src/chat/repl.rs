@@ -121,6 +121,7 @@ pub async fn run(
             None,
             0,
             &empty_files,
+            None, // REPL doesn't track active plans
         )
         .await;
 

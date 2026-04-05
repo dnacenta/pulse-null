@@ -288,6 +288,7 @@ pub async fn chat(
     // Extract values before the call to avoid borrow conflicts with &mut messages
     let recent_files_snapshot = session.data.compaction.recently_accessed_files.clone();
     let current_compaction_failures = session.data.compaction.compaction_failures;
+    let active_plan_snapshot = session.data.compaction.active_plan.clone();
     let compaction_result = crate::context::compact_if_needed(
         &mut session.data.messages,
         state.provider.as_ref(),
@@ -299,6 +300,7 @@ pub async fn chat(
         Some(&session_key),
         current_compaction_failures,
         &recent_files_snapshot,
+        active_plan_snapshot.as_deref(),
     )
     .await;
     // Write back updated compaction failures from result
@@ -313,6 +315,44 @@ pub async fn chat(
         // Update token estimate after compaction
         session.data.compaction.estimated_tokens =
             crate::context::estimate_conversation_tokens(&session.data.messages);
+
+        // Record compaction signal for vigil-pulse trend analysis.
+        // Non-blocking — failures are logged but don't affect the chat flow.
+        let compaction_signal = crate::vigil::compaction_signals::CompactionSignalFrame {
+            timestamp: Utc::now().to_rfc3339(),
+            session_key: session_key.clone(),
+            tier: if compaction_result.circuit_breaker_fired { 3 } else { 2 },
+            tokens_before: compaction_result.tokens_before,
+            tokens_after: compaction_result.tokens_after,
+            quality_score: session.data.compaction.context_quality_score,
+            circuit_breaker_fired: compaction_result.circuit_breaker_fired,
+            files_reinjected: compaction_result.files_reinjected,
+            had_active_plan: active_plan_snapshot.is_some(),
+        };
+        let root_for_signal = state.root_dir.clone();
+        tokio::task::spawn_blocking(move || {
+            if let Err(e) = crate::vigil::compaction_signals::record(
+                &root_for_signal,
+                compaction_signal,
+            ) {
+                tracing::warn!("Failed to record compaction signal: {}", e);
+            }
+        });
+
+        // Structured compaction log for debugging and analysis
+        tracing::info!(
+            "[COMPACTION] tier={} session={} before={}T after={}T recovered={}T \
+             quality={:.2} files_reinjected={} circuit_breaker={} active_plan={}",
+            if compaction_result.circuit_breaker_fired { 3 } else { 2 },
+            session_key,
+            compaction_result.tokens_before,
+            compaction_result.tokens_after,
+            tokens_recovered,
+            session.data.compaction.context_quality_score,
+            compaction_result.files_reinjected,
+            compaction_result.circuit_breaker_fired,
+            active_plan_snapshot.is_some(),
+        );
 
         if compaction_result.circuit_breaker_fired {
             tracing::error!(
@@ -443,6 +483,29 @@ pub async fn chat(
     // Update token estimate for the full conversation
     session.data.compaction.estimated_tokens =
         crate::context::estimate_conversation_tokens(&session.data.messages);
+
+    // Compute context quality score:
+    //   (recent_window_tokens + system_prompt_tokens) / total_tokens
+    // Higher = more of the context is high-quality fresh content.
+    let total_tokens = session.data.compaction.estimated_tokens;
+    if total_tokens > 0 {
+        let sys_tokens = session.data.compaction.system_prompt_tokens;
+        // Estimate recent window as last 10 messages (or all if fewer)
+        let recent_window_tokens = {
+            let msgs = &session.data.messages;
+            let recent_count = msgs.len().min(10);
+            let start = msgs.len().saturating_sub(recent_count);
+            crate::context::estimate_conversation_tokens(&msgs[start..])
+        };
+        session.data.compaction.context_quality_score =
+            (recent_window_tokens + sys_tokens) as f64 / total_tokens as f64;
+        // Clamp to [0, 1] — can exceed 1 if context is mostly recent + system prompt
+        if session.data.compaction.context_quality_score > 1.0 {
+            session.data.compaction.context_quality_score = 1.0;
+        }
+    } else {
+        session.data.compaction.context_quality_score = 1.0;
+    }
 
     // Enforce hard cap on stored messages (safety backstop — session caps should fire first)
     session.data.enforce_message_cap();
