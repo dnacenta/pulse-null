@@ -193,6 +193,10 @@ impl RecallTab {
     }
 
     /// Apply results from a completed background graph load.
+    ///
+    /// On error, we keep the last successful `Loaded` state rather than
+    /// replacing it with an error — stale data is better than a blank screen
+    /// while the DB lock is held by another process.
     fn apply_graph_result(&mut self, result: Result<GraphLoadResult, String>) {
         match result {
             Ok(data) => {
@@ -203,7 +207,12 @@ impl RecallTab {
                 };
             }
             Err(e) => {
-                self.state = GraphState::Error(e);
+                // Only show the error if we have no cached data to display.
+                if !matches!(self.state, GraphState::Loaded { .. }) {
+                    self.state = GraphState::Error(e);
+                }
+                // Otherwise silently keep the last good state — the next
+                // refresh cycle will try again in 30 seconds.
             }
         }
         self.loaded = true;
@@ -514,7 +523,9 @@ impl TabView for RecallTab {
     fn handle_key(&mut self, key: KeyEvent, _ctx: &mut AppContext) -> ScreenAction {
         match key.code {
             KeyCode::Char('r') => {
-                self.loaded = false;
+                // Trigger a refresh without hiding cached data — just reset
+                // the timer so handle_tick picks it up on the next cycle.
+                self.last_refresh = None;
             }
             KeyCode::Char('j') | KeyCode::Down => {
                 if self.scroll_offset < self.stale_count.saturating_sub(1) {
