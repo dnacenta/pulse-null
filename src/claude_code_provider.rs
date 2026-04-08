@@ -99,14 +99,31 @@ impl LmProvider for ClaudeCodeProvider {
 
             if !output.status.success() {
                 let stderr = String::from_utf8_lossy(&output.stderr);
-                let msg = if stderr.trim().is_empty() {
+                let stdout = String::from_utf8_lossy(&output.stdout);
+
+                // Build the most informative error message possible.
+                // claude -p often puts errors in stdout (JSON) rather than stderr.
+                let detail = if !stderr.trim().is_empty() {
+                    truncate(&stderr, 500).to_string()
+                } else if !stdout.trim().is_empty() {
+                    // Try to extract an error field from JSON output
+                    if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&stdout) {
+                        parsed["error"]
+                            .as_str()
+                            .or_else(|| parsed["message"].as_str())
+                            .unwrap_or_else(|| truncate(&stdout, 500))
+                            .to_string()
+                    } else {
+                        truncate(&stdout, 500).to_string()
+                    }
+                } else {
+                    String::new()
+                };
+
+                let msg = if detail.is_empty() {
                     format!("claude -p exited {}", output.status)
                 } else {
-                    format!(
-                        "claude -p exited {}: {}",
-                        output.status,
-                        truncate(&stderr, 500)
-                    )
+                    format!("claude -p exited {}: {}", output.status, detail)
                 };
                 return Err(msg.into());
             }

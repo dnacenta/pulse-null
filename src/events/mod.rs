@@ -89,6 +89,13 @@ pub enum EntityEvent {
         plugin_name: String,
         new_state: PluginStateChange,
     },
+
+    /// Emitted when the LLM provider fails (auth, rate limit, network, etc.).
+    ProviderError {
+        error: String,
+        error_kind: String,
+        task_id: String,
+    },
 }
 
 impl EntityEvent {
@@ -110,6 +117,7 @@ impl EntityEvent {
             EntityEvent::PluginStateChanged { plugin_name, .. } => {
                 format!("plugin_state_{}", plugin_name)
             }
+            EntityEvent::ProviderError { .. } => "provider_error".into(),
         }
     }
 }

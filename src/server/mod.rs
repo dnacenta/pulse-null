@@ -23,6 +23,7 @@ use crate::events::EventBus;
 use crate::persist::PersistCoordinator;
 use crate::pidfile;
 use crate::plugins::manager::PluginManager;
+use crate::provider_status::SharedProviderStatus;
 use crate::scheduler::intent::IntentQueue;
 use crate::scheduler::Schedule;
 use crate::session_store::SessionStore;
@@ -49,6 +50,7 @@ pub struct AppState {
     /// Alert queue for scheduled task output (Phase 5: Task Isolation).
     /// Tasks push alerts here; consumers (Discord plugin, API) drain them.
     pub alert_queue: tokio::sync::Mutex<crate::scheduler::alerts::AlertQueue>,
+    pub provider_status: SharedProviderStatus,
 }
 
 /// Rebuild AWARENESS.md from the current plugin and tool state.
@@ -226,6 +228,7 @@ pub async fn start(config: Config) -> Result<(), Box<dyn std::error::Error>> {
         plugin_manager: tokio::sync::Mutex::new(plugin_manager),
         wal,
         alert_queue: tokio::sync::Mutex::new(alert_queue),
+        provider_status: crate::provider_status::new_shared(),
     });
 
     // Startup pipeline health check
