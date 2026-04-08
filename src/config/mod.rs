@@ -371,6 +371,8 @@ pub struct EventsConfig {
     /// Queue investigation when conversations archive but pipeline docs don't update
     #[serde(default = "default_true")]
     pub pipeline_conversion_low: bool,
+    /// Send notification when LLM provider fails
+    pub provider_error: bool,
 }
 
 impl Default for EventsConfig {
@@ -381,6 +383,7 @@ impl Default for EventsConfig {
             pipeline_frozen: true,
             cognitive_decline: true,
             pipeline_conversion_low: true,
+            provider_error: true,
         }
     }
 }

@@ -159,6 +159,48 @@ pub async fn route_call(content: &str, config: &Config, task_name: &str) {
     }
 }
 
+/// Send a provider error notification via the share webhook.
+/// Called directly on LLM failure — does not go through the intent system
+/// because the provider is likely down.
+pub async fn route_error(error: &str, error_kind: &str, task_name: &str, config: &Config) {
+    let webhook_url = match &config.scheduler.output.share_webhook {
+        Some(url) if !url.is_empty() => url,
+        _ => {
+            tracing::warn!(
+                "[ERROR] Provider failure in '{}' ({}) but no webhook configured: {}",
+                task_name,
+                error_kind,
+                error
+            );
+            return;
+        }
+    };
+
+    let content = format!(
+        "\u{26a0}\u{fe0f} **Provider Error** in `{}`\n**Type:** {}\n**Error:** {}",
+        task_name, error_kind, error
+    );
+
+    let client = reqwest::Client::new();
+    let body = serde_json::json!({ "content": content });
+
+    match client.post(webhook_url).json(&body).send().await {
+        Ok(res) if res.status().is_success() => {
+            tracing::info!("[ERROR] notification delivered for task '{}'", task_name);
+        }
+        Ok(res) => {
+            tracing::warn!(
+                "[ERROR] webhook returned {}: {}",
+                res.status(),
+                res.text().await.unwrap_or_default()
+            );
+        }
+        Err(e) => {
+            tracing::error!("[ERROR] webhook failed: {}", e);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

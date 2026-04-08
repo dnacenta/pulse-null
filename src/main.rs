@@ -20,6 +20,7 @@ mod peer;
 mod persist;
 mod pidfile;
 mod plugins;
+mod provider_status;
 mod praxis;
 mod providers;
 mod registry;

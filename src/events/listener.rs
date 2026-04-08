@@ -409,6 +409,11 @@ fn translate_event(event: &EntityEvent, config: &EventsConfig) -> Option<Intent>
                 depth: 0,
             })
         }
+
+        // ProviderError notifications are handled directly via output::route_error()
+        // in the scheduler — not through the intent system, because the provider
+        // is likely down when this fires.
+        EntityEvent::ProviderError { .. } => None,
     }
 }
 

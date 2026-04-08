@@ -12,6 +12,7 @@ use super::output;
 use super::{Schedule, ScheduledTask};
 use crate::events::EntityEvent;
 use crate::interaction::{InteractionMetadata, InteractionRecord};
+use crate::provider_status;
 use crate::server::prompt;
 use crate::server::AppState;
 
@@ -247,7 +248,9 @@ async fn execute_task(
                 result.messages,
             ),
             Err(e) => {
-                tracing::error!("LLM invocation failed for task '{}': {}", task.id, e);
+                let error_msg = e.to_string();
+                tracing::error!("LLM invocation failed for task '{}': {}", task.id, error_msg);
+                handle_provider_error(state, &task.id, &error_msg).await;
                 return;
             }
         }
@@ -287,11 +290,19 @@ async fn execute_task(
                 )
             }
             Err(e) => {
-                tracing::error!("LLM invocation failed for task '{}': {}", task.id, e);
+                let error_msg = e.to_string();
+                tracing::error!("LLM invocation failed for task '{}': {}", task.id, error_msg);
+                handle_provider_error(state, &task.id, &error_msg).await;
                 return;
             }
         }
     };
+
+    // Record successful invocation
+    {
+        let mut ps = state.provider_status.write().await;
+        ps.record_success();
+    }
 
     // Log hallucination guard events for autonomous tasks
     if was_truncated {
@@ -588,6 +599,30 @@ async fn execute_task(
     // Graph vigil sync (if enabled)
     if state.config.graph.enabled {
         crate::session::graph_sync_vigil(&root_dir).await;
+    }
+}
+
+/// Handle a provider error: classify, update status, emit event, send notification.
+async fn handle_provider_error(state: &Arc<AppState>, task_id: &str, error_msg: &str) {
+    let kind = provider_status::classify_error(error_msg);
+    let kind_str = kind.to_string();
+
+    // Update provider status
+    {
+        let mut ps = state.provider_status.write().await;
+        ps.record_failure(error_msg, kind);
+    }
+
+    // Emit event
+    state.event_bus.emit(EntityEvent::ProviderError {
+        error: error_msg.to_string(),
+        error_kind: kind_str.clone(),
+        task_id: task_id.to_string(),
+    });
+
+    // Send direct webhook notification (bypass intent system — provider is down)
+    if state.config.autonomy.events.provider_error {
+        output::route_error(error_msg, &kind_str, task_id, &state.config).await;
     }
 }
 
