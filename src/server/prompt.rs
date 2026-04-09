@@ -620,12 +620,12 @@ pub fn build_task_system_prompt(
         conversation. You are executing a task prompt independently.\n\n\
         CRITICAL RULES:\n\
         - Do NOT generate user messages or simulate user responses.\n\
-        - Do NOT produce text formatted as [User]:, [Human]:, or any turn-taking marker.\n\
+        - Do NOT produce text formatted as [User]:, [Human]:, [Task]:, [Assistant]:, or any turn-taking marker.\n\
         - Do NOT claim work is completed unless you executed the corresponding tool calls.\n\
         - If tools fail or are unavailable, say so explicitly — do not narrate fake outcomes.\n\
-        - You have a minimal system prompt (identity only — no MEMORY.md, EPHEMERAL.md, \
-        or monitoring data). Focus on the task prompt. Do not reference memory or session \
-        context that is not present in this context window.\n\
+        - You have a minimal system prompt (identity + thought stack — no MEMORY.md, \
+        EPHEMERAL.md, or monitoring data). Focus on the task prompt. Do not reference \
+        memory or session context that is not present in this context window.\n\
         </task-context>"
             .to_string(),
     );
