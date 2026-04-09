@@ -6,7 +6,7 @@ pub fn default_tasks() -> Vec<ScheduledTask> {
         ScheduledTask {
             id: "thinking-loop".to_string(),
             name: "Thinking Loop".to_string(),
-            cron: "0 */20 * * * *".to_string(),
+            cron: "0 10,30,50 * * * *".to_string(),
             channel: "system".to_string(),
             prompt: concat!(
                 "You are in thinking mode. This is autonomous time — no one is talking to you.\n\n",
