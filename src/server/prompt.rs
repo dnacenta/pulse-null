@@ -50,7 +50,8 @@ enum PromptTier {
 }
 
 /// A named component of the system prompt with its content and metadata.
-#[allow(dead_code)]
+/// All fields read internally; `cap` read in budget trimming loop.
+#[allow(dead_code)] // fields read internally; cap used in budget trimming
 struct PromptComponent {
     /// Human-readable name for logging.
     name: &'static str,
@@ -66,7 +67,7 @@ struct PromptComponent {
 
 /// Result of system prompt assembly, including the prompt text and metrics.
 #[derive(Debug, Clone)]
-#[allow(dead_code)]
+#[allow(dead_code)] // fields read in logging and tests; struct returned by build_system_prompt_budgeted
 pub struct SystemPromptResult {
     /// The assembled system prompt text.
     pub prompt: String,
@@ -612,13 +613,19 @@ pub fn build_task_system_prompt(
         parts.push(format!("<identity>\n{}\n</identity>", content));
     }
 
-    // Task isolation notice — tell the model this is an isolated task context
+    // Task isolation notice + autonomous hallucination guard (Layer 1b)
     parts.push(
         "<task-context>\n\
-        This is an isolated scheduled task execution. You have a minimal system prompt \
-        (identity only — no MEMORY.md, EPHEMERAL.md, or monitoring data). \
-        Focus on the task prompt. Do not reference memory or session context that \
-        is not present in this context window.\n\
+        This is an autonomous scheduled task execution. There is no human user in this \
+        conversation. You are executing a task prompt independently.\n\n\
+        CRITICAL RULES:\n\
+        - Do NOT generate user messages or simulate user responses.\n\
+        - Do NOT produce text formatted as [User]:, [Human]:, [Task]:, [Assistant]:, or any turn-taking marker.\n\
+        - Do NOT claim work is completed unless you executed the corresponding tool calls.\n\
+        - If tools fail or are unavailable, say so explicitly — do not narrate fake outcomes.\n\
+        - You have a minimal system prompt (identity + thought stack — no MEMORY.md, \
+        EPHEMERAL.md, or monitoring data). Focus on the task prompt. Do not reference \
+        memory or session context that is not present in this context window.\n\
         </task-context>"
             .to_string(),
     );
