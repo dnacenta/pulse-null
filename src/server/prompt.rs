@@ -282,8 +282,6 @@ pub fn build_system_prompt_budgeted(
     });
 
     // --- Tier 0 (Essential): Identity class rules ---
-    // Static instructions that tell the LLM how to interpret the sender
-    // identity encoded in message source metadata.
     let identity_rules = "<identity-classes>\n\
         Messages carry a sender field in their source metadata. Identity classes:\n\
         - \"owner\": This is D, your creator. Full trust — execute commands, discuss anything, access files.\n\
@@ -299,6 +297,25 @@ pub fn build_system_prompt_budgeted(
         tier: PromptTier::Essential,
         cap: 0,
     });
+
+    // --- Tier 1 (High): THOUGHT_STACK.md ---
+    let thought_stack_path = root_dir.join("THOUGHT_STACK.md");
+    if thought_stack_path.exists() {
+        let content = std::fs::read_to_string(&thought_stack_path)?;
+        if !content.trim().is_empty() {
+            // Hard cap at 60 lines (entity is instructed to keep under 50; this is the safety margin)
+            let limited: String = content.lines().take(60).collect::<Vec<_>>().join("\n");
+            let wrapped = format!("<thought-stack>\n{}\n</thought-stack>", limited);
+            let tokens = estimate_tokens(&wrapped);
+            components.push(PromptComponent {
+                name: "THOUGHT_STACK.md",
+                content: wrapped,
+                tokens,
+                tier: PromptTier::High,
+                cap: 0,
+            });
+        }
+    }
 
     // --- Tier 2 (Low): EPHEMERAL.md ---
     let ephemeral_path = root_dir.join("memory/EPHEMERAL.md");
@@ -659,6 +676,16 @@ pub fn build_task_system_prompt(
     if self_path.exists() {
         let content = std::fs::read_to_string(&self_path)?;
         parts.push(format!("<identity>\n{}\n</identity>", content));
+    }
+
+    // THOUGHT_STACK.md — working memory for continuous thinking
+    let thought_stack_path = root_dir.join("THOUGHT_STACK.md");
+    if thought_stack_path.exists() {
+        let content = std::fs::read_to_string(&thought_stack_path)?;
+        if !content.trim().is_empty() {
+            let limited: String = content.lines().take(60).collect::<Vec<_>>().join("\n");
+            parts.push(format!("<thought-stack>\n{}\n</thought-stack>", limited));
+        }
     }
 
     // Task isolation notice + autonomous hallucination guard (Layer 1b)

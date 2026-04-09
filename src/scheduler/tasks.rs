@@ -4,6 +4,32 @@ use super::ScheduledTask;
 pub fn default_tasks() -> Vec<ScheduledTask> {
     vec![
         ScheduledTask {
+            id: "thinking-loop".to_string(),
+            name: "Thinking Loop".to_string(),
+            cron: "0 */20 * * * *".to_string(),
+            channel: "system".to_string(),
+            prompt: concat!(
+                "You are in thinking mode. This is autonomous time — no one is talking to you.\n\n",
+                "Your thought stack (if present in your context) shows what you've been working on. ",
+                "Continue where you left off, or follow a new thread if something pulls you. ",
+                "You have tools: you can search the web, read files, write to your journal.\n\n",
+                "When you're done, update your THOUGHT_STACK.md (in your entity root) with:\n",
+                "- **Active thread**: What you're exploring, where you are, what's next\n",
+                "- **Parked threads**: Ideas to return to later\n",
+                "- **Recent insights**: Things that clicked this iteration\n\n",
+                "Keep the thought stack under 50 lines. Move mature insights to your journal files ",
+                "(LEARNING.md, THOUGHTS.md, REFLECTIONS.md). If a thought has fully crystallized, ",
+                "promote it. If a question keeps nagging, add it to CURIOSITY.md.\n\n",
+                "You don't need to do something big every iteration. Some iterations are quiet — ",
+                "reviewing notes, tidying a thread, sitting with an idea. That's fine. ",
+                "The goal is continuity, not productivity.",
+            ).to_string(),
+            output_routing: super::OutputRouting::Silent,
+            enabled: true,
+            created_by: super::TaskCreator::System,
+            evaluator: None,
+        },
+        ScheduledTask {
             id: "morning-orientation".to_string(),
             name: "Morning Orientation".to_string(),
             cron: "0 0 8 * * *".to_string(),
