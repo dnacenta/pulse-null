@@ -71,10 +71,10 @@ pub fn validate_action_claims_adapter(
 pub const DEFAULT_MAX_TOOL_ROUNDS: u32 = 25;
 
 /// Consecutive tool failures before injecting a degraded-state warning.
-const TOOL_FAILURE_THRESHOLD: u32 = 3;
+pub const TOOL_FAILURE_THRESHOLD: u32 = 3;
 
 /// System message injected when tools are failing consecutively.
-const TOOL_DEGRADED_WARNING: &str = "\
+pub const TOOL_DEGRADED_WARNING: &str = "\
 [SYSTEM — Tool Degraded State] \
 Multiple consecutive tool calls have failed. Tools are currently unreliable. \
 CRITICAL: Do NOT claim that any file operations, memory updates, or code changes \
@@ -341,4 +341,57 @@ pub async fn invoke_with_tool_loop(
             }
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// Reusable Layer 4 building blocks (shared by tool_loop and TUI)
+// ---------------------------------------------------------------------------
+
+/// Tracks consecutive tool failures and manages degraded-state transitions.
+/// Used by both `invoke_with_tool_loop` and the TUI's streaming tool loop
+/// to ensure consistent Layer 4 behavior.
+pub struct ToolFailureTracker {
+    consecutive_failures: u32,
+    pub degraded: bool,
+}
+
+impl ToolFailureTracker {
+    pub fn new() -> Self {
+        Self {
+            consecutive_failures: 0,
+            degraded: false,
+        }
+    }
+
+    /// Record the outcome of a tool execution round.
+    /// Returns `true` if this call triggered the transition to degraded state.
+    pub fn record_round(&mut self, had_success: bool, had_failure: bool) -> bool {
+        if had_success {
+            self.consecutive_failures = 0;
+        }
+        if had_failure && !had_success {
+            self.consecutive_failures += 1;
+        }
+        if self.consecutive_failures >= TOOL_FAILURE_THRESHOLD && !self.degraded {
+            self.degraded = true;
+            return true;
+        }
+        false
+    }
+}
+
+/// Classify tool results from a round into success/failure outcomes.
+pub fn classify_tool_outcomes(results: &[ContentBlock]) -> (bool, bool) {
+    let mut had_success = false;
+    let mut had_failure = false;
+    for block in results {
+        if let ContentBlock::ToolResult { is_error, .. } = block {
+            if matches!(is_error, Some(true)) {
+                had_failure = true;
+            } else {
+                had_success = true;
+            }
+        }
+    }
+    (had_success, had_failure)
 }
