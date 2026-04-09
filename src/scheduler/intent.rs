@@ -747,7 +747,7 @@ async fn execute_intent(
     }
 
     // Record outcome for caliber-echo
-    if let Some(ref tracker) = state.monitoring.outcome_tracker {
+    if let Some(ref tracker) = state.outcome_tracker {
         let outcome = tracker.build_outcome(
             &intent.id,
             &intent.description,
@@ -763,7 +763,7 @@ async fn execute_intent(
     }
 
     // Extract cognitive signals and check for health changes
-    if let Some(ref monitor) = state.monitoring.cognitive_monitor {
+    if let Some(ref monitor) = state.cognitive_monitor {
         let window = state.config.monitoring.window_size;
         let min_samples = state.config.monitoring.min_samples;
 
@@ -786,7 +786,7 @@ async fn execute_intent(
     }
 
     // Update pipeline state
-    if let Some(ref monitor) = state.monitoring.pipeline_monitor {
+    if let Some(ref monitor) = state.pipeline_monitor {
         let thresholds = state.config.pipeline.to_thresholds();
         let health = monitor.calculate(&root_dir, &thresholds);
         let new_counts = monitor.counts_from_health(&health);

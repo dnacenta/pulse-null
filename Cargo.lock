@@ -4027,7 +4027,7 @@ dependencies = [
 
 [[package]]
 name = "pulse-null"
-version = "0.26.3"
+version = "0.27.0"
 dependencies = [
  "async-stream",
  "axum",
@@ -4387,8 +4387,8 @@ checksum = "bbc4a4ea2a66a41a1152c4b3d86e8954dc087bdf33af35446e6e176db4e73c8c"
 
 [[package]]
 name = "recall-echo"
-version = "3.6.0"
-source = "git+https://github.com/dnacenta/recall-echo.git?tag=v3.6.0#8911757f22fef749b6ca745649068dd1fefa6cf9"
+version = "3.6.1"
+source = "git+https://github.com/dnacenta/recall-echo.git?tag=v3.6.1#0fec0df983f8bd878d252791c0832fd75939c00b"
 dependencies = [
  "async-trait",
  "chrono",
