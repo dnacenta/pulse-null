@@ -18,7 +18,10 @@ use pulse_system_types::llm::{
 };
 
 use crate::streaming::{StreamEvent, StreamingProvider};
-use crate::tool_loop::{validate_action_claims_adapter, validate_content_blocks_adapter};
+use crate::tool_loop::{
+    classify_tool_outcomes, validate_action_claims_adapter, validate_content_blocks_adapter,
+    ToolFailureTracker, TOOL_DEGRADED_WARNING,
+};
 use crate::tools::ToolRegistry;
 use crate::tui::app::AppContext;
 use crate::tui::screens::EntityState;
@@ -619,6 +622,7 @@ async fn conversation_task(
     let mut total_output_tokens: u32 = 0;
     let mut tools_used: Vec<String> = Vec::new();
     let mut final_resp_content: Option<Vec<ContentBlock>> = None;
+    let mut failure_tracker = ToolFailureTracker::new();
 
     loop {
         let stream =
@@ -730,6 +734,21 @@ async fn conversation_task(
                         tool_results.push(result);
                     }
                 }
+
+                // Layer 4: Track consecutive tool failures
+                let (had_success, had_failure) = classify_tool_outcomes(&tool_results);
+                let just_degraded = failure_tracker.record_round(had_success, had_failure);
+                if just_degraded {
+                    tracing::warn!(
+                        "TUI hallucination guard: tool degraded state triggered"
+                    );
+                    tool_results.push(ContentBlock::Text {
+                        text: TOOL_DEGRADED_WARNING.to_string(),
+                    });
+                }
+
+                // MicroCompact Tier 1: truncate large tool results
+                crate::context::truncate_tool_result_blocks(&mut tool_results);
 
                 let first_tool_id = tool_results
                     .iter()

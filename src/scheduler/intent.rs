@@ -122,7 +122,7 @@ impl IntentQueue {
     }
 
     /// Persist to disk.
-    pub fn save(&self) -> Result<(), Box<dyn std::error::Error>> {
+    pub fn save(&self) -> Result<(), crate::errors::PulseError> {
         if let Some(ref dir) = self.root_dir {
             let path = dir.join(INTENTS_FILE);
             let content = serde_json::to_string_pretty(self)?;
@@ -208,7 +208,7 @@ impl IntentQueue {
 pub fn create_intent_from_marker(
     json_str: &str,
     source: IntentSource,
-) -> Result<Intent, Box<dyn std::error::Error + Send + Sync>> {
+) -> Result<Intent, crate::errors::PulseError> {
     let value: serde_json::Value = serde_json::from_str(json_str)?;
 
     let description = value["description"]
@@ -260,9 +260,7 @@ pub fn create_intent_from_marker(
 }
 
 /// Parse a [CHAIN: {...}] JSON marker into an IntentChain.
-pub fn create_chain_from_marker(
-    json_str: &str,
-) -> Result<IntentChain, Box<dyn std::error::Error + Send + Sync>> {
+pub fn create_chain_from_marker(json_str: &str) -> Result<IntentChain, crate::errors::PulseError> {
     let value: serde_json::Value = serde_json::from_str(json_str)?;
 
     let description = value["description"]
@@ -424,25 +422,21 @@ async fn execute_intent(
 ) -> Option<String> {
     let root_dir = state.root_dir.clone();
 
-    // Build system prompt
-    let system_prompt = match prompt::build_system_prompt_async(
-        root_dir.clone(),
-        state.config.clone(),
-        state.pipeline_monitor.clone(),
-        state.cognitive_monitor.clone(),
-    )
-    .await
-    {
-        Ok(p) => p,
-        Err(e) => {
-            tracing::error!(
-                "Cannot build system prompt for intent '{}': {}",
-                intent.id,
-                e
-            );
-            return None;
-        }
-    };
+    // Build task system prompt (minimal — identity + thought stack only).
+    // Intents are autonomous execution: use the task prompt with the
+    // anti-hallucination preamble, not the full interactive prompt.
+    let system_prompt =
+        match prompt::build_task_system_prompt_async(root_dir.clone(), state.config.clone()).await {
+            Ok(p) => p,
+            Err(e) => {
+                tracing::error!(
+                    "Cannot build system prompt for intent '{}': {}",
+                    intent.id,
+                    e
+                );
+                return None;
+            }
+        };
 
     // Build user message with autonomy context
     let autonomy_context = prompt::build_autonomy_context(&root_dir, &state.config);
