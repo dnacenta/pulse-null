@@ -1,3 +1,4 @@
+pub mod caliber;
 pub mod chat;
 pub mod comms;
 pub mod entity;
@@ -20,6 +21,7 @@ pub enum Tab {
     Files,
     Comms,
     Recall,
+    Caliber,
 }
 
 impl Tab {
@@ -31,6 +33,7 @@ impl Tab {
             Tab::Files => 3,
             Tab::Comms => 4,
             Tab::Recall => 5,
+            Tab::Caliber => 6,
         }
     }
 
@@ -42,6 +45,7 @@ impl Tab {
             3 => Tab::Files,
             4 => Tab::Comms,
             5 => Tab::Recall,
+            6 => Tab::Caliber,
             _ => Tab::Chat,
         }
     }
@@ -54,10 +58,11 @@ impl Tab {
             Tab::Files => "files",
             Tab::Comms => "comms",
             Tab::Recall => "recall",
+            Tab::Caliber => "caliber",
         }
     }
 
-    pub const COUNT: usize = 6;
+    pub const COUNT: usize = 7;
 }
 
 pub trait TabView {

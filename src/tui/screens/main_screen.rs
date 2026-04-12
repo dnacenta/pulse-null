@@ -12,6 +12,7 @@ use crate::tui::tabs::comms::{CommsFooter, CommsTab};
 use crate::tui::tabs::entity::EntityTab;
 use crate::tui::tabs::evolution::EvolutionTab;
 use crate::tui::tabs::files::FilesTab;
+use crate::tui::tabs::caliber::CaliberTab;
 use crate::tui::tabs::recall::RecallTab;
 use crate::tui::tabs::{Tab, TabView};
 use crate::tui::theme::*;
@@ -25,6 +26,7 @@ pub struct MainScreen {
     pub files: FilesTab,
     pub comms: CommsTab,
     pub recall: RecallTab,
+    pub caliber: CaliberTab,
     pub fullscreen: bool,
     pub show_help: bool,
     pub multi_entity: bool,
@@ -40,6 +42,7 @@ impl MainScreen {
             files: FilesTab::new(),
             comms: CommsTab::new(entity_name),
             recall: RecallTab::new(),
+            caliber: CaliberTab::new(),
             fullscreen: false,
             show_help: false,
             multi_entity: false,
@@ -192,6 +195,9 @@ impl Screen for MainScreen {
             Tab::Recall => {
                 self.recall.render(frame, chunks[content_idx], ctx);
             }
+            Tab::Caliber => {
+                self.caliber.render(frame, chunks[content_idx], ctx);
+            }
         }
 
         // Footer hints
@@ -313,6 +319,16 @@ impl Screen for MainScreen {
                     Span::styled(" ? ", hint_style_key),
                     Span::styled(" Help ", hint_style_desc),
                 ],
+                Tab::Caliber => vec![
+                    Span::styled(" j/k ", hint_style_key),
+                    Span::styled(" Scroll  ", hint_style_desc),
+                    Span::styled(" r ", hint_style_key),
+                    Span::styled(" Refresh  ", hint_style_desc),
+                    Span::styled(" Tab ", hint_style_key),
+                    Span::styled(" Next tab  ", hint_style_desc),
+                    Span::styled(" ? ", hint_style_key),
+                    Span::styled(" Help ", hint_style_desc),
+                ],
             };
             frame.render_widget(Paragraph::new(Line::from(hints)), chunks[footer_idx]);
         }
@@ -389,6 +405,10 @@ impl Screen for MainScreen {
                     self.active_tab = Tab::Recall;
                     return ScreenAction::None;
                 }
+                KeyCode::Char('7') => {
+                    self.active_tab = Tab::Caliber;
+                    return ScreenAction::None;
+                }
                 // ? opens help (only when not typing)
                 KeyCode::Char('?') => {
                     self.show_help = true;
@@ -424,6 +444,7 @@ impl Screen for MainScreen {
             Tab::Files => self.files.handle_key(key, ctx),
             Tab::Comms => self.comms.handle_key(key, ctx),
             Tab::Recall => self.recall.handle_key(key, ctx),
+            Tab::Caliber => self.caliber.handle_key(key, ctx),
         }
     }
 
@@ -444,6 +465,7 @@ impl Screen for MainScreen {
         self.files.handle_tick(ctx);
         self.comms.handle_tick(ctx);
         self.recall.handle_tick(ctx);
+        self.caliber.handle_tick(ctx);
     }
 }
 
