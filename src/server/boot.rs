@@ -97,6 +97,7 @@ pub async fn boot_entity(
         plugin_manager: tokio::sync::Mutex::new(plugin_manager),
         wal: None,
         alert_queue: tokio::sync::Mutex::new(alert_queue),
+        provider_status: crate::provider_status::new_shared(),
     });
 
     // Pipeline health check

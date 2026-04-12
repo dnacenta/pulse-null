@@ -405,6 +405,35 @@ pub fn build_system_prompt_budgeted(
         }
     }
 
+    // --- Tier 2 (Low): Graph Context ---
+    if config.graph.enabled && config.graph.context_injection {
+        let query_seed = format!(
+            "{} {}",
+            config.entity.name,
+            std::fs::read_to_string(root_dir.join("memory").join("EPHEMERAL.md"))
+                .unwrap_or_default()
+                .chars()
+                .take(500)
+                .collect::<String>()
+        );
+
+        if let Some(block) = crate::graph_context::build_context_block(
+            root_dir,
+            &query_seed,
+            config.graph.context_max_tokens,
+            &config.graph,
+        ) {
+            let tokens = estimate_tokens(&block);
+            components.push(PromptComponent {
+                name: "graph-context",
+                content: block,
+                tokens,
+                tier: PromptTier::Low,
+                cap: config.graph.context_max_tokens,
+            });
+        }
+    }
+
     // --- Budget enforcement ---
     let total_before: usize = components.iter().map(|c| c.tokens).sum();
     let mut was_trimmed = false;

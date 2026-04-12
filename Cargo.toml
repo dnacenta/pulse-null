@@ -76,8 +76,12 @@ libc = "0.2"
 pulse-system-types = "0.6.3"
 
 # Core dependencies (always included — these define an entity)
-recall-echo = { git = "https://github.com/dnacenta/recall-echo.git", tag = "v3.6.1", features = ["pulse-null"] }
+recall-echo = { path = "/opt/recall-echo", default-features = false, features = ["pulse-null", "server"] }
 vigil-pulse = "0.1"
+
+# SurrealDB (for server provisioning — entity DB/user creation)
+surrealdb = { version = "3", default-features = false, features = ["protocol-ws"] }
+which = "7"
 
 # Plugins (optional — different interfaces to speak through)
 voice-echo = { version = "0.8", optional = true }
