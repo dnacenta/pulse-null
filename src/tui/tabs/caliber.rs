@@ -44,6 +44,7 @@ pub struct CaliberTab {
 }
 
 const REFRESH_INTERVAL_SECS: u64 = 30;
+const VISIBLE_OUTCOMES: usize = 10;
 
 impl CaliberTab {
     pub fn new() -> Self {
@@ -64,7 +65,7 @@ impl CaliberTab {
     }
 
     pub fn scroll_down(&mut self, _amount: u16) {
-        let max = self.outcomes.len().saturating_sub(8);
+        let max = self.outcomes.len().saturating_sub(VISIBLE_OUTCOMES);
         if self.scroll_offset < max {
             self.scroll_offset += 1;
         }
@@ -107,13 +108,20 @@ impl CaliberTab {
 
     fn check_pending(&mut self) {
         if let Some(ref rx) = self.pending_load {
-            if let Ok(result) = rx.try_recv() {
-                self.caliber_doc = result.caliber_doc;
-                self.outcomes = result.outcomes;
-                self.today_outcomes = result.today_outcomes;
-                self.loaded = true;
-                self.pending_load = None;
-                self.last_refresh = std::time::Instant::now();
+            match rx.try_recv() {
+                Ok(result) => {
+                    self.caliber_doc = result.caliber_doc;
+                    self.outcomes = result.outcomes;
+                    self.today_outcomes = result.today_outcomes;
+                    self.loaded = true;
+                    self.pending_load = None;
+                    self.last_refresh = std::time::Instant::now();
+                }
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    // Sender dropped (panic or early exit) — clear and allow retry
+                    self.pending_load = None;
+                }
+                Err(mpsc::TryRecvError::Empty) => {} // still loading
             }
         }
     }
@@ -320,8 +328,8 @@ impl CaliberTab {
         }
 
         let visible_count = inner.height.saturating_sub(1) as usize; // -1 for header
-        let start = self.outcomes.len().saturating_sub(10 + self.scroll_offset);
-        let end = self.outcomes.len().saturating_sub(self.scroll_offset);
+        let end = self.outcomes.len().saturating_sub(self.scroll_offset).min(self.outcomes.len());
+        let start = end.saturating_sub(VISIBLE_OUTCOMES);
         let visible: Vec<&OutcomeRecord> = self.outcomes[start..end].iter().rev().collect();
 
         let header = Row::new(vec!["Time", "Domain", "Result", "Tokens"])
@@ -371,7 +379,8 @@ fn score_color(score: f64) -> ratatui::style::Color {
 }
 
 fn score_bar(score: f64, width: usize) -> String {
-    let filled = (score * width as f64).round() as usize;
+    let clamped = score.clamp(0.0, 1.0);
+    let filled = (clamped * width as f64).round() as usize;
     let empty = width.saturating_sub(filled);
     format!("{}{}", "█".repeat(filled), "░".repeat(empty))
 }
