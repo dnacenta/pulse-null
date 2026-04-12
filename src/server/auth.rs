@@ -131,6 +131,7 @@ mod tests {
                 injection_detection: true,
             },
             trust: TrustConfig::default(),
+            owner: crate::config::OwnerConfig::default(),
             memory: MemoryConfig::default(),
             scheduler: SchedulerConfig::default(),
             pipeline: PipelineConfig::default(),
@@ -173,6 +174,7 @@ mod tests {
             plugin_manager: tokio::sync::Mutex::new(plugin_manager),
             wal: None,
             alert_queue: tokio::sync::Mutex::new(alert_queue),
+            provider_status: crate::provider_status::new_shared(),
         })
     }
 
@@ -299,6 +301,7 @@ mod tests {
                 injection_detection: true,
             },
             trust: TrustConfig::default(),
+            owner: crate::config::OwnerConfig::default(),
             memory: MemoryConfig::default(),
             scheduler: SchedulerConfig::default(),
             pipeline: PipelineConfig::default(),
@@ -341,6 +344,7 @@ mod tests {
             plugin_manager: tokio::sync::Mutex::new(plugin_manager),
             wal: None,
             alert_queue: tokio::sync::Mutex::new(alert_queue),
+            provider_status: crate::provider_status::new_shared(),
         })
     }
 

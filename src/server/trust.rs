@@ -1,6 +1,11 @@
+// Trust module is retained during the unified session migration.
+// The chat handler now uses identity-class resolution instead of TrustLevel.
+// This module will be removed in a follow-up once all consumers are migrated.
+
 use crate::config::Config;
 
 #[derive(Debug, Clone, PartialEq)]
+#[allow(dead_code)]
 pub enum TrustLevel {
     Trusted,
     Peer,
@@ -8,6 +13,7 @@ pub enum TrustLevel {
     Untrusted,
 }
 
+#[allow(dead_code)]
 impl TrustLevel {
     pub fn from_channel(channel: &str, config: &Config) -> Self {
         if config.trust.trusted.iter().any(|c| c == channel) {
@@ -101,6 +107,7 @@ mod tests {
                 trusted: vec!["system".into(), "reflection".into()],
                 verified: vec!["chat".into(), "voice".into()],
             },
+            owner: crate::config::OwnerConfig::default(),
             memory: MemoryConfig::default(),
             scheduler: SchedulerConfig::default(),
             pipeline: PipelineConfig::default(),

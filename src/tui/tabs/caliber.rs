@@ -209,9 +209,10 @@ impl TabView for CaliberTab {
 impl CaliberTab {
     fn render_capability_map(&self, frame: &mut Frame, area: Rect) {
         let block = Block::bordered()
-            .title(Line::from(vec![
-                Span::styled(" Capability Map ", Style::default().fg(NORD8).add_modifier(Modifier::BOLD)),
-            ]))
+            .title(Line::from(vec![Span::styled(
+                " Capability Map ",
+                Style::default().fg(NORD8).add_modifier(Modifier::BOLD),
+            )]))
             .border_type(BorderType::Rounded)
             .border_style(Style::default().fg(NORD3));
 
@@ -260,17 +261,20 @@ impl CaliberTab {
 
             frame.render_widget(table, inner);
         } else {
-            let msg = Paragraph::new("CALIBER.md not found. Run trajectory mining to generate capability scores.")
-                .style(Style::default().fg(NORD4));
+            let msg = Paragraph::new(
+                "CALIBER.md not found. Run trajectory mining to generate capability scores.",
+            )
+            .style(Style::default().fg(NORD4));
             frame.render_widget(msg, inner);
         }
     }
 
     fn render_today_summary(&self, frame: &mut Frame, area: Rect) {
         let block = Block::bordered()
-            .title(Line::from(vec![
-                Span::styled(" Today ", Style::default().fg(NORD13).add_modifier(Modifier::BOLD)),
-            ]))
+            .title(Line::from(vec![Span::styled(
+                " Today ",
+                Style::default().fg(NORD13).add_modifier(Modifier::BOLD),
+            )]))
             .border_type(BorderType::Rounded)
             .border_style(Style::default().fg(NORD3));
 
@@ -278,8 +282,8 @@ impl CaliberTab {
         frame.render_widget(block, area);
 
         if self.today_outcomes.is_empty() {
-            let msg = Paragraph::new("No activity recorded today.")
-                .style(Style::default().fg(NORD4));
+            let msg =
+                Paragraph::new("No activity recorded today.").style(Style::default().fg(NORD4));
             frame.render_widget(msg, inner);
             return;
         }
@@ -295,13 +299,20 @@ impl CaliberTab {
             }
             tokens = tokens.saturating_add(o.tokens_used);
         }
-        let success_rate = if total > 0 { success as f64 / total as f64 * 100.0 } else { 0.0 };
+        let success_rate = if total > 0 {
+            success as f64 / total as f64 * 100.0
+        } else {
+            0.0
+        };
 
         let lines = vec![
             Line::from(vec![
                 Span::styled(format!("{total} outcomes"), Style::default().fg(NORD4)),
                 Span::raw("  "),
-                Span::styled(format!("{success_rate:.0}% success"), Style::default().fg(NORD14)),
+                Span::styled(
+                    format!("{success_rate:.0}% success"),
+                    Style::default().fg(NORD14),
+                ),
                 Span::raw("  "),
                 Span::styled(format!("{tokens} tokens"), Style::default().fg(NORD4)),
             ]),
@@ -323,9 +334,10 @@ impl CaliberTab {
 
     fn render_recent_outcomes(&self, frame: &mut Frame, area: Rect) {
         let block = Block::bordered()
-            .title(Line::from(vec![
-                Span::styled(" Recent Outcomes ", Style::default().fg(NORD9).add_modifier(Modifier::BOLD)),
-            ]))
+            .title(Line::from(vec![Span::styled(
+                " Recent Outcomes ",
+                Style::default().fg(NORD9).add_modifier(Modifier::BOLD),
+            )]))
             .border_type(BorderType::Rounded)
             .border_style(Style::default().fg(NORD3));
 
@@ -333,14 +345,17 @@ impl CaliberTab {
         frame.render_widget(block, area);
 
         if self.outcomes.is_empty() {
-            let msg = Paragraph::new("No outcomes recorded yet.")
-                .style(Style::default().fg(NORD4));
+            let msg = Paragraph::new("No outcomes recorded yet.").style(Style::default().fg(NORD4));
             frame.render_widget(msg, inner);
             return;
         }
 
         let visible_count = inner.height.saturating_sub(1) as usize; // -1 for header
-        let end = self.outcomes.len().saturating_sub(self.scroll_offset).min(self.outcomes.len());
+        let end = self
+            .outcomes
+            .len()
+            .saturating_sub(self.scroll_offset)
+            .min(self.outcomes.len());
         let start = end.saturating_sub(VISIBLE_OUTCOMES);
         let visible: Vec<&OutcomeRecord> = self.outcomes[start..end].iter().rev().collect();
 

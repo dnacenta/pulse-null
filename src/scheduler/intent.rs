@@ -425,18 +425,22 @@ async fn execute_intent(
     // Build task system prompt (minimal — identity + thought stack only).
     // Intents are autonomous execution: use the task prompt with the
     // anti-hallucination preamble, not the full interactive prompt.
-    let system_prompt =
-        match prompt::build_task_system_prompt_async(root_dir.clone(), state.config.clone()).await {
-            Ok(p) => p,
-            Err(e) => {
-                tracing::error!(
-                    "Cannot build system prompt for intent '{}': {}",
-                    intent.id,
-                    e
-                );
-                return None;
-            }
-        };
+    let system_prompt = match prompt::build_task_system_prompt_async(
+        root_dir.clone(),
+        state.config.clone(),
+    )
+    .await
+    {
+        Ok(p) => p,
+        Err(e) => {
+            tracing::error!(
+                "Cannot build system prompt for intent '{}': {}",
+                intent.id,
+                e
+            );
+            return None;
+        }
+    };
 
     // Build user message with autonomy context
     let autonomy_context = prompt::build_autonomy_context(&root_dir, &state.config);

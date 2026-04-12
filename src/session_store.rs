@@ -8,6 +8,7 @@ use pulse_system_types::llm::{Message, MessageContent, MessageSource, Role};
 use serde::{Deserialize, Serialize};
 use tokio::sync::RwLock;
 
+use crate::config::OwnerConfig;
 use crate::persist::PersistCoordinator;
 
 /// A recently accessed file tracked for post-compaction re-injection.
@@ -377,6 +378,54 @@ pub fn reset_session(
     archive_path
 }
 
+/// Resolve a raw channel+sender pair into an identity class.
+///
+/// Identity classes determine session boundaries, trust levels, and resource
+/// limits. The channel is treated as metadata, not as a session boundary.
+///
+/// Returns one of:
+/// - `"owner"` — the entity's creator/owner
+/// - `"peer:{name}"` — a known sibling entity in the network
+/// - `"guest:{sender}"` — an unknown or unrecognized sender
+pub fn resolve_sender(
+    channel: &str,
+    sender: Option<&str>,
+    owner: &OwnerConfig,
+    peers: &HashMap<String, crate::config::PeerConfig>,
+) -> String {
+    let sender = sender.unwrap_or("anonymous");
+
+    // TUI/system/reflection channels are always owner
+    if channel == "tui" || channel == "system" || channel == "reflection" {
+        return "owner".into();
+    }
+
+    // Check known owner identities
+    if let Some(ref discord_id) = owner.discord_id {
+        if sender == discord_id {
+            return "owner".into();
+        }
+    }
+    if let Some(ref phone) = owner.phone {
+        if sender == phone {
+            return "owner".into();
+        }
+    }
+    if let Some(ref name) = owner.name {
+        if sender.eq_ignore_ascii_case(name) {
+            return "owner".into();
+        }
+    }
+
+    // Known peer entities
+    if channel == "comms" && peers.contains_key(sender) {
+        return format!("peer:{}", sender);
+    }
+
+    // Unknown sender
+    format!("guest:{}", sender)
+}
+
 /// Runtime session wrapper with tracking metadata.
 pub struct Session {
     pub data: SessionData,
@@ -543,6 +592,10 @@ impl SessionStore {
     }
 
     /// Derive a session key from channel and sender.
+    ///
+    /// Retained for backward compatibility during the unified session transition.
+    /// New code should use `resolve_sender()` + `get_or_create_by_key()` instead.
+    #[allow(dead_code)]
     pub fn session_key(channel: &str, sender: Option<&str>) -> String {
         let sender = sender.unwrap_or("anonymous");
         format!("{}:{}", channel, sender)
@@ -556,6 +609,10 @@ impl SessionStore {
 
     /// Get an existing session without creating a new one.
     /// Returns None if no session exists for this channel/sender.
+    ///
+    /// Retained for backward compatibility during the unified session transition.
+    /// New code should use `get_existing_by_key()` instead.
+    #[allow(dead_code)]
     pub async fn get_existing(
         &self,
         channel: &str,
@@ -567,6 +624,10 @@ impl SessionStore {
     }
 
     /// Get or create a session for the given channel and sender.
+    ///
+    /// Retained for backward compatibility during the unified session transition.
+    /// New code should use `get_or_create_by_key()` instead.
+    #[allow(dead_code)]
     pub async fn get_or_create(
         &self,
         channel: &str,
@@ -599,6 +660,53 @@ impl SessionStore {
         let session = Session::new(key.clone(), channel.to_string(), sender_str);
         let arc = std::sync::Arc::new(RwLock::new(session));
         sessions.insert(key, std::sync::Arc::clone(&arc));
+        arc
+    }
+
+    /// Get an existing session by a pre-resolved identity key.
+    ///
+    /// Returns None if no session exists for this key. Unlike `get_existing`,
+    /// this takes the resolved identity key directly (e.g. "owner", "peer:Nova").
+    pub async fn get_existing_by_key(&self, key: &str) -> Option<Arc<RwLock<Session>>> {
+        let sessions = self.sessions.read().await;
+        sessions.get(key).map(Arc::clone)
+    }
+
+    /// Get or create a session keyed by resolved identity.
+    ///
+    /// The `key` is the resolved identity class (e.g. "owner", "peer:Nova",
+    /// "guest:12345"). Channel and sender are stored as metadata on the session
+    /// but do not affect the session boundary.
+    pub async fn get_or_create_by_key(
+        &self,
+        key: &str,
+        channel: &str,
+        sender: &str,
+    ) -> Arc<RwLock<Session>> {
+        // Fast path: read lock
+        {
+            let sessions = self.sessions.read().await;
+            if let Some(session) = sessions.get(key) {
+                return Arc::clone(session);
+            }
+        }
+
+        // Slow path: write lock, create new session
+        let mut sessions = self.sessions.write().await;
+
+        // Double-check after acquiring write lock
+        if let Some(session) = sessions.get(key) {
+            return Arc::clone(session);
+        }
+
+        // Evict LRU if at capacity
+        if sessions.len() >= self.max_sessions {
+            self.evict_lru(&mut sessions).await;
+        }
+
+        let session = Session::new(key.to_string(), channel.to_string(), sender.to_string());
+        let arc = Arc::new(RwLock::new(session));
+        sessions.insert(key.to_string(), Arc::clone(&arc));
         arc
     }
 

@@ -37,10 +37,7 @@ impl Plugin for DiscordEchoPlugin {
     ) -> PluginResult<'a> {
         Box::pin(async move {
             let config = config::from_toml(toml_config)?;
-            tracing::info!(
-                "discord-echo: configured for guild {}",
-                config.guild_id
-            );
+            tracing::info!("discord-echo: configured for guild {}", config.guild_id);
             self.inner = Some(discord_echo::DiscordEcho::new(config));
             Ok(())
         })
@@ -49,11 +46,11 @@ impl Plugin for DiscordEchoPlugin {
     fn start(&mut self) -> PluginResult<'_> {
         Box::pin(async move {
             let inner = self.inner.as_mut().ok_or("discord-echo: not initialized")?;
-            PstPlugin::start(inner)
-                .await
-                .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> {
+            PstPlugin::start(inner).await.map_err(
+                |e| -> Box<dyn std::error::Error + Send + Sync> {
                     format!("discord-echo start failed: {e}").into()
-                })?;
+                },
+            )?;
             self.started = true;
             Ok(())
         })
@@ -62,11 +59,11 @@ impl Plugin for DiscordEchoPlugin {
     fn stop(&mut self) -> PluginResult<'_> {
         Box::pin(async move {
             if let Some(inner) = self.inner.as_mut() {
-                PstPlugin::stop(inner)
-                    .await
-                    .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> {
+                PstPlugin::stop(inner).await.map_err(
+                    |e| -> Box<dyn std::error::Error + Send + Sync> {
                         format!("discord-echo stop failed: {e}").into()
-                    })?;
+                    },
+                )?;
                 self.started = false;
             }
             Ok(())

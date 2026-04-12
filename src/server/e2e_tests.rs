@@ -110,6 +110,7 @@ fn test_config() -> Config {
             injection_detection: false,
         },
         trust: TrustConfig::default(),
+        owner: crate::config::OwnerConfig::default(),
         memory: MemoryConfig::default(),
         scheduler: SchedulerConfig::default(),
         pipeline: PipelineConfig::default(),
@@ -162,6 +163,7 @@ async fn build_state(provider: MockProvider, tools: ToolRegistry) -> Arc<AppStat
         plugin_manager: tokio::sync::Mutex::new(plugin_manager),
         wal: None,
         alert_queue: tokio::sync::Mutex::new(alert_queue),
+        provider_status: crate::provider_status::new_shared(),
     })
 }
 

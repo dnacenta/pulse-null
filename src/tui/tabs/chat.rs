@@ -739,9 +739,7 @@ async fn conversation_task(
                 let (had_success, had_failure) = classify_tool_outcomes(&tool_results);
                 let just_degraded = failure_tracker.record_round(had_success, had_failure);
                 if just_degraded {
-                    tracing::warn!(
-                        "TUI hallucination guard: tool degraded state triggered"
-                    );
+                    tracing::warn!("TUI hallucination guard: tool degraded state triggered");
                     tool_results.push(ContentBlock::Text {
                         text: TOOL_DEGRADED_WARNING.to_string(),
                     });

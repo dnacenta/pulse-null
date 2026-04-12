@@ -249,7 +249,11 @@ async fn execute_task(
             ),
             Err(e) => {
                 let error_msg = e.to_string();
-                tracing::error!("LLM invocation failed for task '{}': {}", task.id, error_msg);
+                tracing::error!(
+                    "LLM invocation failed for task '{}': {}",
+                    task.id,
+                    error_msg
+                );
                 handle_provider_error(state, &task.id, &error_msg).await;
                 return;
             }
@@ -291,7 +295,11 @@ async fn execute_task(
             }
             Err(e) => {
                 let error_msg = e.to_string();
-                tracing::error!("LLM invocation failed for task '{}': {}", task.id, error_msg);
+                tracing::error!(
+                    "LLM invocation failed for task '{}': {}",
+                    task.id,
+                    error_msg
+                );
                 handle_provider_error(state, &task.id, &error_msg).await;
                 return;
             }

@@ -7,12 +7,12 @@ use ratatui::Frame;
 
 use super::{AppScreen, EntityState, Screen, ScreenAction};
 use crate::tui::app::AppContext;
+use crate::tui::tabs::caliber::CaliberTab;
 use crate::tui::tabs::chat::{ChatAction, ChatTab};
 use crate::tui::tabs::comms::{CommsFooter, CommsTab};
 use crate::tui::tabs::entity::EntityTab;
 use crate::tui::tabs::evolution::EvolutionTab;
 use crate::tui::tabs::files::FilesTab;
-use crate::tui::tabs::caliber::CaliberTab;
 use crate::tui::tabs::recall::RecallTab;
 use crate::tui::tabs::{Tab, TabView};
 use crate::tui::theme::*;

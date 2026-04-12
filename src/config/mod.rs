@@ -16,6 +16,8 @@ pub struct Config {
     #[serde(default)]
     pub trust: TrustConfig,
     #[serde(default)]
+    pub owner: OwnerConfig,
+    #[serde(default)]
     pub memory: MemoryConfig,
     #[serde(default)]
     pub scheduler: SchedulerConfig,
@@ -88,6 +90,21 @@ pub struct SecurityConfig {
     pub secret: Option<String>,
     #[serde(default = "default_true")]
     pub injection_detection: bool,
+}
+
+/// Owner identity configuration for sender resolution.
+///
+/// Maps known owner identities (Discord ID, phone number, name) so that
+/// messages from any of these senders are resolved to the "owner" identity
+/// class regardless of the channel they arrive on.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct OwnerConfig {
+    #[serde(default)]
+    pub name: Option<String>,
+    #[serde(default)]
+    pub discord_id: Option<String>,
+    #[serde(default)]
+    pub phone: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -243,6 +260,32 @@ fn default_archive_max() -> usize {
 
 fn default_timezone() -> String {
     "UTC".to_string()
+}
+
+// Identity-class session limit defaults
+
+fn default_owner_message_cap() -> usize {
+    200
+}
+
+fn default_owner_time_cap() -> u64 {
+    28800 // 8 hours
+}
+
+fn default_peer_message_cap() -> usize {
+    30
+}
+
+fn default_peer_time_cap() -> u64 {
+    3600 // 1 hour
+}
+
+fn default_guest_message_cap() -> usize {
+    20
+}
+
+fn default_guest_time_cap() -> u64 {
+    1800 // 30 minutes
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -454,15 +497,71 @@ pub struct SessionConfig {
     /// Built-in defaults exist for "discord" (50 msgs / 2h), "voice" (30 msgs / 30min),
     /// and "comms" (30 msgs / 1h). Explicit config here overrides built-in defaults.
     pub channel_limits: HashMap<String, ChannelLimits>,
+
+    // --- Identity-class session limits (Phase 1: Unified Session) ---
+    /// Session limits for the owner (unified across all channels).
+    #[serde(default = "default_owner_message_cap")]
+    pub owner_message_cap: usize,
+    /// Owner session time limit in seconds (default: 8h).
+    #[serde(default = "default_owner_time_cap")]
+    pub owner_time_cap_seconds: u64,
+    /// Session limits for peer entities.
+    #[serde(default = "default_peer_message_cap")]
+    pub peer_message_cap: usize,
+    /// Peer session time limit in seconds (default: 1h).
+    #[serde(default = "default_peer_time_cap")]
+    pub peer_time_cap_seconds: u64,
+    /// Session limits for unknown/guest senders.
+    #[serde(default = "default_guest_message_cap")]
+    pub guest_message_cap: usize,
+    /// Guest session time limit in seconds (default: 30min).
+    #[serde(default = "default_guest_time_cap")]
+    pub guest_time_cap_seconds: u64,
 }
 
 impl SessionConfig {
+    /// Get session limits based on resolved identity class.
+    ///
+    /// Identity classes:
+    /// - `"owner"` → generous limits (200 msgs / 8h)
+    /// - `"peer:*"` → moderate limits (30 msgs / 1h)
+    /// - `"guest:*"` → tight limits (20 msgs / 30min)
+    /// - fallback → default channel limits
+    pub fn get_identity_limits(&self, resolved_key: &str) -> ChannelLimits {
+        if resolved_key == "owner" {
+            ChannelLimits {
+                message_cap: self.owner_message_cap,
+                time_cap_seconds: self.owner_time_cap_seconds,
+            }
+        } else if resolved_key.starts_with("peer:") {
+            ChannelLimits {
+                message_cap: self.peer_message_cap,
+                time_cap_seconds: self.peer_time_cap_seconds,
+            }
+        } else if resolved_key.starts_with("guest:") {
+            ChannelLimits {
+                message_cap: self.guest_message_cap,
+                time_cap_seconds: self.guest_time_cap_seconds,
+            }
+        } else {
+            // Fallback for unexpected key formats
+            ChannelLimits {
+                message_cap: self.default_message_cap,
+                time_cap_seconds: self.default_time_cap_seconds,
+            }
+        }
+    }
+
     /// Get channel limits for a given channel, with built-in defaults for known channel types.
     ///
     /// Lookup order:
     /// 1. Explicit `channel_limits` from TOML config
     /// 2. Built-in defaults for known channels (discord, voice, comms)
     /// 3. `default_message_cap` / `default_time_cap_seconds`
+    ///
+    /// Retained for backward compatibility. New code should use
+    /// `get_identity_limits()` with a resolved identity key.
+    #[allow(dead_code)]
     pub fn get_channel_limits(&self, channel: &str) -> ChannelLimits {
         // Explicit config takes priority
         if let Some(limits) = self.channel_limits.get(channel) {
@@ -506,6 +605,12 @@ impl Default for SessionConfig {
             default_message_cap: 100,
             default_time_cap_seconds: 14400,
             channel_limits: HashMap::new(),
+            owner_message_cap: default_owner_message_cap(),
+            owner_time_cap_seconds: default_owner_time_cap(),
+            peer_message_cap: default_peer_message_cap(),
+            peer_time_cap_seconds: default_peer_time_cap(),
+            guest_message_cap: default_guest_message_cap(),
+            guest_time_cap_seconds: default_guest_time_cap(),
         }
     }
 }

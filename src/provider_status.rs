@@ -142,33 +142,51 @@ mod tests {
 
     #[test]
     fn classify_auth_errors() {
-        assert_eq!(classify_error("HTTP 401 Unauthorized"), ErrorKind::AuthExpired);
+        assert_eq!(
+            classify_error("HTTP 401 Unauthorized"),
+            ErrorKind::AuthExpired
+        );
         assert_eq!(classify_error("invalid api key"), ErrorKind::AuthExpired);
         assert_eq!(classify_error("token expired"), ErrorKind::AuthExpired);
     }
 
     #[test]
     fn classify_rate_limit() {
-        assert_eq!(classify_error("HTTP 429 Too Many Requests"), ErrorKind::RateLimit);
+        assert_eq!(
+            classify_error("HTTP 429 Too Many Requests"),
+            ErrorKind::RateLimit
+        );
         assert_eq!(classify_error("rate limit exceeded"), ErrorKind::RateLimit);
     }
 
     #[test]
     fn classify_network() {
-        assert_eq!(classify_error("connection refused"), ErrorKind::NetworkError);
+        assert_eq!(
+            classify_error("connection refused"),
+            ErrorKind::NetworkError
+        );
         assert_eq!(classify_error("request timeout"), ErrorKind::NetworkError);
-        assert_eq!(classify_error("dns resolution failed"), ErrorKind::NetworkError);
+        assert_eq!(
+            classify_error("dns resolution failed"),
+            ErrorKind::NetworkError
+        );
     }
 
     #[test]
     fn classify_spawn() {
-        assert_eq!(classify_error("failed to spawn: No such file"), ErrorKind::ProcessSpawn);
+        assert_eq!(
+            classify_error("failed to spawn: No such file"),
+            ErrorKind::ProcessSpawn
+        );
         assert_eq!(classify_error("permission denied"), ErrorKind::ProcessSpawn);
     }
 
     #[test]
     fn classify_unknown() {
-        assert_eq!(classify_error("something weird happened"), ErrorKind::Unknown);
+        assert_eq!(
+            classify_error("something weird happened"),
+            ErrorKind::Unknown
+        );
     }
 
     #[test]

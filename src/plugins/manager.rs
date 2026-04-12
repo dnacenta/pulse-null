@@ -346,6 +346,7 @@ mod tests {
                 trusted: vec![],
                 verified: vec![],
             },
+            owner: crate::config::OwnerConfig::default(),
             memory: MemoryConfig::default(),
             scheduler: SchedulerConfig::default(),
             pipeline: PipelineConfig::default(),

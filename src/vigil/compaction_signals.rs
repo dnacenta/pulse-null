@@ -159,17 +159,15 @@ pub fn assess(root_dir: &Path) -> CompactionHealth {
     let circuit_breaker_count = signals.iter().filter(|s| s.circuit_breaker_fired).count();
 
     // Average quality score
-    let avg_quality: f64 = signals.iter().map(|s| s.quality_score).sum::<f64>() / event_count as f64;
+    let avg_quality: f64 =
+        signals.iter().map(|s| s.quality_score).sum::<f64>() / event_count as f64;
 
     // Trend: compare first half to second half
     let trend = if event_count >= 4 {
         let mid = event_count / 2;
         let first_half_avg: f64 =
             signals[..mid].iter().map(|s| s.quality_score).sum::<f64>() / mid as f64;
-        let second_half_avg: f64 = signals[mid..]
-            .iter()
-            .map(|s| s.quality_score)
-            .sum::<f64>()
+        let second_half_avg: f64 = signals[mid..].iter().map(|s| s.quality_score).sum::<f64>()
             / (event_count - mid) as f64;
 
         if second_half_avg < LOW_QUALITY_THRESHOLD {
