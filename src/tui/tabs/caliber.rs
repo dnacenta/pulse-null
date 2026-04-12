@@ -13,10 +13,9 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Paragraph, Row, Table};
 use ratatui::Frame;
 
-use crate::caliber::document::{self, CaliberDocument, CapabilityEntry};
+use crate::caliber::document::{self, CaliberDocument};
 use crate::caliber::outcome::{Outcome, OutcomeRecord};
 use crate::caliber::runtime;
-use crate::caliber::state::CaliberState;
 use crate::tui::app::AppContext;
 use crate::tui::screens::ScreenAction;
 use crate::tui::theme::*;
@@ -171,13 +170,17 @@ impl TabView for CaliberTab {
     fn handle_key(&mut self, key: KeyEvent, ctx: &mut AppContext) -> ScreenAction {
         match key.code {
             KeyCode::Char('r') => {
-                self.start_load(&ctx.root_dir);
+                if let Some(ref root) = ctx.root_dir {
+                    if self.pending_load.is_none() {
+                        self.start_load(root);
+                    }
+                }
             }
             KeyCode::Char('j') | KeyCode::Down => self.scroll_down(1),
             KeyCode::Char('k') | KeyCode::Up => self.scroll_up(1),
             _ => {}
         }
-        ScreenAction::Continue
+        ScreenAction::None
     }
 
     fn handle_tick(&mut self, ctx: &mut AppContext) {
@@ -185,14 +188,18 @@ impl TabView for CaliberTab {
 
         // Auto-load on first tick
         if !self.loaded && self.pending_load.is_none() {
-            self.start_load(&ctx.root_dir);
+            if let Some(ref root) = ctx.root_dir {
+                self.start_load(root);
+            }
         }
 
         // Auto-refresh
         if self.last_refresh.elapsed().as_secs() >= REFRESH_INTERVAL_SECS
             && self.pending_load.is_none()
         {
-            self.start_load(&ctx.root_dir);
+            if let Some(ref root) = ctx.root_dir {
+                self.start_load(root);
+            }
         }
     }
 }
@@ -278,11 +285,16 @@ impl CaliberTab {
         }
 
         let total = self.today_outcomes.len();
-        let success = self.today_outcomes.iter().filter(|o| o.outcome == Outcome::Success).count();
-        let partial = self.today_outcomes.iter().filter(|o| o.outcome == Outcome::Partial).count();
-        let failed = self.today_outcomes.iter().filter(|o| o.outcome == Outcome::Failed).count();
-        let surprising = self.today_outcomes.iter().filter(|o| o.outcome == Outcome::Surprising).count();
-        let tokens: u32 = self.today_outcomes.iter().map(|o| o.tokens_used).sum();
+        let (mut success, mut partial, mut failed, mut surprising, mut tokens) = (0, 0, 0, 0, 0u32);
+        for o in &self.today_outcomes {
+            match o.outcome {
+                Outcome::Success => success += 1,
+                Outcome::Partial => partial += 1,
+                Outcome::Failed => failed += 1,
+                Outcome::Surprising => surprising += 1,
+            }
+            tokens = tokens.saturating_add(o.tokens_used);
+        }
         let success_rate = if total > 0 { success as f64 / total as f64 * 100.0 } else { 0.0 };
 
         let lines = vec![
