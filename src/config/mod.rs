@@ -398,6 +398,14 @@ pub struct GraphConfig {
     pub auto_ingest: bool,
     /// Sync pipeline documents to graph after task/intent execution
     pub pipeline_sync: bool,
+    /// Connection mode: "embedded" or "server"
+    pub mode: String,
+    /// Shared data directory for SurrealDB server (default: /opt/pulse-null)
+    pub data_dir: Option<String>,
+    /// Inject relevant graph entities into the system prompt
+    pub context_injection: bool,
+    /// Maximum tokens for graph context block
+    pub context_max_tokens: usize,
 }
 
 impl Default for GraphConfig {
@@ -406,6 +414,10 @@ impl Default for GraphConfig {
             enabled: true,
             auto_ingest: true,
             pipeline_sync: true,
+            mode: "embedded".to_string(),
+            data_dir: None,
+            context_injection: true,
+            context_max_tokens: 500,
         }
     }
 }

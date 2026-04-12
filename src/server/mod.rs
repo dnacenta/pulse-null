@@ -118,6 +118,29 @@ pub async fn start(config: Config) -> Result<(), Box<dyn std::error::Error>> {
     // Ensure required directories and files exist
     ensure_infrastructure(&root_dir);
 
+    // Start SurrealDB server and provision entity database (if graph enabled in server mode)
+    if config.graph.enabled && config.graph.mode == "server" {
+        let data_dir = config
+            .graph
+            .data_dir
+            .as_ref()
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| std::path::PathBuf::from("/opt/pulse-null"));
+
+        if let Err(e) = crate::surrealdb_manager::ensure_running(&data_dir).await {
+            tracing::error!("SurrealDB startup failed: {e}");
+            return Err(e);
+        }
+
+        if let Err(e) =
+            crate::surrealdb_manager::provision_entity(&data_dir, &config.entity.name, &root_dir)
+                .await
+        {
+            tracing::error!("SurrealDB provisioning failed: {e}");
+            return Err(e);
+        }
+    }
+
     // Verify Claude Code integration if applicable
     if config.llm.provider == "claude-code" {
         if let Ok(home) = std::env::var("HOME") {
@@ -394,6 +417,19 @@ pub async fn start(config: Config) -> Result<(), Box<dyn std::error::Error>> {
             });
         })
         .await;
+    }
+
+    // Shut down SurrealDB server if we own it
+    if config.graph.enabled && config.graph.mode == "server" {
+        let data_dir = config
+            .graph
+            .data_dir
+            .as_ref()
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| std::path::PathBuf::from("/opt/pulse-null"));
+        if let Err(e) = crate::surrealdb_manager::shutdown_if_owner(&data_dir).await {
+            tracing::warn!("SurrealDB shutdown: {e}");
+        }
     }
 
     // Remove PID file
