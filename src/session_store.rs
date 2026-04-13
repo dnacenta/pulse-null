@@ -426,6 +426,26 @@ pub fn resolve_sender(
     format!("guest:{}", sender)
 }
 
+/// Check if a session key uses the old `channel:sender` format.
+///
+/// Old keys look like `"discord:h0ck3y"` or `"voice:+34646305937"`.
+/// New identity-based keys look like `"owner"`, `"peer:Nova"`, or `"guest:someone"`.
+/// The distinguishing factor is that old keys use a *channel* name as the prefix,
+/// while new keys use an *identity class*.
+fn is_old_format_key(key: &str) -> bool {
+    let parts: Vec<&str> = key.splitn(2, ':').collect();
+    if parts.len() != 2 {
+        return false;
+    }
+    let prefix = parts[0];
+    // Old-format prefixes are channel names; new-format prefixes are identity classes
+    // (owner, peer, guest). A bare "owner" key has no colon so won't reach here.
+    matches!(
+        prefix,
+        "discord" | "voice" | "chat" | "comms" | "tui" | "tui-chat" | "system" | "reflection"
+    )
+}
+
 /// Runtime session wrapper with tracking metadata.
 pub struct Session {
     pub data: SessionData,
@@ -475,7 +495,7 @@ impl Session {
     }
 }
 
-/// Manages multiple independent sessions keyed by `{channel}:{sender}`.
+/// Manages multiple independent sessions keyed by identity class.
 pub struct SessionStore {
     sessions: RwLock<HashMap<String, std::sync::Arc<RwLock<Session>>>>,
     sessions_dir: PathBuf,
@@ -484,14 +504,45 @@ pub struct SessionStore {
     ttl_seconds: u64,
     max_sessions: usize,
     coordinator: Option<Arc<PersistCoordinator>>,
+    /// Owner config for session key migration.
+    owner: OwnerConfig,
+    /// Peer config for session key migration.
+    peers: HashMap<String, crate::config::PeerConfig>,
 }
 
 impl SessionStore {
-    /// Create a new SessionStore, loading any persisted sessions from disk.
+    /// Create a new SessionStore without identity context.
+    ///
+    /// This is a convenience constructor for tests and contexts where owner/peer
+    /// config is unavailable. Session key migration will resolve all senders as
+    /// guests. Use [`with_identity`] for production code.
+    #[allow(dead_code)]
     pub async fn new(
         root_dir: &Path,
         config: &crate::config::SessionConfig,
         entity_name: &str,
+    ) -> Self {
+        Self::with_identity(
+            root_dir,
+            config,
+            entity_name,
+            &OwnerConfig::default(),
+            &HashMap::new(),
+        )
+        .await
+    }
+
+    /// Create a SessionStore with identity context for key migration.
+    ///
+    /// The `owner` and `peers` parameters are used for migrating old-format
+    /// session keys (`channel:sender`) to identity-based keys (`owner`,
+    /// `peer:Name`, `guest:sender`).
+    pub async fn with_identity(
+        root_dir: &Path,
+        config: &crate::config::SessionConfig,
+        entity_name: &str,
+        owner: &OwnerConfig,
+        peers: &HashMap<String, crate::config::PeerConfig>,
     ) -> Self {
         let sessions_dir = root_dir.join("sessions");
         if let Err(e) = fs::create_dir_all(&sessions_dir) {
@@ -506,6 +557,8 @@ impl SessionStore {
             ttl_seconds: config.ttl_seconds,
             max_sessions: config.max_sessions,
             coordinator: None,
+            owner: owner.clone(),
+            peers: peers.clone(),
         };
 
         // Load persisted sessions
@@ -518,6 +571,8 @@ impl SessionStore {
 
     /// Load sessions from the sessions/ directory.
     /// Expired sessions are archived before being removed from disk.
+    /// Old-format session keys (`channel:sender`) are migrated to identity-based
+    /// keys (`owner`, `peer:Name`, `guest:sender`) on first load.
     async fn load_persisted(&self) {
         let entries = match fs::read_dir(&self.sessions_dir) {
             Ok(e) => e,
@@ -525,6 +580,7 @@ impl SessionStore {
         };
 
         let mut loaded = 0u32;
+        let mut migrated = 0u32;
         for entry in entries.flatten() {
             let path = entry.path();
             if path.extension().and_then(|e| e.to_str()) != Some("json") {
@@ -533,10 +589,40 @@ impl SessionStore {
 
             match fs::read_to_string(&path) {
                 Ok(content) => match serde_json::from_str::<SessionData>(&content) {
-                    Ok(data) => {
+                    Ok(mut data) => {
+                        // Migrate old-format keys (channel:sender -> identity class)
+                        let was_migrated = if is_old_format_key(&data.key) {
+                            let new_key = resolve_sender(
+                                &data.channel,
+                                Some(&data.sender),
+                                &self.owner,
+                                &self.peers,
+                            );
+                            tracing::info!(
+                                "Migrating session key '{}' -> '{}' (file: {})",
+                                data.key,
+                                new_key,
+                                path.display(),
+                            );
+                            data.key = new_key;
+                            migrated += 1;
+
+                            // Remove old file — will be persisted with new key
+                            if let Err(e) = fs::remove_file(&path) {
+                                tracing::warn!(
+                                    "Failed to remove old session file {}: {}",
+                                    path.display(),
+                                    e
+                                );
+                            }
+                            true
+                        } else {
+                            false
+                        };
+
                         let session = Session {
                             data: data.clone(),
-                            dirty: false,
+                            dirty: was_migrated,
                         };
 
                         // Archive and remove expired sessions
@@ -555,20 +641,32 @@ impl SessionStore {
                                 );
                             }
 
-                            // Clean up the file
-                            if let Err(e) = fs::remove_file(&path) {
-                                tracing::warn!(
-                                    "Failed to remove expired session file {}: {}",
-                                    path.display(),
-                                    e
-                                );
-                            }
+                            // Clean up the file (if not already removed by migration)
+                            let _ = fs::remove_file(&path);
                             continue;
                         }
 
                         let key = data.key.clone();
                         let mut sessions = self.sessions.write().await;
-                        sessions.insert(key.clone(), std::sync::Arc::new(RwLock::new(session)));
+
+                        // If a session already exists for the new key (e.g., from merging
+                        // discord:owner + voice:owner -> owner), merge messages
+                        if let Some(existing_arc) = sessions.get(&key) {
+                            let mut existing = existing_arc.write().await;
+                            let mut merged = existing.data.messages.clone();
+                            merged.extend(data.messages);
+                            existing.data.messages = merged;
+                            existing.data.message_count = existing
+                                .data
+                                .message_count
+                                .max(existing.data.messages.len());
+                            existing.data.last_active =
+                                existing.data.last_active.max(data.last_active);
+                            existing.mark_dirty();
+                            tracing::info!("Merged migrated session into existing key '{}'", key);
+                        } else {
+                            sessions.insert(key.clone(), std::sync::Arc::new(RwLock::new(session)));
+                        }
                         loaded += 1;
                     }
                     Err(e) => {
@@ -583,6 +681,12 @@ impl SessionStore {
 
         if loaded > 0 {
             tracing::info!("Loaded {} persisted session(s)", loaded);
+        }
+        if migrated > 0 {
+            tracing::info!(
+                "Migrated {} old-format session(s) to identity keys",
+                migrated
+            );
         }
     }
 
@@ -979,6 +1083,21 @@ impl SessionStore {
         snapshots
     }
 
+    /// Replace a session's messages and persist the change.
+    ///
+    /// Used by the TUI to sync its conversation back into the session store
+    /// after each completion. The session is marked dirty so it will be
+    /// flushed to disk on the next persist cycle.
+    pub async fn update_messages(&self, key: &str, messages: Vec<Message>) {
+        if let Some(session_arc) = self.get_existing_by_key(key).await {
+            let mut session = session_arc.write().await;
+            session.data.message_count = session.data.message_count.max(messages.len());
+            session.data.messages = messages;
+            session.data.last_active = Utc::now();
+            session.mark_dirty();
+        }
+    }
+
     /// Get the total number of active sessions.
     pub async fn count(&self) -> usize {
         self.sessions.read().await.len()
@@ -1270,5 +1389,87 @@ mod tests {
         let back: RecentFile = serde_json::from_str(&json).unwrap();
         assert_eq!(back.path, file.path);
         assert_eq!(back.snippet, file.snippet);
+    }
+
+    // === Phase 3+4: Identity resolution and migration ===
+
+    #[test]
+    fn is_old_format_key_detects_channel_prefix() {
+        assert!(is_old_format_key("discord:h0ck3y"));
+        assert!(is_old_format_key("voice:+34646305937"));
+        assert!(is_old_format_key("chat:user123"));
+        assert!(is_old_format_key("comms:Nova"));
+        assert!(is_old_format_key("tui:local"));
+        assert!(is_old_format_key("tui-chat:local"));
+        assert!(is_old_format_key("system:cron"));
+        assert!(is_old_format_key("reflection:self"));
+    }
+
+    #[test]
+    fn is_old_format_key_rejects_new_format() {
+        assert!(!is_old_format_key("owner"));
+        assert!(!is_old_format_key("peer:Nova"));
+        assert!(!is_old_format_key("guest:someone"));
+    }
+
+    #[test]
+    fn resolve_sender_tui_is_always_owner() {
+        let owner = OwnerConfig::default();
+        let peers = std::collections::HashMap::new();
+        let key = resolve_sender("tui", None, &owner, &peers);
+        assert_eq!(key, "owner");
+    }
+
+    #[test]
+    fn resolve_sender_known_discord_id() {
+        let owner = OwnerConfig {
+            name: Some("Dani".into()),
+            discord_id: Some("693836830436753409".into()),
+            phone: None,
+        };
+        let peers = std::collections::HashMap::new();
+        let key = resolve_sender("discord", Some("693836830436753409"), &owner, &peers);
+        assert_eq!(key, "owner");
+    }
+
+    #[test]
+    fn resolve_sender_unknown_guest() {
+        let owner = OwnerConfig::default();
+        let peers = std::collections::HashMap::new();
+        let key = resolve_sender("discord", Some("stranger"), &owner, &peers);
+        assert_eq!(key, "guest:stranger");
+    }
+
+    #[tokio::test]
+    async fn update_messages_replaces_and_marks_dirty() {
+        let store = SessionStore::new(
+            std::path::Path::new("/tmp/pulse-test-update-msgs"),
+            &crate::config::SessionConfig::default(),
+            "test-entity",
+        )
+        .await;
+
+        // Create a session first
+        let session = store.get_or_create_by_key("owner", "tui", "D").await;
+        {
+            let s = session.read().await;
+            assert!(s.data.messages.is_empty());
+        }
+
+        // Update messages
+        let msgs = vec![Message {
+            role: Role::User,
+            content: MessageContent::Text("hello".into()),
+            source: Some(MessageSource::Human {
+                channel: "tui".into(),
+                sender: "owner".into(),
+            }),
+        }];
+        store.update_messages("owner", msgs).await;
+
+        // Verify
+        let s = session.read().await;
+        assert_eq!(s.data.messages.len(), 1);
+        assert!(s.dirty);
     }
 }

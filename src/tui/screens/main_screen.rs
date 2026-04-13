@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Modifier, Style};
@@ -6,6 +8,8 @@ use ratatui::widgets::{Block, BorderType, Paragraph};
 use ratatui::Frame;
 
 use super::{AppScreen, EntityState, Screen, ScreenAction};
+use crate::config::Config;
+use crate::session_store::{resolve_sender, SessionStore};
 use crate::tui::app::AppContext;
 use crate::tui::tabs::caliber::CaliberTab;
 use crate::tui::tabs::chat::{ChatAction, ChatTab};
@@ -52,6 +56,44 @@ impl MainScreen {
     pub fn with_multi_entity(mut self, multi: bool) -> Self {
         self.multi_entity = multi;
         self
+    }
+
+    /// Load the owner session from the session store into the chat tab.
+    ///
+    /// Resolves the TUI sender as "owner", retrieves or creates the session,
+    /// and populates the chat tab's conversation and display messages from it.
+    pub async fn load_session(&mut self, config: &Config, session_store: &Arc<SessionStore>) {
+        let owner_name = config
+            .owner
+            .name
+            .as_deref()
+            .unwrap_or(&config.entity.owner_alias);
+        let resolved_key = resolve_sender("tui", None, &config.owner, &config.peers);
+
+        let session_arc = session_store
+            .get_or_create_by_key(&resolved_key, "tui", owner_name)
+            .await;
+
+        let session = session_arc.read().await;
+        if !session.data.messages.is_empty() {
+            self.chat.conversation = session.data.messages.clone();
+            self.chat.messages = ChatTab::messages_to_chat_messages(&session.data.messages);
+            tracing::info!(
+                "TUI loaded {} messages from session '{}'",
+                session.data.messages.len(),
+                resolved_key,
+            );
+        }
+    }
+
+    /// Save the chat tab's conversation back into the session store.
+    pub async fn save_session(&self, session_store: &Arc<SessionStore>) {
+        if !self.chat.conversation.is_empty() {
+            session_store
+                .update_messages("owner", self.chat.conversation.clone())
+                .await;
+            session_store.persist("owner").await;
+        }
     }
 
     fn next_tab(&mut self) {
@@ -450,12 +492,26 @@ impl Screen for MainScreen {
 
     fn handle_tick(&mut self, ctx: &mut AppContext) {
         // Drain chat events
+        let was_busy = self.chat.state != EntityState::Idle;
         self.chat.drain_events();
+        let now_idle = self.chat.state == EntityState::Idle;
 
         // Pick up pending tokens
         if let Some((inp, out)) = self.chat.pending_tokens.take() {
             ctx.tokens_in += inp;
             ctx.tokens_out += out;
+        }
+
+        // Persist session on completion (transition from busy to idle)
+        if was_busy && now_idle {
+            if let Some(ref session_store) = ctx.session_store {
+                let store = Arc::clone(session_store);
+                let conversation = self.chat.conversation.clone();
+                tokio::spawn(async move {
+                    store.update_messages("owner", conversation).await;
+                    store.persist("owner").await;
+                });
+            }
         }
 
         // Tick all tabs (lazy loading on first tick)

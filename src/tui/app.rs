@@ -8,6 +8,7 @@ use crate::config::Config;
 use crate::events::EventBus;
 use crate::peer::PeerClient;
 use crate::registry::EntityRegistry;
+use crate::session_store::SessionStore;
 use crate::streaming::StreamingProvider;
 use crate::tools::ToolRegistry;
 
@@ -26,6 +27,9 @@ pub struct AppContext {
     pub tokens_in: u32,
     pub tokens_out: u32,
     pub session_start: Instant,
+
+    /// Session store for TUI conversation persistence.
+    pub session_store: Option<Arc<SessionStore>>,
 
     // Multi-entity state (used by comms tab for local peer auto-discovery)
     #[allow(dead_code)]
@@ -67,6 +71,7 @@ impl AppContext {
             system_prompt,
             peer_client,
             event_bus,
+            session_store: None,
             tokens_in: 0,
             tokens_out: 0,
             session_start: Instant::now(),
@@ -88,6 +93,7 @@ impl AppContext {
             system_prompt: None,
             peer_client: None,
             event_bus: None,
+            session_store: None,
             tokens_in: 0,
             tokens_out: 0,
             session_start: Instant::now(),
@@ -161,6 +167,7 @@ impl AppContext {
         self.system_prompt = None;
         self.peer_client = None;
         self.event_bus = None;
+        self.session_store = None;
         self.tokens_in = 0;
         self.tokens_out = 0;
     }

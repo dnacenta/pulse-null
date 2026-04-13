@@ -121,6 +121,38 @@ impl ChatTab {
         }
     }
 
+    /// Convert persisted `Message` history into display-ready `ChatMessage` list.
+    ///
+    /// Filters out tool-use and tool-result blocks, extracting only visible
+    /// text content from both user and assistant messages.
+    pub fn messages_to_chat_messages(messages: &[Message]) -> Vec<ChatMessage> {
+        messages
+            .iter()
+            .filter_map(|msg| {
+                let text = match &msg.content {
+                    MessageContent::Text(t) => t.clone(),
+                    MessageContent::Blocks(blocks) => blocks
+                        .iter()
+                        .filter_map(|b| match b {
+                            ContentBlock::Text { text } => Some(text.as_str()),
+                            _ => None,
+                        })
+                        .collect::<Vec<_>>()
+                        .join(""),
+                };
+                if text.is_empty() {
+                    return None;
+                }
+                let is_user = matches!(msg.role, Role::User)
+                    && matches!(
+                        &msg.source,
+                        Some(MessageSource::Human { .. }) | Some(MessageSource::System) | None
+                    );
+                Some(ChatMessage { is_user, text })
+            })
+            .collect()
+    }
+
     fn style_textarea(textarea: &mut TextArea<'static>, owner_alias: &str) {
         textarea.set_placeholder_text("...");
         textarea.set_placeholder_style(Style::default().fg(COLOR_DIM));
@@ -460,8 +492,8 @@ impl ChatTab {
             role: Role::User,
             content: MessageContent::Text(text),
             source: Some(MessageSource::Human {
-                channel: "tui-chat".into(),
-                sender: "local".into(),
+                channel: "tui".into(),
+                sender: "owner".into(),
             }),
         });
 

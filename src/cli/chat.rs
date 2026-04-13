@@ -3,6 +3,7 @@ use std::sync::Arc;
 use crate::config::Config;
 use crate::providers;
 use crate::server::prompt;
+use crate::session_store::SessionStore;
 use crate::tools::ToolRegistry;
 
 pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
@@ -14,6 +15,18 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
     // Build system prompt from identity documents
     let root_dir = config.root_dir()?;
     let system_prompt = prompt::build_system_prompt(&root_dir, &config, None, None)?;
+
+    // Initialize session store for TUI persistence (with identity for key migration)
+    let session_store = Arc::new(
+        SessionStore::with_identity(
+            &root_dir,
+            &config.sessions,
+            &config.entity.name,
+            &config.owner,
+            &config.peers,
+        )
+        .await,
+    );
 
     // Register tools
     let mut tools = ToolRegistry::new();
@@ -33,5 +46,13 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let tools = Arc::new(tools);
 
     // Enter v2 TUI (direct to chat, skip splash)
-    crate::tui::run_chat(&config, &root_dir, provider, tools, &system_prompt).await
+    crate::tui::run_chat(
+        &config,
+        &root_dir,
+        provider,
+        tools,
+        &system_prompt,
+        session_store,
+    )
+    .await
 }

@@ -20,6 +20,7 @@ use tokio_stream::StreamExt;
 
 use crate::config::Config;
 use crate::registry::EntityRegistry;
+use crate::session_store::SessionStore;
 use crate::streaming::StreamingProvider;
 use crate::tools::ToolRegistry;
 
@@ -30,8 +31,8 @@ use screens::welcome::WelcomeScreen;
 use screens::wizard::WizardScreen;
 use screens::{AppScreen, Screen, ScreenAction};
 
-/// Launch the full TUI application (splash screen → main workspace).
-/// Single-entity mode — unchanged from before.
+/// Launch the full TUI application (splash screen -> main workspace).
+/// Single-entity mode.
 pub async fn run(
     config: Option<&Config>,
     root_dir: Option<&Path>,
@@ -63,6 +64,23 @@ pub async fn run(
         original_hook(info);
     }));
 
+    // Create session store if config is available (with identity for key migration)
+    let session_store = if let (Some(cfg), Some(rd)) = (config, root_dir) {
+        let store = Arc::new(
+            SessionStore::with_identity(
+                rd,
+                &cfg.sessions,
+                &cfg.entity.name,
+                &cfg.owner,
+                &cfg.peers,
+            )
+            .await,
+        );
+        Some(store)
+    } else {
+        None
+    };
+
     let mut ctx = AppContext::new(
         config.cloned(),
         root_dir.map(|p| p.to_path_buf()),
@@ -71,6 +89,7 @@ pub async fn run(
         system_prompt.map(|s| s.to_string()),
         None,
     );
+    ctx.session_store = session_store.clone();
 
     let entity_available = config.is_some();
     let entity_name = config.map(|c| c.entity.name.as_str());
@@ -135,7 +154,11 @@ pub async fn run(
                             if screen == AppScreen::Main && main_screen.is_none() {
                                 let name = entity_name.unwrap_or("entity");
                                 let alias = owner_alias.unwrap_or("you");
-                                main_screen = Some(MainScreen::new(name, alias));
+                                let mut main = MainScreen::new(name, alias);
+                                if let (Some(cfg), Some(ref store)) = (config, &session_store) {
+                                    main.load_session(cfg, store).await;
+                                }
+                                main_screen = Some(main);
                             }
                             current_screen = screen;
                         }
@@ -187,16 +210,22 @@ pub async fn run(
     )?;
     let _ = std::panic::take_hook();
 
-    // Archive session
+    // Persist session store and archive session
     if let (Some(rd), Some(cfg)) = (root_dir, config) {
         if let Some(ref main) = main_screen {
+            // Save conversation to session store before archiving
+            if let Some(ref store) = session_store {
+                main.save_session(store).await;
+                store.persist_all().await;
+            }
+
             if let Some(archive_path) = crate::session::end_session(
                 rd,
                 &cfg.entity.name,
                 &main.chat.conversation,
-                "tui-v2",
+                "tui",
                 "session-end",
-                None,
+                Some("owner"),
             ) {
                 if cfg.graph.enabled && cfg.graph.auto_ingest {
                     let root = rd.to_path_buf();
@@ -344,10 +373,24 @@ pub async fn run_multi(
                                 // Inject local peers from registry
                                 inject_local_peers(&ctx, &registry, &name).await;
 
-                                main_screen = Some(
-                                    MainScreen::new(&config.entity.name, &config.entity.owner_alias)
-                                        .with_multi_entity(true),
+                                // Create session store for this entity (with identity for key migration)
+                                let store = Arc::new(
+                                    SessionStore::with_identity(
+                                        &info.dir,
+                                        &config.sessions,
+                                        &config.entity.name,
+                                        &config.owner,
+                                        &config.peers,
+                                    )
+                                    .await,
                                 );
+                                ctx.session_store = Some(Arc::clone(&store));
+
+                                let mut main =
+                                    MainScreen::new(&config.entity.name, &config.entity.owner_alias)
+                                        .with_multi_entity(true);
+                                main.load_session(&config, &store).await;
+                                main_screen = Some(main);
                                 current_screen = AppScreen::Main;
                             }
                         }
@@ -355,6 +398,13 @@ pub async fn run_multi(
                         ScreenAction::SwitchTo(screen) => {
                             match screen {
                                 AppScreen::Welcome => {
+                                    // Save session store before archiving
+                                    if let (Some(ref store), Some(ref main)) =
+                                        (&ctx.session_store, &main_screen)
+                                    {
+                                        main.save_session(store).await;
+                                        store.persist_all().await;
+                                    }
                                     // Returning from MainScreen — archive session first
                                     archive_current_session(&ctx, &main_screen);
                                     ctx.unload_entity();
@@ -377,12 +427,17 @@ pub async fn run_multi(
                                                 created_dir,
                                                 &mut ctx,
                                                 &mut main_screen,
-                                            ).await {
+                                            )
+                                            .await
+                                            {
                                                 Ok(_) => {
                                                     current_screen = AppScreen::Main;
                                                 }
                                                 Err(e) => {
-                                                    tracing::error!("Failed to boot new entity: {}", e);
+                                                    tracing::error!(
+                                                        "Failed to boot new entity: {}",
+                                                        e
+                                                    );
                                                     let entities = registry.read().await.list();
                                                     welcome.update_entities(entities);
                                                     current_screen = AppScreen::Welcome;
@@ -444,6 +499,12 @@ pub async fn run_multi(
     )?;
     let _ = std::panic::take_hook();
 
+    // Save session store before archiving
+    if let (Some(ref store), Some(ref main)) = (&ctx.session_store, &main_screen) {
+        main.save_session(store).await;
+        store.persist_all().await;
+    }
+
     // Archive current entity session if active
     archive_current_session(&ctx, &main_screen);
 
@@ -458,9 +519,9 @@ fn archive_current_session(ctx: &AppContext, main_screen: &Option<MainScreen>) {
             rd,
             &cfg.entity.name,
             &main.chat.conversation,
-            "tui-v2",
+            "tui",
             "entity-switch",
-            None,
+            Some("owner"),
         ) {
             if cfg.graph.enabled && cfg.graph.auto_ingest {
                 let root = rd.to_path_buf();
@@ -553,6 +614,7 @@ pub async fn run_chat(
     provider: Arc<dyn StreamingProvider>,
     tools: Arc<ToolRegistry>,
     system_prompt: &str,
+    session_store: Arc<SessionStore>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     terminal::enable_raw_mode()?;
     let mut stdout = io::stdout();
@@ -587,8 +649,12 @@ pub async fn run_chat(
         Some(system_prompt.to_string()),
         Some(Arc::clone(&event_bus)),
     );
+    ctx.session_store = Some(Arc::clone(&session_store));
 
+    // Load session and initialize chat with persisted conversation
     let mut main = MainScreen::new(&config.entity.name, &config.entity.owner_alias);
+    main.load_session(config, &session_store).await;
+
     let mut events = event::EventStream::new();
     let mut tick = tokio::time::interval(Duration::from_millis(100));
 
@@ -622,13 +688,17 @@ pub async fn run_chat(
     )?;
     let _ = std::panic::take_hook();
 
+    // Persist session store before archiving
+    main.save_session(&session_store).await;
+    session_store.persist_all().await;
+
     if let Some(archive_path) = crate::session::end_session(
         root_dir,
         &config.entity.name,
         &main.chat.conversation,
-        "tui-v2",
+        "tui",
         "session-end",
-        None,
+        Some("owner"),
     ) {
         if config.graph.enabled && config.graph.auto_ingest {
             let root = root_dir.to_path_buf();
