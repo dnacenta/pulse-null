@@ -30,6 +30,14 @@ struct CaliberLoadResult {
     today_outcomes: Vec<OutcomeRecord>,
 }
 
+// ─── View mode ───
+
+#[derive(Clone, PartialEq)]
+enum CaliberView {
+    Overview,
+    Detail { domain: String },
+}
+
 // ─── Caliber Tab ───
 
 pub struct CaliberTab {
@@ -38,6 +46,8 @@ pub struct CaliberTab {
     today_outcomes: Vec<OutcomeRecord>,
     loaded: bool,
     scroll_offset: usize,
+    selected_domain: usize,
+    view: CaliberView,
     pending_load: Option<mpsc::Receiver<CaliberLoadResult>>,
     last_refresh: std::time::Instant,
 }
@@ -53,6 +63,8 @@ impl CaliberTab {
             today_outcomes: Vec::new(),
             loaded: false,
             scroll_offset: 0,
+            selected_domain: 0,
+            view: CaliberView::Overview,
             pending_load: None,
             last_refresh: std::time::Instant::now()
                 - std::time::Duration::from_secs(REFRESH_INTERVAL_SECS + 1),
@@ -154,17 +166,23 @@ impl TabView for CaliberTab {
             return;
         }
 
-        // Layout: Capability Map (40%), Today (20%), Recent Outcomes (40%)
-        let chunks = Layout::vertical([
-            Constraint::Percentage(40),
-            Constraint::Percentage(20),
-            Constraint::Percentage(40),
-        ])
-        .split(area);
+        match &self.view {
+            CaliberView::Overview => {
+                let chunks = Layout::vertical([
+                    Constraint::Percentage(40),
+                    Constraint::Percentage(20),
+                    Constraint::Percentage(40),
+                ])
+                .split(area);
 
-        self.render_capability_map(frame, chunks[0]);
-        self.render_today_summary(frame, chunks[1]);
-        self.render_recent_outcomes(frame, chunks[2]);
+                self.render_capability_map(frame, chunks[0]);
+                self.render_today_summary(frame, chunks[1]);
+                self.render_recent_outcomes(frame, chunks[2]);
+            }
+            CaliberView::Detail { domain } => {
+                self.render_detail_view(frame, area, domain);
+            }
+        }
     }
 
     fn handle_key(&mut self, key: KeyEvent, ctx: &mut AppContext) -> ScreenAction {
@@ -176,8 +194,60 @@ impl TabView for CaliberTab {
                     }
                 }
             }
-            KeyCode::Char('j') | KeyCode::Down => self.scroll_down(1),
-            KeyCode::Char('k') | KeyCode::Up => self.scroll_up(1),
+            KeyCode::Char('j') | KeyCode::Down => {
+                if self.view == CaliberView::Overview {
+                    let cap_count = self
+                        .caliber_doc
+                        .as_ref()
+                        .map(|d| d.capabilities.len())
+                        .unwrap_or(0);
+                    if cap_count > 0 && self.selected_domain < cap_count - 1 {
+                        self.selected_domain += 1;
+                    }
+                } else {
+                    self.scroll_down(1);
+                }
+            }
+            KeyCode::Char('k') | KeyCode::Up => {
+                if self.view == CaliberView::Overview {
+                    self.selected_domain = self.selected_domain.saturating_sub(1);
+                } else {
+                    self.scroll_up(1);
+                }
+            }
+            KeyCode::Enter | KeyCode::Char('d') => {
+                if self.view == CaliberView::Overview {
+                    if let Some(ref doc) = self.caliber_doc {
+                        if let Some(cap) = doc.capabilities.get(self.selected_domain) {
+                            self.view = CaliberView::Detail {
+                                domain: cap.domain.clone(),
+                            };
+                            self.scroll_offset = 0;
+                        }
+                    }
+                }
+            }
+            KeyCode::Esc => {
+                if self.view != CaliberView::Overview {
+                    self.view = CaliberView::Overview;
+                    self.scroll_offset = 0;
+                }
+            }
+            KeyCode::Char('v') => {
+                if self.view == CaliberView::Overview {
+                    if let Some(ref doc) = self.caliber_doc {
+                        if let Some(cap) = doc.capabilities.get(self.selected_domain) {
+                            self.view = CaliberView::Detail {
+                                domain: cap.domain.clone(),
+                            };
+                            self.scroll_offset = 0;
+                        }
+                    }
+                } else {
+                    self.view = CaliberView::Overview;
+                    self.scroll_offset = 0;
+                }
+            }
             _ => {}
         }
         ScreenAction::None
@@ -233,9 +303,14 @@ impl CaliberTab {
             let rows: Vec<Row> = doc
                 .capabilities
                 .iter()
-                .map(|cap| {
+                .enumerate()
+                .map(|(i, cap)| {
                     let color = score_color(cap.confidence);
                     let bar = score_bar(cap.confidence, 15);
+                    let mut style = Style::default().fg(color);
+                    if i == self.selected_domain && self.view == CaliberView::Overview {
+                        style = style.bg(NORD1).add_modifier(Modifier::BOLD);
+                    }
                     Row::new(vec![
                         cap.domain.clone(),
                         format!("{:.2}", cap.confidence),
@@ -243,7 +318,7 @@ impl CaliberTab {
                         format!("{}", cap.sample_count),
                         cap.last_calibrated.clone(),
                     ])
-                    .style(Style::default().fg(color))
+                    .style(style)
                 })
                 .collect();
 
@@ -391,9 +466,133 @@ impl CaliberTab {
 
         frame.render_widget(table, inner);
     }
+
+    fn render_detail_view(&self, frame: &mut Frame, area: Rect, domain: &str) {
+        let block = Block::bordered()
+            .title(Line::from(vec![
+                Span::styled(
+                    format!(" {} ", domain),
+                    Style::default().fg(NORD8).add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(" Esc: back ", Style::default().fg(NORD4)),
+            ]))
+            .border_type(BorderType::Rounded)
+            .border_style(Style::default().fg(NORD3));
+
+        let inner = block.inner(area);
+        frame.render_widget(block, area);
+
+        let chunks = Layout::vertical([
+            Constraint::Length(5),
+            Constraint::Min(5),
+        ])
+        .split(inner);
+
+        // Score and success rates
+        let cap = self
+            .caliber_doc
+            .as_ref()
+            .and_then(|d| d.capabilities.iter().find(|c| c.domain == domain));
+
+        let domain_outcomes: Vec<&OutcomeRecord> = self
+            .outcomes
+            .iter()
+            .filter(|o| o.domain == domain)
+            .collect();
+
+        let total = domain_outcomes.len();
+        let successes = domain_outcomes
+            .iter()
+            .filter(|o| o.outcome == Outcome::Success)
+            .count();
+
+        let now = chrono::Utc::now();
+        let rate_7d = success_rate_for_days(&domain_outcomes, &now, 7);
+        let rate_30d = success_rate_for_days(&domain_outcomes, &now, 30);
+        let rate_all = if total == 0 {
+            "—".to_string()
+        } else {
+            format!("{:.0}%", successes as f64 / total as f64 * 100.0)
+        };
+
+        let score_line = if let Some(c) = cap {
+            format!("Score: {:.2}  |  Samples: {}", c.confidence, c.sample_count)
+        } else {
+            "Score: — (no CALIBER.md data)".to_string()
+        };
+
+        let stats_lines = vec![
+            Line::from(Span::styled(score_line, Style::default().fg(NORD8))),
+            Line::from(vec![
+                Span::styled("7d: ", Style::default().fg(NORD4)),
+                Span::styled(&rate_7d, Style::default().fg(NORD14)),
+                Span::styled("  30d: ", Style::default().fg(NORD4)),
+                Span::styled(&rate_30d, Style::default().fg(NORD14)),
+                Span::styled("  All: ", Style::default().fg(NORD4)),
+                Span::styled(&rate_all, Style::default().fg(NORD14)),
+                Span::styled(format!("  ({total} outcomes)"), Style::default().fg(NORD4)),
+            ]),
+        ];
+        frame.render_widget(Paragraph::new(stats_lines), chunks[0]);
+
+        // Recent outcomes in this domain
+        if domain_outcomes.is_empty() {
+            let msg = Paragraph::new("No outcomes in this domain yet.")
+                .style(Style::default().fg(NORD4));
+            frame.render_widget(msg, chunks[1]);
+            return;
+        }
+
+        let header = Row::new(vec!["Time", "Result", "Tokens", "Description"])
+            .style(Style::default().fg(NORD8).add_modifier(Modifier::BOLD));
+
+        let visible_count = chunks[1].height.saturating_sub(1) as usize;
+        let rows: Vec<Row> = domain_outcomes
+            .iter()
+            .rev()
+            .skip(self.scroll_offset)
+            .take(visible_count.max(1))
+            .map(|o| {
+                let time = o.timestamp.format("%m-%d %H:%M").to_string();
+                let (icon, color) = outcome_display(&o.outcome);
+                let desc = if o.description.len() > 40 {
+                    format!("{}...", &o.description[..37])
+                } else {
+                    o.description.clone()
+                };
+                Row::new(vec![time, icon.to_string(), format!("{}", o.tokens_used), desc])
+                    .style(Style::default().fg(color))
+            })
+            .collect();
+
+        let table = Table::new(
+            rows,
+            [
+                Constraint::Percentage(15),
+                Constraint::Percentage(15),
+                Constraint::Percentage(15),
+                Constraint::Percentage(55),
+            ],
+        )
+        .header(header);
+
+        frame.render_widget(table, chunks[1]);
+    }
 }
 
 // ─── Display helpers ───
+
+fn success_rate_for_days(outcomes: &[&OutcomeRecord], now: &chrono::DateTime<chrono::Utc>, days: i64) -> String {
+    let filtered: Vec<&&OutcomeRecord> = outcomes
+        .iter()
+        .filter(|o| (*now - o.timestamp).num_days() <= days)
+        .collect();
+    if filtered.is_empty() {
+        return "—".to_string();
+    }
+    let s = filtered.iter().filter(|o| o.outcome == Outcome::Success).count();
+    format!("{:.0}%", s as f64 / filtered.len() as f64 * 100.0)
+}
 
 fn score_color(score: f64) -> ratatui::style::Color {
     if score >= 0.8 {
