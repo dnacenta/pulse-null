@@ -192,9 +192,15 @@ pub async fn start(config: Config) -> Result<(), Box<dyn std::error::Error>> {
     // Create the persist coordinator (tracks fire-and-forget writes for graceful shutdown)
     let persist_coordinator = Arc::new(PersistCoordinator::new());
 
-    // Initialize session store (loads persisted sessions from disk)
-    let mut session_store =
-        SessionStore::new(&root_dir, &config.sessions, &config.entity.name).await;
+    // Initialize session store (loads persisted sessions from disk, with migration support)
+    let mut session_store = SessionStore::with_identity(
+        &root_dir,
+        &config.sessions,
+        &config.entity.name,
+        &config.owner,
+        &config.peers,
+    )
+    .await;
     session_store.set_coordinator(Arc::clone(&persist_coordinator));
     let loaded_count = session_store.count().await;
     if loaded_count > 0 {
