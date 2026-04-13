@@ -73,6 +73,20 @@ pub const DEFAULT_MAX_TOOL_ROUNDS: u32 = 25;
 /// Consecutive tool failures before injecting a degraded-state warning.
 pub const TOOL_FAILURE_THRESHOLD: u32 = 3;
 
+/// AE-1: Nudge when some tool calls failed in a round (mixed results).
+const EXPECTATION_VIOLATION_MIXED: &str = "\
+[Expectation check] Some of your tool calls succeeded and some failed. \
+Pause and reassess: is your current approach still valid? If a tool \
+returned an error, consider why — wrong path, wrong assumption, or \
+a genuine system issue? Adjust your next step based on what you learned.";
+
+/// AE-1: Nudge when all tool calls failed in a round (before degraded state).
+const EXPECTATION_VIOLATION_FAILED: &str = "\
+[Expectation check] Your tool calls failed this round. Before retrying, \
+stop and think: what did you expect to happen, and why didn't it? \
+Consider whether your assumption was wrong rather than just retrying \
+the same approach.";
+
 /// System message injected when tools are failing consecutively.
 pub const TOOL_DEGRADED_WARNING: &str = "\
 [SYSTEM — Tool Degraded State] \
@@ -291,6 +305,24 @@ pub async fn invoke_with_tool_loop(
                     // so the model sees it before generating its next response
                     tool_results.push(ContentBlock::Text {
                         text: TOOL_DEGRADED_WARNING.to_string(),
+                    });
+                }
+
+                // AE-1: Within-session expectation-violation feedback.
+                // When tool results contain errors or empty results, inject a
+                // metacognitive nudge so the entity adjusts its approach in
+                // real-time rather than continuing with a broken assumption.
+                if round_had_failure && round_had_success {
+                    // Mixed results — some tools worked, some didn't.
+                    // The entity should notice and adapt.
+                    tool_results.push(ContentBlock::Text {
+                        text: EXPECTATION_VIOLATION_MIXED.to_string(),
+                    });
+                } else if round_had_failure && !tool_degraded {
+                    // All tools failed but we haven't hit degraded state yet.
+                    // Nudge the entity to reconsider its approach.
+                    tool_results.push(ContentBlock::Text {
+                        text: EXPECTATION_VIOLATION_FAILED.to_string(),
                     });
                 }
 
