@@ -688,6 +688,20 @@ pub fn build_task_system_prompt(
         }
     }
 
+    // Metacognitive context — vigil health + calibration data for autonomous goal generation
+    let metacog = build_metacognitive_context(root_dir);
+    if !metacog.is_empty() {
+        parts.push(format!(
+            "<metacognitive-state>\n\
+            This is your current cognitive health assessment. Use this to guide your \
+            autonomous thinking. If you notice patterns — declining signals, calibration \
+            surprises, persistent weaknesses — consider generating goals to address them.\n\n\
+            {}\n\
+            </metacognitive-state>",
+            metacog
+        ));
+    }
+
     // Task isolation notice + autonomous hallucination guard (Layer 1b)
     parts.push(
         "<task-context>\n\
@@ -706,6 +720,70 @@ pub fn build_task_system_prompt(
     );
 
     Ok(parts.join("\n\n"))
+}
+
+/// Build metacognitive context for autonomous tasks — vigil health summary
+/// and calibration data so the entity can generate goals from self-knowledge.
+fn build_metacognitive_context(root_dir: &Path) -> String {
+    let mut sections = Vec::new();
+
+    // Vigil analysis (cognitive health)
+    let analysis_path = root_dir.join(".claude").join("vigil").join("analysis.json");
+    if let Ok(content) = std::fs::read_to_string(&analysis_path) {
+        if let Ok(analysis) = serde_json::from_str::<serde_json::Value>(&content) {
+            let alert = analysis
+                .get("alert_level")
+                .and_then(|v| v.as_str())
+                .unwrap_or("unknown");
+            let mut summary = format!("Cognitive health: {alert}");
+
+            if let Some(messages) = analysis.get("watch_messages").and_then(|v| v.as_array()) {
+                for msg in messages {
+                    if let Some(s) = msg.as_str() {
+                        summary.push_str(&format!("\n  - {s}"));
+                    }
+                }
+            }
+            sections.push(summary);
+        }
+    }
+
+    // Calibration data (metacognitive accuracy)
+    let calibration_path = root_dir.join(".claude").join("vigil").join("calibration.json");
+    if let Ok(content) = std::fs::read_to_string(&calibration_path) {
+        if let Ok(cal) = serde_json::from_str::<serde_json::Value>(&content) {
+            if let Some(records) = cal.get("records").and_then(|v| v.as_array()) {
+                if !records.is_empty() {
+                    let last = &records[records.len() - 1];
+                    let surprise = last
+                        .get("mean_surprise")
+                        .and_then(|v| v.as_f64())
+                        .unwrap_or(0.0);
+                    let label = if surprise < 0.1 {
+                        "well-calibrated"
+                    } else if surprise < 0.2 {
+                        "moderately calibrated"
+                    } else {
+                        "poorly calibrated — your self-model needs updating"
+                    };
+                    sections.push(format!(
+                        "Self-model calibration: mean surprise {surprise:.3} ({label}), {} records total",
+                        records.len()
+                    ));
+                }
+            }
+
+            if cal.get("pending_prediction").is_some()
+                && !cal["pending_prediction"].is_null()
+            {
+                sections.push(
+                    "You have a pending calibration prediction — it will be resolved on next signal collection.".to_string()
+                );
+            }
+        }
+    }
+
+    sections.join("\n")
 }
 
 /// Async version of [`build_task_system_prompt`] — runs blocking file I/O
