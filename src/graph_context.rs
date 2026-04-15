@@ -1,69 +1,59 @@
-//! Graph context injection — query the knowledge graph for entities relevant
-//! to the current conversation and format them for the system prompt.
+//! Graph context — cached stats for prompt awareness + future async retrieval.
+//!
+//! The prompt builder runs in a sync (spawn_blocking) context and cannot do async
+//! graph queries. Instead, we cache graph stats to a JSON file during the async
+//! boot sequence, then read the cached file synchronously in the prompt builder.
 
 use std::path::Path;
 
-/// Build a graph context block from the knowledge graph.
-///
-/// Queries the graph for entities semantically similar to `query_text`,
-/// formats top results, and caps at `max_tokens`.
-/// Returns `None` if the graph is unavailable or yields no results.
-pub fn build_context_block(
-    root_dir: &Path,
-    query_text: &str,
-    max_tokens: usize,
-    _config: &crate::config::GraphConfig,
-) -> Option<String> {
-    if query_text.trim().is_empty() {
+const STATS_CACHE_FILE: &str = "memory/graph/stats-cache.json";
+
+/// Cache graph stats to a JSON file. Called during async boot sequence.
+pub async fn cache_graph_stats(root_dir: &Path) {
+    let graph_dir = root_dir.join("memory").join("graph");
+
+    match recall_echo::graph::GraphMemory::open(&graph_dir).await {
+        Ok(gm) => match gm.stats().await {
+            Ok(stats) => {
+                let cache = serde_json::json!({
+                    "entity_count": stats.entity_count,
+                    "relationship_count": stats.relationship_count,
+                    "episode_count": stats.episode_count,
+                });
+                let cache_path = root_dir.join(STATS_CACHE_FILE);
+                if let Err(e) = std::fs::write(&cache_path, cache.to_string()) {
+                    tracing::warn!("Failed to cache graph stats: {e}");
+                }
+            }
+            Err(e) => tracing::warn!("Failed to query graph stats: {e}"),
+        },
+        Err(e) => tracing::warn!("Failed to open graph for stats cache: {e}"),
+    }
+}
+
+/// Read cached graph stats synchronously. Returns a formatted awareness hint
+/// for the system prompt, or None if stats aren't available.
+pub fn graph_awareness_hint(root_dir: &Path) -> Option<String> {
+    let cache_path = root_dir.join(STATS_CACHE_FILE);
+    let content = std::fs::read_to_string(&cache_path).ok()?;
+    let stats: serde_json::Value = serde_json::from_str(&content).ok()?;
+
+    let entities = stats["entity_count"].as_u64().unwrap_or(0);
+    let relationships = stats["relationship_count"].as_u64().unwrap_or(0);
+    let episodes = stats["episode_count"].as_u64().unwrap_or(0);
+
+    if entities == 0 && episodes == 0 {
         return None;
     }
 
-    let graph_dir = root_dir.join("memory").join("graph");
-
-    // Run the graph query in a blocking context
-    let rt = tokio::runtime::Runtime::new().ok()?;
-    let result = rt.block_on(async {
-        let gm = recall_echo::graph::GraphMemory::open(&graph_dir)
-            .await
-            .ok()?;
-
-        let results = gm.search(query_text, 5).await.ok()?;
-        if results.is_empty() {
-            return None;
-        }
-
-        let mut block = String::from("<graph-context>\nRelevant knowledge from your graph:\n\n");
-        let mut token_count = 15usize;
-
-        for sr in &results {
-            let e = &sr.entity;
-            let entry = format!(
-                "- **{}** ({}) [{:.0}%] — {}\n",
-                e.name,
-                e.entity_type,
-                sr.score * 100.0,
-                e.abstract_text,
-            );
-
-            let entry_tokens = entry.len() / 4;
-            if token_count + entry_tokens > max_tokens {
-                break;
-            }
-            block.push_str(&entry);
-            token_count += entry_tokens;
-        }
-
-        let shown = block.matches("- **").count();
-        let remaining = results.len().saturating_sub(shown);
-        if remaining > 0 {
-            block.push_str(&format!(
-                "\n[{remaining} more entities available via graph_query tool]\n"
-            ));
-        }
-
-        block.push_str("</graph-context>");
-        Some(block)
-    });
-
-    result
+    Some(format!(
+        "<graph-awareness>\n\
+        Your knowledge graph contains {entities} entities, {relationships} relationships, \
+        and {episodes} conversation episodes. Use the graph_query tool when:\n\
+        - You need to recall past conversations or decisions\n\
+        - You want relationships between people, projects, or concepts\n\
+        - You're looking for specific knowledge on a topic\n\
+        Available modes: search, entity, relationships, episodes, stats, pipeline\n\
+        </graph-awareness>"
+    ))
 }

@@ -442,31 +442,16 @@ pub fn build_system_prompt_budgeted(
         }
     }
 
-    // --- Tier 2 (Low): Graph Context ---
-    if config.graph.enabled && config.graph.context_injection {
-        let query_seed = format!(
-            "{} {}",
-            config.entity.name,
-            std::fs::read_to_string(root_dir.join("memory").join("EPHEMERAL.md"))
-                .unwrap_or_default()
-                .chars()
-                .take(500)
-                .collect::<String>()
-        );
-
-        if let Some(block) = crate::graph_context::build_context_block(
-            root_dir,
-            &query_seed,
-            config.graph.context_max_tokens,
-            &config.graph,
-        ) {
-            let tokens = estimate_tokens(&block);
+    // --- Tier 2 (Low): Graph Awareness ---
+    if config.graph.enabled {
+        if let Some(hint) = crate::graph_context::graph_awareness_hint(root_dir) {
+            let tokens = estimate_tokens(&hint);
             components.push(PromptComponent {
-                name: "graph-context",
-                content: block,
+                name: "graph-awareness",
+                content: hint,
                 tokens,
                 tier: PromptTier::Low,
-                cap: config.graph.context_max_tokens,
+                cap: 200,
             });
         }
     }
@@ -749,7 +734,10 @@ fn build_metacognitive_context(root_dir: &Path) -> String {
     }
 
     // Calibration data (metacognitive accuracy)
-    let calibration_path = root_dir.join(".claude").join("vigil").join("calibration.json");
+    let calibration_path = root_dir
+        .join(".claude")
+        .join("vigil")
+        .join("calibration.json");
     if let Ok(content) = std::fs::read_to_string(&calibration_path) {
         if let Ok(cal) = serde_json::from_str::<serde_json::Value>(&content) {
             if let Some(records) = cal.get("records").and_then(|v| v.as_array()) {
@@ -773,9 +761,7 @@ fn build_metacognitive_context(root_dir: &Path) -> String {
                 }
             }
 
-            if cal.get("pending_prediction").is_some()
-                && !cal["pending_prediction"].is_null()
-            {
+            if cal.get("pending_prediction").is_some() && !cal["pending_prediction"].is_null() {
                 sections.push(
                     "You have a pending calibration prediction — it will be resolved on next signal collection.".to_string()
                 );
@@ -877,7 +863,7 @@ fn build_capabilities(config: &Config) -> Vec<Capability> {
     if config.graph.enabled {
         capabilities.push(Capability {
             name: "Knowledge Graph".into(),
-            what: "Semantic knowledge graph backed by SurrealDB. Stores entities, relationships, and embeddings.".into(),
+            what: "Semantic knowledge graph with your accumulated knowledge. Check <graph-awareness> in your prompt for current stats.".into(),
             why: "Structured knowledge that memory files can't capture — relationships between concepts, people, and ideas with confidence scores.".into(),
             how: "Use the graph_query tool to search by semantic similarity or query relationships. Graph is populated automatically from conversation archives.".into(),
             constraints: Some("Bayesian confidence model on edges. Priors vary by extraction context. Multi-hop path confidence is the product of edge confidences.".into()),

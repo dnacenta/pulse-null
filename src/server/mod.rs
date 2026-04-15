@@ -139,6 +139,9 @@ pub async fn start(config: Config) -> Result<(), Box<dyn std::error::Error>> {
             tracing::error!("SurrealDB provisioning failed: {e}");
             return Err(e);
         }
+
+        // Cache graph stats for the prompt builder (which runs in sync context)
+        crate::graph_context::cache_graph_stats(&root_dir).await;
     }
 
     // Verify Claude Code integration if applicable
