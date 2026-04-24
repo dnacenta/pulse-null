@@ -456,6 +456,41 @@ pub fn build_system_prompt_budgeted(
         }
     }
 
+    // --- Tier 2 (Low): Prediction Context ---
+    {
+        let stack = crate::prediction::store::load(root_dir);
+        let importance = stack.accumulated_importance();
+        let recent = stack.recent_errors(5);
+        if !recent.is_empty() {
+            let mut block = format!(
+                "<prediction-context importance=\"{importance:.1}\">\nRecent prediction errors:\n"
+            );
+            for err in recent {
+                block.push_str(&format!(
+                    "- [{}] surprise {:.1}: {}\n",
+                    err.direction,
+                    err.surprise,
+                    err.insight.as_deref().unwrap_or("no insight recorded"),
+                ));
+            }
+            let pending_count = stack.predictions.iter().filter(|p| p.is_pending()).count();
+            if pending_count > 0 {
+                block.push_str(&format!(
+                    "{pending_count} predictions awaiting resolution\n"
+                ));
+            }
+            block.push_str("</prediction-context>");
+            let tokens = estimate_tokens(&block);
+            components.push(PromptComponent {
+                name: "prediction-context",
+                content: block,
+                tokens,
+                tier: PromptTier::Low,
+                cap: 300,
+            });
+        }
+    }
+
     // --- Budget enforcement ---
     let total_before: usize = components.iter().map(|c| c.tokens).sum();
     let mut was_trimmed = false;

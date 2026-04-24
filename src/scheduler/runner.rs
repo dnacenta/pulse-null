@@ -504,6 +504,28 @@ async fn execute_task(
         }
     }
 
+    // Post-execution: process prediction markers from task output
+    {
+        let mut stack = crate::prediction::store::load(&root_dir);
+        let new_errors = crate::prediction::resolve::process_task_output(
+            &mut stack,
+            &response_text,
+            &task.id,
+            crate::prediction::Timescale::Cycle,
+        );
+        if !new_errors.is_empty() {
+            tracing::info!(
+                "Prediction errors: {} new (accumulated importance: {:.2})",
+                new_errors.len(),
+                stack.accumulated_importance(),
+            );
+        }
+        stack.prune(100, 50);
+        if let Err(e) = crate::prediction::store::save(&root_dir, &stack) {
+            tracing::error!("Failed to save prediction stack: {e}");
+        }
+    }
+
     // Post-execution: extract cognitive signals and check for health changes
     if let Some(ref monitor) = state.cognitive_monitor {
         let window = state.config.monitoring.window_size;

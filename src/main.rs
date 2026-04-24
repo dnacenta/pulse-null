@@ -22,6 +22,7 @@ mod persist;
 mod pidfile;
 mod plugins;
 mod praxis;
+mod prediction;
 mod provider_status;
 mod providers;
 mod registry;
@@ -269,14 +270,35 @@ enum ArchiveAction {
 
 #[tokio::main]
 async fn main() {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "pulse_null=info".into()),
-        )
-        .init();
-
     let cli = Cli::parse();
+
+    let env_filter = tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| "pulse_null=info".into());
+
+    // Interactive TUI commands must not share stdout with tracing output —
+    // log lines would overwrite the rendered screen. Redirect to a log file.
+    let interactive_tui = matches!(
+        &cli.command,
+        Commands::Up { headless: false } | Commands::Chat
+    );
+
+    if interactive_tui {
+        let log_path = std::env::temp_dir().join(format!("pulse-null-{}.log", std::process::id()));
+        match std::fs::File::create(&log_path) {
+            Ok(file) => {
+                tracing_subscriber::fmt()
+                    .with_env_filter(env_filter)
+                    .with_writer(std::sync::Mutex::new(file))
+                    .with_ansi(false)
+                    .init();
+            }
+            Err(_) => {
+                tracing_subscriber::fmt().with_env_filter(env_filter).init();
+            }
+        }
+    } else {
+        tracing_subscriber::fmt().with_env_filter(env_filter).init();
+    }
 
     match cli.command {
         Commands::Init { dir } => {
