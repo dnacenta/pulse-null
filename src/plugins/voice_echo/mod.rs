@@ -8,6 +8,7 @@ use super::{Plugin, PluginContext, PluginHealth, PluginMeta, PluginResult, Setup
 /// Adapter wrapping the voice-echo crate's `VoiceEcho` struct.
 pub struct VoiceEchoPlugin {
     inner: Option<voice_echo::VoiceEcho>,
+    task: Option<tokio::task::JoinHandle<()>>,
     started: bool,
 }
 
@@ -15,6 +16,7 @@ impl VoiceEchoPlugin {
     pub fn new() -> Self {
         Self {
             inner: None,
+            task: None,
             started: false,
         }
     }
@@ -48,13 +50,13 @@ impl Plugin for VoiceEchoPlugin {
 
     fn start(&mut self) -> PluginResult<'_> {
         Box::pin(async move {
-            let inner = self.inner.as_mut().ok_or("voice-echo: not initialized")?;
-            inner
-                .start()
-                .await
-                .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> {
-                    format!("voice-echo start failed: {e}").into()
-                })?;
+            let mut inner = self.inner.take().ok_or("voice-echo: not initialized")?;
+            let handle = tokio::spawn(async move {
+                if let Err(e) = inner.start().await {
+                    tracing::error!("voice-echo server exited with error: {e}");
+                }
+            });
+            self.task = Some(handle);
             self.started = true;
             Ok(())
         })
@@ -62,15 +64,10 @@ impl Plugin for VoiceEchoPlugin {
 
     fn stop(&mut self) -> PluginResult<'_> {
         Box::pin(async move {
-            if let Some(inner) = self.inner.as_mut() {
-                inner
-                    .stop()
-                    .await
-                    .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> {
-                        format!("voice-echo stop failed: {e}").into()
-                    })?;
-                self.started = false;
+            if let Some(task) = self.task.take() {
+                task.abort();
             }
+            self.started = false;
             Ok(())
         })
     }
