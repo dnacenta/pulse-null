@@ -482,11 +482,7 @@ impl CaliberTab {
         let inner = block.inner(area);
         frame.render_widget(block, area);
 
-        let chunks = Layout::vertical([
-            Constraint::Length(5),
-            Constraint::Min(5),
-        ])
-        .split(inner);
+        let chunks = Layout::vertical([Constraint::Length(5), Constraint::Min(5)]).split(inner);
 
         // Score and success rates
         let cap = self
@@ -537,8 +533,8 @@ impl CaliberTab {
 
         // Recent outcomes in this domain
         if domain_outcomes.is_empty() {
-            let msg = Paragraph::new("No outcomes in this domain yet.")
-                .style(Style::default().fg(NORD4));
+            let msg =
+                Paragraph::new("No outcomes in this domain yet.").style(Style::default().fg(NORD4));
             frame.render_widget(msg, chunks[1]);
             return;
         }
@@ -560,8 +556,13 @@ impl CaliberTab {
                 } else {
                     o.description.clone()
                 };
-                Row::new(vec![time, icon.to_string(), format!("{}", o.tokens_used), desc])
-                    .style(Style::default().fg(color))
+                Row::new(vec![
+                    time,
+                    icon.to_string(),
+                    format!("{}", o.tokens_used),
+                    desc,
+                ])
+                .style(Style::default().fg(color))
             })
             .collect();
 
@@ -582,7 +583,11 @@ impl CaliberTab {
 
 // ─── Display helpers ───
 
-fn success_rate_for_days(outcomes: &[&OutcomeRecord], now: &chrono::DateTime<chrono::Utc>, days: i64) -> String {
+fn success_rate_for_days(
+    outcomes: &[&OutcomeRecord],
+    now: &chrono::DateTime<chrono::Utc>,
+    days: i64,
+) -> String {
     let filtered: Vec<&&OutcomeRecord> = outcomes
         .iter()
         .filter(|o| (*now - o.timestamp).num_days() <= days)
@@ -590,7 +595,10 @@ fn success_rate_for_days(outcomes: &[&OutcomeRecord], now: &chrono::DateTime<chr
     if filtered.is_empty() {
         return "—".to_string();
     }
-    let s = filtered.iter().filter(|o| o.outcome == Outcome::Success).count();
+    let s = filtered
+        .iter()
+        .filter(|o| o.outcome == Outcome::Success)
+        .count();
     format!("{:.0}%", s as f64 / filtered.len() as f64 * 100.0)
 }
 
