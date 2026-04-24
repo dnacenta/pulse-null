@@ -13,19 +13,19 @@ use crate::tui::app::AppContext;
 use crate::tui::theme::*;
 
 const TITLE: [&str; 13] = [
-    "██████╗ ██╗   ██╗██╗     ███████╗███████╗",
-    "██╔══██╗██║   ██║██║     ██╔════╝██╔════╝",
-    "██████╔╝██║   ██║██║     ███████╗█████╗  ",
-    "██╔═══╝ ██║   ██║██║     ╚════██║██╔══╝  ",
-    "██║     ╚██████╔╝███████╗███████║███████╗",
-    "╚═╝      ╚═════╝ ╚══════╝╚══════╝╚══════╝",
+    "██████╗ ██╗   ██╗██╗     ███████╗███████╗ ",
+    "██╔══██╗██║   ██║██║     ██╔════╝██╔════╝ ",
+    "██████╔╝██║   ██║██║     ███████╗█████╗   ",
+    "██╔═══╝ ██║   ██║██║     ╚════██║██╔══╝   ",
+    "██║     ╚██████╔╝███████╗███████║███████╗ ",
+    "╚═╝      ╚═════╝ ╚══════╝╚══════╝╚══════╝ ",
     "                                          ",
-    "  ███╗   ██╗██╗   ██╗██╗     ██╗          ",
-    "  ████╗  ██║██║   ██║██║     ██║          ",
-    "  ██╔██╗ ██║██║   ██║██║     ██║          ",
-    "  ██║╚██╗██║██║   ██║██║     ██║          ",
-    "  ██║ ╚████║╚██████╔╝███████╗███████╗    ",
-    "  ╚═╝  ╚═══╝ ╚═════╝ ╚══════╝╚══════╝    ",
+    "   ███╗   ██╗██╗   ██╗██╗     ██╗         ",
+    "   ████╗  ██║██║   ██║██║     ██║         ",
+    "   ██╔██╗ ██║██║   ██║██║     ██║         ",
+    "   ██║╚██╗██║██║   ██║██║     ██║         ",
+    "   ██║ ╚████║╚██████╔╝███████╗███████╗    ",
+    "   ╚═╝  ╚═══╝ ╚═════╝ ╚══════╝╚══════╝    ",
 ];
 const TITLE_WIDTH: u16 = 42;
 
@@ -122,7 +122,7 @@ impl Screen for WelcomeScreen {
             Constraint::Length(TITLE.len() as u16), // logo
             Constraint::Length(1),                  // spacer
             Constraint::Length(3),                  // aurora
-            Constraint::Length(2),                  // spacer + "Your entities:" label
+            Constraint::Length(1),                  // spacer
             Constraint::Length(menu_height as u16), // entity list + actions
             Constraint::Min(0),                     // flex
             Constraint::Length(1),                  // version
@@ -198,20 +198,13 @@ impl Screen for WelcomeScreen {
             frame.render_widget(canvas, chunks[3]);
         }
 
-        // ─── Section label ───
-        let label = Paragraph::new(Line::styled(
-            "  Your entities:",
-            Style::default().fg(COLOR_DIM),
-        ));
-        frame.render_widget(label, chunks[4]);
-
         // ─── Entity list + actions ───
         let mut menu_lines: Vec<Line> = Vec::new();
         let entity_count = self.entities.len();
 
         if self.entities.is_empty() {
             menu_lines.push(Line::styled(
-                "  No entities found. Create one below.",
+                "No entities found. Create one below.",
                 Style::default().fg(COLOR_DIM),
             ));
         } else {
@@ -226,7 +219,7 @@ impl Screen for WelcomeScreen {
                 let port_style = Style::default().fg(COLOR_DIM);
 
                 menu_lines.push(Line::from(vec![
-                    Span::styled(format!("  {} ", marker), style),
+                    Span::styled(format!("{} ", marker), style),
                     Span::styled(format!("{:<16}", entity.name), style),
                     Span::styled("\u{25cf} ", Style::default().fg(NORD14)),
                     Span::styled(format!(":{}", entity.port), port_style),
@@ -247,7 +240,7 @@ impl Screen for WelcomeScreen {
         };
         let new_marker = if is_new_selected { "\u{25b8}" } else { " " };
         menu_lines.push(Line::styled(
-            format!("  {} New Entity", new_marker),
+            format!("{} New Entity", new_marker),
             new_style,
         ));
 
@@ -260,10 +253,19 @@ impl Screen for WelcomeScreen {
             Style::default().fg(COLOR_TEXT)
         };
         let quit_marker = if is_quit_selected { "\u{25b8}" } else { " " };
-        menu_lines.push(Line::styled(format!("  {} Quit", quit_marker), quit_style));
+        menu_lines.push(Line::styled(format!("{} Quit", quit_marker), quit_style));
 
+        // Center the whole menu block: left-align lines inside a centered column
+        // whose width equals the widest line. This keeps markers column-aligned.
+        let menu_width = menu_lines.iter().map(|l| l.width()).max().unwrap_or(0) as u16;
+        let menu_area = Layout::horizontal([
+            Constraint::Fill(1),
+            Constraint::Length(menu_width),
+            Constraint::Fill(1),
+        ])
+        .split(chunks[5]);
         let menu = Paragraph::new(menu_lines);
-        frame.render_widget(menu, chunks[5]);
+        frame.render_widget(menu, menu_area[1]);
 
         // ─── Version ───
         let version = env!("CARGO_PKG_VERSION");
