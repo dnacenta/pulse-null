@@ -5,13 +5,16 @@ use std::path::PathBuf;
 use super::{Tool, ToolError, ToolResult};
 
 pub struct GraphQueryTool {
+    entity_root: PathBuf,
     graph_dir: PathBuf,
 }
 
 impl GraphQueryTool {
     pub fn new(entity_root: PathBuf) -> Self {
+        let graph_dir = entity_root.join("memory").join("graph");
         Self {
-            graph_dir: entity_root.join("memory").join("graph"),
+            entity_root,
+            graph_dir,
         }
     }
 }
@@ -52,6 +55,11 @@ impl Tool for GraphQueryTool {
 
     fn execute(&self, input: serde_json::Value) -> ToolResult<'_> {
         let graph_dir = self.graph_dir.clone();
+        let entity_root = self.entity_root.clone();
+        // Capture correlation_id from task-local before crossing the
+        // spawn_blocking boundary (task-locals don't propagate through
+        // the nested runtime). See utility-feedback-loop-spec.md.
+        let correlation_id = crate::task_context::current();
 
         Box::pin(async move {
             let mode = input["mode"]
@@ -96,7 +104,16 @@ impl Tool for GraphQueryTool {
             .await;
 
             match result {
-                Ok(Ok(output)) => Ok(output),
+                Ok(Ok((output, retrieved_ids))) => {
+                    // Emit retrieval manifest for the utility feedback loop.
+                    // Best-effort, no-op for non-retrieval modes (empty ids).
+                    crate::graph_feedback::emit_manifest(
+                        &entity_root,
+                        correlation_id.as_deref(),
+                        &retrieved_ids,
+                    );
+                    Ok(output)
+                }
                 Ok(Err(e)) => Err(ToolError::ExecutionFailed(e)),
                 Err(e) => Err(ToolError::ExecutionFailed(format!("Task panicked: {}", e))),
             }
@@ -107,10 +124,18 @@ impl Tool for GraphQueryTool {
 // ---------------------------------------------------------------------------
 // Mode implementations
 // ---------------------------------------------------------------------------
+// Each helper returns (formatted_output, retrieved_entity_ids). The IDs are
+// fed to graph_feedback::emit_manifest for the utility feedback loop. Modes
+// that don't surface retrievable entities (stats, pipeline, relationships)
+// return an empty Vec.
 
 use recall_echo::graph::GraphMemory;
 
-async fn execute_search(gm: &GraphMemory, query: &str, limit: usize) -> Result<String, String> {
+async fn execute_search(
+    gm: &GraphMemory,
+    query: &str,
+    limit: usize,
+) -> Result<(String, Vec<String>), String> {
     if query.is_empty() {
         return Err("'query' is required for search mode".into());
     }
@@ -121,8 +146,10 @@ async fn execute_search(gm: &GraphMemory, query: &str, limit: usize) -> Result<S
         .map_err(|e| format!("Search failed: {}", e))?;
 
     if results.is_empty() {
-        return Ok(format!("No results found for: {}", query));
+        return Ok((format!("No results found for: {}", query), Vec::new()));
     }
+
+    let retrieved_ids: Vec<String> = results.iter().map(|r| r.entity.id_string()).collect();
 
     let mut output = format!("Found {} result(s) for \"{}\":\n\n", results.len(), query);
     for (i, r) in results.iter().enumerate() {
@@ -135,10 +162,13 @@ async fn execute_search(gm: &GraphMemory, query: &str, limit: usize) -> Result<S
             r.score,
         ));
     }
-    Ok(output)
+    Ok((output, retrieved_ids))
 }
 
-async fn execute_entity_lookup(gm: &GraphMemory, name: &str) -> Result<String, String> {
+async fn execute_entity_lookup(
+    gm: &GraphMemory,
+    name: &str,
+) -> Result<(String, Vec<String>), String> {
     if name.is_empty() {
         return Err("'query' (entity name) is required for entity mode".into());
     }
@@ -150,6 +180,7 @@ async fn execute_entity_lookup(gm: &GraphMemory, name: &str) -> Result<String, S
 
     match entity {
         Some(e) => {
+            let retrieved_ids = vec![e.id_string()];
             let mut output = format!(
                 "**{}** ({})\n\nAbstract: {}\n\nOverview: {}\n",
                 e.name, e.entity_type, e.abstract_text, e.overview,
@@ -168,13 +199,16 @@ async fn execute_entity_lookup(gm: &GraphMemory, name: &str) -> Result<String, S
             if let Some(ref attrs) = e.attributes {
                 output.push_str(&format!("\nAttributes: {}\n", attrs));
             }
-            Ok(output)
+            Ok((output, retrieved_ids))
         }
-        None => Ok(format!("No entity found with name: {}", name)),
+        None => Ok((format!("No entity found with name: {}", name), Vec::new())),
     }
 }
 
-async fn execute_relationships(gm: &GraphMemory, name: &str) -> Result<String, String> {
+async fn execute_relationships(
+    gm: &GraphMemory,
+    name: &str,
+) -> Result<(String, Vec<String>), String> {
     if name.is_empty() {
         return Err("'query' (entity name) is required for relationships mode".into());
     }
@@ -185,7 +219,7 @@ async fn execute_relationships(gm: &GraphMemory, name: &str) -> Result<String, S
         .map_err(|e| format!("Relationship query failed: {}", e))?;
 
     if rels.is_empty() {
-        return Ok(format!("No relationships found for: {}", name));
+        return Ok((format!("No relationships found for: {}", name), Vec::new()));
     }
 
     let mut output = format!("{} relationship(s) for \"{}\":\n\n", rels.len(), name);
@@ -197,14 +231,15 @@ async fn execute_relationships(gm: &GraphMemory, name: &str) -> Result<String, S
             output.push_str(&format!("  {}\n", desc));
         }
     }
-    Ok(output)
+    // Relationships mode surfaces edges, not retrievable entity records.
+    Ok((output, Vec::new()))
 }
 
 async fn execute_episode_search(
     gm: &GraphMemory,
     query: &str,
     limit: usize,
-) -> Result<String, String> {
+) -> Result<(String, Vec<String>), String> {
     if query.is_empty() {
         return Err("'query' is required for episodes mode".into());
     }
@@ -215,8 +250,16 @@ async fn execute_episode_search(
         .map_err(|e| format!("Episode search failed: {}", e))?;
 
     if results.is_empty() {
-        return Ok(format!("No episodes found matching: {}", query));
+        return Ok((format!("No episodes found matching: {}", query), Vec::new()));
     }
+
+    let retrieved_ids: Vec<String> = results
+        .iter()
+        .map(|r| match &r.episode.id {
+            serde_json::Value::String(s) => s.clone(),
+            other => other.to_string(),
+        })
+        .collect();
 
     let mut output = format!(
         "Found {} episode(s) matching \"{}\":\n\n",
@@ -238,10 +281,10 @@ async fn execute_episode_search(
             r.score,
         ));
     }
-    Ok(output)
+    Ok((output, retrieved_ids))
 }
 
-async fn execute_stats(gm: &GraphMemory) -> Result<String, String> {
+async fn execute_stats(gm: &GraphMemory) -> Result<(String, Vec<String>), String> {
     let stats = gm
         .stats()
         .await
@@ -263,10 +306,10 @@ async fn execute_stats(gm: &GraphMemory) -> Result<String, String> {
             output.push_str(&format!("  {}: {}\n", type_name, count));
         }
     }
-    Ok(output)
+    Ok((output, Vec::new()))
 }
 
-async fn execute_pipeline_stats(gm: &GraphMemory) -> Result<String, String> {
+async fn execute_pipeline_stats(gm: &GraphMemory) -> Result<(String, Vec<String>), String> {
     let stats = gm
         .pipeline_stats(7)
         .await
@@ -327,5 +370,5 @@ async fn execute_pipeline_stats(gm: &GraphMemory) -> Result<String, String> {
         output.push('\n');
     }
 
-    Ok(output)
+    Ok((output, Vec::new()))
 }

@@ -458,12 +458,15 @@ async fn execute_intent(
         task_id: intent.id.clone(),
     };
 
-    let result = match executor::execute_with_tools(
-        state.provider.as_ref(),
-        &system_prompt,
-        &user_message,
-        &state.tools,
-        &exec_config,
+    let result = match crate::task_context::scope(
+        Some(intent.id.clone()),
+        executor::execute_with_tools(
+            state.provider.as_ref(),
+            &system_prompt,
+            &user_message,
+            &state.tools,
+            &exec_config,
+        ),
     )
     .await
     {
@@ -760,10 +763,19 @@ async fn execute_intent(
             result.total_input_tokens,
             result.total_output_tokens,
         );
+        let outcome_kind = outcome.outcome.clone();
         if let Err(e) = tracker.record_outcome(&root_dir, outcome, state.config.pulse.max_outcomes)
         {
             tracing::error!("Failed to record outcome for intent '{}': {}", intent.id, e);
         }
+        // Best-effort utility feedback to recall-echo. See utility-feedback-loop-spec.md.
+        crate::graph_feedback::bridge_feedback(
+            &root_dir,
+            &intent.id,
+            &outcome_kind,
+            &parsed.clean_content,
+        )
+        .await;
     }
 
     // Extract cognitive signals and check for health changes

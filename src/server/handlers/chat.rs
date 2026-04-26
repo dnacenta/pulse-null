@@ -349,13 +349,25 @@ pub async fn chat(
     // Uses the same chars/4 + overhead estimate as context.rs.
     session.data.compaction.system_prompt_tokens = system_prompt.len() / 4;
 
-    let result = tool_loop::invoke_with_tool_loop(
-        state.provider.as_ref(),
-        &state.tools,
-        &system_prompt,
-        &mut session.data.messages,
-        state.config.llm.max_tokens,
-        MAX_TOOL_ROUNDS,
+    // Per-turn correlation ID for the utility feedback loop. Chat sessions
+    // don't have a task_id, so we synthesize one per turn from session_key
+    // + millisecond timestamp. See utility-feedback-loop-spec.md.
+    let correlation_id = format!(
+        "chat-{}-{}",
+        resolved_key,
+        chrono::Utc::now().timestamp_millis()
+    );
+
+    let result = crate::task_context::scope(
+        Some(correlation_id.clone()),
+        tool_loop::invoke_with_tool_loop(
+            state.provider.as_ref(),
+            &state.tools,
+            &system_prompt,
+            &mut session.data.messages,
+            state.config.llm.max_tokens,
+            MAX_TOOL_ROUNDS,
+        ),
     )
     .await
     .map_err(|e| {
@@ -495,6 +507,7 @@ pub async fn chat(
             result.input_tokens,
             result.output_tokens,
         );
+        let outcome_str = conv_outcome.outcome.to_string();
         if let Err(e) = crate::caliber::runtime::record_outcome(
             &state.root_dir,
             conv_outcome,
@@ -502,6 +515,14 @@ pub async fn chat(
         ) {
             tracing::warn!("Failed to record conversation outcome: {}", e);
         }
+        // Best-effort utility feedback to recall-echo. See utility-feedback-loop-spec.md.
+        crate::graph_feedback::bridge_feedback(
+            &state.root_dir,
+            &correlation_id,
+            &outcome_str,
+            &text,
+        )
+        .await;
     }
 
     // Incremental checkpoint (if conditions met)
