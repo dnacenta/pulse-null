@@ -6,16 +6,15 @@ use super::{Tool, ToolError, ToolResult};
 
 pub struct GraphQueryTool {
     entity_root: PathBuf,
-    graph_dir: PathBuf,
 }
 
 impl GraphQueryTool {
     pub fn new(entity_root: PathBuf) -> Self {
-        let graph_dir = entity_root.join("memory").join("graph");
-        Self {
-            entity_root,
-            graph_dir,
-        }
+        Self { entity_root }
+    }
+
+    fn graph_dir(&self) -> PathBuf {
+        self.entity_root.join("memory").join("graph")
     }
 }
 
@@ -54,11 +53,12 @@ impl Tool for GraphQueryTool {
     }
 
     fn execute(&self, input: serde_json::Value) -> ToolResult<'_> {
-        let graph_dir = self.graph_dir.clone();
         let entity_root = self.entity_root.clone();
+        let graph_dir = self.graph_dir();
         // Capture correlation_id from task-local before crossing the
-        // spawn_blocking boundary (task-locals don't propagate through
-        // the nested runtime). See utility-feedback-loop-spec.md.
+        // spawn_blocking boundary — task-locals are bound to the current
+        // task and don't propagate to spawn_blocking worker threads. See
+        // utility-feedback-loop-spec.md.
         let correlation_id = crate::task_context::current();
 
         Box::pin(async move {
@@ -68,7 +68,7 @@ impl Tool for GraphQueryTool {
                 .to_string();
 
             let query = input["query"].as_str().unwrap_or("").to_string();
-            let limit = input["limit"].as_u64().unwrap_or(10) as usize;
+            let limit = usize::try_from(input["limit"].as_u64().unwrap_or(10)).unwrap_or(10);
 
             if !graph_dir.exists() {
                 return Err(ToolError::NotFound(
@@ -107,11 +107,14 @@ impl Tool for GraphQueryTool {
                 Ok(Ok((output, retrieved_ids))) => {
                     // Emit retrieval manifest for the utility feedback loop.
                     // Best-effort, no-op for non-retrieval modes (empty ids).
+                    // The write goes through `spawn_blocking` so it never
+                    // stalls the async runtime.
                     crate::graph_feedback::emit_manifest(
-                        &entity_root,
-                        correlation_id.as_deref(),
-                        &retrieved_ids,
-                    );
+                        entity_root,
+                        correlation_id,
+                        retrieved_ids,
+                    )
+                    .await;
                     Ok(output)
                 }
                 Ok(Err(e)) => Err(ToolError::ExecutionFailed(e)),

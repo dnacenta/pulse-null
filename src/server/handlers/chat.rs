@@ -350,13 +350,25 @@ pub async fn chat(
     session.data.compaction.system_prompt_tokens = system_prompt.len() / 4;
 
     // Per-turn correlation ID for the utility feedback loop. Chat sessions
-    // don't have a task_id, so we synthesize one per turn from session_key
-    // + millisecond timestamp. See utility-feedback-loop-spec.md.
-    let correlation_id = format!(
-        "chat-{}-{}",
-        resolved_key,
-        chrono::Utc::now().timestamp_millis()
-    );
+    // have no task_id, so we synthesize one per turn. The format is
+    // `chat-<short-hash-of-key>-<uuid>` so that:
+    //   - the resolved_key is not stored in plaintext in the manifest
+    //     (avoids embedding caller IDs in learning artifacts), but
+    //   - turns from the same caller still share a stable hash prefix
+    //     for log greppability, and
+    //   - the UUID nonce eliminates same-millisecond collisions even
+    //     when two callers happen to share a hash bucket.
+    // See utility-feedback-loop-spec.md.
+    let correlation_id = {
+        use std::hash::{Hash, Hasher};
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        resolved_key.hash(&mut hasher);
+        format!(
+            "chat-{:016x}-{}",
+            hasher.finish(),
+            uuid::Uuid::new_v4().simple()
+        )
+    };
 
     let result = crate::task_context::scope(
         Some(correlation_id.clone()),

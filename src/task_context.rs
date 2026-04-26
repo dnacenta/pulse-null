@@ -2,8 +2,11 @@
 //!
 //! When the LLM tool loop runs, retrievals via `graph_query` need to be
 //! correlated with the eventual outcome record. The runner / intent /
-//! chat handlers establish the scope; the tool reads the value before
-//! crossing the spawn_blocking boundary into nested runtimes.
+//! chat handlers establish the scope; the tool reads the value at the
+//! top of `execute()`. It must be read **before** the body crosses into
+//! `tokio::task::spawn_blocking`, because task-locals are bound to the
+//! current task and are not propagated to the worker thread that
+//! executes the blocking closure.
 //!
 //! See: `utility-feedback-loop-spec.md` (Component 1).
 
