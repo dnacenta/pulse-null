@@ -349,13 +349,37 @@ pub async fn chat(
     // Uses the same chars/4 + overhead estimate as context.rs.
     session.data.compaction.system_prompt_tokens = system_prompt.len() / 4;
 
-    let result = tool_loop::invoke_with_tool_loop(
-        state.provider.as_ref(),
-        &state.tools,
-        &system_prompt,
-        &mut session.data.messages,
-        state.config.llm.max_tokens,
-        MAX_TOOL_ROUNDS,
+    // Per-turn correlation ID for the utility feedback loop. Chat sessions
+    // have no task_id, so we synthesize one per turn. The format is
+    // `chat-<short-hash-of-key>-<uuid>` so that:
+    //   - the resolved_key is not stored in plaintext in the manifest
+    //     (avoids embedding caller IDs in learning artifacts), but
+    //   - turns from the same caller still share a stable hash prefix
+    //     for log greppability, and
+    //   - the UUID nonce eliminates same-millisecond collisions even
+    //     when two callers happen to share a hash bucket.
+    // See utility-feedback-loop-spec.md.
+    let correlation_id = {
+        use std::hash::{Hash, Hasher};
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        resolved_key.hash(&mut hasher);
+        format!(
+            "chat-{:016x}-{}",
+            hasher.finish(),
+            uuid::Uuid::new_v4().simple()
+        )
+    };
+
+    let result = crate::task_context::scope(
+        Some(correlation_id.clone()),
+        tool_loop::invoke_with_tool_loop(
+            state.provider.as_ref(),
+            &state.tools,
+            &system_prompt,
+            &mut session.data.messages,
+            state.config.llm.max_tokens,
+            MAX_TOOL_ROUNDS,
+        ),
     )
     .await
     .map_err(|e| {
@@ -495,6 +519,7 @@ pub async fn chat(
             result.input_tokens,
             result.output_tokens,
         );
+        let outcome_str = conv_outcome.outcome.to_string();
         if let Err(e) = crate::caliber::runtime::record_outcome(
             &state.root_dir,
             conv_outcome,
@@ -502,6 +527,14 @@ pub async fn chat(
         ) {
             tracing::warn!("Failed to record conversation outcome: {}", e);
         }
+        // Best-effort utility feedback to recall-echo. See utility-feedback-loop-spec.md.
+        crate::graph_feedback::bridge_feedback(
+            &state.root_dir,
+            &correlation_id,
+            &outcome_str,
+            &text,
+        )
+        .await;
     }
 
     // Incremental checkpoint (if conditions met)
