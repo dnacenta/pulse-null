@@ -32,6 +32,8 @@ pub struct Config {
     #[serde(default)]
     pub graph: GraphConfig,
     #[serde(default)]
+    pub prediction: PredictionConfig,
+    #[serde(default)]
     pub sessions: SessionConfig,
     #[serde(default)]
     pub context_buffer: crate::context_buffer::ContextBufferConfig,
@@ -461,6 +463,52 @@ impl Default for GraphConfig {
             data_dir: None,
             context_injection: true,
             context_max_tokens: 500,
+        }
+    }
+}
+
+/// Configuration for the prediction engine (Hierarchical Predictive Self-Modeling).
+/// See `continuous-entity-process-spec.md` Phase 2.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct PredictionConfig {
+    /// Enable prediction generation, resolution, and prompt injection.
+    pub enabled: bool,
+    /// Generate Cycle-timescale predictions in the thinking loop.
+    pub cycle_predictions: bool,
+    /// Generate Session-timescale predictions in morning-orientation.
+    pub session_predictions: bool,
+    /// Generate Weekly-timescale predictions in weekly-synthesis.
+    pub weekly_predictions: bool,
+    /// INITIAL GUESS — calibration pending. Surprise score is the LLM's
+    /// self-assessed dissimilarity between prediction and actual on a 0.0
+    /// (matched) to 1.0 (completely wrong) scale. Resolutions with surprise
+    /// at or above this threshold create attention-demanding PredictionErrors.
+    /// Not cited from a source; revisit after collecting ≥30 resolved
+    /// predictions per timescale.
+    pub surprise_threshold: f64,
+    /// INITIAL GUESS — calibration pending. Importance is the unweighted sum
+    /// of unprocessed-error surprise values. With surprise in [0,1], a 3.0
+    /// threshold corresponds to roughly three fully-surprising errors or six
+    /// half-surprising ones. Not a port of Park et al.'s 150 (which was
+    /// importance per memory on a 1-10 scale, not accumulated). Revisit
+    /// alongside surprise_threshold.
+    pub importance_threshold: f64,
+    /// Cap on the prediction stack size. Oldest resolved predictions are
+    /// pruned first; pending predictions are always kept.
+    pub max_unresolved: usize,
+}
+
+impl Default for PredictionConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            cycle_predictions: true,
+            session_predictions: true,
+            weekly_predictions: true,
+            surprise_threshold: 0.3,
+            importance_threshold: 3.0,
+            max_unresolved: 20,
         }
     }
 }

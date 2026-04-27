@@ -516,6 +516,31 @@ async fn execute_task(
         .await;
     }
 
+    // Post-execution: extract prediction markers from task output. The LLM
+    // emits `[PREDICT:...]` and `[RESOLVE:...]` markers in its response;
+    // resolve.rs parses them and applies to the persistent stack. Best-
+    // effort throughout. See continuous-entity-process-spec.md Phase 2.
+    if state.config.prediction.enabled {
+        let mut stack = crate::prediction::store::load(&root_dir);
+        let new_errors = crate::prediction::resolve::process_task_output(
+            &mut stack,
+            &parsed.clean_content,
+            &task.id,
+            crate::prediction::Timescale::Cycle,
+        );
+        if !new_errors.is_empty() {
+            tracing::info!(
+                "Prediction errors: {} new (accumulated importance: {:.2})",
+                new_errors.len(),
+                stack.accumulated_importance(),
+            );
+        }
+        stack.prune(state.config.prediction.max_unresolved, 50);
+        if let Err(e) = crate::prediction::store::save(&root_dir, &stack) {
+            tracing::error!("Failed to save prediction stack: {e}");
+        }
+    }
+
     // Post-execution: extract cognitive signals and check for health changes
     if let Some(ref monitor) = state.cognitive_monitor {
         let window = state.config.monitoring.window_size;
