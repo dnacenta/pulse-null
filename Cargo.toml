@@ -85,7 +85,7 @@ which = "7"
 
 # Plugins (optional — different interfaces to speak through)
 voice-echo = { version = "0.8", optional = true }
-discord-echo = { version = "0.1", optional = true }
+discord-echo = { version = "0.1.2", optional = true }
 
 [features]
 default = []

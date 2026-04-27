@@ -1266,9 +1266,9 @@ dependencies = [
 
 [[package]]
 name = "discord-echo"
-version = "0.1.1"
+version = "0.1.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f789b01a5aaf64a8430a58140db6abb260fb987e461b7d15bc7d3d82eaa0f7be"
+checksum = "1122486ba79b5358d691dd23a48e92b9897d317cac16563dd6220f0f0b1f17b5"
 dependencies = [
  "chrono",
  "futures-util",
