@@ -271,14 +271,17 @@ enum ArchiveAction {
 
 #[tokio::main]
 async fn main() {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "pulse_null=info".into()),
-        )
-        .init();
-
     let cli = Cli::parse();
+
+    // TUI commands defer tracing init to their handler so logs land in a file
+    // instead of bleeding onto the alternate screen. Everything else gets stdout.
+    let tui_mode = matches!(
+        &cli.command,
+        Commands::Chat | Commands::Up { headless: false }
+    );
+    if !tui_mode {
+        cli::init_stdout_tracing();
+    }
 
     match cli.command {
         Commands::Init { dir } => {

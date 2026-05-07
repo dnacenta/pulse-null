@@ -28,10 +28,11 @@ async fn run_single_entity(headless: bool) -> Result<(), Box<dyn std::error::Err
         return server::start(config).await;
     }
 
+    let root_dir = config.root_dir()?;
+    crate::cli::init_file_tracing(&root_dir);
+
     let provider = crate::providers::create_streaming_provider(&config)?;
     let provider: Arc<dyn crate::streaming::StreamingProvider> = Arc::from(provider);
-
-    let root_dir = config.root_dir()?;
     let system_prompt = crate::server::prompt::build_system_prompt(&root_dir, &config, None, None)?;
 
     let mut tools = crate::tools::ToolRegistry::new();
@@ -65,6 +66,10 @@ async fn run_multi_entity(
     headless: bool,
     entity_home: PathBuf,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    if !headless {
+        crate::cli::init_file_tracing(&entity_home);
+    }
+
     let discovered = crate::discovery::discover_entities(&entity_home);
 
     tracing::info!(
