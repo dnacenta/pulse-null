@@ -499,6 +499,62 @@ pub fn resolve_task_evaluator(evaluator_type: &str, docs_dir: &Path) -> Option<B
     }
 }
 
+/// Accumulated-importance descriptor returned when prediction-error pressure
+/// crosses the configured threshold. Drives reflection-window graduation:
+/// the entity should promote the LEARNING items associated with the
+/// `triggering_error`'s prediction onto THOUGHTS during the next reflection.
+///
+/// This is the consumer side of spec 2c — without this gate the
+/// `importance_threshold` config would be dead.
+#[derive(Debug, Clone)]
+pub struct PipelinePressure {
+    /// Sum of surprise across unprocessed prediction errors when pressure fired.
+    pub accumulated_importance: f64,
+    /// The single highest-surprise unprocessed error — the most useful
+    /// pointer for "what failed prediction is overdue for processing".
+    pub triggering_prediction_id: String,
+    /// Surprise of the triggering error (∈ [0,1]).
+    pub triggering_surprise: f64,
+    /// Optional insight recorded on the triggering error.
+    pub triggering_insight: Option<String>,
+}
+
+/// Check whether accumulated prediction-error importance has crossed the
+/// configured threshold. Returns `Some(PipelinePressure)` describing the
+/// highest-surprise unprocessed error if so, `None` otherwise.
+///
+/// Reflection-window callers use the descriptor to nudge the LLM toward
+/// graduating the corresponding LEARNING items into THOUGHTS — the
+/// pipeline-graduation side of spec 2c.
+#[must_use]
+pub fn check_importance_pressure(
+    stack: &crate::prediction::PredictionStack,
+) -> Option<PipelinePressure> {
+    let importance = stack.accumulated_importance();
+    if importance < stack.config.importance_threshold {
+        return None;
+    }
+
+    // Highest-surprise unprocessed error. partial_cmp with `Equal` fallback
+    // protects against NaN sneaking in from a misbehaving LLM payload.
+    let triggering = stack
+        .errors
+        .iter()
+        .filter(|e| !e.processed)
+        .max_by(|a, b| {
+            a.surprise
+                .partial_cmp(&b.surprise)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        })?;
+
+    Some(PipelinePressure {
+        accumulated_importance: importance,
+        triggering_prediction_id: triggering.prediction_id.clone(),
+        triggering_surprise: triggering.surprise,
+        triggering_insight: triggering.insight.clone(),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -905,5 +961,66 @@ mod tests {
     fn resolve_task_evaluator_unknown_type() {
         let tmp = TempDir::new().unwrap();
         assert!(resolve_task_evaluator("nonexistent", tmp.path()).is_none());
+    }
+
+    // ----- check_importance_pressure tests (spec 2c gate) ----------------
+
+    use crate::config::PredictionConfig;
+    use crate::prediction::{ErrorDirection, PredictionResolution, PredictionStack, Timescale};
+
+    fn seed_stack_with_surprises(importance_threshold: f64, surprises: &[f64]) -> PredictionStack {
+        let mut stack = PredictionStack::with_config(PredictionConfig {
+            // Use a permissive surprise threshold so every seed surprise
+            // generates a PredictionError without polluting the importance gate.
+            surprise_threshold: 0.0,
+            importance_threshold,
+            ..PredictionConfig::default()
+        });
+        for s in surprises {
+            let id = stack
+                .add_prediction(Timescale::Cycle, "p".to_string(), 0.5)
+                .id
+                .clone();
+            stack.resolve(
+                &id,
+                PredictionResolution {
+                    actual: "x".to_string(),
+                    surprise: *s,
+                    direction: ErrorDirection::Misdirected,
+                    insight: Some(format!("seed surprise {s}")),
+                },
+            );
+        }
+        stack
+    }
+
+    #[test]
+    fn importance_pressure_below_threshold_returns_none() {
+        let stack = seed_stack_with_surprises(1.0, &[0.2, 0.3]);
+        assert!(check_importance_pressure(&stack).is_none());
+    }
+
+    #[test]
+    fn importance_pressure_at_or_above_threshold_returns_some() {
+        let stack = seed_stack_with_surprises(1.0, &[0.6, 0.6]);
+        let pressure = check_importance_pressure(&stack).unwrap();
+        assert!((pressure.accumulated_importance - 1.2).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn importance_pressure_picks_highest_surprise() {
+        let stack = seed_stack_with_surprises(0.5, &[0.3, 0.9, 0.4]);
+        let pressure = check_importance_pressure(&stack).unwrap();
+        assert!((pressure.triggering_surprise - 0.9).abs() < f64::EPSILON);
+        assert_eq!(
+            pressure.triggering_insight.as_deref(),
+            Some("seed surprise 0.9")
+        );
+    }
+
+    #[test]
+    fn importance_pressure_empty_stack_returns_none() {
+        let stack = PredictionStack::with_config(PredictionConfig::default());
+        assert!(check_importance_pressure(&stack).is_none());
     }
 }

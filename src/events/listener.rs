@@ -414,6 +414,11 @@ fn translate_event(event: &EntityEvent, config: &EventsConfig) -> Option<Intent>
         // in the scheduler — not through the intent system, because the provider
         // is likely down when this fires.
         EntityEvent::ProviderError { .. } => None,
+
+        // Prediction pressure is observed and routed by the runner via
+        // reflection-window prompt augmentation, not via an autonomous LLM
+        // intent. The event exists for vigil-pulse and future listeners.
+        EntityEvent::PredictionPressure { .. } => None,
     }
 }
 

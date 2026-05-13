@@ -14,8 +14,8 @@ use tower::ServiceExt;
 
 use crate::config::{
     AutonomyConfig, Config, EntityConfig, GraphConfig, LlmConfig, MemoryConfig, MonitoringConfig,
-    PipelineConfig, PulseConfig, SchedulerConfig, SecurityConfig, ServerConfig, SessionConfig,
-    TrustConfig,
+    PipelineConfig, PredictionConfig, PulseConfig, SchedulerConfig, SecurityConfig, ServerConfig,
+    SessionConfig, TrustConfig,
 };
 use crate::events::EventBus;
 use crate::persist::PersistCoordinator;
@@ -118,6 +118,7 @@ fn test_config() -> Config {
         autonomy: AutonomyConfig::default(),
         pulse: PulseConfig::default(),
         graph: GraphConfig::default(),
+        prediction: PredictionConfig::default(),
         sessions: SessionConfig::default(),
         context_buffer: crate::context_buffer::ContextBufferConfig::default(),
         session_health: crate::session_health::SessionHealthConfig::default(),

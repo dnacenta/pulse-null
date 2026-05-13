@@ -23,6 +23,7 @@ mod persist;
 mod pidfile;
 mod plugins;
 mod praxis;
+mod prediction;
 mod provider_status;
 mod providers;
 mod registry;

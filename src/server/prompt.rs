@@ -456,6 +456,54 @@ pub fn build_system_prompt_budgeted(
         }
     }
 
+    // --- Tier 2 (Low): Prediction Context ---
+    // Surfaces recent prediction errors and pending-prediction count so the
+    // entity can RESOLVE its own predictions in this turn. See
+    // continuous-entity-process-spec.md Phase 2 (Hierarchical Predictive
+    // Self-Modeling). Only renders when there's something to surface.
+    if config.prediction.enabled {
+        // build_system_prompt_budgeted is sync and is called from inside the
+        // spawn_blocking issued by build_system_prompt_async, so sync IO here
+        // doesn't block the tokio worker pool. async callers use load_async.
+        let stack = crate::prediction::store::load(root_dir, config.prediction.clone());
+        let importance = stack.accumulated_importance();
+        let recent = stack.recent_errors(5);
+        if !recent.is_empty() {
+            use std::fmt::Write as _;
+            let mut block = String::new();
+            // String's Write impl is infallible — discard the unit Result.
+            let _ = write!(
+                &mut block,
+                "<prediction-context importance=\"{importance:.1}\">\nRecent prediction errors:\n"
+            );
+            for err in recent {
+                let _ = writeln!(
+                    &mut block,
+                    "- [{}] surprise {:.1}: {}",
+                    err.direction,
+                    err.surprise,
+                    err.insight.as_deref().unwrap_or("no insight recorded"),
+                );
+            }
+            let pending_count = stack.predictions.iter().filter(|p| p.is_pending()).count();
+            if pending_count > 0 {
+                let _ = writeln!(
+                    &mut block,
+                    "{pending_count} predictions awaiting resolution"
+                );
+            }
+            block.push_str("</prediction-context>");
+            let tokens = estimate_tokens(&block);
+            components.push(PromptComponent {
+                name: "prediction-context",
+                content: block,
+                tokens,
+                tier: PromptTier::Low,
+                cap: 300,
+            });
+        }
+    }
+
     // --- Budget enforcement ---
     let total_before: usize = components.iter().map(|c| c.tokens).sum();
     let mut was_trimmed = false;
@@ -865,7 +913,7 @@ fn build_capabilities(config: &Config) -> Vec<Capability> {
             name: "Knowledge Graph".into(),
             what: "Semantic knowledge graph with your accumulated knowledge. Check <graph-awareness> in your prompt for current stats.".into(),
             why: "Structured knowledge that memory files can't capture — relationships between concepts, people, and ideas with confidence scores.".into(),
-            how: "Use the graph_query tool to search by semantic similarity or query relationships. Graph is populated automatically from conversation archives.".into(),
+            how: "Use the graph_query tool to search by semantic similarity or query relationships. Graph is populated automatically from conversation archives. Storage is SurrealDB.".into(),
             constraints: Some("Bayesian confidence model on edges. Priors vary by extraction context. Multi-hop path confidence is the product of edge confidences.".into()),
         });
     }
@@ -1208,6 +1256,7 @@ mod tests {
             autonomy: AutonomyConfig::default(),
             pulse: PulseConfig::default(),
             graph: GraphConfig::default(),
+            prediction: PredictionConfig::default(),
             sessions: SessionConfig::default(),
             context_buffer: crate::context_buffer::ContextBufferConfig::default(),
             session_health: crate::session_health::SessionHealthConfig::default(),
