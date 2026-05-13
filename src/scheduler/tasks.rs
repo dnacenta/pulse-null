@@ -7,6 +7,30 @@ use super::ScheduledTask;
 /// pins the invariant.
 pub const REFLECTION_WINDOW_TASK_ID: &str = "reflection-window";
 
+/// Task id of the morning-orientation task. Spec 2a: predictions emitted
+/// from this task carry the Session timescale. Resolved by night-reflection.
+pub const MORNING_ORIENTATION_TASK_ID: &str = "morning-orientation";
+
+/// Task id of the weekly-synthesis task. Spec 2a: predictions emitted from
+/// this task carry the Weekly timescale. Resolved by next week's synthesis.
+pub const WEEKLY_SYNTHESIS_TASK_ID: &str = "weekly-synthesis";
+
+/// Map a scheduled-task id to the default timescale for any
+/// `[PREDICT:{...}]` markers it emits (spec 2a). The runner uses this when
+/// calling `prediction::resolve::process_task_output` so that morning-
+/// orientation predictions are persisted as `Session` and weekly-synthesis
+/// predictions as `Weekly`, not all stamped `Cycle`. Unknown ids fall back
+/// to `Cycle` — the safe default for any cognitive-cycle-style task.
+#[must_use]
+pub fn default_timescale_for(task_id: &str) -> crate::prediction::Timescale {
+    use crate::prediction::Timescale;
+    match task_id {
+        MORNING_ORIENTATION_TASK_ID => Timescale::Session,
+        WEEKLY_SYNTHESIS_TASK_ID => Timescale::Weekly,
+        _ => Timescale::Cycle,
+    }
+}
+
 /// Create the default cognitive schedule for a new entity.
 pub fn default_tasks() -> Vec<ScheduledTask> {
     vec![
@@ -57,7 +81,7 @@ pub fn default_tasks() -> Vec<ScheduledTask> {
             evaluator: None,
         },
         ScheduledTask {
-            id: "morning-orientation".to_string(),
+            id: MORNING_ORIENTATION_TASK_ID.to_string(),
             name: "Morning Orientation".to_string(),
             cron: "0 0 8 * * *".to_string(),
             channel: "system".to_string(),
@@ -142,7 +166,7 @@ pub fn default_tasks() -> Vec<ScheduledTask> {
             evaluator: Some("pipeline".to_string()),
         },
         ScheduledTask {
-            id: "weekly-synthesis".to_string(),
+            id: WEEKLY_SYNTHESIS_TASK_ID.to_string(),
             name: "Weekly Synthesis".to_string(),
             cron: "0 0 11 * * 7".to_string(),
             channel: "system".to_string(),
@@ -227,5 +251,35 @@ mod tests {
         let task = find_task("weekly-synthesis");
         assert!(task.prompt.contains("Weekly-timescale prediction"));
         assert!(task.prompt.contains("[PREDICT:{"));
+    }
+
+    /// Spec 2a: predictions emitted by each task carry the right timescale.
+    /// Verifies the mapping the runner uses when persisting predictions.
+    #[test]
+    fn default_timescale_for_known_tasks() {
+        use crate::prediction::Timescale;
+        assert_eq!(
+            default_timescale_for(MORNING_ORIENTATION_TASK_ID),
+            Timescale::Session
+        );
+        assert_eq!(
+            default_timescale_for(WEEKLY_SYNTHESIS_TASK_ID),
+            Timescale::Weekly
+        );
+        assert_eq!(
+            default_timescale_for(REFLECTION_WINDOW_TASK_ID),
+            Timescale::Cycle
+        );
+        assert_eq!(default_timescale_for("thinking-loop"), Timescale::Cycle);
+        assert_eq!(default_timescale_for("some-unknown-task"), Timescale::Cycle);
+    }
+
+    /// MORNING_ORIENTATION_TASK_ID + WEEKLY_SYNTHESIS_TASK_ID must be wired
+    /// into the `default_tasks()` definitions consumed by `default_timescale_for`.
+    #[test]
+    fn timescale_task_ids_present_in_default_tasks() {
+        let ids: Vec<String> = default_tasks().iter().map(|t| t.id.clone()).collect();
+        assert!(ids.iter().any(|i| i == MORNING_ORIENTATION_TASK_ID));
+        assert!(ids.iter().any(|i| i == WEEKLY_SYNTHESIS_TASK_ID));
     }
 }

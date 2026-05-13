@@ -850,7 +850,7 @@ async fn post_process_predictions(
         &mut stack,
         clean_content,
         &task.id,
-        crate::prediction::Timescale::Cycle,
+        super::tasks::default_timescale_for(&task.id),
     );
     if !new_errors.is_empty() {
         tracing::info!(
