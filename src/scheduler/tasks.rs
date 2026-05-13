@@ -1,5 +1,12 @@
 use super::ScheduledTask;
 
+/// Task id of the reflection-window task. Lifted to a const because the
+/// scheduler runner uses it to decide whether to inject prediction-pressure
+/// context (`runner::execute_task`). Renaming the task without updating
+/// both call sites would silently break spec 2c — `tests::reflection_window_task_id_matches`
+/// pins the invariant.
+pub const REFLECTION_WINDOW_TASK_ID: &str = "reflection-window";
+
 /// Create the default cognitive schedule for a new entity.
 pub fn default_tasks() -> Vec<ScheduledTask> {
     vec![
@@ -86,7 +93,7 @@ pub fn default_tasks() -> Vec<ScheduledTask> {
             evaluator: None,
         },
         ScheduledTask {
-            id: "reflection-window".to_string(),
+            id: REFLECTION_WINDOW_TASK_ID.to_string(),
             name: "Reflection Window".to_string(),
             cron: "0 0 12 * * *".to_string(),
             channel: "system".to_string(),
@@ -169,6 +176,20 @@ mod tests {
             .into_iter()
             .find(|t| t.id == id)
             .unwrap_or_else(|| panic!("missing task: {id}"))
+    }
+
+    /// Audit Q-H2: the runner's reflection-window pressure path matches a
+    /// task id by const, not magic string. If the const ever drifts away
+    /// from the task vector this fails — making the silent-break failure
+    /// mode loud.
+    #[test]
+    fn reflection_window_task_id_matches() {
+        assert!(
+            default_tasks()
+                .iter()
+                .any(|t| t.id == REFLECTION_WINDOW_TASK_ID),
+            "REFLECTION_WINDOW_TASK_ID const is not present in default_tasks()"
+        );
     }
 
     /// Spec 2d: thinking-loop must follow PREDICTIONS / THINK / RESOLVE / UPDATE.

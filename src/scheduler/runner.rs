@@ -208,13 +208,15 @@ async fn execute_task(
         autonomy_context,
     );
 
-    // Spec 2c: pre-LLM pressure check. When `reflection-window` fires and
-    // accumulated prediction-error importance is over threshold, inject a
-    // directive naming the highest-surprise prediction so the LLM graduates
-    // the corresponding LEARNING item to THOUGHTS this cycle (rather than
-    // waiting for next reflection). The PredictionPressure event lets
-    // vigil-pulse / external listeners observe the same signal.
-    if task.id == "reflection-window" && state.config.prediction.enabled {
+    // Spec 2c: pre-LLM pressure check. When the reflection-window task
+    // fires and accumulated prediction-error importance is over threshold,
+    // inject a directive naming the highest-surprise prediction so the LLM
+    // graduates the corresponding LEARNING item to THOUGHTS this cycle
+    // (rather than waiting for next reflection). The PredictionPressure
+    // event lets vigil-pulse / external listeners observe the same signal.
+    // Task id comes from `tasks::REFLECTION_WINDOW_TASK_ID` so a rename
+    // breaks compilation (and a test pins the invariant).
+    if task.id == super::tasks::REFLECTION_WINDOW_TASK_ID && state.config.prediction.enabled {
         let stack =
             crate::prediction::store::load_async(root_dir.clone(), state.config.prediction.clone())
                 .await;
