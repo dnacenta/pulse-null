@@ -497,6 +497,11 @@ pub struct PredictionConfig {
     /// Cap on the prediction stack size. Oldest resolved predictions are
     /// pruned first; pending predictions are always kept.
     pub max_unresolved: usize,
+    /// Cap on accumulated prediction errors before pruning. Unprocessed
+    /// errors are always kept; processed ones are pruned oldest-first when
+    /// the cap is exceeded. 50 keeps several reflection-window cycles of
+    /// history available for trend analysis without unbounded growth.
+    pub max_errors: usize,
 }
 
 impl Default for PredictionConfig {
@@ -509,6 +514,7 @@ impl Default for PredictionConfig {
             surprise_threshold: 0.3,
             importance_threshold: 3.0,
             max_unresolved: 20,
+            max_errors: 50,
         }
     }
 }

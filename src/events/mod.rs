@@ -96,6 +96,17 @@ pub enum EntityEvent {
         error_kind: String,
         task_id: String,
     },
+
+    /// Emitted when accumulated prediction-error importance crosses
+    /// `PredictionConfig::importance_threshold`. Carries enough context for
+    /// downstream listeners (vigil-pulse feed, reflection-window prompt
+    /// augmentation) to point the entity at the specific prediction that
+    /// most needs graduation.
+    PredictionPressure {
+        accumulated_importance: f64,
+        triggering_prediction_id: String,
+        triggering_surprise: f64,
+    },
 }
 
 impl EntityEvent {
@@ -118,6 +129,7 @@ impl EntityEvent {
                 format!("plugin_state_{}", plugin_name)
             }
             EntityEvent::ProviderError { .. } => "provider_error".into(),
+            EntityEvent::PredictionPressure { .. } => "prediction_pressure".into(),
         }
     }
 }

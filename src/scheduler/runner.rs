@@ -199,7 +199,7 @@ async fn execute_task(
     } else {
         String::new()
     };
-    let user_message = format!(
+    let mut user_message = format!(
         "[Scheduled task: {} | Time: {} | Channel: {}]\n\n{}{}",
         task.name,
         now.format("%Y-%m-%d %H:%M UTC"),
@@ -207,6 +207,49 @@ async fn execute_task(
         task.prompt,
         autonomy_context,
     );
+
+    // Spec 2c: pre-LLM pressure check. When `reflection-window` fires and
+    // accumulated prediction-error importance is over threshold, inject a
+    // directive naming the highest-surprise prediction so the LLM graduates
+    // the corresponding LEARNING item to THOUGHTS this cycle (rather than
+    // waiting for next reflection). The PredictionPressure event lets
+    // vigil-pulse / external listeners observe the same signal.
+    if task.id == "reflection-window" && state.config.prediction.enabled {
+        let stack =
+            crate::prediction::store::load_async(root_dir.clone(), state.config.prediction.clone())
+                .await;
+        if let Some(pressure) = super::evaluator::check_importance_pressure(&stack) {
+            use std::fmt::Write as _;
+            let _ = write!(
+                &mut user_message,
+                "\n\n[PREDICTION PRESSURE: accumulated_importance={:.2} ≥ threshold={:.2}. \
+                 Top unprocessed prediction error: id `{}`, surprise={:.2}{}. \
+                 Graduate the corresponding LEARNING.md item into THOUGHTS.md this cycle.]",
+                pressure.accumulated_importance,
+                stack.config.importance_threshold,
+                pressure.triggering_prediction_id,
+                pressure.triggering_surprise,
+                pressure
+                    .triggering_insight
+                    .as_ref()
+                    .map(|s| format!(" (insight: {s})"))
+                    .unwrap_or_default(),
+            );
+            tracing::info!(
+                accumulated_importance = pressure.accumulated_importance,
+                threshold = stack.config.importance_threshold,
+                triggering_prediction_id = %pressure.triggering_prediction_id,
+                "PredictionPressure fired — augmenting reflection-window user message"
+            );
+            state
+                .event_bus
+                .emit(crate::events::EntityEvent::PredictionPressure {
+                    accumulated_importance: pressure.accumulated_importance,
+                    triggering_prediction_id: pressure.triggering_prediction_id,
+                    triggering_surprise: pressure.triggering_surprise,
+                });
+        }
+    }
 
     // Capture start time for accurate duration tracking in InteractionRecord
     let started_at = Utc::now();
@@ -537,7 +580,10 @@ async fn execute_task(
                 stack.accumulated_importance(),
             );
         }
-        stack.prune(state.config.prediction.max_unresolved, 50);
+        stack.prune(
+            state.config.prediction.max_unresolved,
+            state.config.prediction.max_errors,
+        );
         if let Err(e) = crate::prediction::store::save_async(root_dir.clone(), stack).await {
             tracing::error!("Failed to save prediction stack: {e}");
         }

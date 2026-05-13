@@ -913,7 +913,7 @@ fn build_capabilities(config: &Config) -> Vec<Capability> {
             name: "Knowledge Graph".into(),
             what: "Semantic knowledge graph with your accumulated knowledge. Check <graph-awareness> in your prompt for current stats.".into(),
             why: "Structured knowledge that memory files can't capture — relationships between concepts, people, and ideas with confidence scores.".into(),
-            how: "Use the graph_query tool to search by semantic similarity or query relationships. Graph is populated automatically from conversation archives.".into(),
+            how: "Use the graph_query tool to search by semantic similarity or query relationships. Graph is populated automatically from conversation archives. Storage is SurrealDB.".into(),
             constraints: Some("Bayesian confidence model on edges. Priors vary by extraction context. Multi-hop path confidence is the product of edge confidences.".into()),
         });
     }
