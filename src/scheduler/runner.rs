@@ -221,47 +221,7 @@ async fn execute_task(
         None
     };
 
-    // Spec 2c: when the reflection-window task fires and accumulated
-    // prediction-error importance is over threshold, inject a directive
-    // naming the highest-surprise prediction so the LLM graduates the
-    // corresponding LEARNING item to THOUGHTS this cycle (rather than
-    // waiting for next reflection). PredictionPressure event lets
-    // vigil-pulse / external listeners observe the same signal.
-    if task.id == super::tasks::REFLECTION_WINDOW_TASK_ID {
-        if let Some(stack) = prediction_stack.as_ref() {
-            if let Some(pressure) = super::evaluator::check_importance_pressure(stack) {
-                use std::fmt::Write as _;
-                let _ = write!(
-                    &mut user_message,
-                    "\n\n[PREDICTION PRESSURE: accumulated_importance={:.2} ≥ threshold={:.2}. \
-                     Top unprocessed prediction error: id `{}`, surprise={:.2}{}. \
-                     Graduate the corresponding LEARNING.md item into THOUGHTS.md this cycle.]",
-                    pressure.accumulated_importance,
-                    stack.config.importance_threshold,
-                    pressure.triggering_prediction_id,
-                    pressure.triggering_surprise,
-                    pressure
-                        .triggering_insight
-                        .as_ref()
-                        .map(|s| format!(" (insight: {s})"))
-                        .unwrap_or_default(),
-                );
-                tracing::info!(
-                    accumulated_importance = pressure.accumulated_importance,
-                    threshold = stack.config.importance_threshold,
-                    triggering_prediction_id = %pressure.triggering_prediction_id,
-                    "PredictionPressure fired — augmenting reflection-window user message"
-                );
-                state
-                    .event_bus
-                    .emit(crate::events::EntityEvent::PredictionPressure {
-                        accumulated_importance: pressure.accumulated_importance,
-                        triggering_prediction_id: pressure.triggering_prediction_id,
-                        triggering_surprise: pressure.triggering_surprise,
-                    });
-            }
-        }
-    }
+    inject_reflection_pressure_directive(task, state, &prediction_stack, &mut user_message);
 
     // Capture start time for accurate duration tracking in InteractionRecord
     let started_at = Utc::now();
@@ -574,27 +534,8 @@ async fn execute_task(
     // Post-execution: extract prediction markers from task output and save
     // the stack we loaded pre-LLM. Same in-memory snapshot used by the
     // spec-2c pressure check — no second load, no race against ourselves.
-    if let Some(mut stack) = prediction_stack.take() {
-        let new_errors = crate::prediction::resolve::process_task_output(
-            &mut stack,
-            &parsed.clean_content,
-            &task.id,
-            crate::prediction::Timescale::Cycle,
-        );
-        if !new_errors.is_empty() {
-            tracing::info!(
-                "Prediction errors: {} new (accumulated importance: {:.2})",
-                new_errors.len(),
-                stack.accumulated_importance(),
-            );
-        }
-        stack.prune(
-            state.config.prediction.max_unresolved,
-            state.config.prediction.max_errors,
-        );
-        if let Err(e) = crate::prediction::store::save_async(root_dir.clone(), stack).await {
-            tracing::error!("Failed to save prediction stack: {e}");
-        }
+    if let Some(stack) = prediction_stack.take() {
+        post_process_predictions(stack, state, task, &root_dir, &parsed.clean_content).await;
     }
 
     // Post-execution: extract cognitive signals and check for health changes
@@ -832,4 +773,97 @@ async fn route_output_markers(
 /// Append a task execution record to LOGBOOK.md using the unified format.
 fn log_execution(root_dir: &std::path::Path, task: &ScheduledTask, summary: &str) {
     crate::logbook::write_entry(root_dir, "Task", &task.name, summary);
+}
+
+/// Spec 2c side-effects: when this task is the reflection-window task and
+/// the stack has crossed the importance threshold, append a
+/// `[PREDICTION PRESSURE: ...]` directive to the user message naming the
+/// highest-surprise prediction (so the LLM graduates the corresponding
+/// LEARNING item into THOUGHTS this cycle) and emit `PredictionPressure`
+/// for listeners. Caller is responsible for having already loaded the
+/// stack (it's borrowed immutably here). No-op if prediction is disabled
+/// or the task isn't reflection-window.
+///
+/// Extracted from `execute_task` (Q-H1) to keep that fn under the eye-roll
+/// length and let unit tests cover the directive shape independently.
+fn inject_reflection_pressure_directive(
+    task: &ScheduledTask,
+    state: &Arc<AppState>,
+    prediction_stack: &Option<crate::prediction::PredictionStack>,
+    user_message: &mut String,
+) {
+    if task.id != super::tasks::REFLECTION_WINDOW_TASK_ID {
+        return;
+    }
+    let Some(stack) = prediction_stack.as_ref() else {
+        return;
+    };
+    let Some(pressure) = super::evaluator::check_importance_pressure(stack) else {
+        return;
+    };
+
+    use std::fmt::Write as _;
+    let _ = write!(
+        user_message,
+        "\n\n[PREDICTION PRESSURE: accumulated_importance={:.2} ≥ threshold={:.2}. \
+         Top unprocessed prediction error: id `{}`, surprise={:.2}{}. \
+         Graduate the corresponding LEARNING.md item into THOUGHTS.md this cycle.]",
+        pressure.accumulated_importance,
+        stack.config.importance_threshold,
+        pressure.triggering_prediction_id,
+        pressure.triggering_surprise,
+        pressure
+            .triggering_insight
+            .as_ref()
+            .map(|s| format!(" (insight: {s})"))
+            .unwrap_or_default(),
+    );
+    tracing::info!(
+        accumulated_importance = pressure.accumulated_importance,
+        threshold = stack.config.importance_threshold,
+        triggering_prediction_id = %pressure.triggering_prediction_id,
+        "PredictionPressure fired — augmenting reflection-window user message"
+    );
+    state
+        .event_bus
+        .emit(crate::events::EntityEvent::PredictionPressure {
+            accumulated_importance: pressure.accumulated_importance,
+            triggering_prediction_id: pressure.triggering_prediction_id,
+            triggering_surprise: pressure.triggering_surprise,
+        });
+}
+
+/// Post-LLM phase of the prediction loop: parse `[PREDICT:...]` / `[RESOLVE:...]`
+/// markers from the task output, mutate the stack we loaded pre-LLM, prune
+/// to configured caps, then save via `save_async`. Caller passes ownership
+/// of the stack so this fn can consume it into `save_async`.
+///
+/// Extracted from `execute_task` (Q-H1).
+async fn post_process_predictions(
+    mut stack: crate::prediction::PredictionStack,
+    state: &Arc<AppState>,
+    task: &ScheduledTask,
+    root_dir: &std::path::Path,
+    clean_content: &str,
+) {
+    let new_errors = crate::prediction::resolve::process_task_output(
+        &mut stack,
+        clean_content,
+        &task.id,
+        crate::prediction::Timescale::Cycle,
+    );
+    if !new_errors.is_empty() {
+        tracing::info!(
+            "Prediction errors: {} new (accumulated importance: {:.2})",
+            new_errors.len(),
+            stack.accumulated_importance(),
+        );
+    }
+    stack.prune(
+        state.config.prediction.max_unresolved,
+        state.config.prediction.max_errors,
+    );
+    if let Err(e) = crate::prediction::store::save_async(root_dir.to_path_buf(), stack).await {
+        tracing::error!("Failed to save prediction stack: {e}");
+    }
 }
