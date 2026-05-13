@@ -171,18 +171,17 @@ pub fn parse_resolutions(text: &str) -> Vec<ParsedResolution> {
 /// This is the main entry point for integrating predictions into the cognitive cycle.
 /// It parses both `[PREDICT:...]` and `[RESOLVE:...]` markers from the task output,
 /// adds new predictions to the stack, resolves existing ones, and returns any
-/// new `PredictionError`s that were generated.
+/// new `PredictionError`s that were generated. The surprise cutoff for promoting
+/// a resolution into a `PredictionError` is `stack.config.surprise_threshold`.
 ///
 /// # Arguments
 ///
-/// * `stack` - The prediction stack to update.
+/// * `stack` - The prediction stack to update. Surprise threshold is read from
+///   `stack.config.surprise_threshold` so callers configure once at stack
+///   construction rather than on every call.
 /// * `task_output` - The raw text output from the entity's cognitive cycle.
 /// * `task_id` - Identifier for the task (used for logging).
 /// * `default_timescale` - The timescale to assign to new predictions from this task.
-/// * `surprise_threshold` - Cutoff for promoting a resolution into an
-///   attention-demanding `PredictionError`. Threaded from
-///   `PredictionConfig::surprise_threshold` so it remains calibratable
-///   per entity without a code change.
 ///
 /// # Returns
 ///
@@ -192,7 +191,6 @@ pub fn process_task_output(
     task_output: &str,
     task_id: &str,
     default_timescale: Timescale,
-    surprise_threshold: f64,
 ) -> Vec<PredictionError> {
     let errors_before = stack.errors.len();
 
@@ -220,7 +218,7 @@ pub fn process_task_output(
             insight: parsed.insight.clone(),
         };
 
-        if stack.resolve(&parsed.prediction_id, resolution, surprise_threshold) {
+        if stack.resolve(&parsed.prediction_id, resolution) {
             tracing::info!(
                 task_id = %task_id,
                 prediction_id = %parsed.prediction_id,
@@ -341,17 +339,14 @@ mod tests {
         assert!(parse_resolutions(text).is_empty());
     }
 
-    /// Test default — matches `PredictionConfig::surprise_threshold` default
-    /// so test behavior tracks the documented production default.
-    const TEST_THRESHOLD: f64 = 0.3;
+    use crate::config::PredictionConfig;
 
     #[test]
     fn process_task_output_adds_predictions() {
         let mut stack = PredictionStack::new();
         let text = "[PREDICT:user will return tomorrow|0.6]";
 
-        let errors =
-            process_task_output(&mut stack, text, "test-task", Timescale::Cycle, TEST_THRESHOLD);
+        let errors = process_task_output(&mut stack, text, "test-task", Timescale::Cycle);
 
         assert!(errors.is_empty());
         assert_eq!(stack.predictions.len(), 1);
@@ -369,13 +364,7 @@ mod tests {
         let text = format!(
             "[RESOLVE:{id}|it rained instead|0.7|misdirected|completely wrong about weather]"
         );
-        let errors = process_task_output(
-            &mut stack,
-            &text,
-            "test-task",
-            Timescale::Cycle,
-            TEST_THRESHOLD,
-        );
+        let errors = process_task_output(&mut stack, &text, "test-task", Timescale::Cycle);
 
         assert_eq!(errors.len(), 1);
         assert_eq!(errors[0].surprise, 0.7);
@@ -392,13 +381,7 @@ mod tests {
 
         let text =
             format!("[PREDICT:new prediction|0.7] some text [RESOLVE:{id}|happened|0.8|novel|wow]");
-        let errors = process_task_output(
-            &mut stack,
-            &text,
-            "test-task",
-            Timescale::Session,
-            TEST_THRESHOLD,
-        );
+        let errors = process_task_output(&mut stack, &text, "test-task", Timescale::Session);
 
         // Should have the old prediction (now resolved) + the new one
         assert_eq!(stack.predictions.len(), 2);
@@ -419,7 +402,6 @@ mod tests {
             "just regular text",
             "test-task",
             Timescale::Cycle,
-            TEST_THRESHOLD,
         );
 
         assert!(errors.is_empty());
@@ -435,39 +417,39 @@ mod tests {
             .clone();
 
         let text = format!("[RESOLVE:{id}|as expected|0.1|underconfident]");
-        let errors = process_task_output(
-            &mut stack,
-            &text,
-            "test-task",
-            Timescale::Cycle,
-            TEST_THRESHOLD,
-        );
+        let errors = process_task_output(&mut stack, &text, "test-task", Timescale::Cycle);
 
         assert!(errors.is_empty());
         assert!(stack.predictions[0].resolution.is_some());
     }
 
     #[test]
-    fn process_task_output_threshold_override() {
-        // With threshold = 0.6, the 0.5-surprise resolution stays below
-        // and no error is created (proves the parameter is used).
-        let mut stack = PredictionStack::new();
+    fn process_task_output_threshold_from_config() {
+        // With threshold = 0.6 in the stack's config, the 0.5-surprise
+        // resolution stays below and no error is created.
+        let mut stack = PredictionStack::with_config(PredictionConfig {
+            surprise_threshold: 0.6,
+            ..PredictionConfig::default()
+        });
         let id = stack
             .add_prediction(Timescale::Cycle, "p".to_string(), 0.5)
             .id
             .clone();
         let text = format!("[RESOLVE:{id}|done|0.5|misdirected]");
-        let errors = process_task_output(&mut stack, &text, "test", Timescale::Cycle, 0.6);
+        let errors = process_task_output(&mut stack, &text, "test", Timescale::Cycle);
         assert!(errors.is_empty());
 
         // Same input with threshold = 0.4 produces an error.
-        let mut stack2 = PredictionStack::new();
+        let mut stack2 = PredictionStack::with_config(PredictionConfig {
+            surprise_threshold: 0.4,
+            ..PredictionConfig::default()
+        });
         let id2 = stack2
             .add_prediction(Timescale::Cycle, "p".to_string(), 0.5)
             .id
             .clone();
         let text2 = format!("[RESOLVE:{id2}|done|0.5|misdirected]");
-        let errors2 = process_task_output(&mut stack2, &text2, "test", Timescale::Cycle, 0.4);
+        let errors2 = process_task_output(&mut stack2, &text2, "test", Timescale::Cycle);
         assert_eq!(errors2.len(), 1);
     }
 

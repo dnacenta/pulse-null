@@ -521,7 +521,8 @@ async fn execute_task(
     // resolve.rs parses them and applies to the persistent stack. Best-
     // effort throughout. See continuous-entity-process-spec.md Phase 2.
     if state.config.prediction.enabled {
-        let mut stack = crate::prediction::store::load(&root_dir);
+        let mut stack =
+            crate::prediction::store::load(&root_dir, state.config.prediction.clone());
         let new_errors = crate::prediction::resolve::process_task_output(
             &mut stack,
             &parsed.clean_content,

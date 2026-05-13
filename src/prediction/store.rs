@@ -8,6 +8,7 @@ use std::fs;
 use std::path::Path;
 
 use super::PredictionStack;
+use crate::config::PredictionConfig;
 
 /// File name for the prediction stack on disk.
 const PREDICTIONS_FILE: &str = "predictions.json";
@@ -15,13 +16,16 @@ const PREDICTIONS_FILE: &str = "predictions.json";
 /// Temporary file used during atomic writes.
 const PREDICTIONS_TMP: &str = "predictions.json.tmp";
 
-/// Load the prediction stack from disk.
+/// Load the prediction stack from disk and apply the given config.
 ///
-/// Returns an empty stack if the file is missing, unreadable, or contains
-/// invalid JSON. This ensures the prediction engine always has a valid state
-/// to work with, even on first boot or after corruption.
+/// `predictions.json` carries only the per-entity predictions and errors —
+/// calibration knobs (`PredictionConfig`) live in `pulse-null.toml` and are
+/// always rehydrated from the caller's `Config`, never from the snapshot.
+/// Returns an empty stack with `config` if the file is missing, unreadable,
+/// or contains invalid JSON, so the prediction engine always boots with a
+/// valid state.
 #[must_use]
-pub fn load(root_dir: &Path) -> PredictionStack {
+pub fn load(root_dir: &Path, config: PredictionConfig) -> PredictionStack {
     let path = root_dir.join(PREDICTIONS_FILE);
 
     let content = match fs::read_to_string(&path) {
@@ -34,16 +38,17 @@ pub fn load(root_dir: &Path) -> PredictionStack {
                     "Failed to read predictions file, starting with empty stack"
                 );
             }
-            return PredictionStack::new();
+            return PredictionStack::with_config(config);
         }
     };
 
-    match serde_json::from_str(&content) {
-        Ok(stack) => {
+    match serde_json::from_str::<PredictionStack>(&content) {
+        Ok(mut stack) => {
             tracing::info!(
                 path = %path.display(),
                 "Loaded prediction stack from disk"
             );
+            stack.config = config;
             stack
         }
         Err(e) => {
@@ -52,7 +57,7 @@ pub fn load(root_dir: &Path) -> PredictionStack {
                 error = %e,
                 "Corrupt predictions file, starting with empty stack"
             );
-            PredictionStack::new()
+            PredictionStack::with_config(config)
         }
     }
 }
@@ -96,7 +101,7 @@ mod tests {
     #[test]
     fn load_returns_empty_when_missing() {
         let tmp = TempDir::new().unwrap();
-        let stack = load(tmp.path());
+        let stack = load(tmp.path(), PredictionConfig::default());
         assert!(stack.predictions.is_empty());
         assert!(stack.errors.is_empty());
     }
@@ -122,7 +127,7 @@ mod tests {
 
         save(tmp.path(), &stack).unwrap();
 
-        let loaded = load(tmp.path());
+        let loaded = load(tmp.path(), PredictionConfig::default());
         assert_eq!(loaded.predictions.len(), 1);
         assert_eq!(loaded.predictions[0].id, id);
         assert_eq!(loaded.predictions[0].content, "test prediction");
@@ -135,7 +140,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         fs::write(tmp.path().join(PREDICTIONS_FILE), "not valid json {{{").unwrap();
 
-        let stack = load(tmp.path());
+        let stack = load(tmp.path(), PredictionConfig::default());
         assert!(stack.predictions.is_empty());
     }
 
@@ -172,7 +177,7 @@ mod tests {
         stack.add_prediction(Timescale::Session, "second".to_string(), 0.7);
         save(tmp.path(), &stack).unwrap();
 
-        let loaded = load(tmp.path());
+        let loaded = load(tmp.path(), PredictionConfig::default());
         assert_eq!(loaded.predictions.len(), 2);
     }
 }

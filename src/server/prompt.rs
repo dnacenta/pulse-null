@@ -462,7 +462,7 @@ pub fn build_system_prompt_budgeted(
     // continuous-entity-process-spec.md Phase 2 (Hierarchical Predictive
     // Self-Modeling). Only renders when there's something to surface.
     if config.prediction.enabled {
-        let stack = crate::prediction::store::load(root_dir);
+        let stack = crate::prediction::store::load(root_dir, config.prediction.clone());
         let importance = stack.accumulated_importance();
         let recent = stack.recent_errors(5);
         if !recent.is_empty() {
@@ -1247,6 +1247,7 @@ mod tests {
             autonomy: AutonomyConfig::default(),
             pulse: PulseConfig::default(),
             graph: GraphConfig::default(),
+            prediction: PredictionConfig::default(),
             sessions: SessionConfig::default(),
             context_buffer: crate::context_buffer::ContextBufferConfig::default(),
             session_health: crate::session_health::SessionHealthConfig::default(),

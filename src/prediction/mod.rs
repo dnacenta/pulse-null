@@ -35,10 +35,6 @@
 //! unprocessed `PredictionError`s, which the prompt builder surfaces back
 //! to the entity in the next turn.
 
-#![allow(dead_code)]
-// Types and functions defined here are consumed by the scheduler/executor in a later phase.
-// Suppress dead_code until integration completes.
-
 pub mod resolve;
 pub mod store;
 
@@ -46,12 +42,7 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-/// Default surprise threshold for tests. Production callers thread the
-/// value from `PredictionConfig::surprise_threshold` so it stays
-/// config-driven; see `continuous-entity-process-spec.md` Phase 2 for the
-/// calibration plan (0.3 is an INITIAL GUESS, not literature-grounded).
-#[cfg(test)]
-const DEFAULT_SURPRISE_THRESHOLD: f64 = 0.3;
+use crate::config::PredictionConfig;
 
 /// The timescale at which a prediction operates.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -182,13 +173,37 @@ pub struct PredictionStack {
     pub predictions: Vec<Prediction>,
     /// Prediction errors generated from high-surprise resolutions.
     pub errors: Vec<PredictionError>,
+    /// Calibration knobs (thresholds, caps) — loaded from `Config::prediction`.
+    /// `#[serde(skip)]` because config lives in `pulse-null.toml`, not the
+    /// per-entity `predictions.json` snapshot; reload from `Config` on boot.
+    #[serde(skip)]
+    pub config: PredictionConfig,
 }
 
 impl PredictionStack {
-    /// Create an empty prediction stack.
+    /// Create an empty prediction stack with default config.
+    ///
+    /// `#[cfg(test)]`-gated — production callers always know the entity's
+    /// `PredictionConfig` and should construct via `with_config`, which
+    /// `store::load` does for them.
+    #[cfg(test)]
     #[must_use]
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Create an empty prediction stack with the given config.
+    ///
+    /// Production constructs this from `state.config.prediction.clone()`;
+    /// tests construct ad-hoc configs to vary thresholds without threading
+    /// values through every call site.
+    #[must_use]
+    pub fn with_config(config: PredictionConfig) -> Self {
+        Self {
+            predictions: Vec::new(),
+            errors: Vec::new(),
+            config,
+        }
     }
 
     /// Add a new prediction to the stack.
@@ -215,6 +230,10 @@ impl PredictionStack {
     }
 
     /// Iterate over unresolved predictions at the given timescale.
+    ///
+    /// `#[cfg(test)]`-gated until Phase 2 Increment 3 wires the
+    /// reflection-window evaluator that filters by timescale.
+    #[cfg(test)]
     pub fn pending(&self, timescale: Timescale) -> impl Iterator<Item = &Prediction> {
         self.predictions
             .iter()
@@ -223,21 +242,11 @@ impl PredictionStack {
 
     /// Resolve a prediction by ID.
     ///
-    /// If the resolution's surprise exceeds the threshold, a `PredictionError`
-    /// is created and added to the error queue. Returns `true` if the prediction
-    /// was found and resolved, `false` if not found or already resolved.
-    ///
-    /// `surprise_threshold` is the cutoff above which a resolution generates
-    /// a `PredictionError`. Below the threshold the resolution is recorded
-    /// but no attention-demanding error is created. Threaded from
-    /// `PredictionConfig::surprise_threshold` so it stays calibratable per
-    /// entity without a code change.
-    pub fn resolve(
-        &mut self,
-        prediction_id: &str,
-        resolution: PredictionResolution,
-        surprise_threshold: f64,
-    ) -> bool {
+    /// If the resolution's surprise exceeds `self.config.surprise_threshold`,
+    /// a `PredictionError` is created and added to the error queue. Returns
+    /// `true` if the prediction was found and resolved, `false` if not found
+    /// or already resolved.
+    pub fn resolve(&mut self, prediction_id: &str, resolution: PredictionResolution) -> bool {
         let prediction = self
             .predictions
             .iter_mut()
@@ -256,8 +265,8 @@ impl PredictionStack {
 
         let surprise = resolution.surprise.clamp(0.0, 1.0);
 
-        // Create a prediction error if surprise exceeds threshold
-        if surprise > surprise_threshold {
+        // Create a prediction error if surprise exceeds the configured threshold.
+        if surprise > self.config.surprise_threshold {
             self.errors.push(PredictionError {
                 prediction_id: prediction_id.to_string(),
                 surprise,
@@ -283,6 +292,10 @@ impl PredictionStack {
     }
 
     /// Mark a set of prediction errors as processed by their prediction IDs.
+    ///
+    /// `#[cfg(test)]`-gated until Phase 2 Increment 3 wires the
+    /// reflection-window pipeline-graduation hook that consumes errors.
+    #[cfg(test)]
     pub fn mark_errors_processed(&mut self, ids: &[String]) {
         for error in &mut self.errors {
             if ids.contains(&error.prediction_id) {
