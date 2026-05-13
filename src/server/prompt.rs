@@ -462,26 +462,35 @@ pub fn build_system_prompt_budgeted(
     // continuous-entity-process-spec.md Phase 2 (Hierarchical Predictive
     // Self-Modeling). Only renders when there's something to surface.
     if config.prediction.enabled {
+        // build_system_prompt_budgeted is sync and is called from inside the
+        // spawn_blocking issued by build_system_prompt_async, so sync IO here
+        // doesn't block the tokio worker pool. async callers use load_async.
         let stack = crate::prediction::store::load(root_dir, config.prediction.clone());
         let importance = stack.accumulated_importance();
         let recent = stack.recent_errors(5);
         if !recent.is_empty() {
-            let mut block = format!(
+            use std::fmt::Write as _;
+            let mut block = String::new();
+            // String's Write impl is infallible — discard the unit Result.
+            let _ = write!(
+                &mut block,
                 "<prediction-context importance=\"{importance:.1}\">\nRecent prediction errors:\n"
             );
             for err in recent {
-                block.push_str(&format!(
-                    "- [{}] surprise {:.1}: {}\n",
+                let _ = writeln!(
+                    &mut block,
+                    "- [{}] surprise {:.1}: {}",
                     err.direction,
                     err.surprise,
                     err.insight.as_deref().unwrap_or("no insight recorded"),
-                ));
+                );
             }
             let pending_count = stack.predictions.iter().filter(|p| p.is_pending()).count();
             if pending_count > 0 {
-                block.push_str(&format!(
-                    "{pending_count} predictions awaiting resolution\n"
-                ));
+                let _ = writeln!(
+                    &mut block,
+                    "{pending_count} predictions awaiting resolution"
+                );
             }
             block.push_str("</prediction-context>");
             let tokens = estimate_tokens(&block);

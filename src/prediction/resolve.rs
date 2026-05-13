@@ -1,18 +1,25 @@
 //! Prediction resolution — parsing structured markers from entity task output.
 //!
-//! The entity writes structured markers in its cognitive cycle output:
-//! - `[PREDICT:content|confidence]` — a new prediction
-//! - `[RESOLVE:id|actual|surprise|direction|insight]` — resolution of an existing prediction
+//! The entity writes JSON-in-marker structures in its cognitive cycle output:
+//! - `[PREDICT:{"content":"...","confidence":0.7}]` — a new prediction
+//! - `[RESOLVE:{"id":"...","outcome":"...","surprise":0.4,"direction":"misdirected","insight":"..."}]` —
+//!   resolution of an existing prediction
 //!
-//! This module extracts those markers, validates them, and applies them to the
-//! prediction stack. Malformed markers are logged and skipped — never fatal.
+//! Sibling pattern: `scheduler::output::parse_output` parses the same
+//! `[MARKER: {json}]` shape for `[INTENT:...]` / `[SCHEDULE:...]`. Sharing
+//! the shape lets the LLM emit prediction markers without learning a second
+//! grammar, and eliminates the silent-drop fragility of the previous
+//! pipe-separated parser (`|` or `]` inside content broke it).
+//!
+//! Malformed markers are logged and skipped — never fatal.
 
 use regex::Regex;
+use serde::Deserialize;
 use std::sync::LazyLock;
 
 use super::{ErrorDirection, PredictionError, PredictionResolution, PredictionStack, Timescale};
 
-/// A prediction parsed from task output markers.
+/// A prediction parsed from a `[PREDICT:{...}]` marker.
 #[derive(Debug, Clone)]
 pub struct ParsedPrediction {
     /// What the entity predicts will happen.
@@ -23,7 +30,7 @@ pub struct ParsedPrediction {
     pub timescale: Timescale,
 }
 
-/// A resolution parsed from task output markers.
+/// A resolution parsed from a `[RESOLVE:{...}]` marker.
 #[derive(Debug, Clone)]
 pub struct ParsedResolution {
     /// The ID of the prediction being resolved.
@@ -38,61 +45,75 @@ pub struct ParsedResolution {
     pub insight: Option<String>,
 }
 
-/// Regex for matching `[PREDICT:content|confidence]` markers.
-///
-/// The content field can contain any characters except `|` and `]`.
-/// Confidence is a decimal number.
+/// JSON payload inside a `[PREDICT:{...}]` marker.
+#[derive(Debug, Deserialize)]
+struct PredictionMarker {
+    content: String,
+    confidence: f64,
+}
+
+/// JSON payload inside a `[RESOLVE:{...}]` marker.
+#[derive(Debug, Deserialize)]
+struct ResolutionMarker {
+    id: String,
+    outcome: String,
+    surprise: f64,
+    direction: String,
+    #[serde(default)]
+    insight: Option<String>,
+}
+
+/// Regex for matching `[PREDICT:{...}]` markers. The capture group is the
+/// JSON payload, parsed with `serde_json::from_str` into `PredictionMarker`.
 static PREDICT_RE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"\[PREDICT:([^|\]]+)\|([^|\]]+)\]").expect("PREDICT regex is valid")
+    Regex::new(r"\[PREDICT:\s*(\{[\s\S]*?\})\s*\]").expect("PREDICT regex is valid")
 });
 
-/// Regex for matching `[RESOLVE:id|actual|surprise|direction|insight]` markers.
-///
-/// The insight field is optional — the marker can have 4 or 5 pipe-delimited fields.
-/// All fields except insight cannot contain `|` or `]`.
+/// Regex for matching `[RESOLVE:{...}]` markers. Same pattern as PREDICT_RE.
 static RESOLVE_RE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"\[RESOLVE:([^|\]]+)\|([^|\]]+)\|([^|\]]+)\|([^|\]]+?)(?:\|([^|\]]*))?\]")
-        .expect("RESOLVE regex is valid")
+    Regex::new(r"\[RESOLVE:\s*(\{[\s\S]*?\})\s*\]").expect("RESOLVE regex is valid")
 });
 
-/// Parse prediction markers from entity task output.
+/// Parse `[PREDICT:{...}]` markers from entity task output.
 ///
-/// Extracts all `[PREDICT:content|confidence]` markers from the text.
-/// Invalid confidence values are logged and the marker is skipped.
-/// The timescale is set to the provided default since predictions
-/// inherit their timescale from the task context.
+/// Each match is `serde_json::from_str`'d into `PredictionMarker`; malformed
+/// JSON, missing fields, or empty content cause the marker to be skipped
+/// with a warning. Confidence outside [0,1] is clamped (recoverable LLM
+/// mistake) rather than dropped.
 pub fn parse_predictions(text: &str, default_timescale: Timescale) -> Vec<ParsedPrediction> {
     let mut predictions = Vec::new();
 
     for caps in PREDICT_RE.captures_iter(text) {
-        let content = caps[1].trim().to_string();
-        let confidence_str = caps[2].trim();
+        let payload = &caps[1];
 
-        let confidence = match confidence_str.parse::<f64>() {
-            Ok(c) if (0.0..=1.0).contains(&c) => c,
-            Ok(c) => {
-                tracing::warn!(
-                    content = %content,
-                    raw_confidence = %c,
-                    "Prediction confidence out of range, clamping to [0.0, 1.0]"
-                );
-                c.clamp(0.0, 1.0)
-            }
+        let marker: PredictionMarker = match serde_json::from_str(payload) {
+            Ok(m) => m,
             Err(e) => {
                 tracing::warn!(
-                    content = %content,
-                    raw = %confidence_str,
+                    raw = %payload,
                     error = %e,
-                    "Skipping prediction with unparseable confidence"
+                    "Skipping prediction with unparseable JSON marker"
                 );
                 continue;
             }
         };
 
+        let content = marker.content.trim().to_string();
         if content.is_empty() {
             tracing::warn!("Skipping prediction with empty content");
             continue;
         }
+
+        let confidence = if (0.0..=1.0).contains(&marker.confidence) {
+            marker.confidence
+        } else {
+            tracing::warn!(
+                content = %content,
+                raw_confidence = %marker.confidence,
+                "Prediction confidence out of range, clamping to [0.0, 1.0]"
+            );
+            marker.confidence.clamp(0.0, 1.0)
+        };
 
         predictions.push(ParsedPrediction {
             content,
@@ -104,48 +125,31 @@ pub fn parse_predictions(text: &str, default_timescale: Timescale) -> Vec<Parsed
     predictions
 }
 
-/// Parse resolution markers from entity task output.
+/// Parse `[RESOLVE:{...}]` markers from entity task output.
 ///
-/// Extracts all `[RESOLVE:id|actual|surprise|direction|insight]` markers.
-/// The insight field is optional. Invalid fields are logged and the marker is skipped.
+/// Each match is `serde_json::from_str`'d into `ResolutionMarker`; malformed
+/// JSON, unknown `direction`, or empty `id`/`outcome` cause the marker to be
+/// skipped with a warning.
 pub fn parse_resolutions(text: &str) -> Vec<ParsedResolution> {
     let mut resolutions = Vec::new();
 
     for caps in RESOLVE_RE.captures_iter(text) {
-        let prediction_id = caps[1].trim().to_string();
-        let actual = caps[2].trim().to_string();
-        let surprise_str = caps[3].trim();
-        let direction_str = caps[4].trim();
-        let insight = caps
-            .get(5)
-            .map(|m| m.as_str().trim().to_string())
-            .filter(|s| !s.is_empty());
+        let payload = &caps[1];
 
-        let surprise = match surprise_str.parse::<f64>() {
-            Ok(s) => s.clamp(0.0, 1.0),
+        let marker: ResolutionMarker = match serde_json::from_str(payload) {
+            Ok(m) => m,
             Err(e) => {
                 tracing::warn!(
-                    prediction_id = %prediction_id,
-                    raw = %surprise_str,
+                    raw = %payload,
                     error = %e,
-                    "Skipping resolution with unparseable surprise"
+                    "Skipping resolution with unparseable JSON marker"
                 );
                 continue;
             }
         };
 
-        let direction = match ErrorDirection::from_str_loose(direction_str) {
-            Some(d) => d,
-            None => {
-                tracing::warn!(
-                    prediction_id = %prediction_id,
-                    raw = %direction_str,
-                    "Skipping resolution with unknown direction"
-                );
-                continue;
-            }
-        };
-
+        let prediction_id = marker.id.trim().to_string();
+        let actual = marker.outcome.trim().to_string();
         if prediction_id.is_empty() || actual.is_empty() {
             tracing::warn!(
                 prediction_id = %prediction_id,
@@ -153,6 +157,24 @@ pub fn parse_resolutions(text: &str) -> Vec<ParsedResolution> {
             );
             continue;
         }
+
+        let direction = match ErrorDirection::from_str_loose(marker.direction.trim()) {
+            Some(d) => d,
+            None => {
+                tracing::warn!(
+                    prediction_id = %prediction_id,
+                    raw = %marker.direction,
+                    "Skipping resolution with unknown direction"
+                );
+                continue;
+            }
+        };
+
+        let surprise = marker.surprise.clamp(0.0, 1.0);
+        let insight = marker
+            .insight
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty());
 
         resolutions.push(ParsedResolution {
             prediction_id,
@@ -245,10 +267,11 @@ pub fn process_task_output(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::PredictionConfig;
 
     #[test]
     fn parse_single_prediction() {
-        let text = "Some output [PREDICT:user will ask about weather|0.7] more text";
+        let text = r#"Some output [PREDICT:{"content":"user will ask about weather","confidence":0.7}] more"#;
         let predictions = parse_predictions(text, Timescale::Cycle);
 
         assert_eq!(predictions.len(), 1);
@@ -259,7 +282,11 @@ mod tests {
 
     #[test]
     fn parse_multiple_predictions() {
-        let text = "[PREDICT:first prediction|0.5] middle [PREDICT:second prediction|0.9]";
+        let text = concat!(
+            r#"[PREDICT:{"content":"first prediction","confidence":0.5}]"#,
+            " middle ",
+            r#"[PREDICT:{"content":"second prediction","confidence":0.9}]"#,
+        );
         let predictions = parse_predictions(text, Timescale::Session);
 
         assert_eq!(predictions.len(), 2);
@@ -269,7 +296,7 @@ mod tests {
 
     #[test]
     fn parse_prediction_clamps_confidence() {
-        let text = "[PREDICT:overconfident|1.5]";
+        let text = r#"[PREDICT:{"content":"overconfident","confidence":1.5}]"#;
         let predictions = parse_predictions(text, Timescale::Cycle);
 
         assert_eq!(predictions.len(), 1);
@@ -277,15 +304,23 @@ mod tests {
     }
 
     #[test]
-    fn parse_prediction_skips_invalid_confidence() {
-        let text = "[PREDICT:bad confidence|not_a_number]";
+    fn parse_prediction_skips_invalid_json() {
+        let text = r#"[PREDICT:{"content":"bad","confidence":"not_a_number"}]"#;
+        let predictions = parse_predictions(text, Timescale::Cycle);
+        assert!(predictions.is_empty());
+    }
+
+    #[test]
+    fn parse_prediction_skips_missing_field() {
+        // No "confidence" key — required, no Default
+        let text = r#"[PREDICT:{"content":"missing confidence"}]"#;
         let predictions = parse_predictions(text, Timescale::Cycle);
         assert!(predictions.is_empty());
     }
 
     #[test]
     fn parse_single_resolution() {
-        let text = "[RESOLVE:abc-123|it rained|0.6|overconfident|weather models were wrong]";
+        let text = r#"[RESOLVE:{"id":"abc-123","outcome":"it rained","surprise":0.6,"direction":"overconfident","insight":"weather models were wrong"}]"#;
         let resolutions = parse_resolutions(text);
 
         assert_eq!(resolutions.len(), 1);
@@ -301,7 +336,7 @@ mod tests {
 
     #[test]
     fn parse_resolution_without_insight() {
-        let text = "[RESOLVE:abc-123|it rained|0.6|overconfident]";
+        let text = r#"[RESOLVE:{"id":"abc-123","outcome":"it rained","surprise":0.6,"direction":"overconfident"}]"#;
         let resolutions = parse_resolutions(text);
 
         assert_eq!(resolutions.len(), 1);
@@ -311,21 +346,22 @@ mod tests {
 
     #[test]
     fn parse_resolution_skips_unknown_direction() {
-        let text = "[RESOLVE:abc-123|outcome|0.5|banana]";
+        let text =
+            r#"[RESOLVE:{"id":"abc-123","outcome":"x","surprise":0.5,"direction":"banana"}]"#;
         let resolutions = parse_resolutions(text);
         assert!(resolutions.is_empty());
     }
 
     #[test]
     fn parse_resolution_skips_invalid_surprise() {
-        let text = "[RESOLVE:abc-123|outcome|high|overconfident]";
+        let text = r#"[RESOLVE:{"id":"abc-123","outcome":"x","surprise":"high","direction":"overconfident"}]"#;
         let resolutions = parse_resolutions(text);
         assert!(resolutions.is_empty());
     }
 
     #[test]
     fn parse_resolution_clamps_surprise() {
-        let text = "[RESOLVE:abc-123|outcome|1.5|novel]";
+        let text = r#"[RESOLVE:{"id":"abc-123","outcome":"x","surprise":1.5,"direction":"novel"}]"#;
         let resolutions = parse_resolutions(text);
 
         assert_eq!(resolutions.len(), 1);
@@ -339,12 +375,20 @@ mod tests {
         assert!(parse_resolutions(text).is_empty());
     }
 
-    use crate::config::PredictionConfig;
+    #[test]
+    fn content_with_pipe_no_longer_breaks() {
+        // The old pipe-separated parser dropped any content containing `|`.
+        // JSON-in-marker is immune to that class of failure.
+        let text = r#"[PREDICT:{"content":"a|b|c with pipes","confidence":0.4}]"#;
+        let predictions = parse_predictions(text, Timescale::Cycle);
+        assert_eq!(predictions.len(), 1);
+        assert_eq!(predictions[0].content, "a|b|c with pipes");
+    }
 
     #[test]
     fn process_task_output_adds_predictions() {
         let mut stack = PredictionStack::new();
-        let text = "[PREDICT:user will return tomorrow|0.6]";
+        let text = r#"[PREDICT:{"content":"user will return tomorrow","confidence":0.6}]"#;
 
         let errors = process_task_output(&mut stack, text, "test-task", Timescale::Cycle);
 
@@ -362,7 +406,7 @@ mod tests {
             .clone();
 
         let text = format!(
-            "[RESOLVE:{id}|it rained instead|0.7|misdirected|completely wrong about weather]"
+            r#"[RESOLVE:{{"id":"{id}","outcome":"it rained instead","surprise":0.7,"direction":"misdirected","insight":"completely wrong about weather"}}]"#
         );
         let errors = process_task_output(&mut stack, &text, "test-task", Timescale::Cycle);
 
@@ -379,8 +423,9 @@ mod tests {
             .id
             .clone();
 
-        let text =
-            format!("[PREDICT:new prediction|0.7] some text [RESOLVE:{id}|happened|0.8|novel|wow]");
+        let text = format!(
+            r#"[PREDICT:{{"content":"new prediction","confidence":0.7}}] some text [RESOLVE:{{"id":"{id}","outcome":"happened","surprise":0.8,"direction":"novel","insight":"wow"}}]"#
+        );
         let errors = process_task_output(&mut stack, &text, "test-task", Timescale::Session);
 
         // Should have the old prediction (now resolved) + the new one
@@ -416,7 +461,9 @@ mod tests {
             .id
             .clone();
 
-        let text = format!("[RESOLVE:{id}|as expected|0.1|underconfident]");
+        let text = format!(
+            r#"[RESOLVE:{{"id":"{id}","outcome":"as expected","surprise":0.1,"direction":"underconfident"}}]"#
+        );
         let errors = process_task_output(&mut stack, &text, "test-task", Timescale::Cycle);
 
         assert!(errors.is_empty());
@@ -435,7 +482,9 @@ mod tests {
             .add_prediction(Timescale::Cycle, "p".to_string(), 0.5)
             .id
             .clone();
-        let text = format!("[RESOLVE:{id}|done|0.5|misdirected]");
+        let text = format!(
+            r#"[RESOLVE:{{"id":"{id}","outcome":"done","surprise":0.5,"direction":"misdirected"}}]"#
+        );
         let errors = process_task_output(&mut stack, &text, "test", Timescale::Cycle);
         assert!(errors.is_empty());
 
@@ -448,27 +497,28 @@ mod tests {
             .add_prediction(Timescale::Cycle, "p".to_string(), 0.5)
             .id
             .clone();
-        let text2 = format!("[RESOLVE:{id2}|done|0.5|misdirected]");
+        let text2 = format!(
+            r#"[RESOLVE:{{"id":"{id2}","outcome":"done","surprise":0.5,"direction":"misdirected"}}]"#
+        );
         let errors2 = process_task_output(&mut stack2, &text2, "test", Timescale::Cycle);
         assert_eq!(errors2.len(), 1);
     }
 
     #[test]
     fn parse_resolution_with_empty_insight() {
-        let text = "[RESOLVE:abc-123|outcome|0.5|novel|]";
+        let text = r#"[RESOLVE:{"id":"abc-123","outcome":"x","surprise":0.5,"direction":"novel","insight":""}]"#;
         let resolutions = parse_resolutions(text);
 
         assert_eq!(resolutions.len(), 1);
-        // Empty insight is treated as None
         assert!(resolutions[0].insight.is_none());
     }
 
     #[test]
     fn mixed_valid_and_invalid_markers() {
         let text = concat!(
-            "[PREDICT:good prediction|0.5]",
-            "[PREDICT:bad confidence|xyz]",
-            "[PREDICT:another good one|0.9]",
+            r#"[PREDICT:{"content":"good prediction","confidence":0.5}]"#,
+            r#"[PREDICT:{"content":"bad confidence","confidence":"xyz"}]"#,
+            r#"[PREDICT:{"content":"another good one","confidence":0.9}]"#,
         );
         let predictions = parse_predictions(text, Timescale::Cycle);
         assert_eq!(predictions.len(), 2);
@@ -476,7 +526,9 @@ mod tests {
 
     #[test]
     fn markers_with_whitespace() {
-        let text = "[PREDICT: spaced content | 0.7 ]";
+        // serde_json tolerates whitespace inside the JSON; the outer regex
+        // tolerates whitespace between `[PREDICT:` / `]` and the payload.
+        let text = r#"[PREDICT:  { "content" : "spaced content" , "confidence" : 0.7 }  ]"#;
         let predictions = parse_predictions(text, Timescale::Cycle);
 
         assert_eq!(predictions.len(), 1);
@@ -486,7 +538,7 @@ mod tests {
 
     #[test]
     fn uuid_style_prediction_ids() {
-        let text = "[RESOLVE:550e8400-e29b-41d4-a716-446655440000|result|0.5|novel|insight here]";
+        let text = r#"[RESOLVE:{"id":"550e8400-e29b-41d4-a716-446655440000","outcome":"result","surprise":0.5,"direction":"novel","insight":"insight here"}]"#;
         let resolutions = parse_resolutions(text);
 
         assert_eq!(resolutions.len(), 1);

@@ -38,6 +38,9 @@
 pub mod resolve;
 pub mod store;
 
+#[cfg(test)]
+mod integration_tests;
+
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -92,14 +95,19 @@ impl std::fmt::Display for ErrorDirection {
 }
 
 impl ErrorDirection {
-    /// Parse from a string, case-insensitive.
+    /// Parse from a string, case-insensitive. ASCII-only, allocation-free.
     pub fn from_str_loose(s: &str) -> Option<Self> {
-        match s.trim().to_lowercase().as_str() {
-            "overconfident" => Some(Self::Overconfident),
-            "underconfident" => Some(Self::Underconfident),
-            "misdirected" => Some(Self::Misdirected),
-            "novel" => Some(Self::Novel),
-            _ => None,
+        let trimmed = s.trim();
+        if trimmed.eq_ignore_ascii_case("overconfident") {
+            Some(Self::Overconfident)
+        } else if trimmed.eq_ignore_ascii_case("underconfident") {
+            Some(Self::Underconfident)
+        } else if trimmed.eq_ignore_ascii_case("misdirected") {
+            Some(Self::Misdirected)
+        } else if trimmed.eq_ignore_ascii_case("novel") {
+            Some(Self::Novel)
+        } else {
+            None
         }
     }
 }

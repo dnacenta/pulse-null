@@ -522,7 +522,8 @@ async fn execute_task(
     // effort throughout. See continuous-entity-process-spec.md Phase 2.
     if state.config.prediction.enabled {
         let mut stack =
-            crate::prediction::store::load(&root_dir, state.config.prediction.clone());
+            crate::prediction::store::load_async(root_dir.clone(), state.config.prediction.clone())
+                .await;
         let new_errors = crate::prediction::resolve::process_task_output(
             &mut stack,
             &parsed.clean_content,
@@ -537,7 +538,7 @@ async fn execute_task(
             );
         }
         stack.prune(state.config.prediction.max_unresolved, 50);
-        if let Err(e) = crate::prediction::store::save(&root_dir, &stack) {
+        if let Err(e) = crate::prediction::store::save_async(root_dir.clone(), stack).await {
             tracing::error!("Failed to save prediction stack: {e}");
         }
     }

@@ -3,9 +3,20 @@
 //! Predictions are stored as `predictions.json` in the entity root directory.
 //! Writes use an atomic rename pattern (write to `.tmp`, then rename) to prevent
 //! data corruption from interrupted writes.
+//!
+//! ## Sync vs. async
+//!
+//! `load` and `save` are sync — fast on local disk, and the only synchronous
+//! caller (`prompt::build_system_prompt_budgeted`) already runs inside the
+//! `tokio::task::spawn_blocking` issued by `build_system_prompt_async`, so
+//! the runtime never sees a blocking read on a worker thread.
+//!
+//! Async callers — `scheduler::runner::execute_task` — go through
+//! `load_async` / `save_async`, which wrap the sync core in `spawn_blocking`
+//! per the established `SchedulerState::load/save` pattern in `runner.rs:41`.
 
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use super::PredictionStack;
 use crate::config::PredictionConfig;
@@ -90,6 +101,39 @@ pub fn save(root_dir: &Path, stack: &PredictionStack) -> Result<(), Box<dyn std:
     );
 
     Ok(())
+}
+
+/// Async wrapper for `load` — offloads file IO to a blocking thread.
+///
+/// Use from `async fn` callers (e.g. `scheduler::runner::execute_task`).
+/// Synchronous callers running inside `spawn_blocking` (e.g. the prompt
+/// builder pipeline) should call [`load`] directly.
+pub async fn load_async(root_dir: PathBuf, config: PredictionConfig) -> PredictionStack {
+    tokio::task::spawn_blocking(move || load(&root_dir, config))
+        .await
+        .unwrap_or_else(|join_err| {
+            tracing::error!(
+                error = %join_err,
+                "spawn_blocking panicked while loading prediction stack; using default"
+            );
+            PredictionStack::default()
+        })
+}
+
+/// Async wrapper for `save` — offloads file IO to a blocking thread.
+pub async fn save_async(
+    root_dir: PathBuf,
+    stack: PredictionStack,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let result =
+        tokio::task::spawn_blocking(move || save(&root_dir, &stack).map_err(|e| e.to_string()))
+            .await;
+
+    match result {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(msg)) => Err(msg.into()),
+        Err(join_err) => Err(format!("spawn_blocking panicked: {join_err}").into()),
+    }
 }
 
 #[cfg(test)]
