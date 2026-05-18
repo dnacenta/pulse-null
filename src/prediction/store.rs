@@ -78,7 +78,14 @@ pub fn load(root_dir: &Path, config: PredictionConfig) -> PredictionStack {
 /// Writes to a temporary file first, then renames to the final path.
 /// This prevents partial writes from corrupting the predictions file
 /// if the process is interrupted mid-write.
-pub fn save(root_dir: &Path, stack: &PredictionStack) -> Result<(), Box<dyn std::error::Error>> {
+///
+/// Returns `Box<dyn Error + Send + Sync>` so `save_async` can propagate
+/// the error chain across `spawn_blocking` without stringifying it
+/// (Q-MEDIUM "save error type drops source chain in save_async").
+pub fn save(
+    root_dir: &Path,
+    stack: &PredictionStack,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let path = root_dir.join(PREDICTIONS_FILE);
     let tmp_path = root_dir.join(PREDICTIONS_TMP);
 
@@ -126,17 +133,15 @@ pub async fn load_async(root_dir: PathBuf, config: PredictionConfig) -> Predicti
 }
 
 /// Async wrapper for `save` — offloads file IO to a blocking thread.
+///
+/// The sync `save` now returns `Send + Sync`, so we can pass the error
+/// chain through `spawn_blocking` without stringifying it (M2).
 pub async fn save_async(
     root_dir: PathBuf,
     stack: PredictionStack,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let result =
-        tokio::task::spawn_blocking(move || save(&root_dir, &stack).map_err(|e| e.to_string()))
-            .await;
-
-    match result {
-        Ok(Ok(())) => Ok(()),
-        Ok(Err(msg)) => Err(msg.into()),
+    match tokio::task::spawn_blocking(move || save(&root_dir, &stack)).await {
+        Ok(result) => result,
         Err(join_err) => Err(format!("spawn_blocking panicked: {join_err}").into()),
     }
 }
