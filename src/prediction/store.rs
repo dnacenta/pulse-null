@@ -109,14 +109,19 @@ pub fn save(root_dir: &Path, stack: &PredictionStack) -> Result<(), Box<dyn std:
 /// Synchronous callers running inside `spawn_blocking` (e.g. the prompt
 /// builder pipeline) should call [`load`] directly.
 pub async fn load_async(root_dir: PathBuf, config: PredictionConfig) -> PredictionStack {
+    // Keep a fallback copy outside the closure: if spawn_blocking panics,
+    // the original `config` was already moved in and is unrecoverable.
+    // Without this, the panic path silently returned default thresholds
+    // (Q-MEDIUM "load_async swallows caller config on panic").
+    let config_fallback = config.clone();
     tokio::task::spawn_blocking(move || load(&root_dir, config))
         .await
         .unwrap_or_else(|join_err| {
             tracing::error!(
                 error = %join_err,
-                "spawn_blocking panicked while loading prediction stack; using default"
+                "spawn_blocking panicked while loading prediction stack; using configured fallback"
             );
-            PredictionStack::default()
+            PredictionStack::with_config(config_fallback)
         })
 }
 
