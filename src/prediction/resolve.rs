@@ -17,7 +17,7 @@ use regex::Regex;
 use serde::Deserialize;
 use std::sync::LazyLock;
 
-use super::{ErrorDirection, PredictionError, PredictionResolution, PredictionStack, Timescale};
+use super::{ErrorDirection, PredictionResolution, PredictionStack, Timescale};
 
 /// A prediction parsed from a `[PREDICT:{...}]` marker.
 #[derive(Debug, Clone)]
@@ -252,78 +252,90 @@ pub fn parse_resolutions(text: &str) -> Vec<ParsedResolution> {
 
 /// Process a task's output: extract new predictions, resolve existing ones.
 ///
-/// This is the main entry point for integrating predictions into the cognitive cycle.
-/// It parses both `[PREDICT:...]` and `[RESOLVE:...]` markers from the task output,
-/// adds new predictions to the stack, resolves existing ones, and returns any
-/// new `PredictionError`s that were generated. The surprise cutoff for promoting
-/// a resolution into a `PredictionError` is `stack.config.surprise_threshold`.
+/// Parses `[PREDICT:...]` and `[RESOLVE:...]` markers from `task_output`,
+/// adds new predictions to the stack and applies resolutions. Returns the
+/// **number** of new `PredictionError`s created during this call — callers
+/// can inspect the actual errors via `stack.errors` if they need details.
+///
+/// (M4: previously returned `Vec<PredictionError>` by cloning the new
+/// errors out of the stack; callers only used `.len()` and `.is_empty()`.
+/// Parsed marker fields are now consumed by-value into the stack instead
+/// of cloned per loop iteration.)
 ///
 /// # Arguments
 ///
-/// * `stack` - The prediction stack to update. Surprise threshold is read from
-///   `stack.config.surprise_threshold` so callers configure once at stack
-///   construction rather than on every call.
+/// * `stack` - The prediction stack to update. Surprise threshold is read
+///   from `stack.config.surprise_threshold`.
 /// * `task_output` - The raw text output from the entity's cognitive cycle.
 /// * `task_id` - Identifier for the task (used for logging).
-/// * `default_timescale` - The timescale to assign to new predictions from this task.
-///
-/// # Returns
-///
-/// A list of `PredictionError`s created during resolution (only for high-surprise outcomes).
+/// * `default_timescale` - The timescale to assign to new predictions from
+///   this task.
 pub fn process_task_output(
     stack: &mut PredictionStack,
     task_output: &str,
     task_id: &str,
     default_timescale: Timescale,
-) -> Vec<PredictionError> {
+) -> usize {
     let errors_before = stack.errors.len();
 
-    // Phase 1: Parse and add new predictions
+    // Phase 1: parse and add new predictions. Consume the Vec by value so
+    // `content` moves into the stack rather than being cloned.
     let new_predictions = parse_predictions(task_output, default_timescale);
-    for parsed in &new_predictions {
-        let prediction =
-            stack.add_prediction(parsed.timescale, parsed.content.clone(), parsed.confidence);
+    let new_predictions_count = new_predictions.len();
+    for parsed in new_predictions {
+        let ParsedPrediction {
+            content,
+            confidence,
+            timescale,
+        } = parsed;
+        let prediction = stack.add_prediction(timescale, content, confidence);
         tracing::info!(
             task_id = %task_id,
             prediction_id = %prediction.id,
-            timescale = %parsed.timescale,
-            confidence = %parsed.confidence,
+            timescale = %timescale,
+            confidence = %confidence,
             "New prediction registered"
         );
     }
 
-    // Phase 2: Parse and apply resolutions
+    // Phase 2: parse and apply resolutions. Same by-value consume pattern.
     let resolutions = parse_resolutions(task_output);
-    for parsed in &resolutions {
+    let resolutions_count = resolutions.len();
+    for parsed in resolutions {
+        let ParsedResolution {
+            prediction_id,
+            actual,
+            surprise,
+            direction,
+            insight,
+        } = parsed;
         let resolution = PredictionResolution {
-            actual: parsed.actual.clone(),
-            surprise: parsed.surprise,
-            direction: parsed.direction,
-            insight: parsed.insight.clone(),
+            actual,
+            surprise,
+            direction,
+            insight,
         };
-
-        if stack.resolve(&parsed.prediction_id, resolution) {
+        if stack.resolve(&prediction_id, resolution) {
             tracing::info!(
                 task_id = %task_id,
-                prediction_id = %parsed.prediction_id,
-                surprise = %parsed.surprise,
-                direction = %parsed.direction,
+                prediction_id = %prediction_id,
+                surprise = %surprise,
+                direction = %direction,
                 "Prediction resolved"
             );
         }
     }
 
-    if !new_predictions.is_empty() || !resolutions.is_empty() {
+    if new_predictions_count > 0 || resolutions_count > 0 {
         tracing::info!(
             task_id = %task_id,
-            new_predictions = new_predictions.len(),
-            resolutions = resolutions.len(),
+            new_predictions = new_predictions_count,
+            resolutions = resolutions_count,
             "Processed prediction markers from task output"
         );
     }
 
-    // Return only the errors created during this call
-    stack.errors[errors_before..].to_vec()
+    stack.errors.len() - errors_before
 }
 
 #[cfg(test)]
@@ -452,9 +464,9 @@ mod tests {
         let mut stack = PredictionStack::new();
         let text = r#"[PREDICT:{"content":"user will return tomorrow","confidence":0.6}]"#;
 
-        let errors = process_task_output(&mut stack, text, "test-task", Timescale::Cycle);
+        let new_errors = process_task_output(&mut stack, text, "test-task", Timescale::Cycle);
 
-        assert!(errors.is_empty());
+        assert_eq!(new_errors, 0);
         assert_eq!(stack.predictions.len(), 1);
         assert_eq!(stack.predictions[0].content, "user will return tomorrow");
     }
@@ -470,11 +482,12 @@ mod tests {
         let text = format!(
             r#"[RESOLVE:{{"id":"{id}","outcome":"it rained instead","surprise":0.7,"direction":"misdirected","insight":"completely wrong about weather"}}]"#
         );
-        let errors = process_task_output(&mut stack, &text, "test-task", Timescale::Cycle);
+        let new_errors = process_task_output(&mut stack, &text, "test-task", Timescale::Cycle);
 
-        assert_eq!(errors.len(), 1);
-        assert_eq!(errors[0].surprise, 0.7);
-        assert_eq!(errors[0].direction, ErrorDirection::Misdirected);
+        assert_eq!(new_errors, 1);
+        assert_eq!(stack.errors.len(), 1);
+        assert_eq!(stack.errors[0].surprise, 0.7);
+        assert_eq!(stack.errors[0].direction, ErrorDirection::Misdirected);
     }
 
     #[test]
@@ -488,12 +501,13 @@ mod tests {
         let text = format!(
             r#"[PREDICT:{{"content":"new prediction","confidence":0.7}}] some text [RESOLVE:{{"id":"{id}","outcome":"happened","surprise":0.8,"direction":"novel","insight":"wow"}}]"#
         );
-        let errors = process_task_output(&mut stack, &text, "test-task", Timescale::Session);
+        let new_errors = process_task_output(&mut stack, &text, "test-task", Timescale::Session);
 
         // Should have the old prediction (now resolved) + the new one
         assert_eq!(stack.predictions.len(), 2);
-        assert_eq!(errors.len(), 1);
-        assert_eq!(errors[0].surprise, 0.8);
+        assert_eq!(new_errors, 1);
+        assert_eq!(stack.errors.len(), 1);
+        assert_eq!(stack.errors[0].surprise, 0.8);
 
         // New prediction should have the default timescale
         let new_pred = &stack.predictions[1];
@@ -504,14 +518,14 @@ mod tests {
     #[test]
     fn process_task_output_no_markers_is_noop() {
         let mut stack = PredictionStack::new();
-        let errors = process_task_output(
+        let new_errors = process_task_output(
             &mut stack,
             "just regular text",
             "test-task",
             Timescale::Cycle,
         );
 
-        assert!(errors.is_empty());
+        assert_eq!(new_errors, 0);
         assert!(stack.predictions.is_empty());
     }
 
@@ -526,9 +540,9 @@ mod tests {
         let text = format!(
             r#"[RESOLVE:{{"id":"{id}","outcome":"as expected","surprise":0.1,"direction":"underconfident"}}]"#
         );
-        let errors = process_task_output(&mut stack, &text, "test-task", Timescale::Cycle);
+        let new_errors = process_task_output(&mut stack, &text, "test-task", Timescale::Cycle);
 
-        assert!(errors.is_empty());
+        assert_eq!(new_errors, 0);
         assert!(stack.predictions[0].resolution.is_some());
     }
 
@@ -547,8 +561,8 @@ mod tests {
         let text = format!(
             r#"[RESOLVE:{{"id":"{id}","outcome":"done","surprise":0.5,"direction":"misdirected"}}]"#
         );
-        let errors = process_task_output(&mut stack, &text, "test", Timescale::Cycle);
-        assert!(errors.is_empty());
+        let new_errors = process_task_output(&mut stack, &text, "test", Timescale::Cycle);
+        assert_eq!(new_errors, 0);
 
         // Same input with threshold = 0.4 produces an error.
         let mut stack2 = PredictionStack::with_config(PredictionConfig {
@@ -562,8 +576,8 @@ mod tests {
         let text2 = format!(
             r#"[RESOLVE:{{"id":"{id2}","outcome":"done","surprise":0.5,"direction":"misdirected"}}]"#
         );
-        let errors2 = process_task_output(&mut stack2, &text2, "test", Timescale::Cycle);
-        assert_eq!(errors2.len(), 1);
+        let new_errors2 = process_task_output(&mut stack2, &text2, "test", Timescale::Cycle);
+        assert_eq!(new_errors2, 1);
     }
 
     #[test]

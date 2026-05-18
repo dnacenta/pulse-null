@@ -846,16 +846,16 @@ async fn post_process_predictions(
     root_dir: &std::path::Path,
     clean_content: &str,
 ) {
-    let new_errors = crate::prediction::resolve::process_task_output(
+    let new_error_count = crate::prediction::resolve::process_task_output(
         &mut stack,
         clean_content,
         &task.id,
         super::tasks::default_timescale_for(&task.id),
     );
-    if !new_errors.is_empty() {
+    if new_error_count > 0 {
         tracing::info!(
             "Prediction errors: {} new (accumulated importance: {:.2})",
-            new_errors.len(),
+            new_error_count,
             stack.accumulated_importance(),
         );
     }
