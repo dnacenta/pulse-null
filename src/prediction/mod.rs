@@ -368,13 +368,20 @@ impl PredictionStack {
         }
     }
 
-    /// Get the most recent prediction errors, regardless of processed state.
+    /// Get the most recent prediction errors by `created_at`, regardless
+    /// of processed state. Returns at most `count` items, newest first.
     ///
-    /// Useful for injecting recent prediction error context into prompts.
+    /// (M6: previously returned `&self.errors[len-count..]` — the tail of
+    /// the Vec — which was insertion-order until `prune` reordered the
+    /// processed errors. After a prune the tail wasn't necessarily the
+    /// time-newest entries. Now sorts by `created_at` descending and
+    /// borrows the chosen entries into a `Vec<&PredictionError>`.)
     #[must_use]
-    pub fn recent_errors(&self, count: usize) -> &[PredictionError] {
-        let start = self.errors.len().saturating_sub(count);
-        &self.errors[start..]
+    pub fn recent_errors(&self, count: usize) -> Vec<&PredictionError> {
+        let mut by_recency: Vec<&PredictionError> = self.errors.iter().collect();
+        by_recency.sort_by(|a, b| b.created_at.cmp(&a.created_at));
+        by_recency.truncate(count);
+        by_recency
     }
 }
 
