@@ -96,7 +96,10 @@ pub fn save(
         }
     }
 
-    let content = serde_json::to_string_pretty(stack)?;
+    // Compact JSON: predictions.json is machine-read only (no human
+    // edits expected). Pretty-printing roughly doubled the on-disk size
+    // and added serializer overhead per cycle (PERF-008).
+    let content = serde_json::to_string(stack)?;
     fs::write(&tmp_path, &content)?;
     fs::rename(&tmp_path, &path)?;
 
