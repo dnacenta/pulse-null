@@ -18,7 +18,7 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use super::PredictionStack;
+use super::{PredictionStack, PredictionStackSnapshot};
 use crate::config::PredictionConfig;
 
 /// File name for the prediction stack on disk.
@@ -53,14 +53,13 @@ pub fn load(root_dir: &Path, config: PredictionConfig) -> PredictionStack {
         }
     };
 
-    match serde_json::from_str::<PredictionStack>(&content) {
-        Ok(mut stack) => {
+    match serde_json::from_str::<PredictionStackSnapshot>(&content) {
+        Ok(snapshot) => {
             tracing::info!(
                 path = %path.display(),
                 "Loaded prediction stack from disk"
             );
-            stack.config = config;
-            stack
+            snapshot.into_stack(config)
         }
         Err(e) => {
             tracing::warn!(
@@ -99,7 +98,11 @@ pub fn save(
     // Compact JSON: predictions.json is machine-read only (no human
     // edits expected). Pretty-printing roughly doubled the on-disk size
     // and added serializer overhead per cycle (PERF-008).
-    let content = serde_json::to_string(stack)?;
+    //
+    // Serialize via the snapshot view so config (which is rehydrated
+    // from `pulse-null.toml`, not the file) never reaches disk.
+    let snapshot = PredictionStackSnapshot::from_stack(stack);
+    let content = serde_json::to_string(&snapshot)?;
     fs::write(&tmp_path, &content)?;
     fs::rename(&tmp_path, &path)?;
 

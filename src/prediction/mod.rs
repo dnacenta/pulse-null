@@ -175,17 +175,51 @@ pub struct PredictionError {
 /// This is the main data structure for the prediction engine. It accumulates
 /// predictions from cognitive cycles, tracks their resolution, and surfaces
 /// high-surprise errors for the attention system to consume.
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+///
+/// Not directly `Serialize`/`Deserialize`. The on-disk format is
+/// [`PredictionStackSnapshot`] — `config` lives in `pulse-null.toml`, not
+/// the per-entity JSON snapshot, so any deserializer that produced a
+/// `PredictionStack` directly would silently default the config and
+/// quietly drift away from `Config::prediction` (M7).
+#[derive(Debug, Clone, Default)]
 pub struct PredictionStack {
     /// All predictions (pending and resolved).
     pub predictions: Vec<Prediction>,
     /// Prediction errors generated from high-surprise resolutions.
     pub errors: Vec<PredictionError>,
     /// Calibration knobs (thresholds, caps) — loaded from `Config::prediction`.
-    /// `#[serde(skip)]` because config lives in `pulse-null.toml`, not the
-    /// per-entity `predictions.json` snapshot; reload from `Config` on boot.
-    #[serde(skip)]
     pub config: PredictionConfig,
+}
+
+/// On-disk format for the prediction stack — predictions and errors only.
+/// `PredictionStack::config` is intentionally not serialized; the loader
+/// rehydrates it from the live `PredictionConfig`.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct PredictionStackSnapshot {
+    pub predictions: Vec<Prediction>,
+    pub errors: Vec<PredictionError>,
+}
+
+impl PredictionStackSnapshot {
+    /// Build the on-disk snapshot view of a stack (borrowed clone — cheap
+    /// for typical stack sizes capped by `PredictionConfig::max_*`).
+    pub fn from_stack(stack: &PredictionStack) -> Self {
+        Self {
+            predictions: stack.predictions.clone(),
+            errors: stack.errors.clone(),
+        }
+    }
+
+    /// Promote a deserialized snapshot into a runtime `PredictionStack`,
+    /// stamped with the entity's live `PredictionConfig`.
+    #[must_use]
+    pub fn into_stack(self, config: PredictionConfig) -> PredictionStack {
+        PredictionStack {
+            predictions: self.predictions,
+            errors: self.errors,
+            config,
+        }
+    }
 }
 
 impl PredictionStack {
@@ -698,8 +732,11 @@ mod tests {
         assert_eq!(ErrorDirection::from_str_loose("unknown"), None);
     }
 
+    /// Snapshot is the only thing that round-trips via JSON; `PredictionStack`
+    /// itself no longer derives Serialize/Deserialize so that callers can't
+    /// silently get a default config (M7).
     #[test]
-    fn serde_roundtrip() {
+    fn snapshot_roundtrip_preserves_predictions_and_errors() {
         let mut stack = PredictionStack::new();
         let id = stack
             .add_prediction(Timescale::Session, "will it rain".to_string(), 0.6)
@@ -715,11 +752,23 @@ mod tests {
             },
         );
 
-        let json = serde_json::to_string_pretty(&stack).unwrap();
-        let deserialized: PredictionStack = serde_json::from_str(&json).unwrap();
+        let snapshot = PredictionStackSnapshot::from_stack(&stack);
+        let json = serde_json::to_string_pretty(&snapshot).unwrap();
+        let deserialized: PredictionStackSnapshot = serde_json::from_str(&json).unwrap();
 
+        // Snapshot carries predictions + errors only — no config field.
+        assert!(!json.contains("\"config\""));
         assert_eq!(deserialized.predictions.len(), 1);
         assert_eq!(deserialized.errors.len(), 1);
         assert_eq!(deserialized.predictions[0].id, id);
+
+        // Rehydrating into a stack uses the caller-supplied config —
+        // never the default just because the file didn't contain one.
+        let custom = PredictionConfig {
+            surprise_threshold: 0.95,
+            ..PredictionConfig::default()
+        };
+        let restored = deserialized.into_stack(custom);
+        assert!((restored.config.surprise_threshold - 0.95).abs() < f64::EPSILON);
     }
 }
