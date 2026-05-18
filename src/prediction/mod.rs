@@ -324,58 +324,47 @@ impl PredictionStack {
     /// Prune the stack to stay within size limits.
     ///
     /// Keeps the most recent predictions and errors, dropping the oldest
-    /// resolved predictions and processed errors first.
+    /// resolved predictions and processed errors first. Pending predictions
+    /// and unprocessed errors are always kept (even if their count alone
+    /// exceeds the cap); insertion order is preserved within each group
+    /// thanks to the stable sort.
+    ///
+    /// (M3: rewritten in-place — was double-cloning the stack via two
+    /// `filter().cloned().collect()` passes per side.)
     pub fn prune(&mut self, max_predictions: usize, max_errors: usize) {
         if self.predictions.len() > max_predictions {
-            // Partition: pending predictions are always kept; resolved ones are pruned oldest-first
-            let mut pending: Vec<Prediction> = self
+            // Stable sort: pending first (insertion order), resolved after
+            // (newest first within resolved). Equal-key elements keep their
+            // relative order so pending entries don't get reshuffled.
+            self.predictions.sort_by(|a, b| {
+                match (a.is_pending(), b.is_pending()) {
+                    (true, false) => std::cmp::Ordering::Less,
+                    (false, true) => std::cmp::Ordering::Greater,
+                    (false, false) => b.created_at.cmp(&a.created_at), // newest first among resolved
+                    (true, true) => std::cmp::Ordering::Equal,         // preserve insertion order
+                }
+            });
+            let pending_count = self
                 .predictions
                 .iter()
-                .filter(|p| p.is_pending())
-                .cloned()
-                .collect();
-            let mut resolved: Vec<Prediction> = self
-                .predictions
-                .iter()
-                .filter(|p| !p.is_pending())
-                .cloned()
-                .collect();
-
-            // Sort resolved by created_at descending (newest first)
-            resolved.sort_by(|a, b| b.created_at.cmp(&a.created_at));
-
-            // Keep as many resolved as we can after reserving space for pending
-            let resolved_budget = max_predictions.saturating_sub(pending.len());
-            resolved.truncate(resolved_budget);
-
-            pending.extend(resolved);
-            self.predictions = pending;
+                .take_while(|p| p.is_pending())
+                .count();
+            let target = max_predictions.max(pending_count);
+            self.predictions.truncate(target);
         }
 
         if self.errors.len() > max_errors {
-            // Partition: unprocessed errors are always kept; processed ones are pruned oldest-first
-            let mut unprocessed: Vec<PredictionError> = self
-                .errors
-                .iter()
-                .filter(|e| !e.processed)
-                .cloned()
-                .collect();
-            let mut processed: Vec<PredictionError> = self
-                .errors
-                .iter()
-                .filter(|e| e.processed)
-                .cloned()
-                .collect();
-
-            // Sort processed by created_at descending (newest first)
-            processed.sort_by(|a, b| b.created_at.cmp(&a.created_at));
-
-            // Keep as many processed as we can after reserving space for unprocessed
-            let processed_budget = max_errors.saturating_sub(unprocessed.len());
-            processed.truncate(processed_budget);
-
-            unprocessed.extend(processed);
-            self.errors = unprocessed;
+            // Unprocessed first (insertion order); processed after (newest
+            // first). Same stable-sort trick — preserves order of equal keys.
+            self.errors.sort_by(|a, b| match (a.processed, b.processed) {
+                (false, true) => std::cmp::Ordering::Less,
+                (true, false) => std::cmp::Ordering::Greater,
+                (true, true) => b.created_at.cmp(&a.created_at), // newest first among processed
+                (false, false) => std::cmp::Ordering::Equal,     // preserve insertion order
+            });
+            let unprocessed_count = self.errors.iter().take_while(|e| !e.processed).count();
+            let target = max_errors.max(unprocessed_count);
+            self.errors.truncate(target);
         }
     }
 
