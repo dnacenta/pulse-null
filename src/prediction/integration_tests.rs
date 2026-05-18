@@ -42,14 +42,14 @@ async fn round_trip_predict_resolve_via_markers() {
         r#"Working...
         [RESOLVE:{{"id":"{prediction_id}","outcome":"got pulled into async IO instead","surprise":0.6,"direction":"misdirected","insight":"caliber dragged me sideways"}}]"#
     );
-    let new_errors =
+    let new_error_count =
         process_task_output(&mut reloaded, &resolve_output, "task-2", Timescale::Cycle);
 
     // Step 4: persist and verify final state.
     save_async(root.clone(), reloaded).await.unwrap();
     let final_state = load_async(root.clone(), config).await;
 
-    assert_eq!(new_errors.len(), 1);
+    assert_eq!(new_error_count, 1);
     assert_eq!(final_state.predictions.len(), 1);
     assert!(!final_state.predictions[0].is_pending());
     assert_eq!(final_state.errors.len(), 1);

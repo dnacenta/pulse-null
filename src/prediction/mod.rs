@@ -175,17 +175,51 @@ pub struct PredictionError {
 /// This is the main data structure for the prediction engine. It accumulates
 /// predictions from cognitive cycles, tracks their resolution, and surfaces
 /// high-surprise errors for the attention system to consume.
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+///
+/// Not directly `Serialize`/`Deserialize`. The on-disk format is
+/// [`PredictionStackSnapshot`] — `config` lives in `pulse-null.toml`, not
+/// the per-entity JSON snapshot, so any deserializer that produced a
+/// `PredictionStack` directly would silently default the config and
+/// quietly drift away from `Config::prediction` (M7).
+#[derive(Debug, Clone, Default)]
 pub struct PredictionStack {
     /// All predictions (pending and resolved).
     pub predictions: Vec<Prediction>,
     /// Prediction errors generated from high-surprise resolutions.
     pub errors: Vec<PredictionError>,
     /// Calibration knobs (thresholds, caps) — loaded from `Config::prediction`.
-    /// `#[serde(skip)]` because config lives in `pulse-null.toml`, not the
-    /// per-entity `predictions.json` snapshot; reload from `Config` on boot.
-    #[serde(skip)]
     pub config: PredictionConfig,
+}
+
+/// On-disk format for the prediction stack — predictions and errors only.
+/// `PredictionStack::config` is intentionally not serialized; the loader
+/// rehydrates it from the live `PredictionConfig`.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct PredictionStackSnapshot {
+    pub predictions: Vec<Prediction>,
+    pub errors: Vec<PredictionError>,
+}
+
+impl PredictionStackSnapshot {
+    /// Build the on-disk snapshot view of a stack (borrowed clone — cheap
+    /// for typical stack sizes capped by `PredictionConfig::max_*`).
+    pub fn from_stack(stack: &PredictionStack) -> Self {
+        Self {
+            predictions: stack.predictions.clone(),
+            errors: stack.errors.clone(),
+        }
+    }
+
+    /// Promote a deserialized snapshot into a runtime `PredictionStack`,
+    /// stamped with the entity's live `PredictionConfig`.
+    #[must_use]
+    pub fn into_stack(self, config: PredictionConfig) -> PredictionStack {
+        PredictionStack {
+            predictions: self.predictions,
+            errors: self.errors,
+            config,
+        }
+    }
 }
 
 impl PredictionStack {
@@ -324,68 +358,64 @@ impl PredictionStack {
     /// Prune the stack to stay within size limits.
     ///
     /// Keeps the most recent predictions and errors, dropping the oldest
-    /// resolved predictions and processed errors first.
+    /// resolved predictions and processed errors first. Pending predictions
+    /// and unprocessed errors are always kept (even if their count alone
+    /// exceeds the cap); insertion order is preserved within each group
+    /// thanks to the stable sort.
+    ///
+    /// (M3: rewritten in-place — was double-cloning the stack via two
+    /// `filter().cloned().collect()` passes per side.)
     pub fn prune(&mut self, max_predictions: usize, max_errors: usize) {
         if self.predictions.len() > max_predictions {
-            // Partition: pending predictions are always kept; resolved ones are pruned oldest-first
-            let mut pending: Vec<Prediction> = self
+            // Stable sort: pending first (insertion order), resolved after
+            // (newest first within resolved). Equal-key elements keep their
+            // relative order so pending entries don't get reshuffled.
+            self.predictions.sort_by(|a, b| {
+                match (a.is_pending(), b.is_pending()) {
+                    (true, false) => std::cmp::Ordering::Less,
+                    (false, true) => std::cmp::Ordering::Greater,
+                    (false, false) => b.created_at.cmp(&a.created_at), // newest first among resolved
+                    (true, true) => std::cmp::Ordering::Equal,         // preserve insertion order
+                }
+            });
+            let pending_count = self
                 .predictions
                 .iter()
-                .filter(|p| p.is_pending())
-                .cloned()
-                .collect();
-            let mut resolved: Vec<Prediction> = self
-                .predictions
-                .iter()
-                .filter(|p| !p.is_pending())
-                .cloned()
-                .collect();
-
-            // Sort resolved by created_at descending (newest first)
-            resolved.sort_by(|a, b| b.created_at.cmp(&a.created_at));
-
-            // Keep as many resolved as we can after reserving space for pending
-            let resolved_budget = max_predictions.saturating_sub(pending.len());
-            resolved.truncate(resolved_budget);
-
-            pending.extend(resolved);
-            self.predictions = pending;
+                .take_while(|p| p.is_pending())
+                .count();
+            let target = max_predictions.max(pending_count);
+            self.predictions.truncate(target);
         }
 
         if self.errors.len() > max_errors {
-            // Partition: unprocessed errors are always kept; processed ones are pruned oldest-first
-            let mut unprocessed: Vec<PredictionError> = self
-                .errors
-                .iter()
-                .filter(|e| !e.processed)
-                .cloned()
-                .collect();
-            let mut processed: Vec<PredictionError> = self
-                .errors
-                .iter()
-                .filter(|e| e.processed)
-                .cloned()
-                .collect();
-
-            // Sort processed by created_at descending (newest first)
-            processed.sort_by(|a, b| b.created_at.cmp(&a.created_at));
-
-            // Keep as many processed as we can after reserving space for unprocessed
-            let processed_budget = max_errors.saturating_sub(unprocessed.len());
-            processed.truncate(processed_budget);
-
-            unprocessed.extend(processed);
-            self.errors = unprocessed;
+            // Unprocessed first (insertion order); processed after (newest
+            // first). Same stable-sort trick — preserves order of equal keys.
+            self.errors.sort_by(|a, b| match (a.processed, b.processed) {
+                (false, true) => std::cmp::Ordering::Less,
+                (true, false) => std::cmp::Ordering::Greater,
+                (true, true) => b.created_at.cmp(&a.created_at), // newest first among processed
+                (false, false) => std::cmp::Ordering::Equal,     // preserve insertion order
+            });
+            let unprocessed_count = self.errors.iter().take_while(|e| !e.processed).count();
+            let target = max_errors.max(unprocessed_count);
+            self.errors.truncate(target);
         }
     }
 
-    /// Get the most recent prediction errors, regardless of processed state.
+    /// Get the most recent prediction errors by `created_at`, regardless
+    /// of processed state. Returns at most `count` items, newest first.
     ///
-    /// Useful for injecting recent prediction error context into prompts.
+    /// (M6: previously returned `&self.errors[len-count..]` — the tail of
+    /// the Vec — which was insertion-order until `prune` reordered the
+    /// processed errors. After a prune the tail wasn't necessarily the
+    /// time-newest entries. Now sorts by `created_at` descending and
+    /// borrows the chosen entries into a `Vec<&PredictionError>`.)
     #[must_use]
-    pub fn recent_errors(&self, count: usize) -> &[PredictionError] {
-        let start = self.errors.len().saturating_sub(count);
-        &self.errors[start..]
+    pub fn recent_errors(&self, count: usize) -> Vec<&PredictionError> {
+        let mut by_recency: Vec<&PredictionError> = self.errors.iter().collect();
+        by_recency.sort_by(|a, b| b.created_at.cmp(&a.created_at));
+        by_recency.truncate(count);
+        by_recency
     }
 }
 
@@ -702,8 +732,11 @@ mod tests {
         assert_eq!(ErrorDirection::from_str_loose("unknown"), None);
     }
 
+    /// Snapshot is the only thing that round-trips via JSON; `PredictionStack`
+    /// itself no longer derives Serialize/Deserialize so that callers can't
+    /// silently get a default config (M7).
     #[test]
-    fn serde_roundtrip() {
+    fn snapshot_roundtrip_preserves_predictions_and_errors() {
         let mut stack = PredictionStack::new();
         let id = stack
             .add_prediction(Timescale::Session, "will it rain".to_string(), 0.6)
@@ -719,11 +752,23 @@ mod tests {
             },
         );
 
-        let json = serde_json::to_string_pretty(&stack).unwrap();
-        let deserialized: PredictionStack = serde_json::from_str(&json).unwrap();
+        let snapshot = PredictionStackSnapshot::from_stack(&stack);
+        let json = serde_json::to_string_pretty(&snapshot).unwrap();
+        let deserialized: PredictionStackSnapshot = serde_json::from_str(&json).unwrap();
 
+        // Snapshot carries predictions + errors only — no config field.
+        assert!(!json.contains("\"config\""));
         assert_eq!(deserialized.predictions.len(), 1);
         assert_eq!(deserialized.errors.len(), 1);
         assert_eq!(deserialized.predictions[0].id, id);
+
+        // Rehydrating into a stack uses the caller-supplied config —
+        // never the default just because the file didn't contain one.
+        let custom = PredictionConfig {
+            surprise_threshold: 0.95,
+            ..PredictionConfig::default()
+        };
+        let restored = deserialized.into_stack(custom);
+        assert!((restored.config.surprise_threshold - 0.95).abs() < f64::EPSILON);
     }
 }

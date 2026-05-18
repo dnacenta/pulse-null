@@ -18,7 +18,7 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use super::PredictionStack;
+use super::{PredictionStack, PredictionStackSnapshot};
 use crate::config::PredictionConfig;
 
 /// File name for the prediction stack on disk.
@@ -53,14 +53,13 @@ pub fn load(root_dir: &Path, config: PredictionConfig) -> PredictionStack {
         }
     };
 
-    match serde_json::from_str::<PredictionStack>(&content) {
-        Ok(mut stack) => {
+    match serde_json::from_str::<PredictionStackSnapshot>(&content) {
+        Ok(snapshot) => {
             tracing::info!(
                 path = %path.display(),
                 "Loaded prediction stack from disk"
             );
-            stack.config = config;
-            stack
+            snapshot.into_stack(config)
         }
         Err(e) => {
             tracing::warn!(
@@ -78,7 +77,14 @@ pub fn load(root_dir: &Path, config: PredictionConfig) -> PredictionStack {
 /// Writes to a temporary file first, then renames to the final path.
 /// This prevents partial writes from corrupting the predictions file
 /// if the process is interrupted mid-write.
-pub fn save(root_dir: &Path, stack: &PredictionStack) -> Result<(), Box<dyn std::error::Error>> {
+///
+/// Returns `Box<dyn Error + Send + Sync>` so `save_async` can propagate
+/// the error chain across `spawn_blocking` without stringifying it
+/// (Q-MEDIUM "save error type drops source chain in save_async").
+pub fn save(
+    root_dir: &Path,
+    stack: &PredictionStack,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let path = root_dir.join(PREDICTIONS_FILE);
     let tmp_path = root_dir.join(PREDICTIONS_TMP);
 
@@ -89,7 +95,14 @@ pub fn save(root_dir: &Path, stack: &PredictionStack) -> Result<(), Box<dyn std:
         }
     }
 
-    let content = serde_json::to_string_pretty(stack)?;
+    // Compact JSON: predictions.json is machine-read only (no human
+    // edits expected). Pretty-printing roughly doubled the on-disk size
+    // and added serializer overhead per cycle (PERF-008).
+    //
+    // Serialize via the snapshot view so config (which is rehydrated
+    // from `pulse-null.toml`, not the file) never reaches disk.
+    let snapshot = PredictionStackSnapshot::from_stack(stack);
+    let content = serde_json::to_string(&snapshot)?;
     fs::write(&tmp_path, &content)?;
     fs::rename(&tmp_path, &path)?;
 
@@ -109,29 +122,32 @@ pub fn save(root_dir: &Path, stack: &PredictionStack) -> Result<(), Box<dyn std:
 /// Synchronous callers running inside `spawn_blocking` (e.g. the prompt
 /// builder pipeline) should call [`load`] directly.
 pub async fn load_async(root_dir: PathBuf, config: PredictionConfig) -> PredictionStack {
+    // Keep a fallback copy outside the closure: if spawn_blocking panics,
+    // the original `config` was already moved in and is unrecoverable.
+    // Without this, the panic path silently returned default thresholds
+    // (Q-MEDIUM "load_async swallows caller config on panic").
+    let config_fallback = config.clone();
     tokio::task::spawn_blocking(move || load(&root_dir, config))
         .await
         .unwrap_or_else(|join_err| {
             tracing::error!(
                 error = %join_err,
-                "spawn_blocking panicked while loading prediction stack; using default"
+                "spawn_blocking panicked while loading prediction stack; using configured fallback"
             );
-            PredictionStack::default()
+            PredictionStack::with_config(config_fallback)
         })
 }
 
 /// Async wrapper for `save` — offloads file IO to a blocking thread.
+///
+/// The sync `save` now returns `Send + Sync`, so we can pass the error
+/// chain through `spawn_blocking` without stringifying it (M2).
 pub async fn save_async(
     root_dir: PathBuf,
     stack: PredictionStack,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let result =
-        tokio::task::spawn_blocking(move || save(&root_dir, &stack).map_err(|e| e.to_string()))
-            .await;
-
-    match result {
-        Ok(Ok(())) => Ok(()),
-        Ok(Err(msg)) => Err(msg.into()),
+    match tokio::task::spawn_blocking(move || save(&root_dir, &stack)).await {
+        Ok(result) => result,
         Err(join_err) => Err(format!("spawn_blocking panicked: {join_err}").into()),
     }
 }
