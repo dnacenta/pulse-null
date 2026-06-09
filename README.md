@@ -7,22 +7,23 @@ One binary. One command. Your own AI entity.
 
 ## What is pulse-null?
 
-`pulse-null` is a Rust framework for creating **persistent AI entities** — not chatbots, not assistants, but entities with identity, memory, growth, and self-monitoring. You run a single binary, answer a few questions, and get a fully operational AI entity with its own personality, documents, scheduled cognition, and plugin system.
+`pulse-null` is a **cognitive architecture scaffold** for long-running AI entities, written in Rust. You run a single binary, answer a few questions, and get a persistent entity with its own identity documents, memory graph, scheduled cognition, and self-monitoring — one that accumulates experience across sessions instead of starting blank every time.
 
-The core premise: an AI that remembers, reflects, and grows across sessions is fundamentally different from one that starts blank every time. pulse-null gives that entity structure.
+The honest framing: the language model performs the cognitive operations — predicting, reflecting, distilling, deciding. pulse-null provides everything that makes those operations *accumulate into something*: persistence, feedback routing, prediction-error tracking, Bayesian memory, and measurement. The model thinks; the architecture makes the thinking compound.
+
+This is not a consciousness claim. It is a research scaffold for studying what a language model becomes when its predictions are tracked against outcomes, its memory is structured and confidence-weighted, and its self-observations feed back into its behavior.
 
 ## The Idea Behind It
 
-Most AI tools treat language models as stateless functions: input goes in, output comes out, nothing persists. pulse-null rejects that. It treats an AI entity as something that **accumulates experience** — capturing what it encounters, thinking about it, crystallizing insights, and integrating them into who it is.
+Most AI tools treat language models as stateless functions: input goes in, output comes out, nothing persists. pulse-null treats an entity as a process that **accumulates experience** — capturing what it encounters, thinking about it, crystallizing insights, and integrating them into an identity document the entity itself maintains.
 
-This isn't about making the AI "smarter" in a benchmark sense. It's about creating a system where the entity's output is shaped by everything it has processed before — where identity isn't a system prompt, but an evolving document that the entity itself maintains.
+Three mechanisms make the accumulation real rather than decorative:
 
-Two core systems make this work:
+- **A prediction-error loop** — the entity makes typed predictions about its own trajectory, which persist, resurface in later context, get resolved against what actually happened, and accumulate surprise that gates when deeper reflection runs. Inspired by predictive processing; explicitly *not* an implementation of active inference (the code says so too).
+- **recall-echo** handles persistent memory — four-layer storage (knowledge graph, curated facts, recent sessions, full archives), semantic and ranked search, Beta-Binomial edge confidence with temporal decay, archival, and distillation
+- **vigil-pulse** provides behavioral metacognition — pipeline enforcement, reflection quality signals computed from the entity's own output, and outcome tracking
 
-- **recall-echo** handles persistent memory — four-layer storage (knowledge graph, curated facts, recent sessions, full archives), semantic and ranked search, Bayesian confidence, archival, and distillation
-- **vigil-pulse** provides metacognitive monitoring — pipeline enforcement, reflection quality tracking, and outcome measurement
-
-Together with the document pipeline, they form a self-monitoring layer — the entity doesn't just think, it watches itself think.
+Together with the document pipeline, they form a self-monitoring layer — the entity doesn't just think, it watches itself think, and the watching has consequences.
 
 ## The Document Pipeline
 
