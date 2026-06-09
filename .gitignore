@@ -26,3 +26,6 @@ target
 /target
 .claude/
 target2/
+
+# Local SurrealDB state (contains root password)
+/surrealdb/
