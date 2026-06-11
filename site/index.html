@@ -1,0 +1,227 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>pulse-null — one binary, one command, your own AI entity</title>
+  <meta name="description" content="A cognitive architecture scaffold for long-running AI entities, written in Rust. Persistent identity documents, knowledge-graph memory, scheduled cognition, and self-monitoring — experience that accumulates across sessions." />
+  <meta name="theme-color" content="#2e3440" />
+
+  <!-- Open Graph / social preview -->
+  <meta property="og:type" content="website" />
+  <meta property="og:url" content="https://dnacenta.github.io/pulse-null/" />
+  <meta property="og:title" content="pulse-null — one binary, one command, your own AI entity" />
+  <meta property="og:description" content="A cognitive architecture scaffold for long-running AI entities, written in Rust. Persistent memory, prediction-error tracking, and self-monitoring — experience that accumulates." />
+  <meta property="og:image" content="https://dnacenta.github.io/pulse-null/og-image.png" />
+  <meta property="og:image:width" content="1200" />
+  <meta property="og:image:height" content="630" />
+  <meta property="og:image:alt" content="pulse-null — cognitive architecture scaffold for AI entities" />
+
+  <!-- Twitter / X -->
+  <meta name="twitter:card" content="summary_large_image" />
+  <meta name="twitter:title" content="pulse-null — one binary, one command, your own AI entity" />
+  <meta name="twitter:description" content="A cognitive architecture scaffold for long-running AI entities, written in Rust. Persistent memory, prediction-error tracking, and self-monitoring — experience that accumulates." />
+  <meta name="twitter:image" content="https://dnacenta.github.io/pulse-null/og-image.png" />
+
+  <!-- Reliable monospace fallback; 0xProto Nerd Font is preferred if installed locally -->
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:ital,wght@0,400;0,600;0,700;1,400&display=swap" rel="stylesheet" />
+
+  <link rel="stylesheet" href="./style.css" />
+</head>
+<body>
+  <div class="scanlines" aria-hidden="true"></div>
+
+  <!-- Terminal window -->
+  <div class="term">
+    <div class="term__chrome">
+      <span class="dot dot--red"></span>
+      <span class="dot dot--yellow"></span>
+      <span class="dot dot--green"></span>
+      <span class="term__title">pulse-null — ~/entity — zsh</span>
+    </div>
+
+    <div class="term__body">
+      <header class="hero">
+        <p class="prompt"><span class="prompt__path">~/entity</span> <span class="prompt__sym">❯</span> cat README</p>
+        <p class="hero__eyebrow"># cognitive architecture scaffold for long-running AI entities</p>
+        <h1 class="hero__title">pulse-null<span class="cursor" aria-hidden="true">▋</span></h1>
+        <p class="hero__tagline">One binary. One command. Your own AI entity.</p>
+        <p class="hero__lede">
+          Run a single Rust binary, answer a few questions, and get a persistent entity
+          with its own identity documents, memory graph, scheduled cognition, and
+          self-monitoring — one that accumulates experience across sessions instead of
+          starting blank every time.
+        </p>
+
+        <p class="prompt"><span class="prompt__path">~/entity</span> <span class="prompt__sym">❯</span> pulse-null --help</p>
+        <div class="hero__cta">
+          <a class="btn btn--primary" href="https://github.com/dnacenta/pulse-null">[ view on github ]</a>
+          <a class="btn btn--ghost" href="#quickstart">[ quick start ]</a>
+          <a class="btn btn--ghost" href="https://github.com/dnacenta/pulse-null#readme">[ read the docs ]</a>
+        </div>
+      </header>
+
+      <main>
+        <!-- Honest framing -->
+        <section class="section" id="framing">
+          <h2 class="section__title"><span class="prompt__sym">❯</span> cat DISCLAIMER</h2>
+          <div class="disclaimer">
+            <p>
+              <strong>The honest framing:</strong> the language model performs the cognitive
+              operations — predicting, reflecting, distilling, deciding. pulse-null provides
+              everything that makes those operations <em>accumulate into something</em>:
+              persistence, feedback routing, prediction-error tracking, Bayesian memory,
+              and measurement. <strong>The model thinks; the architecture makes the thinking
+              compound.</strong>
+            </p>
+            <p>
+              This is not a consciousness claim. It is a research scaffold for studying what
+              a language model becomes when its predictions are tracked against outcomes, its
+              memory is structured and confidence-weighted, and its self-observations feed
+              back into its behavior.
+            </p>
+          </div>
+        </section>
+
+        <!-- Stats strip -->
+        <section class="section" id="stats">
+          <h2 class="section__title"><span class="prompt__sym">❯</span> pulse-null --stats</h2>
+          <div class="facts">
+            <div class="fact"><span class="fact__num">1</span><span class="fact__label">binary</span></div>
+            <div class="fact"><span class="fact__num">4</span><span class="fact__label">memory layers</span></div>
+            <div class="fact"><span class="fact__num">5</span><span class="fact__label">pipeline documents</span></div>
+            <div class="fact"><span class="fact__num">3</span><span class="fact__label">LLM providers</span></div>
+            <div class="fact"><span class="fact__num">100<span class="fact__sub">%</span></span><span class="fact__label">Rust · AGPL-3.0</span></div>
+          </div>
+        </section>
+
+        <!-- Document pipeline -->
+        <section class="section" id="pipeline">
+          <h2 class="section__title"><span class="prompt__sym">❯</span> ls journal/</h2>
+          <pre class="ascii">
+Encounter → LEARNING.md → THOUGHTS.md → REFLECTIONS.md → SELF.md / PRAXIS.md
+             (capture)     (incubate)    (crystallize)     (integrate)</pre>
+          <p class="section__note">
+            <span class="comment"># </span>Ideas move through stages of maturity — raw encounters
+            are captured, incubated, crystallized into clear insights, and integrated into the
+            entity's identity and behavioral policies. The pipeline has thresholds: documents
+            can't grow infinitely, so the entity is forced to distill, not hoard. Ideas flow —
+            they don't stagnate.
+          </p>
+        </section>
+
+        <!-- Three mechanisms -->
+        <section class="section" id="mechanisms">
+          <h2 class="section__title"><span class="prompt__sym">❯</span> systemctl status cognition</h2>
+          <div class="cards">
+            <div class="card">
+              <h3>prediction-error loop</h3>
+              <p>
+                The entity makes typed predictions about its own trajectory. They persist,
+                resurface in later context, get resolved against what actually happened, and
+                accumulate surprise that gates when deeper reflection runs.
+              </p>
+              <p class="note"># inspired by predictive processing — explicitly not an
+              implementation of active inference (the code says so too)</p>
+            </div>
+            <div class="card">
+              <h3><a href="https://github.com/dnacenta/recall-echo">recall-echo</a></h3>
+              <p>
+                Persistent memory: four-layer storage (knowledge graph, curated facts, recent
+                sessions, full archives), semantic and ranked search, Beta-Binomial edge
+                confidence with temporal decay, archival, and distillation.
+              </p>
+            </div>
+            <div class="card">
+              <h3><a href="https://github.com/dnacenta/vigil-pulse">vigil-pulse</a></h3>
+              <p>
+                Behavioral metacognition: pipeline enforcement, reflection quality signals
+                computed from the entity's own output, and outcome tracking — with a unified
+                health assessment from HEALTHY down to ALERT.
+              </p>
+            </div>
+          </div>
+          <p class="section__note">
+            <span class="comment"># </span>Together they form a self-monitoring layer — the entity
+            doesn't just think, it watches itself think, and the watching has consequences.
+          </p>
+        </section>
+
+        <!-- Architecture -->
+        <section class="section" id="architecture">
+          <h2 class="section__title"><span class="prompt__sym">❯</span> cat architecture.txt</h2>
+          <pre class="ascii">
+                  ┌─────────────────────────────────────────────┐
+                  │             pulse-null (axum)               │
+                  │                                             │
+Plugins ◄────────►│  POST /chat ──► LLM Provider ──► Response   │
+(voice, discord,  │       │              │                      │
+ n8n, web)        │  trust layer    context builder             │
+                  │  auth middleware    (identity docs,         │
+                  │  rate limiter        memory, journal)       │
+                  │  injection detection                        │
+                  │                                             │
+                  │  ┌──────────────────────────────────────┐   │
+                  │  │  Scheduler (cron)                    │   │
+                  │  │  Cognitive cycles, research,         │   │
+                  │  │  reflection, health checks,          │   │
+                  │  │  intent queue (self-initiated tasks) │   │
+                  │  └──────────────────────────────────────┘   │
+                  │                                             │
+                  │  ┌──────────────────────────────────────┐   │
+                  │  │  vigil-pulse (Metacognitive Monitor) │   │
+                  │  │  Pipeline enforcement, reflection    │   │
+                  │  │  quality, outcome tracking           │   │
+                  │  └──────────────────────────────────────┘   │
+                  │                                             │
+                  │  ┌──────────────────────────────────────┐   │
+                  │  │  recall-echo (Memory System)         │   │
+                  │  │  Four-layer memory, knowledge graph, │   │
+                  │  │  Bayesian confidence, semantic search│   │
+                  │  └──────────────────────────────────────┘   │
+                  └─────────────────────────────────────────────┘</pre>
+          <p class="section__note">
+            <span class="comment"># </span>Every message passes the trust layer, injection
+            detection, and rate limiter before the context builder assembles the entity's full
+            state — identity documents, memory, journal, pipeline signals — and hands it to the
+            configured provider: <code>claude</code>, <code>claude-code</code>, or <code>ollama</code>.
+          </p>
+        </section>
+
+        <!-- Quick start -->
+        <section class="section" id="quickstart">
+          <h2 class="section__title"><span class="prompt__sym">❯</span> pulse-null init</h2>
+          <pre class="codeblock"><span class="comment"># clone and build</span>
+<span class="cmd">git clone</span> https://github.com/dnacenta/pulse-null.git
+<span class="cmd">cd</span> pulse-null
+<span class="cmd">cargo build</span> --release
+
+<span class="comment"># create your entity</span>
+./target/release/pulse-null init
+
+<span class="comment"># start it</span>
+<span class="cmd">cd</span> &lt;your-entity-name&gt;
+pulse-null up</pre>
+          <p class="section__note">
+            <span class="comment"># </span>The init wizard walks you through naming your entity,
+            defining its personality, choosing an LLM provider, and configuring the scheduler.
+          </p>
+        </section>
+      </main>
+
+      <footer class="footer">
+        <p><span class="comment"># the entity watches itself think</span></p>
+        <p class="footer__links">
+          <a href="https://github.com/dnacenta/pulse-null">pulse-null</a><span class="sep">·</span>
+          <a href="https://github.com/dnacenta/recall-echo">recall-echo</a><span class="sep">·</span>
+          <a href="https://github.com/dnacenta/vigil-pulse">vigil-pulse</a><span class="sep">·</span>
+          <a href="https://dnacenta.github.io/claude-certified-architect/">cca study guide</a>
+        </p>
+        <p>AGPL-3.0 <span class="sep">·</span> built by <a href="https://github.com/dnacenta">dnacenta</a></p>
+      </footer>
+    </div>
+  </div>
+</body>
+</html>
