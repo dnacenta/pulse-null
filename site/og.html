@@ -1,0 +1,70 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <title>og image — pulse-null</title>
+  <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;600;700&display=swap" rel="stylesheet" />
+  <style>
+    :root {
+      --nord0: #2e3440; --nord1: #3b4252; --nord3: #4c566a;
+      --nord4: #d8dee9; --nord6: #eceff4;
+      --nord11: #bf616a; --nord13: #ebcb8b; --nord14: #a3be8c; --nord15: #b48ead;
+      --bg: #242933; --muted: #7b8694;
+    }
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      width: 1200px; height: 630px;
+      font-family: "0xProto Nerd Font", "0xProto", "JetBrains Mono", monospace;
+      background-color: var(--bg);
+      background-image: radial-gradient(700px 400px at 50% -10%, rgba(180, 142, 173, 0.16), transparent 70%);
+      display: flex; align-items: center; justify-content: center;
+    }
+    .term {
+      width: 1040px;
+      background: var(--nord0);
+      border: 1px solid var(--nord3);
+      border-radius: 14px;
+      overflow: hidden;
+      box-shadow: 0 30px 70px -20px rgba(0,0,0,0.6), 0 0 90px -40px rgba(180,142,173,0.5);
+    }
+    .chrome {
+      display: flex; align-items: center; gap: 9px;
+      padding: 14px 18px;
+      background: var(--nord1);
+      border-bottom: 1px solid var(--nord3);
+    }
+    .dot { width: 15px; height: 15px; border-radius: 50%; }
+    .title { flex: 1; text-align: center; color: var(--muted); font-size: 15px; margin-right: 63px; }
+    .body { padding: 48px 56px 52px; }
+    .prompt { color: var(--muted); font-size: 19px; margin-bottom: 14px; }
+    .prompt .path { color: var(--nord14); }
+    .prompt .sym { color: var(--nord15); font-weight: 700; }
+    .eyebrow { color: var(--muted); font-size: 20px; margin-bottom: 10px; }
+    h1 {
+      color: var(--nord6); font-size: 76px; font-weight: 700; line-height: 1.05;
+      letter-spacing: -0.01em; margin-bottom: 18px;
+      text-shadow: 0 0 26px rgba(180, 142, 173, 0.25);
+    }
+    h1 .cursor { color: var(--nord15); }
+    .tagline { color: var(--nord6); font-size: 27px; font-weight: 600; margin-bottom: 14px; }
+    .sub { color: var(--nord4); font-size: 20px; max-width: 56ch; }
+  </style>
+</head>
+<body>
+  <div class="term">
+    <div class="chrome">
+      <span class="dot" style="background:var(--nord11)"></span>
+      <span class="dot" style="background:var(--nord13)"></span>
+      <span class="dot" style="background:var(--nord14)"></span>
+      <span class="title">pulse-null — ~/entity — zsh</span>
+    </div>
+    <div class="body">
+      <p class="prompt"><span class="path">~/entity</span> <span class="sym">❯</span> cat README</p>
+      <p class="eyebrow"># cognitive architecture scaffold for long-running AI entities</p>
+      <h1>pulse-null<span class="cursor">▋</span></h1>
+      <p class="tagline">One binary. One command. Your own AI entity.</p>
+      <p class="sub">Persistent identity, knowledge-graph memory, scheduled cognition, self-monitoring — experience that accumulates across sessions.</p>
+    </div>
+  </div>
+</body>
+</html>
