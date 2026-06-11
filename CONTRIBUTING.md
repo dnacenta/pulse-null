@@ -69,8 +69,9 @@ docs(#3): expand configuration reference
 ## Code style
 
 - Run `cargo fmt` before submitting
-- Run `cargo clippy` -- no warnings (dead_code from unused trait methods is acceptable during early development)
+- Run `cargo clippy -- -D warnings -A dead_code` -- CI's exact lint gate (dead_code from unused trait methods is acceptable during early development)
 - Run `cargo test` to make sure nothing breaks
+- Keep your toolchain current (`rustup update stable`) -- CI lints with the latest stable, so new clippy lints apply as Rust releases
 - Keep changes focused -- one issue per PR
 
 ## Release workflow

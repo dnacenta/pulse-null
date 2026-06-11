@@ -376,6 +376,11 @@ cargo build --release --features all-plugins
 - [Rust](https://rustup.rs/) 1.80+
 - An [Anthropic](https://console.anthropic.com/) API key (or Ollama for local inference)
 
+> **Note on toolchain:** CI lints with the **latest stable** Rust toolchain, so new clippy
+> lints land as Rust releases. Before pushing, run `rustup update stable` and CI's exact
+> gate: `cargo fmt --check && cargo clippy -- -D warnings -A dead_code && cargo test`.
+> A clippy pass on an older local toolchain does not guarantee a green CI.
+
 ## Contributing
 
 See [CONTRIBUTING.md](CONTRIBUTING.md) for branch naming, commit conventions, and workflow.
