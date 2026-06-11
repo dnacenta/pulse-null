@@ -2,6 +2,7 @@
 
 [![License: AGPL-3.0](https://img.shields.io/github/license/dnacenta/pulse-null)](LICENSE)
 [![Rust](https://img.shields.io/badge/rust-1.80%2B-orange)](https://rustup.rs/)
+[![Website](https://img.shields.io/badge/website-dnacenta.github.io%2Fpulse--null-b48ead)](https://dnacenta.github.io/pulse-null/)
 
 One binary. One command. Your own AI entity.
 
