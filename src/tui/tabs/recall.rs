@@ -140,7 +140,7 @@ impl RecallTab {
                 Ok((stats, pipeline)) => {
                     let mut type_counts: Vec<(String, u64)> =
                         stats.entity_type_counts.into_iter().collect();
-                    type_counts.sort_by(|a, b| b.1.cmp(&a.1));
+                    type_counts.sort_by_key(|c| std::cmp::Reverse(c.1));
 
                     let health = GraphHealthData {
                         entity_count: stats.entity_count,

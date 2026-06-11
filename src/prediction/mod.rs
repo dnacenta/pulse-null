@@ -390,12 +390,13 @@ impl PredictionStack {
         if self.errors.len() > max_errors {
             // Unprocessed first (insertion order); processed after (newest
             // first). Same stable-sort trick — preserves order of equal keys.
-            self.errors.sort_by(|a, b| match (a.processed, b.processed) {
-                (false, true) => std::cmp::Ordering::Less,
-                (true, false) => std::cmp::Ordering::Greater,
-                (true, true) => b.created_at.cmp(&a.created_at), // newest first among processed
-                (false, false) => std::cmp::Ordering::Equal,     // preserve insertion order
-            });
+            self.errors
+                .sort_by(|a, b| match (a.processed, b.processed) {
+                    (false, true) => std::cmp::Ordering::Less,
+                    (true, false) => std::cmp::Ordering::Greater,
+                    (true, true) => b.created_at.cmp(&a.created_at), // newest first among processed
+                    (false, false) => std::cmp::Ordering::Equal,     // preserve insertion order
+                });
             let unprocessed_count = self.errors.iter().take_while(|e| !e.processed).count();
             let target = max_errors.max(unprocessed_count);
             self.errors.truncate(target);
@@ -413,7 +414,7 @@ impl PredictionStack {
     #[must_use]
     pub fn recent_errors(&self, count: usize) -> Vec<&PredictionError> {
         let mut by_recency: Vec<&PredictionError> = self.errors.iter().collect();
-        by_recency.sort_by(|a, b| b.created_at.cmp(&a.created_at));
+        by_recency.sort_by_key(|e| std::cmp::Reverse(e.created_at));
         by_recency.truncate(count);
         by_recency
     }

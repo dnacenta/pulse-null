@@ -223,7 +223,7 @@ fn build_domain_reports(outcomes: &[&OutcomeRecord]) -> Vec<DomainReport> {
         .collect();
 
     // Sort by sample size descending for consistent output
-    reports.sort_by(|a, b| b.sample_size.cmp(&a.sample_size));
+    reports.sort_by_key(|r| std::cmp::Reverse(r.sample_size));
     reports
 }
 

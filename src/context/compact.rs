@@ -96,7 +96,7 @@ fn build_file_reinjection(recent_files: &[RecentFile]) -> Option<String> {
 
     // Sort by access time descending, take most recent
     let mut sorted: Vec<&RecentFile> = recent_files.iter().collect();
-    sorted.sort_by(|a, b| b.accessed_at.cmp(&a.accessed_at));
+    sorted.sort_by_key(|f| std::cmp::Reverse(f.accessed_at));
     let selected: Vec<&RecentFile> = sorted.into_iter().take(MAX_REINJECTION_FILES).collect();
 
     if selected.is_empty() {
