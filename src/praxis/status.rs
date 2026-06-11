@@ -11,11 +11,9 @@ const RESET: &str = "\x1b[0m";
 
 fn bar(count: usize, soft: usize, hard: usize) -> String {
     let max_width = 20;
-    let filled = if hard > 0 {
-        (count * max_width / hard).min(max_width)
-    } else {
-        0
-    };
+    let filled = (count * max_width)
+        .checked_div(hard)
+        .map_or(0, |f| f.min(max_width));
     let empty = max_width - filled;
 
     let color = if count >= hard {

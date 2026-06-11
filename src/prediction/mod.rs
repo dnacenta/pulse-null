@@ -414,7 +414,7 @@ impl PredictionStack {
     #[must_use]
     pub fn recent_errors(&self, count: usize) -> Vec<&PredictionError> {
         let mut by_recency: Vec<&PredictionError> = self.errors.iter().collect();
-        by_recency.sort_by(|a, b| b.created_at.cmp(&a.created_at));
+        by_recency.sort_by_key(|e| std::cmp::Reverse(e.created_at));
         by_recency.truncate(count);
         by_recency
     }

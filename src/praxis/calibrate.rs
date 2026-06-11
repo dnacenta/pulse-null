@@ -435,7 +435,7 @@ fn build_outcome_summary(outcomes: &[OutcomeRecord]) -> OutcomeSummary {
         .into_iter()
         .map(|(d, (count, succ))| (d, count, succ as f64 / count as f64))
         .collect();
-    domains.sort_by(|a, b| b.1.cmp(&a.1));
+    domains.sort_by_key(|d| std::cmp::Reverse(d.1));
 
     OutcomeSummary {
         total,

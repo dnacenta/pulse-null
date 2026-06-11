@@ -599,10 +599,8 @@ impl Screen for WizardScreen {
                     KeyCode::Up => {
                         self.provider_idx = self.provider_idx.saturating_sub(1);
                     }
-                    KeyCode::Down => {
-                        if self.provider_idx < 2 {
-                            self.provider_idx += 1;
-                        }
+                    KeyCode::Down if self.provider_idx < 2 => {
+                        self.provider_idx += 1;
                     }
                     _ => {}
                 }
@@ -613,10 +611,8 @@ impl Screen for WizardScreen {
                     KeyCode::Up => {
                         self.timezone_idx = self.timezone_idx.saturating_sub(1);
                     }
-                    KeyCode::Down => {
-                        if self.timezone_idx < TIMEZONES.len() - 1 {
-                            self.timezone_idx += 1;
-                        }
+                    KeyCode::Down if self.timezone_idx < TIMEZONES.len() - 1 => {
+                        self.timezone_idx += 1;
                     }
                     _ => {}
                 }

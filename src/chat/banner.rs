@@ -111,11 +111,9 @@ fn print_doc_bar(name: &str, doc: &DocumentHealth) {
 /// Build a progress bar string.
 fn status_bar(count: usize, hard: usize) -> String {
     let width = 10;
-    let filled = if hard > 0 {
-        (count * width / hard).min(width)
-    } else {
-        0
-    };
+    let filled = (count * width)
+        .checked_div(hard)
+        .map_or(0, |f| f.min(width));
     let empty = width - filled;
     format!("{}{}", "█".repeat(filled), "░".repeat(empty))
 }
