@@ -133,6 +133,8 @@ pub struct SchedulerConfig {
     pub timezone: String,
     #[serde(default)]
     pub output: OutputConfig,
+    #[serde(default)]
+    pub liveness: LivenessConfig,
 }
 
 impl Default for SchedulerConfig {
@@ -141,6 +143,40 @@ impl Default for SchedulerConfig {
             enabled: true,
             timezone: default_timezone(),
             output: OutputConfig::default(),
+            liveness: LivenessConfig::default(),
+        }
+    }
+}
+
+/// Scheduler liveness alarm — turns a silent task outage into a webhook alert.
+///
+/// Per-task streaks alert after `alert_after_consecutive_failures` and then
+/// repeat on a backoff ladder (`alert_backoff_hours`, then 4× that). The
+/// global rule alerts when *no* task has succeeded for
+/// `global_silence_alert_hours` while tasks are enabled — set it above the
+/// longest interval in your schedule.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LivenessConfig {
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    /// Consecutive failures of one task before the first [ALERT].
+    #[serde(default = "default_alert_after_consecutive_failures")]
+    pub alert_after_consecutive_failures: u32,
+    /// Hours without a success on *any* task before the global [ALERT].
+    #[serde(default = "default_global_silence_alert_hours")]
+    pub global_silence_alert_hours: u64,
+    /// Hours before the first repeat of a still-unresolved alert.
+    #[serde(default = "default_alert_backoff_hours")]
+    pub alert_backoff_hours: u64,
+}
+
+impl Default for LivenessConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            alert_after_consecutive_failures: default_alert_after_consecutive_failures(),
+            global_silence_alert_hours: default_global_silence_alert_hours(),
+            alert_backoff_hours: default_alert_backoff_hours(),
         }
     }
 }
@@ -262,6 +298,18 @@ fn default_archive_max() -> usize {
 
 fn default_timezone() -> String {
     "UTC".to_string()
+}
+
+fn default_alert_after_consecutive_failures() -> u32 {
+    3
+}
+
+fn default_global_silence_alert_hours() -> u64 {
+    6
+}
+
+fn default_alert_backoff_hours() -> u64 {
+    6
 }
 
 // Identity-class session limit defaults

@@ -83,5 +83,35 @@ pub fn validate(config: &Config) -> Result<(), ConfigError> {
             "Monitoring window_size must be > 0".into(),
         ));
     }
+    validate_liveness(&config.scheduler.liveness)?;
+    Ok(())
+}
+
+/// Upper bound for liveness hour knobs — a year, which keeps every
+/// `chrono::Duration::hours` conversion far from overflow.
+const MAX_LIVENESS_HOURS: u64 = 8760;
+
+fn validate_liveness(liveness: &super::LivenessConfig) -> Result<(), ConfigError> {
+    if !liveness.enabled {
+        return Ok(());
+    }
+    if liveness.alert_after_consecutive_failures == 0 {
+        return Err(ConfigError::Validation(
+            "Scheduler liveness alert_after_consecutive_failures must be > 0".into(),
+        ));
+    }
+    for (name, hours) in [
+        (
+            "global_silence_alert_hours",
+            liveness.global_silence_alert_hours,
+        ),
+        ("alert_backoff_hours", liveness.alert_backoff_hours),
+    ] {
+        if hours == 0 || hours > MAX_LIVENESS_HOURS {
+            return Err(ConfigError::Validation(format!(
+                "Scheduler liveness {name} must be between 1 and {MAX_LIVENESS_HOURS}"
+            )));
+        }
+    }
     Ok(())
 }

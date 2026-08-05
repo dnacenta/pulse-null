@@ -80,6 +80,12 @@ timezone = "{timezone}"
 # share_webhook = "https://discord.com/api/webhooks/..."
 # call_endpoint = "http://localhost:8443/api/call"
 
+[scheduler.liveness]
+enabled = true
+alert_after_consecutive_failures = 3
+global_silence_alert_hours = 6
+alert_backoff_hours = 6
+
 [pipeline]
 enabled = true
 learning_soft = 5
