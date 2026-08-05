@@ -6,12 +6,34 @@ use chrono::Utc;
 
 /// Maximum lines before rotation triggers.
 const MAX_LINES: usize = 200;
+/// Maximum bytes before rotation triggers. A line cap bounds entry *count*,
+/// not size — one 200KB entry is still one line.
+const MAX_BYTES: usize = 64 * 1024;
 /// Lines to keep from the end after rotation.
 const KEEP_TAIL: usize = 50;
 /// Lines to keep from the start (title/header).
 const KEEP_HEADER: usize = 3;
+/// Byte share of MAX_BYTES the header may claim.
+const HEADER_MAX_BYTES: usize = MAX_BYTES / 4;
+/// Byte allowance reserved for the "rotated" note.
+const ROTATION_NOTE_MAX_BYTES: usize = 128;
 
-/// Rotate LOGBOOK.md when it exceeds MAX_LINES.
+/// Take lines while their total size (including newlines) stays within budget.
+fn take_within_budget<'a>(lines: impl Iterator<Item = &'a str>, budget: usize) -> Vec<&'a str> {
+    let mut kept = Vec::new();
+    let mut used = 0usize;
+    for line in lines {
+        let cost = line.len() + 1;
+        if used + cost > budget {
+            break;
+        }
+        used += cost;
+        kept.push(line);
+    }
+    kept
+}
+
+/// Rotate LOGBOOK.md when it exceeds MAX_LINES or MAX_BYTES.
 /// Archives the full file and keeps header + most recent KEEP_TAIL lines.
 pub fn rotate_if_needed(root_dir: &Path, logbook_path: &Path) {
     let content = match std::fs::read_to_string(logbook_path) {
@@ -20,7 +42,7 @@ pub fn rotate_if_needed(root_dir: &Path, logbook_path: &Path) {
     };
 
     let lines: Vec<&str> = content.lines().collect();
-    if lines.len() <= MAX_LINES {
+    if lines.len() <= MAX_LINES && content.len() <= MAX_BYTES {
         return;
     }
 
@@ -38,17 +60,14 @@ pub fn rotate_if_needed(root_dir: &Path, logbook_path: &Path) {
         return;
     }
 
-    // Keep header + most recent entries
-    let header: Vec<&str> = lines.iter().take(KEEP_HEADER).copied().collect();
-    let tail: Vec<&str> = lines
-        .iter()
-        .rev()
-        .take(KEEP_TAIL)
-        .copied()
-        .collect::<Vec<_>>()
-        .into_iter()
-        .rev()
-        .collect();
+    // Keep header + most recent entries, bounded by lines and by bytes.
+    // The full content is archived above, so anything dropped here is
+    // recoverable from the archive.
+    let header = take_within_budget(lines.iter().take(KEEP_HEADER).copied(), HEADER_MAX_BYTES);
+    let header_bytes: usize = header.iter().map(|l| l.len() + 1).sum();
+    let tail_budget = MAX_BYTES.saturating_sub(header_bytes + ROTATION_NOTE_MAX_BYTES);
+    let mut tail = take_within_budget(lines.iter().rev().take(KEEP_TAIL).copied(), tail_budget);
+    tail.reverse();
 
     let mut rotated = header.join("\n");
     rotated.push_str(&format!(
@@ -63,9 +82,10 @@ pub fn rotate_if_needed(root_dir: &Path, logbook_path: &Path) {
         tracing::error!("Failed to write rotated LOGBOOK: {}", e);
     } else {
         tracing::info!(
-            "LOGBOOK rotated: {} lines → ~{} lines (archived to {})",
+            "LOGBOOK rotated: {} lines / {} bytes → {} lines (archived to {})",
             lines.len(),
-            KEEP_HEADER + KEEP_TAIL + 2,
+            content.len(),
+            header.len() + tail.len() + 2,
             archive_path.display()
         );
     }
@@ -215,4 +235,63 @@ pub fn log_session_end(
         &format!("{}, {} messages", channel, message_count),
         &archive_note,
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn logbook_path(root: &Path) -> std::path::PathBuf {
+        let journal = root.join("journal");
+        std::fs::create_dir_all(&journal).unwrap();
+        journal.join("LOGBOOK.md")
+    }
+
+    #[test]
+    fn small_logbook_is_not_rotated() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = logbook_path(tmp.path());
+        std::fs::write(&path, "# LOGBOOK\n\n### entry\n").unwrap();
+
+        rotate_if_needed(tmp.path(), &path);
+
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "# LOGBOOK\n\n### entry\n"
+        );
+        assert!(!tmp.path().join("archives").exists());
+    }
+
+    /// PN-75: 200 lines is not 200 lines' worth of bytes — one runaway entry
+    /// must still trigger rotation.
+    #[test]
+    fn oversized_logbook_rotates_on_bytes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = logbook_path(tmp.path());
+
+        let mut content = String::from("# LOGBOOK\n\n");
+        content.push_str(&"g".repeat(MAX_BYTES + 1024));
+        content.push('\n');
+        std::fs::write(&path, &content).unwrap();
+
+        rotate_if_needed(tmp.path(), &path);
+
+        let after = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            after.len() <= MAX_BYTES,
+            "rotated LOGBOOK still {} bytes",
+            after.len()
+        );
+        assert!(after.starts_with("# LOGBOOK"));
+        assert!(after.contains("Rotated"));
+
+        // The full content is preserved in the archive.
+        let archives = std::fs::read_dir(tmp.path().join("archives")).unwrap();
+        let archived: Vec<_> = archives.flatten().collect();
+        assert_eq!(archived.len(), 1);
+        assert_eq!(
+            std::fs::read_to_string(archived[0].path()).unwrap(),
+            content
+        );
+    }
 }

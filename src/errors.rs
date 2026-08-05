@@ -102,6 +102,34 @@ pub enum PromptError {
     Assembly(String),
     #[error("prompt IO error: {0}")]
     Io(#[from] std::io::Error),
+    #[error(
+        "essential system prompt components are {bytes} bytes, over the {limit} byte hard limit — \
+         essential content is never auto-trimmed, so trim CLAUDE.md or the rules directory by hand"
+    )]
+    EssentialTooLarge { bytes: usize, limit: usize },
+}
+
+/// Errors from driving the Claude Code CLI subprocess.
+#[derive(Debug, Error)]
+pub enum ClaudeCliError {
+    #[error(
+        "claude CLI at '{bin}' does not support --system-prompt-file — upgrade the CLI; \
+         pulse-null requires it to keep the system prompt off argv (a single argv argument is \
+         capped at 128KB and an oversized prompt fails every spawn with E2BIG)"
+    )]
+    SystemPromptFileUnsupported { bin: String },
+    #[error("failed to probe claude CLI at '{bin}' for --system-prompt-file support: {source}")]
+    Probe {
+        bin: String,
+        #[source]
+        source: std::io::Error,
+    },
+    #[error("failed to stage the system prompt file at '{path}': {source}")]
+    SystemPromptFile {
+        path: String,
+        #[source]
+        source: std::io::Error,
+    },
 }
 
 /// Top-level error type for CLI and binary boundaries.

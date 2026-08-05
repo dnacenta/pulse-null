@@ -772,6 +772,18 @@ pub struct SystemPromptBudgetConfig {
     pub pipeline_health_cap: usize,
     pub cognitive_health_cap: usize,
     pub caliber_cap: usize,
+    /// Hard byte ceiling for THOUGHT_STACK.md content.
+    ///
+    /// The `*_max_bytes` ceilings are safety limits, not budgeting: they are
+    /// enforced even when `enabled` is false. Line counts do not bound bytes —
+    /// a 60-line THOUGHT_STACK of 3KB lines is 180KB — and an oversized prompt
+    /// is what killed every subprocess spawn for seven weeks.
+    pub thought_stack_max_bytes: usize,
+    /// Hard byte ceiling for AWARENESS.md content (API/Ollama providers only).
+    pub awareness_max_bytes: usize,
+    /// Hard byte ceiling for MEMORY.md content, complementing
+    /// `memory.memory_max_lines`.
+    pub memory_max_bytes: usize,
 }
 
 impl Default for SystemPromptBudgetConfig {
@@ -788,6 +800,9 @@ impl Default for SystemPromptBudgetConfig {
             pipeline_health_cap: 500,
             cognitive_health_cap: 300,
             caliber_cap: 200,
+            thought_stack_max_bytes: 48 * 1024,
+            awareness_max_bytes: 16 * 1024,
+            memory_max_bytes: 32 * 1024,
         }
     }
 }

@@ -655,6 +655,42 @@ pub fn count_recent_conversations(root_dir: &Path, days: i64) -> u32 {
     count
 }
 
+/// Size at which `pipeline-changes.jsonl` rotates. Append-only journals with
+/// no rotation are how a disk fills up quietly.
+const PIPELINE_JOURNAL_MAX_BYTES: u64 = 8 * 1024 * 1024;
+
+/// Rotate an append-only journal once it passes `max_bytes`.
+///
+/// Keep-newest semantics: the live file is renamed to `<name>.1` (replacing any
+/// previous generation) and the next append starts a fresh file. Readers that
+/// open the live path always see valid JSON lines — never a half-truncated one —
+/// and only ever lose visibility of entries older than the last rotation.
+fn rotate_journal_if_over(path: &Path, max_bytes: u64) {
+    let size = match fs::metadata(path) {
+        Ok(meta) => meta.len(),
+        Err(_) => return,
+    };
+    if size <= max_bytes {
+        return;
+    }
+
+    let file_name = match path.file_name().and_then(|n| n.to_str()) {
+        Some(name) => name.to_string(),
+        None => return,
+    };
+    let rotated = path.with_file_name(format!("{}.1", file_name));
+
+    match fs::rename(path, &rotated) {
+        Ok(()) => tracing::info!(
+            "Rotated {} ({} bytes) to {}",
+            path.display(),
+            size,
+            rotated.display()
+        ),
+        Err(e) => tracing::error!("Failed to rotate {}: {}", path.display(), e),
+    }
+}
+
 /// Log a pipeline state change to the pipeline change journal.
 /// Each entry records the old and new counts along with what changed.
 pub fn log_pipeline_change(
@@ -669,6 +705,7 @@ pub fn log_pipeline_change(
     }
 
     let journal_path = root_dir.join("pipeline-changes.jsonl");
+    rotate_journal_if_over(&journal_path, PIPELINE_JOURNAL_MAX_BYTES);
 
     let mut changes = Vec::new();
     if old_counts.learning != new_counts.learning {
@@ -1048,5 +1085,66 @@ mod tests {
     fn count_recent_conversations_no_index() {
         let tmp = tempfile::tempdir().unwrap();
         assert_eq!(count_recent_conversations(tmp.path(), 7), 0);
+    }
+
+    // --- PN-75: journal rotation ---
+
+    #[test]
+    fn journal_under_the_limit_is_left_alone() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("pipeline-changes.jsonl");
+        fs::write(&path, "{\"a\":1}\n").unwrap();
+
+        rotate_journal_if_over(&path, 1024);
+
+        assert_eq!(fs::read_to_string(&path).unwrap(), "{\"a\":1}\n");
+        assert!(!tmp.path().join("pipeline-changes.jsonl.1").exists());
+    }
+
+    /// AC8: rotation keeps the newest entries readable and leaves whole JSON
+    /// lines behind — no reader sees a truncated record.
+    #[test]
+    fn journal_rotation_keeps_newest_entries() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let path = root.join("pipeline-changes.jsonl");
+        let rotated = root.join("pipeline-changes.jsonl.1");
+
+        let old_entries = "{\"old\":true}\n".repeat(200);
+        fs::write(&path, &old_entries).unwrap();
+
+        rotate_journal_if_over(&path, 128);
+
+        assert!(!path.exists(), "live journal restarts empty after rotation");
+        assert_eq!(fs::read_to_string(&rotated).unwrap(), old_entries);
+
+        // A subsequent append starts a fresh, fully parseable journal.
+        let old_counts = pulse_system_types::monitoring::DocumentCounts::default();
+        let mut new_counts = old_counts.clone();
+        new_counts.learning += 1;
+        log_pipeline_change(root, &old_counts, &new_counts, "test");
+
+        let live = fs::read_to_string(&path).unwrap();
+        let lines: Vec<&str> = live.lines().filter(|l| !l.is_empty()).collect();
+        assert_eq!(lines.len(), 1);
+        for line in lines {
+            serde_json::from_str::<serde_json::Value>(line).unwrap();
+        }
+    }
+
+    #[test]
+    fn journal_rotation_replaces_the_previous_generation() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("pipeline-changes.jsonl");
+        let rotated = tmp.path().join("pipeline-changes.jsonl.1");
+
+        fs::write(&rotated, "{\"generation\":0}\n").unwrap();
+        fs::write(&path, "{\"generation\":1}\n".repeat(100)).unwrap();
+
+        rotate_journal_if_over(&path, 64);
+
+        let kept = fs::read_to_string(&rotated).unwrap();
+        assert!(kept.contains("\"generation\":1"));
+        assert!(!kept.contains("\"generation\":0"));
     }
 }
