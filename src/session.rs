@@ -350,7 +350,10 @@ pub async fn graph_ingest_archive(
             let gm = recall_echo::graph::GraphMemory::open(&graph_dir)
                 .await
                 .map_err(|e| format!("graph open: {e}"))?;
-            gm.ingest_archive(&archive_content, &filename_clone, log_number, None)
+            // Provenance is inferred per chunk from turn roles: the human's
+            // turns count as `user` evidence, the entity's own as `self`.
+            let context = recall_echo::graph::IngestContext::new(&filename_clone, log_number);
+            gm.ingest_archive(&archive_content, &context, None)
                 .await
                 .map_err(|e| format!("ingest: {e}"))
         })
