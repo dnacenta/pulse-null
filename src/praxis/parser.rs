@@ -113,17 +113,10 @@ fn extract_date_field(line: &str, field: &str) -> Option<String> {
     let lower = line.to_lowercase();
     let field_lower = field.to_lowercase();
 
-    // Match patterns like "**Last touched**: 2026-02-26" or "Last touched: 2026-02-26"
-    if lower.contains(&field_lower) {
-        // Find a date pattern (YYYY-MM-DD) after the field name
-        let after_field = if let Some(idx) = lower.find(&field_lower) {
-            &line[idx + field.len()..]
-        } else {
-            return None;
-        };
-        return find_date_in_str(after_field);
-    }
-    None
+    // Match patterns like "**Last touched**: 2026-02-26" or "Last touched: 2026-02-26",
+    // then look for a YYYY-MM-DD after the field name.
+    let idx = lower.find(&field_lower)?;
+    find_date_in_str(&line[idx + field.len()..])
 }
 
 /// Find first YYYY-MM-DD pattern in a string.
