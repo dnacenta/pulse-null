@@ -601,11 +601,11 @@ mod tests {
 
     #[test]
     fn micro_compact_strips_resolved_tool_pairs() {
-        let mut messages = Vec::new();
-
-        // Tool use + result pair (old, will be resolved)
-        messages.push(tool_use_msg("t1", "read_file"));
-        messages.push(tool_result_msg("t1", &large_text(100)));
+        let mut messages = vec![
+            // Tool use + result pair (old, will be resolved)
+            tool_use_msg("t1", "read_file"),
+            tool_result_msg("t1", &large_text(100)),
+        ];
 
         // Two assistant messages after (makes the pair "resolved")
         messages.push(text_msg(
@@ -760,10 +760,10 @@ mod tests {
 
     #[test]
     fn micro_compact_result_tracks_all_metrics() {
-        let mut messages = Vec::new();
-
-        // System messages to collapse
-        messages.push(text_msg(Role::User, "sys 1", Some(MessageSource::System)));
+        let mut messages = vec![
+            // System messages to collapse
+            text_msg(Role::User, "sys 1", Some(MessageSource::System)),
+        ];
         messages.push(text_msg(Role::User, "sys 2", Some(MessageSource::System)));
 
         // Tool pair to strip

@@ -35,6 +35,39 @@ fn truncate_to_token_cap(text: &str, token_cap: usize) -> String {
     )
 }
 
+/// Truncate text to a hard byte ceiling, preserving the beginning.
+///
+/// Line counts do not bound bytes: a 60-line file of 3KB lines is 180KB. Every
+/// line-capped component gets one of these ceilings so a single runaway
+/// document cannot blow up the assembled prompt.
+///
+/// The result is at most `max_bytes` bytes, including the truncation marker
+/// (unless `max_bytes` is smaller than the marker itself). Truncation happens
+/// on a char boundary, so the output is always valid UTF-8.
+fn truncate_to_byte_cap(text: &str, max_bytes: usize) -> String {
+    if text.len() <= max_bytes {
+        return text.to_string();
+    }
+    let marker = format!("\n[truncated — exceeded {} byte ceiling]", max_bytes);
+    let content_budget = max_bytes.saturating_sub(marker.len());
+    format!(
+        "{}{}",
+        crate::utils::safe_truncate(text, content_budget),
+        marker
+    )
+}
+
+/// Line cap for THOUGHT_STACK.md. The entity is instructed to keep it under
+/// 50 lines; this is the safety margin on top of that.
+const THOUGHT_STACK_MAX_LINES: usize = 60;
+
+/// Hard byte ceiling for the Essential tier as a whole.
+///
+/// Essential components are never trimmed, so if they alone exceed this the
+/// prompt is unshippable and assembly fails loudly rather than handing a
+/// doomed prompt to the provider.
+const ESSENTIAL_MAX_BYTES: usize = 64 * 1024;
+
 /// Priority tier for a system prompt component.
 /// Lower number = higher priority = trimmed last.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -219,7 +252,8 @@ pub fn build_system_prompt_budgeted(
         if awareness_path.exists() {
             let content = std::fs::read_to_string(&awareness_path)?;
             if !content.trim().is_empty() {
-                let wrapped = format!("<platform>\n{}\n</platform>", content);
+                let bounded = truncate_to_byte_cap(&content, budget_cfg.awareness_max_bytes);
+                let wrapped = format!("<platform>\n{}\n</platform>", bounded);
                 let tokens = estimate_tokens(&wrapped);
                 components.push(PromptComponent {
                     name: "AWARENESS.md",
@@ -241,7 +275,8 @@ pub fn build_system_prompt_budgeted(
             .take(config.memory.memory_max_lines)
             .collect::<Vec<_>>()
             .join("\n");
-        let wrapped = format!("<memory>\n{}\n</memory>", limited);
+        let bounded = truncate_to_byte_cap(&limited, budget_cfg.memory_max_bytes);
+        let wrapped = format!("<memory>\n{}\n</memory>", bounded);
         let capped = if budget_enabled && budget_cfg.memory_cap > 0 {
             truncate_to_token_cap(&wrapped, budget_cfg.memory_cap)
         } else {
@@ -299,22 +334,15 @@ pub fn build_system_prompt_budgeted(
     });
 
     // --- Tier 1 (High): THOUGHT_STACK.md ---
-    let thought_stack_path = root_dir.join("THOUGHT_STACK.md");
-    if thought_stack_path.exists() {
-        let content = std::fs::read_to_string(&thought_stack_path)?;
-        if !content.trim().is_empty() {
-            // Hard cap at 60 lines (entity is instructed to keep under 50; this is the safety margin)
-            let limited: String = content.lines().take(60).collect::<Vec<_>>().join("\n");
-            let wrapped = format!("<thought-stack>\n{}\n</thought-stack>", limited);
-            let tokens = estimate_tokens(&wrapped);
-            components.push(PromptComponent {
-                name: "THOUGHT_STACK.md",
-                content: wrapped,
-                tokens,
-                tier: PromptTier::High,
-                cap: 0,
-            });
-        }
+    if let Some(wrapped) = load_thought_stack(root_dir, budget_cfg.thought_stack_max_bytes)? {
+        let tokens = estimate_tokens(&wrapped);
+        components.push(PromptComponent {
+            name: "THOUGHT_STACK.md",
+            content: wrapped,
+            tokens,
+            tier: PromptTier::High,
+            cap: 0,
+        });
     }
 
     // --- Tier 2 (Low): EPHEMERAL.md ---
@@ -504,7 +532,28 @@ pub fn build_system_prompt_budgeted(
         }
     }
 
-    // --- Budget enforcement ---
+    enforce_budget_and_assemble(components, budget_cfg, "chat")
+}
+
+/// Apply the budget passes to a component set and render the final prompt.
+///
+/// Shared by the chat and scheduled-task assembly paths so both are governed by
+/// the same tiers, the same passes and the same metrics.
+///
+/// Passes, in order:
+/// 1. Compress Low-tier components to one-line summaries.
+/// 2. Drop Low-tier components entirely.
+/// 3. Hard-truncate High-tier components down to whatever the Essential tier
+///    leaves of the budget.
+///
+/// Essential components are never trimmed; they are instead verified against
+/// [`ESSENTIAL_MAX_BYTES`] and reported as an error when they exceed it.
+fn enforce_budget_and_assemble(
+    mut components: Vec<PromptComponent>,
+    budget_cfg: &crate::config::SystemPromptBudgetConfig,
+    profile: &str,
+) -> Result<SystemPromptResult, crate::errors::PromptError> {
+    let budget_enabled = budget_cfg.enabled;
     let total_before: usize = components.iter().map(|c| c.tokens).sum();
     let mut was_trimmed = false;
     let mut dropped_components = Vec::new();
@@ -568,15 +617,56 @@ pub fn build_system_prompt_budgeted(
             }
         }
 
-        // Pass 3: Truncate High-tier components if STILL over budget (rare, means
-        // essential + high alone exceed the budget — log a warning).
+        // Pass 3: Hard-truncate High-tier components if STILL over budget.
+        // Essential is untouchable, so High shares whatever the budget has left
+        // after Essential. Earlier components keep their allowance first.
         if current_total > budget {
+            let essential_tokens: usize = components
+                .iter()
+                .filter(|c| c.tier == PromptTier::Essential)
+                .map(|c| c.tokens)
+                .sum();
             warn!(
                 "[system-prompt-budget] essential + high-priority components ({} tokens) exceed \
-                 budget ({} tokens) — core documents may be too large",
+                 budget ({} tokens) — truncating high-priority content to fit",
                 current_total, budget
             );
+
+            let mut allowance = budget.saturating_sub(essential_tokens);
+            for component in components
+                .iter_mut()
+                .filter(|c| c.tier == PromptTier::High && !c.content.is_empty())
+            {
+                if component.tokens <= allowance {
+                    allowance -= component.tokens;
+                    continue;
+                }
+                let original_tokens = component.tokens;
+                let truncated = truncate_to_token_cap(&component.content, allowance);
+                component.tokens = estimate_tokens(&truncated);
+                component.content = truncated;
+                allowance = 0;
+                was_trimmed = true;
+                info!(
+                    "[system-prompt-budget] truncated {} from ~{} to ~{} tokens",
+                    component.name, original_tokens, component.tokens
+                );
+            }
         }
+    }
+
+    // Essential is never trimmed, so it is the one tier that can still push the
+    // prompt past what a subprocess can carry. Verify it before shipping.
+    let essential_bytes: usize = components
+        .iter()
+        .filter(|c| c.tier == PromptTier::Essential)
+        .map(|c| c.content.len())
+        .sum();
+    if essential_bytes > ESSENTIAL_MAX_BYTES {
+        return Err(crate::errors::PromptError::EssentialTooLarge {
+            bytes: essential_bytes,
+            limit: ESSENTIAL_MAX_BYTES,
+        });
     }
 
     // Assemble final prompt from non-empty components (preserving original order)
@@ -588,15 +678,17 @@ pub fn build_system_prompt_budgeted(
     let prompt = parts.join("\n\n");
     let estimated_tokens = estimate_tokens(&prompt);
 
-    if budget_enabled {
-        info!(
-            "[system-prompt-budget] assembled {} tokens (budget: {}, trimmed: {}, dropped: {})",
-            estimated_tokens,
-            budget_cfg.token_budget,
-            was_trimmed,
-            dropped_components.len()
-        );
-    }
+    info!(
+        "[system-prompt-budget] {} prompt assembled: {} tokens, {} bytes \
+         (budget: {}, enabled: {}, trimmed: {}, dropped: {})",
+        profile,
+        estimated_tokens,
+        prompt.len(),
+        budget_cfg.token_budget,
+        budget_enabled,
+        was_trimmed,
+        dropped_components.len()
+    );
 
     Ok(SystemPromptResult {
         prompt,
@@ -678,24 +770,68 @@ pub fn build_task_system_prompt(
     root_dir: &Path,
     config: &Config,
 ) -> Result<String, crate::errors::PromptError> {
-    let mut parts = Vec::new();
+    Ok(build_task_system_prompt_budgeted(root_dir, config)?.prompt)
+}
 
-    // CLAUDE.md — behavioral instructions (core identity)
+/// Build the scheduled-task system prompt with full budget metrics returned.
+///
+/// Same tiers, caps and passes as the chat path — a task prompt that outgrows
+/// the budget is exactly as fatal as a chat prompt that does.
+pub fn build_task_system_prompt_budgeted(
+    root_dir: &Path,
+    config: &Config,
+) -> Result<SystemPromptResult, crate::errors::PromptError> {
+    let budget_cfg = &config.system_prompt_budget;
+    let budget_enabled = budget_cfg.enabled;
+    let mut components = Vec::new();
+
+    // --- Tier 0 (Essential): CLAUDE.md — behavioral instructions ---
     let claude_path = root_dir.join("CLAUDE.md");
     if claude_path.exists() {
         let content = std::fs::read_to_string(&claude_path)?;
-        parts.push(content);
+        let capped = if budget_enabled && budget_cfg.claude_md_cap > 0 {
+            truncate_to_token_cap(&content, budget_cfg.claude_md_cap)
+        } else {
+            content
+        };
+        let tokens = estimate_tokens(&capped);
+        components.push(PromptComponent {
+            name: "CLAUDE.md",
+            content: capped,
+            tokens,
+            tier: PromptTier::Essential,
+            cap: budget_cfg.claude_md_cap,
+        });
     }
 
-    // Shared rule/protocol files
+    // --- Tier 0 (Essential): Shared rule/protocol files ---
     if let Some(ref rules_dir) = config.entity.rules_dir {
         match load_rule_files(rules_dir) {
             Ok(rules) => {
+                let mut rules_text = String::new();
                 for (name, content) in rules {
-                    parts.push(format!(
+                    if !rules_text.is_empty() {
+                        rules_text.push_str("\n\n");
+                    }
+                    rules_text.push_str(&format!(
                         "<protocol name=\"{}\">\n{}\n</protocol>",
                         name, content
                     ));
+                }
+                if !rules_text.is_empty() {
+                    let capped = if budget_enabled && budget_cfg.rules_cap > 0 {
+                        truncate_to_token_cap(&rules_text, budget_cfg.rules_cap)
+                    } else {
+                        rules_text
+                    };
+                    let tokens = estimate_tokens(&capped);
+                    components.push(PromptComponent {
+                        name: "rules",
+                        content: capped,
+                        tokens,
+                        tier: PromptTier::Essential,
+                        cap: budget_cfg.rules_cap,
+                    });
                 }
             }
             Err(e) => {
@@ -704,27 +840,43 @@ pub fn build_task_system_prompt(
         }
     }
 
-    // SELF.md — identity
+    // --- Tier 1 (High): SELF.md — identity ---
     let self_path = root_dir.join("SELF.md");
     if self_path.exists() {
         let content = std::fs::read_to_string(&self_path)?;
-        parts.push(format!("<identity>\n{}\n</identity>", content));
+        let wrapped = format!("<identity>\n{}\n</identity>", content);
+        let capped = if budget_enabled && budget_cfg.self_md_cap > 0 {
+            truncate_to_token_cap(&wrapped, budget_cfg.self_md_cap)
+        } else {
+            wrapped
+        };
+        let tokens = estimate_tokens(&capped);
+        components.push(PromptComponent {
+            name: "SELF.md",
+            content: capped,
+            tokens,
+            tier: PromptTier::High,
+            cap: budget_cfg.self_md_cap,
+        });
     }
 
-    // THOUGHT_STACK.md — working memory for continuous thinking
-    let thought_stack_path = root_dir.join("THOUGHT_STACK.md");
-    if thought_stack_path.exists() {
-        let content = std::fs::read_to_string(&thought_stack_path)?;
-        if !content.trim().is_empty() {
-            let limited: String = content.lines().take(60).collect::<Vec<_>>().join("\n");
-            parts.push(format!("<thought-stack>\n{}\n</thought-stack>", limited));
-        }
+    // --- Tier 1 (High): THOUGHT_STACK.md — working memory ---
+    if let Some(wrapped) = load_thought_stack(root_dir, budget_cfg.thought_stack_max_bytes)? {
+        let tokens = estimate_tokens(&wrapped);
+        components.push(PromptComponent {
+            name: "THOUGHT_STACK.md",
+            content: wrapped,
+            tokens,
+            tier: PromptTier::High,
+            cap: 0,
+        });
     }
 
-    // Metacognitive context — vigil health + calibration data for autonomous goal generation
+    // --- Tier 2 (Low): Metacognitive context ---
+    // Vigil health + calibration data for autonomous goal generation.
     let metacog = build_metacognitive_context(root_dir);
     if !metacog.is_empty() {
-        parts.push(format!(
+        let wrapped = format!(
             "<metacognitive-state>\n\
             This is your current cognitive health assessment. Use this to guide your \
             autonomous thinking. If you notice patterns — declining signals, calibration \
@@ -732,12 +884,21 @@ pub fn build_task_system_prompt(
             {}\n\
             </metacognitive-state>",
             metacog
-        ));
+        );
+        let tokens = estimate_tokens(&wrapped);
+        components.push(PromptComponent {
+            name: "metacognitive-state",
+            content: wrapped,
+            tokens,
+            tier: PromptTier::Low,
+            cap: 0,
+        });
     }
 
-    // Task isolation notice + autonomous hallucination guard (Layer 1b)
-    parts.push(
-        "<task-context>\n\
+    // --- Tier 0 (Essential): Task isolation notice + hallucination guard ---
+    // Essential because dropping it is how autonomous runs start inventing
+    // user turns (Layer 1b).
+    let task_context = "<task-context>\n\
         This is an autonomous scheduled task execution. There is no human user in this \
         conversation. You are executing a task prompt independently.\n\n\
         CRITICAL RULES:\n\
@@ -749,10 +910,46 @@ pub fn build_task_system_prompt(
         EPHEMERAL.md, or monitoring data). Focus on the task prompt. Do not reference \
         memory or session context that is not present in this context window.\n\
         </task-context>"
-            .to_string(),
-    );
+        .to_string();
+    let tokens = estimate_tokens(&task_context);
+    components.push(PromptComponent {
+        name: "task-context",
+        content: task_context,
+        tokens,
+        tier: PromptTier::Essential,
+        cap: 0,
+    });
 
-    Ok(parts.join("\n\n"))
+    enforce_budget_and_assemble(components, budget_cfg, "task")
+}
+
+/// Load THOUGHT_STACK.md bounded by both line count and bytes, wrapped for the
+/// prompt. Returns `None` when the file is missing or blank.
+///
+/// The line cap is the entity-facing rule (it is instructed to stay under 50);
+/// the byte ceiling is the safety net, because 60 lines say nothing about size.
+fn load_thought_stack(
+    root_dir: &Path,
+    max_bytes: usize,
+) -> Result<Option<String>, crate::errors::PromptError> {
+    let path = root_dir.join("THOUGHT_STACK.md");
+    if !path.exists() {
+        return Ok(None);
+    }
+    let content = std::fs::read_to_string(&path)?;
+    if content.trim().is_empty() {
+        return Ok(None);
+    }
+    let limited: String = content
+        .lines()
+        .take(THOUGHT_STACK_MAX_LINES)
+        .collect::<Vec<_>>()
+        .join("\n");
+    let bounded = truncate_to_byte_cap(&limited, max_bytes);
+    Ok(Some(format!(
+        "<thought-stack>\n{}\n</thought-stack>",
+        bounded
+    )))
 }
 
 /// Build metacognitive context for autonomous tasks — vigil health summary
@@ -1510,21 +1707,23 @@ mod tests {
     }
 
     #[test]
-    fn budget_disabled_loads_everything() {
+    fn budget_disabled_skips_token_caps() {
         let dir = tempfile::tempdir().unwrap();
         let mut config = minimal_config();
         config.system_prompt_budget.enabled = false;
 
-        // Write large files
-        std::fs::write(dir.path().join("CLAUDE.md"), "x".repeat(80_000)).unwrap();
+        // Large, but each component stays under its byte ceiling.
+        std::fs::write(dir.path().join("CLAUDE.md"), "x".repeat(60_000)).unwrap();
         std::fs::create_dir_all(dir.path().join("memory")).unwrap();
-        std::fs::write(dir.path().join("memory/MEMORY.md"), "y".repeat(40_000)).unwrap();
+        std::fs::write(dir.path().join("memory/MEMORY.md"), "y".repeat(30_000)).unwrap();
 
         let result = build_system_prompt_budgeted(dir.path(), &config, None, None).unwrap();
 
-        // Everything loaded, no trimming
+        // Everything loaded, no trimming — token caps are budgeting, and
+        // budgeting is off.
         assert!(!result.was_trimmed);
-        assert!(result.estimated_tokens > 25_000);
+        assert!(!result.prompt.contains("[truncated"));
+        assert!(result.estimated_tokens > 22_000);
     }
 
     #[test]
@@ -1669,6 +1868,246 @@ mod tests {
         assert_eq!(cfg.pipeline_health_cap, 500);
         assert_eq!(cfg.cognitive_health_cap, 300);
         assert_eq!(cfg.caliber_cap, 200);
+        assert_eq!(cfg.thought_stack_max_bytes, 48 * 1024);
+        assert_eq!(cfg.awareness_max_bytes, 16 * 1024);
+        assert_eq!(cfg.memory_max_bytes, 32 * 1024);
+    }
+
+    // --- PN-75: byte ceilings and task-path budgeting ---
+
+    fn write_giant_line(path: &std::path::Path, bytes: usize) {
+        std::fs::write(path, "z".repeat(bytes)).unwrap();
+    }
+
+    #[test]
+    fn truncate_to_byte_cap_noop_when_under() {
+        let text = "short text";
+        assert_eq!(truncate_to_byte_cap(text, 1024), text);
+    }
+
+    #[test]
+    fn truncate_to_byte_cap_bounds_a_single_giant_line() {
+        let text = "a".repeat(200_000);
+        let result = truncate_to_byte_cap(&text, 4096);
+        assert!(result.len() <= 4096, "got {} bytes", result.len());
+        assert!(result.contains("[truncated"));
+        assert!(result.contains("4096 byte ceiling"));
+    }
+
+    #[test]
+    fn truncate_to_byte_cap_respects_char_boundaries() {
+        // Each emoji is 4 bytes — an odd cap must not split one.
+        let text = "\u{1F600}".repeat(1000);
+        let result = truncate_to_byte_cap(&text, 101);
+        assert!(result.len() <= 101);
+        assert!(result.starts_with('\u{1F600}'));
+    }
+
+    #[test]
+    fn thought_stack_enforces_byte_ceiling() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = minimal_config();
+
+        std::fs::write(dir.path().join("CLAUDE.md"), "# Entity").unwrap();
+        write_giant_line(&dir.path().join("THOUGHT_STACK.md"), 200_000);
+
+        let result = build_system_prompt_budgeted(dir.path(), &config, None, None).unwrap();
+
+        assert!(result.prompt.contains("<thought-stack>"));
+        assert!(result.prompt.contains("byte ceiling"));
+        assert!(
+            result.prompt.len() < 64 * 1024,
+            "prompt should be bounded by the thought stack ceiling, got {} bytes",
+            result.prompt.len()
+        );
+    }
+
+    #[test]
+    fn memory_enforces_byte_ceiling() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = minimal_config();
+        // Generous token cap so the byte ceiling is the binding constraint.
+        config.system_prompt_budget.memory_cap = 100_000;
+        config.system_prompt_budget.token_budget = 1_000_000;
+
+        std::fs::create_dir_all(dir.path().join("memory")).unwrap();
+        write_giant_line(&dir.path().join("memory/MEMORY.md"), 200_000);
+
+        let result = build_system_prompt_budgeted(dir.path(), &config, None, None).unwrap();
+
+        assert!(result.prompt.contains("<memory>"));
+        assert!(result.prompt.contains("byte ceiling"));
+        assert!(result.prompt.len() < 64 * 1024);
+    }
+
+    #[test]
+    fn awareness_enforces_byte_ceiling() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = minimal_config();
+        config.system_prompt_budget.token_budget = 1_000_000;
+
+        write_giant_line(&dir.path().join("AWARENESS.md"), 200_000);
+
+        let result = build_system_prompt_budgeted(dir.path(), &config, None, None).unwrap();
+
+        assert!(result.prompt.contains("<platform>"));
+        assert!(result.prompt.contains("byte ceiling"));
+        assert!(result.prompt.len() < 32 * 1024);
+    }
+
+    /// AC6: the byte ceilings are safety, not budgeting — they survive
+    /// `system_prompt_budget.enabled = false`.
+    #[test]
+    fn byte_ceilings_hold_with_budget_disabled() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = minimal_config();
+        config.system_prompt_budget.enabled = false;
+
+        std::fs::write(dir.path().join("CLAUDE.md"), "# Entity").unwrap();
+        write_giant_line(&dir.path().join("THOUGHT_STACK.md"), 500_000);
+        write_giant_line(&dir.path().join("AWARENESS.md"), 500_000);
+        std::fs::create_dir_all(dir.path().join("memory")).unwrap();
+        write_giant_line(&dir.path().join("memory/MEMORY.md"), 500_000);
+
+        let chat = build_system_prompt_budgeted(dir.path(), &config, None, None).unwrap();
+        assert!(
+            chat.prompt.len() < 128 * 1024,
+            "chat prompt unbounded with budget disabled: {} bytes",
+            chat.prompt.len()
+        );
+        assert_eq!(chat.prompt.matches("byte ceiling").count(), 3);
+
+        let task = build_task_system_prompt_budgeted(dir.path(), &config).unwrap();
+        assert!(
+            task.prompt.len() < 64 * 1024,
+            "task prompt unbounded with budget disabled: {} bytes",
+            task.prompt.len()
+        );
+        assert!(task.prompt.contains("byte ceiling"));
+    }
+
+    /// AC1 (prompt side): a 10MB THOUGHT_STACK of 4KB lines still assembles
+    /// into a prompt small enough to hand to a subprocess.
+    #[test]
+    fn giant_thought_stack_yields_a_bounded_prompt() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = minimal_config();
+
+        std::fs::write(dir.path().join("CLAUDE.md"), "# Entity").unwrap();
+        let line = "t".repeat(4096);
+        let stack: String = std::iter::repeat(line.as_str())
+            .take(2560)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(stack.len() > 10 * 1024 * 1024);
+        std::fs::write(dir.path().join("THOUGHT_STACK.md"), &stack).unwrap();
+
+        let result = build_system_prompt_budgeted(dir.path(), &config, None, None).unwrap();
+        assert!(
+            result.prompt.len() < 64 * 1024,
+            "assembled prompt was {} bytes",
+            result.prompt.len()
+        );
+    }
+
+    #[test]
+    fn essential_over_hard_byte_limit_fails_loudly() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = minimal_config();
+        // Token caps off — only the essential hard limit should speak here.
+        config.system_prompt_budget.enabled = false;
+
+        std::fs::write(dir.path().join("CLAUDE.md"), "c".repeat(70 * 1024)).unwrap();
+
+        let err = build_system_prompt_budgeted(dir.path(), &config, None, None).unwrap_err();
+        assert!(
+            matches!(err, crate::errors::PromptError::EssentialTooLarge { .. }),
+            "expected EssentialTooLarge, got: {err}"
+        );
+        assert!(err.to_string().contains("never auto-trimmed"));
+    }
+
+    #[test]
+    fn pass_three_hard_truncates_high_tier() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = minimal_config();
+        config.system_prompt_budget.enabled = true;
+        // Essential (~100 tokens of static blocks) plus a High-tier SELF.md
+        // that alone blows the budget. Low tiers are absent, so only Pass 3
+        // can bring this back under.
+        config.system_prompt_budget.token_budget = 800;
+        config.system_prompt_budget.self_md_cap = 0;
+
+        std::fs::write(dir.path().join("CLAUDE.md"), "# Entity").unwrap();
+        std::fs::write(dir.path().join("SELF.md"), "s".repeat(40_000)).unwrap();
+
+        let result = build_system_prompt_budgeted(dir.path(), &config, None, None).unwrap();
+
+        assert!(result.was_trimmed, "Pass 3 must trim, not just warn");
+        assert!(result.prompt.contains("token cap"));
+        assert!(
+            result.estimated_tokens <= 900,
+            "prompt still over budget: {} tokens",
+            result.estimated_tokens
+        );
+        // Essential survives untouched.
+        assert!(result.prompt.contains("# Entity"));
+        assert!(result.prompt.contains("memory-curation"));
+    }
+
+    // --- Task path ---
+
+    #[test]
+    fn task_prompt_keeps_its_content_and_order() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = minimal_config();
+
+        std::fs::write(dir.path().join("CLAUDE.md"), "# Entity\nBehave.").unwrap();
+        std::fs::write(dir.path().join("SELF.md"), "I am a test.").unwrap();
+        std::fs::write(dir.path().join("THOUGHT_STACK.md"), "- thinking").unwrap();
+
+        let prompt = build_task_system_prompt(dir.path(), &config).unwrap();
+
+        let claude = prompt.find("# Entity").unwrap();
+        let identity = prompt.find("<identity>").unwrap();
+        let stack = prompt.find("<thought-stack>").unwrap();
+        let task = prompt.find("<task-context>").unwrap();
+        assert!(claude < identity && identity < stack && stack < task);
+
+        // Chat-only components stay out of the task prompt.
+        assert!(!prompt.contains("<memory>"));
+        assert!(!prompt.contains("<last-session>"));
+        assert!(!prompt.contains("memory-curation"));
+    }
+
+    #[test]
+    fn task_prompt_reports_budget_metrics() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = minimal_config();
+
+        std::fs::write(dir.path().join("CLAUDE.md"), "# Entity").unwrap();
+
+        let result = build_task_system_prompt_budgeted(dir.path(), &config).unwrap();
+
+        assert!(result.estimated_tokens > 0);
+        assert!(!result.was_trimmed);
+        assert!(result.dropped_components.is_empty());
+        assert!(result.prompt.contains("<task-context>"));
+    }
+
+    #[test]
+    fn task_prompt_applies_component_caps() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = minimal_config();
+        config.system_prompt_budget.claude_md_cap = 50;
+
+        std::fs::write(dir.path().join("CLAUDE.md"), "x".repeat(4_000)).unwrap();
+
+        let result = build_task_system_prompt_budgeted(dir.path(), &config).unwrap();
+
+        assert!(result.prompt.contains("[truncated"));
+        // The hallucination guard is essential and always survives.
+        assert!(result.prompt.contains("Do NOT generate user messages"));
     }
 
     #[test]

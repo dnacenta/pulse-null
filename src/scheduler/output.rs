@@ -201,6 +201,41 @@ pub async fn route_error(error: &str, error_kind: &str, task_name: &str, config:
     }
 }
 
+/// Deliver a liveness `[ALERT]` / `[RESOLVED]` message via the share webhook.
+///
+/// Unlike the fire-and-forget routers above, this reports delivery: the
+/// scheduler only commits an alert as sent when this returns `Ok`, so a
+/// failing webhook leaves the alert pending for the next watchdog tick
+/// instead of losing it (AC7).
+///
+/// With no webhook configured there is nothing to retry — the alert is
+/// logged at `error` level and reported as delivered so the backoff ladder
+/// still applies.
+///
+/// Takes the URL rather than the whole `Config` because that is all it
+/// needs, which also makes the delivery contract testable on its own.
+pub async fn deliver_liveness_alert(content: &str, webhook: Option<&str>) -> Result<(), String> {
+    let webhook_url = match webhook {
+        Some(url) if !url.is_empty() => url,
+        _ => {
+            tracing::error!("Liveness alert (no webhook configured): {}", content);
+            return Ok(());
+        }
+    };
+
+    let client = reqwest::Client::builder()
+        .timeout(WEBHOOK_TIMEOUT)
+        .build()
+        .map_err(|e| format!("client build failed: {e}"))?;
+    let body = serde_json::json!({ "content": content });
+
+    match client.post(webhook_url).json(&body).send().await {
+        Ok(res) if res.status().is_success() => Ok(()),
+        Ok(res) => Err(format!("webhook returned {}", res.status())),
+        Err(e) => Err(format!("webhook request failed: {e}")),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -273,6 +308,27 @@ mod tests {
         assert_eq!(parsed.chain_requests.len(), 1);
         assert!(parsed.chain_requests[0].contains("Reflect"));
         assert!(!parsed.clean_content.contains("[CHAIN:"));
+    }
+
+    #[tokio::test]
+    async fn liveness_alert_without_webhook_counts_as_delivered() {
+        // Nothing to retry against, so the caller must be free to start the
+        // backoff clock instead of looping on an impossible delivery.
+        assert!(deliver_liveness_alert("[ALERT] test", None).await.is_ok());
+        assert!(deliver_liveness_alert("[ALERT] test", Some(""))
+            .await
+            .is_ok());
+    }
+
+    #[tokio::test]
+    async fn liveness_alert_reports_transport_failure() {
+        // Port 1 on loopback refuses instantly — the failure must surface as
+        // Err so the alert stays pending for the next watchdog tick.
+        let result = deliver_liveness_alert("[ALERT] test", Some("http://127.0.0.1:1/hook")).await;
+        assert!(
+            result.is_err(),
+            "expected transport failure, got {result:?}"
+        );
     }
 
     #[test]

@@ -1,15 +1,26 @@
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
+use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 
 use pulse_system_types::llm::{
     ContentBlock, LlmResponse, LlmResult, LmProvider, Message, MessageContent, MessageSource, Role,
     StopReason,
 };
+use tracing::warn;
 
 /// Default timeout for Claude Code subprocess (5 minutes).
 /// Claude Code runs tools and may take longer than a direct API call.
 const SUBPROCESS_TIMEOUT: Duration = Duration::from_secs(300);
 
+/// Timeout for the one-off `--system-prompt-file` support probe.
+const PROBE_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// What a CLI without the flag prints when it parses `--system-prompt-file`.
+const UNKNOWN_OPTION_MARKER: &str = "unknown option";
+
+use crate::errors::ClaudeCliError;
 use crate::session::strip_system_prefixes;
 use crate::streaming::{self, StreamResult, StreamingProvider};
 
@@ -24,6 +35,158 @@ impl ClaudeCodeProvider {
             .or_else(|| std::env::var("CLAUDE_BIN").ok())
             .unwrap_or_else(|| "claude".into());
         Self { model, claude_bin }
+    }
+}
+
+/// A private on-disk copy of the system prompt for a single CLI invocation.
+///
+/// The prompt is handed to `claude` as `--system-prompt-file <path>` rather
+/// than as an argv string: Linux caps a single argv argument at
+/// `MAX_ARG_STRLEN` (128KB), and an oversized system prompt made every spawn
+/// fail with E2BIG. The file is created with mode 0600 and unlinked when this
+/// guard drops, which covers the success, error, timeout and cancellation
+/// paths alike — every exit from the invocation future drops its locals.
+struct SystemPromptFile {
+    path: PathBuf,
+}
+
+impl SystemPromptFile {
+    /// Write `contents` to a uniquely named private file in the temp dir.
+    fn create(contents: &str) -> Result<Self, ClaudeCliError> {
+        let path = std::env::temp_dir().join(format!(
+            "pulse-null-system-prompt-{}.md",
+            uuid::Uuid::new_v4()
+        ));
+
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+
+        let staged = Self { path };
+        let mut file = options
+            .open(&staged.path)
+            .map_err(|source| staged.error(source))?;
+        {
+            use std::io::Write;
+            file.write_all(contents.as_bytes())
+                .map_err(|source| staged.error(source))?;
+        }
+        Ok(staged)
+    }
+
+    fn path(&self) -> &Path {
+        &self.path
+    }
+
+    fn error(&self, source: std::io::Error) -> ClaudeCliError {
+        ClaudeCliError::SystemPromptFile {
+            path: self.path.display().to_string(),
+            source,
+        }
+    }
+}
+
+impl Drop for SystemPromptFile {
+    fn drop(&mut self) {
+        match std::fs::remove_file(&self.path) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => warn!(
+                "failed to remove system prompt file '{}': {}",
+                self.path.display(),
+                e
+            ),
+        }
+    }
+}
+
+/// Probe results for `--system-prompt-file`, keyed by resolved binary path.
+fn support_cache() -> &'static Mutex<HashMap<String, bool>> {
+    static CACHE: OnceLock<Mutex<HashMap<String, bool>>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Verify the resolved CLI accepts `--system-prompt-file`, probing at most once
+/// per binary path.
+///
+/// Falling back to `--system-prompt` on argv is not an option: that is the
+/// failure mode this transport exists to remove, so an unsupported CLI is a
+/// hard, named error.
+async fn ensure_system_prompt_file_support(claude_bin: &str) -> Result<(), ClaudeCliError> {
+    let cached = support_cache()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(claude_bin)
+        .copied();
+
+    let supported = match cached {
+        Some(supported) => supported,
+        None => {
+            let supported = probe_system_prompt_file(claude_bin).await?;
+            support_cache()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .insert(claude_bin.to_string(), supported);
+            supported
+        }
+    };
+
+    if supported {
+        Ok(())
+    } else {
+        Err(ClaudeCliError::SystemPromptFileUnsupported {
+            bin: claude_bin.to_string(),
+        })
+    }
+}
+
+/// Run the CLI with `--system-prompt-file` pointed at a path that cannot exist.
+///
+/// A CLI that knows the flag rejects the missing *file*; one that does not
+/// rejects the unknown *option*. Either way the process exits during argument
+/// handling, so the probe never reaches the API.
+async fn probe_system_prompt_file(claude_bin: &str) -> Result<bool, ClaudeCliError> {
+    let absent = std::env::temp_dir().join(format!("pulse-null-probe-{}.md", uuid::Uuid::new_v4()));
+
+    let mut cmd = tokio::process::Command::new(claude_bin);
+    cmd.arg("-p")
+        .arg("--system-prompt-file")
+        .arg(&absent)
+        .env_remove("CLAUDECODE")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    cmd.kill_on_drop(true);
+
+    let child = cmd.spawn().map_err(|source| ClaudeCliError::Probe {
+        bin: claude_bin.to_string(),
+        source,
+    })?;
+
+    match tokio::time::timeout(PROBE_TIMEOUT, child.wait_with_output()).await {
+        Ok(Ok(output)) => {
+            let mut combined = String::from_utf8_lossy(&output.stderr).into_owned();
+            combined.push_str(&String::from_utf8_lossy(&output.stdout));
+            Ok(!combined.contains(UNKNOWN_OPTION_MARKER))
+        }
+        Ok(Err(source)) => Err(ClaudeCliError::Probe {
+            bin: claude_bin.to_string(),
+            source,
+        }),
+        Err(_) => {
+            // The flag was accepted by the argument parser — an unknown option
+            // exits immediately — so treat a slow probe as support.
+            warn!(
+                "probe of '{}' for --system-prompt-file timed out after {}s; assuming supported",
+                claude_bin,
+                PROBE_TIMEOUT.as_secs()
+            );
+            Ok(true)
+        }
     }
 }
 
@@ -43,6 +206,11 @@ impl LmProvider for ClaudeCodeProvider {
         Box::pin(async move {
             let prompt = serialize_messages(&messages);
 
+            ensure_system_prompt_file_support(&claude_bin).await?;
+            // Dropped on every exit from this future — success, error, timeout
+            // and cancellation — which unlinks the staged prompt.
+            let system_prompt_file = SystemPromptFile::create(&system_prompt)?;
+
             let mut cmd = tokio::process::Command::new(&claude_bin);
             cmd.arg("-p")
                 .arg("-")
@@ -50,8 +218,8 @@ impl LmProvider for ClaudeCodeProvider {
                 .arg(&model)
                 .arg("--output-format")
                 .arg("json")
-                .arg("--system-prompt")
-                .arg(&system_prompt)
+                .arg("--system-prompt-file")
+                .arg(system_prompt_file.path())
                 .arg("--no-session-persistence")
                 .arg("--dangerously-skip-permissions")
                 .env_remove("CLAUDECODE")
@@ -424,6 +592,242 @@ mod tests {
     fn provider_name() {
         let provider = ClaudeCodeProvider::new("opus".into(), None);
         assert_eq!(provider.name(), "claude-code");
+    }
+
+    // --- PN-75: system prompt off argv ---
+
+    /// A fake `claude` CLI that mimics the parts of the real one this provider
+    /// depends on: it rejects a missing `--system-prompt-file`, records its
+    /// argv and the prompt file it was given, then emits a JSON result.
+    struct MockCli {
+        _dir: tempfile::TempDir,
+        bin: PathBuf,
+        argv_log: PathBuf,
+        prompt_copy: PathBuf,
+        prompt_path_log: PathBuf,
+    }
+
+    impl MockCli {
+        fn new(body: &str) -> Self {
+            let dir = tempfile::tempdir().unwrap();
+            let bin = dir.path().join("claude-mock");
+            let argv_log = dir.path().join("argv.log");
+            let prompt_copy = dir.path().join("prompt.copy");
+            let prompt_path_log = dir.path().join("prompt-path.log");
+
+            let script = format!(
+                "#!/bin/sh\n\
+                 spf=\"\"\n\
+                 prev=\"\"\n\
+                 for a in \"$@\"; do\n\
+                 \x20 if [ \"$prev\" = \"--system-prompt-file\" ]; then spf=\"$a\"; fi\n\
+                 \x20 prev=\"$a\"\n\
+                 done\n\
+                 if [ -n \"$spf\" ] && [ ! -f \"$spf\" ]; then\n\
+                 \x20 echo \"Error: System prompt file not found: $spf\" >&2\n\
+                 \x20 exit 1\n\
+                 fi\n\
+                 cat > /dev/null\n\
+                 : > \"{argv}\"\n\
+                 for a in \"$@\"; do printf '%s\\n' \"$a\" >> \"{argv}\"; done\n\
+                 if [ -n \"$spf\" ]; then\n\
+                 \x20 cp \"$spf\" \"{copy}\"\n\
+                 \x20 printf '%s' \"$spf\" > \"{pathlog}\"\n\
+                 fi\n\
+                 {body}\n",
+                argv = argv_log.display(),
+                copy = prompt_copy.display(),
+                pathlog = prompt_path_log.display(),
+                body = body,
+            );
+            std::fs::write(&bin, script).unwrap();
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+            }
+
+            Self {
+                _dir: dir,
+                bin,
+                argv_log,
+                prompt_copy,
+                prompt_path_log,
+            }
+        }
+
+        /// A mock that succeeds with a fixed JSON result.
+        fn succeeding() -> Self {
+            Self::new("printf '{\"result\":\"mock ok\",\"session_id\":\"mock\"}'")
+        }
+
+        fn provider(&self, model: &str) -> ClaudeCodeProvider {
+            ClaudeCodeProvider::new(model.into(), Some(self.bin.display().to_string()))
+        }
+
+        fn argv(&self) -> Vec<String> {
+            std::fs::read_to_string(&self.argv_log)
+                .unwrap()
+                .lines()
+                .map(str::to_string)
+                .collect()
+        }
+
+        fn captured_prompt(&self) -> String {
+            std::fs::read_to_string(&self.prompt_copy).unwrap()
+        }
+
+        fn captured_prompt_path(&self) -> PathBuf {
+            PathBuf::from(std::fs::read_to_string(&self.prompt_path_log).unwrap())
+        }
+    }
+
+    fn user_message(text: &str) -> Vec<Message> {
+        vec![Message {
+            role: Role::User,
+            content: MessageContent::Text(text.into()),
+            source: None,
+        }]
+    }
+
+    #[tokio::test]
+    async fn system_prompt_goes_to_a_file_not_argv() {
+        let mock = MockCli::succeeding();
+        let provider = mock.provider("opus");
+        let system_prompt = "# Identity\nYou are a test entity.";
+
+        let response = provider
+            .invoke(system_prompt, &user_message("hello"), 1024, None)
+            .await
+            .unwrap();
+        assert_eq!(response.text(), "mock ok");
+
+        let argv = mock.argv();
+        assert!(
+            argv.iter().any(|a| a == "--system-prompt-file"),
+            "expected --system-prompt-file in argv, got {argv:?}"
+        );
+        assert!(
+            !argv.iter().any(|a| a == "--system-prompt"),
+            "system prompt must never ride argv, got {argv:?}"
+        );
+        assert!(
+            !argv.iter().any(|a| a.contains("You are a test entity")),
+            "prompt content leaked into argv: {argv:?}"
+        );
+        assert_eq!(mock.captured_prompt(), system_prompt);
+    }
+
+    #[tokio::test]
+    async fn system_prompt_file_is_removed_after_invocation() {
+        let mock = MockCli::succeeding();
+        let provider = mock.provider("opus");
+
+        provider
+            .invoke("system", &user_message("hello"), 1024, None)
+            .await
+            .unwrap();
+
+        let staged = mock.captured_prompt_path();
+        assert!(
+            !staged.exists(),
+            "staged system prompt {} should be unlinked after the invocation",
+            staged.display()
+        );
+    }
+
+    #[tokio::test]
+    async fn system_prompt_file_is_removed_when_the_cli_fails() {
+        let mock = MockCli::new("echo 'boom' >&2\nexit 2");
+        let provider = mock.provider("opus");
+
+        let err = provider
+            .invoke("system", &user_message("hello"), 1024, None)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("boom"), "got: {err}");
+
+        let staged = mock.captured_prompt_path();
+        assert!(
+            !staged.exists(),
+            "staged system prompt {} should be unlinked after a failed invocation",
+            staged.display()
+        );
+    }
+
+    /// AC1: a system prompt far past the 128KB single-argv kernel limit spawns
+    /// successfully, and argv stays tiny.
+    #[tokio::test]
+    async fn giant_system_prompt_spawns_with_small_argv() {
+        const MEGABYTE: usize = 1024 * 1024;
+
+        let mock = MockCli::succeeding();
+        let provider = mock.provider("opus");
+        let system_prompt = "x".repeat(MEGABYTE);
+
+        let response = provider
+            .invoke(&system_prompt, &user_message("hello"), 1024, None)
+            .await
+            .unwrap();
+        assert_eq!(response.text(), "mock ok");
+
+        let argv = mock.argv();
+        let argv_bytes: usize = argv.iter().map(|a| a.len() + 1).sum();
+        assert!(
+            argv_bytes < 8 * 1024,
+            "argv should carry flags only, got {argv_bytes} bytes: {argv:?}"
+        );
+        assert_eq!(mock.captured_prompt().len(), MEGABYTE);
+    }
+
+    #[tokio::test]
+    async fn unsupported_cli_fails_with_a_named_error() {
+        let mock = MockCli::new("exit 0");
+        // Overwrite the mock with one that rejects the flag outright.
+        std::fs::write(
+            &mock.bin,
+            "#!/bin/sh\necho \"error: unknown option '--system-prompt-file'\" >&2\nexit 1\n",
+        )
+        .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&mock.bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+
+        let provider = mock.provider("opus");
+        let err = provider
+            .invoke("system", &user_message("hello"), 1024, None)
+            .await
+            .unwrap_err();
+
+        assert!(
+            err.to_string()
+                .contains("does not support --system-prompt-file"),
+            "expected a named unsupported-CLI error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn system_prompt_file_is_private_and_self_cleaning() {
+        let path = {
+            let staged = SystemPromptFile::create("secret prompt").unwrap();
+            assert_eq!(
+                std::fs::read_to_string(staged.path()).unwrap(),
+                "secret prompt"
+            );
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let mode = std::fs::metadata(staged.path())
+                    .unwrap()
+                    .permissions()
+                    .mode();
+                assert_eq!(mode & 0o777, 0o600, "staged prompt must be owner-only");
+            }
+            staged.path().to_path_buf()
+        };
+        assert!(!path.exists(), "guard must unlink the file when dropped");
     }
 
     #[test]

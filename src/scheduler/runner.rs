@@ -8,6 +8,7 @@ use tokio::sync::RwLock;
 use super::evaluator::{resolve_docs_dir, resolve_task_evaluator, EvalDecision, SchedulerState};
 use super::executor::{self, ExecutionConfig};
 use super::intent::{self, IntentQueue, IntentSource};
+use super::liveness::{self, SharedTaskHealth, TaskOutcome};
 use super::output;
 use super::{Schedule, ScheduledTask};
 use crate::events::EntityEvent;
@@ -22,6 +23,7 @@ pub async fn run_task_loop(
     state: Arc<AppState>,
     schedule: Arc<RwLock<Schedule>>,
     intent_queue: Arc<RwLock<IntentQueue>>,
+    health: SharedTaskHealth,
     tz: chrono_tz::Tz,
 ) {
     let normalized_cron = super::normalize_cron(&task.cron);
@@ -117,10 +119,13 @@ pub async fn run_task_loop(
 
         // Check for built-in deterministic handlers first
         if run_builtin_handler(&task, &state, &root_dir).await {
+            liveness::record_outcome(&health, &state, &task.id, &task.name, TaskOutcome::Success)
+                .await;
             continue;
         }
 
-        execute_task(&task, &state, &schedule, &intent_queue, &mut eval_state).await;
+        let outcome = execute_task(&task, &state, &schedule, &intent_queue, &mut eval_state).await;
+        liveness::record_outcome(&health, &state, &task.id, &task.name, outcome).await;
     }
 }
 
@@ -163,13 +168,16 @@ async fn run_builtin_handler(
 }
 
 /// Execute a scheduled task: build prompt, call LLM (with tools if autonomy enabled), route output.
+///
+/// Returns what the liveness alarm should record. Execution semantics are
+/// unchanged — the outcome is an observation, not a control signal.
 async fn execute_task(
     task: &ScheduledTask,
     state: &Arc<AppState>,
     schedule: &Arc<RwLock<Schedule>>,
     intent_queue: &Arc<RwLock<IntentQueue>>,
     eval_state: &mut SchedulerState,
-) {
+) -> TaskOutcome {
     // Use cached root_dir from AppState
     let root_dir = state.root_dir.clone();
 
@@ -185,7 +193,7 @@ async fn execute_task(
         Ok(p) => p,
         Err(e) => {
             tracing::error!("Cannot build system prompt for task '{}': {}", task.id, e);
-            return;
+            return TaskOutcome::Failure(format!("system prompt build failed: {e}"));
         }
     };
 
@@ -273,7 +281,7 @@ async fn execute_task(
                     error_msg
                 );
                 handle_provider_error(state, &task.id, &error_msg).await;
-                return;
+                return TaskOutcome::Failure(error_msg);
             }
         }
     } else {
@@ -319,7 +327,7 @@ async fn execute_task(
                     error_msg
                 );
                 handle_provider_error(state, &task.id, &error_msg).await;
-                return;
+                return TaskOutcome::Failure(error_msg);
             }
         }
     };
@@ -642,6 +650,8 @@ async fn execute_task(
     if state.config.graph.enabled {
         crate::session::graph_sync_vigil(&root_dir).await;
     }
+
+    TaskOutcome::Success
 }
 
 /// Handle a provider error: classify, update status, emit event, send notification.

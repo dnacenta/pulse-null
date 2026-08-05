@@ -16,6 +16,10 @@ use serde::Serialize;
 const AUDIT_FILE: &str = "intake-audit.jsonl";
 #[allow(dead_code)]
 const MAX_AUDIT_LINES: usize = 500;
+/// Byte ceiling for the audit file. A line cap alone bounds nothing: a `detail`
+/// field can be arbitrarily long, so 500 entries can still be megabytes.
+#[allow(dead_code)]
+const MAX_AUDIT_BYTES: usize = 64 * 1024;
 
 /// A single audit entry recording an interaction's pipeline flow.
 #[derive(Debug, Serialize)]
@@ -95,8 +99,8 @@ pub fn entry(
     }
 }
 
-/// Rotate the audit file if it exceeds MAX_AUDIT_LINES.
-/// Keeps the most recent half of entries.
+/// Rotate the audit file if it exceeds MAX_AUDIT_LINES or MAX_AUDIT_BYTES.
+/// Keeps the most recent entries that fit under both ceilings.
 #[allow(dead_code)]
 pub fn rotate_if_needed(root_dir: &Path) {
     let audit_path = root_dir.join(AUDIT_FILE);
@@ -107,12 +111,18 @@ pub fn rotate_if_needed(root_dir: &Path) {
     };
 
     let lines: Vec<&str> = content.lines().collect();
-    if lines.len() <= MAX_AUDIT_LINES {
+    if lines.len() <= MAX_AUDIT_LINES && content.len() <= MAX_AUDIT_BYTES {
         return;
     }
 
-    // Keep the most recent half
-    let keep_from = lines.len() - (MAX_AUDIT_LINES / 2);
+    // Keep the most recent half, then walk forward until the tail fits the
+    // byte ceiling as well.
+    let mut keep_from = lines.len().saturating_sub(MAX_AUDIT_LINES / 2);
+    let mut kept_bytes: usize = lines[keep_from..].iter().map(|l| l.len() + 1).sum();
+    while keep_from < lines.len() && kept_bytes > MAX_AUDIT_BYTES {
+        kept_bytes = kept_bytes.saturating_sub(lines[keep_from].len() + 1);
+        keep_from += 1;
+    }
     let kept: String = lines[keep_from..].join("\n") + "\n";
     if let Err(e) = fs::write(&audit_path, kept) {
         tracing::error!("Failed to rotate audit file: {}", e);
@@ -176,5 +186,37 @@ mod tests {
         assert!(lines.len() <= MAX_AUDIT_LINES / 2 + 1);
         // Should keep the most recent entries
         assert!(lines.last().unwrap().contains("id-599"));
+    }
+
+    /// PN-75: 500 entries say nothing about size — a fat `detail` field can
+    /// make a few dozen lines megabytes.
+    #[test]
+    fn rotate_enforces_the_byte_ceiling() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+
+        let fat = "d".repeat(8 * 1024);
+        let mut content = String::new();
+        for i in 0..40 {
+            content.push_str(&format!(
+                "{{\"interaction_id\":\"id-{i}\",\"detail\":\"{fat}\"}}\n"
+            ));
+        }
+        assert!(content.len() > MAX_AUDIT_BYTES);
+        fs::write(root.join(AUDIT_FILE), &content).unwrap();
+
+        rotate_if_needed(root);
+
+        let after = fs::read_to_string(root.join(AUDIT_FILE)).unwrap();
+        assert!(
+            after.len() <= MAX_AUDIT_BYTES,
+            "audit file still {} bytes",
+            after.len()
+        );
+        let lines: Vec<&str> = after.lines().filter(|l| !l.is_empty()).collect();
+        assert!(lines.last().unwrap().contains("id-39"));
+        for line in lines {
+            serde_json::from_str::<serde_json::Value>(line).unwrap();
+        }
     }
 }

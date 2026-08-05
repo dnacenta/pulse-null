@@ -3,7 +3,9 @@ pub mod digest;
 pub mod dynamic;
 pub mod evaluator;
 pub mod executor;
+pub mod health;
 pub mod intent;
+pub mod liveness;
 pub mod output;
 pub mod runner;
 pub mod tasks;
@@ -121,16 +123,33 @@ pub async fn start(
 
     let mut handles = Vec::new();
 
+    // Liveness store: one shared handle for every task loop and the
+    // watchdog, so a failure streak is visible across tasks and restarts.
+    let health: liveness::SharedTaskHealth =
+        Arc::new(RwLock::new(health::TaskHealthStore::load(&state.root_dir)));
+
     for task in enabled_tasks {
         let state = Arc::clone(&state);
         let schedule = Arc::clone(&schedule);
         let queue = Arc::clone(&intent_queue);
+        let task_health = Arc::clone(&health);
 
         let handle = tokio::spawn(async move {
-            runner::run_task_loop(task, state, schedule, queue, tz).await;
+            runner::run_task_loop(task, state, schedule, queue, task_health, tz).await;
         });
 
         handles.push(handle);
+    }
+
+    if state.config.scheduler.liveness.enabled {
+        let watchdog_state = Arc::clone(&state);
+        let watchdog_schedule = Arc::clone(&schedule);
+        let watchdog_health = Arc::clone(&health);
+        handles.push(tokio::spawn(async move {
+            liveness::watchdog_loop(watchdog_state, watchdog_schedule, watchdog_health).await;
+        }));
+    } else {
+        tracing::warn!("Scheduler liveness alarm disabled in config — task outages will be silent");
     }
 
     // Start the intent drain loop
