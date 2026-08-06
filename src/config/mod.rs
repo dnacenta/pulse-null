@@ -148,13 +148,28 @@ impl Default for SchedulerConfig {
     }
 }
 
+/// Hard cap on the rolling outcome window kept per task.
+///
+/// This bounds `task_health.json`, so it is a constant rather than a knob:
+/// `flap_window_size` may narrow the sample the flap rule looks at, never
+/// widen what is stored.
+pub const MAX_FLAP_WINDOW_SIZE: u32 = 20;
+
 /// Scheduler liveness alarm — turns a silent task outage into a webhook alert.
 ///
-/// Per-task streaks alert after `alert_after_consecutive_failures` and then
-/// repeat on a backoff ladder (`alert_backoff_hours`, then 4× that). The
-/// global rule alerts when *no* task has succeeded for
-/// `global_silence_alert_hours` while tasks are enabled — set it above the
-/// longest interval in your schedule.
+/// Three rules watch three failure shapes:
+///
+/// * **Sustained** — a task alerts after `alert_after_consecutive_failures`
+///   failures in a row, then repeats on a backoff ladder
+///   (`alert_backoff_hours`, then 4× that).
+/// * **Intermittent** — a task alerts when fewer than
+///   `flap_min_success_percent` of its last `flap_window_size` cycles
+///   succeeded, over at least `flap_min_samples` cycles no older than
+///   `flap_window_hours`. This is the half-broken task that never strings
+///   enough failures together to trip the sustained rule.
+/// * **Global** — nothing at all has succeeded for
+///   `global_silence_alert_hours` while tasks are enabled. Set it above the
+///   longest interval in your schedule.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LivenessConfig {
     #[serde(default = "default_true")]
@@ -168,6 +183,22 @@ pub struct LivenessConfig {
     /// Hours before the first repeat of a still-unresolved alert.
     #[serde(default = "default_alert_backoff_hours")]
     pub alert_backoff_hours: u64,
+    /// Whether the intermittent-failure (flap) rule is armed.
+    #[serde(default = "default_true")]
+    pub flap_enabled: bool,
+    /// Recent cycles the flap rule judges, at most [`MAX_FLAP_WINDOW_SIZE`].
+    #[serde(default = "default_flap_window_size")]
+    pub flap_window_size: u32,
+    /// Cycles older than this are ignored by the flap rule. Keeps the count
+    /// window from letting month-old failures speak for a slow task.
+    #[serde(default = "default_flap_window_hours")]
+    pub flap_window_hours: u64,
+    /// Cycles required in the window before the flap rule may fire at all.
+    #[serde(default = "default_flap_min_samples")]
+    pub flap_min_samples: u32,
+    /// Success rate (percent) below which the window counts as flapping.
+    #[serde(default = "default_flap_min_success_percent")]
+    pub flap_min_success_percent: u32,
 }
 
 impl Default for LivenessConfig {
@@ -177,6 +208,11 @@ impl Default for LivenessConfig {
             alert_after_consecutive_failures: default_alert_after_consecutive_failures(),
             global_silence_alert_hours: default_global_silence_alert_hours(),
             alert_backoff_hours: default_alert_backoff_hours(),
+            flap_enabled: true,
+            flap_window_size: default_flap_window_size(),
+            flap_window_hours: default_flap_window_hours(),
+            flap_min_samples: default_flap_min_samples(),
+            flap_min_success_percent: default_flap_min_success_percent(),
         }
     }
 }
@@ -310,6 +346,22 @@ fn default_global_silence_alert_hours() -> u64 {
 
 fn default_alert_backoff_hours() -> u64 {
     6
+}
+
+fn default_flap_window_size() -> u32 {
+    MAX_FLAP_WINDOW_SIZE
+}
+
+fn default_flap_window_hours() -> u64 {
+    168
+}
+
+fn default_flap_min_samples() -> u32 {
+    5
+}
+
+fn default_flap_min_success_percent() -> u32 {
+    70
 }
 
 // Identity-class session limit defaults

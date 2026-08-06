@@ -106,6 +106,7 @@ fn validate_liveness(liveness: &super::LivenessConfig) -> Result<(), ConfigError
             liveness.global_silence_alert_hours,
         ),
         ("alert_backoff_hours", liveness.alert_backoff_hours),
+        ("flap_window_hours", liveness.flap_window_hours),
     ] {
         if hours == 0 || hours > MAX_LIVENESS_HOURS {
             return Err(ConfigError::Validation(format!(
@@ -113,5 +114,79 @@ fn validate_liveness(liveness: &super::LivenessConfig) -> Result<(), ConfigError
             )));
         }
     }
+    validate_flap(liveness)
+}
+
+/// The flap rule needs a sample big enough to mean something and a threshold
+/// that can actually be crossed — a one-cycle sample or a 100% floor would
+/// turn every isolated failure into an alert.
+fn validate_flap(liveness: &super::LivenessConfig) -> Result<(), ConfigError> {
+    if !liveness.flap_enabled {
+        return Ok(());
+    }
+    let max_window = super::MAX_FLAP_WINDOW_SIZE;
+    if liveness.flap_min_samples < 2 {
+        return Err(ConfigError::Validation(
+            "Scheduler liveness flap_min_samples must be >= 2".into(),
+        ));
+    }
+    if liveness.flap_window_size < liveness.flap_min_samples
+        || liveness.flap_window_size > max_window
+    {
+        return Err(ConfigError::Validation(format!(
+            "Scheduler liveness flap_window_size must be between flap_min_samples ({}) and {max_window}",
+            liveness.flap_min_samples
+        )));
+    }
+    if !(1..=99).contains(&liveness.flap_min_success_percent) {
+        return Err(ConfigError::Validation(
+            "Scheduler liveness flap_min_success_percent must be between 1 and 99".into(),
+        ));
+    }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::LivenessConfig;
+    use super::validate_liveness;
+
+    fn liveness(mutate: impl FnOnce(&mut LivenessConfig)) -> LivenessConfig {
+        let mut config = LivenessConfig::default();
+        mutate(&mut config);
+        config
+    }
+
+    #[test]
+    fn defaults_validate() {
+        assert!(validate_liveness(&LivenessConfig::default()).is_ok());
+    }
+
+    #[test]
+    fn flap_knobs_must_describe_a_usable_sample() {
+        let rejected = [
+            liveness(|c| c.flap_min_samples = 1),
+            liveness(|c| c.flap_window_size = 4),
+            liveness(|c| c.flap_window_size = super::super::MAX_FLAP_WINDOW_SIZE + 1),
+            liveness(|c| c.flap_min_success_percent = 0),
+            liveness(|c| c.flap_min_success_percent = 100),
+            liveness(|c| c.flap_window_hours = 0),
+        ];
+        for config in rejected {
+            assert!(
+                validate_liveness(&config).is_err(),
+                "expected rejection for {config:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn disarmed_flap_rule_skips_its_own_knobs() {
+        let config = liveness(|c| {
+            c.flap_enabled = false;
+            c.flap_min_samples = 0;
+            c.flap_window_size = 0;
+        });
+        assert!(validate_liveness(&config).is_ok());
+    }
 }
