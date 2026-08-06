@@ -85,6 +85,13 @@ enabled = true
 alert_after_consecutive_failures = 3
 global_silence_alert_hours = 6
 alert_backoff_hours = 6
+# Intermittent-failure (flap) rule: alert when a task keeps losing cycles
+# without ever failing enough times in a row to trip the streak rule.
+flap_enabled = true
+flap_window_size = 20
+flap_window_hours = 168
+flap_min_samples = 5
+flap_min_success_percent = 70
 
 [pipeline]
 enabled = true

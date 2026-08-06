@@ -59,10 +59,13 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-/// Per-task liveness: last-success age, failure streak, staleness marker.
+/// Per-task liveness: last-success age, failure streak, staleness and
+/// flapping markers.
 ///
 /// This is the SSH glance that answers "is the entity actually alive?" —
-/// the question that went unanswered for seven weeks.
+/// the question that went unanswered for seven weeks. It answers "is it
+/// *half* alive?" too, so a task whose last cycle happened to pass cannot
+/// read as `[ OK ]` while most of its cycles die.
 fn print_task_liveness(config: &Config, root_dir: &std::path::Path) {
     // `Schedule::load` seeds a default schedule.json when none exists;
     // reporting status must not write anything.
@@ -108,7 +111,9 @@ fn print_task_liveness(config: &Config, root_dir: &std::path::Path) {
         }
         let line = health::status_line(&view, liveness, now);
         let styled = match level {
-            TaskStatusLevel::Failing | TaskStatusLevel::Stale => style(line).red(),
+            TaskStatusLevel::Failing | TaskStatusLevel::Stale | TaskStatusLevel::Flapping => {
+                style(line).red()
+            }
             TaskStatusLevel::Degraded => style(line).yellow(),
             TaskStatusLevel::Ok => style(line).green(),
             TaskStatusLevel::Idle => style(line).white(),

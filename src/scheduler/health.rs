@@ -7,6 +7,15 @@
 //! `predictions.json` / `intents.json` that survives restarts, plus the pure
 //! rules that turn its contents into `[ALERT]` / `[RESOLVED]` messages.
 //!
+//! ## Two failure shapes
+//!
+//! A consecutive-failure streak catches a task that is *dead*. It is blind to
+//! a task that is *half* dead: on 2026-08-06 Echo's thinking loop failed at
+//! 06:35, succeeded at 06:54, failed at 07:15 and 07:35, then succeeded at
+//! 07:54 — never three in a row, so the streak rule stayed silent while the
+//! task lost most of its cycles. The rolling outcome window
+//! ([`TaskHealth::recent_outcomes`]) and the flap rule exist for that shape.
+//!
 //! ## Separation of concerns
 //!
 //! Everything here is pure state and pure decisions: it never talks to the
@@ -27,7 +36,7 @@ use std::path::{Path, PathBuf};
 use chrono::{DateTime, Duration, Utc};
 use serde::{Deserialize, Serialize};
 
-use crate::config::LivenessConfig;
+use crate::config::{LivenessConfig, MAX_FLAP_WINDOW_SIZE};
 use crate::errors::SchedulerError;
 
 /// Persisted health store, in the entity root alongside `predictions.json`.
@@ -46,6 +55,11 @@ const STALE_INTERVAL_MULTIPLIER: i32 = 2;
 /// Repeat alerts wait `alert_backoff_hours`, then this multiple of it
 /// (6h then 24h with the default config).
 const LATE_BACKOFF_MULTIPLIER: u64 = 4;
+
+/// Outcomes retained per task. Storage bound, not policy: it caps
+/// `task_health.json` at roughly 1 KB per task no matter how often a task
+/// fires. `flap_window_size` picks how many of these the flap rule judges.
+const OUTCOME_WINDOW_CAPACITY: usize = MAX_FLAP_WINDOW_SIZE as usize;
 
 // ---------------------------------------------------------------------------
 // Persisted state
@@ -72,6 +86,28 @@ pub struct TaskHealth {
     /// A recovery that has not been announced yet. Set on the success that
     /// ends an *alerted* streak, cleared once the `[RESOLVED]` is delivered.
     pub pending_resolution: Option<Resolution>,
+    /// Rolling record of the last [`OUTCOME_WINDOW_CAPACITY`] cycles, oldest
+    /// first. The flap rule's only input.
+    pub recent_outcomes: Vec<OutcomeRecord>,
+    /// When the last flap `[ALERT]` was *delivered*.
+    pub flap_last_alert_at: Option<DateTime<Utc>>,
+    /// Flap alerts delivered since the last flap `[RESOLVED]` — drives the
+    /// same backoff ladder as the streak rule.
+    pub flap_alerts_sent: u32,
+    /// Cycles at or before this instant are invisible to the flap rule.
+    ///
+    /// Set when the streak rule speaks for this task, so the two rules never
+    /// report the same failures.
+    pub flap_baseline_at: Option<DateTime<Utc>>,
+}
+
+/// One recorded cycle, as the flap rule sees it.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct OutcomeRecord {
+    /// When the cycle finished.
+    pub at: DateTime<Utc>,
+    /// Whether it succeeded.
+    pub ok: bool,
 }
 
 /// A recovery awaiting its `[RESOLVED]` message.
@@ -209,6 +245,7 @@ impl TaskHealthStore {
         health.last_alert_at = None;
         health.alerts_sent_this_streak = 0;
         health.last_success = Some(now);
+        push_outcome(health, now, true);
 
         self.file.global = GlobalHealth {
             pending_resolution: silence_alerted.then(|| GlobalResolution {
@@ -238,6 +275,7 @@ impl TaskHealthStore {
         health.consecutive_failures = health.consecutive_failures.saturating_add(1);
         health.last_failure = Some(now);
         health.last_error = Some(crate::utils::safe_truncate(error, MAX_ERROR_LEN).to_string());
+        push_outcome(health, now, false);
         self.persist();
     }
 
@@ -268,7 +306,12 @@ impl TaskHealthStore {
     ///
     /// A pending `[RESOLVED]` outranks a new failure alert so the operator
     /// reads the outage story in order. Returns `None` when the task is
-    /// healthy, below the threshold, or inside its backoff window.
+    /// healthy, below every threshold, or inside its backoff window.
+    ///
+    /// At most one alert comes back per call, and the sustained-failure rule
+    /// is resolved first: while a task is in an alerting streak the flap rule
+    /// never speaks for it, not even when that streak's backoff is what
+    /// silenced the repeat.
     #[must_use]
     pub fn pending_task_alert(
         &self,
@@ -288,26 +331,26 @@ impl TaskHealthStore {
             });
         }
 
-        if health.consecutive_failures < config.alert_after_consecutive_failures {
-            return None;
-        }
-        if !alert_due(
-            health.last_alert_at,
-            health.alerts_sent_this_streak,
-            config,
-            now,
-        ) {
-            return None;
+        if health.consecutive_failures >= config.alert_after_consecutive_failures {
+            if !alert_due(
+                health.last_alert_at,
+                health.alerts_sent_this_streak,
+                config,
+                now,
+            ) {
+                return None;
+            }
+            return Some(LivenessAlert::TaskFailing {
+                task_id: task_id.to_string(),
+                task_name: health.task_name.clone(),
+                consecutive_failures: health.consecutive_failures,
+                streak_started: health.first_failure_of_streak,
+                last_error: health.last_error.clone(),
+                repeat: health.alerts_sent_this_streak,
+            });
         }
 
-        Some(LivenessAlert::TaskFailing {
-            task_id: task_id.to_string(),
-            task_name: health.task_name.clone(),
-            consecutive_failures: health.consecutive_failures,
-            streak_started: health.first_failure_of_streak,
-            last_error: health.last_error.clone(),
-            repeat: health.alerts_sent_this_streak,
-        })
+        pending_flap_alert(task_id, health, config, now)
     }
 
     /// Commit a delivered task alert so the backoff clock starts.
@@ -328,6 +371,20 @@ impl TaskHealthStore {
             LivenessAlert::TaskFailing { .. } => {
                 health.last_alert_at = Some(now);
                 health.alerts_sent_this_streak = health.alerts_sent_this_streak.saturating_add(1);
+                // Cycles the streak rule has now reported must never be
+                // reported a second time as flapping.
+                health.flap_baseline_at = Some(now);
+            }
+            LivenessAlert::TaskFlapping { .. } => {
+                health.flap_last_alert_at = Some(now);
+                health.flap_alerts_sent = health.flap_alerts_sent.saturating_add(1);
+            }
+            LivenessAlert::TaskFlapResolved { .. } => {
+                health.flap_last_alert_at = None;
+                health.flap_alerts_sent = 0;
+                // Start the next judgement from a clean window, so the
+                // failures just declared resolved cannot re-fire.
+                health.flap_baseline_at = Some(now);
             }
             LivenessAlert::GlobalSilence { .. } | LivenessAlert::GlobalRecovered { .. } => {
                 tracing::warn!("Global alert passed to per-task delivery bookkeeping — ignored");
@@ -393,7 +450,10 @@ impl TaskHealthStore {
                 self.file.global.last_alert_at = Some(now);
                 self.file.global.alerts_sent = self.file.global.alerts_sent.saturating_add(1);
             }
-            LivenessAlert::TaskFailing { .. } | LivenessAlert::TaskRecovered { .. } => {
+            LivenessAlert::TaskFailing { .. }
+            | LivenessAlert::TaskRecovered { .. }
+            | LivenessAlert::TaskFlapping { .. }
+            | LivenessAlert::TaskFlapResolved { .. } => {
                 tracing::warn!("Task alert passed to global delivery bookkeeping — ignored");
                 return;
             }
@@ -425,6 +485,144 @@ impl TaskHealthStore {
     }
 }
 
+/// Append one cycle, dropping the oldest to stay inside the storage cap.
+fn push_outcome(health: &mut TaskHealth, at: DateTime<Utc>, ok: bool) {
+    health.recent_outcomes.push(OutcomeRecord { at, ok });
+    let overflow = health
+        .recent_outcomes
+        .len()
+        .saturating_sub(OUTCOME_WINDOW_CAPACITY);
+    if overflow > 0 {
+        health.recent_outcomes.drain(..overflow);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Flap rule
+// ---------------------------------------------------------------------------
+
+/// The sample of cycles the flap rule judged.
+#[derive(Debug, Clone, PartialEq)]
+pub struct FlapWindow {
+    /// Cycles in the sample that failed.
+    pub failures: u32,
+    /// Cycles in the sample.
+    pub total: u32,
+    /// First cycle in the sample.
+    pub started: DateTime<Utc>,
+    /// Last cycle in the sample.
+    pub ended: DateTime<Utc>,
+}
+
+impl FlapWindow {
+    /// Share of the sample that succeeded, rounded down.
+    #[must_use]
+    pub fn success_percent(&self) -> u32 {
+        if self.total == 0 {
+            return 100;
+        }
+        self.total.saturating_sub(self.failures) * 100 / self.total
+    }
+
+    /// Wall-clock time the sample covers.
+    #[must_use]
+    pub fn span(&self) -> Duration {
+        self.ended - self.started
+    }
+}
+
+/// The flap rule's reading of one task's recent cycles.
+#[derive(Debug, Clone, PartialEq)]
+enum FlapVerdict {
+    /// Fewer than `flap_min_samples` usable cycles — no opinion.
+    Insufficient,
+    /// Success rate is at or above the configured floor.
+    Healthy(FlapWindow),
+    /// Success rate has fallen below the floor.
+    Flapping(FlapWindow),
+}
+
+/// Judge a task's recent cycles.
+///
+/// The sample is bounded twice, and which bound binds depends on how often
+/// the task fires: `flap_window_size` cycles for a frequent task (20 cycles
+/// of a 20-minute loop is under seven hours), `flap_window_hours` for a rare
+/// one (a daily task keeps a week, a weekly task never gathers a sample and
+/// is left to the streak and staleness rules). Cycles already reported by
+/// the streak rule are excluded via `flap_baseline_at`.
+fn flap_verdict(health: &TaskHealth, config: &LivenessConfig, now: DateTime<Utc>) -> FlapVerdict {
+    if !config.flap_enabled {
+        return FlapVerdict::Insufficient;
+    }
+    let horizon = now - hours(config.flap_window_hours);
+    let baseline = health.flap_baseline_at.unwrap_or(DateTime::<Utc>::MIN_UTC);
+    let size = (config.flap_window_size as usize).clamp(1, OUTCOME_WINDOW_CAPACITY);
+
+    let mut sample: Vec<&OutcomeRecord> = health
+        .recent_outcomes
+        .iter()
+        .filter(|outcome| outcome.at >= horizon && outcome.at > baseline)
+        .collect();
+    if sample.len() > size {
+        sample.drain(..sample.len() - size);
+    }
+
+    let (Some(first), Some(last)) = (sample.first(), sample.last()) else {
+        return FlapVerdict::Insufficient;
+    };
+    let total = sample.len() as u32;
+    if total < config.flap_min_samples.max(2) {
+        return FlapVerdict::Insufficient;
+    }
+
+    let window = FlapWindow {
+        failures: sample.iter().filter(|outcome| !outcome.ok).count() as u32,
+        total,
+        started: first.at,
+        ended: last.at,
+    };
+    if window.success_percent() < config.flap_min_success_percent {
+        FlapVerdict::Flapping(window)
+    } else {
+        FlapVerdict::Healthy(window)
+    }
+}
+
+/// The flap alert (or all-clear) this task owes, if any.
+///
+/// Only called once the streak rule has declined to speak, so the two can
+/// never fire for the same task in the same pass.
+fn pending_flap_alert(
+    task_id: &str,
+    health: &TaskHealth,
+    config: &LivenessConfig,
+    now: DateTime<Utc>,
+) -> Option<LivenessAlert> {
+    match flap_verdict(health, config, now) {
+        FlapVerdict::Flapping(window) => alert_due(
+            health.flap_last_alert_at,
+            health.flap_alerts_sent,
+            config,
+            now,
+        )
+        .then(|| LivenessAlert::TaskFlapping {
+            task_id: task_id.to_string(),
+            task_name: health.task_name.clone(),
+            window,
+            last_error: health.last_error.clone(),
+            repeat: health.flap_alerts_sent,
+        }),
+        FlapVerdict::Healthy(window) => {
+            (health.flap_alerts_sent > 0).then(|| LivenessAlert::TaskFlapResolved {
+                task_id: task_id.to_string(),
+                task_name: health.task_name.clone(),
+                window,
+            })
+        }
+        FlapVerdict::Insufficient => None,
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Alerts
 // ---------------------------------------------------------------------------
@@ -450,6 +648,22 @@ pub enum LivenessAlert {
         streak_started: Option<DateTime<Utc>>,
         recovered_at: DateTime<Utc>,
     },
+    /// One task is losing too many of its recent cycles without ever
+    /// stringing enough failures together to trip the streak rule.
+    TaskFlapping {
+        task_id: String,
+        task_name: String,
+        window: FlapWindow,
+        last_error: Option<String>,
+        /// Flap alerts already sent (0 = first alert).
+        repeat: u32,
+    },
+    /// A task's success rate climbed back above the floor.
+    TaskFlapResolved {
+        task_id: String,
+        task_name: String,
+        window: FlapWindow,
+    },
     /// No task at all has succeeded inside the configured window.
     GlobalSilence {
         /// Last success across all tasks, or store creation if never.
@@ -473,7 +687,9 @@ impl LivenessAlert {
     pub fn task_id(&self) -> Option<&str> {
         match self {
             LivenessAlert::TaskFailing { task_id, .. }
-            | LivenessAlert::TaskRecovered { task_id, .. } => Some(task_id),
+            | LivenessAlert::TaskRecovered { task_id, .. }
+            | LivenessAlert::TaskFlapping { task_id, .. }
+            | LivenessAlert::TaskFlapResolved { task_id, .. } => Some(task_id),
             LivenessAlert::GlobalSilence { .. } | LivenessAlert::GlobalRecovered { .. } => None,
         }
     }
@@ -527,6 +743,43 @@ impl LivenessAlert {
                     format_instant(*streak_started, now),
                 )
             }
+            LivenessAlert::TaskFlapping {
+                task_id,
+                task_name,
+                window,
+                last_error,
+                repeat,
+            } => {
+                let mut msg = format!(
+                    "[ALERT] Scheduled task '{}' ({}) is failing intermittently: {} of {} recent cycles failed ({}% success).",
+                    display_name(task_name, task_id),
+                    task_id,
+                    window.failures,
+                    window.total,
+                    window.success_percent(),
+                );
+                msg.push_str(&format!("\nWindow: {}", format_window(window, now)));
+                if let Some(error) = last_error {
+                    msg.push_str(&format!("\nLast error: {error}"));
+                }
+                if *repeat > 0 {
+                    msg.push_str(&format!("\nStill flapping (alert #{}).", repeat + 1));
+                }
+                msg
+            }
+            LivenessAlert::TaskFlapResolved {
+                task_id,
+                task_name,
+                window,
+            } => format!(
+                "[RESOLVED] Scheduled task '{}' ({}) is no longer failing intermittently: {} of {} recent cycles failed ({}% success).\nWindow: {}",
+                display_name(task_name, task_id),
+                task_id,
+                window.failures,
+                window.total,
+                window.success_percent(),
+                format_window(window, now),
+            ),
             LivenessAlert::GlobalSilence {
                 since,
                 silent_for,
@@ -616,6 +869,8 @@ pub enum TaskStatusLevel {
     Idle,
     /// Last success older than twice the task's own interval.
     Stale,
+    /// Losing too many recent cycles, whatever the last one did.
+    Flapping,
     /// Failing, but not yet at the alert threshold.
     Degraded,
     /// At or past the alert threshold.
@@ -632,6 +887,7 @@ impl TaskStatusLevel {
             TaskStatusLevel::Ok => "[ OK  ]",
             TaskStatusLevel::Idle => "[IDLE ]",
             TaskStatusLevel::Stale => "[STALE]",
+            TaskStatusLevel::Flapping => "[FLAP ]",
             TaskStatusLevel::Degraded => "[WARN ]",
             TaskStatusLevel::Failing => "[FAIL ]",
             TaskStatusLevel::Disabled => "[ off ]",
@@ -643,7 +899,10 @@ impl TaskStatusLevel {
     pub fn is_problem(self) -> bool {
         matches!(
             self,
-            TaskStatusLevel::Stale | TaskStatusLevel::Degraded | TaskStatusLevel::Failing
+            TaskStatusLevel::Stale
+                | TaskStatusLevel::Flapping
+                | TaskStatusLevel::Degraded
+                | TaskStatusLevel::Failing
         )
     }
 }
@@ -660,6 +919,11 @@ pub struct TaskStatusView<'a> {
 }
 
 /// Classify a task for the status surface.
+///
+/// The flap check sits above the streak check for good reason: a task whose
+/// last cycle happened to pass but which has lost half of its recent ones is
+/// not `[ OK ]`, and reading it as OK is exactly how a half-dead task stayed
+/// invisible for hours.
 #[must_use]
 pub fn classify(
     view: &TaskStatusView<'_>,
@@ -677,6 +941,9 @@ pub fn classify(
     }
     if is_stale(view, now) {
         return TaskStatusLevel::Stale;
+    }
+    if matches!(flap_verdict(health, config, now), FlapVerdict::Flapping(_)) {
+        return TaskStatusLevel::Flapping;
     }
     if health.consecutive_failures > 0 {
         return TaskStatusLevel::Degraded;
@@ -729,6 +996,18 @@ pub fn status_line(
     if level == TaskStatusLevel::Stale {
         if let Some(interval) = view.interval {
             line.push_str(&format!("; STALE (interval {})", format_duration(interval)));
+        }
+    }
+    if level == TaskStatusLevel::Flapping {
+        if let Some(FlapVerdict::Flapping(window)) =
+            view.health.map(|h| flap_verdict(h, config, now))
+        {
+            line.push_str(&format!(
+                "; FLAPPING ({} of {} recent cycles failed over {})",
+                window.failures,
+                window.total,
+                format_duration(window.span())
+            ));
         }
     }
     line
@@ -787,6 +1066,17 @@ pub fn format_age(timestamp: Option<DateTime<Utc>>, now: DateTime<Utc>) -> Strin
     }
 }
 
+/// The span a flap window covers: `06:35 → 07:54 UTC (1h 19m, ended 16m ago)`.
+fn format_window(window: &FlapWindow, now: DateTime<Utc>) -> String {
+    format!(
+        "{} → {} ({}, ended {})",
+        window.started.format("%Y-%m-%d %H:%M UTC"),
+        window.ended.format("%Y-%m-%d %H:%M UTC"),
+        format_duration(window.span()),
+        format_age(Some(window.ended), now),
+    )
+}
+
 /// Absolute timestamp plus relative age, or `unknown`.
 fn format_instant(timestamp: Option<DateTime<Utc>>, now: DateTime<Utc>) -> String {
     match timestamp {
@@ -815,6 +1105,41 @@ mod tests {
     fn fail_n(store: &mut TaskHealthStore, task: &str, count: u32, start: DateTime<Utc>) {
         for i in 0..count {
             store.record_failure(task, "Task", "boom", start + Duration::minutes(i as i64));
+        }
+    }
+
+    /// Injectable clock. Every rule in this module takes `now` as a
+    /// parameter, so "injecting a clock" is handing out the instants a
+    /// scenario needs — no globals, no sleeping, no wall-clock flake.
+    struct Clock {
+        now: DateTime<Utc>,
+    }
+
+    impl Clock {
+        fn starting_at(base: DateTime<Utc>) -> Self {
+            Self { now: base }
+        }
+
+        fn now(&self) -> DateTime<Utc> {
+            self.now
+        }
+
+        fn advance(&mut self, minutes: i64) -> DateTime<Utc> {
+            self.now += Duration::minutes(minutes);
+            self.now
+        }
+    }
+
+    /// Replay a run of cycles: `.` succeeded, `x` failed, one every `gap`
+    /// minutes. Lets a scenario read the way an operator describes it.
+    fn replay(store: &mut TaskHealthStore, task: &str, pattern: &str, clock: &mut Clock, gap: i64) {
+        for symbol in pattern.chars() {
+            let now = clock.advance(gap);
+            match symbol {
+                '.' => store.record_success(task, "Thinking Loop", now),
+                'x' => store.record_failure(task, "Thinking Loop", "subprocess timed out", now),
+                other => panic!("unknown cycle symbol {other:?} in {pattern:?}"),
+            }
         }
     }
 
@@ -1041,6 +1366,292 @@ mod tests {
         assert!(store.pending_task_alert("t", &cfg, at(1)).is_some());
     }
 
+    // -- flap rule ---------------------------------------------------------
+
+    #[test]
+    fn flap_rule_reads_recent_cycles() {
+        struct Case {
+            name: &'static str,
+            /// `.` = success, `x` = failure, oldest cycle first.
+            cycles: &'static str,
+            /// Minutes between cycles.
+            gap: i64,
+            expect_flap: bool,
+        }
+
+        let cases = [
+            Case {
+                name: "a healthy task never flaps",
+                cycles: "....................",
+                gap: 20,
+                expect_flap: false,
+            },
+            Case {
+                name: "2026-08-06: fail, success, fail, fail, success in 80 minutes",
+                cycles: "x.xx.",
+                gap: 20,
+                expect_flap: true,
+            },
+            Case {
+                name: "half the cycles dying across eight tries",
+                cycles: "x.xx.x..",
+                gap: 20,
+                expect_flap: true,
+            },
+            Case {
+                name: "one bad cycle in twenty is not a flap",
+                cycles: "x...................",
+                gap: 20,
+                expect_flap: false,
+            },
+            Case {
+                name: "one bad cycle in five is not a flap",
+                cycles: "x....",
+                gap: 20,
+                expect_flap: false,
+            },
+            Case {
+                name: "a failure on the newest cycle alone is not a flap",
+                cycles: "....x",
+                gap: 20,
+                expect_flap: false,
+            },
+            Case {
+                name: "two of five is bad enough to speak up",
+                cycles: "x.x..",
+                gap: 20,
+                expect_flap: true,
+            },
+            Case {
+                name: "too few cycles to have an opinion",
+                cycles: "x.x",
+                gap: 20,
+                expect_flap: false,
+            },
+            Case {
+                name: "cycles older than the horizon do not count",
+                cycles: "x.xx.",
+                gap: 60 * 24 * 3,
+                expect_flap: false,
+            },
+        ];
+
+        for case in cases {
+            let dir = TempDir::new().unwrap();
+            let mut store = TaskHealthStore::load(dir.path());
+            let mut clock = Clock::starting_at(at(1_000));
+            replay(&mut store, "t", case.cycles, &mut clock, case.gap);
+
+            let alert = store.pending_task_alert("t", &config(), clock.now());
+            let flapped = matches!(alert, Some(LivenessAlert::TaskFlapping { .. }));
+            assert_eq!(flapped, case.expect_flap, "{}: got {alert:?}", case.name);
+        }
+    }
+
+    #[test]
+    fn flap_alert_names_the_ratio_and_the_window_it_covers() {
+        let dir = TempDir::new().unwrap();
+        let mut store = TaskHealthStore::load(dir.path());
+        let mut clock = Clock::starting_at(at(1_000));
+        // 06:35 fail, 06:54 ok, 07:15 fail, 07:35 fail, 07:54 ok.
+        replay(&mut store, "thinking-loop", "x.xx.", &mut clock, 20);
+
+        let alert = store
+            .pending_task_alert("thinking-loop", &config(), clock.now())
+            .expect("half the cycles died — that is an alert");
+        let LivenessAlert::TaskFlapping { window, repeat, .. } = &alert else {
+            panic!("expected TaskFlapping, got {alert:?}");
+        };
+        assert_eq!(window.failures, 3);
+        assert_eq!(window.total, 5);
+        assert_eq!(window.success_percent(), 40);
+        assert_eq!(window.span(), Duration::minutes(80));
+        assert_eq!(*repeat, 0);
+
+        let message = alert.message(clock.now());
+        assert!(message.starts_with("[ALERT]"));
+        assert!(message.contains("is failing intermittently"));
+        assert!(message.contains("3 of 5 recent cycles failed"));
+        assert!(message.contains("(40% success)"));
+        assert!(message.contains("Window:"));
+        assert!(message.contains("1h 20m"));
+        assert!(message.contains("subprocess timed out"));
+        // It must not read like the sustained-failure alert.
+        assert!(!message.contains("in a row"));
+    }
+
+    #[test]
+    fn flap_alert_repeats_on_the_shared_backoff_ladder() {
+        let dir = TempDir::new().unwrap();
+        let mut store = TaskHealthStore::load(dir.path());
+        let cfg = config();
+        let mut clock = Clock::starting_at(at(1_000));
+        replay(&mut store, "t", "x.xx.", &mut clock, 20);
+
+        let first = store.pending_task_alert("t", &cfg, clock.now()).unwrap();
+        store.mark_task_alert_delivered("t", &first, clock.now());
+
+        // Silent inside the 6h window, even though the window still looks bad.
+        assert!(store
+            .pending_task_alert("t", &cfg, clock.now() + Duration::hours(5))
+            .is_none());
+
+        let repeat = store
+            .pending_task_alert("t", &cfg, clock.now() + Duration::hours(6))
+            .unwrap();
+        let LivenessAlert::TaskFlapping { repeat: n, .. } = &repeat else {
+            panic!("expected a repeat TaskFlapping, got {repeat:?}");
+        };
+        assert_eq!(*n, 1);
+        assert!(repeat
+            .message(clock.now() + Duration::hours(6))
+            .contains("Still flapping (alert #2)"));
+    }
+
+    #[test]
+    fn flap_alert_resolves_once_the_success_rate_recovers() {
+        let dir = TempDir::new().unwrap();
+        let mut store = TaskHealthStore::load(dir.path());
+        let cfg = config();
+        let mut clock = Clock::starting_at(at(1_000));
+        replay(&mut store, "t", "x.xx.", &mut clock, 20);
+
+        let alert = store.pending_task_alert("t", &cfg, clock.now()).unwrap();
+        store.mark_task_alert_delivered("t", &alert, clock.now());
+
+        replay(&mut store, "t", "........", &mut clock, 20);
+        let resolved = store.pending_task_alert("t", &cfg, clock.now()).unwrap();
+        let LivenessAlert::TaskFlapResolved { window, .. } = &resolved else {
+            panic!("expected TaskFlapResolved, got {resolved:?}");
+        };
+        assert_eq!(window.failures, 3);
+        assert_eq!(window.total, 13);
+
+        let message = resolved.message(clock.now());
+        assert!(message.starts_with("[RESOLVED]"));
+        assert!(message.contains("no longer failing intermittently"));
+
+        store.mark_task_alert_delivered("t", &resolved, clock.now());
+        assert!(store.pending_task_alert("t", &cfg, clock.now()).is_none());
+    }
+
+    #[test]
+    fn recovery_is_only_announced_after_a_flap_alert() {
+        let dir = TempDir::new().unwrap();
+        let mut store = TaskHealthStore::load(dir.path());
+        let mut clock = Clock::starting_at(at(1_000));
+        // Flapping, but the webhook never got the alert, so nothing to resolve.
+        replay(&mut store, "t", "x.xx.........", &mut clock, 20);
+        assert!(store
+            .pending_task_alert("t", &config(), clock.now())
+            .is_none());
+    }
+
+    #[test]
+    fn streak_rule_and_flap_rule_never_both_speak_for_one_task() {
+        let dir = TempDir::new().unwrap();
+        let mut store = TaskHealthStore::load(dir.path());
+        let cfg = config();
+        let mut clock = Clock::starting_at(at(1_000));
+        // Chronically flapping *and* ending in a streak long enough to alert.
+        replay(&mut store, "t", "x.x.x.x.x.x.x.xxx", &mut clock, 20);
+
+        let alert = store.pending_task_alert("t", &cfg, clock.now()).unwrap();
+        assert!(
+            matches!(alert, LivenessAlert::TaskFailing { .. }),
+            "the sustained rule owns a task that is failing right now, got {alert:?}"
+        );
+        store.mark_task_alert_delivered("t", &alert, clock.now());
+
+        // Its backoff must silence the task outright — the flap rule does not
+        // get to fill the gap with a second story about the same failures.
+        assert!(store
+            .pending_task_alert("t", &cfg, clock.now() + Duration::hours(1))
+            .is_none());
+
+        // And once the streak resolves, the cycles it already reported are
+        // baselined out rather than re-litigated as a flap.
+        let recovered = clock.advance(20);
+        store.record_success("t", "Thinking Loop", recovered);
+        let resolution = store.pending_task_alert("t", &cfg, recovered).unwrap();
+        assert!(matches!(resolution, LivenessAlert::TaskRecovered { .. }));
+        store.mark_task_alert_delivered("t", &resolution, recovered);
+
+        assert!(store.pending_task_alert("t", &cfg, recovered).is_none());
+    }
+
+    #[test]
+    fn flap_rule_can_be_turned_off() {
+        let dir = TempDir::new().unwrap();
+        let mut store = TaskHealthStore::load(dir.path());
+        let cfg = LivenessConfig {
+            flap_enabled: false,
+            ..LivenessConfig::default()
+        };
+        let mut clock = Clock::starting_at(at(1_000));
+        replay(&mut store, "t", "x.xx.", &mut clock, 20);
+        assert!(store.pending_task_alert("t", &cfg, clock.now()).is_none());
+    }
+
+    // -- outcome window ----------------------------------------------------
+
+    #[test]
+    fn outcome_window_is_capped_and_survives_a_restart() {
+        let dir = TempDir::new().unwrap();
+        let mut clock = Clock::starting_at(at(1_000));
+        {
+            let mut store = TaskHealthStore::load(dir.path());
+            for _ in 0..3 {
+                replay(&mut store, "t", "x.........", &mut clock, 20);
+            }
+            let outcomes = &store.get("t").unwrap().recent_outcomes;
+            assert_eq!(
+                outcomes.len(),
+                OUTCOME_WINDOW_CAPACITY,
+                "30 cycles must not grow the store past its cap"
+            );
+        }
+
+        let store = TaskHealthStore::load(dir.path());
+        let outcomes = &store.get("t").unwrap().recent_outcomes;
+        assert_eq!(outcomes.len(), OUTCOME_WINDOW_CAPACITY);
+        assert_eq!(outcomes.last().unwrap().at, clock.now());
+        assert!(
+            outcomes.windows(2).all(|pair| pair[0].at < pair[1].at),
+            "the window stays in chronological order across a reload"
+        );
+    }
+
+    #[test]
+    fn health_file_written_before_flap_detection_still_loads() {
+        let dir = TempDir::new().unwrap();
+        std::fs::write(
+            dir.path().join(TASK_HEALTH_FILE),
+            r#"{
+              "created_at": "2026-06-01T00:00:00Z",
+              "tasks": {
+                "thinking-loop": {
+                  "task_name": "Thinking Loop",
+                  "consecutive_failures": 2,
+                  "last_failure": "2026-06-01T06:35:00Z",
+                  "first_failure_of_streak": "2026-06-01T06:15:00Z",
+                  "last_error": "boom"
+                }
+              },
+              "global": { "alerts_sent": 0 }
+            }"#,
+        )
+        .unwrap();
+
+        let store = TaskHealthStore::load(dir.path());
+        let health = store.get("thinking-loop").expect("legacy task survives");
+        assert_eq!(health.consecutive_failures, 2);
+        assert_eq!(health.task_name, "Thinking Loop");
+        assert!(health.recent_outcomes.is_empty());
+        assert_eq!(health.flap_alerts_sent, 0);
+        assert!(health.flap_baseline_at.is_none());
+    }
+
     // -- global rule -------------------------------------------------------
 
     #[test]
@@ -1256,6 +1867,36 @@ mod tests {
         assert!(line.contains("Morning Check (morning)"));
         assert!(line.contains("last success 2d 2h ago"));
         assert!(line.contains("42 consecutive failure(s), last 12m ago"));
+    }
+
+    #[test]
+    fn status_reads_a_flapping_task_as_degraded_not_ok() {
+        let dir = TempDir::new().unwrap();
+        let mut store = TaskHealthStore::load(dir.path());
+        let cfg = config();
+        let mut clock = Clock::starting_at(at(1_000));
+        replay(&mut store, "thinking-loop", "x.xx.", &mut clock, 20);
+
+        let health = store.get("thinking-loop").unwrap();
+        assert_eq!(
+            health.consecutive_failures, 0,
+            "the last cycle passed — this is exactly what used to read [ OK ]"
+        );
+
+        let view = TaskStatusView {
+            task_id: "thinking-loop",
+            task_name: "Thinking Loop",
+            enabled: true,
+            interval: Some(Duration::minutes(20)),
+            health: Some(health),
+        };
+        let level = classify(&view, &cfg, clock.now());
+        assert_eq!(level, TaskStatusLevel::Flapping);
+        assert!(level.is_problem());
+
+        let line = status_line(&view, &cfg, clock.now());
+        assert!(line.starts_with("[FLAP ]"), "got {line}");
+        assert!(line.contains("FLAPPING (3 of 5 recent cycles failed over 1h 20m)"));
     }
 
     #[test]
