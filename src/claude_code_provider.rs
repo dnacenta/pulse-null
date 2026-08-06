@@ -10,9 +10,27 @@ use pulse_system_types::llm::{
 };
 use tracing::warn;
 
-/// Default timeout for Claude Code subprocess (5 minutes).
-/// Claude Code runs tools and may take longer than a direct API call.
-const SUBPROCESS_TIMEOUT: Duration = Duration::from_secs(300);
+/// Default timeout for a Claude Code subprocess.
+///
+/// This is not an API call — it is an agent that reads files, runs tools and
+/// writes for as long as the task needs. Measured on the live entity, a
+/// thinking-loop cycle takes 3.8-4.4 minutes and grows with the size of the
+/// memory it reasons over; at the old 300s ceiling roughly half of them were
+/// killed mid-thought. Fifteen minutes leaves headroom for that growth while
+/// still catching a genuinely wedged process. Override with
+/// `RECALL_LLM_TIMEOUT_SECS` / `PULSE_LLM_TIMEOUT_SECS`.
+const DEFAULT_SUBPROCESS_TIMEOUT_SECS: u64 = 900;
+
+/// Resolve the subprocess timeout, honouring an environment override.
+fn subprocess_timeout() -> Duration {
+    let secs = std::env::var("PULSE_LLM_TIMEOUT_SECS")
+        .or_else(|_| std::env::var("RECALL_LLM_TIMEOUT_SECS"))
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .filter(|v| *v > 0)
+        .unwrap_or(DEFAULT_SUBPROCESS_TIMEOUT_SECS);
+    Duration::from_secs(secs)
+}
 
 /// Timeout for the one-off `--system-prompt-file` support probe.
 const PROBE_TIMEOUT: Duration = Duration::from_secs(30);
@@ -249,12 +267,12 @@ impl LmProvider for ClaudeCodeProvider {
                 // Drop stdin to close it and signal EOF
             }
 
-            let output = tokio::time::timeout(SUBPROCESS_TIMEOUT, child.wait_with_output())
+            let output = tokio::time::timeout(subprocess_timeout(), child.wait_with_output())
                 .await
                 .map_err(|_| -> Box<dyn std::error::Error + Send + Sync> {
                     format!(
                         "claude -p timed out after {}s",
-                        SUBPROCESS_TIMEOUT.as_secs()
+                        subprocess_timeout().as_secs()
                     )
                     .into()
                 })?
@@ -834,5 +852,21 @@ mod tests {
     fn provider_no_tools() {
         let provider = ClaudeCodeProvider::new("opus".into(), None);
         assert!(!provider.supports_tools());
+    }
+}
+
+#[cfg(test)]
+mod timeout_tests {
+    use super::{subprocess_timeout, DEFAULT_SUBPROCESS_TIMEOUT_SECS};
+
+    #[test]
+    fn default_leaves_headroom_over_a_real_thinking_cycle() {
+        // Live cycles measured at 3.8-4.4 min; the old 300s ceiling killed
+        // roughly half of them. Guard against anyone tightening it back.
+        const { assert!(DEFAULT_SUBPROCESS_TIMEOUT_SECS >= 600) };
+        assert_eq!(
+            subprocess_timeout().as_secs(),
+            DEFAULT_SUBPROCESS_TIMEOUT_SECS
+        );
     }
 }
