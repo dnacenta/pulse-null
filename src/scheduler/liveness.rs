@@ -112,8 +112,8 @@ async fn watchdog_tick(
         sched
             .tasks
             .iter()
-            .filter(|t| t.enabled)
-            .map(|t| t.id.clone())
+            .filter(|t| t.task.enabled)
+            .map(|t| t.task.id.clone())
             .collect()
     };
 

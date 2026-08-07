@@ -4,7 +4,15 @@ use console::style;
 use cron::Schedule as CronSchedule;
 
 use crate::config::Config;
-use crate::scheduler::{OutputRouting, Schedule, ScheduledTask, TaskCreator};
+use crate::scheduler::{OutputRouting, Schedule, ScheduleEntry, ScheduledTask, TaskCreator};
+
+/// How a task's model reads in `schedule list`: its own, or the inherited one.
+fn model_line(entry: &ScheduleEntry, default_model: &str) -> String {
+    match entry.model_override() {
+        Some(model) => format!("{model} (override)"),
+        None => format!("{default_model} (from [llm] model)"),
+    }
+}
 
 pub async fn list() -> Result<(), Box<dyn std::error::Error>> {
     let config = Config::load()?;
@@ -20,7 +28,8 @@ pub async fn list() -> Result<(), Box<dyn std::error::Error>> {
     println!("  {}", style("Scheduled Tasks").bold());
     println!();
 
-    for task in &schedule.tasks {
+    for entry in &schedule.tasks {
+        let task = &entry.task;
         let status = if task.enabled {
             style("enabled").green()
         } else {
@@ -48,6 +57,7 @@ pub async fn list() -> Result<(), Box<dyn std::error::Error>> {
             task.cron,
         );
         println!("    Next: {}", next);
+        println!("    Model: {}", model_line(entry, &config.llm.model));
         println!();
     }
 
@@ -85,7 +95,7 @@ pub async fn add(
         evaluator: None,
     };
 
-    schedule.add_task(task);
+    schedule.add_task(ScheduleEntry::from(task));
     schedule.save(&root_dir)?;
 
     println!("  Task '{}' added (id: {})", style(&name).cyan(), id);
@@ -112,8 +122,8 @@ pub async fn enable(id: String) -> Result<(), Box<dyn std::error::Error>> {
     let root_dir = config.root_dir()?;
     let mut schedule = Schedule::load(&root_dir)?;
 
-    if let Some(task) = schedule.find_task_mut(&id) {
-        task.enabled = true;
+    if let Some(entry) = schedule.find_task_mut(&id) {
+        entry.task.enabled = true;
         schedule.save(&root_dir)?;
         println!("  Task '{}' enabled.", style(&id).green());
     } else {
@@ -128,13 +138,53 @@ pub async fn disable(id: String) -> Result<(), Box<dyn std::error::Error>> {
     let root_dir = config.root_dir()?;
     let mut schedule = Schedule::load(&root_dir)?;
 
-    if let Some(task) = schedule.find_task_mut(&id) {
-        task.enabled = false;
+    if let Some(entry) = schedule.find_task_mut(&id) {
+        entry.task.enabled = false;
         schedule.save(&root_dir)?;
         println!("  Task '{}' disabled.", style(&id).yellow());
     } else {
         println!("  Task '{}' not found.", style(&id).red());
     }
 
+    Ok(())
+}
+
+/// Pin one task to a model, or clear the pin so it follows `[llm] model`.
+///
+/// Editing schedule.json by hand does not work while the entity is running —
+/// the process rewrites the file — so the override needs a command of its own,
+/// exactly like `enable` / `disable`.
+pub async fn set_model(
+    id: String,
+    model: Option<String>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let config = Config::load()?;
+    let root_dir = config.root_dir()?;
+    let mut schedule = Schedule::load(&root_dir)?;
+
+    let Some(entry) = schedule.find_task_mut(&id) else {
+        println!("  Task '{}' not found.", style(&id).red());
+        return Ok(());
+    };
+
+    let model = model
+        .map(|m| m.trim().to_string())
+        .filter(|m| !m.is_empty());
+    entry.model.clone_from(&model);
+    schedule.save(&root_dir)?;
+
+    match model {
+        Some(model) => println!(
+            "  Task '{}' pinned to model {}.",
+            style(&id).cyan(),
+            style(&model).cyan()
+        ),
+        None => println!(
+            "  Task '{}' now follows [llm] model ({}).",
+            style(&id).cyan(),
+            style(&config.llm.model).cyan()
+        ),
+    }
+    println!("  Restart the entity for a running scheduler to pick this up.");
     Ok(())
 }

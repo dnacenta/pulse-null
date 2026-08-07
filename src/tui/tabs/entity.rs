@@ -109,12 +109,12 @@ impl EntityTab {
 
             // Schedule
             let (schedule_summary, schedule_tasks) = if let Ok(schedule) = Schedule::load(&root) {
-                let enabled = schedule.tasks.iter().filter(|t| t.enabled).count();
+                let enabled = schedule.tasks.iter().filter(|t| t.task.enabled).count();
                 let total = schedule.tasks.len();
                 let task_names: Vec<(String, bool)> = schedule
                     .tasks
                     .iter()
-                    .map(|t| (t.name.clone(), t.enabled))
+                    .map(|t| (t.task.name.clone(), t.task.enabled))
                     .collect();
                 let summary = ScheduleSummary {
                     enabled,
@@ -125,12 +125,12 @@ impl EntityTab {
                     .tasks
                     .iter()
                     .map(|t| ScheduleTaskEntry {
-                        id: t.id.clone(),
-                        name: t.name.clone(),
-                        cron_display: cron_to_human(&t.cron),
-                        enabled: t.enabled,
-                        created_by: t.created_by.clone(),
-                        prompt: t.prompt.clone(),
+                        id: t.task.id.clone(),
+                        name: t.task.name.clone(),
+                        cron_display: cron_to_human(&t.task.cron),
+                        enabled: t.task.enabled,
+                        created_by: t.task.created_by.clone(),
+                        prompt: t.task.prompt.clone(),
                     })
                     .collect();
                 (Some(summary), tasks)
@@ -175,8 +175,8 @@ impl EntityTab {
             return;
         };
         if let Ok(mut schedule) = Schedule::load(root) {
-            if let Some(st) = schedule.find_task_mut(&task.id) {
-                st.enabled = task.enabled;
+            if let Some(entry) = schedule.find_task_mut(&task.id) {
+                entry.task.enabled = task.enabled;
             }
             let _ = schedule.save(root);
         }

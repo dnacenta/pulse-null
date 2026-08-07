@@ -274,9 +274,31 @@ impl TaskHealthStore {
         }
         health.consecutive_failures = health.consecutive_failures.saturating_add(1);
         health.last_failure = Some(now);
-        health.last_error = Some(crate::utils::safe_truncate(error, MAX_ERROR_LEN).to_string());
+        health.last_error = Some(stored_error(error));
         push_outcome(health, now, false);
         self.persist();
+    }
+
+    /// Whether a failure that has **not yet been recorded** tells the operator
+    /// something the store does not already hold.
+    ///
+    /// Ask this before [`record_failure`](Self::record_failure) — it compares
+    /// the incoming failure against the state as of the previous cycle.
+    ///
+    /// See [`failure_is_news_for`] for the rule.
+    #[must_use]
+    pub fn failure_is_news(&self, task_id: &str, error: &str) -> bool {
+        failure_is_news_for(self.file.tasks.get(task_id), error)
+    }
+
+    /// Failures recorded in the current streak, not counting one that has not
+    /// been recorded yet. Zero when the task is healthy or unknown.
+    #[must_use]
+    pub fn consecutive_failures(&self, task_id: &str) -> u32 {
+        self.file
+            .tasks
+            .get(task_id)
+            .map_or(0, |h| h.consecutive_failures)
     }
 
     /// Health for one task, if it has ever reported an outcome.
@@ -481,6 +503,37 @@ impl TaskHealthStore {
     fn persist(&self) {
         if let Err(e) = self.save() {
             tracing::error!(error = %e, "Failed to persist scheduler health store");
+        }
+    }
+}
+
+/// The stored form of an error message: what `last_error` holds, and so what
+/// any comparison against it must be made against.
+fn stored_error(error: &str) -> String {
+    crate::utils::safe_truncate(error, MAX_ERROR_LEN).to_string()
+}
+
+/// Whether an unrecorded failure is news, given the task's health so far.
+///
+/// News means one of two things, and nothing else:
+///
+/// * **A streak started.** `consecutive_failures == 0` — the previous cycle
+///   passed (or the task is unknown), so this failure is a new event.
+/// * **The error text changed.** The task is already failing, but for a
+///   different reason than last time: a new failure mode is new information.
+///
+/// A repeat of the same error inside a streak is not news. That is the case
+/// the liveness alarm exists for, and reporting it per-cycle is what turns a
+/// channel into noise.
+///
+/// Comparison is against the *stored* (truncated) form, so two errors that the
+/// store cannot tell apart are not treated as different.
+#[must_use]
+pub fn failure_is_news_for(health: Option<&TaskHealth>, error: &str) -> bool {
+    match health {
+        None => true,
+        Some(health) => {
+            health.consecutive_failures == 0 || health.last_error != Some(stored_error(error))
         }
     }
 }

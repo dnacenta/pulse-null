@@ -225,6 +225,19 @@ pub struct OutputConfig {
     /// Endpoint for [CALL:] output (voice plugin)
     #[serde(default)]
     pub call_endpoint: Option<String>,
+    /// Webhook URL for per-failure task diagnostics (`[task-error]` lines).
+    ///
+    /// These carry the full error text at the moment of failure and exist to
+    /// *diagnose*, not to alarm — the alarm is
+    /// [`LivenessConfig`]'s `[ALERT]` / `[RESOLVED]`. Point this at a
+    /// different channel than `share_webhook` so the alarm channel contains
+    /// nothing that looks like an alarm.
+    ///
+    /// Unset falls back to `share_webhook` with plain, un-alarming framing —
+    /// silence would lose the only full error text there is. See
+    /// [`crate::scheduler::diagnostics`].
+    #[serde(default)]
+    pub diagnostics_webhook: Option<String>,
 }
 
 impl Default for MemoryConfig {
@@ -516,7 +529,11 @@ pub struct EventsConfig {
     /// Queue investigation when conversations archive but pipeline docs don't update
     #[serde(default = "default_true")]
     pub pipeline_conversion_low: bool,
-    /// Send notification when LLM provider fails
+    /// Send a `[task-error]` diagnostic when a scheduled task fails.
+    ///
+    /// The diagnostic is state-aware: one per failure streak plus one per
+    /// change of error text. Turning this off leaves the liveness alarm as
+    /// the only failure signal.
     pub provider_error: bool,
 }
 
@@ -922,6 +939,55 @@ impl Default for PulseConfig {
         Self {
             enabled: true,
             max_outcomes: 200,
+        }
+    }
+}
+
+#[cfg(test)]
+pub mod test_support {
+    use super::*;
+
+    /// A `Config` with every required field filled in and everything else at
+    /// its default — the starting point for tests that need to vary one knob.
+    pub fn minimal_config() -> Config {
+        Config {
+            entity: EntityConfig {
+                name: "Test".into(),
+                owner_name: "Owner".into(),
+                owner_alias: "O".into(),
+                rules_dir: None,
+            },
+            server: ServerConfig::default(),
+            llm: LlmConfig {
+                provider: default_provider(),
+                api_key: Some("test-key".into()),
+                model: default_model(),
+                max_tokens: default_max_tokens(),
+                base_url: None,
+                claude_bin: None,
+                context_budget: 0,
+            },
+            security: SecurityConfig {
+                secret: None,
+                injection_detection: true,
+            },
+            trust: TrustConfig::default(),
+            owner: OwnerConfig::default(),
+            memory: MemoryConfig::default(),
+            scheduler: SchedulerConfig::default(),
+            pipeline: PipelineConfig::default(),
+            monitoring: MonitoringConfig::default(),
+            autonomy: AutonomyConfig::default(),
+            pulse: PulseConfig::default(),
+            graph: GraphConfig::default(),
+            prediction: PredictionConfig::default(),
+            sessions: SessionConfig::default(),
+            context_buffer: crate::context_buffer::ContextBufferConfig::default(),
+            session_health: crate::session_health::SessionHealthConfig::default(),
+            platform: PlatformConfig::default(),
+            system_prompt_budget: SystemPromptBudgetConfig::default(),
+            peers: HashMap::new(),
+            plugins: HashMap::new(),
         }
     }
 }
