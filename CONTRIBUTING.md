@@ -9,11 +9,11 @@ Open an [issue](https://github.com/dnacenta/pulse-null/issues). Use a clear titl
 ## Making changes
 
 1. Fork the repo
-2. Create a branch from `development` (see naming below)
+2. Create a branch from `main` (see naming below)
 3. Make your changes
-4. Open a PR targeting `development`
+4. Open a PR targeting `main`
 
-`main` is protected. All changes go through `development` first.
+`main` is protected — all changes land through a PR.
 
 ## Branch naming
 
@@ -76,4 +76,4 @@ docs(#3): expand configuration reference
 
 ## Release workflow
 
-Releases go from `development` to `main` via merge commit (not squash). Feature PRs to `development` use squash merge.
+Feature PRs target `main` and use squash merge.
