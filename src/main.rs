@@ -8,6 +8,7 @@ mod cli;
 mod config;
 mod context;
 mod context_buffer;
+mod coordinator;
 mod discovery;
 mod errors;
 mod events;

@@ -94,6 +94,7 @@ discord-text = ["dep:discord-echo"]
 all-plugins = ["voice", "discord-text"]
 
 [dev-dependencies]
+proptest = "1"
 tempfile = "3"
 tower = { version = "0.5.3", features = ["util"] }
 
