@@ -167,6 +167,8 @@ async fn build_state_in(
     tools: ToolRegistry,
 ) -> Arc<AppState> {
     let config = test_config();
+    let wal =
+        crate::wal::WalWriter::new(&root_dir.join("sessions"), crate::wal::WalFsync::None).ok();
     let session_store =
         crate::session_store::SessionStore::new(&root_dir, &config.sessions, &config.entity.name)
             .await;
@@ -186,7 +188,7 @@ async fn build_state_in(
         context_buffer: None,
         persist_coordinator: Arc::new(PersistCoordinator::new()),
         plugin_manager: tokio::sync::Mutex::new(plugin_manager),
-        wal: None,
+        wal,
         alert_queue: tokio::sync::Mutex::new(alert_queue),
         provider_status: crate::provider_status::new_shared(),
         leadership: std::sync::atomic::AtomicBool::new(false),
@@ -708,4 +710,193 @@ async fn e2e_second_coordinator_locked_out_until_shutdown() {
         )
         .expect("lease was not released on shutdown");
     assert!(lease.fencing_token > crate::coordinator::lease::FencingToken(1));
+}
+
+// ---------------------------------------------------------------------------
+// Isolation Mode (Stage 2): AC16-AC19
+// ---------------------------------------------------------------------------
+
+async fn post_chat_on(app: &Router, channel: &str, message: &str) -> (StatusCode, String) {
+    let body = serde_json::json!({ "message": message, "channel": channel });
+    let req = Request::builder()
+        .method("POST")
+        .uri("/chat")
+        .header("Content-Type", "application/json")
+        .body(Body::from(serde_json::to_string(&body).unwrap()))
+        .unwrap();
+    let response = app.clone().oneshot(req).await.unwrap();
+    let status = response.status();
+    let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    (status, String::from_utf8(bytes.to_vec()).unwrap())
+}
+
+fn snapshot_dir(dir: &std::path::Path) -> Vec<(String, u64)> {
+    let mut entries = Vec::new();
+    if let Ok(rd) = std::fs::read_dir(dir) {
+        for e in rd.flatten() {
+            let len = e.metadata().map(|m| m.len()).unwrap_or(0);
+            entries.push((e.file_name().to_string_lossy().to_string(), len));
+        }
+    }
+    entries.sort();
+    entries
+}
+
+/// AC16 + AC17 + AC18: isolation entered and exited over the chat channel
+/// with the coordinator forcibly wedged; banner sticky; no writes while
+/// isolated; writes resume after exit.
+#[tokio::test]
+async fn e2e_isolation_over_chat_with_coordinator_wedged() {
+    let dir = tempfile::tempdir().unwrap();
+    let provider = MockProvider::new(vec![
+        mock_text("diagnosing in isolation"),
+        mock_text("second isolated turn"),
+        mock_text("normal again"),
+    ]);
+    let state = build_state_in(dir.path().to_path_buf(), provider, ToolRegistry::new()).await;
+
+    let schedule = Arc::new(RwLock::new(
+        crate::scheduler::Schedule::load_or_init(dir.path()).unwrap(),
+    ));
+    let intents = Arc::new(RwLock::new(crate::scheduler::intent::IntentQueue::load(
+        dir.path(),
+    )));
+    let coordinator =
+        crate::coordinator::control::Coordinator::start(Arc::clone(&state), schedule, intents);
+    wait_for_leadership(&dir.path().join("coordinator")).await;
+    // The case that matters (spec Stage 2 exit): trigger works with the
+    // coordinator wedged.
+    coordinator.wedge_for_test();
+
+    let app = build_app(Arc::clone(&state));
+
+    // Enter over the interactive channel ("system" resolves to owner).
+    let (status, body) = post_chat_on(&app, "system", "/isolate suspect graph").await;
+    assert_eq!(status, StatusCode::OK);
+    let json: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(json["isolation"], true);
+    assert!(json["response"]
+        .as_str()
+        .unwrap()
+        .starts_with(crate::server::isolation::BANNER));
+
+    // AC18: a normal turn while isolated writes nothing.
+    let sessions_before = snapshot_dir(&dir.path().join("sessions"));
+    let wal_before = snapshot_dir(&dir.path().join("sessions").join("wal"));
+    let archives_before = snapshot_dir(&dir.path().join("archives").join("conversations"));
+
+    let (status, body) = post_chat_on(&app, "system", "what do you see in the journal?").await;
+    assert_eq!(status, StatusCode::OK);
+    let json: serde_json::Value = serde_json::from_str(&body).unwrap();
+    // AC17: sticky banner on every reply, not just the entry event.
+    assert_eq!(json["isolation"], true);
+    assert!(json["response"]
+        .as_str()
+        .unwrap()
+        .starts_with(crate::server::isolation::BANNER));
+
+    assert_eq!(
+        snapshot_dir(&dir.path().join("sessions")),
+        sessions_before,
+        "session files changed during isolation"
+    );
+    assert_eq!(
+        snapshot_dir(&dir.path().join("sessions").join("wal")),
+        wal_before,
+        "conversation WAL changed during isolation"
+    );
+    assert_eq!(
+        snapshot_dir(&dir.path().join("archives").join("conversations")),
+        archives_before,
+        "archives changed during isolation"
+    );
+
+    // Exit: explicit back-to-normal, banner gone, writes resume.
+    let (status, body) = post_chat_on(&app, "system", "/resume").await;
+    assert_eq!(status, StatusCode::OK);
+    let json: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(
+        json["response"].as_str().unwrap(),
+        crate::server::isolation::BACK_TO_NORMAL
+    );
+    assert!(json.get("isolation").is_none() || json["isolation"] == false);
+
+    let (status, body) = post_chat_on(&app, "system", "hello again").await;
+    assert_eq!(status, StatusCode::OK);
+    let json: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert!(json.get("isolation").is_none() || json["isolation"] == false);
+    assert!(!json["response"]
+        .as_str()
+        .unwrap()
+        .starts_with(crate::server::isolation::BANNER));
+    let mut resumed_writes = false;
+    for _ in 0..30 {
+        if snapshot_dir(&dir.path().join("sessions").join("wal")) != wal_before {
+            resumed_writes = true;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    assert!(resumed_writes, "writes did not resume after /resume");
+}
+
+/// AC19: entering isolation releases the control-plane lease (provably free)
+/// and the coordinator re-acquires unaided after exit.
+#[tokio::test]
+async fn e2e_isolation_parks_coordinator_and_resumes() {
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter("pulse_null=debug")
+        .try_init();
+    let dir = tempfile::tempdir().unwrap();
+    let provider = MockProvider::new(vec![]);
+    let state = build_state_in(dir.path().to_path_buf(), provider, ToolRegistry::new()).await;
+
+    let schedule = Arc::new(RwLock::new(
+        crate::scheduler::Schedule::load_or_init(dir.path()).unwrap(),
+    ));
+    let intents = Arc::new(RwLock::new(crate::scheduler::intent::IntentQueue::load(
+        dir.path(),
+    )));
+    let coordinator =
+        crate::coordinator::control::Coordinator::start(Arc::clone(&state), schedule, intents);
+    let coord_dir = dir.path().join("coordinator");
+    wait_for_leadership(&coord_dir).await;
+    assert!(state.leadership.load(std::sync::atomic::Ordering::Relaxed));
+
+    // Enter isolation via the file trigger (the CLI path).
+    crate::server::isolation::enter(dir.path(), "test", None).unwrap();
+
+    // Within a few poll ticks the tenure ends and the lease is RELEASED.
+    let wal_path = coord_dir.join("leases.jsonl");
+    let mut released = false;
+    for _ in 0..100 {
+        let content = std::fs::read_to_string(&wal_path).unwrap_or_default();
+        if content.contains(r#""event":"released""#)
+            && !state.leadership.load(std::sync::atomic::Ordering::Relaxed)
+        {
+            released = true;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    assert!(
+        released,
+        "control-plane lease was not released on isolation"
+    );
+
+    // Exit isolation: leadership resumes unaided.
+    crate::server::isolation::exit(dir.path()).unwrap();
+    let mut resumed = false;
+    for _ in 0..100 {
+        if state.leadership.load(std::sync::atomic::Ordering::Relaxed) {
+            resumed = true;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    assert!(resumed, "coordinator did not resume leadership after exit");
+
+    coordinator.shutdown().await;
 }

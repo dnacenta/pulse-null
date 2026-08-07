@@ -44,6 +44,9 @@ pub const CONTROL_PLANE_RESOURCE: &str = "control-plane";
 const LEASE_TTL: Duration = Duration::from_secs(90);
 const RENEW_INTERVAL: Duration = Duration::from_secs(30);
 const RETRY_BACKOFF: Duration = Duration::from_secs(15);
+/// How often the loop re-checks isolation/shutdown between renewals — keeps
+/// isolation-entry latency in seconds without renewing more than needed.
+const POLL_INTERVAL: Duration = Duration::from_secs(2);
 
 /// The process-wide lease table. One WAL lock per process, so every consumer
 /// (leadership loop, task loops, intent drain) shares this handle.
@@ -242,7 +245,7 @@ async fn leadership_loop(
                     );
                     parked_logged = true;
                 }
-                if wait_or_shutdown(&mut shutdown_rx, RETRY_BACKOFF).await {
+                if wait_or_shutdown(&mut shutdown_rx, POLL_INTERVAL).await {
                     return;
                 }
                 continue;
@@ -468,13 +471,19 @@ async fn renew_until_lost_or_shutdown(
     root_dir: &std::path::Path,
     shutdown_rx: &mut watch::Receiver<bool>,
 ) -> TenureEnd {
+    let mut since_renew = Duration::ZERO;
     loop {
-        if wait_or_shutdown(shutdown_rx, RENEW_INTERVAL).await {
+        if wait_or_shutdown(shutdown_rx, POLL_INTERVAL).await {
             return TenureEnd::Shutdown;
         }
         if crate::server::isolation::is_active(root_dir) {
             return TenureEnd::Isolated;
         }
+        since_renew += POLL_INTERVAL;
+        if since_renew < RENEW_INTERVAL {
+            continue;
+        }
+        since_renew = Duration::ZERO;
         let renewed = {
             leases
                 .lock()
