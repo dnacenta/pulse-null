@@ -10,3 +10,6 @@
 pub mod fenced;
 pub mod lease;
 pub mod wal;
+
+#[cfg(test)]
+mod proptests;
