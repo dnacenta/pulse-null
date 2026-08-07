@@ -2,7 +2,7 @@
 name = "pulse-null"
 version = "0.30.0"
 edition = "2021"
-rust-version = "1.80"
+rust-version = "1.89"
 license = "AGPL-3.0-only"
 description = "One binary. One command. Your own AI entity."
 repository = "https://github.com/dnacenta/pulse-null"

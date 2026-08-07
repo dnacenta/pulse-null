@@ -4,15 +4,23 @@
 //! paused past lease expiry can still present a formerly-valid token — the
 //! resource, not the lease table, is the last line of defense: any write
 //! bearing a token below the highest it has seen is rejected.
+//!
+//! **Trust boundary:** the guard orders tokens; it cannot know which were
+//! actually issued. A holder presenting a never-issued high token (say
+//! `u64::MAX`) would fence every legitimate writer with no reset path.
+//! Holders are trusted to present only tokens the lease table granted them;
+//! Stage 1's wiring must cross-check presented tokens against the
+//! coordinator's watermark before they reach `accept`. Guard state is not
+//! yet persisted — rebuild after restart via `FencedResource::at` from the
+//! recovered watermark (same Stage 1 wiring).
 
-use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use super::lease::FencingToken;
 
 /// A write was fenced: the presented token is stale.
 #[derive(Debug, Error, PartialEq, Eq)]
-#[error("write fenced: presented token {presented:?} < high-water {high_water:?}")]
+#[error("write fenced: presented token {presented} < high-water {high_water}")]
 pub struct Rejected {
     pub presented: FencingToken,
     pub high_water: FencingToken,
@@ -20,8 +28,8 @@ pub struct Rejected {
 
 /// Per-resource fencing guard. One instance protects one resource; it tracks
 /// the highest token it has ever accepted, independent of the lease table
-/// (which may be down, restarted, or lagging — decision 3 in the spec).
-#[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// (which may be down, restarted, or lagging).
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct FencedResource {
     high_water: Option<FencingToken>,
 }
@@ -32,7 +40,7 @@ impl FencedResource {
     }
 
     /// Rebuild a guard at a known watermark (e.g. after WAL recovery).
-    pub fn at(high_water: FencingToken) -> Self {
+    pub const fn at(high_water: FencingToken) -> Self {
         Self {
             high_water: Some(high_water),
         }
@@ -53,7 +61,7 @@ impl FencedResource {
         }
     }
 
-    pub fn high_water(&self) -> Option<FencingToken> {
+    pub const fn high_water(&self) -> Option<FencingToken> {
         self.high_water
     }
 }

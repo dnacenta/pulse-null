@@ -1995,8 +1995,7 @@ mod tests {
 
         std::fs::write(dir.path().join("CLAUDE.md"), "# Entity").unwrap();
         let line = "t".repeat(4096);
-        let stack: String = std::iter::repeat(line.as_str())
-            .take(2560)
+        let stack: String = std::iter::repeat_n(line.as_str(), 2560)
             .collect::<Vec<_>>()
             .join("\n");
         assert!(stack.len() > 10 * 1024 * 1024);
