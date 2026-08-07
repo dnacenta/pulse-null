@@ -173,6 +173,8 @@ impl Drop for Coordinator {
 enum TenureEnd {
     Shutdown,
     Lost,
+    /// Isolation Mode entered — release everything and park until it exits.
+    Isolated,
 }
 
 /// Sleep for `dur` unless shutdown fires first. Returns true on shutdown.
@@ -203,6 +205,7 @@ async fn leadership_loop(
     // stale-claim sweep nor fenced completion could tell them apart.
     let mut tenure: u64 = 0;
     let mut failed_acquires: u32 = 0;
+    let mut parked_logged = false;
 
     'open: loop {
         if *shutdown_rx.borrow() {
@@ -227,6 +230,26 @@ async fn leadership_loop(
         loop {
             if *shutdown_rx.borrow() {
                 return;
+            }
+            // Isolation Mode (spec Stage 2): the control plane is shed. Park —
+            // no acquire, no scheduler — until the data plane exits isolation.
+            // The marker is file-based and owned by the channel holder, so
+            // this check works no matter what state the rest of us are in.
+            if crate::server::isolation::is_active(&state.root_dir) {
+                if !parked_logged {
+                    tracing::warn!(
+                        "coordinator: ISOLATION active — control plane parked (scheduler down)                          until /resume"
+                    );
+                    parked_logged = true;
+                }
+                if wait_or_shutdown(&mut shutdown_rx, RETRY_BACKOFF).await {
+                    return;
+                }
+                continue;
+            }
+            if parked_logged {
+                tracing::info!("coordinator: isolation exited — resuming control plane");
+                parked_logged = false;
             }
             tenure += 1;
             let holder = format!("{holder_base}-t{tenure}");
@@ -351,7 +374,9 @@ async fn leadership_loop(
                 *guard = started;
             }
 
-            let tenure_end = renew_until_lost_or_shutdown(&leases, &holder, &mut shutdown_rx).await;
+            let tenure_end =
+                renew_until_lost_or_shutdown(&leases, &holder, &state.root_dir, &mut shutdown_rx)
+                    .await;
             state
                 .leadership
                 .store(false, std::sync::atomic::Ordering::Relaxed);
@@ -380,6 +405,15 @@ async fn leadership_loop(
                             .await
                             .release(CONTROL_PLANE_RESOURCE, &holder, Utc::now());
                     tracing::warn!("coordinator: leadership lost; will re-acquire");
+                }
+                TenureEnd::Isolated => {
+                    // Release so the lease is provably free while isolated
+                    // (AC19), then loop back into the parking check.
+                    let _ =
+                        leases
+                            .lock()
+                            .await
+                            .release(CONTROL_PLANE_RESOURCE, &holder, Utc::now());
                 }
             }
         }
@@ -431,11 +465,15 @@ async fn reconcile_control_plane(
 async fn renew_until_lost_or_shutdown(
     leases: &SharedLeases,
     holder: &str,
+    root_dir: &std::path::Path,
     shutdown_rx: &mut watch::Receiver<bool>,
 ) -> TenureEnd {
     loop {
         if wait_or_shutdown(shutdown_rx, RENEW_INTERVAL).await {
             return TenureEnd::Shutdown;
+        }
+        if crate::server::isolation::is_active(root_dir) {
+            return TenureEnd::Isolated;
         }
         let renewed = {
             leases

@@ -192,10 +192,12 @@ pub async fn chat(
     user_message.push_str("\nUser message: ");
     user_message.push_str(&req.message);
 
-    // Record incoming message to context buffer
-    if let Some(ref cb) = state.context_buffer {
-        cb.record(&req.channel, sender_label, "user", &req.message)
-            .await;
+    // Record incoming message to context buffer (shed in isolation)
+    if !isolated {
+        if let Some(ref cb) = state.context_buffer {
+            cb.record(&req.channel, sender_label, "user", &req.message)
+                .await;
+        }
     }
 
     // Get or create session keyed by resolved identity (Phase 1: Unified Session)
@@ -214,7 +216,9 @@ pub async fn chat(
     // time cap, or hallucination threshold). If so, archive the current conversation
     // with a structured handoff and start fresh before processing this message.
     let limits = state.config.sessions.get_identity_limits(&resolved_key);
-    if session.data.should_reset(&limits) {
+    // Session resets archive to disk — shed in isolation (the in-memory
+    // session simply keeps growing for the duration of the diagnosis).
+    if !isolated && session.data.should_reset(&limits) {
         tracing::info!(
             "[session-reset] auto-reset triggered for {} (msgs={}, cap={}, age_s={}, time_cap={})",
             session_key,
@@ -237,7 +241,9 @@ pub async fn chat(
 
     // WAL: append user message BEFORE adding to session (write-ahead).
     // Only increment wal_seq on success to keep it in sync with the WAL file.
-    if let Some(ref wal) = state.wal {
+    // (Shed in isolation: the diagnostic conversation is deliberately
+    // ephemeral — nothing that writes.)
+    if let Some(wal) = state.wal.as_ref().filter(|_| !isolated) {
         let next_seq = session.data.wal.wal_seq + 1;
         match wal.append(
             &session_key,
@@ -278,88 +284,92 @@ pub async fn chat(
             crate::context::estimate_conversation_tokens(&session.data.messages);
     }
 
-    // Compact conversation if approaching context budget (Tier 2 — Structured AutoCompact)
-    // Extract values before the call to avoid borrow conflicts with &mut messages
-    let recent_files_snapshot = session.data.compaction.recently_accessed_files.clone();
-    let current_compaction_failures = session.data.compaction.compaction_failures;
-    let active_plan_snapshot = session.data.compaction.active_plan.clone();
-    let compaction_result = crate::context::compact_if_needed(
-        &mut session.data.messages,
-        state.provider.as_ref(),
-        state.config.llm.context_budget,
-        state.config.llm.max_tokens,
-        &state.root_dir,
-        &state.config.entity.name,
-        &req.channel,
-        Some(&session_key),
-        current_compaction_failures,
-        &recent_files_snapshot,
-        active_plan_snapshot.as_deref(),
-    )
-    .await;
-    // Write back updated compaction failures from result
-    session.data.compaction.compaction_failures = compaction_result.compaction_failures;
-    if compaction_result.compacted {
-        session.data.compaction.compaction_count += 1;
-        let tokens_recovered = compaction_result
-            .tokens_before
-            .saturating_sub(compaction_result.tokens_after);
-        session.data.compaction.total_tokens_recovered_compact += tokens_recovered;
-        session.data.compaction.last_compaction_at = Some(Utc::now());
-        // Update token estimate after compaction
-        session.data.compaction.estimated_tokens =
-            crate::context::estimate_conversation_tokens(&session.data.messages);
+    // Tier-2 compaction is shed in isolation: it calls the provider and
+    // writes archives — both belong to the subsystems under suspicion.
+    if !isolated {
+        // Compact conversation if approaching context budget (Tier 2 — Structured AutoCompact)
+        // Extract values before the call to avoid borrow conflicts with &mut messages
+        let recent_files_snapshot = session.data.compaction.recently_accessed_files.clone();
+        let current_compaction_failures = session.data.compaction.compaction_failures;
+        let active_plan_snapshot = session.data.compaction.active_plan.clone();
+        let compaction_result = crate::context::compact_if_needed(
+            &mut session.data.messages,
+            state.provider.as_ref(),
+            state.config.llm.context_budget,
+            state.config.llm.max_tokens,
+            &state.root_dir,
+            &state.config.entity.name,
+            &req.channel,
+            Some(&session_key),
+            current_compaction_failures,
+            &recent_files_snapshot,
+            active_plan_snapshot.as_deref(),
+        )
+        .await;
+        // Write back updated compaction failures from result
+        session.data.compaction.compaction_failures = compaction_result.compaction_failures;
+        if compaction_result.compacted {
+            session.data.compaction.compaction_count += 1;
+            let tokens_recovered = compaction_result
+                .tokens_before
+                .saturating_sub(compaction_result.tokens_after);
+            session.data.compaction.total_tokens_recovered_compact += tokens_recovered;
+            session.data.compaction.last_compaction_at = Some(Utc::now());
+            // Update token estimate after compaction
+            session.data.compaction.estimated_tokens =
+                crate::context::estimate_conversation_tokens(&session.data.messages);
 
-        // Record compaction signal for vigil-pulse trend analysis.
-        // Non-blocking — failures are logged but don't affect the chat flow.
-        let compaction_signal = crate::vigil::compaction_signals::CompactionSignalFrame {
-            timestamp: Utc::now().to_rfc3339(),
-            session_key: session_key.clone(),
-            tier: if compaction_result.circuit_breaker_fired {
-                3
-            } else {
-                2
-            },
-            tokens_before: compaction_result.tokens_before,
-            tokens_after: compaction_result.tokens_after,
-            quality_score: session.data.compaction.context_quality_score,
-            circuit_breaker_fired: compaction_result.circuit_breaker_fired,
-            files_reinjected: compaction_result.files_reinjected,
-            had_active_plan: active_plan_snapshot.is_some(),
-        };
-        let root_for_signal = state.root_dir.clone();
-        tokio::task::spawn_blocking(move || {
-            if let Err(e) =
-                crate::vigil::compaction_signals::record(&root_for_signal, compaction_signal)
-            {
-                tracing::warn!("Failed to record compaction signal: {}", e);
-            }
-        });
+            // Record compaction signal for vigil-pulse trend analysis.
+            // Non-blocking — failures are logged but don't affect the chat flow.
+            let compaction_signal = crate::vigil::compaction_signals::CompactionSignalFrame {
+                timestamp: Utc::now().to_rfc3339(),
+                session_key: session_key.clone(),
+                tier: if compaction_result.circuit_breaker_fired {
+                    3
+                } else {
+                    2
+                },
+                tokens_before: compaction_result.tokens_before,
+                tokens_after: compaction_result.tokens_after,
+                quality_score: session.data.compaction.context_quality_score,
+                circuit_breaker_fired: compaction_result.circuit_breaker_fired,
+                files_reinjected: compaction_result.files_reinjected,
+                had_active_plan: active_plan_snapshot.is_some(),
+            };
+            let root_for_signal = state.root_dir.clone();
+            tokio::task::spawn_blocking(move || {
+                if let Err(e) =
+                    crate::vigil::compaction_signals::record(&root_for_signal, compaction_signal)
+                {
+                    tracing::warn!("Failed to record compaction signal: {}", e);
+                }
+            });
 
-        // Structured compaction log for debugging and analysis
-        tracing::info!(
-            "[COMPACTION] tier={} session={} before={}T after={}T recovered={}T \
-             quality={:.2} files_reinjected={} circuit_breaker={} active_plan={}",
-            if compaction_result.circuit_breaker_fired {
-                3
-            } else {
-                2
-            },
-            session_key,
-            compaction_result.tokens_before,
-            compaction_result.tokens_after,
-            tokens_recovered,
-            session.data.compaction.context_quality_score,
-            compaction_result.files_reinjected,
-            compaction_result.circuit_breaker_fired,
-            active_plan_snapshot.is_some(),
-        );
-
-        if compaction_result.circuit_breaker_fired {
-            tracing::error!(
-                session_key = %session_key,
-                "Compaction circuit breaker fired — session compaction frozen"
+            // Structured compaction log for debugging and analysis
+            tracing::info!(
+                "[COMPACTION] tier={} session={} before={}T after={}T recovered={}T \
+                 quality={:.2} files_reinjected={} circuit_breaker={} active_plan={}",
+                if compaction_result.circuit_breaker_fired {
+                    3
+                } else {
+                    2
+                },
+                session_key,
+                compaction_result.tokens_before,
+                compaction_result.tokens_after,
+                tokens_recovered,
+                session.data.compaction.context_quality_score,
+                compaction_result.files_reinjected,
+                compaction_result.circuit_breaker_fired,
+                active_plan_snapshot.is_some(),
             );
+
+            if compaction_result.circuit_breaker_fired {
+                tracing::error!(
+                    session_key = %session_key,
+                    "Compaction circuit breaker fired — session compaction frozen"
+                );
+            }
         }
     }
 
@@ -397,11 +407,23 @@ pub async fn chat(
         )
     };
 
+    // Isolation offers only the read-only introspection tool set — no
+    // file_write, no web_fetch, no plugin tools.
+    let readonly_tools = if isolated {
+        Some(crate::server::setup::register_readonly_tools(
+            &state.root_dir,
+            &state.config,
+        ))
+    } else {
+        None
+    };
+    let active_tools = readonly_tools.as_ref().unwrap_or(&state.tools);
+
     let result = crate::task_context::scope(
         Some(correlation_id.clone()),
         tool_loop::invoke_with_tool_loop(
             state.provider.as_ref(),
-            &state.tools,
+            active_tools,
             &system_prompt,
             &mut session.data.messages,
             state.config.llm.max_tokens,
@@ -425,9 +447,8 @@ pub async fn chat(
         }
     }
 
-    // WAL: append assistant response.
-    // Only increment wal_seq on success to keep it in sync with the WAL file.
-    if let Some(ref wal) = state.wal {
+    // WAL: append assistant response. (Shed in isolation.)
+    if let Some(wal) = state.wal.as_ref().filter(|_| !isolated) {
         let next_seq = session.data.wal.wal_seq + 1;
         match wal.append(
             &session_key,
@@ -535,8 +556,8 @@ pub async fn chat(
     // Enforce hard cap on stored messages (safety backstop — session caps should fire first)
     session.data.enforce_message_cap();
 
-    // Record conversation outcome for caliber-echo
-    if let Some(ref _tracker) = state.outcome_tracker {
+    // Record conversation outcome for caliber-echo (shed in isolation)
+    if let Some(_tracker) = state.outcome_tracker.as_ref().filter(|_| !isolated) {
         let conv_outcome = crate::caliber::runtime::build_conversation_outcome(
             &session_key,
             &channel,
@@ -564,13 +585,17 @@ pub async fn chat(
         .await;
     }
 
-    // Incremental checkpoint (if conditions met)
-    maybe_checkpoint(&state, &session_key, &mut session.data, &channel).await;
+    // Incremental checkpoint (if conditions met; shed in isolation)
+    if !isolated {
+        maybe_checkpoint(&state, &session_key, &mut session.data, &channel).await;
+    }
 
-    // Record entity response to context buffer
-    if let Some(ref cb) = state.context_buffer {
-        cb.record(&channel, &state.config.entity.name, "assistant", &text)
-            .await;
+    // Record entity response to context buffer (shed in isolation)
+    if !isolated {
+        if let Some(ref cb) = state.context_buffer {
+            cb.record(&channel, &state.config.entity.name, "assistant", &text)
+                .await;
+        }
     }
 
     // Build InteractionRecord from the session before dropping the lock.
@@ -596,14 +621,22 @@ pub async fn chat(
     );
     // Drop the session lock before persisting to avoid deadlock
     drop(session);
-    persist_store.persist(&persist_key).await;
-    tracing::debug!("[chat] persist call returned for key={}", persist_key);
+    if isolated {
+        tracing::debug!("[chat] session persist shed (isolation)");
+    } else {
+        persist_store.persist(&persist_key).await;
+        tracing::debug!("[chat] persist call returned for key={}", persist_key);
+    }
 
     // Emit PostInteraction event from the InteractionRecord
     // Chat sessions are persisted separately (session store), so we emit
     // on every request for real-time assessment. Only assessable interactions
     // are worth emitting — trivial health-checks get skipped.
-    if interaction.is_assessable() {
+    if isolated {
+        // Shed in isolation: the event listener downstream writes intent and
+        // evaluator state, and the audit log is itself a write.
+        tracing::debug!("[chat] event emission and intake audit shed (isolation)");
+    } else if interaction.is_assessable() {
         let receivers = state.event_bus.emit(interaction.to_event());
         tracing::debug!(
             "[chat] PostInteraction emitted to {} receivers (source={})",
