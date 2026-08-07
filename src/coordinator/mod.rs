@@ -15,6 +15,7 @@
 
 pub mod control;
 pub mod durable;
+pub mod farm;
 pub mod fenced;
 pub mod lease;
 pub mod wal;
