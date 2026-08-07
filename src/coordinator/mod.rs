@@ -9,3 +9,4 @@
 
 pub mod fenced;
 pub mod lease;
+pub mod wal;
