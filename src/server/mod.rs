@@ -266,17 +266,17 @@ pub async fn start(config: Config) -> Result<(), Box<dyn std::error::Error>> {
     // Startup pipeline health check
     setup::startup_pipeline_check(&root_dir, &config, &state.pipeline_monitor);
 
-    // Load schedule and intent queue, start scheduler
+    // Load schedule and intent queue; the coordinator gates the scheduler on
+    // control-plane leadership (fail-open: chat/voice never wait on this).
     let schedule = Schedule::load(&root_dir)?;
     let schedule = Arc::new(RwLock::new(schedule));
     let intent_queue = IntentQueue::load(&root_dir);
     let intent_queue = Arc::new(RwLock::new(intent_queue));
-    let scheduler_handles = crate::scheduler::start(
+    let coordinator = crate::coordinator::control::Coordinator::start(
         Arc::clone(&state),
         Arc::clone(&schedule),
         Arc::clone(&intent_queue),
-    )
-    .await?;
+    );
 
     // Recover orphaned conversations from WAL (post-init: provider + plugins ready)
     if let Some(ref wal) = state.wal {
@@ -349,12 +349,10 @@ pub async fn start(config: Config) -> Result<(), Box<dyn std::error::Error>> {
     // === Post-signal sequence ===
     // These run immediately after SIGTERM, while axum is still draining.
 
-    // 1. Abort scheduler tasks — they call the provider directly and may hold
-    //    long-running LLM requests that block the runtime.
-    tracing::info!("Aborting {} scheduler task(s)", scheduler_handles.len());
-    for handle in scheduler_handles {
-        handle.abort();
-    }
+    // 1. Stop the coordinator — aborts scheduler tasks (they call the provider
+    //    directly and may hold long-running LLM requests) and releases the
+    //    control-plane lease so a successor need not wait out the ttl.
+    coordinator.shutdown().await;
 
     // 2. Stop plugins (Discord bot, etc.) so they stop generating new requests.
     state.plugin_manager.lock().await.stop_all().await;

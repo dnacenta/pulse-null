@@ -15,7 +15,7 @@ pub struct RunningEntity {
     pub config: Config,
     pub port: u16,
     pub server_handle: JoinHandle<()>,
-    pub scheduler_handles: Vec<JoinHandle<()>>,
+    pub coordinator: crate::coordinator::control::Coordinator,
     #[allow(dead_code)]
     pub event_bus: Arc<EventBus>,
     pub persist_coordinator: Arc<PersistCoordinator>,
@@ -118,9 +118,7 @@ impl EntityRegistry {
             }
 
             entity.server_handle.abort();
-            for h in entity.scheduler_handles {
-                h.abort();
-            }
+            entity.coordinator.shutdown().await;
         }
     }
 

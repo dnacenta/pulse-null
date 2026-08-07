@@ -573,7 +573,7 @@ async fn boot_and_enter(
             config: config.clone(),
             port: booted.actual_port,
             server_handle: booted.server_handle,
-            scheduler_handles: booted.scheduler_handles,
+            coordinator: booted.coordinator,
             event_bus: booted.event_bus,
             persist_coordinator: booted.persist_coordinator,
         });

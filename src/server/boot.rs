@@ -16,7 +16,7 @@ use super::AppState;
 /// Result of booting an entity's server.
 pub struct BootedEntity {
     pub server_handle: JoinHandle<()>,
-    pub scheduler_handles: Vec<JoinHandle<()>>,
+    pub coordinator: crate::coordinator::control::Coordinator,
     pub event_bus: Arc<EventBus>,
     pub actual_port: u16,
     pub persist_coordinator: Arc<PersistCoordinator>,
@@ -109,17 +109,17 @@ pub async fn boot_entity(
     // Pipeline health check
     super::setup::startup_pipeline_check(&root_dir, &config, &state.pipeline_monitor);
 
-    // Scheduler
+    // Scheduler — gated on control-plane leadership (fail-open: the entity's
+    // interactive surfaces never wait on the coordinator).
     let schedule = Schedule::load(&root_dir)?;
     let schedule = Arc::new(RwLock::new(schedule));
     let intent_queue = IntentQueue::load(&root_dir);
     let intent_queue = Arc::new(RwLock::new(intent_queue));
-    let scheduler_handles = crate::scheduler::start(
+    let coordinator = crate::coordinator::control::Coordinator::start(
         Arc::clone(&state),
         Arc::clone(&schedule),
         Arc::clone(&intent_queue),
-    )
-    .await?;
+    );
 
     // Give the plugin manager access to the event bus for runtime state-change events
     {
@@ -153,7 +153,7 @@ pub async fn boot_entity(
 
     Ok(BootedEntity {
         server_handle,
-        scheduler_handles,
+        coordinator,
         event_bus,
         actual_port,
         persist_coordinator: Arc::clone(&state.persist_coordinator),
