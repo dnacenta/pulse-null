@@ -134,7 +134,6 @@ pub fn archive_conversation(
     fs::create_dir_all(&conv_dir)
         .map_err(|e| format!("Failed to create conversations archive dir: {e}"))?;
 
-    let next_num = highest_log_number(&conv_dir) + 1;
     let now = Utc::now();
     let date_full = now.format("%Y-%m-%dT%H:%M:%SZ").to_string();
     let date_short = now.format("%Y-%m-%d").to_string();
@@ -147,6 +146,23 @@ pub fn archive_conversation(
         None => String::new(),
     };
 
+    // Claim the log number with O_EXCL: chat and scheduler paths both archive
+    // here, and a scan-then-write would let two writers pick the same number
+    // and silently overwrite one conversation with another.
+    let mut next_num = highest_log_number(&conv_dir) + 1;
+    let (mut file, log_path, next_num) = loop {
+        let candidate = conv_dir.join(format!("conversation-{next_num:03}.md"));
+        match fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&candidate)
+        {
+            Ok(f) => break (f, candidate, next_num),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => next_num += 1,
+            Err(e) => return Err(format!("Failed to create conversation archive: {e}")),
+        }
+    };
+
     let content = format!(
         "---\nlog: {next_num}\ndate: \"{date_full}\"\ntrigger: {trigger}\nchannel: {channel}\nentity: \"{entity}\"\n{session_key_line}message_count: {message_count}\n---\n\n# Conversation {next_num:03}\n\n{conversation_md}",
         trigger = meta.trigger,
@@ -154,9 +170,9 @@ pub fn archive_conversation(
         entity = meta.entity_name,
     );
 
-    let log_path = conv_dir.join(format!("conversation-{next_num:03}.md"));
-    fs::write(&log_path, &content)
+    file.write_all(content.as_bytes())
         .map_err(|e| format!("Failed to write conversation archive: {e}"))?;
+    drop(file);
 
     append_index(
         root_dir,
@@ -805,6 +821,42 @@ mod tests {
     fn empty_conversation_produces_empty_markdown() {
         let md = conversation_to_markdown(&[]);
         assert!(md.is_empty());
+    }
+
+    /// AC14: allocation is O_EXCL-claimed, so a competing writer that already
+    /// took the next number can never be overwritten — the archiver skips
+    /// forward instead.
+    #[test]
+    fn conversation_numbering_never_overwrites_a_competing_writer() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let conversation = vec![Message {
+            role: Role::User,
+            content: MessageContent::Text("hello".into()),
+            source: None,
+        }];
+        let meta = ArchiveMeta {
+            trigger: "test".into(),
+            channel: "chat".into(),
+            entity_name: "echo".into(),
+            session_key: None,
+        };
+
+        let first = archive_conversation(root, &conversation, &meta).unwrap();
+        assert!(first.ends_with("conversation-001.md"));
+
+        // A competing writer (scheduler path) claims 002 between our scan
+        // and our write.
+        let conv_dir = root.join("archives").join("conversations");
+        std::fs::write(conv_dir.join("conversation-002.md"), "claimed by other").unwrap();
+
+        let second = archive_conversation(root, &conversation, &meta).unwrap();
+        assert!(second.ends_with("conversation-003.md"));
+        // The competitor's file is intact.
+        assert_eq!(
+            std::fs::read_to_string(conv_dir.join("conversation-002.md")).unwrap(),
+            "claimed by other"
+        );
     }
 
     #[test]

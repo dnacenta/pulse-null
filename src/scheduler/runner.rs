@@ -78,17 +78,38 @@ pub async fn run_task_loop(
 
         tokio::time::sleep(duration).await;
 
-        // Check if still enabled (might have been disabled at runtime)
+        // Check if still enabled — against DISK, so a `pulse-null schedule
+        // disable` from the CLI takes effect at the next fire without a
+        // service restart (the in-memory copy can't see external edits).
+        // Falls back to the shared copy if the file is transiently unreadable.
         {
-            let sched = schedule.read().await;
-            if let Some(t) = sched.find_task(&task.id) {
-                if !t.task.enabled {
+            let rd = root_dir.clone();
+            let disk = tokio::task::spawn_blocking(move || Schedule::load(&rd)).await;
+            let entry_enabled = match disk {
+                Ok(Ok(fresh)) => {
+                    let enabled = fresh.find_task(&task.id).map(|t| t.task.enabled);
+                    *schedule.write().await = fresh;
+                    enabled
+                }
+                _ => {
+                    tracing::warn!(
+                        "Task '{}': schedule.json unreadable for enabled-check; using shared copy",
+                        task.id
+                    );
+                    let sched = schedule.read().await;
+                    sched.find_task(&task.id).map(|t| t.task.enabled)
+                }
+            };
+            match entry_enabled {
+                Some(true) => {}
+                Some(false) => {
                     tracing::info!("Task '{}' disabled, stopping loop", task.id);
                     return;
                 }
-            } else {
-                tracing::info!("Task '{}' removed, stopping loop", task.id);
-                return;
+                None => {
+                    tracing::info!("Task '{}' removed, stopping loop", task.id);
+                    return;
+                }
             }
         }
 
@@ -803,10 +824,12 @@ async fn route_output_markers(
                     new_task.name,
                     new_task.cron
                 );
-                let mut sched = schedule.write().await;
-                sched.add_task(new_task);
-                if let Err(e) = sched.save(root_dir) {
-                    tracing::error!("Failed to persist schedule: {}", e);
+                // Delta against disk, never a wholesale write of memory —
+                // concurrent CLI/TUI edits survive; then refresh the shared
+                // copy from the merged result.
+                match Schedule::save_delta(root_dir, |s| s.add_task(new_task)) {
+                    Ok(merged) => *schedule.write().await = merged,
+                    Err(e) => tracing::error!("Failed to persist schedule: {}", e),
                 }
             }
             Err(e) => {

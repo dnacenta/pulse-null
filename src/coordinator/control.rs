@@ -204,6 +204,27 @@ async fn leadership_loop(
                 lease.fencing_token
             );
 
+            // Reconcile-on-reconnect (spec decision 2): other writers — the
+            // CLI, the event listener, a prior wedged tenure — may have
+            // changed control-plane state while we weren't leader. Re-read
+            // the actual files; never assume the in-memory copies. (Evaluator
+            // state and task health are re-loaded from disk inside the
+            // scheduler itself, per tenure.)
+            if let Err(e) = reconcile_control_plane(&state.root_dir, &schedule, &intent_queue).await
+            {
+                // Unknown control-plane state: fail closed on the control
+                // plane only. Release and retry; the data plane keeps serving.
+                tracing::error!("coordinator: reconcile failed ({e}); not starting scheduler");
+                let _ = leases
+                    .lock()
+                    .await
+                    .release(CONTROL_PLANE_RESOURCE, &holder, Utc::now());
+                if wait_or_shutdown(&mut shutdown_rx, RETRY_BACKOFF).await {
+                    return;
+                }
+                continue;
+            }
+
             let handles = match scheduler::start(
                 Arc::clone(&state),
                 Arc::clone(&schedule),
@@ -259,6 +280,19 @@ async fn leadership_loop(
     }
 }
 
+/// Replace the shared control-plane state with what is actually on disk.
+async fn reconcile_control_plane(
+    root_dir: &std::path::Path,
+    schedule: &Arc<RwLock<Schedule>>,
+    intent_queue: &Arc<RwLock<IntentQueue>>,
+) -> Result<(), crate::errors::SchedulerError> {
+    let fresh_schedule = Schedule::load(root_dir)?;
+    let fresh_intents = IntentQueue::load(root_dir);
+    *schedule.write().await = fresh_schedule;
+    *intent_queue.write().await = fresh_intents;
+    Ok(())
+}
+
 async fn renew_until_lost_or_shutdown(
     leases: &SharedLeases,
     holder: &str,
@@ -290,6 +324,47 @@ async fn renew_until_lost_or_shutdown(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// AC12: at leadership acquisition the shared state is replaced by disk
+    /// truth — an edit made while the coordinator was down survives.
+    #[tokio::test]
+    async fn reconcile_replaces_shared_state_with_disk_truth() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+
+        let schedule = Arc::new(RwLock::new(Schedule::load(root).unwrap()));
+        let intents = Arc::new(RwLock::new(IntentQueue::load(root)));
+        let task_id = schedule.read().await.tasks[0].task.id.clone();
+        assert!(
+            schedule
+                .read()
+                .await
+                .find_task(&task_id)
+                .unwrap()
+                .task
+                .enabled
+        );
+
+        // "CLI disabled the task while the coordinator was down."
+        {
+            let mut cli = Schedule::load(root).unwrap();
+            cli.find_task_mut(&task_id).unwrap().task.enabled = false;
+            cli.save(root).unwrap();
+        }
+
+        reconcile_control_plane(root, &schedule, &intents)
+            .await
+            .unwrap();
+        assert!(
+            !schedule
+                .read()
+                .await
+                .find_task(&task_id)
+                .unwrap()
+                .task
+                .enabled
+        );
+    }
 
     #[test]
     fn holder_id_is_lease_charset_safe() {

@@ -582,10 +582,10 @@ async fn execute_intent(
                     new_task.name,
                     new_task.cron
                 );
-                let mut sched = schedule.write().await;
-                sched.add_task(new_task);
-                if let Err(e) = sched.save(&root_dir) {
-                    tracing::error!("Failed to persist schedule: {}", e);
+                // Delta against disk (reconcile) + refresh the shared copy.
+                match Schedule::save_delta(&root_dir, |s| s.add_task(new_task)) {
+                    Ok(merged) => *schedule.write().await = merged,
+                    Err(e) => tracing::error!("Failed to persist schedule: {}", e),
                 }
             }
             Err(e) => tracing::warn!("Invalid [SCHEDULE:] marker from intent: {}", e),
