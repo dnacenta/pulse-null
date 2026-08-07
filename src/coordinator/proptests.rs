@@ -24,12 +24,31 @@ use super::lease::FencingToken;
 
 #[derive(Debug, Clone)]
 enum Op {
-    Acquire { r: u8, h: u8, ttl_secs: u8 },
-    Renew { r: u8, h: u8, ttl_secs: u8 },
-    Release { r: u8, h: u8 },
-    Advance { secs: u8 },
+    Acquire {
+        r: u8,
+        h: u8,
+        ttl_secs: u8,
+    },
+    Renew {
+        r: u8,
+        h: u8,
+        ttl_secs: u8,
+    },
+    Release {
+        r: u8,
+        h: u8,
+    },
+    Advance {
+        secs: u8,
+    },
     Restart,
-    Write { r: u8, h: u8 },
+    /// Crash mid-append: torn unterminated bytes land on the log, then the
+    /// coordinator restarts. Acked state must survive unchanged.
+    TearAndRestart,
+    Write {
+        r: u8,
+        h: u8,
+    },
 }
 
 fn op_strategy() -> impl Strategy<Value = Op> {
@@ -44,6 +63,7 @@ fn op_strategy() -> impl Strategy<Value = Op> {
         2 => (r.clone(), h.clone()).prop_map(|(r, h)| Op::Release { r, h }),
         3 => (1..120u8).prop_map(|secs| Op::Advance { secs }),
         1 => Just(Op::Restart),
+        1 => Just(Op::TearAndRestart),
         4 => (r, h).prop_map(|(r, h)| Op::Write { r, h }),
     ]
 }
@@ -113,6 +133,21 @@ proptest! {
                     let before = durable.table().clone();
                     drop(durable);
                     durable = DurableLeaseTable::open(dir.path()).unwrap();
+                    prop_assert_eq!(durable.table(), &before);
+                }
+                Op::TearAndRestart => {
+                    let before = durable.table().clone();
+                    drop(durable);
+                    {
+                        use std::io::Write;
+                        let mut f = std::fs::OpenOptions::new()
+                            .append(true)
+                            .open(dir.path().join("leases.jsonl"))
+                            .unwrap();
+                        f.write_all(br#"{"v":1,"e":{"event":"acq"#).unwrap();
+                    }
+                    durable = DurableLeaseTable::open(dir.path()).unwrap();
+                    // Torn bytes are truncated; every acked grant survives.
                     prop_assert_eq!(durable.table(), &before);
                 }
                 Op::Write { r, h } => {

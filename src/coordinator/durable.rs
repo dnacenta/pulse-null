@@ -39,7 +39,15 @@ impl DurableLeaseTable {
     /// Open the lease WAL under `dir` (taking its exclusive lock) and
     /// recover the table from it.
     pub fn open(dir: &Path) -> Result<Self, ReplayError> {
-        let wal = LeaseWal::new(dir)?;
+        let wal = LeaseWal::new(dir).map_err(|e| {
+            if e.kind() == io::ErrorKind::WouldBlock {
+                ReplayError::Locked {
+                    path: dir.join("leases.jsonl"),
+                }
+            } else {
+                ReplayError::Io(e)
+            }
+        })?;
         let table = wal.replay()?;
         Ok(Self { table, wal })
     }
@@ -181,12 +189,12 @@ mod tests {
     }
 
     #[test]
-    fn second_durable_table_on_same_dir_is_refused() {
+    fn second_durable_table_on_same_dir_is_refused_as_locked() {
         let dir = tempfile::tempdir().unwrap();
         let _held = DurableLeaseTable::open(dir.path()).unwrap();
         assert!(matches!(
             DurableLeaseTable::open(dir.path()),
-            Err(ReplayError::Io(_))
+            Err(ReplayError::Locked { .. })
         ));
     }
 }

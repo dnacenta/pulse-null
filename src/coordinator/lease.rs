@@ -70,6 +70,7 @@ impl fmt::Display for FencingToken {
 
 /// A granted lease on a resource.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Lease {
     pub resource_id: String,
     pub holder_id: String,
@@ -187,6 +188,18 @@ pub enum ApplyError {
         resource_id: String,
         token: FencingToken,
         current: FencingToken,
+    },
+    #[error("renew of an expired lease on '{resource_id}' (expired {expired_at}, event ts {ts})")]
+    RenewedExpired {
+        resource_id: String,
+        expired_at: DateTime<Utc>,
+        ts: DateTime<Utc>,
+    },
+    #[error("implausible granted_at on '{resource_id}': {granted_at} vs event ts {ts}")]
+    ImplausibleGrantTime {
+        resource_id: String,
+        granted_at: DateTime<Utc>,
+        ts: DateTime<Utc>,
     },
     #[error("invalid lease in event: {0}")]
     InvalidLease(#[from] LeaseError),
@@ -326,8 +339,14 @@ impl LeaseTable {
     /// violation is an error — the caller (replay) fails closed.
     pub fn apply(&mut self, event: &LeaseEvent) -> Result<(), ApplyError> {
         match event {
-            LeaseEvent::Acquired { lease, .. } | LeaseEvent::Reclaimed { lease, .. } => {
-                Self::validate_event_lease(lease)?;
+            // Note: an `Acquired` over a live unexpired lease is accepted
+            // here even though the online path forbids it — replay cannot
+            // re-derive the online expiry decision (it used an injected
+            // `now`, not the event `ts`, and clocks skew across restarts).
+            // Safety holds regardless: the incoming token is strictly
+            // higher, so the displaced holder is fenced at the resource.
+            LeaseEvent::Acquired { ts, lease } | LeaseEvent::Reclaimed { ts, lease } => {
+                Self::validate_event_lease(lease, *ts)?;
                 if let Some(watermark) = self.watermark(&lease.resource_id) {
                     if lease.fencing_token <= watermark {
                         return Err(ApplyError::TokenRegression {
@@ -341,8 +360,8 @@ impl LeaseTable {
                 self.watermarks
                     .insert(lease.resource_id.clone(), lease.fencing_token);
             }
-            LeaseEvent::Renewed { lease, .. } => {
-                Self::validate_event_lease(lease)?;
+            LeaseEvent::Renewed { ts, lease } => {
+                Self::validate_event_lease(lease, *ts)?;
                 let current =
                     self.leases
                         .get(&lease.resource_id)
@@ -350,6 +369,16 @@ impl LeaseTable {
                             op: "renew",
                             resource_id: lease.resource_id.clone(),
                         })?;
+                // A renew of a lease already expired at the event's own ts
+                // would resurrect it with its original token and no
+                // watermark bump — a state the online path forbids.
+                if current.is_expired(*ts) {
+                    return Err(ApplyError::RenewedExpired {
+                        resource_id: lease.resource_id.clone(),
+                        expired_at: current.expires_at(),
+                        ts: *ts,
+                    });
+                }
                 if current.holder_id != lease.holder_id {
                     return Err(ApplyError::HolderMismatch {
                         op: "renew",
@@ -393,10 +422,22 @@ impl LeaseTable {
         Ok(())
     }
 
-    fn validate_event_lease(lease: &Lease) -> Result<(), LeaseError> {
+    fn validate_event_lease(lease: &Lease, ts: DateTime<Utc>) -> Result<(), ApplyError> {
         validate_id("resource", &lease.resource_id)?;
         validate_id("holder", &lease.holder_id)?;
-        validate_ttl(&lease.resource_id, lease.ttl)
+        validate_ttl(&lease.resource_id, lease.ttl)?;
+        // A grant time far from the append time has no online equivalent —
+        // an unbounded granted_at would let a forged line park a resource
+        // beyond any reclaim (its expiry saturating past every real clock).
+        let skew = (lease.granted_at - ts).abs();
+        if skew > TimeDelta::from_std(MAX_TTL).expect("MAX_TTL fits TimeDelta") {
+            return Err(ApplyError::ImplausibleGrantTime {
+                resource_id: lease.resource_id.clone(),
+                granted_at: lease.granted_at,
+                ts,
+            });
+        }
+        Ok(())
     }
 
     fn next_token(&self, resource_id: &str) -> Result<FencingToken, LeaseError> {
@@ -721,6 +762,49 @@ mod tests {
             ApplyError::HolderMismatch { .. }
         ));
         assert!(table.get("wal").is_some());
+    }
+
+    #[test]
+    fn apply_rejects_renew_of_expired_lease() {
+        let mut source = LeaseTable::new();
+        let lease = source.acquire("wal", "echo-a", secs(30), t0()).unwrap();
+
+        let mut table = LeaseTable::new();
+        table.apply(&acquired(&lease)).unwrap();
+
+        // Renew stamped after expiry would resurrect the lease with its
+        // original token and no watermark bump.
+        let mut resurrected = lease.clone();
+        resurrected.granted_at = t0() + secs(100);
+        let err = table
+            .apply(&LeaseEvent::Renewed {
+                ts: t0() + secs(100),
+                lease: resurrected,
+            })
+            .unwrap_err();
+        assert!(matches!(err, ApplyError::RenewedExpired { .. }));
+    }
+
+    #[test]
+    fn apply_rejects_implausible_grant_time() {
+        // A forged granted_at far past the append ts would saturate expiry
+        // beyond any reclaim, parking the resource forever.
+        let mut table = LeaseTable::new();
+        let forged = Lease {
+            resource_id: "wal".to_string(),
+            holder_id: "echo-a".to_string(),
+            fencing_token: FencingToken(1),
+            granted_at: DateTime::<Utc>::MAX_UTC - secs(10),
+            ttl: secs(30),
+        };
+        let err = table
+            .apply(&LeaseEvent::Acquired {
+                ts: t0(),
+                lease: forged,
+            })
+            .unwrap_err();
+        assert!(matches!(err, ApplyError::ImplausibleGrantTime { .. }));
+        assert!(table.get("wal").is_none());
     }
 
     #[test]
