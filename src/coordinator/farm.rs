@@ -357,6 +357,154 @@ where
     None
 }
 
+/// Parse and run a `[FARM: {json}]` marker under the current tenure. Returns
+/// the farm's composed result text (synthesized when the spec asks for it),
+/// or an error string for the caller to log. Children run WITHOUT tools —
+/// bounded reasoning work; anything that needs side effects is not a farm.
+pub async fn run_farm_from_marker(
+    farm_json: &str,
+    state: &Arc<crate::server::AppState>,
+    tenure: &super::control::TenureLeases,
+) -> Result<String, String> {
+    let spec: FarmSpec =
+        serde_json::from_str(farm_json).map_err(|e| format!("invalid [FARM:] json: {e}"))?;
+    if spec.subtasks.is_empty() {
+        return Err("farm has no subtasks".to_string());
+    }
+    if spec.subtasks.len() > MAX_SUBTASKS {
+        return Err(format!(
+            "farm has {} subtasks (max {MAX_SUBTASKS})",
+            spec.subtasks.len()
+        ));
+    }
+    {
+        let mut ids: Vec<&str> = spec.subtasks.iter().map(|s| s.id.as_str()).collect();
+        ids.sort_unstable();
+        ids.dedup();
+        if ids.len() != spec.subtasks.len() {
+            return Err("duplicate subtask ids".to_string());
+        }
+    }
+
+    let system_prompt = crate::server::prompt::build_task_system_prompt_async(
+        state.root_dir.clone(),
+        state.config.clone(),
+    )
+    .await
+    .map_err(|e| format!("cannot build farm system prompt: {e}"))?;
+
+    let synthesis = spec.synthesis.clone();
+    let description = spec.description.clone();
+    let farm_label = spec.id.clone();
+    let max_tokens = state.config.llm.max_tokens;
+
+    let exec_state = Arc::clone(state);
+    let exec_prompt = system_prompt.clone();
+    let executor = move |sub: SubtaskSpec| {
+        let state = Arc::clone(&exec_state);
+        let system_prompt = exec_prompt.clone();
+        async move {
+            let messages = vec![pulse_system_types::llm::Message {
+                role: pulse_system_types::llm::Role::User,
+                content: pulse_system_types::llm::MessageContent::Text(sub.prompt),
+                source: None,
+            }];
+            let response = state
+                .provider
+                .invoke(&system_prompt, &messages, max_tokens, None)
+                .await
+                .map_err(|e| e.to_string())?;
+            Ok(response_text(&response))
+        }
+    };
+
+    let outcome = run_farm(
+        Arc::clone(&tenure.leases),
+        &tenure.holder,
+        state.root_dir.clone(),
+        spec,
+        FarmCaps::default(),
+        executor,
+    )
+    .await;
+
+    if outcome.results.is_empty() {
+        return Err(format!(
+            "farm '{farm_label}' produced no results (failed: {:?})",
+            outcome.failed
+        ));
+    }
+
+    let mut composed = String::new();
+    for r in &outcome.results {
+        composed.push_str(&format!(
+            "## {}
+{}
+
+",
+            r.sub_id, r.text
+        ));
+    }
+    if !outcome.failed.is_empty() {
+        composed.push_str(&format!(
+            "(failed subtasks: {:?})
+",
+            outcome.failed
+        ));
+    }
+
+    let final_text = match synthesis {
+        Some(template) => {
+            let prompt = template.replace("{results}", &composed);
+            let messages = vec![pulse_system_types::llm::Message {
+                role: pulse_system_types::llm::Role::User,
+                content: pulse_system_types::llm::MessageContent::Text(prompt),
+                source: None,
+            }];
+            match state
+                .provider
+                .invoke(&system_prompt, &messages, max_tokens, None)
+                .await
+            {
+                Ok(response) => response_text(&response),
+                Err(e) => {
+                    tracing::warn!(
+                        "farm '{farm_label}': synthesis failed ({e}); using raw results"
+                    );
+                    composed
+                }
+            }
+        }
+        None => composed,
+    };
+
+    crate::logbook::write_entry(
+        &state.root_dir,
+        "Farm",
+        &description,
+        &format!(
+            "{} subtask(s), {} reclaim(s), {} late-fenced",
+            outcome.results.len(),
+            outcome.reclaims,
+            outcome.late_fenced
+        ),
+    );
+
+    Ok(final_text)
+}
+
+fn response_text(response: &pulse_system_types::llm::LlmResponse) -> String {
+    response
+        .content
+        .iter()
+        .filter_map(|block| match block {
+            pulse_system_types::llm::ContentBlock::Text { text } => Some(text.as_str()),
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

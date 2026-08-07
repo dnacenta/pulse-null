@@ -22,6 +22,8 @@ pub struct ParsedOutput {
     pub intent_requests: Vec<String>,
     /// JSON content extracted from [CHAIN:] markers
     pub chain_requests: Vec<String>,
+    /// JSON content extracted from [FARM:] markers (Stage 3 subtask farming)
+    pub farm_requests: Vec<String>,
 }
 
 static SHARE_RE: LazyLock<Regex> =
@@ -37,6 +39,9 @@ static INTENT_RE: LazyLock<Regex> =
 
 static CHAIN_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"\[CHAIN:\s*(\{[\s\S]*?\})\]").unwrap());
+
+static FARM_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"\[FARM:\s*(\{[\s\S]*?\})\]").unwrap());
 
 /// Parse LLM response for output routing markers.
 pub fn parse_output(content: &str) -> ParsedOutput {
@@ -65,6 +70,11 @@ pub fn parse_output(content: &str) -> ParsedOutput {
         .map(|c| c[1].trim().to_string())
         .collect();
 
+    let farm_requests: Vec<String> = FARM_RE
+        .captures_iter(content)
+        .map(|c| c[1].trim().to_string())
+        .collect();
+
     // Strip all markers from content for the clean version
     let mut clean = content.to_string();
     clean = SHARE_RE.replace_all(&clean, "").to_string();
@@ -72,6 +82,7 @@ pub fn parse_output(content: &str) -> ParsedOutput {
     clean = SCHEDULE_RE.replace_all(&clean, "").to_string();
     clean = INTENT_RE.replace_all(&clean, "").to_string();
     clean = CHAIN_RE.replace_all(&clean, "").to_string();
+    clean = FARM_RE.replace_all(&clean, "").to_string();
     let clean_content = clean.trim().to_string();
 
     ParsedOutput {
@@ -81,6 +92,7 @@ pub fn parse_output(content: &str) -> ParsedOutput {
         schedule_requests,
         intent_requests,
         chain_requests,
+        farm_requests,
     }
 }
 
@@ -230,6 +242,16 @@ pub async fn deliver_liveness_alert(content: &str, webhook: Option<&str>) -> Res
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn farm_marker_is_parsed_and_stripped() {
+        let content =
+            r#"Delegating. [FARM: {"id":"f1","subtasks":[{"id":"a","prompt":"pa"}]}] Done."#;
+        let parsed = parse_output(content);
+        assert_eq!(parsed.farm_requests.len(), 1);
+        assert!(parsed.farm_requests[0].contains("\"id\":\"f1\""));
+        assert!(!parsed.clean_content.contains("FARM"));
+    }
 
     #[test]
     fn parse_share_marker() {

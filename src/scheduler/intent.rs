@@ -454,7 +454,11 @@ pub async fn drain_loop(
         );
 
         // Execute the intent
-        let result = execute_intent(&intent, &state, &queue, &schedule, config).await;
+        let tenure = crate::coordinator::control::TenureLeases {
+            leases: Arc::clone(&leases),
+            holder: holder.clone(),
+        };
+        let result = execute_intent(&intent, &state, &queue, &schedule, config, &tenure).await;
 
         match result {
             Some(output) if output.trim().is_empty() => {
@@ -555,6 +559,7 @@ async fn execute_intent(
     queue: &Arc<RwLock<IntentQueue>>,
     schedule: &Arc<RwLock<Schedule>>,
     config: &AutonomyConfig,
+    tenure: &crate::coordinator::control::TenureLeases,
 ) -> Option<String> {
     let root_dir = state.root_dir.clone();
 
@@ -623,6 +628,29 @@ async fn execute_intent(
 
     // Parse output for markers
     let parsed = output::parse_output(&result.response_text);
+
+    // [FARM:] — bounded subtask delegation on the lease substrate (Stage 3)
+    for farm_json in &parsed.farm_requests {
+        match crate::coordinator::farm::run_farm_from_marker(farm_json, state, tenure).await {
+            Ok(result) => {
+                tracing::info!(
+                    "Intent '{}' farm complete ({} chars)",
+                    intent.id,
+                    result.len()
+                );
+                crate::logbook::write_task_output(
+                    &root_dir,
+                    &format!("intent-{}-farm", intent.id),
+                    &format!("{} (farm)", intent.description),
+                    &result,
+                    0,
+                    0,
+                    0,
+                );
+            }
+            Err(e) => tracing::warn!("[FARM:] from intent '{}' failed: {e}", intent.id),
+        }
+    }
 
     // Handle [SCHEDULE:] markers
     for schedule_json in &parsed.schedule_requests {

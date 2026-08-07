@@ -201,7 +201,15 @@ pub async fn run_task_loop(
             continue;
         }
 
-        let outcome = execute_task(&entry, &state, &schedule, &intent_queue, &mut eval_state).await;
+        let outcome = execute_task(
+            &entry,
+            &state,
+            &schedule,
+            &intent_queue,
+            &mut eval_state,
+            &tenure,
+        )
+        .await;
         // Diagnostics before the outcome is recorded: the store must still
         // describe the previous cycle for "is this failure news?" to mean
         // anything. Every failure path converges here, so a failure that never
@@ -280,6 +288,7 @@ async fn execute_task(
     schedule: &Arc<RwLock<Schedule>>,
     intent_queue: &Arc<RwLock<IntentQueue>>,
     eval_state: &mut SchedulerState,
+    tenure: &crate::coordinator::control::TenureLeases,
 ) -> TaskOutcome {
     let task = &entry.task;
     // Use cached root_dir from AppState
@@ -503,7 +512,16 @@ async fn execute_task(
 
     // Parse and route output markers
     let parsed = output::parse_output(&response_text);
-    route_output_markers(&parsed, task, state, schedule, intent_queue, &root_dir).await;
+    route_output_markers(
+        &parsed,
+        task,
+        state,
+        schedule,
+        intent_queue,
+        &root_dir,
+        tenure,
+    )
+    .await;
 
     // Log to LOGBOOK.md
     log_execution(&root_dir, task, &parsed.clean_content);
@@ -827,6 +845,7 @@ async fn handle_provider_error(state: &Arc<AppState>, task_id: &str, error_msg: 
 ///
 /// Handles [SCHEDULE:], [SHARE:], [CALL:], [INTENT:], and [CHAIN:] markers
 /// extracted from the LLM response.
+#[allow(clippy::too_many_arguments)]
 async fn route_output_markers(
     parsed: &output::ParsedOutput,
     task: &ScheduledTask,
@@ -834,7 +853,27 @@ async fn route_output_markers(
     schedule: &Arc<RwLock<Schedule>>,
     intent_queue: &Arc<RwLock<IntentQueue>>,
     root_dir: &std::path::Path,
+    tenure: &crate::coordinator::control::TenureLeases,
 ) {
+    // [FARM:] — bounded subtask delegation on the lease substrate (Stage 3)
+    for farm_json in &parsed.farm_requests {
+        match crate::coordinator::farm::run_farm_from_marker(farm_json, state, tenure).await {
+            Ok(result) => {
+                tracing::info!("Task '{}' farm complete ({} chars)", task.id, result.len());
+                crate::logbook::write_task_output(
+                    root_dir,
+                    &format!("{}-farm", task.id),
+                    &format!("{} (farm)", task.name),
+                    &result,
+                    0,
+                    0,
+                    0,
+                );
+            }
+            Err(e) => tracing::warn!("[FARM:] from task '{}' failed: {e}", task.id),
+        }
+    }
+
     // [SCHEDULE:] — create new dynamic tasks
     for schedule_json in &parsed.schedule_requests {
         match super::dynamic::create_task_from_marker(schedule_json) {
