@@ -100,6 +100,16 @@ impl Coordinator {
         }
     }
 
+    /// Simulate a coordinator wedge/crash: the leadership loop dies without
+    /// releasing the lease or stopping anything. Fail-open tests use this to
+    /// prove the data plane doesn't care.
+    #[cfg(test)]
+    pub(crate) fn wedge_for_test(&self) {
+        if let Some(handle) = &self.handle {
+            handle.abort();
+        }
+    }
+
     /// Abort the scheduler tasks and release the lease. Bounded: gives the
     /// loop 10s to wind down before letting go.
     pub async fn shutdown(self) {

@@ -34,6 +34,9 @@ use pulse_system_types::llm::{
 struct MockProvider {
     responses: std::sync::Mutex<Vec<LlmResponse>>,
     call_count: AtomicUsize,
+    /// Per-invocation artificial latency — lets a test hold a chat turn
+    /// "in flight" while something else happens to the process.
+    delay: std::time::Duration,
 }
 
 impl MockProvider {
@@ -41,6 +44,14 @@ impl MockProvider {
         Self {
             responses: std::sync::Mutex::new(responses),
             call_count: AtomicUsize::new(0),
+            delay: std::time::Duration::ZERO,
+        }
+    }
+
+    fn with_delay(responses: Vec<LlmResponse>, delay: std::time::Duration) -> Self {
+        Self {
+            delay,
+            ..Self::new(responses)
         }
     }
 }
@@ -71,7 +82,13 @@ impl LmProvider for MockProvider {
                 responses.remove(0)
             }
         };
-        Box::pin(async move { Ok(response) })
+        let delay = self.delay;
+        Box::pin(async move {
+            if !delay.is_zero() {
+                tokio::time::sleep(delay).await;
+            }
+            Ok(response)
+        })
     }
 
     fn name(&self) -> &str {
@@ -141,7 +158,14 @@ fn build_app(state: Arc<AppState>) -> Router {
 }
 
 async fn build_state(provider: MockProvider, tools: ToolRegistry) -> Arc<AppState> {
-    let root_dir = std::env::temp_dir();
+    build_state_in(std::env::temp_dir(), provider, tools).await
+}
+
+async fn build_state_in(
+    root_dir: std::path::PathBuf,
+    provider: MockProvider,
+    tools: ToolRegistry,
+) -> Arc<AppState> {
     let config = test_config();
     let session_store =
         crate::session_store::SessionStore::new(&root_dir, &config.sessions, &config.entity.name)
@@ -566,4 +590,121 @@ async fn e2e_token_accumulation_across_rounds() {
     let json: serde_json::Value = serde_json::from_str(&body).unwrap();
     assert_eq!(json["input_tokens"], 300); // 100 + 200
     assert_eq!(json["output_tokens"], 125); // 50 + 75
+}
+
+// ---------------------------------------------------------------------------
+// Fail-open: the data plane must not care about the coordinator (AC10, AC11)
+// ---------------------------------------------------------------------------
+
+fn mock_text(text: &str) -> LlmResponse {
+    LlmResponse {
+        content: vec![ContentBlock::Text {
+            text: text.to_string(),
+        }],
+        stop_reason: StopReason::EndTurn,
+        model: "mock-model".to_string(),
+        input_tokens: Some(1),
+        output_tokens: Some(1),
+    }
+}
+
+/// Wait until the coordinator has durably acquired the control-plane lease.
+/// Non-locking: reads the lease WAL's contents instead of opening the table
+/// (an open would steal the file lock out from under the coordinator).
+async fn wait_for_leadership(coord_dir: &std::path::Path) {
+    let wal_path = coord_dir.join("leases.jsonl");
+    for _ in 0..100 {
+        if let Ok(content) = std::fs::read_to_string(&wal_path) {
+            if content.contains("control-plane") {
+                return;
+            }
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    panic!("coordinator never acquired the control-plane lease");
+}
+
+/// AC10: an in-flight chat turn survives the coordinator wedging mid-turn,
+/// and chat keeps serving with the coordinator dead.
+#[tokio::test]
+async fn e2e_chat_survives_coordinator_wedge() {
+    let dir = tempfile::tempdir().unwrap();
+    let provider = MockProvider::with_delay(
+        vec![
+            mock_text("in-flight response"),
+            mock_text("post-wedge response"),
+        ],
+        std::time::Duration::from_millis(400),
+    );
+    let state = build_state_in(dir.path().to_path_buf(), provider, ToolRegistry::new()).await;
+
+    let schedule = Arc::new(RwLock::new(
+        crate::scheduler::Schedule::load(dir.path()).unwrap(),
+    ));
+    let intents = Arc::new(RwLock::new(crate::scheduler::intent::IntentQueue::load(
+        dir.path(),
+    )));
+    let coordinator =
+        crate::coordinator::control::Coordinator::start(Arc::clone(&state), schedule, intents);
+    wait_for_leadership(&dir.path().join("coordinator")).await;
+
+    let app = build_app(Arc::clone(&state));
+
+    // Put a chat turn in flight, then wedge the coordinator mid-turn.
+    let app_inflight = app.clone();
+    let inflight =
+        tokio::spawn(async move { post_chat(&app_inflight, "hello during wedge").await });
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    coordinator.wedge_for_test();
+
+    let (status, body) = inflight.await.unwrap();
+    assert_eq!(status, StatusCode::OK, "in-flight turn was interrupted");
+    let json: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(json["response"], "in-flight response");
+
+    // Fresh turns keep working with the coordinator dead.
+    let (status, body) = post_chat(&app, "anyone home?").await;
+    assert_eq!(status, StatusCode::OK, "chat died with the coordinator");
+    let json: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(json["response"], "post-wedge response");
+}
+
+/// AC11: while a coordinator holds the control plane, a second one cannot
+/// take it (WAL lock); after a clean shutdown the lease is released and a
+/// successor acquires immediately, without waiting out the ttl.
+#[tokio::test]
+async fn e2e_second_coordinator_locked_out_until_shutdown() {
+    let dir = tempfile::tempdir().unwrap();
+    let provider = MockProvider::new(vec![]);
+    let state = build_state_in(dir.path().to_path_buf(), provider, ToolRegistry::new()).await;
+
+    let schedule = Arc::new(RwLock::new(
+        crate::scheduler::Schedule::load(dir.path()).unwrap(),
+    ));
+    let intents = Arc::new(RwLock::new(crate::scheduler::intent::IntentQueue::load(
+        dir.path(),
+    )));
+    let coordinator =
+        crate::coordinator::control::Coordinator::start(Arc::clone(&state), schedule, intents);
+    let coord_dir = dir.path().join("coordinator");
+    wait_for_leadership(&coord_dir).await;
+
+    // A second coordinator (process) is refused at the WAL lock.
+    assert!(matches!(
+        crate::coordinator::durable::DurableLeaseTable::open(&coord_dir),
+        Err(crate::coordinator::wal::ReplayError::Locked { .. })
+    ));
+
+    // Clean shutdown releases the lease; a successor acquires immediately.
+    coordinator.shutdown().await;
+    let mut successor = crate::coordinator::durable::DurableLeaseTable::open(&coord_dir).unwrap();
+    let lease = successor
+        .acquire(
+            crate::coordinator::control::CONTROL_PLANE_RESOURCE,
+            "successor-1",
+            std::time::Duration::from_secs(90),
+            chrono::Utc::now(),
+        )
+        .expect("lease was not released on shutdown");
+    assert!(lease.fencing_token > crate::coordinator::lease::FencingToken(1));
 }
