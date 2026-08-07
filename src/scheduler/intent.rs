@@ -121,14 +121,44 @@ impl IntentQueue {
         queue
     }
 
-    /// Persist to disk.
+    /// Persist to disk, atomically (tmp + rename) so a concurrent reader
+    /// never observes a truncated file.
     pub fn save(&self) -> Result<(), crate::errors::PulseError> {
         if let Some(ref dir) = self.root_dir {
             let path = dir.join(INTENTS_FILE);
+            let tmp = dir.join(format!(".{INTENTS_FILE}.tmp.{}", std::process::id()));
             let content = serde_json::to_string_pretty(self)?;
-            std::fs::write(&path, content)?;
+            std::fs::write(&tmp, content)?;
+            std::fs::rename(&tmp, &path)?;
         }
         Ok(())
+    }
+
+    /// Apply a mutation against the CURRENT on-disk queue and persist the
+    /// result — reconcile (spec decision 2) for intents, same contract as
+    /// `Schedule::save_delta`: a `pulse-null intent add` from the CLI (or an
+    /// event-listener push racing a reconcile) survives every daemon write.
+    /// Serialized in-process by a static mutex and cross-process by an
+    /// exclusive lock on `intents.json.lock`. Returns the merged queue so
+    /// callers can refresh their shared copy.
+    pub fn save_delta(
+        root_dir: &Path,
+        apply: impl FnOnce(&mut IntentQueue),
+    ) -> Result<IntentQueue, crate::errors::PulseError> {
+        static IN_PROCESS: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let _guard = IN_PROCESS.lock().unwrap_or_else(|p| p.into_inner());
+
+        let lock_file = std::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(false)
+            .open(root_dir.join(format!("{INTENTS_FILE}.lock")))?;
+        lock_file.lock()?;
+
+        let mut disk = Self::load(root_dir);
+        apply(&mut disk);
+        disk.save()?;
+        Ok(disk)
     }
 
     /// Add an intent. Returns false if queue is at capacity.
@@ -345,13 +375,13 @@ pub async fn drain_loop(
     queue: Arc<RwLock<IntentQueue>>,
     schedule: Arc<RwLock<Schedule>>,
     leases: crate::coordinator::control::SharedLeases,
+    holder: String,
 ) {
     let config = &state.config.autonomy;
     if !config.enabled {
         tracing::info!("Intent queue disabled (autonomy.enabled = false)");
         return;
     }
-    let holder = crate::coordinator::control::holder_id(&state.config.entity.name);
 
     let poll_interval = Duration::from_secs(config.intent_poll_interval);
     let mut rate_tracker = RateTracker::new(config.max_intents_per_hour);
@@ -372,6 +402,19 @@ pub async fn drain_loop(
             poll_interval
         };
         tokio::time::sleep(sleep_duration).await;
+
+        // Tenure liveness: stop if our tenure lost the control plane and
+        // nothing aborted us (wedged leadership loop).
+        {
+            let table = leases.lock().await;
+            let leads = table
+                .get(crate::coordinator::control::CONTROL_PLANE_RESOURCE)
+                .is_some_and(|l| l.holder_id == holder && !l.is_expired(Utc::now()));
+            if !leads {
+                tracing::warn!("Intent drain: tenure '{holder}' no longer leads; stopping");
+                return;
+            }
+        }
 
         // Claim the next processable intent via a lease, leaving it in the
         // queue. A crash between claim and completion loses nothing: the
@@ -422,7 +465,7 @@ pub async fn drain_loop(
         // Fenced completion: only the current claim holder may remove the
         // intent. A stale executor's completion is refused and its intent
         // re-runs — the at-least-once direction the queue already accepts.
-        commit_intent_completion(&queue, &leases, &holder, &intent.id).await;
+        commit_intent_completion(&state.root_dir, &queue, &leases, &holder, &intent.id).await;
     }
 }
 
@@ -466,6 +509,7 @@ async fn claim_next_intent(
 /// the queue. Returns false — without touching the queue — when the claim
 /// has expired or been reclaimed: the fenced-stale-executor case.
 pub(crate) async fn commit_intent_completion(
+    root_dir: &Path,
     queue: &Arc<RwLock<IntentQueue>>,
     leases: &crate::coordinator::control::SharedLeases,
     holder: &str,
@@ -486,12 +530,13 @@ pub(crate) async fn commit_intent_completion(
         return false;
     }
 
-    {
-        let mut q = queue.write().await;
+    // Delta against disk (reconcile): removal must not clobber intents
+    // other writers added while this one executed.
+    match IntentQueue::save_delta(root_dir, |q| {
         q.remove_by_id(intent_id);
-        if let Err(e) = q.save() {
-            tracing::error!("Failed to save intent queue: {}", e);
-        }
+    }) {
+        Ok(merged) => *queue.write().await = merged,
+        Err(e) => tracing::error!("Failed to save intent queue: {}", e),
     }
     let _ = { leases.lock().await.release(&resource, holder, Utc::now()) };
     true
@@ -606,8 +651,12 @@ async fn execute_intent(
                         new_intent.description
                     );
                 } else {
-                    let mut q = queue.write().await;
-                    q.push(new_intent, config.max_queue_size);
+                    match IntentQueue::save_delta(&root_dir, |q| {
+                        q.push(new_intent, config.max_queue_size);
+                    }) {
+                        Ok(merged) => *queue.write().await = merged,
+                        Err(e) => tracing::error!("Failed to persist intent queue: {}", e),
+                    }
                 }
             }
             Err(e) => tracing::warn!("Invalid [INTENT:] marker from intent: {}", e),
@@ -654,8 +703,12 @@ async fn execute_intent(
                         output_routing: chain.output_routing,
                         depth: new_depth,
                     };
-                    let mut q = queue.write().await;
-                    q.push(chain_intent, config.max_queue_size);
+                    match IntentQueue::save_delta(&root_dir, |q| {
+                        q.push(chain_intent, config.max_queue_size);
+                    }) {
+                        Ok(merged) => *queue.write().await = merged,
+                        Err(e) => tracing::error!("Failed to persist intent queue: {}", e),
+                    }
                 }
             }
             Err(e) => tracing::warn!("Invalid [CHAIN:] marker: {}", e),
@@ -682,8 +735,12 @@ async fn execute_intent(
                 output_routing: chain.output_routing.clone(),
                 depth: new_depth,
             };
-            let mut q = queue.write().await;
-            q.push(chain_intent, config.max_queue_size);
+            match IntentQueue::save_delta(&root_dir, |q| {
+                q.push(chain_intent, config.max_queue_size);
+            }) {
+                Ok(merged) => *queue.write().await = merged,
+                Err(e) => tracing::error!("Failed to persist intent queue: {}", e),
+            }
         }
     }
 
@@ -1049,15 +1106,44 @@ mod tests {
             .unwrap();
 
         // A wakes and tries to commit: fenced, queue untouched.
-        let committed = commit_intent_completion(&queue, &leases, "exec-a", "i1").await;
+        let committed = commit_intent_completion(dir.path(), &queue, &leases, "exec-a", "i1").await;
         assert!(!committed);
         assert_eq!(queue.read().await.len(), 1);
         assert_eq!(IntentQueue::load(dir.path()).len(), 1);
 
         // B commits fine — exactly once overall.
-        let committed = commit_intent_completion(&queue, &leases, "exec-b", "i1").await;
+        let committed = commit_intent_completion(dir.path(), &queue, &leases, "exec-b", "i1").await;
         assert!(committed);
         assert_eq!(IntentQueue::load(dir.path()).len(), 0);
+    }
+
+    /// MEDIUM-4 regression: daemon intent writes are deltas against disk, so
+    /// an external add (CLI, event listener) survives a concurrent removal.
+    #[test]
+    fn intent_save_delta_preserves_external_adds() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let mut q = IntentQueue::load(root);
+        q.push(make_intent("daemon-known", IntentPriority::Normal), 20);
+        q.save().unwrap();
+
+        // External writer (CLI) adds an intent the daemon's memory never saw.
+        IntentQueue::save_delta(root, |q| {
+            q.push(make_intent("cli-added", IntentPriority::Normal), 20);
+        })
+        .unwrap();
+
+        // Daemon commits a removal via save_delta — the CLI's intent survives
+        // (a wholesale q.save() of daemon memory would have erased it).
+        let merged = IntentQueue::save_delta(root, |q| {
+            q.remove_by_id("daemon-known");
+        })
+        .unwrap();
+        assert_eq!(merged.len(), 1);
+
+        let disk = IntentQueue::load(root);
+        assert_eq!(disk.len(), 1);
+        assert_eq!(disk.sorted_candidates()[0].id, "cli-added");
     }
 
     #[test]

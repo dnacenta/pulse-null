@@ -639,7 +639,7 @@ async fn e2e_chat_survives_coordinator_wedge() {
     let state = build_state_in(dir.path().to_path_buf(), provider, ToolRegistry::new()).await;
 
     let schedule = Arc::new(RwLock::new(
-        crate::scheduler::Schedule::load(dir.path()).unwrap(),
+        crate::scheduler::Schedule::load_or_init(dir.path()).unwrap(),
     ));
     let intents = Arc::new(RwLock::new(crate::scheduler::intent::IntentQueue::load(
         dir.path(),
@@ -679,7 +679,7 @@ async fn e2e_second_coordinator_locked_out_until_shutdown() {
     let state = build_state_in(dir.path().to_path_buf(), provider, ToolRegistry::new()).await;
 
     let schedule = Arc::new(RwLock::new(
-        crate::scheduler::Schedule::load(dir.path()).unwrap(),
+        crate::scheduler::Schedule::load_or_init(dir.path()).unwrap(),
     ));
     let intents = Arc::new(RwLock::new(crate::scheduler::intent::IntentQueue::load(
         dir.path(),

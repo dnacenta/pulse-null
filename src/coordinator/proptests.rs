@@ -76,6 +76,44 @@ fn hid(h: u8) -> String {
     format!("holder-{h}")
 }
 
+/// Recovery guarantee with memory-only renewals: recovery reproduces the
+/// last durable GRANT for each resource exactly (holder, token, watermark,
+/// grant expiry); renewals are deliberately forgotten. Forgetting an
+/// extending renew shortens the recovered lease (faster reclaim, higher
+/// token — safe); forgetting a shortening renew restores the grant's longer
+/// expiry (a bounded liveness cost, never a safety loss: fencing does not
+/// depend on expiry).
+fn assert_recovery_sound(
+    after: &super::lease::LeaseTable,
+    before: &super::lease::LeaseTable,
+    durable_grants: &HashMap<String, chrono::DateTime<Utc>>,
+    resources: &[String],
+) -> Result<(), proptest::test_runner::TestCaseError> {
+    for r in resources {
+        prop_assert_eq!(
+            before.watermark(r),
+            after.watermark(r),
+            "watermark changed across restart on {}",
+            r
+        );
+        match (before.get(r), after.get(r)) {
+            (None, None) => {}
+            (Some(b), Some(a)) => {
+                prop_assert_eq!(&b.holder_id, &a.holder_id, "holder changed on {}", r);
+                prop_assert_eq!(b.fencing_token, a.fencing_token, "token changed on {}", r);
+                prop_assert_eq!(
+                    Some(a.expires_at()),
+                    durable_grants.get(r).copied(),
+                    "recovered expiry is not the durable grant's on {}",
+                    r
+                );
+            }
+            (b, a) => prop_assert!(false, "lease presence changed on {}: {:?} -> {:?}", r, b, a),
+        }
+    }
+    Ok(())
+}
+
 proptest! {
     #![proptest_config(ProptestConfig::with_cases(192))]
 
@@ -93,6 +131,9 @@ proptest! {
         // Each holder's belief about the token it holds — kept even after the
         // lease is reclaimed under it. This IS the paused stale holder.
         let mut believed: HashMap<(String, String), FencingToken> = HashMap::new();
+        // Expiry of the last durable GRANT per resource — what recovery
+        // reproduces (renewals are memory-only by design).
+        let mut durable_grants: HashMap<String, chrono::DateTime<Utc>> = HashMap::new();
 
         for op in ops {
             match op {
@@ -107,6 +148,7 @@ proptest! {
                         prop_assert!(prior.iter().all(|t| lease.fencing_token > *t),
                             "token {} not above prior {:?}", lease.fencing_token, prior);
                         prior.push(lease.fencing_token);
+                        durable_grants.insert(r.clone(), lease.expires_at());
                         believed.insert((r, h), lease.fencing_token);
                     }
                 }
@@ -122,6 +164,7 @@ proptest! {
                 Op::Release { r, h } => {
                     let (r, h) = (rid(r), hid(h));
                     if durable.release(&r, &h, now).is_ok() {
+                        durable_grants.remove(&r);
                         believed.remove(&(r, h));
                     }
                 }
@@ -129,11 +172,13 @@ proptest! {
                     now += Duration::from_secs(u64::from(secs));
                 }
                 Op::Restart => {
-                    // Invariant 4: recovery reproduces the live table exactly.
+                    // Invariant 4: recovery is sound — grants/releases exact,
+                    // renewals may be forgotten (shorter expiry only).
                     let before = durable.table().clone();
                     drop(durable);
                     durable = DurableLeaseTable::open(dir.path()).unwrap();
-                    prop_assert_eq!(durable.table(), &before);
+                    let resources: Vec<String> = (0..2u8).map(rid).collect();
+                    assert_recovery_sound(durable.table(), &before, &durable_grants, &resources)?;
                 }
                 Op::TearAndRestart => {
                     let before = durable.table().clone();
@@ -148,7 +193,8 @@ proptest! {
                     }
                     durable = DurableLeaseTable::open(dir.path()).unwrap();
                     // Torn bytes are truncated; every acked grant survives.
-                    prop_assert_eq!(durable.table(), &before);
+                    let resources: Vec<String> = (0..2u8).map(rid).collect();
+                    assert_recovery_sound(durable.table(), &before, &durable_grants, &resources)?;
                 }
                 Op::Write { r, h } => {
                     let (r, h) = (rid(r), hid(h));

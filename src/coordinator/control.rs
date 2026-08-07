@@ -49,6 +49,14 @@ const RETRY_BACKOFF: Duration = Duration::from_secs(15);
 /// (leadership loop, task loops, intent drain) shares this handle.
 pub type SharedLeases = Arc<tokio::sync::Mutex<DurableLeaseTable>>;
 
+/// A tenure's claim-taking identity: the shared lease table plus the
+/// tenure-scoped holder id every claim of this tenure is made under.
+#[derive(Clone)]
+pub struct TenureLeases {
+    pub leases: SharedLeases,
+    pub holder: String,
+}
+
 /// Sanitize an arbitrary string into the lease id charset.
 pub(crate) fn lease_safe(input: &str) -> String {
     let sanitized: String = input
@@ -73,6 +81,20 @@ pub(crate) fn lease_safe(input: &str) -> String {
 pub struct Coordinator {
     shutdown_tx: watch::Sender<bool>,
     handle: Option<JoinHandle<()>>,
+    /// The current tenure's scheduler tasks. Owned here — not on the
+    /// leadership loop's stack — so they can be aborted even if the loop
+    /// itself dies abruptly (panic, abort, drop): a stale tenure must never
+    /// keep acting.
+    scheduler_handles: SharedHandles,
+}
+
+type SharedHandles = Arc<std::sync::Mutex<Vec<JoinHandle<()>>>>;
+
+fn abort_all(handles: &SharedHandles) {
+    let mut guard = handles.lock().unwrap_or_else(|p| p.into_inner());
+    for handle in guard.drain(..) {
+        handle.abort();
+    }
 }
 
 impl Coordinator {
@@ -86,17 +108,26 @@ impl Coordinator {
         intent_queue: Arc<RwLock<IntentQueue>>,
     ) -> Self {
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let scheduler_handles: SharedHandles = Arc::new(std::sync::Mutex::new(Vec::new()));
         if !state.config.scheduler.enabled {
             tracing::info!("Scheduler disabled in config — coordinator not started");
             return Self {
                 shutdown_tx,
                 handle: None,
+                scheduler_handles,
             };
         }
-        let handle = tokio::spawn(leadership_loop(state, schedule, intent_queue, shutdown_rx));
+        let handle = tokio::spawn(leadership_loop(
+            state,
+            schedule,
+            intent_queue,
+            shutdown_rx,
+            Arc::clone(&scheduler_handles),
+        ));
         Self {
             shutdown_tx,
             handle: Some(handle),
+            scheduler_handles,
         }
     }
 
@@ -111,10 +142,11 @@ impl Coordinator {
     }
 
     /// Abort the scheduler tasks and release the lease. Bounded: gives the
-    /// loop 10s to wind down before letting go.
-    pub async fn shutdown(self) {
+    /// loop 10s to wind down before letting go. Scheduler handles are
+    /// aborted here too as a backstop — even if the loop is already dead.
+    pub async fn shutdown(mut self) {
         let _ = self.shutdown_tx.send(true);
-        if let Some(handle) = self.handle {
+        if let Some(handle) = self.handle.take() {
             if tokio::time::timeout(Duration::from_secs(10), handle)
                 .await
                 .is_err()
@@ -122,6 +154,19 @@ impl Coordinator {
                 tracing::warn!("coordinator: shutdown timed out after 10s");
             }
         }
+        abort_all(&self.scheduler_handles);
+    }
+}
+
+impl Drop for Coordinator {
+    /// Dropping the coordinator (registry overwrite, early boot error) must
+    /// not orphan a running scheduler. The watch sender's drop also resolves
+    /// `changed()` in the loop, which treats it as shutdown.
+    fn drop(&mut self) {
+        if let Some(handle) = self.handle.take() {
+            handle.abort();
+        }
+        abort_all(&self.scheduler_handles);
     }
 }
 
@@ -149,9 +194,15 @@ async fn leadership_loop(
     schedule: Arc<RwLock<Schedule>>,
     intent_queue: Arc<RwLock<IntentQueue>>,
     mut shutdown_rx: watch::Receiver<bool>,
+    scheduler_handles: SharedHandles,
 ) {
     let dir = state.root_dir.join("coordinator");
-    let holder = holder_id(&state.config.entity.name);
+    let holder_base = holder_id(&state.config.entity.name);
+    // Tenure-scoped holder ids: without the suffix, a predecessor tenure's
+    // leftover claim would be indistinguishable from ours, and neither the
+    // stale-claim sweep nor fenced completion could tell them apart.
+    let mut tenure: u64 = 0;
+    let mut failed_acquires: u32 = 0;
 
     'open: loop {
         if *shutdown_rx.borrow() {
@@ -177,6 +228,8 @@ async fn leadership_loop(
             if *shutdown_rx.borrow() {
                 return;
             }
+            tenure += 1;
+            let holder = format!("{holder_base}-t{tenure}");
             let acquired = {
                 leases
                     .lock()
@@ -192,27 +245,55 @@ async fn leadership_loop(
                 })) => {
                     // A crashed predecessor's lease runs out on its own; a
                     // live one keeps renewing. Either way: wait, retry.
-                    tracing::info!(
-                        "coordinator: control plane held by '{holder_id}' until {expires_at}; waiting"
-                    );
+                    failed_acquires += 1;
+                    if failed_acquires.is_multiple_of(8) {
+                        tracing::error!(
+                            "coordinator: control plane STILL held by '{holder_id}' after \
+                             {failed_acquires} attempts (until {expires_at}) — scheduler is down"
+                        );
+                    } else {
+                        tracing::info!(
+                            "coordinator: control plane held by '{holder_id}' until {expires_at}; waiting"
+                        );
+                    }
                     if wait_or_shutdown(&mut shutdown_rx, RETRY_BACKOFF).await {
                         return;
                     }
                     continue;
                 }
                 Err(e) => {
-                    tracing::warn!("coordinator: lease acquire failed ({e}); retrying");
+                    failed_acquires += 1;
+                    if failed_acquires.is_multiple_of(8) {
+                        tracing::error!(
+                            "coordinator: lease acquire STILL failing after {failed_acquires} \
+                             attempts ({e}) — scheduler is down"
+                        );
+                    } else {
+                        tracing::warn!("coordinator: lease acquire failed ({e}); retrying");
+                    }
                     if wait_or_shutdown(&mut shutdown_rx, RETRY_BACKOFF).await {
                         return;
                     }
                     continue;
                 }
             };
+            failed_acquires = 0;
 
             tracing::info!(
-                "coordinator: control-plane leadership acquired (token {}, ttl {LEASE_TTL:?})",
+                "coordinator: control-plane leadership acquired as '{holder}' \
+                 (token {}, ttl {LEASE_TTL:?})",
                 lease.fencing_token
             );
+
+            // Sweep claims left by dead tenures (a crash mid-task, a lost
+            // tenure's aborted loops). Safe by construction: no scheduler is
+            // running right now — this tenure hasn't started one, and the
+            // previous tenure's tasks were aborted before we got here — so
+            // any task-/intent- lease in the table is an orphan. Without the
+            // sweep, a daily task whose run died mid-flight would have its
+            // next fire refused (up to the 30m claim ttl — or the whole day,
+            // since the cron decides when the retry happens).
+            sweep_stale_claims(&leases, &holder).await;
 
             // Reconcile-on-reconnect (spec decision 2): other writers — the
             // CLI, the event listener, a prior wedged tenure — may have
@@ -235,11 +316,12 @@ async fn leadership_loop(
                 continue;
             }
 
-            let handles = match scheduler::start(
+            let started = match scheduler::start(
                 Arc::clone(&state),
                 Arc::clone(&schedule),
                 Arc::clone(&intent_queue),
                 Arc::clone(&leases),
+                holder.clone(),
             )
             .await
             {
@@ -261,14 +343,14 @@ async fn leadership_loop(
                 }
             };
 
-            let tenure_end = renew_until_lost_or_shutdown(&leases, &holder, &mut shutdown_rx).await;
-            tracing::info!(
-                "coordinator: ending tenure, aborting {} scheduler task(s)",
-                handles.len()
-            );
-            for handle in &handles {
-                handle.abort();
+            {
+                let mut guard = scheduler_handles.lock().unwrap_or_else(|p| p.into_inner());
+                *guard = started;
             }
+
+            let tenure_end = renew_until_lost_or_shutdown(&leases, &holder, &mut shutdown_rx).await;
+            tracing::info!("coordinator: ending tenure '{holder}', aborting scheduler task(s)");
+            abort_all(&scheduler_handles);
 
             match tenure_end {
                 TenureEnd::Shutdown => {
@@ -283,9 +365,46 @@ async fn leadership_loop(
                     return;
                 }
                 TenureEnd::Lost => {
+                    // If the renewal only failed transiently (we are still
+                    // the recorded holder), release now so the re-acquire
+                    // doesn't wait out our own ttl.
+                    let _ =
+                        leases
+                            .lock()
+                            .await
+                            .release(CONTROL_PLANE_RESOURCE, &holder, Utc::now());
                     tracing::warn!("coordinator: leadership lost; will re-acquire");
                 }
             }
+        }
+    }
+}
+
+/// Release every task-/intent- claim in the table. Called at leadership
+/// acquisition, when provably no scheduler is running — every such claim
+/// belongs to a dead tenure and would otherwise block that resource's next
+/// fire for up to its remaining ttl.
+async fn sweep_stale_claims(leases: &SharedLeases, tenure_holder: &str) {
+    let mut table = leases.lock().await;
+    let stale: Vec<_> = table
+        .leases()
+        .into_iter()
+        .filter(|l| {
+            l.holder_id != tenure_holder
+                && (l.resource_id.starts_with("task-") || l.resource_id.starts_with("intent-"))
+        })
+        .collect();
+    for lease in stale {
+        match table.release(&lease.resource_id, &lease.holder_id, Utc::now()) {
+            Ok(()) => tracing::warn!(
+                "coordinator: swept stale claim '{}' held by dead tenure '{}'",
+                lease.resource_id,
+                lease.holder_id
+            ),
+            Err(e) => tracing::warn!(
+                "coordinator: failed to sweep stale claim '{}': {e}",
+                lease.resource_id
+            ),
         }
     }
 }
@@ -342,7 +461,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
 
-        let schedule = Arc::new(RwLock::new(Schedule::load(root).unwrap()));
+        let schedule = Arc::new(RwLock::new(Schedule::load_or_init(root).unwrap()));
         let intents = Arc::new(RwLock::new(IntentQueue::load(root)));
         let task_id = schedule.read().await.tasks[0].task.id.clone();
         assert!(
@@ -374,6 +493,62 @@ mod tests {
                 .task
                 .enabled
         );
+    }
+
+    /// HIGH-1 regression: claims left by a dead tenure (crash mid-task,
+    /// aborted loops) must not block the resource's next fire — the sweep at
+    /// leadership acquisition releases them.
+    #[tokio::test]
+    async fn stale_claims_are_swept_at_leadership_acquisition() {
+        let dir = tempfile::tempdir().unwrap();
+        let leases: SharedLeases = Arc::new(tokio::sync::Mutex::new(
+            DurableLeaseTable::open(dir.path()).unwrap(),
+        ));
+
+        // A dead tenure left claims behind (unexpired — mid side-effect
+        // window when it died).
+        {
+            let mut t = leases.lock().await;
+            t.acquire(
+                "task-thinking-loop",
+                "echo-1-t1",
+                Duration::from_secs(1800),
+                Utc::now(),
+            )
+            .unwrap();
+            t.acquire(
+                "intent-abc",
+                "echo-1-t1",
+                Duration::from_secs(1800),
+                Utc::now(),
+            )
+            .unwrap();
+            // Non-claim resources are never swept.
+            t.acquire(
+                CONTROL_PLANE_RESOURCE,
+                "echo-1-t1",
+                Duration::from_secs(90),
+                Utc::now(),
+            )
+            .unwrap();
+        }
+
+        sweep_stale_claims(&leases, "echo-1-t2").await;
+
+        let t = leases.lock().await;
+        assert!(t.get("task-thinking-loop").is_none());
+        assert!(t.get("intent-abc").is_none());
+        assert!(t.get(CONTROL_PLANE_RESOURCE).is_some());
+        drop(t);
+
+        // The new tenure's fire claims immediately — no 30m wait.
+        let claimed = leases.lock().await.acquire(
+            "task-thinking-loop",
+            "echo-1-t2",
+            Duration::from_secs(1800),
+            Utc::now(),
+        );
+        assert!(claimed.is_ok());
     }
 
     #[test]

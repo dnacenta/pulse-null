@@ -268,7 +268,7 @@ pub async fn start(config: Config) -> Result<(), Box<dyn std::error::Error>> {
 
     // Load schedule and intent queue; the coordinator gates the scheduler on
     // control-plane leadership (fail-open: chat/voice never wait on this).
-    let schedule = Schedule::load(&root_dir)?;
+    let schedule = Schedule::load_or_init(&root_dir)?;
     let schedule = Arc::new(RwLock::new(schedule));
     let intent_queue = IntentQueue::load(&root_dir);
     let intent_queue = Arc::new(RwLock::new(intent_queue));

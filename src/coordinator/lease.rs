@@ -333,6 +333,11 @@ impl LeaseTable {
         self.watermarks.get(resource_id).copied()
     }
 
+    /// Every lease in the table, held or expired-but-unreclaimed.
+    pub fn all(&self) -> impl Iterator<Item = &Lease> {
+        self.leases.values()
+    }
+
     /// Fold one replayed event into the table, enforcing the same invariants
     /// the online path does: ids and ttl valid, tokens never regress, renew
     /// never mints, release and renew only by the recorded holder. Any

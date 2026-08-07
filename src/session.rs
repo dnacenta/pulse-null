@@ -170,8 +170,13 @@ pub fn archive_conversation(
         entity = meta.entity_name,
     );
 
-    file.write_all(content.as_bytes())
-        .map_err(|e| format!("Failed to write conversation archive: {e}"))?;
+    if let Err(e) = file.write_all(content.as_bytes()) {
+        // Don't let a failed write permanently consume this number as an
+        // empty file.
+        drop(file);
+        let _ = fs::remove_file(&log_path);
+        return Err(format!("Failed to write conversation archive: {e}"));
+    }
     drop(file);
 
     append_index(

@@ -81,6 +81,13 @@ impl DurableLeaseTable {
         Ok(lease)
     }
 
+    /// Renewals are deliberately NOT persisted. Renew mints no token, and
+    /// losing renewals at a crash only makes the lease look *shorter* than it
+    /// was — a successor reclaims sooner, with a strictly higher token, and
+    /// the stale holder is fenced: the safe direction. In exchange, the WAL
+    /// grows per grant instead of per renewal (a 30s renew cadence would
+    /// otherwise fsync ~2,880 lines/day forever), and crash takeover waits
+    /// out the ttl from the last *durable* grant, not the last renewal.
     pub fn renew(
         &mut self,
         resource_id: &str,
@@ -88,14 +95,7 @@ impl DurableLeaseTable {
         ttl: Duration,
         now: DateTime<Utc>,
     ) -> Result<Lease, DurableError> {
-        let mut staged = self.table.clone();
-        let lease = staged.renew(resource_id, holder_id, ttl, now)?;
-        self.wal.append(&LeaseEvent::Renewed {
-            ts: now,
-            lease: lease.clone(),
-        })?;
-        self.table = staged;
-        Ok(lease)
+        Ok(self.table.renew(resource_id, holder_id, ttl, now)?)
     }
 
     pub fn release(
@@ -117,6 +117,12 @@ impl DurableLeaseTable {
 
     pub fn get(&self, resource_id: &str) -> Option<&Lease> {
         self.table.get(resource_id)
+    }
+
+    /// Snapshot of every lease currently in the table (held or expired-but-
+    /// unreclaimed). Used by the coordinator's stale-claim sweep.
+    pub fn leases(&self) -> Vec<Lease> {
+        self.table.all().cloned().collect()
     }
 
     pub fn table(&self) -> &LeaseTable {
@@ -183,6 +189,34 @@ mod tests {
         }
         let mut durable = DurableLeaseTable::open(dir.path()).unwrap();
         let reclaimed = durable
+            .acquire("wal", "echo-b", secs(30), t0() + secs(31))
+            .unwrap();
+        assert!(reclaimed.fencing_token > first.fencing_token);
+    }
+
+    #[test]
+    fn renewals_are_memory_only_and_crash_recovery_reclaims_fast() {
+        let dir = tempfile::tempdir().unwrap();
+        let first;
+        {
+            let mut durable = DurableLeaseTable::open(dir.path()).unwrap();
+            first = durable.acquire("wal", "echo-a", secs(30), t0()).unwrap();
+            // Renew far past the original expiry — memory only.
+            durable
+                .renew("wal", "echo-a", secs(30), t0() + secs(20))
+                .unwrap();
+            assert_eq!(
+                durable.get("wal").unwrap().expires_at(),
+                t0() + secs(20) + secs(30)
+            );
+        }
+        // "Crash": recovery sees only the durable grant, so the lease looks
+        // expired at t0+30 — a successor reclaims at t0+31 with a strictly
+        // higher token instead of waiting out the renewed expiry. The stale
+        // holder is fenced by that token: the safe direction.
+        let mut recovered = DurableLeaseTable::open(dir.path()).unwrap();
+        assert_eq!(recovered.get("wal").unwrap().expires_at(), t0() + secs(30));
+        let reclaimed = recovered
             .acquire("wal", "echo-b", secs(30), t0() + secs(31))
             .unwrap();
         assert!(reclaimed.fencing_token > first.fencing_token);

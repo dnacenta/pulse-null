@@ -111,7 +111,7 @@ pub async fn boot_entity(
 
     // Scheduler — gated on control-plane leadership (fail-open: the entity's
     // interactive surfaces never wait on the coordinator).
-    let schedule = Schedule::load(&root_dir)?;
+    let schedule = Schedule::load_or_init(&root_dir)?;
     let schedule = Arc::new(RwLock::new(schedule));
     let intent_queue = IntentQueue::load(&root_dir);
     let intent_queue = Arc::new(RwLock::new(intent_queue));

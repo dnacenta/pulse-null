@@ -31,10 +31,9 @@ pub async fn run_task_loop(
     intent_queue: Arc<RwLock<IntentQueue>>,
     health: SharedTaskHealth,
     tz: chrono_tz::Tz,
-    leases: crate::coordinator::control::SharedLeases,
+    tenure: crate::coordinator::control::TenureLeases,
 ) {
     let task = &entry.task;
-    let lease_holder = crate::coordinator::control::holder_id(&state.config.entity.name);
     let lease_resource = format!("task-{}", crate::coordinator::control::lease_safe(&task.id));
     let normalized_cron = super::normalize_cron(&task.cron);
     let cron_expr = match CronSchedule::from_str(&normalized_cron) {
@@ -151,19 +150,32 @@ pub async fn run_task_loop(
             }
         }
 
+        // Tenure liveness: if our tenure no longer holds the control plane
+        // (the leadership loop died without aborting us — a wedge), stop
+        // rather than keep acting as a stale tenure.
+        if !tenure_still_leads(&tenure.leases, &tenure.holder).await {
+            tracing::warn!(
+                "Task '{}': tenure '{}' no longer leads; stopping loop",
+                task.id,
+                tenure.holder
+            );
+            return;
+        }
+
         // Claim the per-run lease before any side effect. A refusal means a
         // prior run of this task is still inside its side-effect window (or
         // wedged short of its ttl) — skip this fire rather than double-run.
+        // Error level: a skipped fire on a daily cron is a lost day.
         let claim = {
-            leases.lock().await.acquire(
+            tenure.leases.lock().await.acquire(
                 &lease_resource,
-                &lease_holder,
+                &tenure.holder,
                 TASK_LEASE_TTL,
                 chrono::Utc::now(),
             )
         };
         if let Err(e) = claim {
-            tracing::warn!("Task '{}' fire skipped — lease not available: {e}", task.id);
+            tracing::error!("Task '{}' fire SKIPPED — lease not available: {e}", task.id);
             continue;
         }
 
@@ -177,7 +189,7 @@ pub async fn run_task_loop(
         if run_builtin_handler(task, &state, &root_dir).await {
             liveness::record_outcome(&health, &state, &task.id, &task.name, TaskOutcome::Success)
                 .await;
-            release_task_lease(&leases, &lease_resource, &lease_holder, &task.id).await;
+            release_task_lease(&tenure.leases, &lease_resource, &tenure.holder, &task.id).await;
             continue;
         }
 
@@ -190,7 +202,7 @@ pub async fn run_task_loop(
             diagnostics::report_failure(&health, &state, &entry, error).await;
         }
         liveness::record_outcome(&health, &state, &task.id, &task.name, outcome).await;
-        release_task_lease(&leases, &lease_resource, &lease_holder, &task.id).await;
+        release_task_lease(&tenure.leases, &lease_resource, &tenure.holder, &task.id).await;
     }
 }
 
@@ -861,10 +873,12 @@ async fn route_output_markers(
                         task.id,
                         new_intent.description
                     );
-                    let mut q = intent_queue.write().await;
-                    q.push(new_intent, state.config.autonomy.max_queue_size);
-                    if let Err(e) = q.save() {
-                        tracing::error!("Failed to persist intent queue: {}", e);
+                    let max = state.config.autonomy.max_queue_size;
+                    match intent::IntentQueue::save_delta(root_dir, |q| {
+                        q.push(new_intent, max);
+                    }) {
+                        Ok(merged) => *intent_queue.write().await = merged,
+                        Err(e) => tracing::error!("Failed to persist intent queue: {}", e),
                     }
                 }
                 Err(e) => tracing::warn!("Invalid [INTENT:] marker: {}", e),
@@ -895,10 +909,12 @@ async fn route_output_markers(
                         task.id,
                         chain_intent.description
                     );
-                    let mut q = intent_queue.write().await;
-                    q.push(chain_intent, state.config.autonomy.max_queue_size);
-                    if let Err(e) = q.save() {
-                        tracing::error!("Failed to persist intent queue: {}", e);
+                    let max = state.config.autonomy.max_queue_size;
+                    match intent::IntentQueue::save_delta(root_dir, |q| {
+                        q.push(chain_intent, max);
+                    }) {
+                        Ok(merged) => *intent_queue.write().await = merged,
+                        Err(e) => tracing::error!("Failed to persist intent queue: {}", e),
                     }
                 }
                 Err(e) => tracing::warn!("Invalid [CHAIN:] marker: {}", e),
@@ -1003,4 +1019,17 @@ async fn post_process_predictions(
     if let Err(e) = crate::prediction::store::save_async(root_dir.to_path_buf(), stack).await {
         tracing::error!("Failed to save prediction stack: {e}");
     }
+}
+
+/// True while this tenure's holder still owns an unexpired control-plane
+/// lease. Task loops check it before each fire so a wedged coordinator's
+/// orphans stop themselves instead of acting as a stale tenure.
+async fn tenure_still_leads(
+    leases: &crate::coordinator::control::SharedLeases,
+    tenure_holder: &str,
+) -> bool {
+    let table = leases.lock().await;
+    table
+        .get(crate::coordinator::control::CONTROL_PLANE_RESOURCE)
+        .is_some_and(|l| l.holder_id == tenure_holder && !l.is_expired(chrono::Utc::now()))
 }
