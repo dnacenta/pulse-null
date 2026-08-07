@@ -177,6 +177,23 @@ impl IntentQueue {
         Some(self.intents.remove(best_idx))
     }
 
+    /// All intents in processing order (priority desc, stable), left in the
+    /// queue. The drain loop claims one via a lease and removes it only on
+    /// fenced completion — so a crash mid-execution never loses the intent,
+    /// no matter who saves the queue in between.
+    pub fn sorted_candidates(&self) -> Vec<Intent> {
+        let mut candidates = self.intents.clone();
+        candidates.sort_by(|a, b| b.priority.cmp(&a.priority));
+        candidates
+    }
+
+    /// Remove an intent by id. Returns true if it was present.
+    pub fn remove_by_id(&mut self, id: &str) -> bool {
+        let before = self.intents.len();
+        self.intents.retain(|i| i.id != id);
+        self.intents.len() < before
+    }
+
     pub fn len(&self) -> usize {
         self.intents.len()
     }
@@ -327,12 +344,14 @@ pub async fn drain_loop(
     state: Arc<AppState>,
     queue: Arc<RwLock<IntentQueue>>,
     schedule: Arc<RwLock<Schedule>>,
+    leases: crate::coordinator::control::SharedLeases,
 ) {
     let config = &state.config.autonomy;
     if !config.enabled {
         tracing::info!("Intent queue disabled (autonomy.enabled = false)");
         return;
     }
+    let holder = crate::coordinator::control::holder_id(&state.config.entity.name);
 
     let poll_interval = Duration::from_secs(config.intent_poll_interval);
     let mut rate_tracker = RateTracker::new(config.max_intents_per_hour);
@@ -354,30 +373,26 @@ pub async fn drain_loop(
         };
         tokio::time::sleep(sleep_duration).await;
 
-        // Pop next intent
-        let intent = {
-            let mut q = queue.write().await;
-            q.pop_next()
-        };
+        // Claim the next processable intent via a lease, leaving it in the
+        // queue. A crash between claim and completion loses nothing: the
+        // intent is still queued and the claim expires on its ttl.
+        let candidates = { queue.read().await.sorted_candidates() };
+        if candidates.is_empty() {
+            continue;
+        }
+        let claimed = claim_next_intent(&leases, &holder, &candidates).await;
+        let Some(intent) = claimed else { continue };
 
-        let intent = match intent {
-            Some(i) => i,
-            None => continue,
-        };
-
-        // Rate limit check
+        // Rate limit check — release the claim and re-check later; the
+        // intent never left the queue, so there is nothing to re-queue.
         if !rate_tracker.record_and_check() {
             tracing::info!(
-                "Intent rate limit reached ({}/hr), re-queuing: {}",
+                "Intent rate limit reached ({}/hr), deferring: {}",
                 config.max_intents_per_hour,
                 intent.description
             );
-            let mut q = queue.write().await;
-            q.push(intent, config.max_queue_size);
-            if let Err(e) = q.save() {
-                tracing::error!("Failed to persist intent queue: {}", e);
-            }
-            // Sleep for a full interval before checking again
+            let resource = intent_resource(&intent.id);
+            let _ = { leases.lock().await.release(&resource, &holder, Utc::now()) };
             tokio::time::sleep(poll_interval).await;
             continue;
         }
@@ -404,12 +419,82 @@ pub async fn drain_loop(
             }
         }
 
-        // Save queue state after processing
-        let q = queue.read().await;
+        // Fenced completion: only the current claim holder may remove the
+        // intent. A stale executor's completion is refused and its intent
+        // re-runs — the at-least-once direction the queue already accepts.
+        commit_intent_completion(&queue, &leases, &holder, &intent.id).await;
+    }
+}
+
+/// Lease resource id for an intent claim.
+fn intent_resource(intent_id: &str) -> String {
+    format!(
+        "intent-{}",
+        crate::coordinator::control::lease_safe(intent_id)
+    )
+}
+
+/// Ttl on an intent claim — covers one execution's side-effect window.
+const INTENT_LEASE_TTL: Duration = Duration::from_secs(30 * 60);
+
+/// Try to claim the highest-priority candidate whose lease is free. A held
+/// lease means a prior claim is still inside its window (e.g. a wedged
+/// predecessor short of its ttl) — skip it and try the next.
+async fn claim_next_intent(
+    leases: &crate::coordinator::control::SharedLeases,
+    holder: &str,
+    candidates: &[Intent],
+) -> Option<Intent> {
+    let mut table = leases.lock().await;
+    for intent in candidates {
+        let resource = intent_resource(&intent.id);
+        match table.acquire(&resource, holder, INTENT_LEASE_TTL, Utc::now()) {
+            Ok(_) => return Some(intent.clone()),
+            Err(crate::coordinator::durable::DurableError::Lease(
+                crate::coordinator::lease::LeaseError::Held { .. },
+            )) => continue,
+            Err(e) => {
+                tracing::warn!("Intent claim failed for '{}': {e}", intent.id);
+                return None;
+            }
+        }
+    }
+    None
+}
+
+/// Prove the claim is still ours (renew), then remove the intent and persist
+/// the queue. Returns false — without touching the queue — when the claim
+/// has expired or been reclaimed: the fenced-stale-executor case.
+pub(crate) async fn commit_intent_completion(
+    queue: &Arc<RwLock<IntentQueue>>,
+    leases: &crate::coordinator::control::SharedLeases,
+    holder: &str,
+    intent_id: &str,
+) -> bool {
+    let resource = intent_resource(intent_id);
+    let renewed = {
+        leases
+            .lock()
+            .await
+            .renew(&resource, holder, INTENT_LEASE_TTL, Utc::now())
+    };
+    if let Err(e) = renewed {
+        tracing::warn!(
+            "Intent '{intent_id}': completion fenced — claim no longer held ({e}); \
+             the intent stays queued and will re-run"
+        );
+        return false;
+    }
+
+    {
+        let mut q = queue.write().await;
+        q.remove_by_id(intent_id);
         if let Err(e) = q.save() {
             tracing::error!("Failed to save intent queue: {}", e);
         }
     }
+    let _ = { leases.lock().await.release(&resource, holder, Utc::now()) };
+    true
 }
 
 /// Execute a single intent with tools.
@@ -877,6 +962,122 @@ fn log_intent_execution(root_dir: &Path, intent: &Intent, summary: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn make_intent(id: &str, priority: IntentPriority) -> Intent {
+        Intent {
+            id: id.into(),
+            description: format!("Intent {id}"),
+            prompt: "Do something".into(),
+            source: IntentSource::UserCli,
+            priority,
+            created_at: Utc::now(),
+            chain: None,
+            output_routing: IntentOutput::Silent,
+            depth: 0,
+        }
+    }
+
+    fn shared_leases(dir: &Path) -> crate::coordinator::control::SharedLeases {
+        Arc::new(tokio::sync::Mutex::new(
+            crate::coordinator::durable::DurableLeaseTable::open(&dir.join("coordinator")).unwrap(),
+        ))
+    }
+
+    #[tokio::test]
+    async fn claim_skips_held_intent_and_takes_next() {
+        let dir = tempfile::tempdir().unwrap();
+        let leases = shared_leases(dir.path());
+        let candidates = vec![
+            make_intent("i-urgent", IntentPriority::Urgent),
+            make_intent("i-normal", IntentPriority::Normal),
+        ];
+
+        // Another holder is mid-flight on the urgent one.
+        leases
+            .lock()
+            .await
+            .acquire("intent-i-urgent", "other-1", INTENT_LEASE_TTL, Utc::now())
+            .unwrap();
+
+        let claimed = claim_next_intent(&leases, "me-1", &candidates).await;
+        assert_eq!(claimed.unwrap().id, "i-normal");
+    }
+
+    #[tokio::test]
+    async fn crash_between_claim_and_completion_loses_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let leases = shared_leases(dir.path());
+        let mut q = IntentQueue::load(dir.path());
+        q.push(make_intent("i1", IntentPriority::Normal), 20);
+        q.save().unwrap();
+        let queue = Arc::new(RwLock::new(q));
+
+        let claimed = claim_next_intent(&leases, "me-1", &queue.read().await.sorted_candidates())
+            .await
+            .unwrap();
+        assert_eq!(claimed.id, "i1");
+
+        // "Crash": no completion, no release. The intent is still durably
+        // queued — a restart reloads it intact.
+        let reloaded = IntentQueue::load(dir.path());
+        assert_eq!(reloaded.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn stale_completion_is_fenced_and_queue_unchanged() {
+        let dir = tempfile::tempdir().unwrap();
+        let leases = shared_leases(dir.path());
+        let mut q = IntentQueue::load(dir.path());
+        q.push(make_intent("i1", IntentPriority::Normal), 20);
+        q.save().unwrap();
+        let queue = Arc::new(RwLock::new(q));
+
+        // Executor A claims, then stalls past its ttl; B reclaims (the
+        // substrate allows an acquire dated after A's expiry).
+        claim_next_intent(&leases, "exec-a", &queue.read().await.sorted_candidates())
+            .await
+            .unwrap();
+        leases
+            .lock()
+            .await
+            .acquire(
+                "intent-i1",
+                "exec-b",
+                INTENT_LEASE_TTL,
+                Utc::now() + INTENT_LEASE_TTL + Duration::from_secs(1),
+            )
+            .unwrap();
+
+        // A wakes and tries to commit: fenced, queue untouched.
+        let committed = commit_intent_completion(&queue, &leases, "exec-a", "i1").await;
+        assert!(!committed);
+        assert_eq!(queue.read().await.len(), 1);
+        assert_eq!(IntentQueue::load(dir.path()).len(), 1);
+
+        // B commits fine — exactly once overall.
+        let committed = commit_intent_completion(&queue, &leases, "exec-b", "i1").await;
+        assert!(committed);
+        assert_eq!(IntentQueue::load(dir.path()).len(), 0);
+    }
+
+    #[test]
+    fn sorted_candidates_orders_by_priority_and_keeps_queue() {
+        let mut queue = IntentQueue {
+            intents: Vec::new(),
+            root_dir: None,
+        };
+        queue.push(make_intent("low", IntentPriority::Low), 20);
+        queue.push(make_intent("urgent", IntentPriority::Urgent), 20);
+        queue.push(make_intent("normal", IntentPriority::Normal), 20);
+
+        let ids: Vec<String> = queue
+            .sorted_candidates()
+            .into_iter()
+            .map(|i| i.id)
+            .collect();
+        assert_eq!(ids, vec!["urgent", "normal", "low"]);
+        assert_eq!(queue.len(), 3);
+    }
 
     #[test]
     fn intent_queue_push_and_pop() {

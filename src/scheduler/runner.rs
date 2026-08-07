@@ -18,6 +18,11 @@ use crate::provider_status;
 use crate::server::prompt;
 use crate::server::AppState;
 
+/// Ttl on a per-run task lease. Covers the full side-effect window of one
+/// execution (LLM rounds included); a run that wedges past this is
+/// reclaimable and its late writes are what fencing exists to reject.
+const TASK_LEASE_TTL: std::time::Duration = std::time::Duration::from_secs(30 * 60);
+
 /// Run a single task in a loop: calculate next fire time → sleep → execute → repeat.
 pub async fn run_task_loop(
     entry: ScheduleEntry,
@@ -26,8 +31,11 @@ pub async fn run_task_loop(
     intent_queue: Arc<RwLock<IntentQueue>>,
     health: SharedTaskHealth,
     tz: chrono_tz::Tz,
+    leases: crate::coordinator::control::SharedLeases,
 ) {
     let task = &entry.task;
+    let lease_holder = crate::coordinator::control::holder_id(&state.config.entity.name);
+    let lease_resource = format!("task-{}", crate::coordinator::control::lease_safe(&task.id));
     let normalized_cron = super::normalize_cron(&task.cron);
     let cron_expr = match CronSchedule::from_str(&normalized_cron) {
         Ok(c) => c,
@@ -122,6 +130,22 @@ pub async fn run_task_loop(
             }
         }
 
+        // Claim the per-run lease before any side effect. A refusal means a
+        // prior run of this task is still inside its side-effect window (or
+        // wedged short of its ttl) — skip this fire rather than double-run.
+        let claim = {
+            leases.lock().await.acquire(
+                &lease_resource,
+                &lease_holder,
+                TASK_LEASE_TTL,
+                chrono::Utc::now(),
+            )
+        };
+        if let Err(e) = claim {
+            tracing::warn!("Task '{}' fire skipped — lease not available: {e}", task.id);
+            continue;
+        }
+
         tracing::info!(
             model = %entry.effective_model(&state.config.llm.model),
             "Executing scheduled task: {}",
@@ -132,6 +156,7 @@ pub async fn run_task_loop(
         if run_builtin_handler(task, &state, &root_dir).await {
             liveness::record_outcome(&health, &state, &task.id, &task.name, TaskOutcome::Success)
                 .await;
+            release_task_lease(&leases, &lease_resource, &lease_holder, &task.id).await;
             continue;
         }
 
@@ -144,6 +169,25 @@ pub async fn run_task_loop(
             diagnostics::report_failure(&health, &state, &entry, error).await;
         }
         liveness::record_outcome(&health, &state, &task.id, &task.name, outcome).await;
+        release_task_lease(&leases, &lease_resource, &lease_holder, &task.id).await;
+    }
+}
+
+/// Release the per-run lease after the outcome is recorded. A failure here is
+/// survivable — the lease expires on its ttl — but worth a warning because it
+/// delays the next fire of this task by up to the remaining ttl.
+async fn release_task_lease(
+    leases: &crate::coordinator::control::SharedLeases,
+    resource: &str,
+    holder: &str,
+    task_id: &str,
+) {
+    if let Err(e) = leases
+        .lock()
+        .await
+        .release(resource, holder, chrono::Utc::now())
+    {
+        tracing::warn!("Task '{task_id}': lease release failed ({e}); next fire may be delayed");
     }
 }
 

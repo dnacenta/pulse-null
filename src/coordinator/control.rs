@@ -45,6 +45,30 @@ const LEASE_TTL: Duration = Duration::from_secs(90);
 const RENEW_INTERVAL: Duration = Duration::from_secs(30);
 const RETRY_BACKOFF: Duration = Duration::from_secs(15);
 
+/// The process-wide lease table. One WAL lock per process, so every consumer
+/// (leadership loop, task loops, intent drain) shares this handle.
+pub type SharedLeases = Arc<tokio::sync::Mutex<DurableLeaseTable>>;
+
+/// Sanitize an arbitrary string into the lease id charset.
+pub(crate) fn lease_safe(input: &str) -> String {
+    let sanitized: String = input
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-') {
+                c
+            } else {
+                '-'
+            }
+        })
+        .take(64)
+        .collect();
+    if sanitized.is_empty() {
+        "unnamed".to_string()
+    } else {
+        sanitized
+    }
+}
+
 /// Handle to the coordinator's leadership loop.
 pub struct Coordinator {
     shutdown_tx: watch::Sender<bool>,
@@ -106,24 +130,8 @@ async fn wait_or_shutdown(shutdown_rx: &mut watch::Receiver<bool>, dur: Duration
 
 /// Lease holder id: entity name (sanitized to the lease id charset) + pid,
 /// so concurrent processes are distinguishable in the lease WAL.
-fn holder_id(entity_name: &str) -> String {
-    let sanitized: String = entity_name
-        .chars()
-        .map(|c| {
-            if c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-') {
-                c
-            } else {
-                '-'
-            }
-        })
-        .take(64)
-        .collect();
-    let base = if sanitized.is_empty() {
-        "entity".to_string()
-    } else {
-        sanitized
-    };
-    format!("{base}-{}", std::process::id())
+pub(crate) fn holder_id(entity_name: &str) -> String {
+    format!("{}-{}", lease_safe(entity_name), std::process::id())
 }
 
 async fn leadership_loop(
@@ -141,8 +149,9 @@ async fn leadership_loop(
         }
         // Opening takes the WAL's exclusive file lock — held for as long as
         // this table lives, so it spans tenures and re-acquire attempts.
-        let mut table = match DurableLeaseTable::open(&dir) {
-            Ok(t) => t,
+        // Shared: task loops and the intent drain claim their leases here too.
+        let leases: SharedLeases = match DurableLeaseTable::open(&dir) {
+            Ok(t) => Arc::new(tokio::sync::Mutex::new(t)),
             Err(e) => {
                 tracing::warn!(
                     "coordinator: lease table unavailable ({e}); retrying in {RETRY_BACKOFF:?}"
@@ -158,8 +167,13 @@ async fn leadership_loop(
             if *shutdown_rx.borrow() {
                 return;
             }
-            let lease = match table.acquire(CONTROL_PLANE_RESOURCE, &holder, LEASE_TTL, Utc::now())
-            {
+            let acquired = {
+                leases
+                    .lock()
+                    .await
+                    .acquire(CONTROL_PLANE_RESOURCE, &holder, LEASE_TTL, Utc::now())
+            };
+            let lease = match acquired {
                 Ok(lease) => lease,
                 Err(DurableError::Lease(LeaseError::Held {
                     holder_id,
@@ -194,6 +208,7 @@ async fn leadership_loop(
                 Arc::clone(&state),
                 Arc::clone(&schedule),
                 Arc::clone(&intent_queue),
+                Arc::clone(&leases),
             )
             .await
             {
@@ -206,13 +221,16 @@ async fn leadership_loop(
                         "coordinator: scheduler failed to start ({e}); \
                          releasing control plane — interactive faculties unaffected"
                     );
-                    let _ = table.release(CONTROL_PLANE_RESOURCE, &holder, Utc::now());
+                    let _ =
+                        leases
+                            .lock()
+                            .await
+                            .release(CONTROL_PLANE_RESOURCE, &holder, Utc::now());
                     return;
                 }
             };
 
-            let tenure_end =
-                renew_until_lost_or_shutdown(&mut table, &holder, &mut shutdown_rx).await;
+            let tenure_end = renew_until_lost_or_shutdown(&leases, &holder, &mut shutdown_rx).await;
             tracing::info!(
                 "coordinator: ending tenure, aborting {} scheduler task(s)",
                 handles.len()
@@ -223,7 +241,12 @@ async fn leadership_loop(
 
             match tenure_end {
                 TenureEnd::Shutdown => {
-                    if let Err(e) = table.release(CONTROL_PLANE_RESOURCE, &holder, Utc::now()) {
+                    if let Err(e) =
+                        leases
+                            .lock()
+                            .await
+                            .release(CONTROL_PLANE_RESOURCE, &holder, Utc::now())
+                    {
                         tracing::warn!("coordinator: lease release on shutdown failed: {e}");
                     }
                     return;
@@ -237,7 +260,7 @@ async fn leadership_loop(
 }
 
 async fn renew_until_lost_or_shutdown(
-    table: &mut DurableLeaseTable,
+    leases: &SharedLeases,
     holder: &str,
     shutdown_rx: &mut watch::Receiver<bool>,
 ) -> TenureEnd {
@@ -245,7 +268,13 @@ async fn renew_until_lost_or_shutdown(
         if wait_or_shutdown(shutdown_rx, RENEW_INTERVAL).await {
             return TenureEnd::Shutdown;
         }
-        match table.renew(CONTROL_PLANE_RESOURCE, holder, LEASE_TTL, Utc::now()) {
+        let renewed = {
+            leases
+                .lock()
+                .await
+                .renew(CONTROL_PLANE_RESOURCE, holder, LEASE_TTL, Utc::now())
+        };
+        match renewed {
             Ok(_) => {}
             Err(e) => {
                 // Expired (we stalled past ttl), reclaimed by a successor,
@@ -270,6 +299,6 @@ mod tests {
             .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-')));
         assert!(id.starts_with("Echo-Prime--v2--"));
         let empty = holder_id("");
-        assert!(empty.starts_with("entity-"));
+        assert!(empty.starts_with("unnamed-"));
     }
 }

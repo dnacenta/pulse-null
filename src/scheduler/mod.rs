@@ -156,12 +156,15 @@ impl Schedule {
     }
 }
 
-/// Start the scheduler alongside the server.
+/// Start the scheduler alongside the server. Called only by the coordinator,
+/// under a held control-plane lease; individual task runs and intent claims
+/// take their own leases from the shared table.
 /// Returns a handle that can be used for graceful shutdown.
 pub async fn start(
     state: Arc<AppState>,
     schedule: Arc<RwLock<Schedule>>,
     intent_queue: Arc<RwLock<intent::IntentQueue>>,
+    leases: crate::coordinator::control::SharedLeases,
 ) -> Result<Vec<tokio::task::JoinHandle<()>>, crate::errors::SchedulerError> {
     if !state.config.scheduler.enabled {
         tracing::info!("Scheduler disabled in config");
@@ -202,9 +205,11 @@ pub async fn start(
         let schedule = Arc::clone(&schedule);
         let queue = Arc::clone(&intent_queue);
         let task_health = Arc::clone(&health);
+        let task_leases = Arc::clone(&leases);
 
         let handle = tokio::spawn(async move {
-            runner::run_task_loop(entry, state, schedule, queue, task_health, tz).await;
+            runner::run_task_loop(entry, state, schedule, queue, task_health, tz, task_leases)
+                .await;
         });
 
         handles.push(handle);
@@ -226,8 +231,9 @@ pub async fn start(
         let drain_state = Arc::clone(&state);
         let drain_queue = Arc::clone(&intent_queue);
         let drain_schedule = Arc::clone(&schedule);
+        let drain_leases = Arc::clone(&leases);
         let drain_handle = tokio::spawn(async move {
-            intent::drain_loop(drain_state, drain_queue, drain_schedule).await;
+            intent::drain_loop(drain_state, drain_queue, drain_schedule, drain_leases).await;
         });
         handles.push(drain_handle);
 
