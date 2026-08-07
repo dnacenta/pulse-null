@@ -176,6 +176,7 @@ mod tests {
             wal: None,
             alert_queue: tokio::sync::Mutex::new(alert_queue),
             provider_status: crate::provider_status::new_shared(),
+            leadership: std::sync::atomic::AtomicBool::new(false),
         })
     }
 
@@ -347,6 +348,7 @@ mod tests {
             wal: None,
             alert_queue: tokio::sync::Mutex::new(alert_queue),
             provider_status: crate::provider_status::new_shared(),
+            leadership: std::sync::atomic::AtomicBool::new(false),
         })
     }
 

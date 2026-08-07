@@ -104,6 +104,7 @@ pub async fn boot_entity(
         wal: None,
         alert_queue: tokio::sync::Mutex::new(alert_queue),
         provider_status: crate::provider_status::new_shared(),
+        leadership: std::sync::atomic::AtomicBool::new(false),
     });
 
     // Pipeline health check

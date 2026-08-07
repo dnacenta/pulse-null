@@ -114,6 +114,25 @@ enum Commands {
     },
     /// Verify and repair Claude Code integration (symlinks, hooks, config)
     Repair,
+    /// Isolation mode — the minimal-core diagnostic retreat
+    Isolate {
+        #[command(subcommand)]
+        action: IsolateAction,
+    },
+}
+
+#[derive(Subcommand)]
+enum IsolateAction {
+    /// Enter isolation mode (sticky until 'off')
+    On {
+        /// Optional reason, recorded in the marker
+        #[arg(long)]
+        reason: Option<String>,
+    },
+    /// Exit isolation mode
+    Off,
+    /// Show isolation status
+    Status,
 }
 
 #[derive(Subcommand)]
@@ -431,6 +450,17 @@ async fn main() {
         }
         Commands::Repair => {
             if let Err(e) = cli::repair::run().await {
+                eprintln!("Error: {e}");
+                std::process::exit(1);
+            }
+        }
+        Commands::Isolate { action } => {
+            let result = match action {
+                IsolateAction::On { reason } => cli::isolate::on(reason).await,
+                IsolateAction::Off => cli::isolate::off().await,
+                IsolateAction::Status => cli::isolate::status().await,
+            };
+            if let Err(e) = result {
                 eprintln!("Error: {e}");
                 std::process::exit(1);
             }

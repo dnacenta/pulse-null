@@ -30,6 +30,11 @@ pub struct ChatResponse {
     pub input_tokens: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub output_tokens: Option<u32>,
+    /// Sticky isolation-mode indicator — present (true) on every response
+    /// while the entity is isolated, so any consumer arriving mid-session
+    /// sees the posture.
+    #[serde(skip_serializing_if = "std::ops::Not::not", default)]
+    pub isolation: bool,
 }
 
 fn default_channel() -> String {
@@ -106,6 +111,28 @@ pub async fn chat(
         &state.config.owner,
         &state.config.peers,
     );
+
+    // Isolation commands are handled before ANYTHING else touches the turn —
+    // including the provider, which may itself be the suspect. Owned by the
+    // channel holder (spec decision 5): works with the coordinator wedged.
+    match crate::server::isolation::intercept_command(
+        &state.root_dir,
+        &req.message,
+        &resolved_key,
+        sender_label,
+    ) {
+        crate::server::isolation::Intercept::Handled { response, isolated } => {
+            return Ok(Json(ChatResponse {
+                response,
+                model: "isolation-control".to_string(),
+                input_tokens: None,
+                output_tokens: None,
+                isolation: isolated,
+            }));
+        }
+        crate::server::isolation::Intercept::None => {}
+    }
+    let isolated = crate::server::isolation::is_active(&state.root_dir);
 
     // Build the user message
     let mut user_message = String::new();
@@ -610,10 +637,16 @@ pub async fn chat(
     }
 
     Ok(Json(ChatResponse {
-        response: text,
+        // Sticky banner: every reply while isolated carries the marker.
+        response: if isolated {
+            crate::server::isolation::banner_wrap(text)
+        } else {
+            text
+        },
         model: result.model,
         input_tokens: Some(result.input_tokens),
         output_tokens: Some(result.output_tokens),
+        isolation: isolated,
     }))
 }
 

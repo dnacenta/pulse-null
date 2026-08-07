@@ -5,6 +5,7 @@ pub mod capability;
 mod e2e_tests;
 mod handlers;
 pub mod injection;
+pub mod isolation;
 pub mod prompt;
 pub mod rate_limit;
 pub mod setup;
@@ -51,6 +52,10 @@ pub struct AppState {
     /// Tasks push alerts here; consumers (Discord plugin, API) drain them.
     pub alert_queue: tokio::sync::Mutex<crate::scheduler::alerts::AlertQueue>,
     pub provider_status: SharedProviderStatus,
+    /// True while this process's coordinator holds the control-plane lease.
+    /// Written by the coordinator, read by /health — the data plane never
+    /// depends on it.
+    pub leadership: std::sync::atomic::AtomicBool,
 }
 
 /// Rebuild AWARENESS.md from the current plugin and tool state.
@@ -261,6 +266,7 @@ pub async fn start(config: Config) -> Result<(), Box<dyn std::error::Error>> {
         wal,
         alert_queue: tokio::sync::Mutex::new(alert_queue),
         provider_status: crate::provider_status::new_shared(),
+        leadership: std::sync::atomic::AtomicBool::new(false),
     });
 
     // Startup pipeline health check

@@ -279,6 +279,9 @@ async fn leadership_loop(
             };
             failed_acquires = 0;
 
+            state
+                .leadership
+                .store(true, std::sync::atomic::Ordering::Relaxed);
             tracing::info!(
                 "coordinator: control-plane leadership acquired as '{holder}' \
                  (token {}, ttl {LEASE_TTL:?})",
@@ -349,6 +352,9 @@ async fn leadership_loop(
             }
 
             let tenure_end = renew_until_lost_or_shutdown(&leases, &holder, &mut shutdown_rx).await;
+            state
+                .leadership
+                .store(false, std::sync::atomic::Ordering::Relaxed);
             tracing::info!("coordinator: ending tenure '{holder}', aborting scheduler task(s)");
             abort_all(&scheduler_handles);
 
