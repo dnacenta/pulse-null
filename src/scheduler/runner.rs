@@ -5,12 +5,13 @@ use chrono::Utc;
 use cron::Schedule as CronSchedule;
 use tokio::sync::RwLock;
 
+use super::diagnostics;
 use super::evaluator::{resolve_docs_dir, resolve_task_evaluator, EvalDecision, SchedulerState};
 use super::executor::{self, ExecutionConfig};
 use super::intent::{self, IntentQueue, IntentSource};
 use super::liveness::{self, SharedTaskHealth, TaskOutcome};
 use super::output;
-use super::{Schedule, ScheduledTask};
+use super::{Schedule, ScheduleEntry, ScheduledTask};
 use crate::events::EntityEvent;
 use crate::interaction::{InteractionMetadata, InteractionRecord};
 use crate::provider_status;
@@ -19,13 +20,14 @@ use crate::server::AppState;
 
 /// Run a single task in a loop: calculate next fire time → sleep → execute → repeat.
 pub async fn run_task_loop(
-    task: ScheduledTask,
+    entry: ScheduleEntry,
     state: Arc<AppState>,
     schedule: Arc<RwLock<Schedule>>,
     intent_queue: Arc<RwLock<IntentQueue>>,
     health: SharedTaskHealth,
     tz: chrono_tz::Tz,
 ) {
+    let task = &entry.task;
     let normalized_cron = super::normalize_cron(&task.cron);
     let cron_expr = match CronSchedule::from_str(&normalized_cron) {
         Ok(c) => c,
@@ -35,7 +37,12 @@ pub async fn run_task_loop(
         }
     };
 
-    tracing::info!("Scheduled task '{}' ({})", task.name, task.cron);
+    tracing::info!(
+        model = %entry.effective_model(&state.config.llm.model),
+        "Scheduled task '{}' ({})",
+        task.name,
+        task.cron
+    );
 
     // Use cached root_dir from AppState (avoids re-walking filesystem every task execution)
     let root_dir = state.root_dir.clone();
@@ -67,7 +74,7 @@ pub async fn run_task_loop(
         {
             let sched = schedule.read().await;
             if let Some(t) = sched.find_task(&task.id) {
-                if !t.enabled {
+                if !t.task.enabled {
                     tracing::info!("Task '{}' disabled, stopping loop", task.id);
                     return;
                 }
@@ -115,16 +122,27 @@ pub async fn run_task_loop(
             }
         }
 
-        tracing::info!("Executing scheduled task: {}", task.name);
+        tracing::info!(
+            model = %entry.effective_model(&state.config.llm.model),
+            "Executing scheduled task: {}",
+            task.name
+        );
 
         // Check for built-in deterministic handlers first
-        if run_builtin_handler(&task, &state, &root_dir).await {
+        if run_builtin_handler(task, &state, &root_dir).await {
             liveness::record_outcome(&health, &state, &task.id, &task.name, TaskOutcome::Success)
                 .await;
             continue;
         }
 
-        let outcome = execute_task(&task, &state, &schedule, &intent_queue, &mut eval_state).await;
+        let outcome = execute_task(&entry, &state, &schedule, &intent_queue, &mut eval_state).await;
+        // Diagnostics before the outcome is recorded: the store must still
+        // describe the previous cycle for "is this failure news?" to mean
+        // anything. Every failure path converges here, so a failure that never
+        // reached the provider is reported like any other.
+        if let TaskOutcome::Failure(ref error) = outcome {
+            diagnostics::report_failure(&health, &state, &entry, error).await;
+        }
         liveness::record_outcome(&health, &state, &task.id, &task.name, outcome).await;
     }
 }
@@ -172,14 +190,27 @@ async fn run_builtin_handler(
 /// Returns what the liveness alarm should record. Execution semantics are
 /// unchanged — the outcome is an observation, not a control signal.
 async fn execute_task(
-    task: &ScheduledTask,
+    entry: &ScheduleEntry,
     state: &Arc<AppState>,
     schedule: &Arc<RwLock<Schedule>>,
     intent_queue: &Arc<RwLock<IntentQueue>>,
     eval_state: &mut SchedulerState,
 ) -> TaskOutcome {
+    let task = &entry.task;
     // Use cached root_dir from AppState
     let root_dir = state.root_dir.clone();
+
+    // A model override means a provider of its own; without one this is the
+    // shared provider, byte for byte the previous behaviour.
+    let overridden = match resolve_provider_override(entry, state) {
+        Ok(provider) => provider,
+        Err(failure) => return failure,
+    };
+    let provider: &dyn pulse_system_types::llm::LmProvider = match overridden {
+        Some(ref boxed) => boxed.as_ref(),
+        None => state.provider.as_ref(),
+    };
+    let model = entry.effective_model(&state.config.llm.model);
 
     // Phase 5: Use minimal task system prompt (identity only, no MEMORY.md
     // or monitoring data). This keeps the task context small and focused,
@@ -254,7 +285,7 @@ async fn execute_task(
         match crate::task_context::scope(
             Some(task.id.clone()),
             executor::execute_with_tools(
-                state.provider.as_ref(),
+                provider,
                 &system_prompt,
                 &user_message,
                 &state.tools,
@@ -295,8 +326,7 @@ async fn execute_task(
             }),
         }];
 
-        match state
-            .provider
+        match provider
             .invoke(&system_prompt, &messages, state.config.llm.max_tokens, None)
             .await
         {
@@ -362,8 +392,10 @@ async fn execute_task(
         String::new()
     };
     tracing::info!(
-        "Task '{}' completed ({} tokens in, {} tokens out{})",
+        model = %model,
+        "Task '{}' completed on {} ({} tokens in, {} tokens out{})",
         task.id,
+        model,
         input_tokens,
         output_tokens,
         tool_info,
@@ -654,7 +686,40 @@ async fn execute_task(
     TaskOutcome::Success
 }
 
-/// Handle a provider error: classify, update status, emit event, send notification.
+/// Build this task's own provider, if it overrides `[llm] model`.
+///
+/// `Ok(None)` means "use the shared provider" — the unconfigured, unchanged
+/// path. An override that cannot be built fails the task rather than quietly
+/// running the default model: the reason to pin a task to a model is that the
+/// other model *refuses* it, and a refusal returns as a normal, successful
+/// response. A loud failure is recoverable; a silent wrong model is not.
+fn resolve_provider_override(
+    entry: &ScheduleEntry,
+    state: &Arc<AppState>,
+) -> Result<Option<Box<dyn pulse_system_types::llm::LmProvider>>, TaskOutcome> {
+    let Some(model) = entry.model_override() else {
+        return Ok(None);
+    };
+    match crate::providers::create_provider_with_model(&state.config, model) {
+        Ok(provider) => Ok(Some(provider)),
+        Err(e) => {
+            let message = format!("model override '{model}' could not be applied: {e}");
+            tracing::error!(
+                task_id = %entry.task.id,
+                model,
+                "Refusing to run task on the default model: {}",
+                message
+            );
+            Err(TaskOutcome::Failure(message))
+        }
+    }
+}
+
+/// Handle a provider error: classify, update status, emit event.
+///
+/// The operator-facing notification is not sent here — every failure path,
+/// including the ones that never reach the provider, is reported once from
+/// [`run_task_loop`] via [`diagnostics::report_failure`].
 async fn handle_provider_error(state: &Arc<AppState>, task_id: &str, error_msg: &str) {
     let kind = provider_status::classify_error(error_msg);
     let kind_str = kind.to_string();
@@ -668,14 +733,9 @@ async fn handle_provider_error(state: &Arc<AppState>, task_id: &str, error_msg: 
     // Emit event
     state.event_bus.emit(EntityEvent::ProviderError {
         error: error_msg.to_string(),
-        error_kind: kind_str.clone(),
+        error_kind: kind_str,
         task_id: task_id.to_string(),
     });
-
-    // Send direct webhook notification (bypass intent system — provider is down)
-    if state.config.autonomy.events.provider_error {
-        output::route_error(error_msg, &kind_str, task_id, &state.config).await;
-    }
 }
 
 /// Route parsed output markers to their respective handlers.

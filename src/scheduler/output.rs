@@ -159,44 +159,35 @@ pub async fn route_call(content: &str, config: &Config, task_name: &str) {
     }
 }
 
-/// Send a provider error notification via the share webhook.
-/// Called directly on LLM failure — does not go through the intent system
-/// because the provider is likely down.
-pub async fn route_error(error: &str, error_kind: &str, task_name: &str, config: &Config) {
-    let webhook_url = match &config.scheduler.output.share_webhook {
-        Some(url) if !url.is_empty() => url,
-        _ => {
-            tracing::warn!(
-                "[ERROR] Provider failure in '{}' ({}) but no webhook configured: {}",
-                task_name,
-                error_kind,
-                error
-            );
+/// Deliver one `[task-error]` diagnostic to `webhook`.
+///
+/// Deliberately dumber than [`deliver_liveness_alert`]: a diagnostic that
+/// misses is gone, not queued. It reports one moment in time, and the moment
+/// has a successor a cycle later; the alarm is what must never be lost.
+///
+/// Failure is logged and swallowed — the diagnostics path can never take down
+/// the task it is reporting on. The message body has already been rendered
+/// and logged in full by [`super::diagnostics`], so nothing is lost that the
+/// journal does not already hold.
+pub async fn deliver_diagnostic(content: &str, webhook: &str) {
+    let client = match reqwest::Client::builder().timeout(WEBHOOK_TIMEOUT).build() {
+        Ok(client) => client,
+        Err(e) => {
+            tracing::error!(error = %e, "Diagnostics client build failed");
             return;
         }
     };
-
-    let content = format!(
-        "\u{26a0}\u{fe0f} **Provider Error** in `{}`\n**Type:** {}\n**Error:** {}",
-        task_name, error_kind, error
-    );
-
-    let client = reqwest::Client::new();
     let body = serde_json::json!({ "content": content });
 
-    match client.post(webhook_url).json(&body).send().await {
+    match client.post(webhook).json(&body).send().await {
         Ok(res) if res.status().is_success() => {
-            tracing::info!("[ERROR] notification delivered for task '{}'", task_name);
+            tracing::debug!("Task diagnostic delivered");
         }
         Ok(res) => {
-            tracing::warn!(
-                "[ERROR] webhook returned {}: {}",
-                res.status(),
-                res.text().await.unwrap_or_default()
-            );
+            tracing::warn!(status = %res.status(), "Diagnostics webhook rejected the message");
         }
         Err(e) => {
-            tracing::error!("[ERROR] webhook failed: {}", e);
+            tracing::warn!(error = %e, "Diagnostics webhook failed");
         }
     }
 }
@@ -329,6 +320,14 @@ mod tests {
             result.is_err(),
             "expected transport failure, got {result:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn diagnostic_delivery_failure_is_swallowed() {
+        // Port 1 on loopback refuses instantly. Unlike an alert, a diagnostic
+        // is not retried and must never surface an error into the task loop —
+        // the journal already holds the full text.
+        deliver_diagnostic("[task-error] t (t) — failure #1", "http://127.0.0.1:1/hook").await;
     }
 
     #[test]

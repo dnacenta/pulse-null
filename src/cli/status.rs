@@ -94,7 +94,8 @@ fn print_task_liveness(config: &Config, root_dir: &std::path::Path) {
 
     let mut enabled = 0usize;
     let mut problems = 0usize;
-    for task in &schedule.tasks {
+    for entry in &schedule.tasks {
+        let task = &entry.task;
         if task.enabled {
             enabled += 1;
         }

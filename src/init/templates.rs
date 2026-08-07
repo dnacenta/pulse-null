@@ -79,6 +79,11 @@ timezone = "{timezone}"
 [scheduler.output]
 # share_webhook = "https://discord.com/api/webhooks/..."
 # call_endpoint = "http://localhost:8443/api/call"
+# Per-failure diagnostics ([task-error] lines with the full error text).
+# Point this at a channel of its own: the liveness [ALERT] below can only be
+# read as an alarm if nothing else in its channel looks like one. Unset falls
+# back to share_webhook with plain framing.
+# diagnostics_webhook = "https://discord.com/api/webhooks/..."
 
 [scheduler.liveness]
 enabled = true

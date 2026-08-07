@@ -1,4 +1,5 @@
 pub mod alerts;
+pub mod diagnostics;
 pub mod digest;
 pub mod dynamic;
 pub mod evaluator;
@@ -21,10 +22,64 @@ use crate::server::AppState;
 // Re-export shared types from pulse-system-types
 pub use pulse_system_types::{OutputRouting, ScheduledTask, TaskCreator};
 
+/// One line of `schedule.json`: a task definition plus the overrides that
+/// belong to this host rather than to the shared plugin contract.
+///
+/// [`ScheduledTask`] is the cross-crate contract (`pulse-system-types`) that
+/// plugins also build, so host-only knobs cannot live on it. They live here
+/// and are flattened into the same JSON object, which keeps the file shape
+/// operators edit unchanged:
+///
+/// ```json
+/// { "id": "research-session", "cron": "0 0 10 * * *", "model": "claude-opus-4-8", ... }
+/// ```
+///
+/// Absent overrides are omitted on write, so a schedule.json that has never
+/// used one round-trips byte-identically through the running process.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ScheduleEntry {
+    #[serde(flatten)]
+    pub task: ScheduledTask,
+    /// Model this task runs on, overriding `[llm] model` for this task only.
+    ///
+    /// Exists because a safety layer can refuse a whole *class* of task while
+    /// leaving chat untouched: pinning the entity globally to work around one
+    /// refusing task costs every other caller the model they wanted.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+}
+
+impl ScheduleEntry {
+    /// The model this task should run on, given the configured default.
+    ///
+    /// Precedence: the task's own `model`, else `[llm] model`. A blank or
+    /// whitespace-only override counts as absent — an empty string in
+    /// schedule.json is a typo, not a request for a nameless model.
+    #[must_use]
+    pub fn effective_model<'a>(&'a self, default_model: &'a str) -> &'a str {
+        self.model_override().unwrap_or(default_model)
+    }
+
+    /// The override itself, normalized: `None` unless it names something.
+    #[must_use]
+    pub fn model_override(&self) -> Option<&str> {
+        self.model
+            .as_deref()
+            .map(str::trim)
+            .filter(|m| !m.is_empty())
+    }
+}
+
+impl From<ScheduledTask> for ScheduleEntry {
+    fn from(task: ScheduledTask) -> Self {
+        Self { task, model: None }
+    }
+}
+
 /// The full schedule — loaded from and persisted to schedule.json
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Schedule {
-    pub tasks: Vec<ScheduledTask>,
+    pub tasks: Vec<ScheduleEntry>,
 }
 
 impl Schedule {
@@ -42,7 +97,7 @@ impl Schedule {
         let schedule: Schedule = match serde_json::from_str::<Schedule>(&content) {
             Ok(s) => s,
             Err(_) => {
-                let tasks: Vec<ScheduledTask> = serde_json::from_str(&content)?;
+                let tasks: Vec<ScheduleEntry> = serde_json::from_str(&content)?;
                 Schedule { tasks }
             }
         };
@@ -60,33 +115,43 @@ impl Schedule {
     /// Create a schedule with default tasks
     pub fn with_defaults() -> Self {
         Self {
-            tasks: tasks::default_tasks(),
+            tasks: tasks::default_tasks().into_iter().map(Into::into).collect(),
         }
     }
 
     /// Find a task by id
-    pub fn find_task(&self, id: &str) -> Option<&ScheduledTask> {
-        self.tasks.iter().find(|t| t.id == id)
+    pub fn find_task(&self, id: &str) -> Option<&ScheduleEntry> {
+        self.tasks.iter().find(|t| t.task.id == id)
     }
 
     /// Find a task by id (mutable)
-    pub fn find_task_mut(&mut self, id: &str) -> Option<&mut ScheduledTask> {
-        self.tasks.iter_mut().find(|t| t.id == id)
+    pub fn find_task_mut(&mut self, id: &str) -> Option<&mut ScheduleEntry> {
+        self.tasks.iter_mut().find(|t| t.task.id == id)
     }
 
-    /// Add a task (replaces if same id exists)
-    pub fn add_task(&mut self, task: ScheduledTask) {
-        if let Some(existing) = self.find_task_mut(&task.id) {
-            *existing = task;
+    /// Add a task (replaces if same id exists).
+    ///
+    /// A replacement that carries no model override inherits the one it
+    /// replaces. The override is operator policy about *how* a task runs;
+    /// the definition is content, and the entity rewrites its own content
+    /// via `[SCHEDULE:]`. Dropping the override on rewrite would silently
+    /// move a task back onto the model it was moved off.
+    pub fn add_task(&mut self, task: impl Into<ScheduleEntry>) {
+        let mut entry = task.into();
+        if let Some(existing) = self.find_task_mut(&entry.task.id) {
+            if entry.model.is_none() {
+                entry.model.clone_from(&existing.model);
+            }
+            *existing = entry;
         } else {
-            self.tasks.push(task);
+            self.tasks.push(entry);
         }
     }
 
     /// Remove a task by id, returns true if found
     pub fn remove_task(&mut self, id: &str) -> bool {
         let len_before = self.tasks.len();
-        self.tasks.retain(|t| t.id != id);
+        self.tasks.retain(|t| t.task.id != id);
         self.tasks.len() < len_before
     }
 }
@@ -111,8 +176,12 @@ pub async fn start(
     })?;
 
     let tasks = schedule.read().await;
-    let enabled_tasks: Vec<ScheduledTask> =
-        tasks.tasks.iter().filter(|t| t.enabled).cloned().collect();
+    let enabled_tasks: Vec<ScheduleEntry> = tasks
+        .tasks
+        .iter()
+        .filter(|t| t.task.enabled)
+        .cloned()
+        .collect();
     drop(tasks);
 
     tracing::info!(
@@ -128,14 +197,14 @@ pub async fn start(
     let health: liveness::SharedTaskHealth =
         Arc::new(RwLock::new(health::TaskHealthStore::load(&state.root_dir)));
 
-    for task in enabled_tasks {
+    for entry in enabled_tasks {
         let state = Arc::clone(&state);
         let schedule = Arc::clone(&schedule);
         let queue = Arc::clone(&intent_queue);
         let task_health = Arc::clone(&health);
 
         let handle = tokio::spawn(async move {
-            runner::run_task_loop(task, state, schedule, queue, task_health, tz).await;
+            runner::run_task_loop(entry, state, schedule, queue, task_health, tz).await;
         });
 
         handles.push(handle);
@@ -191,6 +260,176 @@ pub fn normalize_cron(expr: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tempfile::TempDir;
+
+    /// Two tasks, one pinned to a model and one not — the shape an operator
+    /// actually ends up with.
+    const SCHEDULE_JSON: &str = r#"{
+      "tasks": [
+        {
+          "id": "research-session",
+          "name": "Research Session",
+          "cron": "0 0 10 * * *",
+          "channel": "system",
+          "prompt": "Go deep.",
+          "model": "claude-opus-4-8"
+        },
+        {
+          "id": "night-reflection",
+          "name": "Night Reflection",
+          "cron": "0 30 23 * * *",
+          "channel": "system",
+          "prompt": "Look back on today."
+        }
+      ]
+    }"#;
+
+    fn write_schedule(dir: &TempDir, json: &str) {
+        std::fs::write(dir.path().join("schedule.json"), json).unwrap();
+    }
+
+    fn entry(id: &str, model: Option<&str>) -> ScheduleEntry {
+        ScheduleEntry {
+            task: ScheduledTask {
+                id: id.to_string(),
+                name: id.to_string(),
+                cron: "0 0 10 * * *".to_string(),
+                channel: "system".to_string(),
+                prompt: "Do it.".to_string(),
+                output_routing: OutputRouting::Silent,
+                enabled: true,
+                created_by: TaskCreator::System,
+                evaluator: None,
+            },
+            model: model.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn model_override_parses_alongside_the_task_definition() {
+        let schedule: Schedule = serde_json::from_str(SCHEDULE_JSON).unwrap();
+        let pinned = schedule.find_task("research-session").unwrap();
+        assert_eq!(pinned.model_override(), Some("claude-opus-4-8"));
+        assert_eq!(pinned.task.cron, "0 0 10 * * *");
+        assert_eq!(schedule.find_task("night-reflection").unwrap().model, None);
+    }
+
+    /// The running process rewrites schedule.json (dynamic `[SCHEDULE:]`
+    /// tasks, enable/disable). The override has to come back out of that
+    /// rewrite, and the task that never had one must not grow a null.
+    #[test]
+    fn override_survives_a_load_save_load_cycle() {
+        let dir = TempDir::new().unwrap();
+        write_schedule(&dir, SCHEDULE_JSON);
+
+        let loaded = Schedule::load(dir.path()).unwrap();
+        loaded.save(dir.path()).unwrap();
+
+        let written = std::fs::read_to_string(dir.path().join("schedule.json")).unwrap();
+        assert_eq!(
+            written.matches("\"model\"").count(),
+            1,
+            "only the pinned task should carry a model key:\n{written}"
+        );
+
+        let reloaded = Schedule::load(dir.path()).unwrap();
+        assert_eq!(
+            reloaded
+                .find_task("research-session")
+                .unwrap()
+                .model_override(),
+            Some("claude-opus-4-8")
+        );
+        assert_eq!(reloaded.find_task("night-reflection").unwrap().model, None);
+    }
+
+    /// A bare `[...]` schedule.json is still accepted, overrides included.
+    #[test]
+    fn bare_array_schedule_keeps_overrides() {
+        let dir = TempDir::new().unwrap();
+        write_schedule(
+            &dir,
+            r#"[{"id":"t","name":"T","cron":"0 0 10 * * *","channel":"system","prompt":"p","model":"m"}]"#,
+        );
+        let schedule = Schedule::load(dir.path()).unwrap();
+        assert_eq!(schedule.find_task("t").unwrap().model_override(), Some("m"));
+    }
+
+    /// The entity rewrites its own tasks via `[SCHEDULE:]`. Losing the
+    /// override there would silently move a task back onto the model it was
+    /// deliberately moved off.
+    #[test]
+    fn replacing_a_task_inherits_the_override_it_replaces() {
+        let mut schedule = Schedule {
+            tasks: vec![entry("research-session", Some("claude-opus-4-8"))],
+        };
+
+        let mut rewritten = entry("research-session", None);
+        rewritten.task.prompt = "New prompt.".to_string();
+        schedule.add_task(rewritten);
+
+        let stored = schedule.find_task("research-session").unwrap();
+        assert_eq!(stored.model_override(), Some("claude-opus-4-8"));
+        assert_eq!(stored.task.prompt, "New prompt.");
+        assert_eq!(schedule.tasks.len(), 1);
+    }
+
+    #[test]
+    fn an_explicit_override_replaces_the_previous_one() {
+        let mut schedule = Schedule {
+            tasks: vec![entry("t", Some("old-model"))],
+        };
+        schedule.add_task(entry("t", Some("new-model")));
+        assert_eq!(
+            schedule.find_task("t").unwrap().model_override(),
+            Some("new-model")
+        );
+    }
+
+    #[test]
+    fn plain_scheduled_tasks_still_add_without_an_override() {
+        let mut schedule = Schedule { tasks: Vec::new() };
+        schedule.add_task(entry("t", None).task);
+        assert_eq!(schedule.find_task("t").unwrap().model, None);
+    }
+
+    #[test]
+    fn effective_model_prefers_the_task_over_the_config_default() {
+        assert_eq!(
+            entry("t", Some("claude-opus-4-8")).effective_model("fable-5"),
+            "claude-opus-4-8"
+        );
+        assert_eq!(entry("t", None).effective_model("fable-5"), "fable-5");
+    }
+
+    /// An empty or whitespace-only `model` is a typo, not a request for a
+    /// nameless model — it must not reach the provider factory.
+    #[test]
+    fn blank_override_falls_back_to_the_config_default() {
+        assert_eq!(entry("t", Some("")).effective_model("fable-5"), "fable-5");
+        assert_eq!(
+            entry("t", Some("   ")).effective_model("fable-5"),
+            "fable-5"
+        );
+        assert_eq!(entry("t", Some("   ")).model_override(), None);
+    }
+
+    /// Surrounding whitespace is trimmed rather than passed through to the CLI.
+    #[test]
+    fn override_is_trimmed() {
+        assert_eq!(
+            entry("t", Some("  claude-opus-4-8 ")).effective_model("fable-5"),
+            "claude-opus-4-8"
+        );
+    }
+
+    #[test]
+    fn defaults_carry_no_overrides() {
+        assert!(Schedule::with_defaults()
+            .tasks
+            .iter()
+            .all(|t| t.model.is_none()));
+    }
 
     #[test]
     fn normalize_sunday_zero_to_seven() {

@@ -145,6 +145,17 @@ enum ScheduleAction {
         /// Task ID
         id: String,
     },
+    /// Pin a task to a specific model, overriding [llm] model for that task
+    Model {
+        /// Task ID
+        id: String,
+        /// Model name (omit with --clear to follow [llm] model again)
+        #[arg(required_unless_present = "clear", conflicts_with = "clear")]
+        model: Option<String>,
+        /// Remove the override so the task follows [llm] model
+        #[arg(long)]
+        clear: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -321,6 +332,9 @@ async fn main() {
                 ScheduleAction::Remove { id } => cli::schedule::remove(id).await,
                 ScheduleAction::Enable { id } => cli::schedule::enable(id).await,
                 ScheduleAction::Disable { id } => cli::schedule::disable(id).await,
+                ScheduleAction::Model { id, model, clear } => {
+                    cli::schedule::set_model(id, if clear { None } else { model }).await
+                }
             };
             if let Err(e) = result {
                 eprintln!("Error: {e}");
