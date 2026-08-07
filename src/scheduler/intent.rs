@@ -403,6 +403,12 @@ pub async fn drain_loop(
         };
         tokio::time::sleep(sleep_duration).await;
 
+        // Isolation backstop, independent of the coordinator loop.
+        if crate::server::isolation::is_active(&state.root_dir) {
+            tracing::warn!("Intent drain: ISOLATION active — stopping");
+            return;
+        }
+
         // Tenure liveness: stop if our tenure lost the control plane and
         // nothing aborted us (wedged leadership loop).
         {

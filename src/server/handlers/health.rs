@@ -23,13 +23,10 @@ pub async fn health(State(state): State<Arc<AppState>>) -> (StatusCode, Json<ser
         "status": state_str,
         "entity": state.config.entity.name,
         "isolation": isolated,
-        "control_plane": if isolated {
-            "shed"
-        } else if leading {
-            "leading"
-        } else {
-            "not-leading"
-        },
+        // Observed state only — the marker is reported separately as
+        // `isolation`; claiming "shed" from the marker alone would lie
+        // whenever the coordinator is wedged and its tasks still run.
+        "control_plane": if leading { "leading" } else { "not-leading" },
     });
 
     if status.state != ProviderState::Healthy {

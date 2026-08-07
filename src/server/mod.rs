@@ -63,6 +63,10 @@ pub struct AppState {
 /// Shared by both the event-driven rebuild and the lagged-channel fallback
 /// to eliminate logic duplication.
 async fn rebuild_awareness(state: &Arc<AppState>) {
+    // AWARENESS.md is a write — shed while isolated.
+    if crate::server::isolation::is_active(&state.root_dir) {
+        return;
+    }
     let pm = state.plugin_manager.lock().await;
     let plugin_descriptions = pm.collect_platform_descriptions();
     let tool_names = state.tools.names();
@@ -380,11 +384,18 @@ pub async fn start(config: Config) -> Result<(), Box<dyn std::error::Error>> {
         tracing::warn!("Some persistence tasks did not complete before shutdown");
     }
 
-    // 5. Archive all sessions on shutdown and persist to disk
-    let archived_paths = state
-        .session_store
-        .archive_all(&root_dir, &config.entity.name)
-        .await;
+    // 5. Archive all sessions on shutdown and persist to disk. Shed while
+    // isolated: sessions may carry the ephemeral isolation tail, which must
+    // never reach disk (spec Stage 2 — nothing that writes).
+    let archived_paths = if crate::server::isolation::is_active(&root_dir) {
+        tracing::warn!("shutdown during ISOLATION — session archive/persist shed");
+        Vec::new()
+    } else {
+        state
+            .session_store
+            .archive_all(&root_dir, &config.entity.name)
+            .await
+    };
 
     // 6. Clean up WAL and checkpoint files for archived sessions
     if let Some(ref wal) = state.wal {

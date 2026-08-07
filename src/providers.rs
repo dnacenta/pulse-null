@@ -28,10 +28,16 @@ pub fn create_provider(config: &Config) -> Result<Box<dyn LmProvider>, ProviderE
             config.llm.model.clone(),
             config.llm.base_url.clone(),
         ))),
-        "claude-code" => Ok(Box::new(ClaudeCodeProvider::new(
-            config.llm.model.clone(),
-            config.llm.claude_bin.clone(),
-        ))),
+        "claude-code" => {
+            let mut provider =
+                ClaudeCodeProvider::new(config.llm.model.clone(), config.llm.claude_bin.clone());
+            // Isolation awareness (spec Stage 2): the CLI subprocess brings
+            // its own tools, so the marker must reach the spawn itself.
+            if let Ok(root) = config.root_dir() {
+                provider = provider.with_isolation_root(root);
+            }
+            Ok(Box::new(provider))
+        }
         other => Err(ProviderError::Unknown(other.to_string())),
     }
 }
@@ -57,10 +63,16 @@ pub fn create_streaming_provider(
             config.llm.model.clone(),
             config.llm.base_url.clone(),
         ))),
-        "claude-code" => Ok(Box::new(ClaudeCodeProvider::new(
-            config.llm.model.clone(),
-            config.llm.claude_bin.clone(),
-        ))),
+        "claude-code" => {
+            let mut provider =
+                ClaudeCodeProvider::new(config.llm.model.clone(), config.llm.claude_bin.clone());
+            // Isolation awareness (spec Stage 2): the CLI subprocess brings
+            // its own tools, so the marker must reach the spawn itself.
+            if let Ok(root) = config.root_dir() {
+                provider = provider.with_isolation_root(root);
+            }
+            Ok(Box::new(provider))
+        }
         other => Err(ProviderError::Unknown(other.to_string())),
     }
 }

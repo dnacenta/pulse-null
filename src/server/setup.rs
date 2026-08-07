@@ -226,6 +226,11 @@ pub fn spawn_session_cleanup(config: &Config, state: &Arc<super::AppState>) {
             interval.tick().await; // Skip first immediate tick
             loop {
                 interval.tick().await;
+                // Shed while isolated: cleanup archives, persists, and graph-
+                // ingests — all writes (coordinator spec, Stage 2).
+                if crate::server::isolation::is_active(&cleanup_state.root_dir) {
+                    continue;
+                }
                 let archived_paths = cleanup_state
                     .session_store
                     .cleanup_expired(&cleanup_state.root_dir, &cleanup_state.config.entity.name)

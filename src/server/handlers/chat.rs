@@ -211,10 +211,29 @@ pub async fn chat(
     let mut session = session_arc.write().await;
     session.touch();
 
+    // Ephemeral isolation tail (spec Stage 2: "nothing that writes"): while
+    // isolated, remember where the in-memory conversation stood; the first
+    // normal turn truncates back to it so the isolated exchange never
+    // reaches disk through persist, checkpoint, archive, or eviction.
+    if isolated {
+        if session.data.isolation_ephemeral_from.is_none() {
+            session.data.isolation_ephemeral_from = Some(session.data.messages.len());
+        }
+    } else if let Some(watermark) = session.data.isolation_ephemeral_from.take() {
+        let dropped = session.data.messages.len().saturating_sub(watermark);
+        session.data.messages.truncate(watermark);
+        session.data.compaction.estimated_tokens =
+            crate::context::estimate_conversation_tokens(&session.data.messages);
+        tracing::info!(
+            "[chat] dropped {dropped} ephemeral isolation message(s) on return to normal"
+        );
+    }
+
     // === Session limit check ===
     // Check if the session has exceeded its channel-specific limits (message cap,
     // time cap, or hallucination threshold). If so, archive the current conversation
     // with a structured handoff and start fresh before processing this message.
+    let pre_turn_len = session.data.messages.len();
     let limits = state.config.sessions.get_identity_limits(&resolved_key);
     // Session resets archive to disk — shed in isolation (the in-memory
     // session simply keeps growing for the duration of the diagnosis).
@@ -270,7 +289,9 @@ pub async fn chat(
         }),
     });
     session.data.message_count += 1;
-    session.data.wal.messages_since_checkpoint += 1;
+    if !isolated {
+        session.data.wal.messages_since_checkpoint += 1;
+    }
     // Real human message arrived — reset the autonomous round counter
     session.data.health.rounds_since_human_input = 0;
 
@@ -433,8 +454,22 @@ pub async fn chat(
     .await
     .map_err(|e| {
         tracing::error!("LLM invocation failed: {}", e);
-        (StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
+        // Keep the banner sticky even on the failure path — while isolated
+        // the provider is precisely the suspect.
+        let msg = if crate::server::isolation::is_active(&state.root_dir) {
+            format!("{} {}", crate::server::isolation::BANNER, e)
+        } else {
+            e.to_string()
+        };
+        (StatusCode::INTERNAL_SERVER_ERROR, msg)
     })?;
+
+    // Re-sample: a turn admitted just before the marker appeared must not
+    // write after it. OR of the two samples drives every gate below.
+    let isolated = isolated || crate::server::isolation::is_active(&state.root_dir);
+    if isolated && session.data.isolation_ephemeral_from.is_none() {
+        session.data.isolation_ephemeral_from = Some(pre_turn_len);
+    }
 
     let text = result.text;
 
@@ -610,7 +645,9 @@ pub async fn chat(
     );
 
     // Mark session dirty and persist asynchronously
-    session.mark_dirty();
+    if !isolated {
+        session.mark_dirty();
+    }
     let persist_key = session_key.clone();
     let persist_store = &state.session_store;
     tracing::debug!(
@@ -669,9 +706,11 @@ pub async fn chat(
         );
     }
 
+    // Sticky banner for trusted consumers; concealed from guests (the
+    // operating posture is not their business).
+    let reveal = isolated && !resolved_key.starts_with("guest:");
     Ok(Json(ChatResponse {
-        // Sticky banner: every reply while isolated carries the marker.
-        response: if isolated {
+        response: if reveal {
             crate::server::isolation::banner_wrap(text)
         } else {
             text
@@ -679,7 +718,7 @@ pub async fn chat(
         model: result.model,
         input_tokens: Some(result.input_tokens),
         output_tokens: Some(result.output_tokens),
-        isolation: isolated,
+        isolation: reveal,
     }))
 }
 

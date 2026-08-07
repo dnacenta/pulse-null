@@ -48,8 +48,17 @@ fn marker_path(root_dir: &Path) -> std::path::PathBuf {
 }
 
 /// Whether isolation mode is active. One stat — cheap enough per request.
+/// IO errors other than NotFound count as isolated: the failure direction is
+/// INTO the retreat, never silently out of it.
 pub fn is_active(root_dir: &Path) -> bool {
-    marker_path(root_dir).exists()
+    match std::fs::symlink_metadata(marker_path(root_dir)) {
+        Ok(_) => true,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => false,
+        Err(e) => {
+            tracing::warn!("isolation marker unreadable ({e}); treating as ISOLATED");
+            true
+        }
+    }
 }
 
 /// Current marker, if isolated. A marker that exists but doesn't parse still
@@ -110,28 +119,26 @@ pub fn intercept_command(
     sender_label: &str,
 ) -> Intercept {
     let trimmed = message.trim();
-    let (is_enter, is_exit) = (
-        trimmed == ENTER_COMMAND || trimmed.starts_with(&format!("{ENTER_COMMAND} ")),
-        trimmed == EXIT_COMMAND,
-    );
+    let first_token = trimmed.split_whitespace().next().unwrap_or("");
+    let is_enter = first_token.eq_ignore_ascii_case(ENTER_COMMAND);
+    let is_exit = first_token.eq_ignore_ascii_case(EXIT_COMMAND);
     if !is_enter && !is_exit {
         return Intercept::None;
     }
 
-    if resolved_key.starts_with("guest:") {
+    // Owner only — not guests, not peers (a sibling entity must not be able
+    // to /resume this one mid-diagnosis). The refusal conceals the posture.
+    if resolved_key != "owner" {
         return Intercept::Handled {
-            response: "Isolation commands are restricted to trusted senders.".to_string(),
-            isolated: is_active(root_dir),
+            response: "Isolation commands are restricted to the owner.".to_string(),
+            isolated: false,
         };
     }
 
     if is_enter {
-        let reason = trimmed
-            .strip_prefix(ENTER_COMMAND)
-            .map(str::trim)
-            .filter(|r| !r.is_empty())
-            .map(String::from);
-        match enter(root_dir, sender_label, reason) {
+        let reason =
+            Some(sanitize_field(trimmed[first_token.len()..].trim())).filter(|r| !r.is_empty());
+        match enter(root_dir, &sanitize_field(sender_label), reason) {
             Ok(marker) => Intercept::Handled {
                 response: format!(
                     "{BANNER} Isolation mode ACTIVE (entered {} by {}). \
@@ -171,6 +178,16 @@ pub fn intercept_command(
 /// Apply the sticky banner to a normal (non-command) response while isolated.
 pub fn banner_wrap(response: String) -> String {
     format!("{BANNER} {response}")
+}
+
+/// Marker fields are echoed to the operator's terminal — cap length and
+/// strip control characters (ANSI injection via a crafted sender/reason).
+fn sanitize_field(input: &str) -> String {
+    input
+        .chars()
+        .filter(|c| !c.is_control())
+        .take(256)
+        .collect()
 }
 
 #[cfg(test)]
@@ -222,7 +239,7 @@ mod tests {
     #[test]
     fn trusted_sender_enters_and_exits_with_explicit_signals() {
         let dir = tempfile::tempdir().unwrap();
-        match intercept_command(dir.path(), "/isolate suspect graph", "owner:D", "D") {
+        match intercept_command(dir.path(), "/isolate suspect graph", "owner", "D") {
             Intercept::Handled { response, isolated } => {
                 assert!(isolated);
                 assert!(response.starts_with(BANNER));
@@ -235,7 +252,7 @@ mod tests {
             Some("suspect graph")
         );
 
-        match intercept_command(dir.path(), "/resume", "owner:D", "D") {
+        match intercept_command(dir.path(), "/resume", "owner", "D") {
             Intercept::Handled { response, isolated } => {
                 assert!(!isolated);
                 assert_eq!(response, BACK_TO_NORMAL);
@@ -246,14 +263,77 @@ mod tests {
     }
 
     #[test]
+    fn readonly_tool_set_has_no_writers() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = crate::config::test_support::minimal_config();
+        let names = crate::server::setup::register_readonly_tools(dir.path(), &config).names();
+        assert!(!names.iter().any(|n| n.contains("write")), "{names:?}");
+        assert!(!names.iter().any(|n| n.contains("fetch")), "{names:?}");
+    }
+
+    #[test]
+    fn commands_are_owner_only_and_conceal_posture() {
+        let dir = tempfile::tempdir().unwrap();
+        enter(dir.path(), "D", None).unwrap();
+        for key in ["guest:x", "peer:echo2"] {
+            match intercept_command(dir.path(), "/resume", key, "x") {
+                Intercept::Handled { response, isolated } => {
+                    assert!(response.contains("owner"));
+                    assert!(!isolated, "posture leaked to {key}");
+                }
+                Intercept::None => panic!("should intercept"),
+            }
+            assert!(is_active(dir.path()), "{key} flipped isolation");
+        }
+    }
+
+    #[test]
+    fn command_matching_is_tokenized_and_case_insensitive() {
+        let dir = tempfile::tempdir().unwrap();
+        match intercept_command(
+            dir.path(),
+            "  /ISOLATE   graph acting weird  ",
+            "owner",
+            "D",
+        ) {
+            Intercept::Handled { isolated, .. } => assert!(isolated),
+            Intercept::None => panic!("should intercept"),
+        }
+        assert_eq!(
+            status(dir.path()).unwrap().reason.as_deref(),
+            Some("graph acting weird")
+        );
+        match intercept_command(dir.path(), "/Resume", "owner", "D") {
+            Intercept::Handled { isolated, .. } => assert!(!isolated),
+            Intercept::None => panic!("should intercept"),
+        }
+        assert!(!is_active(dir.path()));
+    }
+
+    #[test]
+    fn marker_fields_are_sanitized() {
+        let dir = tempfile::tempdir().unwrap();
+        let long_reason = "x".repeat(5000);
+        let msg = format!("/isolate \u{1b}[31mred\u{1b}[0m {long_reason}");
+        match intercept_command(dir.path(), &msg, "owner", "evil\u{7}bell") {
+            Intercept::Handled { isolated, .. } => assert!(isolated),
+            Intercept::None => panic!("should intercept"),
+        }
+        let marker = status(dir.path()).unwrap();
+        assert!(marker.reason.as_ref().unwrap().len() <= 256 * 4);
+        assert!(!marker.reason.as_ref().unwrap().contains('\u{1b}'));
+        assert!(!marker.by.contains('\u{7}'));
+    }
+
+    #[test]
     fn ordinary_messages_pass_through() {
         let dir = tempfile::tempdir().unwrap();
         assert!(matches!(
-            intercept_command(dir.path(), "tell me about /isolate", "owner:D", "D"),
+            intercept_command(dir.path(), "tell me about /isolate", "owner", "D"),
             Intercept::None
         ));
         assert!(matches!(
-            intercept_command(dir.path(), "hello", "owner:D", "D"),
+            intercept_command(dir.path(), "hello", "owner", "D"),
             Intercept::None
         ));
     }

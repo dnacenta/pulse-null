@@ -112,6 +112,11 @@ pub async fn event_listener(
                     }
                 }
 
+                // Shed while isolated: translating events writes intent and
+                // evaluator state.
+                if crate::server::isolation::is_active(&root_dir) {
+                    continue;
+                }
                 if let Some(intent) = translate_event(&event, &events_config) {
                     // Delta against disk (reconcile) + refresh the shared copy,
                     // so this push survives a concurrent daemon write and vice versa.

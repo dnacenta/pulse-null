@@ -45,6 +45,11 @@ use crate::streaming::{self, StreamResult, StreamingProvider};
 pub struct ClaudeCodeProvider {
     model: String,
     claude_bin: String,
+    /// Entity root consulted per-invocation for the isolation marker. While
+    /// isolated, the spawned CLI is restricted to read-only tools — the
+    /// in-process tool registry swap cannot reach a subprocess that brings
+    /// its own tools (and normally runs with permission prompts disabled).
+    isolation_root: Option<PathBuf>,
 }
 
 impl ClaudeCodeProvider {
@@ -52,8 +57,51 @@ impl ClaudeCodeProvider {
         let claude_bin = claude_bin
             .or_else(|| std::env::var("CLAUDE_BIN").ok())
             .unwrap_or_else(|| "claude".into());
-        Self { model, claude_bin }
+        Self {
+            model,
+            claude_bin,
+            isolation_root: None,
+        }
     }
+
+    /// Enable per-invocation isolation awareness (coordinator spec, Stage 2).
+    #[must_use]
+    pub fn with_isolation_root(mut self, root: PathBuf) -> Self {
+        self.isolation_root = Some(root);
+        self
+    }
+}
+
+/// Tools denied to the CLI subprocess while isolated: everything that writes,
+/// executes, or leaves the box. Camel-case flag per the Claude Code CLI. If a
+/// future CLI rejects the flag the invocation fails — closed, not open.
+const ISOLATION_DISALLOWED_TOOLS: &str =
+    "Write,Edit,MultiEdit,NotebookEdit,Bash,WebFetch,WebSearch,Task";
+
+/// Argv for one CLI invocation, factored out so tests can pin the
+/// isolation-restricted shape without spawning anything.
+fn invoke_args(
+    model: &str,
+    system_prompt_file: &std::path::Path,
+    restricted: bool,
+) -> Vec<std::ffi::OsString> {
+    let mut args: Vec<std::ffi::OsString> = vec![
+        "-p".into(),
+        "-".into(),
+        "--model".into(),
+        model.into(),
+        "--output-format".into(),
+        "json".into(),
+        "--system-prompt-file".into(),
+        system_prompt_file.into(),
+        "--no-session-persistence".into(),
+        "--dangerously-skip-permissions".into(),
+    ];
+    if restricted {
+        args.push("--disallowedTools".into());
+        args.push(ISOLATION_DISALLOWED_TOOLS.into());
+    }
+    args
 }
 
 /// A private on-disk copy of the system prompt for a single CLI invocation.
@@ -220,6 +268,10 @@ impl LmProvider for ClaudeCodeProvider {
         let messages = messages.to_vec();
         let model = self.model.clone();
         let claude_bin = self.claude_bin.clone();
+        let restricted = self
+            .isolation_root
+            .as_deref()
+            .is_some_and(crate::server::isolation::is_active);
 
         Box::pin(async move {
             let prompt = serialize_messages(&messages);
@@ -230,16 +282,7 @@ impl LmProvider for ClaudeCodeProvider {
             let system_prompt_file = SystemPromptFile::create(&system_prompt)?;
 
             let mut cmd = tokio::process::Command::new(&claude_bin);
-            cmd.arg("-p")
-                .arg("-")
-                .arg("--model")
-                .arg(&model)
-                .arg("--output-format")
-                .arg("json")
-                .arg("--system-prompt-file")
-                .arg(system_prompt_file.path())
-                .arg("--no-session-persistence")
-                .arg("--dangerously-skip-permissions")
+            cmd.args(invoke_args(&model, system_prompt_file.path(), restricted))
                 .env_remove("CLAUDECODE")
                 .stdin(Stdio::piped())
                 .stdout(Stdio::piped())
@@ -432,6 +475,36 @@ fn parse_response(
 
 fn truncate(s: &str, max: usize) -> &str {
     crate::utils::safe_truncate(s, max)
+}
+
+#[cfg(test)]
+mod isolation_argv_tests {
+    use super::*;
+
+    #[test]
+    fn isolated_argv_denies_writing_tools() {
+        let args = invoke_args("m", std::path::Path::new("/tmp/x"), true);
+        let strs: Vec<String> = args
+            .iter()
+            .map(|a| a.to_string_lossy().to_string())
+            .collect();
+        let pos = strs
+            .iter()
+            .position(|a| a == "--disallowedTools")
+            .expect("isolated argv must carry --disallowedTools");
+        let denied = &strs[pos + 1];
+        for tool in ["Write", "Edit", "Bash", "WebFetch", "WebSearch", "Task"] {
+            assert!(denied.contains(tool), "{tool} missing from deny list");
+        }
+    }
+
+    #[test]
+    fn normal_argv_is_unrestricted() {
+        let args = invoke_args("m", std::path::Path::new("/tmp/x"), false);
+        assert!(!args
+            .iter()
+            .any(|a| a.to_string_lossy().contains("disallowedTools")));
+    }
 }
 
 #[cfg(test)]

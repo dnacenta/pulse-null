@@ -150,6 +150,14 @@ pub async fn run_task_loop(
             }
         }
 
+        // Isolation backstop: independent of the coordinator loop (which may
+        // itself be wedged — the very case isolation exists for), every task
+        // checks the marker before firing.
+        if crate::server::isolation::is_active(&root_dir) {
+            tracing::warn!("Task '{}': ISOLATION active — stopping loop", task.id);
+            return;
+        }
+
         // Tenure liveness: if our tenure no longer holds the control plane
         // (the leadership loop died without aborting us — a wedge), stop
         // rather than keep acting as a stale tenure.

@@ -926,6 +926,7 @@ mod tests {
             wal: crate::session_store::WalState::default(),
             health: crate::session_store::HealthCounters::default(),
             compaction: crate::session_store::CompactionMetrics::default(),
+            isolation_ephemeral_from: None,
         }
     }
 

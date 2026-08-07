@@ -142,6 +142,11 @@ pub struct SessionData {
     pub health: HealthCounters,
     #[serde(flatten)]
     pub compaction: CompactionMetrics,
+    /// Index of the first message added while isolated (coordinator spec,
+    /// Stage 2). Never serialized: the isolated tail is ephemeral by design —
+    /// the first normal turn truncates back to this watermark.
+    #[serde(skip)]
+    pub isolation_ephemeral_from: Option<usize>,
 }
 
 impl SessionData {
@@ -471,6 +476,7 @@ impl Session {
                 },
                 health: HealthCounters::default(),
                 compaction: CompactionMetrics::default(),
+                isolation_ephemeral_from: None,
             },
             dirty: false,
         }

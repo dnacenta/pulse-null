@@ -782,7 +782,13 @@ async fn e2e_isolation_over_chat_with_coordinator_wedged() {
         .unwrap()
         .starts_with(crate::server::isolation::BANNER));
 
-    // AC18: a normal turn while isolated writes nothing.
+    // AC18: a normal turn while isolated writes nothing. Flush + settle
+    // first so an un-shed async write would land before the compare.
+    state
+        .persist_coordinator
+        .flush(std::time::Duration::from_secs(2))
+        .await;
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
     let sessions_before = snapshot_dir(&dir.path().join("sessions"));
     let wal_before = snapshot_dir(&dir.path().join("sessions").join("wal"));
     let archives_before = snapshot_dir(&dir.path().join("archives").join("conversations"));
@@ -797,6 +803,11 @@ async fn e2e_isolation_over_chat_with_coordinator_wedged() {
         .unwrap()
         .starts_with(crate::server::isolation::BANNER));
 
+    state
+        .persist_coordinator
+        .flush(std::time::Duration::from_secs(2))
+        .await;
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
     assert_eq!(
         snapshot_dir(&dir.path().join("sessions")),
         sessions_before,

@@ -84,6 +84,9 @@ pub(crate) fn lease_safe(input: &str) -> String {
 pub struct Coordinator {
     shutdown_tx: watch::Sender<bool>,
     handle: Option<JoinHandle<()>>,
+    /// For resetting the /health leadership flag when the loop dies without
+    /// running its own cleanup (wedge, drop).
+    app: Option<Arc<AppState>>,
     /// The current tenure's scheduler tasks. Owned here — not on the
     /// leadership loop's stack — so they can be aborted even if the loop
     /// itself dies abruptly (panic, abort, drop): a stale tenure must never
@@ -117,9 +120,11 @@ impl Coordinator {
             return Self {
                 shutdown_tx,
                 handle: None,
+                app: None,
                 scheduler_handles,
             };
         }
+        let app = Arc::clone(&state);
         let handle = tokio::spawn(leadership_loop(
             state,
             schedule,
@@ -130,6 +135,7 @@ impl Coordinator {
         Self {
             shutdown_tx,
             handle: Some(handle),
+            app: Some(app),
             scheduler_handles,
         }
     }
@@ -141,6 +147,11 @@ impl Coordinator {
     pub(crate) fn wedge_for_test(&self) {
         if let Some(handle) = &self.handle {
             handle.abort();
+        }
+        // The loop can no longer maintain the flag — don't let /health lie.
+        if let Some(app) = &self.app {
+            app.leadership
+                .store(false, std::sync::atomic::Ordering::Relaxed);
         }
     }
 
@@ -170,6 +181,10 @@ impl Drop for Coordinator {
             handle.abort();
         }
         abort_all(&self.scheduler_handles);
+        if let Some(app) = &self.app {
+            app.leadership
+                .store(false, std::sync::atomic::Ordering::Relaxed);
+        }
     }
 }
 
@@ -345,6 +360,20 @@ async fn leadership_loop(
                 continue;
             }
 
+            // The marker may have appeared between the parking check and
+            // here (acquire + sweep + reconcile are disk work) — never start
+            // a scheduler into active isolation.
+            if crate::server::isolation::is_active(&state.root_dir) {
+                state
+                    .leadership
+                    .store(false, std::sync::atomic::Ordering::Relaxed);
+                let _ = leases
+                    .lock()
+                    .await
+                    .release(CONTROL_PLANE_RESOURCE, &holder, Utc::now());
+                continue;
+            }
+
             let started = match scheduler::start(
                 Arc::clone(&state),
                 Arc::clone(&schedule),
@@ -471,7 +500,10 @@ async fn renew_until_lost_or_shutdown(
     root_dir: &std::path::Path,
     shutdown_rx: &mut watch::Receiver<bool>,
 ) -> TenureEnd {
-    let mut since_renew = Duration::ZERO;
+    // Wall-clock deadline, not accumulated nominal sleeps: each iteration
+    // also pays stats/locks, and drift across many 2s polls could push a
+    // renewal past the ttl.
+    let mut last_renew = tokio::time::Instant::now();
     loop {
         if wait_or_shutdown(shutdown_rx, POLL_INTERVAL).await {
             return TenureEnd::Shutdown;
@@ -479,11 +511,10 @@ async fn renew_until_lost_or_shutdown(
         if crate::server::isolation::is_active(root_dir) {
             return TenureEnd::Isolated;
         }
-        since_renew += POLL_INTERVAL;
-        if since_renew < RENEW_INTERVAL {
+        if last_renew.elapsed() < RENEW_INTERVAL {
             continue;
         }
-        since_renew = Duration::ZERO;
+        last_renew = tokio::time::Instant::now();
         let renewed = {
             leases
                 .lock()
