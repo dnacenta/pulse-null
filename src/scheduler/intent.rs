@@ -629,29 +629,6 @@ async fn execute_intent(
     // Parse output for markers
     let parsed = output::parse_output(&result.response_text);
 
-    // [FARM:] — bounded subtask delegation on the lease substrate (Stage 3)
-    for farm_json in &parsed.farm_requests {
-        match crate::coordinator::farm::run_farm_from_marker(farm_json, state, tenure).await {
-            Ok(result) => {
-                tracing::info!(
-                    "Intent '{}' farm complete ({} chars)",
-                    intent.id,
-                    result.len()
-                );
-                crate::logbook::write_task_output(
-                    &root_dir,
-                    &format!("intent-{}-farm", intent.id),
-                    &format!("{} (farm)", intent.description),
-                    &result,
-                    0,
-                    0,
-                    0,
-                );
-            }
-            Err(e) => tracing::warn!("[FARM:] from intent '{}' failed: {e}", intent.id),
-        }
-    }
-
     // Handle [SCHEDULE:] markers
     for schedule_json in &parsed.schedule_requests {
         match super::dynamic::create_task_from_marker(schedule_json) {
@@ -775,6 +752,37 @@ async fn execute_intent(
                 Ok(merged) => *queue.write().await = merged,
                 Err(e) => tracing::error!("Failed to persist intent queue: {}", e),
             }
+        }
+    }
+
+    // [FARM:] — bounded subtask delegation on the lease substrate (Stage 3).
+    // Routed last; one farm per response.
+    if let Some(farm_json) = parsed.farm_requests.first() {
+        if parsed.farm_requests.len() > 1 {
+            tracing::warn!(
+                "Intent '{}': {} [FARM:] markers — running only the first",
+                intent.id,
+                parsed.farm_requests.len()
+            );
+        }
+        match crate::coordinator::farm::run_farm_from_marker(farm_json, state, tenure).await {
+            Ok(result) => {
+                tracing::info!(
+                    "Intent '{}' farm complete ({} chars)",
+                    intent.id,
+                    result.len()
+                );
+                crate::logbook::write_task_output(
+                    &root_dir,
+                    &format!("intent-{}-farm", intent.id),
+                    &format!("{} (farm)", intent.description),
+                    &result,
+                    0,
+                    0,
+                    0,
+                );
+            }
+            Err(e) => tracing::warn!("[FARM:] from intent '{}' failed: {e}", intent.id),
         }
     }
 

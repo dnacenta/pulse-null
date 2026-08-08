@@ -463,7 +463,9 @@ async fn sweep_stale_claims(leases: &SharedLeases, tenure_holder: &str) {
         .into_iter()
         .filter(|l| {
             l.holder_id != tenure_holder
-                && (l.resource_id.starts_with("task-") || l.resource_id.starts_with("intent-"))
+                && (l.resource_id.starts_with("task-")
+                    || l.resource_id.starts_with("intent-")
+                    || l.resource_id.starts_with("farm-"))
         })
         .collect();
     for lease in stale {

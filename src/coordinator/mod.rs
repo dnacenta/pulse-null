@@ -9,10 +9,6 @@
 //! therefore the lease table. `wal::LeaseWal` enforces this with an exclusive
 //! file lock held for the process lifetime; a second coordinator instance
 //! fails to open rather than silently sharing the log.
-// Stages 2-3 consumers (FencedResource, parts of the lease API) are not
-// wired yet — keep dead_code suppressed until the umbrella lands complete.
-#![allow(dead_code)]
-
 pub mod control;
 pub mod durable;
 pub mod farm;

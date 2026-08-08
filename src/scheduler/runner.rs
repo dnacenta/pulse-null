@@ -855,25 +855,6 @@ async fn route_output_markers(
     root_dir: &std::path::Path,
     tenure: &crate::coordinator::control::TenureLeases,
 ) {
-    // [FARM:] — bounded subtask delegation on the lease substrate (Stage 3)
-    for farm_json in &parsed.farm_requests {
-        match crate::coordinator::farm::run_farm_from_marker(farm_json, state, tenure).await {
-            Ok(result) => {
-                tracing::info!("Task '{}' farm complete ({} chars)", task.id, result.len());
-                crate::logbook::write_task_output(
-                    root_dir,
-                    &format!("{}-farm", task.id),
-                    &format!("{} (farm)", task.name),
-                    &result,
-                    0,
-                    0,
-                    0,
-                );
-            }
-            Err(e) => tracing::warn!("[FARM:] from task '{}' failed: {e}", task.id),
-        }
-    }
-
     // [SCHEDULE:] — create new dynamic tasks
     for schedule_json in &parsed.schedule_requests {
         match super::dynamic::create_task_from_marker(schedule_json) {
@@ -966,6 +947,34 @@ async fn route_output_markers(
                 }
                 Err(e) => tracing::warn!("Invalid [CHAIN:] marker: {}", e),
             }
+        }
+    }
+
+    // [FARM:] — bounded subtask delegation on the lease substrate (Stage 3).
+    // Routed LAST so [SHARE:]/[CALL:] in the same response are not delayed
+    // behind a long farm; one farm per response.
+    if let Some(farm_json) = parsed.farm_requests.first() {
+        if parsed.farm_requests.len() > 1 {
+            tracing::warn!(
+                "Task '{}': {} [FARM:] markers in one response — running only the first",
+                task.id,
+                parsed.farm_requests.len()
+            );
+        }
+        match crate::coordinator::farm::run_farm_from_marker(farm_json, state, tenure).await {
+            Ok(result) => {
+                tracing::info!("Task '{}' farm complete ({} chars)", task.id, result.len());
+                crate::logbook::write_task_output(
+                    root_dir,
+                    &format!("{}-farm", task.id),
+                    &format!("{} (farm)", task.name),
+                    &result,
+                    0,
+                    0,
+                    0,
+                );
+            }
+            Err(e) => tracing::warn!("[FARM:] from task '{}' failed: {e}", task.id),
         }
     }
 }

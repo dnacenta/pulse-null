@@ -1392,7 +1392,8 @@ pub fn build_autonomy_context(root_dir: &Path, _config: &Config) -> String {
         - [CALL: <reason>] — Request a call with the owner\n\
         - [SCHEDULE: {\"name\": \"...\", \"cron\": \"...\", \"prompt\": \"...\"}] — Create a recurring scheduled task\n\
         - [INTENT: {\"description\": \"...\", \"prompt\": \"...\", \"priority\": \"low|normal|high|urgent\"}] — Queue a one-shot task for later\n\
-        - [CHAIN: {\"description\": \"...\", \"prompt\": \"Based on: {result}\"}] — Queue a follow-up that receives this task's output\n\n\
+        - [CHAIN: {\"description\": \"...\", \"prompt\": \"Based on: {result}\"}] — Queue a follow-up that receives this task's output\n\
+        - [FARM: {\"id\": \"...\", \"description\": \"...\", \"subtasks\": [{\"id\": \"...\", \"prompt\": \"...\"}], \"synthesis\": \"Merge: {results}\"}] — Delegate up to 8 bounded subtasks to run concurrently (no tools); one farm per response\n\n\
         Use markers sparingly. Only share content worth surfacing. Only queue intents for genuine follow-up work."
             .to_string(),
     );

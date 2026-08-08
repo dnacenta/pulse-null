@@ -40,11 +40,82 @@ static INTENT_RE: LazyLock<Regex> =
 static CHAIN_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"\[CHAIN:\s*(\{[\s\S]*?\})\]").unwrap());
 
-static FARM_RE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"\[FARM:\s*(\{[\s\S]*?\})\]").unwrap());
+/// Extract `[TAG: {json}]` payloads with a brace-balance scan — a lazy regex
+/// stops at the first `}]`, which truncates any payload containing a nested
+/// array of objects (e.g. a farm's `subtasks`). Quote/escape aware.
+fn extract_json_markers(content: &str, tag: &str) -> (Vec<String>, String) {
+    let open = format!("[{tag}:");
+    let mut payloads = Vec::new();
+    let mut clean = String::with_capacity(content.len());
+    let mut rest = content;
+
+    while let Some(start) = rest.find(&open) {
+        clean.push_str(&rest[..start]);
+        let after_tag = &rest[start + open.len()..];
+        let brace_off = after_tag.find('{');
+        let candidate = match brace_off {
+            Some(off) if after_tag[..off].trim().is_empty() => &after_tag[off..],
+            _ => {
+                // Not a JSON marker — emit the tag literally and move on.
+                clean.push_str(&open);
+                rest = after_tag;
+                continue;
+            }
+        };
+
+        let mut depth = 0usize;
+        let mut in_string = false;
+        let mut escaped = false;
+        let mut end = None;
+        for (i, c) in candidate.char_indices() {
+            if in_string {
+                if escaped {
+                    escaped = false;
+                } else if c == '\\' {
+                    escaped = true;
+                } else if c == '"' {
+                    in_string = false;
+                }
+                continue;
+            }
+            match c {
+                '"' => in_string = true,
+                '{' => depth += 1,
+                '}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        end = Some(i + 1);
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        match end {
+            Some(end) if candidate[end..].trim_start().starts_with(']') => {
+                payloads.push(candidate[..end].to_string());
+                let close = candidate[end..].find(']').unwrap();
+                rest = &candidate[end + close + 1..];
+            }
+            _ => {
+                // Unbalanced or unterminated — emit literally.
+                clean.push_str(&open);
+                rest = after_tag;
+            }
+        }
+    }
+    clean.push_str(rest);
+    (payloads, clean)
+}
 
 /// Parse LLM response for output routing markers.
 pub fn parse_output(content: &str) -> ParsedOutput {
+    // FARM first: its payload legitimately contains `}]`, which the simple
+    // lazy regexes below would mis-slice if they ran across it.
+    let (farm_requests, content_no_farm) = extract_json_markers(content, "FARM");
+    let content = content_no_farm.as_str();
+
     let share_content: Vec<String> = SHARE_RE
         .captures_iter(content)
         .map(|c| c[1].trim().to_string())
@@ -70,11 +141,6 @@ pub fn parse_output(content: &str) -> ParsedOutput {
         .map(|c| c[1].trim().to_string())
         .collect();
 
-    let farm_requests: Vec<String> = FARM_RE
-        .captures_iter(content)
-        .map(|c| c[1].trim().to_string())
-        .collect();
-
     // Strip all markers from content for the clean version
     let mut clean = content.to_string();
     clean = SHARE_RE.replace_all(&clean, "").to_string();
@@ -82,7 +148,6 @@ pub fn parse_output(content: &str) -> ParsedOutput {
     clean = SCHEDULE_RE.replace_all(&clean, "").to_string();
     clean = INTENT_RE.replace_all(&clean, "").to_string();
     clean = CHAIN_RE.replace_all(&clean, "").to_string();
-    clean = FARM_RE.replace_all(&clean, "").to_string();
     let clean_content = clean.trim().to_string();
 
     ParsedOutput {
@@ -244,13 +309,17 @@ mod tests {
     use super::*;
 
     #[test]
-    fn farm_marker_is_parsed_and_stripped() {
-        let content =
-            r#"Delegating. [FARM: {"id":"f1","subtasks":[{"id":"a","prompt":"pa"}]}] Done."#;
+    fn farm_marker_round_trips_through_serde_with_nested_arrays() {
+        let content = r#"Delegating. [FARM: {"id":"f1","subtasks":[{"id":"a","prompt":"pa {with} [brackets] and \"quoted }]\""},{"id":"b","prompt":"pb"}],"synthesis":"merge {results}"}] Done."#;
         let parsed = parse_output(content);
         assert_eq!(parsed.farm_requests.len(), 1);
-        assert!(parsed.farm_requests[0].contains("\"id\":\"f1\""));
+        let spec: crate::coordinator::farm::FarmSpec =
+            serde_json::from_str(&parsed.farm_requests[0]).expect("captured JSON must be complete");
+        assert_eq!(spec.subtasks.len(), 2);
+        assert!(spec.subtasks[0].prompt.contains("[brackets]"));
         assert!(!parsed.clean_content.contains("FARM"));
+        assert!(parsed.clean_content.contains("Delegating."));
+        assert!(parsed.clean_content.contains("Done."));
     }
 
     #[test]

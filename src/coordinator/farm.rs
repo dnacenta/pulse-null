@@ -6,17 +6,33 @@
 //! farming needed one, Stage 0 was incomplete (spec decision 6).
 //!
 //! Mechanics per subtask:
-//! - each attempt acquires the lease `farm-{farm}-{sub}` under an
-//!   attempt-scoped holder, minting a strictly higher fencing token;
-//! - the result store holds one `FencedResource` guard per subtask, fenced
-//!   AT the current attempt's token before the child runs — so a stalled
-//!   predecessor's commit is rejected in every interleaving, including the
-//!   window before the new child commits;
+//! - each attempt acquires the lease `farm-{farm}-s{index}` (index-keyed:
+//!   LLM-chosen subtask ids never collide or overflow at the lease layer)
+//!   under an attempt-scoped holder, minting a strictly higher fencing
+//!   token;
+//! - the result store holds one `FencedResource` guard per subtask, raised
+//!   TO the current attempt's token before the child runs — a stalled
+//!   predecessor's commit is rejected in every interleaving — and a
+//!   controller only trusts a commit made under its OWN token;
 //! - a child that outlives its lease ttl is reclaimed: the next attempt's
 //!   acquire (over the expired lease) mints a higher token, the guard is
-//!   re-fenced, and the old child is aborted (`kill_on_drop` reaps the CLI
-//!   subprocess). Its late result, if it slips through before the abort
-//!   lands, presents a stale token and is fenced.
+//!   raised, and the old child is aborted (`kill_on_drop` reaps the CLI
+//!   subprocess). Its late result, if it fires first, presents a stale
+//!   token and is fenced.
+//!
+//! Lifetime discipline: every spawned task (controllers and children) sits
+//! behind an abort-on-drop guard, so dropping `run_farm`'s future — tenure
+//! loss, shutdown, the wall-budget deadline — reaps the whole farm,
+//! provider subprocesses included. Leases a killed farm leaves behind are
+//! released by the coordinator's stale-claim sweep at the next leadership
+//! acquisition.
+//!
+//! Budgets: `wall_budget` (default 20min) keeps a farm inside its parent
+//! task's 30min lease; `subtask_ttl` (default 16min) sits above the
+//! provider's 15min subprocess timeout so a slow-but-legitimate child is
+//! not reclaimed while its subprocess is still within budget. The lease
+//! stall path depends on a non-decreasing wall clock (documented Stage 0
+//! precondition).
 //!
 //! The executor is injected, so all of this is deterministic under test and
 //! provider-free; production passes a closure that invokes the LmProvider.
@@ -57,14 +73,18 @@ pub struct FarmSpec {
     pub synthesis: Option<String>,
 }
 
-/// Execution knobs. Defaults are production values; tests shrink the ttl and
-/// may disable reclaim-abort to let a stalled child run long enough to prove
-/// its late commit is fenced.
+/// Execution knobs. Defaults are production values; tests shrink the
+/// durations and may disable reclaim-abort to let a stalled child run long
+/// enough to prove its late commit is fenced.
 #[derive(Debug, Clone)]
 pub struct FarmCaps {
     pub max_concurrency: usize,
     pub max_attempts: u32,
+    /// Per-attempt lease ttl. Must exceed the provider's own subprocess
+    /// timeout (15min) or legitimately slow children get reclaimed mid-work.
     pub subtask_ttl: Duration,
+    /// Whole-farm wall budget — keeps a farm inside its parent's lease.
+    pub wall_budget: Duration,
     /// Abort a reclaimed child (production). `false` only in tests that
     /// deliberately let the stale child finish and hit the fence.
     pub reclaim_abort: bool,
@@ -75,7 +95,8 @@ impl Default for FarmCaps {
         Self {
             max_concurrency: 3,
             max_attempts: 2,
-            subtask_ttl: Duration::from_secs(10 * 60),
+            subtask_ttl: Duration::from_secs(16 * 60),
+            wall_budget: Duration::from_secs(20 * 60),
             reclaim_abort: true,
         }
     }
@@ -91,7 +112,7 @@ pub struct SubtaskResult {
 #[derive(Debug)]
 pub struct FarmOutcome {
     pub results: Vec<SubtaskResult>,
-    /// Subtasks that failed every attempt (or were cut off by abort).
+    /// Subtasks that failed every attempt (or were cut off by the budget).
     pub failed: Vec<String>,
     /// Late commits from reclaimed children rejected by fencing — the spec's
     /// Stage 3 exit criterion made observable.
@@ -100,10 +121,22 @@ pub struct FarmOutcome {
     pub reclaims: u32,
 }
 
+/// A spawned task aborted when dropped — nothing in a farm outlives the
+/// farm's future.
+struct AbortOnDrop<T>(tokio::task::JoinHandle<T>);
+
+impl<T> Drop for AbortOnDrop<T> {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
 /// Fenced result store: the ONLY place child output lands, guarded per
-/// subtask by a Stage 0 `FencedResource`.
+/// subtask by a Stage 0 `FencedResource`. Results carry the committing
+/// token so a controller can distinguish its own attempt's commit.
 struct FarmResults {
-    inner: Mutex<HashMap<String, (FencedResource, Option<String>)>>,
+    #[allow(clippy::type_complexity)]
+    inner: Mutex<HashMap<String, (FencedResource, Option<(FencingToken, String)>)>>,
     late_fenced: std::sync::atomic::AtomicU32,
 }
 
@@ -115,15 +148,16 @@ impl FarmResults {
         }
     }
 
-    /// Raise the subtask's fence to `token` — called at every attempt's
-    /// acquire, BEFORE the child runs. Tokens are strictly increasing across
-    /// attempts, so this only ever raises.
-    async fn fence_at(&self, sub_id: &str, token: FencingToken) {
+    /// Raise the subtask's fence to at least `token` — called at every
+    /// attempt's acquire, BEFORE the child runs. Never lowers: a stale or
+    /// duplicate caller cannot un-fence a newer epoch.
+    async fn raise_fence(&self, sub_id: &str, token: FencingToken) {
         let mut inner = self.inner.lock().await;
         let entry = inner
             .entry(sub_id.to_string())
             .or_insert_with(|| (FencedResource::new(), None));
-        entry.0 = FencedResource::at(token);
+        let target = entry.0.high_water().map_or(token, |high| high.max(token));
+        entry.0 = FencedResource::at(target);
     }
 
     /// Commit a child's result under its token. A stale (reclaimed) child is
@@ -135,7 +169,7 @@ impl FarmResults {
             .or_insert_with(|| (FencedResource::new(), None));
         match entry.0.accept(token) {
             Ok(()) => {
-                entry.1 = Some(text);
+                entry.1 = Some((token, text));
                 true
             }
             Err(rejected) => {
@@ -149,17 +183,20 @@ impl FarmResults {
         }
     }
 
-    async fn take(&self, sub_id: &str) -> Option<String> {
-        self.inner
-            .lock()
-            .await
-            .get_mut(sub_id)
-            .and_then(|(_, r)| r.take())
+    /// Take the result iff it was committed under `token` — a controller
+    /// only trusts its own attempt's commit.
+    async fn take_if_token(&self, sub_id: &str, token: FencingToken) -> Option<String> {
+        let mut inner = self.inner.lock().await;
+        let entry = inner.get_mut(sub_id)?;
+        match &entry.1 {
+            Some((t, _)) if *t == token => entry.1.take().map(|(_, text)| text),
+            _ => None,
+        }
     }
 }
 
-/// Run a farm to completion. The executor is one child attempt: it receives
-/// the subtask spec and returns the child's text (or an error string).
+/// Run a farm to completion (or its wall budget). The executor is one child
+/// attempt: it receives the subtask spec and returns the child's text.
 pub async fn run_farm<F, Fut>(
     leases: SharedLeases,
     tenure_holder: &str,
@@ -177,10 +214,32 @@ where
     let semaphore = Arc::new(Semaphore::new(caps.max_concurrency.max(1)));
     let reclaims = Arc::new(std::sync::atomic::AtomicU32::new(0));
 
-    let subtasks: Vec<SubtaskSpec> = spec.subtasks.into_iter().take(MAX_SUBTASKS).collect();
-    let mut controllers = Vec::new();
+    let mut outcome = FarmOutcome {
+        results: Vec::new(),
+        failed: Vec::new(),
+        late_fenced: 0,
+        reclaims: 0,
+    };
 
-    for sub in subtasks.iter().cloned() {
+    // Dedup here too (the direct API must not rely on the marker path's
+    // validation): a duplicate id would share a results key across distinct
+    // lease resources and confuse token scoping.
+    let mut seen = std::collections::HashSet::new();
+    let mut subtasks: Vec<SubtaskSpec> = Vec::new();
+    for sub in spec.subtasks.into_iter().take(MAX_SUBTASKS) {
+        if seen.insert(sub.id.clone()) {
+            subtasks.push(sub);
+        } else {
+            tracing::warn!(
+                "farm '{farm_id}': duplicate subtask id '{}' dropped",
+                sub.id
+            );
+            outcome.failed.push(sub.id);
+        }
+    }
+
+    let mut controllers: Vec<(AbortOnDrop<ControllerOutput>, SubtaskSpec)> = Vec::new();
+    for (index, sub) in subtasks.into_iter().enumerate() {
         let leases = Arc::clone(&leases);
         let results = Arc::clone(&results);
         let semaphore = Arc::clone(&semaphore);
@@ -190,8 +249,9 @@ where
         let root_dir = root_dir.clone();
         let tenure_holder = tenure_holder.to_string();
         let farm_id = farm_id.clone();
+        let sub_for_task = sub.clone();
 
-        controllers.push(tokio::spawn(async move {
+        let handle = tokio::spawn(async move {
             subtask_controller(
                 leases,
                 results,
@@ -202,30 +262,42 @@ where
                 root_dir,
                 tenure_holder,
                 farm_id,
-                sub,
+                index,
+                sub_for_task,
             )
             .await
-        }));
+        });
+        controllers.push((AbortOnDrop(handle), sub));
     }
 
-    let mut outcome = FarmOutcome {
-        results: Vec::new(),
-        failed: Vec::new(),
-        late_fenced: 0,
-        reclaims: 0,
-    };
-
-    for (controller, sub) in controllers.into_iter().zip(subtasks.iter()) {
-        let attempts = controller.await.unwrap_or(None);
-        match (attempts, results.take(&sub.id).await) {
-            (Some(attempts), Some(text)) => outcome.results.push(SubtaskResult {
+    // Join under the wall budget. Past the deadline every remaining
+    // controller — and, via its guards, every remaining child — is aborted
+    // by drop: the farm cannot outrun its parent's lease.
+    let deadline = tokio::time::Instant::now() + caps.wall_budget;
+    for (mut controller, sub) in controllers {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        let joined = tokio::time::timeout(remaining, &mut controller.0).await;
+        let output = match joined {
+            Ok(join_result) => join_result.ok().flatten(),
+            Err(_) => {
+                tracing::warn!(
+                    "farm '{farm_id}': wall budget {:?} exhausted — aborting '{}'",
+                    caps.wall_budget,
+                    sub.id
+                );
+                None
+            }
+        };
+        match output {
+            Some((attempts, text)) => outcome.results.push(SubtaskResult {
                 sub_id: sub.id.clone(),
                 text,
                 attempts,
             }),
-            _ => outcome.failed.push(sub.id.clone()),
+            None => outcome.failed.push(sub.id.clone()),
         }
     }
+
     outcome.late_fenced = results
         .late_fenced
         .load(std::sync::atomic::Ordering::Relaxed);
@@ -233,8 +305,11 @@ where
     outcome
 }
 
-/// Drive one subtask through its attempts. Returns Some(attempt_count) when
-/// a result was committed, None when every attempt failed.
+type ControllerOutput = Option<(u32, String)>;
+
+/// Drive one subtask through its attempts. Returns the attempt count and
+/// the committed text — taken from the store only under this attempt's own
+/// token, so a stale predecessor's commit can never masquerade as ours.
 #[allow(clippy::too_many_arguments)]
 async fn subtask_controller<F, Fut>(
     leases: SharedLeases,
@@ -246,14 +321,17 @@ async fn subtask_controller<F, Fut>(
     root_dir: PathBuf,
     tenure_holder: String,
     farm_id: String,
+    index: usize,
     sub: SubtaskSpec,
-) -> Option<u32>
+) -> ControllerOutput
 where
     F: Fn(SubtaskSpec) -> Fut + Send + Sync + Clone + 'static,
     Fut: std::future::Future<Output = Result<String, String>> + Send + 'static,
 {
-    let resource = format!("farm-{farm_id}-{}", lease_safe(&sub.id));
-    let mut stalled_child: Option<tokio::task::JoinHandle<()>> = None;
+    // Index-keyed: LLM-chosen ids can neither collide nor overflow the
+    // lease id budget once composed with the farm id.
+    let resource = format!("farm-{farm_id}-s{index}");
+    let mut stalled_child: Option<AbortOnDrop<bool>> = None;
 
     for attempt in 1..=caps.max_attempts {
         // Shed with everything else: a farm never outlives isolation entry.
@@ -262,36 +340,35 @@ where
                 "farm '{farm_id}': ISOLATION active — abandoning '{}'",
                 sub.id
             );
-            break;
+            return None;
         }
 
         // Acquire (attempt 1) or reclaim-by-expiry (attempt >1: the previous
         // child stalled past its ttl; this acquire mints a higher token).
         let holder = format!("{tenure_holder}-a{attempt}");
-        let lease = {
+        let acquired = {
             leases
                 .lock()
                 .await
                 .acquire(&resource, &holder, caps.subtask_ttl, Utc::now())
         };
-        let lease = match lease {
+        let lease = match acquired {
             Ok(lease) => lease,
             Err(e) => {
                 tracing::warn!("farm '{farm_id}': claim failed on '{}': {e}", sub.id);
-                break;
+                return None;
             }
         };
 
-        // Fence BEFORE the child runs: from this instant, any commit bearing
-        // an older token — a stalled predecessor waking up — is rejected,
-        // regardless of interleaving.
-        results.fence_at(&sub.id, lease.fencing_token).await;
+        // Raise the fence BEFORE the child runs: from this instant any
+        // commit bearing an older token — a stalled predecessor waking up —
+        // is rejected, regardless of interleaving.
+        results.raise_fence(&sub.id, lease.fencing_token).await;
         if attempt > 1 {
             reclaims.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             if caps.reclaim_abort {
-                if let Some(old) = stalled_child.take() {
-                    old.abort();
-                }
+                // Guard drop aborts the child; kill_on_drop reaps the CLI.
+                stalled_child = None;
             }
         }
 
@@ -303,57 +380,65 @@ where
             let executor = executor.clone();
             let sub = sub.clone();
             let token = lease.fencing_token;
-            tokio::spawn(async move {
+            AbortOnDrop(tokio::spawn(async move {
                 let _permit = permit;
-                if let Ok(text) = executor(sub.clone()).await {
-                    results.commit(&sub.id, token, text).await;
+                match executor(sub.clone()).await {
+                    Ok(text) => results.commit(&sub.id, token, text).await,
+                    Err(e) => {
+                        tracing::warn!("farm child '{}' failed: {e}", sub.id);
+                        false
+                    }
                 }
-            })
+            }))
         };
 
         // Wait out this attempt's lease window. select (not timeout) so the
-        // JoinHandle survives a stall — a dropped handle would detach the
-        // child beyond reach of the reclaim abort.
-        let finished = tokio::select! {
-            _ = &mut child => true,
-            () = tokio::time::sleep(caps.subtask_ttl) => false,
+        // guard survives a stall — the handle must stay reachable for the
+        // reclaim abort, and abort-on-drop must cover farm teardown.
+        let finished: Option<bool> = tokio::select! {
+            joined = &mut child.0 => Some(joined.unwrap_or(false)),
+            () = tokio::time::sleep(caps.subtask_ttl) => None,
         };
+
         match finished {
-            true => {
-                // Child finished (ok or executor error) within its lease.
-                let committed = {
-                    results
-                        .inner
-                        .lock()
-                        .await
-                        .get(&sub.id)
-                        .is_some_and(|(_, r)| r.is_some())
-                };
+            Some(committed) => {
                 let _ = { leases.lock().await.release(&resource, &holder, Utc::now()) };
                 if committed {
-                    return Some(attempt);
+                    // Only OUR token's commit counts — a stale predecessor's
+                    // text under an older token is invisible here.
+                    if let Some(text) = results.take_if_token(&sub.id, lease.fencing_token).await {
+                        // Test determinism: with reclaim-abort disabled, a
+                        // still-running stale child gets its lease window to
+                        // fire (and be fenced) before the farm reports.
+                        if let Some(mut old) = stalled_child.take() {
+                            if !caps.reclaim_abort {
+                                let _ = tokio::time::timeout(caps.subtask_ttl, &mut old.0).await;
+                            }
+                        }
+                        return Some((attempt, text));
+                    }
                 }
-                // Executor error: retry on the next attempt (fresh acquire —
-                // the lease was released, watermark still climbs).
+                // Executor error (or a commit that wasn't ours): retry on
+                // the next attempt — the lease was released, the watermark
+                // still climbs.
             }
-            false => {
-                // Stalled past the ttl: keep the handle; the NEXT attempt's
-                // acquire reclaims by expiry and re-fences before (optionally)
-                // aborting it. Do not release — expiry is the reclaim signal.
+            None => {
+                // Stalled past the ttl: keep the guard; the NEXT attempt's
+                // acquire reclaims by expiry and raises the fence before
+                // (optionally) aborting it. Do not release — expiry is the
+                // reclaim signal. If this was the last attempt, the guard's
+                // drop reaps the child on return.
                 tracing::warn!(
                     "farm '{farm_id}': child on '{}' exceeded ttl {:?} — reclaiming",
                     sub.id,
                     caps.subtask_ttl
                 );
                 stalled_child = Some(child);
+                continue;
             }
         }
     }
 
-    // Out of attempts (or aborted): reap a still-stalled child.
-    if let Some(old) = stalled_child.take() {
-        old.abort();
-    }
     None
 }
 
@@ -376,14 +461,6 @@ pub async fn run_farm_from_marker(
             "farm has {} subtasks (max {MAX_SUBTASKS})",
             spec.subtasks.len()
         ));
-    }
-    {
-        let mut ids: Vec<&str> = spec.subtasks.iter().map(|s| s.id.as_str()).collect();
-        ids.sort_unstable();
-        ids.dedup();
-        if ids.len() != spec.subtasks.len() {
-            return Err("duplicate subtask ids".to_string());
-        }
     }
 
     let system_prompt = crate::server::prompt::build_task_system_prompt_async(
@@ -437,20 +514,10 @@ pub async fn run_farm_from_marker(
 
     let mut composed = String::new();
     for r in &outcome.results {
-        composed.push_str(&format!(
-            "## {}
-{}
-
-",
-            r.sub_id, r.text
-        ));
+        composed.push_str(&format!("## {}\n{}\n\n", r.sub_id, r.text));
     }
     if !outcome.failed.is_empty() {
-        composed.push_str(&format!(
-            "(failed subtasks: {:?})
-",
-            outcome.failed
-        ));
+        composed.push_str(&format!("(failed subtasks: {:?})\n", outcome.failed));
     }
 
     let final_text = match synthesis {
@@ -536,6 +603,7 @@ mod tests {
             max_concurrency: 3,
             max_attempts: 2,
             subtask_ttl: Duration::from_millis(ttl_ms),
+            wall_budget: Duration::from_secs(30),
             reclaim_abort,
         }
     }
@@ -550,7 +618,7 @@ mod tests {
             "tenure-1",
             dir.path().to_path_buf(),
             spec(&[("a", "pa"), ("b", "pb"), ("c", "pc")]),
-            caps(5_000, true),
+            caps(10_000, true),
             |sub: SubtaskSpec| async move { Ok(format!("done:{}", sub.id)) },
         )
         .await;
@@ -561,24 +629,26 @@ mod tests {
         let mut texts: Vec<_> = outcome.results.iter().map(|r| r.text.clone()).collect();
         texts.sort();
         assert_eq!(texts, vec!["done:a", "done:b", "done:c"]);
-        // Tokens were minted per subtask resource (watermarks exist).
+        // Tokens were minted per index-keyed subtask resource.
         let table = leases.lock().await;
-        for sub in ["a", "b", "c"] {
-            assert!(table.table().watermark(&format!("farm-f1-{sub}")).is_some());
+        for i in 0..3 {
+            assert!(table.table().watermark(&format!("farm-f1-s{i}")).is_some());
         }
     }
 
     /// AC21 + AC22 (spec Stage 3 exit): a stalled child is reclaimed under a
-    /// strictly higher token; its LATE commit is rejected by fencing; the
-    /// outcome carries exactly one result — the successor's.
+    /// strictly higher token; its LATE result is rejected by fencing —
+    /// observable in the outcome — and exactly one result survives: the
+    /// successor's.
     #[tokio::test]
     async fn reclaimed_child_late_result_is_fenced_and_parent_uncorrupted() {
         let dir = tempfile::tempdir().unwrap();
         let leases = shared_leases(dir.path());
 
-        // Attempt 1 stalls past the 200ms ttl and finishes late (600ms);
-        // attempt 2 completes promptly. reclaim_abort=false lets the stale
-        // child live long enough to actually hit the fence.
+        // Attempt 1 stalls past the 1s ttl and finishes at 1.8s; attempt 2
+        // completes promptly. reclaim_abort=false keeps the stale child
+        // alive, and the controller waits for it to hit the fence before the
+        // farm reports — so late_fenced is asserted, not assumed.
         let attempt = Arc::new(std::sync::atomic::AtomicU32::new(0));
         let attempt_c = Arc::clone(&attempt);
         let outcome = run_farm(
@@ -586,12 +656,12 @@ mod tests {
             "tenure-1",
             dir.path().to_path_buf(),
             spec(&[("slow", "p")]),
-            caps(200, false),
+            caps(1_000, false),
             move |_sub: SubtaskSpec| {
                 let n = attempt_c.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                 async move {
                     if n == 0 {
-                        tokio::time::sleep(Duration::from_millis(600)).await;
+                        tokio::time::sleep(Duration::from_millis(1_800)).await;
                         Ok("STALE result from reclaimed child".to_string())
                     } else {
                         Ok("fresh result".to_string())
@@ -601,32 +671,37 @@ mod tests {
         )
         .await;
 
-        // Give the stale child time to fire its late commit before asserting.
-        tokio::time::sleep(Duration::from_millis(600)).await;
-
         assert_eq!(outcome.results.len(), 1, "exactly one result");
         assert_eq!(outcome.results[0].text, "fresh result");
         assert_eq!(outcome.results[0].attempts, 2);
         assert_eq!(outcome.reclaims, 1);
+        assert_eq!(
+            outcome.late_fenced, 1,
+            "the stale commit must hit the fence"
+        );
         // Token strictly increased across the reclaim.
         let table = leases.lock().await;
-        assert!(table.table().watermark("farm-f1-slow").unwrap() >= FencingToken(2));
+        assert!(table.table().watermark("farm-f1-s0").unwrap() >= FencingToken(2));
     }
 
-    /// The late-fenced counter observes the rejection when the stale child
-    /// commits after the farm reports (deterministic ordering variant).
+    /// Store-level pin of the exact interleaving, incl. that a fence can
+    /// never be lowered and a controller only takes its own token's result.
     #[tokio::test]
-    async fn late_commit_is_observably_fenced() {
+    async fn late_commit_is_observably_fenced_and_token_scoped() {
         let results = Arc::new(FarmResults::new());
 
-        // Simulate the exact interleaving at the store level: attempt 1
-        // fenced at token 1; reclaim re-fences at token 2 BEFORE the stale
-        // child commits; stale commit rejected; successor accepted.
-        results.fence_at("s", FencingToken(1)).await;
-        results.fence_at("s", FencingToken(2)).await;
+        results.raise_fence("s", FencingToken(1)).await;
+        results.raise_fence("s", FencingToken(2)).await;
+        // Attempting to lower the fence is a no-op.
+        results.raise_fence("s", FencingToken(1)).await;
         assert!(!results.commit("s", FencingToken(1), "stale".into()).await);
         assert!(results.commit("s", FencingToken(2), "fresh".into()).await);
-        assert_eq!(results.take("s").await.as_deref(), Some("fresh"));
+        // A controller holding token 1 cannot take token 2's result.
+        assert!(results.take_if_token("s", FencingToken(1)).await.is_none());
+        assert_eq!(
+            results.take_if_token("s", FencingToken(2)).await.as_deref(),
+            Some("fresh")
+        );
         assert_eq!(
             results
                 .late_fenced
@@ -671,6 +746,48 @@ mod tests {
         )
         .await;
         assert!(outcome.results.is_empty());
+        assert_eq!(outcome.failed, vec!["a".to_string()]);
+    }
+
+    /// The wall budget aborts a farm that would outrun its parent's lease.
+    #[tokio::test]
+    async fn wall_budget_bounds_the_farm() {
+        let dir = tempfile::tempdir().unwrap();
+        let leases = shared_leases(dir.path());
+        let mut c = caps(10_000, true);
+        c.wall_budget = Duration::from_millis(300);
+        let outcome = run_farm(
+            leases,
+            "tenure-1",
+            dir.path().to_path_buf(),
+            spec(&[("a", "p")]),
+            c,
+            |_sub: SubtaskSpec| async move {
+                tokio::time::sleep(Duration::from_secs(60)).await;
+                Ok("too late".to_string())
+            },
+        )
+        .await;
+        assert!(outcome.results.is_empty());
+        assert_eq!(outcome.failed, vec!["a".to_string()]);
+    }
+
+    /// Duplicate subtask ids are dropped (kept once), not silently collided.
+    #[tokio::test]
+    async fn duplicate_subtask_ids_are_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let leases = shared_leases(dir.path());
+        let outcome = run_farm(
+            leases,
+            "tenure-1",
+            dir.path().to_path_buf(),
+            spec(&[("a", "p1"), ("a", "p2")]),
+            caps(5_000, true),
+            |sub: SubtaskSpec| async move { Ok(format!("done:{}", sub.prompt)) },
+        )
+        .await;
+        assert_eq!(outcome.results.len(), 1);
+        assert_eq!(outcome.results[0].text, "done:p1");
         assert_eq!(outcome.failed, vec!["a".to_string()]);
     }
 }
