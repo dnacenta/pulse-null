@@ -112,13 +112,26 @@ pub async fn event_listener(
                     }
                 }
 
+                // Shed while isolated: translating events writes intent and
+                // evaluator state.
+                if crate::server::isolation::is_active(&root_dir) {
+                    continue;
+                }
                 if let Some(intent) = translate_event(&event, &events_config) {
-                    let mut q = intent_queue.write().await;
-                    if q.push(intent.clone(), max_queue_size) {
-                        tracing::info!("Event → intent queued: '{}'", intent.description);
-                        if let Err(e) = q.save() {
-                            tracing::error!("Failed to persist intent queue: {}", e);
-                        }
+                    // Delta against disk (reconcile) + refresh the shared copy,
+                    // so this push survives a concurrent daemon write and vice versa.
+                    let mut pushed = false;
+                    let description = intent.description.clone();
+                    let merged =
+                        crate::scheduler::intent::IntentQueue::save_delta(&root_dir, |q| {
+                            pushed = q.push(intent, max_queue_size);
+                        });
+                    match merged {
+                        Ok(merged) => *intent_queue.write().await = merged,
+                        Err(e) => tracing::error!("Failed to persist intent queue: {}", e),
+                    }
+                    if pushed {
+                        tracing::info!("Event → intent queued: '{}'", description);
 
                         // Record fire in evaluator state via trait
                         if let Some(ref eval) = evaluator {
@@ -140,12 +153,12 @@ pub async fn event_listener(
                         if is_post_conversation {
                             tracing::warn!(
                                 "PostInteraction intent rejected (queue full or duplicate): '{}'",
-                                intent.description
+                                description
                             );
                         } else {
                             tracing::debug!(
                                 "Event intent not queued (full or duplicate): '{}'",
-                                intent.description
+                                description
                             );
                         }
                     }

@@ -83,15 +83,13 @@ pub struct Schedule {
 }
 
 impl Schedule {
-    /// Load schedule from schedule.json in the entity root
+    /// Load schedule from schedule.json in the entity root. Pure read: a
+    /// missing file is an error. Only `load_or_init` (boot) may create the
+    /// defaults — this load runs from task loops and save_delta, where a
+    /// transiently absent file (unlink+rename edit, restore, mount blip)
+    /// must NEVER silently resurrect the full default task set.
     pub fn load(root_dir: &Path) -> Result<Self, crate::errors::SchedulerError> {
         let path = root_dir.join("schedule.json");
-        if !path.exists() {
-            // No schedule file — create with defaults
-            let schedule = Self::with_defaults();
-            schedule.save(root_dir)?;
-            return Ok(schedule);
-        }
         let content = std::fs::read_to_string(&path)?;
         // Accept both {"tasks": [...]} and bare [...]
         let schedule: Schedule = match serde_json::from_str::<Schedule>(&content) {
@@ -104,11 +102,26 @@ impl Schedule {
         Ok(schedule)
     }
 
-    /// Save schedule to schedule.json
+    /// Boot-time load: creates and persists the default schedule if the file
+    /// does not exist yet (fresh entity).
+    pub fn load_or_init(root_dir: &Path) -> Result<Self, crate::errors::SchedulerError> {
+        if !root_dir.join("schedule.json").exists() {
+            let schedule = Self::with_defaults();
+            schedule.save(root_dir)?;
+            return Ok(schedule);
+        }
+        Self::load(root_dir)
+    }
+
+    /// Save schedule to schedule.json, atomically (tmp + rename) so a
+    /// concurrent reader never observes a truncated file and the file is
+    /// never transiently absent.
     pub fn save(&self, root_dir: &Path) -> Result<(), crate::errors::SchedulerError> {
         let path = root_dir.join("schedule.json");
+        let tmp = root_dir.join(format!(".schedule.json.tmp.{}", std::process::id()));
         let content = serde_json::to_string_pretty(self)?;
-        std::fs::write(&path, content)?;
+        std::fs::write(&tmp, content)?;
+        std::fs::rename(&tmp, &path)?;
         Ok(())
     }
 
@@ -154,14 +167,51 @@ impl Schedule {
         self.tasks.retain(|t| t.task.id != id);
         self.tasks.len() < len_before
     }
+
+    /// Apply a mutation against the CURRENT on-disk schedule and persist the
+    /// result. This is reconcile (coordinator spec, decision 2) applied to
+    /// every write: the writer re-reads disk at the moment of writing instead
+    /// of assuming its in-memory copy is authoritative, so edits from other
+    /// surfaces — the CLI, the TUI, anything that ran while the coordinator
+    /// was down — survive. Returns the merged schedule so the caller can
+    /// refresh its shared copy.
+    ///
+    /// The load-apply-save window is serialized against every other
+    /// `save_delta` caller: in-process via a static mutex, cross-process
+    /// (daemon vs CLI) via an exclusive lock on `schedule.json.lock`.
+    pub fn save_delta(
+        root_dir: &Path,
+        apply: impl FnOnce(&mut Schedule),
+    ) -> Result<Schedule, crate::errors::SchedulerError> {
+        static IN_PROCESS: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let _guard = IN_PROCESS.lock().unwrap_or_else(|p| p.into_inner());
+
+        let lock_path = root_dir.join("schedule.json.lock");
+        let lock_file = std::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(false)
+            .open(&lock_path)?;
+        lock_file.lock()?;
+
+        let mut disk = Self::load(root_dir)?;
+        apply(&mut disk);
+        disk.save(root_dir)?;
+        Ok(disk)
+        // lock_file drop releases the flock
+    }
 }
 
-/// Start the scheduler alongside the server.
+/// Start the scheduler alongside the server. Called only by the coordinator,
+/// under a held control-plane lease; individual task runs and intent claims
+/// take their own leases from the shared table.
 /// Returns a handle that can be used for graceful shutdown.
 pub async fn start(
     state: Arc<AppState>,
     schedule: Arc<RwLock<Schedule>>,
     intent_queue: Arc<RwLock<intent::IntentQueue>>,
+    leases: crate::coordinator::control::SharedLeases,
+    tenure_holder: String,
 ) -> Result<Vec<tokio::task::JoinHandle<()>>, crate::errors::SchedulerError> {
     if !state.config.scheduler.enabled {
         tracing::info!("Scheduler disabled in config");
@@ -202,9 +252,13 @@ pub async fn start(
         let schedule = Arc::clone(&schedule);
         let queue = Arc::clone(&intent_queue);
         let task_health = Arc::clone(&health);
+        let tenure = crate::coordinator::control::TenureLeases {
+            leases: Arc::clone(&leases),
+            holder: tenure_holder.clone(),
+        };
 
         let handle = tokio::spawn(async move {
-            runner::run_task_loop(entry, state, schedule, queue, task_health, tz).await;
+            runner::run_task_loop(entry, state, schedule, queue, task_health, tz, tenure).await;
         });
 
         handles.push(handle);
@@ -226,8 +280,17 @@ pub async fn start(
         let drain_state = Arc::clone(&state);
         let drain_queue = Arc::clone(&intent_queue);
         let drain_schedule = Arc::clone(&schedule);
+        let drain_leases = Arc::clone(&leases);
+        let drain_holder = tenure_holder.clone();
         let drain_handle = tokio::spawn(async move {
-            intent::drain_loop(drain_state, drain_queue, drain_schedule).await;
+            intent::drain_loop(
+                drain_state,
+                drain_queue,
+                drain_schedule,
+                drain_leases,
+                drain_holder,
+            )
+            .await;
         });
         handles.push(drain_handle);
 
@@ -261,6 +324,107 @@ pub fn normalize_cron(expr: &str) -> String {
 mod tests {
     use super::*;
     use tempfile::TempDir;
+
+    /// MEDIUM-3 regression: concurrent save_delta callers must not lose
+    /// updates (load-apply-save is serialized by the static mutex + flock).
+    #[test]
+    fn concurrent_save_deltas_lose_nothing() {
+        let dir = TempDir::new().unwrap();
+        let root = dir.path().to_path_buf();
+        Schedule::load_or_init(&root).unwrap();
+
+        let handles: Vec<_> = (0..8)
+            .map(|i| {
+                let root = root.clone();
+                std::thread::spawn(move || {
+                    let entry = ScheduleEntry::from(ScheduledTask {
+                        id: format!("concurrent-{i}"),
+                        name: format!("Concurrent {i}"),
+                        cron: "0 0 12 * * *".into(),
+                        channel: "system".into(),
+                        prompt: "p".into(),
+                        output_routing: OutputRouting::Silent,
+                        enabled: true,
+                        created_by: TaskCreator::Entity,
+                        evaluator: None,
+                    });
+                    Schedule::save_delta(&root, |s| s.add_task(entry)).unwrap();
+                })
+            })
+            .collect();
+        for h in handles {
+            h.join().unwrap();
+        }
+
+        let disk = Schedule::load(&root).unwrap();
+        for i in 0..8 {
+            assert!(
+                disk.find_task(&format!("concurrent-{i}")).is_some(),
+                "task concurrent-{i} was lost to a racing save_delta"
+            );
+        }
+    }
+
+    /// HIGH-2 regression: a transiently absent schedule.json must never
+    /// resurrect the default task set from a background path.
+    #[test]
+    fn pure_load_errors_on_missing_file_instead_of_creating_defaults() {
+        let dir = TempDir::new().unwrap();
+        assert!(Schedule::load(dir.path()).is_err());
+        // And it wrote nothing.
+        assert!(!dir.path().join("schedule.json").exists());
+        // Boot path does create.
+        Schedule::load_or_init(dir.path()).unwrap();
+        assert!(dir.path().join("schedule.json").exists());
+    }
+
+    /// AC12 fixture: an external edit ("CLI disabled a task while the
+    /// coordinator was down / mid-tenure") survives a marker-driven save,
+    /// because save_delta re-reads disk instead of writing stale memory.
+    #[test]
+    fn save_delta_preserves_external_edits() {
+        let dir = TempDir::new().unwrap();
+        let root = dir.path();
+
+        // Boot-time state: defaults on disk, one copy held "in memory".
+        let mut in_memory = Schedule::load_or_init(root).unwrap();
+        assert!(!in_memory.tasks.is_empty());
+        let existing_id = in_memory.tasks[0].task.id.clone();
+        assert!(in_memory.find_task(&existing_id).unwrap().task.enabled);
+
+        // External edit while the holder of `in_memory` isn't looking:
+        // the CLI disables the task on disk.
+        {
+            let mut cli_copy = Schedule::load(root).unwrap();
+            cli_copy.find_task_mut(&existing_id).unwrap().task.enabled = false;
+            cli_copy.save(root).unwrap();
+        }
+
+        // Marker path fires: adds a new task via save_delta. The OLD code
+        // would have saved `in_memory` wholesale, resurrecting the task.
+        let new_task = ScheduleEntry::from(ScheduledTask {
+            id: "self-scheduled".into(),
+            name: "Self Scheduled".into(),
+            cron: "0 0 12 * * *".into(),
+            channel: "system".into(),
+            prompt: "do the thing".into(),
+            output_routing: OutputRouting::Silent,
+            enabled: true,
+            created_by: TaskCreator::Entity,
+            evaluator: None,
+        });
+        in_memory = Schedule::save_delta(root, |s| s.add_task(new_task)).unwrap();
+
+        // Disk has both the external disable AND the new task; the refreshed
+        // in-memory copy agrees with disk.
+        let disk = Schedule::load(root).unwrap();
+        assert!(!disk.find_task(&existing_id).unwrap().task.enabled);
+        assert!(disk.find_task("self-scheduled").is_some());
+        assert_eq!(
+            serde_json::to_string(&disk).unwrap(),
+            serde_json::to_string(&in_memory).unwrap()
+        );
+    }
 
     /// Two tasks, one pinned to a model and one not — the shape an operator
     /// actually ends up with.

@@ -17,9 +17,16 @@ pub async fn health(State(state): State<Arc<AppState>>) -> (StatusCode, Json<ser
         ProviderState::Offline => (StatusCode::SERVICE_UNAVAILABLE, "offline"),
     };
 
+    let isolated = crate::server::isolation::is_active(&state.root_dir);
+    let leading = state.leadership.load(std::sync::atomic::Ordering::Relaxed);
     let mut body = serde_json::json!({
         "status": state_str,
         "entity": state.config.entity.name,
+        "isolation": isolated,
+        // Observed state only — the marker is reported separately as
+        // `isolation`; claiming "shed" from the marker alone would lie
+        // whenever the coordinator is wedged and its tasks still run.
+        "control_plane": if leading { "leading" } else { "not-leading" },
     });
 
     if status.state != ProviderState::Healthy {

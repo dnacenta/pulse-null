@@ -109,12 +109,16 @@ impl Tool for GraphQueryTool {
                     // Best-effort, no-op for non-retrieval modes (empty ids).
                     // The write goes through `spawn_blocking` so it never
                     // stalls the async runtime.
-                    crate::graph_feedback::emit_manifest(
-                        entity_root,
-                        correlation_id,
-                        retrieved_ids,
-                    )
-                    .await;
+                    // Shed while isolated: the retrieval manifest is a write
+                    // into archives/ — and the graph is a likely suspect.
+                    if !crate::server::isolation::is_active(&entity_root) {
+                        crate::graph_feedback::emit_manifest(
+                            entity_root,
+                            correlation_id,
+                            retrieved_ids,
+                        )
+                        .await;
+                    }
                     Ok(output)
                 }
                 Ok(Err(e)) => Err(ToolError::ExecutionFailed(e)),

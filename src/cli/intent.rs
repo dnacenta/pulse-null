@@ -57,7 +57,6 @@ pub async fn add(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let config = Config::load()?;
     let root_dir = config.root_dir()?;
-    let mut queue = IntentQueue::load(&root_dir);
 
     let priority = match priority.as_str() {
         "low" => IntentPriority::Low,
@@ -81,8 +80,9 @@ pub async fn add(
     };
 
     let max_size = config.autonomy.max_queue_size;
-    if queue.push(intent, max_size) {
-        queue.save()?;
+    let mut pushed = false;
+    IntentQueue::save_delta(&root_dir, |q| pushed = q.push(intent, max_size))?;
+    if pushed {
         println!(
             "  Intent '{}' added (id: {})",
             style(&description).cyan(),
@@ -98,10 +98,10 @@ pub async fn add(
 pub async fn remove(id: String) -> Result<(), Box<dyn std::error::Error>> {
     let config = Config::load()?;
     let root_dir = config.root_dir()?;
-    let mut queue = IntentQueue::load(&root_dir);
 
-    if queue.remove(&id) {
-        queue.save()?;
+    let mut removed = false;
+    IntentQueue::save_delta(&root_dir, |q| removed = q.remove(&id))?;
+    if removed {
         println!("  Intent '{}' removed.", style(&id).cyan());
     } else {
         println!("  Intent '{}' not found.", style(&id).red());
@@ -113,11 +113,12 @@ pub async fn remove(id: String) -> Result<(), Box<dyn std::error::Error>> {
 pub async fn clear() -> Result<(), Box<dyn std::error::Error>> {
     let config = Config::load()?;
     let root_dir = config.root_dir()?;
-    let mut queue = IntentQueue::load(&root_dir);
 
-    let count = queue.len();
-    queue.clear();
-    queue.save()?;
+    let mut count = 0;
+    IntentQueue::save_delta(&root_dir, |q| {
+        count = q.len();
+        q.clear();
+    })?;
 
     println!("  Cleared {} intent(s).", count);
     Ok(())

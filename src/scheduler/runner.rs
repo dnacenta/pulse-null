@@ -18,6 +18,11 @@ use crate::provider_status;
 use crate::server::prompt;
 use crate::server::AppState;
 
+/// Ttl on a per-run task lease. Covers the full side-effect window of one
+/// execution (LLM rounds included); a run that wedges past this is
+/// reclaimable and its late writes are what fencing exists to reject.
+const TASK_LEASE_TTL: std::time::Duration = std::time::Duration::from_secs(30 * 60);
+
 /// Run a single task in a loop: calculate next fire time → sleep → execute → repeat.
 pub async fn run_task_loop(
     entry: ScheduleEntry,
@@ -26,8 +31,10 @@ pub async fn run_task_loop(
     intent_queue: Arc<RwLock<IntentQueue>>,
     health: SharedTaskHealth,
     tz: chrono_tz::Tz,
+    tenure: crate::coordinator::control::TenureLeases,
 ) {
     let task = &entry.task;
+    let lease_resource = format!("task-{}", crate::coordinator::control::lease_safe(&task.id));
     let normalized_cron = super::normalize_cron(&task.cron);
     let cron_expr = match CronSchedule::from_str(&normalized_cron) {
         Ok(c) => c,
@@ -70,17 +77,38 @@ pub async fn run_task_loop(
 
         tokio::time::sleep(duration).await;
 
-        // Check if still enabled (might have been disabled at runtime)
+        // Check if still enabled — against DISK, so a `pulse-null schedule
+        // disable` from the CLI takes effect at the next fire without a
+        // service restart (the in-memory copy can't see external edits).
+        // Falls back to the shared copy if the file is transiently unreadable.
         {
-            let sched = schedule.read().await;
-            if let Some(t) = sched.find_task(&task.id) {
-                if !t.task.enabled {
+            let rd = root_dir.clone();
+            let disk = tokio::task::spawn_blocking(move || Schedule::load(&rd)).await;
+            let entry_enabled = match disk {
+                Ok(Ok(fresh)) => {
+                    let enabled = fresh.find_task(&task.id).map(|t| t.task.enabled);
+                    *schedule.write().await = fresh;
+                    enabled
+                }
+                _ => {
+                    tracing::warn!(
+                        "Task '{}': schedule.json unreadable for enabled-check; using shared copy",
+                        task.id
+                    );
+                    let sched = schedule.read().await;
+                    sched.find_task(&task.id).map(|t| t.task.enabled)
+                }
+            };
+            match entry_enabled {
+                Some(true) => {}
+                Some(false) => {
                     tracing::info!("Task '{}' disabled, stopping loop", task.id);
                     return;
                 }
-            } else {
-                tracing::info!("Task '{}' removed, stopping loop", task.id);
-                return;
+                None => {
+                    tracing::info!("Task '{}' removed, stopping loop", task.id);
+                    return;
+                }
             }
         }
 
@@ -122,6 +150,43 @@ pub async fn run_task_loop(
             }
         }
 
+        // Isolation backstop: independent of the coordinator loop (which may
+        // itself be wedged — the very case isolation exists for), every task
+        // checks the marker before firing.
+        if crate::server::isolation::is_active(&root_dir) {
+            tracing::warn!("Task '{}': ISOLATION active — stopping loop", task.id);
+            return;
+        }
+
+        // Tenure liveness: if our tenure no longer holds the control plane
+        // (the leadership loop died without aborting us — a wedge), stop
+        // rather than keep acting as a stale tenure.
+        if !tenure_still_leads(&tenure.leases, &tenure.holder).await {
+            tracing::warn!(
+                "Task '{}': tenure '{}' no longer leads; stopping loop",
+                task.id,
+                tenure.holder
+            );
+            return;
+        }
+
+        // Claim the per-run lease before any side effect. A refusal means a
+        // prior run of this task is still inside its side-effect window (or
+        // wedged short of its ttl) — skip this fire rather than double-run.
+        // Error level: a skipped fire on a daily cron is a lost day.
+        let claim = {
+            tenure.leases.lock().await.acquire(
+                &lease_resource,
+                &tenure.holder,
+                TASK_LEASE_TTL,
+                chrono::Utc::now(),
+            )
+        };
+        if let Err(e) = claim {
+            tracing::error!("Task '{}' fire SKIPPED — lease not available: {e}", task.id);
+            continue;
+        }
+
         tracing::info!(
             model = %entry.effective_model(&state.config.llm.model),
             "Executing scheduled task: {}",
@@ -132,10 +197,19 @@ pub async fn run_task_loop(
         if run_builtin_handler(task, &state, &root_dir).await {
             liveness::record_outcome(&health, &state, &task.id, &task.name, TaskOutcome::Success)
                 .await;
+            release_task_lease(&tenure.leases, &lease_resource, &tenure.holder, &task.id).await;
             continue;
         }
 
-        let outcome = execute_task(&entry, &state, &schedule, &intent_queue, &mut eval_state).await;
+        let outcome = execute_task(
+            &entry,
+            &state,
+            &schedule,
+            &intent_queue,
+            &mut eval_state,
+            &tenure,
+        )
+        .await;
         // Diagnostics before the outcome is recorded: the store must still
         // describe the previous cycle for "is this failure news?" to mean
         // anything. Every failure path converges here, so a failure that never
@@ -144,6 +218,25 @@ pub async fn run_task_loop(
             diagnostics::report_failure(&health, &state, &entry, error).await;
         }
         liveness::record_outcome(&health, &state, &task.id, &task.name, outcome).await;
+        release_task_lease(&tenure.leases, &lease_resource, &tenure.holder, &task.id).await;
+    }
+}
+
+/// Release the per-run lease after the outcome is recorded. A failure here is
+/// survivable — the lease expires on its ttl — but worth a warning because it
+/// delays the next fire of this task by up to the remaining ttl.
+async fn release_task_lease(
+    leases: &crate::coordinator::control::SharedLeases,
+    resource: &str,
+    holder: &str,
+    task_id: &str,
+) {
+    if let Err(e) = leases
+        .lock()
+        .await
+        .release(resource, holder, chrono::Utc::now())
+    {
+        tracing::warn!("Task '{task_id}': lease release failed ({e}); next fire may be delayed");
     }
 }
 
@@ -195,6 +288,7 @@ async fn execute_task(
     schedule: &Arc<RwLock<Schedule>>,
     intent_queue: &Arc<RwLock<IntentQueue>>,
     eval_state: &mut SchedulerState,
+    tenure: &crate::coordinator::control::TenureLeases,
 ) -> TaskOutcome {
     let task = &entry.task;
     // Use cached root_dir from AppState
@@ -418,7 +512,16 @@ async fn execute_task(
 
     // Parse and route output markers
     let parsed = output::parse_output(&response_text);
-    route_output_markers(&parsed, task, state, schedule, intent_queue, &root_dir).await;
+    route_output_markers(
+        &parsed,
+        task,
+        state,
+        schedule,
+        intent_queue,
+        &root_dir,
+        tenure,
+    )
+    .await;
 
     // Log to LOGBOOK.md
     log_execution(&root_dir, task, &parsed.clean_content);
@@ -742,6 +845,7 @@ async fn handle_provider_error(state: &Arc<AppState>, task_id: &str, error_msg: 
 ///
 /// Handles [SCHEDULE:], [SHARE:], [CALL:], [INTENT:], and [CHAIN:] markers
 /// extracted from the LLM response.
+#[allow(clippy::too_many_arguments)]
 async fn route_output_markers(
     parsed: &output::ParsedOutput,
     task: &ScheduledTask,
@@ -749,6 +853,7 @@ async fn route_output_markers(
     schedule: &Arc<RwLock<Schedule>>,
     intent_queue: &Arc<RwLock<IntentQueue>>,
     root_dir: &std::path::Path,
+    tenure: &crate::coordinator::control::TenureLeases,
 ) {
     // [SCHEDULE:] — create new dynamic tasks
     for schedule_json in &parsed.schedule_requests {
@@ -759,10 +864,12 @@ async fn route_output_markers(
                     new_task.name,
                     new_task.cron
                 );
-                let mut sched = schedule.write().await;
-                sched.add_task(new_task);
-                if let Err(e) = sched.save(root_dir) {
-                    tracing::error!("Failed to persist schedule: {}", e);
+                // Delta against disk, never a wholesale write of memory —
+                // concurrent CLI/TUI edits survive; then refresh the shared
+                // copy from the merged result.
+                match Schedule::save_delta(root_dir, |s| s.add_task(new_task)) {
+                    Ok(merged) => *schedule.write().await = merged,
+                    Err(e) => tracing::error!("Failed to persist schedule: {}", e),
                 }
             }
             Err(e) => {
@@ -794,10 +901,12 @@ async fn route_output_markers(
                         task.id,
                         new_intent.description
                     );
-                    let mut q = intent_queue.write().await;
-                    q.push(new_intent, state.config.autonomy.max_queue_size);
-                    if let Err(e) = q.save() {
-                        tracing::error!("Failed to persist intent queue: {}", e);
+                    let max = state.config.autonomy.max_queue_size;
+                    match intent::IntentQueue::save_delta(root_dir, |q| {
+                        q.push(new_intent, max);
+                    }) {
+                        Ok(merged) => *intent_queue.write().await = merged,
+                        Err(e) => tracing::error!("Failed to persist intent queue: {}", e),
                     }
                 }
                 Err(e) => tracing::warn!("Invalid [INTENT:] marker: {}", e),
@@ -828,14 +937,44 @@ async fn route_output_markers(
                         task.id,
                         chain_intent.description
                     );
-                    let mut q = intent_queue.write().await;
-                    q.push(chain_intent, state.config.autonomy.max_queue_size);
-                    if let Err(e) = q.save() {
-                        tracing::error!("Failed to persist intent queue: {}", e);
+                    let max = state.config.autonomy.max_queue_size;
+                    match intent::IntentQueue::save_delta(root_dir, |q| {
+                        q.push(chain_intent, max);
+                    }) {
+                        Ok(merged) => *intent_queue.write().await = merged,
+                        Err(e) => tracing::error!("Failed to persist intent queue: {}", e),
                     }
                 }
                 Err(e) => tracing::warn!("Invalid [CHAIN:] marker: {}", e),
             }
+        }
+    }
+
+    // [FARM:] — bounded subtask delegation on the lease substrate (Stage 3).
+    // Routed LAST so [SHARE:]/[CALL:] in the same response are not delayed
+    // behind a long farm; one farm per response.
+    if let Some(farm_json) = parsed.farm_requests.first() {
+        if parsed.farm_requests.len() > 1 {
+            tracing::warn!(
+                "Task '{}': {} [FARM:] markers in one response — running only the first",
+                task.id,
+                parsed.farm_requests.len()
+            );
+        }
+        match crate::coordinator::farm::run_farm_from_marker(farm_json, state, tenure).await {
+            Ok(result) => {
+                tracing::info!("Task '{}' farm complete ({} chars)", task.id, result.len());
+                crate::logbook::write_task_output(
+                    root_dir,
+                    &format!("{}-farm", task.id),
+                    &format!("{} (farm)", task.name),
+                    &result,
+                    0,
+                    0,
+                    0,
+                );
+            }
+            Err(e) => tracing::warn!("[FARM:] from task '{}' failed: {e}", task.id),
         }
     }
 }
@@ -936,4 +1075,17 @@ async fn post_process_predictions(
     if let Err(e) = crate::prediction::store::save_async(root_dir.to_path_buf(), stack).await {
         tracing::error!("Failed to save prediction stack: {e}");
     }
+}
+
+/// True while this tenure's holder still owns an unexpired control-plane
+/// lease. Task loops check it before each fire so a wedged coordinator's
+/// orphans stop themselves instead of acting as a stale tenure.
+async fn tenure_still_leads(
+    leases: &crate::coordinator::control::SharedLeases,
+    tenure_holder: &str,
+) -> bool {
+    let table = leases.lock().await;
+    table
+        .get(crate::coordinator::control::CONTROL_PLANE_RESOURCE)
+        .is_some_and(|l| l.holder_id == tenure_holder && !l.is_expired(chrono::Utc::now()))
 }

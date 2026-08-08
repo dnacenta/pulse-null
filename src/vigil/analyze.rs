@@ -97,7 +97,7 @@ pub fn run(history: &[SignalVector], config: &Config) -> Analysis {
         match trend {
             Trend::Improving => {
                 improving += 1;
-                if best_delta.as_ref().map_or(true, |(_, bd)| delta > *bd) {
+                if best_delta.as_ref().is_none_or(|(_, bd)| delta > *bd) {
                     best_delta = Some((name.to_string(), delta));
                 }
             }

@@ -174,12 +174,13 @@ impl EntityTab {
         let Some(ref root) = self.schedule_root else {
             return;
         };
-        if let Ok(mut schedule) = Schedule::load(root) {
-            if let Some(entry) = schedule.find_task_mut(&task.id) {
-                entry.task.enabled = task.enabled;
+        let enabled = task.enabled;
+        let task_id = task.id.clone();
+        let _ = Schedule::save_delta(root, |s| {
+            if let Some(entry) = s.find_task_mut(&task_id) {
+                entry.task.enabled = enabled;
             }
-            let _ = schedule.save(root);
-        }
+        });
 
         // Update summary
         if let Some(ref mut summary) = self.schedule_summary {
@@ -205,10 +206,9 @@ impl EntityTab {
         let Some(ref root) = self.schedule_root else {
             return;
         };
-        if let Ok(mut schedule) = Schedule::load(root) {
-            schedule.remove_task(&task_id);
-            let _ = schedule.save(root);
-        }
+        let _ = Schedule::save_delta(root, |s| {
+            s.remove_task(&task_id);
+        });
 
         self.schedule_tasks.retain(|t| t.id != task_id);
         if self.schedule_selected >= self.schedule_tasks.len() && self.schedule_selected > 0 {

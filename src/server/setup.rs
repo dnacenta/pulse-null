@@ -69,6 +69,28 @@ pub fn register_builtin_tools(root_dir: &Path, config: &Config) -> ToolRegistry 
     tools
 }
 
+/// The read-only introspection tool set for Isolation Mode (coordinator
+/// spec, Stage 2): journal/ and memory/ are readable, nothing is writable,
+/// and nothing reaches outside the entity root. No plugin tools.
+pub fn register_readonly_tools(root_dir: &Path, config: &Config) -> ToolRegistry {
+    let mut tools = ToolRegistry::new();
+    tools.register(Box::new(crate::tools::file_read::FileReadTool::new(
+        root_dir.to_path_buf(),
+    )));
+    tools.register(Box::new(crate::tools::file_list::FileListTool::new(
+        root_dir.to_path_buf(),
+    )));
+    tools.register(Box::new(crate::tools::grep::GrepTool::new(
+        root_dir.to_path_buf(),
+    )));
+    if config.graph.enabled {
+        tools.register(Box::new(crate::tools::graph_query::GraphQueryTool::new(
+            root_dir.to_path_buf(),
+        )));
+    }
+    tools
+}
+
 /// Initialize and start plugins, collecting their tools into the registry.
 ///
 /// Returns the plugin manager and any plugin-contributed routes.
@@ -204,6 +226,11 @@ pub fn spawn_session_cleanup(config: &Config, state: &Arc<super::AppState>) {
             interval.tick().await; // Skip first immediate tick
             loop {
                 interval.tick().await;
+                // Shed while isolated: cleanup archives, persists, and graph-
+                // ingests — all writes (coordinator spec, Stage 2).
+                if crate::server::isolation::is_active(&cleanup_state.root_dir) {
+                    continue;
+                }
                 let archived_paths = cleanup_state
                     .session_store
                     .cleanup_expired(&cleanup_state.root_dir, &cleanup_state.config.entity.name)

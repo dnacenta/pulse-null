@@ -238,6 +238,7 @@ mod tests {
             wal: WalState::default(),
             health: HealthCounters::default(),
             compaction: CompactionMetrics::default(),
+            isolation_ephemeral_from: None,
         }
     }
 

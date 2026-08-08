@@ -31,6 +31,16 @@ pub async fn reset_session(
     State(state): State<Arc<AppState>>,
     Json(req): Json<ResetRequest>,
 ) -> Result<Json<ResetResponse>, (StatusCode, String)> {
+    // Resets archive to disk — shed while isolated.
+    if crate::server::isolation::is_active(&state.root_dir) {
+        return Err((
+            StatusCode::CONFLICT,
+            format!(
+                "{} isolation mode active — session reset writes are shed until /resume",
+                crate::server::isolation::BANNER
+            ),
+        ));
+    }
     // Find the session
     let sessions = state.session_store.sessions_map().await;
     let session_arc = match sessions.get(&req.session_key) {

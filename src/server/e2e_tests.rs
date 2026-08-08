@@ -34,6 +34,9 @@ use pulse_system_types::llm::{
 struct MockProvider {
     responses: std::sync::Mutex<Vec<LlmResponse>>,
     call_count: AtomicUsize,
+    /// Per-invocation artificial latency — lets a test hold a chat turn
+    /// "in flight" while something else happens to the process.
+    delay: std::time::Duration,
 }
 
 impl MockProvider {
@@ -41,6 +44,14 @@ impl MockProvider {
         Self {
             responses: std::sync::Mutex::new(responses),
             call_count: AtomicUsize::new(0),
+            delay: std::time::Duration::ZERO,
+        }
+    }
+
+    fn with_delay(responses: Vec<LlmResponse>, delay: std::time::Duration) -> Self {
+        Self {
+            delay,
+            ..Self::new(responses)
         }
     }
 }
@@ -71,7 +82,13 @@ impl LmProvider for MockProvider {
                 responses.remove(0)
             }
         };
-        Box::pin(async move { Ok(response) })
+        let delay = self.delay;
+        Box::pin(async move {
+            if !delay.is_zero() {
+                tokio::time::sleep(delay).await;
+            }
+            Ok(response)
+        })
     }
 
     fn name(&self) -> &str {
@@ -141,8 +158,17 @@ fn build_app(state: Arc<AppState>) -> Router {
 }
 
 async fn build_state(provider: MockProvider, tools: ToolRegistry) -> Arc<AppState> {
-    let root_dir = std::env::temp_dir();
+    build_state_in(std::env::temp_dir(), provider, tools).await
+}
+
+async fn build_state_in(
+    root_dir: std::path::PathBuf,
+    provider: MockProvider,
+    tools: ToolRegistry,
+) -> Arc<AppState> {
     let config = test_config();
+    let wal =
+        crate::wal::WalWriter::new(&root_dir.join("sessions"), crate::wal::WalFsync::None).ok();
     let session_store =
         crate::session_store::SessionStore::new(&root_dir, &config.sessions, &config.entity.name)
             .await;
@@ -162,9 +188,10 @@ async fn build_state(provider: MockProvider, tools: ToolRegistry) -> Arc<AppStat
         context_buffer: None,
         persist_coordinator: Arc::new(PersistCoordinator::new()),
         plugin_manager: tokio::sync::Mutex::new(plugin_manager),
-        wal: None,
+        wal,
         alert_queue: tokio::sync::Mutex::new(alert_queue),
         provider_status: crate::provider_status::new_shared(),
+        leadership: std::sync::atomic::AtomicBool::new(false),
     })
 }
 
@@ -566,4 +593,321 @@ async fn e2e_token_accumulation_across_rounds() {
     let json: serde_json::Value = serde_json::from_str(&body).unwrap();
     assert_eq!(json["input_tokens"], 300); // 100 + 200
     assert_eq!(json["output_tokens"], 125); // 50 + 75
+}
+
+// ---------------------------------------------------------------------------
+// Fail-open: the data plane must not care about the coordinator (AC10, AC11)
+// ---------------------------------------------------------------------------
+
+fn mock_text(text: &str) -> LlmResponse {
+    LlmResponse {
+        content: vec![ContentBlock::Text {
+            text: text.to_string(),
+        }],
+        stop_reason: StopReason::EndTurn,
+        model: "mock-model".to_string(),
+        input_tokens: Some(1),
+        output_tokens: Some(1),
+    }
+}
+
+/// Wait until the coordinator has durably acquired the control-plane lease.
+/// Non-locking: reads the lease WAL's contents instead of opening the table
+/// (an open would steal the file lock out from under the coordinator).
+async fn wait_for_leadership(coord_dir: &std::path::Path) {
+    let wal_path = coord_dir.join("leases.jsonl");
+    for _ in 0..100 {
+        if let Ok(content) = std::fs::read_to_string(&wal_path) {
+            if content.contains("control-plane") {
+                return;
+            }
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    panic!("coordinator never acquired the control-plane lease");
+}
+
+/// AC10: an in-flight chat turn survives the coordinator wedging mid-turn,
+/// and chat keeps serving with the coordinator dead.
+#[tokio::test]
+async fn e2e_chat_survives_coordinator_wedge() {
+    let dir = tempfile::tempdir().unwrap();
+    let provider = MockProvider::with_delay(
+        vec![
+            mock_text("in-flight response"),
+            mock_text("post-wedge response"),
+        ],
+        std::time::Duration::from_millis(400),
+    );
+    let state = build_state_in(dir.path().to_path_buf(), provider, ToolRegistry::new()).await;
+
+    let schedule = Arc::new(RwLock::new(
+        crate::scheduler::Schedule::load_or_init(dir.path()).unwrap(),
+    ));
+    let intents = Arc::new(RwLock::new(crate::scheduler::intent::IntentQueue::load(
+        dir.path(),
+    )));
+    let coordinator =
+        crate::coordinator::control::Coordinator::start(Arc::clone(&state), schedule, intents);
+    wait_for_leadership(&dir.path().join("coordinator")).await;
+
+    let app = build_app(Arc::clone(&state));
+
+    // Put a chat turn in flight, then wedge the coordinator mid-turn.
+    let app_inflight = app.clone();
+    let inflight =
+        tokio::spawn(async move { post_chat(&app_inflight, "hello during wedge").await });
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    coordinator.wedge_for_test();
+
+    let (status, body) = inflight.await.unwrap();
+    assert_eq!(status, StatusCode::OK, "in-flight turn was interrupted");
+    let json: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(json["response"], "in-flight response");
+
+    // Fresh turns keep working with the coordinator dead.
+    let (status, body) = post_chat(&app, "anyone home?").await;
+    assert_eq!(status, StatusCode::OK, "chat died with the coordinator");
+    let json: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(json["response"], "post-wedge response");
+}
+
+/// AC11: while a coordinator holds the control plane, a second one cannot
+/// take it (WAL lock); after a clean shutdown the lease is released and a
+/// successor acquires immediately, without waiting out the ttl.
+#[tokio::test]
+async fn e2e_second_coordinator_locked_out_until_shutdown() {
+    let dir = tempfile::tempdir().unwrap();
+    let provider = MockProvider::new(vec![]);
+    let state = build_state_in(dir.path().to_path_buf(), provider, ToolRegistry::new()).await;
+
+    let schedule = Arc::new(RwLock::new(
+        crate::scheduler::Schedule::load_or_init(dir.path()).unwrap(),
+    ));
+    let intents = Arc::new(RwLock::new(crate::scheduler::intent::IntentQueue::load(
+        dir.path(),
+    )));
+    let coordinator =
+        crate::coordinator::control::Coordinator::start(Arc::clone(&state), schedule, intents);
+    let coord_dir = dir.path().join("coordinator");
+    wait_for_leadership(&coord_dir).await;
+
+    // A second coordinator (process) is refused at the WAL lock.
+    assert!(matches!(
+        crate::coordinator::durable::DurableLeaseTable::open(&coord_dir),
+        Err(crate::coordinator::wal::ReplayError::Locked { .. })
+    ));
+
+    // Clean shutdown releases the lease; a successor acquires immediately.
+    coordinator.shutdown().await;
+    let mut successor = crate::coordinator::durable::DurableLeaseTable::open(&coord_dir).unwrap();
+    let lease = successor
+        .acquire(
+            crate::coordinator::control::CONTROL_PLANE_RESOURCE,
+            "successor-1",
+            std::time::Duration::from_secs(90),
+            chrono::Utc::now(),
+        )
+        .expect("lease was not released on shutdown");
+    assert!(lease.fencing_token > crate::coordinator::lease::FencingToken(1));
+}
+
+// ---------------------------------------------------------------------------
+// Isolation Mode (Stage 2): AC16-AC19
+// ---------------------------------------------------------------------------
+
+async fn post_chat_on(app: &Router, channel: &str, message: &str) -> (StatusCode, String) {
+    let body = serde_json::json!({ "message": message, "channel": channel });
+    let req = Request::builder()
+        .method("POST")
+        .uri("/chat")
+        .header("Content-Type", "application/json")
+        .body(Body::from(serde_json::to_string(&body).unwrap()))
+        .unwrap();
+    let response = app.clone().oneshot(req).await.unwrap();
+    let status = response.status();
+    let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    (status, String::from_utf8(bytes.to_vec()).unwrap())
+}
+
+fn snapshot_dir(dir: &std::path::Path) -> Vec<(String, u64)> {
+    let mut entries = Vec::new();
+    if let Ok(rd) = std::fs::read_dir(dir) {
+        for e in rd.flatten() {
+            let len = e.metadata().map(|m| m.len()).unwrap_or(0);
+            entries.push((e.file_name().to_string_lossy().to_string(), len));
+        }
+    }
+    entries.sort();
+    entries
+}
+
+/// AC16 + AC17 + AC18: isolation entered and exited over the chat channel
+/// with the coordinator forcibly wedged; banner sticky; no writes while
+/// isolated; writes resume after exit.
+#[tokio::test]
+async fn e2e_isolation_over_chat_with_coordinator_wedged() {
+    let dir = tempfile::tempdir().unwrap();
+    let provider = MockProvider::new(vec![
+        mock_text("diagnosing in isolation"),
+        mock_text("second isolated turn"),
+        mock_text("normal again"),
+    ]);
+    let state = build_state_in(dir.path().to_path_buf(), provider, ToolRegistry::new()).await;
+
+    let schedule = Arc::new(RwLock::new(
+        crate::scheduler::Schedule::load_or_init(dir.path()).unwrap(),
+    ));
+    let intents = Arc::new(RwLock::new(crate::scheduler::intent::IntentQueue::load(
+        dir.path(),
+    )));
+    let coordinator =
+        crate::coordinator::control::Coordinator::start(Arc::clone(&state), schedule, intents);
+    wait_for_leadership(&dir.path().join("coordinator")).await;
+    // The case that matters (spec Stage 2 exit): trigger works with the
+    // coordinator wedged.
+    coordinator.wedge_for_test();
+
+    let app = build_app(Arc::clone(&state));
+
+    // Enter over the interactive channel ("system" resolves to owner).
+    let (status, body) = post_chat_on(&app, "system", "/isolate suspect graph").await;
+    assert_eq!(status, StatusCode::OK);
+    let json: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(json["isolation"], true);
+    assert!(json["response"]
+        .as_str()
+        .unwrap()
+        .starts_with(crate::server::isolation::BANNER));
+
+    // AC18: a normal turn while isolated writes nothing. Flush + settle
+    // first so an un-shed async write would land before the compare.
+    state
+        .persist_coordinator
+        .flush(std::time::Duration::from_secs(2))
+        .await;
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    let sessions_before = snapshot_dir(&dir.path().join("sessions"));
+    let wal_before = snapshot_dir(&dir.path().join("sessions").join("wal"));
+    let archives_before = snapshot_dir(&dir.path().join("archives").join("conversations"));
+
+    let (status, body) = post_chat_on(&app, "system", "what do you see in the journal?").await;
+    assert_eq!(status, StatusCode::OK);
+    let json: serde_json::Value = serde_json::from_str(&body).unwrap();
+    // AC17: sticky banner on every reply, not just the entry event.
+    assert_eq!(json["isolation"], true);
+    assert!(json["response"]
+        .as_str()
+        .unwrap()
+        .starts_with(crate::server::isolation::BANNER));
+
+    state
+        .persist_coordinator
+        .flush(std::time::Duration::from_secs(2))
+        .await;
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    assert_eq!(
+        snapshot_dir(&dir.path().join("sessions")),
+        sessions_before,
+        "session files changed during isolation"
+    );
+    assert_eq!(
+        snapshot_dir(&dir.path().join("sessions").join("wal")),
+        wal_before,
+        "conversation WAL changed during isolation"
+    );
+    assert_eq!(
+        snapshot_dir(&dir.path().join("archives").join("conversations")),
+        archives_before,
+        "archives changed during isolation"
+    );
+
+    // Exit: explicit back-to-normal, banner gone, writes resume.
+    let (status, body) = post_chat_on(&app, "system", "/resume").await;
+    assert_eq!(status, StatusCode::OK);
+    let json: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(
+        json["response"].as_str().unwrap(),
+        crate::server::isolation::BACK_TO_NORMAL
+    );
+    assert!(json.get("isolation").is_none() || json["isolation"] == false);
+
+    let (status, body) = post_chat_on(&app, "system", "hello again").await;
+    assert_eq!(status, StatusCode::OK);
+    let json: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert!(json.get("isolation").is_none() || json["isolation"] == false);
+    assert!(!json["response"]
+        .as_str()
+        .unwrap()
+        .starts_with(crate::server::isolation::BANNER));
+    let mut resumed_writes = false;
+    for _ in 0..30 {
+        if snapshot_dir(&dir.path().join("sessions").join("wal")) != wal_before {
+            resumed_writes = true;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    assert!(resumed_writes, "writes did not resume after /resume");
+}
+
+/// AC19: entering isolation releases the control-plane lease (provably free)
+/// and the coordinator re-acquires unaided after exit.
+#[tokio::test]
+async fn e2e_isolation_parks_coordinator_and_resumes() {
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter("pulse_null=debug")
+        .try_init();
+    let dir = tempfile::tempdir().unwrap();
+    let provider = MockProvider::new(vec![]);
+    let state = build_state_in(dir.path().to_path_buf(), provider, ToolRegistry::new()).await;
+
+    let schedule = Arc::new(RwLock::new(
+        crate::scheduler::Schedule::load_or_init(dir.path()).unwrap(),
+    ));
+    let intents = Arc::new(RwLock::new(crate::scheduler::intent::IntentQueue::load(
+        dir.path(),
+    )));
+    let coordinator =
+        crate::coordinator::control::Coordinator::start(Arc::clone(&state), schedule, intents);
+    let coord_dir = dir.path().join("coordinator");
+    wait_for_leadership(&coord_dir).await;
+    assert!(state.leadership.load(std::sync::atomic::Ordering::Relaxed));
+
+    // Enter isolation via the file trigger (the CLI path).
+    crate::server::isolation::enter(dir.path(), "test", None).unwrap();
+
+    // Within a few poll ticks the tenure ends and the lease is RELEASED.
+    let wal_path = coord_dir.join("leases.jsonl");
+    let mut released = false;
+    for _ in 0..100 {
+        let content = std::fs::read_to_string(&wal_path).unwrap_or_default();
+        if content.contains(r#""event":"released""#)
+            && !state.leadership.load(std::sync::atomic::Ordering::Relaxed)
+        {
+            released = true;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    assert!(
+        released,
+        "control-plane lease was not released on isolation"
+    );
+
+    // Exit isolation: leadership resumes unaided.
+    crate::server::isolation::exit(dir.path()).unwrap();
+    let mut resumed = false;
+    for _ in 0..100 {
+        if state.leadership.load(std::sync::atomic::Ordering::Relaxed) {
+            resumed = true;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    assert!(resumed, "coordinator did not resume leadership after exit");
+
+    coordinator.shutdown().await;
 }

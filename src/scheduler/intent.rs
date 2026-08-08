@@ -121,14 +121,44 @@ impl IntentQueue {
         queue
     }
 
-    /// Persist to disk.
+    /// Persist to disk, atomically (tmp + rename) so a concurrent reader
+    /// never observes a truncated file.
     pub fn save(&self) -> Result<(), crate::errors::PulseError> {
         if let Some(ref dir) = self.root_dir {
             let path = dir.join(INTENTS_FILE);
+            let tmp = dir.join(format!(".{INTENTS_FILE}.tmp.{}", std::process::id()));
             let content = serde_json::to_string_pretty(self)?;
-            std::fs::write(&path, content)?;
+            std::fs::write(&tmp, content)?;
+            std::fs::rename(&tmp, &path)?;
         }
         Ok(())
+    }
+
+    /// Apply a mutation against the CURRENT on-disk queue and persist the
+    /// result — reconcile (spec decision 2) for intents, same contract as
+    /// `Schedule::save_delta`: a `pulse-null intent add` from the CLI (or an
+    /// event-listener push racing a reconcile) survives every daemon write.
+    /// Serialized in-process by a static mutex and cross-process by an
+    /// exclusive lock on `intents.json.lock`. Returns the merged queue so
+    /// callers can refresh their shared copy.
+    pub fn save_delta(
+        root_dir: &Path,
+        apply: impl FnOnce(&mut IntentQueue),
+    ) -> Result<IntentQueue, crate::errors::PulseError> {
+        static IN_PROCESS: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let _guard = IN_PROCESS.lock().unwrap_or_else(|p| p.into_inner());
+
+        let lock_file = std::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(false)
+            .open(root_dir.join(format!("{INTENTS_FILE}.lock")))?;
+        lock_file.lock()?;
+
+        let mut disk = Self::load(root_dir);
+        apply(&mut disk);
+        disk.save()?;
+        Ok(disk)
     }
 
     /// Add an intent. Returns false if queue is at capacity.
@@ -175,6 +205,23 @@ impl IntentQueue {
             }
         }
         Some(self.intents.remove(best_idx))
+    }
+
+    /// All intents in processing order (priority desc, stable), left in the
+    /// queue. The drain loop claims one via a lease and removes it only on
+    /// fenced completion — so a crash mid-execution never loses the intent,
+    /// no matter who saves the queue in between.
+    pub fn sorted_candidates(&self) -> Vec<Intent> {
+        let mut candidates = self.intents.clone();
+        candidates.sort_by(|a, b| b.priority.cmp(&a.priority));
+        candidates
+    }
+
+    /// Remove an intent by id. Returns true if it was present.
+    pub fn remove_by_id(&mut self, id: &str) -> bool {
+        let before = self.intents.len();
+        self.intents.retain(|i| i.id != id);
+        self.intents.len() < before
     }
 
     pub fn len(&self) -> usize {
@@ -327,6 +374,8 @@ pub async fn drain_loop(
     state: Arc<AppState>,
     queue: Arc<RwLock<IntentQueue>>,
     schedule: Arc<RwLock<Schedule>>,
+    leases: crate::coordinator::control::SharedLeases,
+    holder: String,
 ) {
     let config = &state.config.autonomy;
     if !config.enabled {
@@ -354,30 +403,45 @@ pub async fn drain_loop(
         };
         tokio::time::sleep(sleep_duration).await;
 
-        // Pop next intent
-        let intent = {
-            let mut q = queue.write().await;
-            q.pop_next()
-        };
+        // Isolation backstop, independent of the coordinator loop.
+        if crate::server::isolation::is_active(&state.root_dir) {
+            tracing::warn!("Intent drain: ISOLATION active — stopping");
+            return;
+        }
 
-        let intent = match intent {
-            Some(i) => i,
-            None => continue,
-        };
+        // Tenure liveness: stop if our tenure lost the control plane and
+        // nothing aborted us (wedged leadership loop).
+        {
+            let table = leases.lock().await;
+            let leads = table
+                .get(crate::coordinator::control::CONTROL_PLANE_RESOURCE)
+                .is_some_and(|l| l.holder_id == holder && !l.is_expired(Utc::now()));
+            if !leads {
+                tracing::warn!("Intent drain: tenure '{holder}' no longer leads; stopping");
+                return;
+            }
+        }
 
-        // Rate limit check
+        // Claim the next processable intent via a lease, leaving it in the
+        // queue. A crash between claim and completion loses nothing: the
+        // intent is still queued and the claim expires on its ttl.
+        let candidates = { queue.read().await.sorted_candidates() };
+        if candidates.is_empty() {
+            continue;
+        }
+        let claimed = claim_next_intent(&leases, &holder, &candidates).await;
+        let Some(intent) = claimed else { continue };
+
+        // Rate limit check — release the claim and re-check later; the
+        // intent never left the queue, so there is nothing to re-queue.
         if !rate_tracker.record_and_check() {
             tracing::info!(
-                "Intent rate limit reached ({}/hr), re-queuing: {}",
+                "Intent rate limit reached ({}/hr), deferring: {}",
                 config.max_intents_per_hour,
                 intent.description
             );
-            let mut q = queue.write().await;
-            q.push(intent, config.max_queue_size);
-            if let Err(e) = q.save() {
-                tracing::error!("Failed to persist intent queue: {}", e);
-            }
-            // Sleep for a full interval before checking again
+            let resource = intent_resource(&intent.id);
+            let _ = { leases.lock().await.release(&resource, &holder, Utc::now()) };
             tokio::time::sleep(poll_interval).await;
             continue;
         }
@@ -390,7 +454,11 @@ pub async fn drain_loop(
         );
 
         // Execute the intent
-        let result = execute_intent(&intent, &state, &queue, &schedule, config).await;
+        let tenure = crate::coordinator::control::TenureLeases {
+            leases: Arc::clone(&leases),
+            holder: holder.clone(),
+        };
+        let result = execute_intent(&intent, &state, &queue, &schedule, config, &tenure).await;
 
         match result {
             Some(output) if output.trim().is_empty() => {
@@ -404,12 +472,84 @@ pub async fn drain_loop(
             }
         }
 
-        // Save queue state after processing
-        let q = queue.read().await;
-        if let Err(e) = q.save() {
-            tracing::error!("Failed to save intent queue: {}", e);
+        // Fenced completion: only the current claim holder may remove the
+        // intent. A stale executor's completion is refused and its intent
+        // re-runs — the at-least-once direction the queue already accepts.
+        commit_intent_completion(&state.root_dir, &queue, &leases, &holder, &intent.id).await;
+    }
+}
+
+/// Lease resource id for an intent claim.
+fn intent_resource(intent_id: &str) -> String {
+    format!(
+        "intent-{}",
+        crate::coordinator::control::lease_safe(intent_id)
+    )
+}
+
+/// Ttl on an intent claim — covers one execution's side-effect window.
+const INTENT_LEASE_TTL: Duration = Duration::from_secs(30 * 60);
+
+/// Try to claim the highest-priority candidate whose lease is free. A held
+/// lease means a prior claim is still inside its window (e.g. a wedged
+/// predecessor short of its ttl) — skip it and try the next.
+async fn claim_next_intent(
+    leases: &crate::coordinator::control::SharedLeases,
+    holder: &str,
+    candidates: &[Intent],
+) -> Option<Intent> {
+    let mut table = leases.lock().await;
+    for intent in candidates {
+        let resource = intent_resource(&intent.id);
+        match table.acquire(&resource, holder, INTENT_LEASE_TTL, Utc::now()) {
+            Ok(_) => return Some(intent.clone()),
+            Err(crate::coordinator::durable::DurableError::Lease(
+                crate::coordinator::lease::LeaseError::Held { .. },
+            )) => continue,
+            Err(e) => {
+                tracing::warn!("Intent claim failed for '{}': {e}", intent.id);
+                return None;
+            }
         }
     }
+    None
+}
+
+/// Prove the claim is still ours (renew), then remove the intent and persist
+/// the queue. Returns false — without touching the queue — when the claim
+/// has expired or been reclaimed: the fenced-stale-executor case.
+pub(crate) async fn commit_intent_completion(
+    root_dir: &Path,
+    queue: &Arc<RwLock<IntentQueue>>,
+    leases: &crate::coordinator::control::SharedLeases,
+    holder: &str,
+    intent_id: &str,
+) -> bool {
+    let resource = intent_resource(intent_id);
+    let renewed = {
+        leases
+            .lock()
+            .await
+            .renew(&resource, holder, INTENT_LEASE_TTL, Utc::now())
+    };
+    if let Err(e) = renewed {
+        tracing::warn!(
+            "Intent '{intent_id}': completion fenced — claim no longer held ({e}); \
+             the intent stays queued and will re-run"
+        );
+        return false;
+    }
+
+    // Delta against disk (reconcile): removal must not clobber intents
+    // other writers added while this one executed.
+    match IntentQueue::save_delta(root_dir, |q| {
+        q.remove_by_id(intent_id);
+    }) {
+        Ok(merged) => *queue.write().await = merged,
+        Err(e) => tracing::error!("Failed to save intent queue: {}", e),
+    }
+    let _ = { leases.lock().await.release(&resource, holder, Utc::now()) };
+    true
 }
 
 /// Execute a single intent with tools.
@@ -419,6 +559,7 @@ async fn execute_intent(
     queue: &Arc<RwLock<IntentQueue>>,
     schedule: &Arc<RwLock<Schedule>>,
     config: &AutonomyConfig,
+    tenure: &crate::coordinator::control::TenureLeases,
 ) -> Option<String> {
     let root_dir = state.root_dir.clone();
 
@@ -497,10 +638,10 @@ async fn execute_intent(
                     new_task.name,
                     new_task.cron
                 );
-                let mut sched = schedule.write().await;
-                sched.add_task(new_task);
-                if let Err(e) = sched.save(&root_dir) {
-                    tracing::error!("Failed to persist schedule: {}", e);
+                // Delta against disk (reconcile) + refresh the shared copy.
+                match Schedule::save_delta(&root_dir, |s| s.add_task(new_task)) {
+                    Ok(merged) => *schedule.write().await = merged,
+                    Err(e) => tracing::error!("Failed to persist schedule: {}", e),
                 }
             }
             Err(e) => tracing::warn!("Invalid [SCHEDULE:] marker from intent: {}", e),
@@ -521,8 +662,12 @@ async fn execute_intent(
                         new_intent.description
                     );
                 } else {
-                    let mut q = queue.write().await;
-                    q.push(new_intent, config.max_queue_size);
+                    match IntentQueue::save_delta(&root_dir, |q| {
+                        q.push(new_intent, config.max_queue_size);
+                    }) {
+                        Ok(merged) => *queue.write().await = merged,
+                        Err(e) => tracing::error!("Failed to persist intent queue: {}", e),
+                    }
                 }
             }
             Err(e) => tracing::warn!("Invalid [INTENT:] marker from intent: {}", e),
@@ -569,8 +714,12 @@ async fn execute_intent(
                         output_routing: chain.output_routing,
                         depth: new_depth,
                     };
-                    let mut q = queue.write().await;
-                    q.push(chain_intent, config.max_queue_size);
+                    match IntentQueue::save_delta(&root_dir, |q| {
+                        q.push(chain_intent, config.max_queue_size);
+                    }) {
+                        Ok(merged) => *queue.write().await = merged,
+                        Err(e) => tracing::error!("Failed to persist intent queue: {}", e),
+                    }
                 }
             }
             Err(e) => tracing::warn!("Invalid [CHAIN:] marker: {}", e),
@@ -597,8 +746,43 @@ async fn execute_intent(
                 output_routing: chain.output_routing.clone(),
                 depth: new_depth,
             };
-            let mut q = queue.write().await;
-            q.push(chain_intent, config.max_queue_size);
+            match IntentQueue::save_delta(&root_dir, |q| {
+                q.push(chain_intent, config.max_queue_size);
+            }) {
+                Ok(merged) => *queue.write().await = merged,
+                Err(e) => tracing::error!("Failed to persist intent queue: {}", e),
+            }
+        }
+    }
+
+    // [FARM:] — bounded subtask delegation on the lease substrate (Stage 3).
+    // Routed last; one farm per response.
+    if let Some(farm_json) = parsed.farm_requests.first() {
+        if parsed.farm_requests.len() > 1 {
+            tracing::warn!(
+                "Intent '{}': {} [FARM:] markers — running only the first",
+                intent.id,
+                parsed.farm_requests.len()
+            );
+        }
+        match crate::coordinator::farm::run_farm_from_marker(farm_json, state, tenure).await {
+            Ok(result) => {
+                tracing::info!(
+                    "Intent '{}' farm complete ({} chars)",
+                    intent.id,
+                    result.len()
+                );
+                crate::logbook::write_task_output(
+                    &root_dir,
+                    &format!("intent-{}-farm", intent.id),
+                    &format!("{} (farm)", intent.description),
+                    &result,
+                    0,
+                    0,
+                    0,
+                );
+            }
+            Err(e) => tracing::warn!("[FARM:] from intent '{}' failed: {e}", intent.id),
         }
     }
 
@@ -877,6 +1061,151 @@ fn log_intent_execution(root_dir: &Path, intent: &Intent, summary: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn make_intent(id: &str, priority: IntentPriority) -> Intent {
+        Intent {
+            id: id.into(),
+            description: format!("Intent {id}"),
+            prompt: "Do something".into(),
+            source: IntentSource::UserCli,
+            priority,
+            created_at: Utc::now(),
+            chain: None,
+            output_routing: IntentOutput::Silent,
+            depth: 0,
+        }
+    }
+
+    fn shared_leases(dir: &Path) -> crate::coordinator::control::SharedLeases {
+        Arc::new(tokio::sync::Mutex::new(
+            crate::coordinator::durable::DurableLeaseTable::open(&dir.join("coordinator")).unwrap(),
+        ))
+    }
+
+    #[tokio::test]
+    async fn claim_skips_held_intent_and_takes_next() {
+        let dir = tempfile::tempdir().unwrap();
+        let leases = shared_leases(dir.path());
+        let candidates = vec![
+            make_intent("i-urgent", IntentPriority::Urgent),
+            make_intent("i-normal", IntentPriority::Normal),
+        ];
+
+        // Another holder is mid-flight on the urgent one.
+        leases
+            .lock()
+            .await
+            .acquire("intent-i-urgent", "other-1", INTENT_LEASE_TTL, Utc::now())
+            .unwrap();
+
+        let claimed = claim_next_intent(&leases, "me-1", &candidates).await;
+        assert_eq!(claimed.unwrap().id, "i-normal");
+    }
+
+    #[tokio::test]
+    async fn crash_between_claim_and_completion_loses_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let leases = shared_leases(dir.path());
+        let mut q = IntentQueue::load(dir.path());
+        q.push(make_intent("i1", IntentPriority::Normal), 20);
+        q.save().unwrap();
+        let queue = Arc::new(RwLock::new(q));
+
+        let claimed = claim_next_intent(&leases, "me-1", &queue.read().await.sorted_candidates())
+            .await
+            .unwrap();
+        assert_eq!(claimed.id, "i1");
+
+        // "Crash": no completion, no release. The intent is still durably
+        // queued — a restart reloads it intact.
+        let reloaded = IntentQueue::load(dir.path());
+        assert_eq!(reloaded.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn stale_completion_is_fenced_and_queue_unchanged() {
+        let dir = tempfile::tempdir().unwrap();
+        let leases = shared_leases(dir.path());
+        let mut q = IntentQueue::load(dir.path());
+        q.push(make_intent("i1", IntentPriority::Normal), 20);
+        q.save().unwrap();
+        let queue = Arc::new(RwLock::new(q));
+
+        // Executor A claims, then stalls past its ttl; B reclaims (the
+        // substrate allows an acquire dated after A's expiry).
+        claim_next_intent(&leases, "exec-a", &queue.read().await.sorted_candidates())
+            .await
+            .unwrap();
+        leases
+            .lock()
+            .await
+            .acquire(
+                "intent-i1",
+                "exec-b",
+                INTENT_LEASE_TTL,
+                Utc::now() + INTENT_LEASE_TTL + Duration::from_secs(1),
+            )
+            .unwrap();
+
+        // A wakes and tries to commit: fenced, queue untouched.
+        let committed = commit_intent_completion(dir.path(), &queue, &leases, "exec-a", "i1").await;
+        assert!(!committed);
+        assert_eq!(queue.read().await.len(), 1);
+        assert_eq!(IntentQueue::load(dir.path()).len(), 1);
+
+        // B commits fine — exactly once overall.
+        let committed = commit_intent_completion(dir.path(), &queue, &leases, "exec-b", "i1").await;
+        assert!(committed);
+        assert_eq!(IntentQueue::load(dir.path()).len(), 0);
+    }
+
+    /// MEDIUM-4 regression: daemon intent writes are deltas against disk, so
+    /// an external add (CLI, event listener) survives a concurrent removal.
+    #[test]
+    fn intent_save_delta_preserves_external_adds() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let mut q = IntentQueue::load(root);
+        q.push(make_intent("daemon-known", IntentPriority::Normal), 20);
+        q.save().unwrap();
+
+        // External writer (CLI) adds an intent the daemon's memory never saw.
+        IntentQueue::save_delta(root, |q| {
+            q.push(make_intent("cli-added", IntentPriority::Normal), 20);
+        })
+        .unwrap();
+
+        // Daemon commits a removal via save_delta — the CLI's intent survives
+        // (a wholesale q.save() of daemon memory would have erased it).
+        let merged = IntentQueue::save_delta(root, |q| {
+            q.remove_by_id("daemon-known");
+        })
+        .unwrap();
+        assert_eq!(merged.len(), 1);
+
+        let disk = IntentQueue::load(root);
+        assert_eq!(disk.len(), 1);
+        assert_eq!(disk.sorted_candidates()[0].id, "cli-added");
+    }
+
+    #[test]
+    fn sorted_candidates_orders_by_priority_and_keeps_queue() {
+        let mut queue = IntentQueue {
+            intents: Vec::new(),
+            root_dir: None,
+        };
+        queue.push(make_intent("low", IntentPriority::Low), 20);
+        queue.push(make_intent("urgent", IntentPriority::Urgent), 20);
+        queue.push(make_intent("normal", IntentPriority::Normal), 20);
+
+        let ids: Vec<String> = queue
+            .sorted_candidates()
+            .into_iter()
+            .map(|i| i.id)
+            .collect();
+        assert_eq!(ids, vec!["urgent", "normal", "low"]);
+        assert_eq!(queue.len(), 3);
+    }
 
     #[test]
     fn intent_queue_push_and_pop() {

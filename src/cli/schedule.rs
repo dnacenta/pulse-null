@@ -17,7 +17,7 @@ fn model_line(entry: &ScheduleEntry, default_model: &str) -> String {
 pub async fn list() -> Result<(), Box<dyn std::error::Error>> {
     let config = Config::load()?;
     let root_dir = config.root_dir()?;
-    let schedule = Schedule::load(&root_dir)?;
+    let schedule = Schedule::load_or_init(&root_dir)?;
 
     if schedule.tasks.is_empty() {
         println!("  No scheduled tasks.");
@@ -75,7 +75,7 @@ pub async fn add(
 
     let config = Config::load()?;
     let root_dir = config.root_dir()?;
-    let mut schedule = Schedule::load(&root_dir)?;
+    Schedule::load_or_init(&root_dir)?;
 
     let id = name
         .to_lowercase()
@@ -95,8 +95,7 @@ pub async fn add(
         evaluator: None,
     };
 
-    schedule.add_task(ScheduleEntry::from(task));
-    schedule.save(&root_dir)?;
+    Schedule::save_delta(&root_dir, |s| s.add_task(ScheduleEntry::from(task)))?;
 
     println!("  Task '{}' added (id: {})", style(&name).cyan(), id);
     Ok(())
@@ -105,10 +104,9 @@ pub async fn add(
 pub async fn remove(id: String) -> Result<(), Box<dyn std::error::Error>> {
     let config = Config::load()?;
     let root_dir = config.root_dir()?;
-    let mut schedule = Schedule::load(&root_dir)?;
-
-    if schedule.remove_task(&id) {
-        schedule.save(&root_dir)?;
+    let mut found = false;
+    Schedule::save_delta(&root_dir, |s| found = s.remove_task(&id))?;
+    if found {
         println!("  Task '{}' removed.", style(&id).cyan());
     } else {
         println!("  Task '{}' not found.", style(&id).red());
@@ -120,11 +118,14 @@ pub async fn remove(id: String) -> Result<(), Box<dyn std::error::Error>> {
 pub async fn enable(id: String) -> Result<(), Box<dyn std::error::Error>> {
     let config = Config::load()?;
     let root_dir = config.root_dir()?;
-    let mut schedule = Schedule::load(&root_dir)?;
-
-    if let Some(entry) = schedule.find_task_mut(&id) {
-        entry.task.enabled = true;
-        schedule.save(&root_dir)?;
+    let mut found = false;
+    Schedule::save_delta(&root_dir, |s| {
+        if let Some(entry) = s.find_task_mut(&id) {
+            entry.task.enabled = true;
+            found = true;
+        }
+    })?;
+    if found {
         println!("  Task '{}' enabled.", style(&id).green());
     } else {
         println!("  Task '{}' not found.", style(&id).red());
@@ -136,11 +137,14 @@ pub async fn enable(id: String) -> Result<(), Box<dyn std::error::Error>> {
 pub async fn disable(id: String) -> Result<(), Box<dyn std::error::Error>> {
     let config = Config::load()?;
     let root_dir = config.root_dir()?;
-    let mut schedule = Schedule::load(&root_dir)?;
-
-    if let Some(entry) = schedule.find_task_mut(&id) {
-        entry.task.enabled = false;
-        schedule.save(&root_dir)?;
+    let mut found = false;
+    Schedule::save_delta(&root_dir, |s| {
+        if let Some(entry) = s.find_task_mut(&id) {
+            entry.task.enabled = false;
+            found = true;
+        }
+    })?;
+    if found {
         println!("  Task '{}' disabled.", style(&id).yellow());
     } else {
         println!("  Task '{}' not found.", style(&id).red());
@@ -160,18 +164,20 @@ pub async fn set_model(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let config = Config::load()?;
     let root_dir = config.root_dir()?;
-    let mut schedule = Schedule::load(&root_dir)?;
-
-    let Some(entry) = schedule.find_task_mut(&id) else {
-        println!("  Task '{}' not found.", style(&id).red());
-        return Ok(());
-    };
-
     let model = model
         .map(|m| m.trim().to_string())
         .filter(|m| !m.is_empty());
-    entry.model.clone_from(&model);
-    schedule.save(&root_dir)?;
+    let mut found = false;
+    Schedule::save_delta(&root_dir, |s| {
+        if let Some(entry) = s.find_task_mut(&id) {
+            entry.model.clone_from(&model);
+            found = true;
+        }
+    })?;
+    if !found {
+        println!("  Task '{}' not found.", style(&id).red());
+        return Ok(());
+    }
 
     match model {
         Some(model) => println!(
@@ -185,6 +191,6 @@ pub async fn set_model(
             style(&config.llm.model).cyan()
         ),
     }
-    println!("  Restart the entity for a running scheduler to pick this up.");
+    println!("  A running scheduler picks this up at the task's next fire.");
     Ok(())
 }
