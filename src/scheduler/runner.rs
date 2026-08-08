@@ -187,11 +187,17 @@ pub async fn run_task_loop(
             continue;
         }
 
-        tracing::info!(
-            model = %entry.effective_model(&state.config.llm.model),
-            "Executing scheduled task: {}",
-            task.name
-        );
+        {
+            // Log the model the fire will ACTUALLY use: the override is read
+            // live from the shared schedule (refreshed above), not from the
+            // entry captured at spawn.
+            let sched = schedule.read().await;
+            let live = sched.find_task(&task.id).map_or_else(
+                || entry.effective_model(&state.config.llm.model).to_string(),
+                |f| f.effective_model(&state.config.llm.model).to_string(),
+            );
+            tracing::info!(model = %live, "Executing scheduled task: {}", task.name);
+        }
 
         // Check for built-in deterministic handlers first
         if run_builtin_handler(task, &state, &root_dir).await {
@@ -294,9 +300,21 @@ async fn execute_task(
     // Use cached root_dir from AppState
     let root_dir = state.root_dir.clone();
 
+    // The model override is read from the SHARED schedule — refreshed from
+    // disk by the enabled-check just before this call — not from the entry
+    // captured at spawn, so `pulse-null schedule model` really does apply at
+    // the task's next fire, as its CLI output promises. Fall back to the
+    // spawn-time entry only if the task vanished from the shared copy
+    // mid-flight (racing removal).
+    let current_override: Option<String> = {
+        let sched = schedule.read().await;
+        sched
+            .find_task(&task.id)
+            .map_or_else(|| entry.model.clone(), |fresh| fresh.model.clone())
+    };
     // A model override means a provider of its own; without one this is the
     // shared provider, byte for byte the previous behaviour.
-    let overridden = match resolve_provider_override(entry, state) {
+    let overridden = match resolve_provider_override(&task.id, current_override.as_deref(), state) {
         Ok(provider) => provider,
         Err(failure) => return failure,
     };
@@ -304,7 +322,11 @@ async fn execute_task(
         Some(ref boxed) => boxed.as_ref(),
         None => state.provider.as_ref(),
     };
-    let model = entry.effective_model(&state.config.llm.model);
+    let model = current_override
+        .as_deref()
+        .map(str::trim)
+        .filter(|m| !m.is_empty())
+        .unwrap_or(&state.config.llm.model);
 
     // Phase 5: Use minimal task system prompt (identity only, no MEMORY.md
     // or monitoring data). This keeps the task context small and focused,
@@ -797,10 +819,11 @@ async fn execute_task(
 /// other model *refuses* it, and a refusal returns as a normal, successful
 /// response. A loud failure is recoverable; a silent wrong model is not.
 fn resolve_provider_override(
-    entry: &ScheduleEntry,
+    task_id: &str,
+    override_model: Option<&str>,
     state: &Arc<AppState>,
 ) -> Result<Option<Box<dyn pulse_system_types::llm::LmProvider>>, TaskOutcome> {
-    let Some(model) = entry.model_override() else {
+    let Some(model) = override_model.map(str::trim).filter(|m| !m.is_empty()) else {
         return Ok(None);
     };
     match crate::providers::create_provider_with_model(&state.config, model) {
@@ -808,7 +831,7 @@ fn resolve_provider_override(
         Err(e) => {
             let message = format!("model override '{model}' could not be applied: {e}");
             tracing::error!(
-                task_id = %entry.task.id,
+                task_id = %task_id,
                 model,
                 "Refusing to run task on the default model: {}",
                 message
