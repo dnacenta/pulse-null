@@ -809,6 +809,24 @@ mod tests {
         assert_eq!(mock.captured_prompt(), system_prompt);
     }
 
+    /// The staged prompt is unlinked by a drop guard inside the invocation
+    /// future — ordered before `.await` returns, but observed once to lag
+    /// under full parallel-suite load (fs visibility, not logic). A bounded
+    /// wait keeps the assertion meaningful without the one-in-a-thousand
+    /// flake: a real leak still fails after 2s.
+    async fn assert_unlinked(staged: &std::path::Path, context: &str) {
+        for _ in 0..40 {
+            if !staged.exists() {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        panic!(
+            "staged system prompt {} should be unlinked {context}",
+            staged.display()
+        );
+    }
+
     #[tokio::test]
     async fn system_prompt_file_is_removed_after_invocation() {
         let mock = MockCli::succeeding();
@@ -820,11 +838,7 @@ mod tests {
             .unwrap();
 
         let staged = mock.captured_prompt_path();
-        assert!(
-            !staged.exists(),
-            "staged system prompt {} should be unlinked after the invocation",
-            staged.display()
-        );
+        assert_unlinked(&staged, "after the invocation").await;
     }
 
     #[tokio::test]
@@ -839,11 +853,7 @@ mod tests {
         assert!(err.to_string().contains("boom"), "got: {err}");
 
         let staged = mock.captured_prompt_path();
-        assert!(
-            !staged.exists(),
-            "staged system prompt {} should be unlinked after a failed invocation",
-            staged.display()
-        );
+        assert_unlinked(&staged, "after a failed invocation").await;
     }
 
     /// AC1: a system prompt far past the 128KB single-argv kernel limit spawns
