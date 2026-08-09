@@ -193,6 +193,10 @@ impl IntentQueue {
     }
 
     /// Pop the highest-priority intent (then FIFO within same priority).
+    // Not yet called anywhere (drain is the consumer path today); kept as the
+    // documented single-pop API. Targeted allow per CONTRIBUTING — no blanket
+    // `-A dead_code`.
+    #[allow(dead_code)]
     pub fn pop_next(&mut self) -> Option<Intent> {
         if self.intents.is_empty() {
             return None;

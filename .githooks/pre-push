@@ -1,0 +1,5 @@
+#!/usr/bin/env bash
+# Pre-push hook: run the deterministic gate before anything leaves the machine.
+# Installed via scripts/install-hooks.sh (sets core.hooksPath = .githooks).
+set -euo pipefail
+exec "$(git rev-parse --show-toplevel)/scripts/gate.sh"

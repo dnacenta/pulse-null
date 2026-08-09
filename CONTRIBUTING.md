@@ -68,11 +68,21 @@ docs(#3): expand configuration reference
 
 ## Code style
 
-- Run `cargo fmt` before submitting
-- Run `cargo clippy -- -D warnings -A dead_code` -- CI's exact lint gate (dead_code from unused trait methods is acceptable during early development)
-- Run `cargo test` to make sure nothing breaks
+- Run `scripts/gate.sh` before submitting -- it is CI's exact gate (fmt, `clippy --all-targets -- -D warnings`, tests), single source of truth for both
+- Optionally run `scripts/install-hooks.sh` once per clone to make the gate a pre-push hook
+- Intentionally unused code gets a targeted `#[allow(dead_code)]` with a comment explaining why -- there is no blanket `-A dead_code`, so unintentional dead code fails the gate
 - Keep your toolchain current (`rustup update stable`) -- CI lints with the latest stable, so new clippy lints apply as Rust releases
 - Keep changes focused -- one issue per PR
+
+### The gate
+
+`scripts/gate.sh` is deterministic by contract: no model and no human
+judgment executes inside it, so it cannot habituate -- it reads PR 500 with
+the same eyes it read PR 1. Human/AI review is for what the gate cannot
+encode: whether the change should exist, collateral behavior, boundary
+drift. Edits to `scripts/gate.sh` or `.github/workflows/ci.yml` are the one
+diff class that deserves the sharpest review, since the gate cannot audit
+changes to itself.
 
 ## Release workflow
 
