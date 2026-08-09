@@ -424,19 +424,25 @@ pub async fn chat(
     };
     let active_tools = readonly_tools.as_ref().unwrap_or(&state.tools);
 
-    // The default (fable) model always runs first; on an AUP refusal, and only
-    // if a fallback is configured and we are not isolated, the same turn is
-    // re-run on the fallback model and the exchange is quarantined out of the
-    // default model's context. `create_provider_with_model` is called lazily —
-    // the fallback provider is built on demand, only when a refusal fires.
-    let fallback_model = if isolated {
-        None
-    } else {
-        state.config.llm.fallback_target().map(str::to_string)
-    };
+    // The default (fable) model always runs first; on an AUP refusal the same
+    // turn is re-run on the fallback model and the exchange is quarantined out
+    // of the default model's context. The fallback provider is built lazily
+    // (`create_provider_with_model`), only when a refusal actually fires.
+    //
+    // SEC-001: the fallback is OWNER-ONLY. Re-running a refused turn on the more
+    // permissive opus model must not be reachable by an untrusted caller, or
+    // fable-5's AUP classifier becomes bypassable by anyone who can hit /chat.
+    // `resolve_sender` maps the owner's configured phone/discord-id/name and the
+    // tui/system/reflection channels to "owner", so D's voice calls still get
+    // the fallback while guests and peers never do. `gated_fallback` enforces
+    // the owner gate (and the isolation shed) and drops the builder unbuilt for
+    // everyone else.
     let config_for_fallback = &state.config;
-    let build_fallback = fallback_model.as_deref().map(|model| {
-        move || crate::providers::create_provider_with_model(config_for_fallback, model)
+    let build_fallback = state.config.llm.fallback_target().and_then(|model| {
+        let model = model.to_string();
+        gated_fallback(&resolved_key, isolated, move || {
+            crate::providers::create_provider_with_model(config_for_fallback, &model)
+        })
     });
 
     let turn = invoke_turn_with_refusal_fallback(
@@ -785,6 +791,18 @@ impl std::fmt::Debug for TurnResult {
             .field("quarantined", &self.quarantined)
             .finish()
     }
+}
+
+/// Owner-only, non-isolated gate for the reactive refusal fallback (SEC-001).
+///
+/// Returns `Some(build)` — arming the fallback — only for the owner and only
+/// when not isolated; otherwise the builder is dropped unbuilt and a refusal
+/// takes the ordinary rollback + error path. The fallback re-runs a refused turn
+/// on the more permissive opus model, so letting a guest or peer trigger it
+/// would make fable-5's AUP classifier bypassable by any untrusted caller who
+/// can reach `/chat`. This is the intended default, not a config knob.
+fn gated_fallback<F>(resolved_key: &str, isolated: bool, build: F) -> Option<F> {
+    (!isolated && resolved_key == "owner").then_some(build)
 }
 
 /// Run one interactive turn with reactive refusal fallback (PN-88).
@@ -1476,6 +1494,101 @@ mod tests {
         assert!(
             !called.load(Ordering::SeqCst),
             "fallback provider built for a non-refusal error"
+        );
+        assert_eq!(data.messages.len(), trunk_before - 1);
+        assert!(data.quarantine.is_empty());
+    }
+
+    /// SEC-001: the fallback gate is owner-only, and shed while isolated.
+    #[test]
+    fn fallback_gate_is_owner_only() {
+        // Owner, not isolated → armed.
+        assert!(gated_fallback("owner", false, || Ok(Box::new(FailingMock) as Box<dyn LmProvider>))
+            .is_some());
+        // Guests and peers never arm the fallback.
+        assert!(
+            gated_fallback("guest:stranger", false, || Ok(
+                Box::new(FailingMock) as Box<dyn LmProvider>
+            ))
+            .is_none()
+        );
+        assert!(
+            gated_fallback("peer:Nova", false, || Ok(
+                Box::new(FailingMock) as Box<dyn LmProvider>
+            ))
+            .is_none()
+        );
+        // Even the owner is shed while isolated (the provider is the suspect).
+        assert!(
+            gated_fallback("owner", true, || Ok(Box::new(FailingMock) as Box<dyn LmProvider>))
+                .is_none()
+        );
+    }
+
+    /// SEC-001: a guest refusal never builds the fallback provider and rolls the
+    /// turn back (mirrors `generic_error_rolls_back_without_fallback`, but the
+    /// gate — not the error class — is what drops the builder).
+    #[tokio::test]
+    async fn guest_refusal_never_builds_fallback() {
+        let mut data = session_with(&["earlier turn"], "spicy question");
+        let trunk_before = data.messages.len();
+        let tools = ToolRegistry::new();
+        let called = Arc::new(AtomicBool::new(false));
+        let called_in_build = Arc::clone(&called);
+
+        let build = move || {
+            called_in_build.store(true, Ordering::SeqCst);
+            Ok(Box::new(RecordingProvider {
+                reply: "should not happen".to_string(),
+                seen: Arc::new(Mutex::new(Vec::new())),
+            }) as Box<dyn LmProvider>)
+        };
+        // The owner-only gate drops the builder for a guest.
+        let gated = gated_fallback("guest:stranger", false, build);
+
+        let err = invoke_turn_with_refusal_fallback(
+            &mut data, &RefusingMock, gated, &tools, "sys", 1024, "corr",
+        )
+        .await
+        .unwrap_err();
+
+        assert!(err.downcast_ref::<RefusalError>().is_some());
+        assert!(
+            !called.load(Ordering::SeqCst),
+            "fallback provider built for a guest refusal"
+        );
+        assert_eq!(data.messages.len(), trunk_before - 1);
+        assert!(data.quarantine.is_empty());
+    }
+
+    /// SEC-001: a peer refusal is treated exactly like a guest — no fallback.
+    #[tokio::test]
+    async fn peer_refusal_never_builds_fallback() {
+        let mut data = session_with(&["earlier turn"], "spicy question");
+        let trunk_before = data.messages.len();
+        let tools = ToolRegistry::new();
+        let called = Arc::new(AtomicBool::new(false));
+        let called_in_build = Arc::clone(&called);
+
+        let build = move || {
+            called_in_build.store(true, Ordering::SeqCst);
+            Ok(Box::new(RecordingProvider {
+                reply: "should not happen".to_string(),
+                seen: Arc::new(Mutex::new(Vec::new())),
+            }) as Box<dyn LmProvider>)
+        };
+        let gated = gated_fallback("peer:Nova", false, build);
+
+        let err = invoke_turn_with_refusal_fallback(
+            &mut data, &RefusingMock, gated, &tools, "sys", 1024, "corr",
+        )
+        .await
+        .unwrap_err();
+
+        assert!(err.downcast_ref::<RefusalError>().is_some());
+        assert!(
+            !called.load(Ordering::SeqCst),
+            "fallback provider built for a peer refusal"
         );
         assert_eq!(data.messages.len(), trunk_before - 1);
         assert!(data.quarantine.is_empty());
