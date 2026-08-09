@@ -47,6 +47,16 @@ use uuid::Uuid;
 
 use crate::config::PredictionConfig;
 
+/// Shortest abbreviation of a prediction id accepted as a resolution reference.
+///
+/// Eight hex characters is 32 bits, which keeps collisions negligible for a
+/// store bounded at tens of pending predictions, and matches the abbreviation
+/// length that every display surface already uses. Shorter references are
+/// rejected rather than matched, on the same reasoning git uses for object
+/// names: an abbreviation that is unique in a small store stops being unique
+/// as the store grows, so the floor is set by the population, not by taste.
+const MIN_ABBREVIATED_ID_LEN: usize = 8;
+
 /// The timescale at which a prediction operates.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -303,35 +313,38 @@ impl PredictionStack {
             .filter(move |p| p.timescale == timescale && p.is_pending())
     }
 
-    /// Resolve a prediction by ID.
+    /// Resolve a prediction by ID, or by an unambiguous abbreviation of one.
+    ///
+    /// Prediction ids are UUIDs, and every surface that displays one abbreviates
+    /// it. Following git's object-name rule, an abbreviation is therefore a valid
+    /// *input* form as well as a display form: a reference of at least
+    /// [`MIN_ABBREVIATED_ID_LEN`] characters resolves if it is a prefix of exactly
+    /// one pending prediction. Ambiguous references are rejected rather than
+    /// guessed at, so a short reference can never resolve the wrong row.
     ///
     /// If the resolution's surprise exceeds `self.config.surprise_threshold`,
-    /// a `PredictionError` is created and added to the error queue. Returns
-    /// `true` if the prediction was found and resolved, `false` if not found
-    /// or already resolved.
+    /// a `PredictionError` is created and added to the error queue, keyed by the
+    /// *canonical* id — an abbreviation that is unique today may not be later.
+    /// Returns `true` if the prediction was found and resolved, `false` if not
+    /// found, ambiguous, or already resolved.
     pub fn resolve(&mut self, prediction_id: &str, resolution: PredictionResolution) -> bool {
+        let canonical_id = match self.canonical_pending_id(prediction_id) {
+            Some(id) => id,
+            None => return false,
+        };
+
         let prediction = self
             .predictions
             .iter_mut()
-            .find(|p| p.id == prediction_id && p.is_pending());
-
-        let prediction = match prediction {
-            Some(p) => p,
-            None => {
-                tracing::warn!(
-                    prediction_id,
-                    "Attempted to resolve unknown or already-resolved prediction"
-                );
-                return false;
-            }
-        };
+            .find(|p| p.id == canonical_id && p.is_pending())
+            .expect("canonical_pending_id returned a pending prediction");
 
         let surprise = resolution.surprise.clamp(0.0, 1.0);
 
         // Create a prediction error if surprise exceeds the configured threshold.
         if surprise > self.config.surprise_threshold {
             self.errors.push(PredictionError {
-                prediction_id: prediction_id.to_string(),
+                prediction_id: canonical_id.clone(),
                 surprise,
                 direction: resolution.direction,
                 insight: resolution.insight.clone(),
@@ -347,6 +360,59 @@ impl PredictionStack {
         });
 
         true
+    }
+
+    /// Map a reference — a full id or an abbreviation of one — to the canonical
+    /// id of the single pending prediction it names.
+    ///
+    /// Returns `None` and logs when the reference matches nothing, is shorter
+    /// than [`MIN_ABBREVIATED_ID_LEN`], or is ambiguous. Exact matches are
+    /// preferred over prefix matches so a full id always wins.
+    fn canonical_pending_id(&self, reference: &str) -> Option<String> {
+        let reference = reference.trim();
+
+        if let Some(exact) = self
+            .predictions
+            .iter()
+            .find(|p| p.id == reference && p.is_pending())
+        {
+            return Some(exact.id.clone());
+        }
+
+        if reference.len() < MIN_ABBREVIATED_ID_LEN {
+            tracing::warn!(
+                prediction_id = reference,
+                min_len = MIN_ABBREVIATED_ID_LEN,
+                "Attempted to resolve prediction by a reference too short to disambiguate"
+            );
+            return None;
+        }
+
+        let matches: Vec<&Prediction> = self
+            .predictions
+            .iter()
+            .filter(|p| p.is_pending() && p.id.starts_with(reference))
+            .collect();
+
+        match matches.as_slice() {
+            [one] => Some(one.id.clone()),
+            [] => {
+                tracing::warn!(
+                    prediction_id = reference,
+                    "Attempted to resolve unknown or already-resolved prediction"
+                );
+                None
+            }
+            many => {
+                let candidates: Vec<&str> = many.iter().map(|p| p.id.as_str()).collect();
+                tracing::warn!(
+                    prediction_id = reference,
+                    candidates = ?candidates,
+                    "Ambiguous prediction reference — matches more than one pending prediction"
+                );
+                None
+            }
+        }
     }
 
     /// Iterate over unprocessed prediction errors.
@@ -529,6 +595,105 @@ mod tests {
 
         assert!(stack.resolve(&id, resolution));
         assert!(stack.errors.is_empty());
+    }
+
+    #[test]
+    fn resolve_accepts_unambiguous_abbreviation() {
+        let mut stack = PredictionStack::new();
+        let id = stack
+            .add_prediction(Timescale::Cycle, "test".to_string(), 0.8)
+            .id
+            .clone();
+
+        let resolution = PredictionResolution {
+            actual: "resolved by prefix".to_string(),
+            surprise: 0.1,
+            direction: ErrorDirection::WellCalibrated,
+            insight: None,
+        };
+
+        assert!(stack.resolve(&id[..8], resolution));
+        assert!(stack.predictions[0].resolved_at.is_some());
+    }
+
+    #[test]
+    fn resolve_by_abbreviation_records_canonical_id_in_error() {
+        let mut stack = PredictionStack::new();
+        let id = stack
+            .add_prediction(Timescale::Cycle, "test".to_string(), 0.8)
+            .id
+            .clone();
+
+        let resolution = PredictionResolution {
+            actual: "surprising".to_string(),
+            surprise: 0.7,
+            direction: ErrorDirection::Misdirected,
+            insight: None,
+        };
+
+        assert!(stack.resolve(&id[..8], resolution));
+        // The error must be keyed by the full id, not by the abbreviation that
+        // happened to be typed — abbreviations rot as the store grows.
+        assert_eq!(stack.errors[0].prediction_id, id);
+    }
+
+    #[test]
+    fn resolve_rejects_ambiguous_abbreviation() {
+        let mut stack = PredictionStack::new();
+        // Force a shared prefix by rewriting ids after insertion.
+        stack.add_prediction(Timescale::Cycle, "first".to_string(), 0.8);
+        stack.add_prediction(Timescale::Cycle, "second".to_string(), 0.8);
+        stack.predictions[0].id = "abcd1234-0000-0000-0000-000000000001".to_string();
+        stack.predictions[1].id = "abcd1234-0000-0000-0000-000000000002".to_string();
+
+        let resolution = PredictionResolution {
+            actual: "whichever".to_string(),
+            surprise: 0.5,
+            direction: ErrorDirection::Novel,
+            insight: None,
+        };
+
+        assert!(!stack.resolve("abcd1234", resolution));
+        assert!(stack.predictions.iter().all(|p| p.is_pending()));
+    }
+
+    #[test]
+    fn resolve_rejects_reference_shorter_than_minimum() {
+        let mut stack = PredictionStack::new();
+        let id = stack
+            .add_prediction(Timescale::Cycle, "test".to_string(), 0.8)
+            .id
+            .clone();
+
+        let resolution = PredictionResolution {
+            actual: "too short".to_string(),
+            surprise: 0.5,
+            direction: ErrorDirection::Novel,
+            insight: None,
+        };
+
+        assert!(!stack.resolve(&id[..4], resolution));
+        assert!(stack.predictions[0].is_pending());
+    }
+
+    #[test]
+    fn resolve_prefers_exact_match_over_prefix_match() {
+        let mut stack = PredictionStack::new();
+        stack.add_prediction(Timescale::Cycle, "short id".to_string(), 0.8);
+        stack.add_prediction(Timescale::Cycle, "longer id".to_string(), 0.8);
+        stack.predictions[0].id = "abcd1234".to_string();
+        stack.predictions[1].id = "abcd1234-0000-0000-0000-000000000002".to_string();
+
+        let resolution = PredictionResolution {
+            actual: "exact wins".to_string(),
+            surprise: 0.1,
+            direction: ErrorDirection::WellCalibrated,
+            insight: None,
+        };
+
+        assert!(stack.resolve("abcd1234", resolution));
+        assert!(stack.predictions[0].resolved_at.is_some());
+        assert!(stack.predictions[1].is_pending());
     }
 
     #[test]
