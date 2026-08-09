@@ -363,11 +363,11 @@ async fn execute_task(
         autonomy_context,
     );
 
-    // Load the prediction stack ONCE per execute_task and hold it across
-    // the LLM call (Q-H3). Pre-LLM: spec 2c pressure check on
-    // reflection-window. Post-LLM: marker processing + prune + save.
-    // Single in-memory snapshot, single IO round-trip per side.
-    let mut prediction_stack = if state.config.prediction.enabled {
+    // Load the prediction stack pre-LLM for the spec-2c pressure check on
+    // reflection-window (Q-H3). Post-LLM marker processing re-loads under
+    // the store lock instead of reusing this snapshot (PN-86) — by then it
+    // is minutes stale and writing it back would erase concurrent updates.
+    let prediction_stack = if state.config.prediction.enabled {
         Some(
             crate::prediction::store::load_async(root_dir.clone(), state.config.prediction.clone())
                 .await,
@@ -696,11 +696,11 @@ async fn execute_task(
         .await;
     }
 
-    // Post-execution: extract prediction markers from task output and save
-    // the stack we loaded pre-LLM. Same in-memory snapshot used by the
-    // spec-2c pressure check — no second load, no race against ourselves.
-    if let Some(stack) = prediction_stack.take() {
-        post_process_predictions(stack, state, task, &root_dir, &parsed.clean_content).await;
+    // Post-execution: extract prediction markers from task output. Applies
+    // against a fresh locked load of the store (PN-86) — the pre-LLM stack
+    // is minutes stale by now and only fed the pressure check.
+    if prediction_stack.is_some() {
+        post_process_predictions(state, task, &root_dir, &parsed.clean_content).await;
     }
 
     // Post-execution: extract cognitive signals and check for health changes
@@ -1066,37 +1066,47 @@ fn inject_reflection_pressure_directive(
 }
 
 /// Post-LLM phase of the prediction loop: parse `[PREDICT:...]` / `[RESOLVE:...]`
-/// markers from the task output, mutate the stack we loaded pre-LLM, prune
-/// to configured caps, then save via `save_async`. Caller passes ownership
-/// of the stack so this fn can consume it into `save_async`.
+/// markers from the task output, prune to configured caps, and persist.
+///
+/// Runs as a locked load-apply-save against the store (PN-86) rather than
+/// writing back the stack captured pre-LLM: the provider call takes minutes,
+/// and an overlapping task fire or intent completion may have written the
+/// store since our load — saving the stale snapshot would erase their
+/// updates. The pre-LLM stack (Q-H3) remains read-only pressure input.
 ///
 /// Extracted from `execute_task` (Q-H1).
 async fn post_process_predictions(
-    mut stack: crate::prediction::PredictionStack,
     state: &Arc<AppState>,
     task: &ScheduledTask,
     root_dir: &std::path::Path,
     clean_content: &str,
 ) {
-    let new_error_count = crate::prediction::resolve::process_task_output(
-        &mut stack,
-        clean_content,
-        &task.id,
-        super::tasks::default_timescale_for(&task.id),
-    );
-    if new_error_count > 0 {
-        tracing::info!(
-            "Prediction errors: {} new (accumulated importance: {:.2})",
-            new_error_count,
-            stack.accumulated_importance(),
-        );
-    }
-    stack.prune(
-        state.config.prediction.max_unresolved,
-        state.config.prediction.max_errors,
-    );
-    if let Err(e) = crate::prediction::store::save_async(root_dir.to_path_buf(), stack).await {
-        tracing::error!("Failed to save prediction stack: {e}");
+    let task_id = task.id.clone();
+    let timescale = super::tasks::default_timescale_for(&task.id);
+    let content = clean_content.to_string();
+    let max_unresolved = state.config.prediction.max_unresolved;
+    let max_errors = state.config.prediction.max_errors;
+    let result = crate::prediction::store::save_delta_async(
+        root_dir.to_path_buf(),
+        state.config.prediction.clone(),
+        move |stack| {
+            let new_error_count = crate::prediction::resolve::process_task_output(
+                stack, &content, &task_id, timescale,
+            );
+            stack.prune(max_unresolved, max_errors);
+            (new_error_count, stack.accumulated_importance())
+        },
+    )
+    .await;
+    match result {
+        Ok((new_error_count, importance)) => {
+            if new_error_count > 0 {
+                tracing::info!(
+                    "Prediction errors: {new_error_count} new (accumulated importance: {importance:.2})"
+                );
+            }
+        }
+        Err(e) => tracing::error!("Failed to save prediction stack: {e}"),
     }
 }
 

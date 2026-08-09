@@ -136,11 +136,15 @@ impl PipelineState {
         }
     }
 
-    /// Save state to `{root_dir}/pipeline-state.json`.
+    /// Save state to `{root_dir}/pipeline-state.json`, atomically (tmp +
+    /// rename) so a concurrent reader never observes a truncated file
+    /// (PN-86 — was a plain `fs::write`).
     pub fn save(&self, root_dir: &Path) -> Result<(), Box<dyn std::error::Error>> {
         let path = root_dir.join(STATE_FILENAME);
+        let tmp = root_dir.join(format!(".{STATE_FILENAME}.tmp.{}", std::process::id()));
         let json = serde_json::to_string_pretty(self)?;
-        std::fs::write(&path, json)?;
+        std::fs::write(&tmp, json)?;
+        std::fs::rename(&tmp, &path)?;
         Ok(())
     }
 

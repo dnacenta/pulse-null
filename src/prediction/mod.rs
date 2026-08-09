@@ -81,6 +81,12 @@ pub enum ErrorDirection {
     Misdirected,
     /// Something genuinely new happened that the entity had no model for.
     Novel,
+    /// The prediction held: confidence matched the outcome. Not an error
+    /// direction — a calibration system that cannot record being right is
+    /// measuring the wrong thing (PN-86). A well-calibrated resolution
+    /// normally carries low surprise; error creation stays purely
+    /// surprise-threshold-driven either way.
+    WellCalibrated,
 }
 
 impl std::fmt::Display for ErrorDirection {
@@ -90,6 +96,7 @@ impl std::fmt::Display for ErrorDirection {
             ErrorDirection::Underconfident => write!(f, "underconfident"),
             ErrorDirection::Misdirected => write!(f, "misdirected"),
             ErrorDirection::Novel => write!(f, "novel"),
+            ErrorDirection::WellCalibrated => write!(f, "well-calibrated"),
         }
     }
 }
@@ -106,6 +113,11 @@ impl ErrorDirection {
             Some(Self::Misdirected)
         } else if trimmed.eq_ignore_ascii_case("novel") {
             Some(Self::Novel)
+        } else if trimmed.eq_ignore_ascii_case("well-calibrated")
+            || trimmed.eq_ignore_ascii_case("well_calibrated")
+            || trimmed.eq_ignore_ascii_case("wellcalibrated")
+        {
+            Some(Self::WellCalibrated)
         } else {
             None
         }
@@ -730,7 +742,54 @@ mod tests {
             ErrorDirection::from_str_loose("novel"),
             Some(ErrorDirection::Novel)
         );
+        assert_eq!(
+            ErrorDirection::WellCalibrated.to_string(),
+            "well-calibrated"
+        );
+        assert_eq!(
+            ErrorDirection::from_str_loose("well-calibrated"),
+            Some(ErrorDirection::WellCalibrated)
+        );
+        assert_eq!(
+            ErrorDirection::from_str_loose("Well_Calibrated"),
+            Some(ErrorDirection::WellCalibrated)
+        );
+        assert_eq!(
+            ErrorDirection::from_str_loose("wellcalibrated"),
+            Some(ErrorDirection::WellCalibrated)
+        );
         assert_eq!(ErrorDirection::from_str_loose("unknown"), None);
+    }
+
+    /// A well-calibrated resolution is the normal "I was right" outcome:
+    /// low surprise, no PredictionError. The variant must also survive the
+    /// snapshot serde round-trip (it reaches disk via resolutions).
+    #[test]
+    fn well_calibrated_resolution_no_error_and_roundtrips() {
+        let mut stack = PredictionStack::new();
+        let id = stack
+            .add_prediction(Timescale::Cycle, "as planned".to_string(), 0.8)
+            .id
+            .clone();
+        assert!(stack.resolve(
+            &id,
+            PredictionResolution {
+                actual: "went as planned".to_string(),
+                surprise: 0.1,
+                direction: ErrorDirection::WellCalibrated,
+                insight: None,
+            },
+        ));
+        assert!(stack.errors.is_empty());
+
+        let snapshot = PredictionStackSnapshot::from_stack(&stack);
+        let json = serde_json::to_string(&snapshot).unwrap();
+        assert!(json.contains("\"well_calibrated\""));
+        let back: PredictionStackSnapshot = serde_json::from_str(&json).unwrap();
+        assert_eq!(
+            back.predictions[0].resolution.as_ref().unwrap().direction,
+            ErrorDirection::WellCalibrated
+        );
     }
 
     /// Snapshot is the only thing that round-trips via JSON; `PredictionStack`

@@ -72,6 +72,79 @@ pub fn load(root_dir: &Path, config: PredictionConfig) -> PredictionStack {
     }
 }
 
+/// Fail-closed load for read-modify-write callers (PN-86).
+///
+/// [`load`] deliberately fail-opens: a corrupt file yields an empty stack so
+/// the prediction engine always boots. That is the wrong contract inside
+/// [`save_delta`], where the loaded stack is written straight back — a
+/// transient read/parse failure would silently wipe the store. Here a
+/// missing file is still an empty stack (fresh entity), but an existing
+/// file that cannot be read or parsed is an error and the delta is aborted.
+fn load_strict(
+    root_dir: &Path,
+    config: PredictionConfig,
+) -> Result<PredictionStack, Box<dyn std::error::Error + Send + Sync>> {
+    let path = root_dir.join(PREDICTIONS_FILE);
+    let content = match fs::read_to_string(&path) {
+        Ok(c) => c,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(PredictionStack::with_config(config));
+        }
+        Err(e) => return Err(Box::new(e)),
+    };
+    let snapshot: PredictionStackSnapshot = serde_json::from_str(&content)?;
+    Ok(snapshot.into_stack(config))
+}
+
+/// Locked read-modify-write on the prediction store (PN-86).
+///
+/// Every `predictions.json` writer previously did unlocked load-mutate-save;
+/// the atomic rename in [`save`] prevents torn files but not lost updates.
+/// Two overlaps are real in production: task fires hold their pre-LLM stack
+/// across multi-minute provider calls (two overlapping fires last-writer-win
+/// each other), and the intent drain writes concurrently with task fires.
+/// Same fix family as `Schedule::save_delta` / `IntentQueue::save_delta`
+/// (PN-80): serialize in-process via a static mutex, cross-process via an
+/// exclusive lock on `predictions.json.lock`, and always apply against a
+/// fresh load from disk. Returns whatever `apply` returns.
+pub fn save_delta<T>(
+    root_dir: &Path,
+    config: PredictionConfig,
+    apply: impl FnOnce(&mut PredictionStack) -> T,
+) -> Result<T, Box<dyn std::error::Error + Send + Sync>> {
+    static IN_PROCESS: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let _guard = IN_PROCESS.lock().unwrap_or_else(|p| p.into_inner());
+
+    fs::create_dir_all(root_dir)?;
+    let lock_path = root_dir.join("predictions.json.lock");
+    let lock_file = fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(false)
+        .open(&lock_path)?;
+    lock_file.lock()?;
+
+    let mut stack = load_strict(root_dir, config)?;
+    let out = apply(&mut stack);
+    save(root_dir, &stack)?;
+    Ok(out)
+    // lock_file drop releases the flock
+}
+
+/// Async wrapper for [`save_delta`] — offloads the locked IO to a blocking
+/// thread so the flock (and any in-process mutex wait) never parks a tokio
+/// worker.
+pub async fn save_delta_async<T: Send + 'static>(
+    root_dir: PathBuf,
+    config: PredictionConfig,
+    apply: impl FnOnce(&mut PredictionStack) -> T + Send + 'static,
+) -> Result<T, Box<dyn std::error::Error + Send + Sync>> {
+    match tokio::task::spawn_blocking(move || save_delta(&root_dir, config, apply)).await {
+        Ok(result) => result,
+        Err(join_err) => Err(Box::new(join_err)),
+    }
+}
+
 /// Save the prediction stack to disk atomically.
 ///
 /// Writes to a temporary file first, then renames to the final path.
@@ -239,5 +312,95 @@ mod tests {
 
         let loaded = load(tmp.path(), PredictionConfig::default());
         assert_eq!(loaded.predictions.len(), 2);
+    }
+
+    /// PN-86 lost-update regression: a prediction written to disk between a
+    /// caller's earlier load and its write must survive, because the write
+    /// goes through save_delta's fresh locked load — not a stale snapshot.
+    #[test]
+    fn save_delta_applies_against_fresh_disk_state() {
+        let tmp = TempDir::new().unwrap();
+
+        // "Pre-LLM" snapshot taken by caller A (never written back).
+        let mut stale = load(tmp.path(), PredictionConfig::default());
+        stale.add_prediction(Timescale::Cycle, "a-only-in-memory".to_string(), 0.5);
+
+        // Concurrent caller B lands a prediction on disk meanwhile.
+        save_delta(tmp.path(), PredictionConfig::default(), |stack| {
+            stack.add_prediction(Timescale::Cycle, "b-on-disk".to_string(), 0.6);
+        })
+        .unwrap();
+
+        // Caller A now writes via save_delta: B's prediction must survive.
+        save_delta(tmp.path(), PredictionConfig::default(), |stack| {
+            stack.add_prediction(Timescale::Cycle, "a-final".to_string(), 0.7);
+        })
+        .unwrap();
+
+        let loaded = load(tmp.path(), PredictionConfig::default());
+        let contents: Vec<&str> = loaded.predictions.iter().map(|p| p.content.as_str()).collect();
+        assert!(contents.contains(&"b-on-disk"));
+        assert!(contents.contains(&"a-final"));
+        assert_eq!(loaded.predictions.len(), 2);
+    }
+
+    /// PN-86: concurrent save_delta writers from multiple threads all land —
+    /// no last-writer-wins erasure under the in-process mutex + flock.
+    #[test]
+    fn save_delta_concurrent_writers_lose_nothing() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path().to_path_buf();
+
+        let handles: Vec<_> = (0..8)
+            .map(|i| {
+                let root = root.clone();
+                std::thread::spawn(move || {
+                    save_delta(&root, PredictionConfig::default(), |stack| {
+                        stack.add_prediction(Timescale::Cycle, format!("writer-{i}"), 0.5);
+                    })
+                    .unwrap();
+                })
+            })
+            .collect();
+        for h in handles {
+            h.join().unwrap();
+        }
+
+        let loaded = load(tmp.path(), PredictionConfig::default());
+        assert_eq!(loaded.predictions.len(), 8);
+    }
+
+    /// PN-86: save_delta must abort on a corrupt existing file rather than
+    /// wiping it with a freshly-defaulted stack (fail-closed, unlike `load`).
+    #[test]
+    fn save_delta_aborts_on_corrupt_file() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join(PREDICTIONS_FILE);
+        std::fs::write(&path, "{ not valid json").unwrap();
+
+        let result = save_delta(tmp.path(), PredictionConfig::default(), |stack| {
+            stack.add_prediction(Timescale::Cycle, "should-not-land".to_string(), 0.5);
+        });
+        assert!(result.is_err());
+
+        // The corrupt file is untouched — no silent wipe.
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "{ not valid json"
+        );
+    }
+
+    /// PN-86: missing file is a fresh entity, not an error — save_delta
+    /// starts from an empty stack and creates the file.
+    #[test]
+    fn save_delta_missing_file_starts_empty() {
+        let tmp = TempDir::new().unwrap();
+        let count = save_delta(tmp.path(), PredictionConfig::default(), |stack| {
+            stack.add_prediction(Timescale::Cycle, "first".to_string(), 0.5);
+            stack.predictions.len()
+        })
+        .unwrap();
+        assert_eq!(count, 1);
+        assert!(tmp.path().join(PREDICTIONS_FILE).exists());
     }
 }
