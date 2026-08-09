@@ -273,6 +273,12 @@ pub async fn chat(
         }),
     });
 
+    // A real human message just arrived — reset the autonomous round counter
+    // now, pre-turn, so that even a turn that later refuses or errors still
+    // counts as human input for the autonomy / hallucination gates. (Resetting
+    // only on success would let a run of failed human turns keep climbing.)
+    session.data.health.rounds_since_human_input = 0;
+
     // MicroCompact (Tier 1): cheap mechanical compaction before checking
     // whether expensive LLM-based summarization is needed.
     let mc_result = crate::context::micro_compact(&mut session.data.messages);
@@ -487,9 +493,6 @@ pub async fn chat(
     if !isolated {
         session.data.wal.messages_since_checkpoint += 1;
     }
-    // Real human message arrived and was answered — reset the autonomous
-    // round counter.
-    session.data.health.rounds_since_human_input = 0;
 
     // Track recently accessed files from tool use (for post-compaction re-injection).
     // Scan all messages (the tool loop may have added tool-use/tool-result pairs).
