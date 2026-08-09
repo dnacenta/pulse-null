@@ -627,7 +627,10 @@ mod tests {
     #[test]
     fn classify_is_case_insensitive_on_policy_text() {
         let json = r#"{"is_error":true,"result":"violates our usage policy"}"#;
-        matches!(classify_nonzero_exit(json), RefusalCheck::Refusal(_));
+        assert!(matches!(
+            classify_nonzero_exit(json),
+            RefusalCheck::Refusal(_)
+        ));
     }
 
     #[test]
