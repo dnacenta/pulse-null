@@ -798,8 +798,17 @@ where
         -> Result<Box<dyn pulse_system_types::llm::LmProvider>, crate::errors::ProviderError>,
 {
     // The user message is the trunk tail: compaction only rewrites older
-    // messages, never the newest turn.
-    let user_index = data.messages.len() - 1;
+    // messages, never the newest turn. Guard the subtraction so a future caller
+    // that invokes this with an empty trunk gets a clean error instead of an
+    // integer underflow panic / out-of-bounds index (SEC-005).
+    let user_index = match data.messages.len().checked_sub(1) {
+        Some(index) => index,
+        None => {
+            return Err(
+                "invoke_turn_with_refusal_fallback called with an empty trunk".into(),
+            )
+        }
+    };
 
     let default_outcome = crate::task_context::scope(
         Some(correlation_id.to_string()),
