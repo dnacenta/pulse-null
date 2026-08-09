@@ -484,7 +484,7 @@ pub struct Session {
 }
 
 impl Session {
-    fn new(key: String, channel: String, sender: String) -> Self {
+    pub(crate) fn new(key: String, channel: String, sender: String) -> Self {
         let now = Utc::now();
         Self {
             data: SessionData {

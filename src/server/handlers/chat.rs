@@ -418,41 +418,47 @@ pub async fn chat(
     };
     let active_tools = readonly_tools.as_ref().unwrap_or(&state.tools);
 
-    // Index of the just-pushed user message: it is always the trunk tail here
-    // (compaction only ever rewrites older messages, never the newest turn).
-    let user_index = session.data.messages.len() - 1;
-
-    let turn_outcome = crate::task_context::scope(
-        Some(correlation_id.clone()),
-        tool_loop::invoke_with_tool_loop(
-            state.provider.as_ref(),
-            active_tools,
-            &system_prompt,
-            &mut session.data.messages,
-            state.config.llm.max_tokens,
-            MAX_TOOL_ROUNDS,
-        ),
-    )
-    .await;
-
-    let result = match turn_outcome {
-        Ok(r) => r,
-        Err(e) => {
-            // Roll the turn back to the pre-turn trunk: drop the user message
-            // and anything the tool loop appended, and commit nothing to the
-            // WAL. The session is left exactly as it was pre-turn (AC7).
-            session.data.messages.truncate(user_index);
-            tracing::error!("LLM invocation failed: {}", e);
-            // Keep the banner sticky even on the failure path — while isolated
-            // the provider is precisely the suspect.
-            let msg = if crate::server::isolation::is_active(&state.root_dir) {
-                format!("{} {}", crate::server::isolation::BANNER, e)
-            } else {
-                e.to_string()
-            };
-            return Err((StatusCode::INTERNAL_SERVER_ERROR, msg));
-        }
+    // The default (fable) model always runs first; on an AUP refusal, and only
+    // if a fallback is configured and we are not isolated, the same turn is
+    // re-run on the fallback model and the exchange is quarantined out of the
+    // default model's context. `create_provider_with_model` is called lazily —
+    // the fallback provider is built on demand, only when a refusal fires.
+    let fallback_model = if isolated {
+        None
+    } else {
+        state.config.llm.fallback_target().map(str::to_string)
     };
+    let config_for_fallback = &state.config;
+    let build_fallback = fallback_model.as_deref().map(|model| {
+        move || crate::providers::create_provider_with_model(config_for_fallback, model)
+    });
+
+    let turn = invoke_turn_with_refusal_fallback(
+        &mut session.data,
+        state.provider.as_ref(),
+        build_fallback,
+        active_tools,
+        &system_prompt,
+        state.config.llm.max_tokens,
+        &correlation_id,
+    )
+    .await
+    .map_err(|e| {
+        // The turn failed even after any fallback — the helper has already
+        // rolled the trunk back to its pre-turn state (AC7, AC8).
+        tracing::error!("LLM turn failed: {}", e);
+        // Keep the banner sticky even on the failure path — while isolated
+        // the provider is precisely the suspect.
+        let msg = if crate::server::isolation::is_active(&state.root_dir) {
+            format!("{} {}", crate::server::isolation::BANNER, e)
+        } else {
+            e.to_string()
+        };
+        (StatusCode::INTERNAL_SERVER_ERROR, msg)
+    })?;
+
+    let committed_to_quarantine = turn.quarantined;
+    let result = turn.result;
 
     // Re-sample: a turn admitted just before the marker appeared must not
     // write after it. OR of the two samples drives every gate below.
@@ -486,8 +492,14 @@ pub async fn chat(
     // until success (see the user-message push above) so a refused or failed
     // turn leaves no entry — "user-message-not-committed-until-success"
     // ordering keeps WAL replay consistent with the in-memory trunk. User
-    // first, then assistant. (Shed in isolation.)
-    if let Some(wal) = state.wal.as_ref().filter(|_| !isolated) {
+    // first, then assistant. (Shed in isolation.) A quarantined turn is not on
+    // the trunk, so it must not be replayed into it — its WAL commit lands on
+    // the quarantine lane in a later step.
+    if let Some(wal) = state
+        .wal
+        .as_ref()
+        .filter(|_| !isolated && !committed_to_quarantine)
+    {
         let user_seq = session.data.wal.wal_seq + 1;
         match wal.append(
             &session_key,
@@ -740,6 +752,145 @@ pub async fn chat(
     }))
 }
 
+/// Outcome of one interactive turn after the refusal-fallback dance.
+struct TurnResult {
+    /// The response to return to the caller (from the default or fallback model).
+    result: tool_loop::ToolLoopResult,
+    /// True when the turn was handled by the fallback model and quarantined.
+    quarantined: bool,
+}
+
+impl std::fmt::Debug for TurnResult {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TurnResult")
+            .field("text", &self.result.text)
+            .field("quarantined", &self.quarantined)
+            .finish()
+    }
+}
+
+/// Run one interactive turn with reactive refusal fallback (PN-88).
+///
+/// The default (fable) model runs first, appending to the trunk (`data.messages`).
+/// On an AUP [`RefusalError`](crate::errors::RefusalError) — and only when
+/// `build_fallback` is `Some` — the same turn is re-run on the fallback model
+/// with the full picture (trunk + prior quarantine + this user message), and the
+/// exchange is quarantined so the default model's classifier does not re-trip on
+/// later benign turns. On any unrecovered error (non-refusal, fallback disabled,
+/// fallback-build failure, or the fallback also failing) the trunk is rolled back
+/// to exactly its pre-turn state and the error is surfaced (AC7, AC8).
+///
+/// Precondition: the current user message is the last element of `data.messages`.
+async fn invoke_turn_with_refusal_fallback<F>(
+    data: &mut crate::session_store::SessionData,
+    default_provider: &dyn pulse_system_types::llm::LmProvider,
+    build_fallback: Option<F>,
+    tools: &crate::tools::ToolRegistry,
+    system_prompt: &str,
+    max_tokens: u32,
+    correlation_id: &str,
+) -> Result<TurnResult, Box<dyn std::error::Error + Send + Sync>>
+where
+    F: FnOnce() -> Result<Box<dyn pulse_system_types::llm::LmProvider>, crate::errors::ProviderError>,
+{
+    // The user message is the trunk tail: compaction only rewrites older
+    // messages, never the newest turn.
+    let user_index = data.messages.len() - 1;
+
+    let default_outcome = crate::task_context::scope(
+        Some(correlation_id.to_string()),
+        tool_loop::invoke_with_tool_loop(
+            default_provider,
+            tools,
+            system_prompt,
+            &mut data.messages,
+            max_tokens,
+            MAX_TOOL_ROUNDS,
+        ),
+    )
+    .await;
+
+    let refusal = match default_outcome {
+        Ok(result) => {
+            return Ok(TurnResult {
+                result,
+                quarantined: false,
+            })
+        }
+        Err(e) => e,
+    };
+
+    let is_refusal = refusal
+        .downcast_ref::<crate::errors::RefusalError>()
+        .is_some();
+    let build = match (is_refusal, build_fallback) {
+        (true, Some(build)) => build,
+        _ => {
+            // Not a refusal, or fallback disabled: roll the turn back and
+            // surface the error unchanged.
+            data.messages.truncate(user_index);
+            return Err(refusal);
+        }
+    };
+
+    // Refusal + fallback enabled. Restore the clean trunk before building the
+    // fallback model's view of the conversation.
+    let user_msg = data.messages[user_index].clone();
+    data.messages.truncate(user_index);
+
+    let fallback_provider = match build() {
+        Ok(p) => p,
+        Err(build_err) => {
+            // The trunk is already rolled back — surface one error.
+            return Err(build_err.into());
+        }
+    };
+
+    // The fallback model sees the full conversation: clean trunk + prior
+    // quarantined tangents + the current (refused) user message.
+    let mut fallback_ctx: Vec<Message> =
+        Vec::with_capacity(data.messages.len() + data.quarantine.len() + 1);
+    fallback_ctx.extend(data.messages.iter().cloned());
+    fallback_ctx.extend(data.quarantine.iter().cloned());
+    fallback_ctx.push(user_msg.clone());
+
+    let fallback_outcome = crate::task_context::scope(
+        Some(correlation_id.to_string()),
+        tool_loop::invoke_with_tool_loop(
+            fallback_provider.as_ref(),
+            tools,
+            system_prompt,
+            &mut fallback_ctx,
+            max_tokens,
+            MAX_TOOL_ROUNDS,
+        ),
+    )
+    .await;
+
+    match fallback_outcome {
+        Ok(result) => {
+            // Quarantine the exchange: the trunk stays clean so the default
+            // model does not re-trip on later benign turns.
+            data.quarantine.push(user_msg);
+            data.quarantine.push(Message {
+                role: Role::Assistant,
+                content: MessageContent::Text(result.text.clone()),
+                source: None,
+            });
+            data.enforce_quarantine_cap();
+            Ok(TurnResult {
+                result,
+                quarantined: true,
+            })
+        }
+        Err(fallback_err) => {
+            // AC8: the fallback also failed. The trunk is already rolled back;
+            // surface a single error and leave no partial quarantine entry.
+            Err(fallback_err)
+        }
+    }
+}
+
 /// Map a resolved identity key to the event system's ConversationTrust.
 fn conversation_trust_from_identity(resolved_key: &str) -> crate::events::ConversationTrust {
     if resolved_key == "owner" {
@@ -967,5 +1118,355 @@ mod tests {
             conversation_trust_from_identity("guest:someone"),
             crate::events::ConversationTrust::Public
         ));
+    }
+
+    // ---- PN-88: refusal-fallback orchestration ----------------------------
+
+    use crate::errors::{ProviderError, RefusalError};
+    use crate::session_store::{Session, SessionData};
+    use crate::tools::ToolRegistry;
+    use pulse_system_types::llm::{
+        ContentBlock, LlmResponse, LlmResult, LmProvider, StopReason,
+    };
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Mutex;
+
+    /// Answers every turn, recording the joined message text it was given so a
+    /// test can assert what context the model actually saw.
+    struct RecordingProvider {
+        reply: String,
+        seen: Arc<Mutex<Vec<String>>>,
+    }
+
+    impl LmProvider for RecordingProvider {
+        fn invoke(
+            &self,
+            _system_prompt: &str,
+            messages: &[Message],
+            _max_tokens: u32,
+            _tools: Option<&[serde_json::Value]>,
+        ) -> LlmResult<'_> {
+            let joined = messages
+                .iter()
+                .filter_map(|m| match &m.content {
+                    MessageContent::Text(t) => Some(t.clone()),
+                    MessageContent::Blocks(_) => None,
+                })
+                .collect::<Vec<_>>()
+                .join("|");
+            self.seen.lock().unwrap().push(joined);
+            let reply = self.reply.clone();
+            Box::pin(async move {
+                Ok(LlmResponse {
+                    content: vec![ContentBlock::Text { text: reply }],
+                    stop_reason: StopReason::EndTurn,
+                    model: "recording".to_string(),
+                    input_tokens: Some(1),
+                    output_tokens: Some(1),
+                })
+            })
+        }
+        fn name(&self) -> &str {
+            "recording"
+        }
+        fn supports_tools(&self) -> bool {
+            false
+        }
+    }
+
+    /// Always issues an AUP refusal.
+    struct RefusingMock;
+    impl LmProvider for RefusingMock {
+        fn invoke(
+            &self,
+            _system_prompt: &str,
+            _messages: &[Message],
+            _max_tokens: u32,
+            _tools: Option<&[serde_json::Value]>,
+        ) -> LlmResult<'_> {
+            Box::pin(async {
+                Err(Box::new(RefusalError {
+                    model: "fable".to_string(),
+                    detail: "violates our Usage Policy".to_string(),
+                }) as Box<dyn std::error::Error + Send + Sync>)
+            })
+        }
+        fn name(&self) -> &str {
+            "refusing"
+        }
+        fn supports_tools(&self) -> bool {
+            false
+        }
+    }
+
+    /// Always fails with a generic (non-refusal) error.
+    struct FailingMock;
+    impl LmProvider for FailingMock {
+        fn invoke(
+            &self,
+            _system_prompt: &str,
+            _messages: &[Message],
+            _max_tokens: u32,
+            _tools: Option<&[serde_json::Value]>,
+        ) -> LlmResult<'_> {
+            Box::pin(async { Err("network drop".into()) })
+        }
+        fn name(&self) -> &str {
+            "failing"
+        }
+        fn supports_tools(&self) -> bool {
+            false
+        }
+    }
+
+    fn user(text: &str) -> Message {
+        Message {
+            role: Role::User,
+            content: MessageContent::Text(text.to_string()),
+            source: Some(MessageSource::Human {
+                channel: "chat".into(),
+                sender: "owner".into(),
+            }),
+        }
+    }
+
+    /// A session whose trunk holds `trunk` then the current user turn `turn`.
+    fn session_with(trunk: &[&str], turn: &str) -> SessionData {
+        let mut data = Session::new("chat:owner".into(), "chat".into(), "owner".into()).data;
+        for t in trunk {
+            data.messages.push(user(t));
+        }
+        data.messages.push(user(turn));
+        data
+    }
+
+    fn no_fallback() -> Option<fn() -> Result<Box<dyn LmProvider>, ProviderError>> {
+        None
+    }
+
+    /// AC2: fable refuses → the same turn is answered by the fallback model and
+    /// the exchange is quarantined out of the trunk.
+    #[tokio::test]
+    async fn refusal_falls_back_and_quarantines() {
+        let mut data = session_with(&["earlier turn"], "spicy question");
+        let trunk_before = data.messages.len();
+        let tools = ToolRegistry::new();
+
+        let turn = invoke_turn_with_refusal_fallback(
+            &mut data,
+            &RefusingMock,
+            Some(|| {
+                Ok(Box::new(RecordingProvider {
+                    reply: "opus answer".to_string(),
+                    seen: Arc::new(Mutex::new(Vec::new())),
+                }) as Box<dyn LmProvider>)
+            }),
+            &tools,
+            "sys",
+            1024,
+            "corr",
+        )
+        .await
+        .unwrap();
+
+        assert!(turn.quarantined);
+        assert_eq!(turn.result.text, "opus answer");
+        // Trunk lost the refused user message (rolled back to pre-turn).
+        assert_eq!(data.messages.len(), trunk_before - 1);
+        // Quarantine holds the user turn + opus reply.
+        assert_eq!(data.quarantine.len(), 2);
+    }
+
+    /// AC3: after a quarantined turn, the default model's next turn does NOT see
+    /// the quarantined tangent (its context is the clean trunk only).
+    #[tokio::test]
+    async fn default_model_context_excludes_quarantine() {
+        let mut data = session_with(&["earlier turn"], "spicy question");
+        let tools = ToolRegistry::new();
+        // First turn: refuse → quarantine.
+        invoke_turn_with_refusal_fallback(
+            &mut data,
+            &RefusingMock,
+            Some(|| {
+                Ok(Box::new(RecordingProvider {
+                    reply: "opus answer".to_string(),
+                    seen: Arc::new(Mutex::new(Vec::new())),
+                }) as Box<dyn LmProvider>)
+            }),
+            &tools,
+            "sys",
+            1024,
+            "corr",
+        )
+        .await
+        .unwrap();
+
+        // Second (benign) turn handled by the default model — record its context.
+        data.messages.push(user("benign hello"));
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let default = RecordingProvider {
+            reply: "fable reply".to_string(),
+            seen: Arc::clone(&seen),
+        };
+        let turn = invoke_turn_with_refusal_fallback(
+            &mut data,
+            &default,
+            no_fallback(),
+            &tools,
+            "sys",
+            1024,
+            "corr",
+        )
+        .await
+        .unwrap();
+
+        assert!(!turn.quarantined);
+        let context = seen.lock().unwrap().join("###");
+        assert!(context.contains("benign hello"));
+        assert!(
+            !context.contains("spicy question") && !context.contains("opus answer"),
+            "default model context leaked the quarantined tangent: {context}"
+        );
+    }
+
+    /// AC4: consecutive refusals accumulate in quarantine, and the fallback
+    /// model on the second refusal sees the first tangent.
+    #[tokio::test]
+    async fn consecutive_refusals_accumulate_and_share_context() {
+        let mut data = session_with(&["earlier turn"], "spicy one");
+        let tools = ToolRegistry::new();
+        invoke_turn_with_refusal_fallback(
+            &mut data,
+            &RefusingMock,
+            Some(|| {
+                Ok(Box::new(RecordingProvider {
+                    reply: "opus one".to_string(),
+                    seen: Arc::new(Mutex::new(Vec::new())),
+                }) as Box<dyn LmProvider>)
+            }),
+            &tools,
+            "sys",
+            1024,
+            "corr",
+        )
+        .await
+        .unwrap();
+
+        data.messages.push(user("spicy two"));
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let seen_for_build = Arc::clone(&seen);
+        invoke_turn_with_refusal_fallback(
+            &mut data,
+            &RefusingMock,
+            Some(move || {
+                Ok(Box::new(RecordingProvider {
+                    reply: "opus two".to_string(),
+                    seen: seen_for_build,
+                }) as Box<dyn LmProvider>)
+            }),
+            &tools,
+            "sys",
+            1024,
+            "corr",
+        )
+        .await
+        .unwrap();
+
+        // Four quarantined messages: two user turns + two opus replies.
+        assert_eq!(data.quarantine.len(), 4);
+        // The second fallback saw the first tangent (continuity).
+        let context = seen.lock().unwrap().join("###");
+        assert!(context.contains("spicy one"));
+        assert!(context.contains("opus one"));
+        assert!(context.contains("spicy two"));
+    }
+
+    /// AC5: fallback disabled → a refusal rolls the turn back and surfaces the
+    /// error; no fallback is attempted.
+    #[tokio::test]
+    async fn refusal_without_fallback_rolls_back() {
+        let mut data = session_with(&["earlier turn"], "spicy question");
+        let trunk_before = data.messages.len();
+        let tools = ToolRegistry::new();
+
+        let err = invoke_turn_with_refusal_fallback(
+            &mut data,
+            &RefusingMock,
+            no_fallback(),
+            &tools,
+            "sys",
+            1024,
+            "corr",
+        )
+        .await
+        .unwrap_err();
+
+        assert!(err.downcast_ref::<RefusalError>().is_some());
+        assert_eq!(data.messages.len(), trunk_before - 1);
+        assert!(data.quarantine.is_empty());
+    }
+
+    /// AC7: a non-refusal error rolls the turn back and never attempts fallback.
+    #[tokio::test]
+    async fn generic_error_rolls_back_without_fallback() {
+        let mut data = session_with(&["earlier turn"], "hello");
+        let trunk_before = data.messages.len();
+        let tools = ToolRegistry::new();
+        let called = Arc::new(AtomicBool::new(false));
+        let called_in_build = Arc::clone(&called);
+
+        let err = invoke_turn_with_refusal_fallback(
+            &mut data,
+            &FailingMock,
+            Some(move || {
+                called_in_build.store(true, Ordering::SeqCst);
+                Ok(Box::new(RecordingProvider {
+                    reply: "should not happen".to_string(),
+                    seen: Arc::new(Mutex::new(Vec::new())),
+                }) as Box<dyn LmProvider>)
+            }),
+            &tools,
+            "sys",
+            1024,
+            "corr",
+        )
+        .await
+        .unwrap_err();
+
+        assert!(err.downcast_ref::<RefusalError>().is_none());
+        assert!(
+            !called.load(Ordering::SeqCst),
+            "fallback provider built for a non-refusal error"
+        );
+        assert_eq!(data.messages.len(), trunk_before - 1);
+        assert!(data.quarantine.is_empty());
+    }
+
+    /// AC8: fable refuses and the fallback also fails → rollback, single error,
+    /// no partial quarantine entry.
+    #[tokio::test]
+    async fn fallback_also_fails_rolls_back_cleanly() {
+        let mut data = session_with(&["earlier turn"], "spicy question");
+        let trunk_before = data.messages.len();
+        let tools = ToolRegistry::new();
+
+        let err = invoke_turn_with_refusal_fallback(
+            &mut data,
+            &RefusingMock,
+            Some(|| Ok(Box::new(FailingMock) as Box<dyn LmProvider>)),
+            &tools,
+            "sys",
+            1024,
+            "corr",
+        )
+        .await
+        .unwrap_err();
+
+        assert!(err.downcast_ref::<RefusalError>().is_none());
+        assert_eq!(data.messages.len(), trunk_before - 1);
+        assert!(
+            data.quarantine.is_empty(),
+            "a failed fallback left a partial quarantine entry"
+        );
     }
 }
