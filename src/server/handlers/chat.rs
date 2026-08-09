@@ -445,7 +445,11 @@ pub async fn chat(
     .await
     .map_err(|e| {
         // The turn failed even after any fallback — the helper has already
-        // rolled the trunk back to its pre-turn state (AC7, AC8).
+        // rolled the user turn (the trunk tail) and its deferred WAL/counter
+        // commit back off (AC7, AC8). Note this is NOT a full pre-turn restore:
+        // compaction ran before the helper, and its side-effects (summarized
+        // older messages, compaction counters, the compaction signal/archive)
+        // are intentionally retained.
         tracing::error!("LLM turn failed: {}", e);
         // Keep the banner sticky even on the failure path — while isolated
         // the provider is precisely the suspect.
@@ -780,8 +784,10 @@ impl std::fmt::Debug for TurnResult {
 /// with the full picture (trunk + prior quarantine + this user message), and the
 /// exchange is quarantined so the default model's classifier does not re-trip on
 /// later benign turns. On any unrecovered error (non-refusal, fallback disabled,
-/// fallback-build failure, or the fallback also failing) the trunk is rolled back
-/// to exactly its pre-turn state and the error is surfaced (AC7, AC8).
+/// fallback-build failure, or the fallback also failing) the user turn (the
+/// trunk tail this helper appended) is rolled back and the error is surfaced
+/// (AC7, AC8). This rolls back only the current turn's tail — any compaction the
+/// caller performed before invoking the helper is not reverted.
 ///
 /// Precondition: the current user message is the last element of `data.messages`.
 async fn invoke_turn_with_refusal_fallback<F>(
