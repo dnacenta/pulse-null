@@ -84,9 +84,17 @@ pub enum ErrorDirection {
     /// The prediction held: confidence matched the outcome. Not an error
     /// direction — a calibration system that cannot record being right is
     /// measuring the wrong thing (PN-86). A well-calibrated resolution
-    /// normally carries low surprise; error creation stays purely
-    /// surprise-threshold-driven either way.
+    /// normally carries low surprise; a well-calibrated resolution with
+    /// surprise above threshold is rejected as self-contradictory in
+    /// `resolve::process_task_output`.
     WellCalibrated,
+    /// Catch-all for direction values written to disk by a newer release
+    /// than this binary (SEC-006). Without it, one unrecognized direction
+    /// makes the whole snapshot fail to deserialize, `load` fail-opens to
+    /// an empty stack, and the next save erases the entity's entire
+    /// prediction history. Never produced by the marker parser.
+    #[serde(other)]
+    Unknown,
 }
 
 impl std::fmt::Display for ErrorDirection {
@@ -97,6 +105,7 @@ impl std::fmt::Display for ErrorDirection {
             ErrorDirection::Misdirected => write!(f, "misdirected"),
             ErrorDirection::Novel => write!(f, "novel"),
             ErrorDirection::WellCalibrated => write!(f, "well-calibrated"),
+            ErrorDirection::Unknown => write!(f, "unknown"),
         }
     }
 }
@@ -790,6 +799,20 @@ mod tests {
             back.predictions[0].resolution.as_ref().unwrap().direction,
             ErrorDirection::WellCalibrated
         );
+    }
+
+    /// SEC-006: a direction value written by a newer release must not fail
+    /// the whole snapshot deserialization — that would fail-open `load` to
+    /// an empty stack, and the next save would erase the entity's entire
+    /// prediction history.
+    #[test]
+    fn unknown_direction_value_deserializes_to_catch_all() {
+        let json = r#"{"predictions":[],"errors":[{"prediction_id":"p1","surprise":0.9,"direction":"some_future_direction","insight":null,"created_at":"2026-08-09T00:00:00Z","processed":false}]}"#;
+        let snapshot: PredictionStackSnapshot = serde_json::from_str(json).unwrap();
+        assert_eq!(snapshot.errors[0].direction, ErrorDirection::Unknown);
+        assert_eq!(ErrorDirection::Unknown.to_string(), "unknown");
+        // The marker parser never produces it.
+        assert_eq!(ErrorDirection::from_str_loose("unknown"), None);
     }
 
     /// Snapshot is the only thing that round-trips via JSON; `PredictionStack`

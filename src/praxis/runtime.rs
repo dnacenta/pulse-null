@@ -141,7 +141,15 @@ impl PipelineState {
     /// (PN-86 — was a plain `fs::write`).
     pub fn save(&self, root_dir: &Path) -> Result<(), Box<dyn std::error::Error>> {
         let path = root_dir.join(STATE_FILENAME);
-        let tmp = root_dir.join(format!(".{STATE_FILENAME}.tmp.{}", std::process::id()));
+        // Per-call unique tmp name: two async paths (task fires and the
+        // intent drain) save concurrently within one process, so a
+        // pid-only suffix would let one writer truncate the other's tmp
+        // mid-publish (SEC-008).
+        let tmp = root_dir.join(format!(
+            ".{STATE_FILENAME}.tmp.{}.{}",
+            std::process::id(),
+            uuid::Uuid::new_v4().simple()
+        ));
         let json = serde_json::to_string_pretty(self)?;
         std::fs::write(&tmp, json)?;
         std::fs::rename(&tmp, &path)?;

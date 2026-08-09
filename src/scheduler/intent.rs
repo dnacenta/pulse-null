@@ -636,7 +636,9 @@ async fn execute_intent(
     // the store's locked load-apply-save, racing task fires safely.
     if state.config.prediction.enabled {
         let intent_id = intent.id.clone();
-        let content = parsed.clean_content.clone();
+        // Raw response, not clean_content: the lazy SHARE/CALL regexes can
+        // swallow an embedded [RESOLVE:] span while stripping (SEC-013).
+        let content = result.response_text.clone();
         let max_unresolved = state.config.prediction.max_unresolved;
         let max_errors = state.config.prediction.max_errors;
         let processed = crate::prediction::store::save_delta_async(
@@ -671,11 +673,18 @@ async fn execute_intent(
                     state.alert_queue.lock().await.push(alert);
                 }
             }
-            Err(e) => tracing::error!(
-                "Failed to process prediction markers for intent '{}': {}",
-                intent.id,
-                e
-            ),
+            Err(e) => {
+                // Infrastructure failure loses the resolutions AND their
+                // skip report — alert, don't just log (SEC-012).
+                tracing::error!(
+                    "Failed to process prediction markers for intent '{}': {}",
+                    intent.id,
+                    e
+                );
+                let alert =
+                    super::alerts::alert_from_store_failure(&intent.description, &e.to_string());
+                state.alert_queue.lock().await.push(alert);
+            }
         }
     }
 
@@ -747,8 +756,17 @@ async fn execute_intent(
                         chain.description
                     );
                 } else {
-                    // Substitute {result} with the output
-                    let chain_prompt = chain.prompt.replace("{result}", &parsed.clean_content);
+                    // Substitute {result} with the output. Prediction markers
+                    // are stripped: now that the intent path processes them,
+                    // markers surviving into a child's prompt would be echoed
+                    // and re-processed — duplicate predictions and dead
+                    // resolves (SEC-007).
+                    let chain_prompt = chain.prompt.replace(
+                        "{result}",
+                        &crate::prediction::resolve::strip_prediction_markers(
+                            &parsed.clean_content,
+                        ),
+                    );
                     let chain_intent = Intent {
                         id: format!(
                             "chain-{}-{}",
@@ -780,7 +798,11 @@ async fn execute_intent(
     if let Some(ref chain) = intent.chain {
         let new_depth = intent.depth + 1;
         if new_depth <= config.max_chain_depth {
-            let chain_prompt = chain.prompt.replace("{result}", &parsed.clean_content);
+            // Same marker-replay guard as the [CHAIN:] path above (SEC-007).
+            let chain_prompt = chain.prompt.replace(
+                "{result}",
+                &crate::prediction::resolve::strip_prediction_markers(&parsed.clean_content),
+            );
             let chain_intent = Intent {
                 id: format!(
                     "chain-{}-{}",

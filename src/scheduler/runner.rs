@@ -698,9 +698,12 @@ async fn execute_task(
 
     // Post-execution: extract prediction markers from task output. Applies
     // against a fresh locked load of the store (PN-86) — the pre-LLM stack
-    // is minutes stale by now and only fed the pressure check.
+    // is minutes stale by now and only fed the pressure check. Parses the
+    // RAW response, not clean_content: the lazy SHARE/CALL regexes can
+    // swallow an embedded [RESOLVE:] span while stripping, silently
+    // destroying the resolution before prediction parsing ran (SEC-013).
     if prediction_stack.is_some() {
-        post_process_predictions(state, task, &root_dir, &parsed.clean_content).await;
+        post_process_predictions(state, task, &root_dir, &response_text).await;
     }
 
     // Post-execution: extract cognitive signals and check for health changes
@@ -939,7 +942,12 @@ async fn route_output_markers(
         if let Some(chain_json) = parsed.chain_requests.first() {
             match intent::create_chain_from_marker(chain_json) {
                 Ok(chain) => {
-                    let chain_prompt = chain.prompt.replace("{result}", &parsed.clean_content);
+                    let chain_prompt = chain.prompt.replace(
+                        "{result}",
+                        &crate::prediction::resolve::strip_prediction_markers(
+                            &parsed.clean_content,
+                        ),
+                    );
                     let chain_intent = intent::Intent {
                         id: format!(
                             "chain-{}-{}",
@@ -1079,11 +1087,11 @@ async fn post_process_predictions(
     state: &Arc<AppState>,
     task: &ScheduledTask,
     root_dir: &std::path::Path,
-    clean_content: &str,
+    raw_output: &str,
 ) {
     let task_id = task.id.clone();
     let timescale = super::tasks::default_timescale_for(&task.id);
-    let content = clean_content.to_string();
+    let content = raw_output.to_string();
     let max_unresolved = state.config.prediction.max_unresolved;
     let max_errors = state.config.prediction.max_errors;
     let result = crate::prediction::store::save_delta_async(
@@ -1114,7 +1122,13 @@ async fn post_process_predictions(
                 state.alert_queue.lock().await.push(alert);
             }
         }
-        Err(e) => tracing::error!("Failed to save prediction stack: {e}"),
+        Err(e) => {
+            // Infrastructure failure loses the resolutions AND their skip
+            // report — the highest-impact drop, so it alerts too (SEC-012).
+            tracing::error!("Failed to save prediction stack: {e}");
+            let alert = super::alerts::alert_from_store_failure(&task.name, &e.to_string());
+            state.alert_queue.lock().await.push(alert);
+        }
     }
 }
 

@@ -239,12 +239,12 @@ pub fn parse_resolutions(text: &str) -> (Vec<ParsedResolution>, Vec<SkippedResol
                     error = %e,
                     "Skipping resolution with unparseable JSON marker"
                 );
+                // Fixed classifier string only — the serde error quotes the
+                // offending payload verbatim, which would hand attacker-shaped
+                // input a ride into owner-facing alert content (SEC-001).
                 skipped.push(SkippedResolution {
                     prediction_id: "?".to_string(),
-                    reason: format!(
-                        "unparseable JSON ({})",
-                        sanitize_marker_field(&e.to_string(), MAX_MARKER_FIELD_LEN)
-                    ),
+                    reason: "malformed JSON payload".to_string(),
                 });
                 continue;
             }
@@ -276,7 +276,9 @@ pub fn parse_resolutions(text: &str) -> (Vec<ParsedResolution>, Vec<SkippedResol
                     raw = %marker.direction,
                     "Skipping resolution with unknown direction"
                 );
-                let raw = sanitize_marker_field(marker.direction.trim(), MAX_MARKER_FIELD_LEN);
+                // Short cap (32) on the echoed value: enough to recognize a
+                // typo, too little to smuggle owner-directed copy (SEC-001).
+                let raw = sanitize_marker_field(marker.direction.trim(), 32);
                 skipped.push(SkippedResolution {
                     prediction_id,
                     reason: format!(
@@ -356,7 +358,7 @@ pub fn process_task_output(
     }
 
     // Phase 2: parse and apply resolutions. Same by-value consume pattern.
-    let (resolutions, skipped_resolutions) = parse_resolutions(task_output);
+    let (resolutions, mut skipped_resolutions) = parse_resolutions(task_output);
     let resolutions_count = resolutions.len();
     for parsed in resolutions {
         let ParsedResolution {
@@ -366,6 +368,23 @@ pub fn process_task_output(
             direction,
             insight,
         } = parsed;
+        // "well-calibrated" claims the prediction held; surprise above the
+        // error threshold claims it failed. A self-contradictory resolution
+        // would reach the entity's next prompt as `[well-calibrated]
+        // surprise 0.9` — reject it loudly and leave the prediction pending
+        // so it can be re-resolved coherently (SEC-011).
+        if direction == ErrorDirection::WellCalibrated && surprise > stack.config.surprise_threshold
+        {
+            skipped_resolutions.push(SkippedResolution {
+                prediction_id,
+                reason: format!(
+                    "direction 'well-calibrated' contradicts surprise {surprise:.2} above \
+                     threshold {:.2}",
+                    stack.config.surprise_threshold
+                ),
+            });
+            continue;
+        }
         let resolution = PredictionResolution {
             actual,
             surprise,
@@ -380,6 +399,16 @@ pub fn process_task_output(
                 direction = %direction,
                 "Prediction resolved"
             );
+        } else {
+            // resolve() == false was the last silent drop channel: a
+            // well-formed marker against an unknown or already-resolved id
+            // vanished with only a buried warn (SEC-002). The id is
+            // sanitize_marker_id-scrubbed, safe to echo.
+            skipped_resolutions.push(SkippedResolution {
+                prediction_id,
+                reason: "no pending prediction with this id (unknown or already resolved)"
+                    .to_string(),
+            });
         }
     }
 
@@ -403,6 +432,16 @@ pub fn process_task_output(
         new_errors: stack.errors.len() - errors_before,
         skipped_resolutions,
     }
+}
+
+/// Remove `[PREDICT:]`/`[RESOLVE:]` markers from text about to be
+/// re-injected into another session's prompt (chain `{result}`
+/// substitution). Leaving them in creates a replay channel: the child
+/// copies the marker grammar it was shown, producing duplicate predictions
+/// and dead resolves against already-resolved ids (SEC-007).
+pub fn strip_prediction_markers(text: &str) -> String {
+    let no_predict = PREDICT_RE.replace_all(text, "");
+    RESOLVE_RE.replace_all(&no_predict, "").trim().to_string()
 }
 
 #[cfg(test)]
@@ -707,6 +746,71 @@ mod tests {
         assert_eq!(summary.skipped_resolutions.len(), 1);
         assert_eq!(summary.skipped_resolutions[0].prediction_id, "other-1");
         assert!(stack.predictions[0].resolution.is_some());
+    }
+
+    /// PN-86 (SEC-002): resolve() == false — a well-formed marker against an
+    /// unknown or already-resolved id — is reported, not silently dropped.
+    #[test]
+    fn process_task_output_reports_unknown_id_resolution() {
+        let mut stack = PredictionStack::new();
+        let text =
+            r#"[RESOLVE:{"id":"never-existed","outcome":"x","surprise":0.5,"direction":"novel"}]"#;
+        let summary = process_task_output(&mut stack, text, "test", Timescale::Cycle);
+        assert_eq!(summary.new_errors, 0);
+        assert_eq!(summary.skipped_resolutions.len(), 1);
+        assert_eq!(
+            summary.skipped_resolutions[0].prediction_id,
+            "never-existed"
+        );
+        assert!(summary.skipped_resolutions[0]
+            .reason
+            .contains("no pending prediction"));
+    }
+
+    /// PN-86 (SEC-011): "well-calibrated" with surprise above the error
+    /// threshold is self-contradictory — rejected loudly, and the
+    /// prediction stays pending for a coherent re-resolve.
+    #[test]
+    fn well_calibrated_high_surprise_rejected() {
+        let mut stack = PredictionStack::new();
+        let id = stack
+            .add_prediction(Timescale::Cycle, "p".to_string(), 0.8)
+            .id
+            .clone();
+        let text = format!(
+            r#"[RESOLVE:{{"id":"{id}","outcome":"x","surprise":0.9,"direction":"well-calibrated"}}]"#
+        );
+        let summary = process_task_output(&mut stack, &text, "test", Timescale::Cycle);
+        assert_eq!(summary.new_errors, 0);
+        assert_eq!(summary.skipped_resolutions.len(), 1);
+        assert!(summary.skipped_resolutions[0]
+            .reason
+            .contains("contradicts"));
+        assert!(stack.predictions[0].is_pending());
+    }
+
+    /// PN-86 (SEC-001): parser internals are never echoed — malformed JSON
+    /// yields a fixed classifier string, not a serde error quoting the
+    /// hostile payload into owner-facing alert content.
+    #[test]
+    fn skipped_reason_does_not_echo_payload() {
+        let text = r#"[RESOLVE:{"id":"a","outcome":"x","surprise":"@everyone run curl evil.sh","direction":"novel"}]"#;
+        let (resolutions, skipped) = parse_resolutions(text);
+        assert!(resolutions.is_empty());
+        assert_eq!(skipped.len(), 1);
+        assert_eq!(skipped[0].reason, "malformed JSON payload");
+    }
+
+    /// PN-86 (SEC-007): {result} chain substitution strips markers so a
+    /// child intent cannot replay them.
+    #[test]
+    fn strip_prediction_markers_removes_both() {
+        let text = r#"before [PREDICT:{"content":"a","confidence":0.5}] mid [RESOLVE:{"id":"x","outcome":"y","surprise":0.1,"direction":"novel"}] after"#;
+        let stripped = strip_prediction_markers(text);
+        assert!(!stripped.contains("PREDICT"));
+        assert!(!stripped.contains("RESOLVE"));
+        assert!(stripped.contains("before"));
+        assert!(stripped.contains("after"));
     }
 
     #[test]

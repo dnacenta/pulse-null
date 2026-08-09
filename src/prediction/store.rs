@@ -11,9 +11,11 @@
 //! `tokio::task::spawn_blocking` issued by `build_system_prompt_async`, so
 //! the runtime never sees a blocking read on a worker thread.
 //!
-//! Async callers — `scheduler::runner::execute_task` — go through
-//! `load_async` / `save_async`, which wrap the sync core in `spawn_blocking`
-//! per the established `SchedulerState::load/save` pattern in `runner.rs:41`.
+//! Async callers go through `load_async` (reads) and `save_delta_async`
+//! (writes), which wrap the sync core in `spawn_blocking` per the
+//! established `SchedulerState::load/save` pattern in `runner.rs:41`.
+//! All writes are locked read-modify-write via `save_delta` (PN-86) —
+//! there is no production path that writes back a previously-loaded stack.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -80,6 +82,12 @@ pub fn load(root_dir: &Path, config: PredictionConfig) -> PredictionStack {
 /// transient read/parse failure would silently wipe the store. Here a
 /// missing file is still an empty stack (fresh entity), but an existing
 /// file that cannot be read or parsed is an error and the delta is aborted.
+///
+/// A corrupt file is additionally **quarantined** (renamed to
+/// `predictions.json.corrupt.<ts>`) so the failure costs one cycle instead
+/// of wedging every future write forever (SEC-003): this call still errors
+/// — loud, callers alert — but the next `save_delta` starts from a fresh
+/// empty stack, and the corrupt bytes are kept for forensics.
 fn load_strict(
     root_dir: &Path,
     config: PredictionConfig,
@@ -92,8 +100,26 @@ fn load_strict(
         }
         Err(e) => return Err(Box::new(e)),
     };
-    let snapshot: PredictionStackSnapshot = serde_json::from_str(&content)?;
-    Ok(snapshot.into_stack(config))
+    match serde_json::from_str::<PredictionStackSnapshot>(&content) {
+        Ok(snapshot) => Ok(snapshot.into_stack(config)),
+        Err(e) => {
+            let quarantine = root_dir.join(format!(
+                "{PREDICTIONS_FILE}.corrupt.{}",
+                chrono::Utc::now().format("%Y%m%dT%H%M%S")
+            ));
+            match fs::rename(&path, &quarantine) {
+                Ok(()) => Err(format!(
+                    "corrupt predictions.json quarantined to {} ({e})",
+                    quarantine.display()
+                )
+                .into()),
+                Err(rename_err) => Err(format!(
+                    "corrupt predictions.json, quarantine also failed ({rename_err}): {e}"
+                )
+                .into()),
+            }
+        }
+    }
 }
 
 /// Locked read-modify-write on the prediction store (PN-86).
@@ -215,6 +241,12 @@ pub async fn load_async(root_dir: PathBuf, config: PredictionConfig) -> Predicti
 ///
 /// The sync `save` now returns `Send + Sync`, so we can pass the error
 /// chain through `spawn_blocking` without stringifying it (M2).
+///
+/// Test-only since PN-86 (SEC-012): production writers MUST go through
+/// [`save_delta_async`] — an unlocked write-back of a previously-loaded
+/// stack is exactly the lost-update bug PN-86 fixed. Gated so a future
+/// caller cannot quietly reintroduce it.
+#[cfg(test)]
 pub async fn save_async(
     root_dir: PathBuf,
     stack: PredictionStack,
@@ -374,10 +406,11 @@ mod tests {
         assert_eq!(loaded.predictions.len(), 8);
     }
 
-    /// PN-86: save_delta must abort on a corrupt existing file rather than
-    /// wiping it with a freshly-defaulted stack (fail-closed, unlike `load`).
+    /// PN-86 (SEC-003): save_delta must abort on a corrupt existing file
+    /// rather than wiping it — and must quarantine it so the failure costs
+    /// one loud cycle, not every future write forever.
     #[test]
-    fn save_delta_aborts_on_corrupt_file() {
+    fn save_delta_aborts_and_quarantines_corrupt_file() {
         let tmp = TempDir::new().unwrap();
         let path = tmp.path().join(PREDICTIONS_FILE);
         std::fs::write(&path, "{ not valid json").unwrap();
@@ -387,8 +420,31 @@ mod tests {
         });
         assert!(result.is_err());
 
-        // The corrupt file is untouched — no silent wipe.
-        assert_eq!(std::fs::read_to_string(&path).unwrap(), "{ not valid json");
+        // Corrupt bytes preserved under quarantine, not overwritten.
+        assert!(!path.exists());
+        let quarantined: Vec<_> = std::fs::read_dir(tmp.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| {
+                e.file_name()
+                    .to_string_lossy()
+                    .starts_with("predictions.json.corrupt.")
+            })
+            .collect();
+        assert_eq!(quarantined.len(), 1);
+        assert_eq!(
+            std::fs::read_to_string(quarantined[0].path()).unwrap(),
+            "{ not valid json"
+        );
+
+        // The next delta self-heals from empty.
+        save_delta(tmp.path(), PredictionConfig::default(), |stack| {
+            stack.add_prediction(Timescale::Cycle, "after-quarantine".to_string(), 0.5);
+        })
+        .unwrap();
+        let loaded = load(tmp.path(), PredictionConfig::default());
+        assert_eq!(loaded.predictions.len(), 1);
+        assert_eq!(loaded.predictions[0].content, "after-quarantine");
     }
 
     /// PN-86: missing file is a fresh entity, not an error — save_delta
