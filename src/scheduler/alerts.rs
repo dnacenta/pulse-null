@@ -127,6 +127,35 @@ impl AlertQueue {
     }
 }
 
+/// Create an alert reporting rejected `[RESOLVE:]` markers (PN-86).
+/// A dropped resolution is lost calibration data — it must reach the owner
+/// through the alert drain, not die as a `tracing::warn` nobody reads.
+pub fn alert_from_skipped_resolutions(
+    task_name: &str,
+    skipped: &[crate::prediction::resolve::SkippedResolution],
+) -> Alert {
+    use std::fmt::Write as _;
+    let mut content = format!(
+        "{} RESOLVE marker(s) rejected during '{}' — calibration data lost unless re-emitted:",
+        skipped.len(),
+        task_name
+    );
+    for s in skipped {
+        let _ = write!(content, "\n- id {}: {}", s.prediction_id, s.reason);
+    }
+    Alert {
+        id: format!(
+            "alert-{}-{}",
+            task_name,
+            &uuid::Uuid::new_v4().to_string()[..8]
+        ),
+        source_task: task_name.to_string(),
+        content,
+        created_at: Utc::now(),
+        target_channel: None,
+    }
+}
+
 /// Create an alert from [SHARE:] content produced by a scheduled task.
 pub fn alert_from_share(task_name: &str, content: &str) -> Alert {
     Alert {

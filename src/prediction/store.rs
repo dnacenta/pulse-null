@@ -338,7 +338,11 @@ mod tests {
         .unwrap();
 
         let loaded = load(tmp.path(), PredictionConfig::default());
-        let contents: Vec<&str> = loaded.predictions.iter().map(|p| p.content.as_str()).collect();
+        let contents: Vec<&str> = loaded
+            .predictions
+            .iter()
+            .map(|p| p.content.as_str())
+            .collect();
         assert!(contents.contains(&"b-on-disk"));
         assert!(contents.contains(&"a-final"));
         assert_eq!(loaded.predictions.len(), 2);
@@ -384,10 +388,7 @@ mod tests {
         assert!(result.is_err());
 
         // The corrupt file is untouched — no silent wipe.
-        assert_eq!(
-            std::fs::read_to_string(&path).unwrap(),
-            "{ not valid json"
-        );
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "{ not valid json");
     }
 
     /// PN-86: missing file is a fresh entity, not an error — save_delta

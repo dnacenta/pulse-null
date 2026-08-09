@@ -1090,20 +1090,28 @@ async fn post_process_predictions(
         root_dir.to_path_buf(),
         state.config.prediction.clone(),
         move |stack| {
-            let new_error_count = crate::prediction::resolve::process_task_output(
+            let summary = crate::prediction::resolve::process_task_output(
                 stack, &content, &task_id, timescale,
             );
             stack.prune(max_unresolved, max_errors);
-            (new_error_count, stack.accumulated_importance())
+            (summary, stack.accumulated_importance())
         },
     )
     .await;
     match result {
-        Ok((new_error_count, importance)) => {
-            if new_error_count > 0 {
+        Ok((summary, importance)) => {
+            if summary.new_errors > 0 {
                 tracing::info!(
-                    "Prediction errors: {new_error_count} new (accumulated importance: {importance:.2})"
+                    "Prediction errors: {} new (accumulated importance: {importance:.2})",
+                    summary.new_errors,
                 );
+            }
+            if !summary.skipped_resolutions.is_empty() {
+                let alert = super::alerts::alert_from_skipped_resolutions(
+                    &task.name,
+                    &summary.skipped_resolutions,
+                );
+                state.alert_queue.lock().await.push(alert);
             }
         }
         Err(e) => tracing::error!("Failed to save prediction stack: {e}"),

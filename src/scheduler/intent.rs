@@ -629,6 +629,56 @@ async fn execute_intent(
     // Parse output for markers
     let parsed = output::parse_output(&result.response_text);
 
+    // Handle [PREDICT:] / [RESOLVE:] markers (PN-86). Until now the intent
+    // path silently dropped them — process_task_output's only call site was
+    // the task path in runner.rs, so predictions and resolutions emitted
+    // during intent sessions never reached predictions.json. Applies via
+    // the store's locked load-apply-save, racing task fires safely.
+    if state.config.prediction.enabled {
+        let intent_id = intent.id.clone();
+        let content = parsed.clean_content.clone();
+        let max_unresolved = state.config.prediction.max_unresolved;
+        let max_errors = state.config.prediction.max_errors;
+        let processed = crate::prediction::store::save_delta_async(
+            root_dir.clone(),
+            state.config.prediction.clone(),
+            move |stack| {
+                let summary = crate::prediction::resolve::process_task_output(
+                    stack,
+                    &content,
+                    &intent_id,
+                    crate::prediction::Timescale::Cycle,
+                );
+                stack.prune(max_unresolved, max_errors);
+                summary
+            },
+        )
+        .await;
+        match processed {
+            Ok(summary) => {
+                if summary.new_errors > 0 {
+                    tracing::info!(
+                        "Intent '{}': {} new prediction errors",
+                        intent.id,
+                        summary.new_errors
+                    );
+                }
+                if !summary.skipped_resolutions.is_empty() {
+                    let alert = super::alerts::alert_from_skipped_resolutions(
+                        &intent.description,
+                        &summary.skipped_resolutions,
+                    );
+                    state.alert_queue.lock().await.push(alert);
+                }
+            }
+            Err(e) => tracing::error!(
+                "Failed to process prediction markers for intent '{}': {}",
+                intent.id,
+                e
+            ),
+        }
+    }
+
     // Handle [SCHEDULE:] markers
     for schedule_json in &parsed.schedule_requests {
         match super::dynamic::create_task_from_marker(schedule_json) {
