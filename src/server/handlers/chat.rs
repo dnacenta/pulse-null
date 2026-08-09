@@ -44,6 +44,11 @@ fn default_channel() -> String {
 /// Maximum number of tool-use round trips before we force a text response.
 const MAX_TOOL_ROUNDS: u32 = 25;
 
+/// Maximum number of refusal-fallback invocations per session (SEC-002).
+/// Once reached, further refusals take the ordinary rollback + error path
+/// rather than spawning more expensive opus tool-loops. Reset on session reset.
+const MAX_FALLBACKS_PER_SESSION: u32 = 25;
+
 const MAX_MESSAGE_LEN: usize = 100_000;
 const MAX_CHANNEL_LEN: usize = 64;
 const MAX_SENDER_LEN: usize = 64;
@@ -435,12 +440,14 @@ pub async fn chat(
     // `resolve_sender` maps the owner's configured phone/discord-id/name and the
     // tui/system/reflection channels to "owner", so D's voice calls still get
     // the fallback while guests and peers never do. `gated_fallback` enforces
-    // the owner gate (and the isolation shed) and drops the builder unbuilt for
-    // everyone else.
+    // the owner gate, the isolation shed, and the per-session invocation cap
+    // (SEC-002), dropping the builder unbuilt otherwise.
+    let fallback_capped =
+        session.data.health.fallback_count_this_session >= MAX_FALLBACKS_PER_SESSION;
     let config_for_fallback = &state.config;
     let build_fallback = state.config.llm.fallback_target().and_then(|model| {
         let model = model.to_string();
-        gated_fallback(&resolved_key, isolated, move || {
+        gated_fallback(&resolved_key, isolated, !fallback_capped, move || {
             crate::providers::create_provider_with_model(config_for_fallback, &model)
         })
     });
@@ -471,6 +478,16 @@ pub async fn chat(
         } else {
             tracing::error!("LLM turn failed: {}", e);
         }
+        // SEC-002: a refusal that was denied the fallback because the session
+        // hit the invocation cap took this error path deliberately — surface it
+        // so the cap is visible in the logs.
+        if fallback_capped && e.downcast_ref::<crate::errors::RefusalError>().is_some() {
+            tracing::warn!(
+                session_key = %session_key,
+                cap = MAX_FALLBACKS_PER_SESSION,
+                "refusal fallback cap reached — refusal took the error path without invoking the fallback model"
+            );
+        }
         // Keep the banner sticky even on the failure path — while isolated
         // the provider is precisely the suspect.
         let msg = if crate::server::isolation::is_active(&state.root_dir) {
@@ -498,6 +515,11 @@ pub async fn chat(
     session.data.message_count += 1;
     if !isolated {
         session.data.wal.messages_since_checkpoint += 1;
+    }
+    // SEC-002: count a fallback invocation once it actually committed to
+    // quarantine, so the per-session cap bounds real opus tool-loops.
+    if committed_to_quarantine {
+        session.data.health.fallback_count_this_session += 1;
     }
 
     // Track recently accessed files from tool use (for post-compaction re-injection).
@@ -793,16 +815,21 @@ impl std::fmt::Debug for TurnResult {
     }
 }
 
-/// Owner-only, non-isolated gate for the reactive refusal fallback (SEC-001).
+/// Gate for the reactive refusal fallback (SEC-001, SEC-002).
 ///
-/// Returns `Some(build)` — arming the fallback — only for the owner and only
-/// when not isolated; otherwise the builder is dropped unbuilt and a refusal
-/// takes the ordinary rollback + error path. The fallback re-runs a refused turn
-/// on the more permissive opus model, so letting a guest or peer trigger it
-/// would make fable-5's AUP classifier bypassable by any untrusted caller who
-/// can reach `/chat`. This is the intended default, not a config knob.
-fn gated_fallback<F>(resolved_key: &str, isolated: bool, build: F) -> Option<F> {
-    (!isolated && resolved_key == "owner").then_some(build)
+/// Returns `Some(build)` — arming the fallback — only when ALL of:
+/// - the caller is the owner (SEC-001): the fallback re-runs a refused turn on
+///   the more permissive opus model, so letting a guest or peer trigger it would
+///   make fable-5's AUP classifier bypassable by any untrusted caller who can
+///   reach `/chat`. Owner-only is the intended default, not a config knob.
+/// - we are not isolated: while isolated the provider is itself the suspect.
+/// - the session is under the per-session invocation cap (SEC-002): bounds
+///   runaway or repeated refusals from driving unbounded opus tool-loops.
+///
+/// Otherwise the builder is dropped unbuilt and a refusal takes the ordinary
+/// rollback + error path.
+fn gated_fallback<F>(resolved_key: &str, isolated: bool, under_cap: bool, build: F) -> Option<F> {
+    (!isolated && resolved_key == "owner" && under_cap).then_some(build)
 }
 
 /// Run one interactive turn with reactive refusal fallback (PN-88).
@@ -1499,30 +1526,60 @@ mod tests {
         assert!(data.quarantine.is_empty());
     }
 
-    /// SEC-001: the fallback gate is owner-only, and shed while isolated.
+    /// A convenience builder for gate tests — an owner+under_cap combination
+    /// should arm, everything else should not.
+    fn dummy_build() -> Result<Box<dyn LmProvider>, ProviderError> {
+        Ok(Box::new(FailingMock) as Box<dyn LmProvider>)
+    }
+
+    /// SEC-001 + SEC-002: the fallback gate is owner-only, shed while isolated,
+    /// and shed once the per-session cap is hit.
     #[test]
-    fn fallback_gate_is_owner_only() {
-        // Owner, not isolated → armed.
-        assert!(gated_fallback("owner", false, || Ok(Box::new(FailingMock) as Box<dyn LmProvider>))
-            .is_some());
+    fn fallback_gate_is_owner_only_and_capped() {
+        // Owner, not isolated, under cap → armed.
+        assert!(gated_fallback("owner", false, true, dummy_build).is_some());
         // Guests and peers never arm the fallback.
-        assert!(
-            gated_fallback("guest:stranger", false, || Ok(
-                Box::new(FailingMock) as Box<dyn LmProvider>
-            ))
-            .is_none()
-        );
-        assert!(
-            gated_fallback("peer:Nova", false, || Ok(
-                Box::new(FailingMock) as Box<dyn LmProvider>
-            ))
-            .is_none()
-        );
+        assert!(gated_fallback("guest:stranger", false, true, dummy_build).is_none());
+        assert!(gated_fallback("peer:Nova", false, true, dummy_build).is_none());
         // Even the owner is shed while isolated (the provider is the suspect).
+        assert!(gated_fallback("owner", true, true, dummy_build).is_none());
+        // SEC-002: even the owner is shed once over the cap.
+        assert!(gated_fallback("owner", false, false, dummy_build).is_none());
+    }
+
+    /// SEC-002: the (N+1)th refusal in a session does not build the fallback —
+    /// the over-cap gate drops the builder even for the owner.
+    #[tokio::test]
+    async fn capped_owner_refusal_does_not_build_fallback() {
+        let mut data = session_with(&["earlier turn"], "spicy question");
+        let trunk_before = data.messages.len();
+        let tools = ToolRegistry::new();
+        let called = Arc::new(AtomicBool::new(false));
+        let called_in_build = Arc::clone(&called);
+
+        let build = move || {
+            called_in_build.store(true, Ordering::SeqCst);
+            Ok(Box::new(RecordingProvider {
+                reply: "should not happen".to_string(),
+                seen: Arc::new(Mutex::new(Vec::new())),
+            }) as Box<dyn LmProvider>)
+        };
+        // Owner, not isolated, but OVER the cap (under_cap = false).
+        let gated = gated_fallback("owner", false, false, build);
+
+        let err = invoke_turn_with_refusal_fallback(
+            &mut data, &RefusingMock, gated, &tools, "sys", 1024, "corr",
+        )
+        .await
+        .unwrap_err();
+
+        assert!(err.downcast_ref::<RefusalError>().is_some());
         assert!(
-            gated_fallback("owner", true, || Ok(Box::new(FailingMock) as Box<dyn LmProvider>))
-                .is_none()
+            !called.load(Ordering::SeqCst),
+            "fallback built for an over-cap owner refusal"
         );
+        assert_eq!(data.messages.len(), trunk_before - 1);
+        assert!(data.quarantine.is_empty());
     }
 
     /// SEC-001: a guest refusal never builds the fallback provider and rolls the
@@ -1544,7 +1601,7 @@ mod tests {
             }) as Box<dyn LmProvider>)
         };
         // The owner-only gate drops the builder for a guest.
-        let gated = gated_fallback("guest:stranger", false, build);
+        let gated = gated_fallback("guest:stranger", false, true, build);
 
         let err = invoke_turn_with_refusal_fallback(
             &mut data, &RefusingMock, gated, &tools, "sys", 1024, "corr",
@@ -1577,7 +1634,7 @@ mod tests {
                 seen: Arc::new(Mutex::new(Vec::new())),
             }) as Box<dyn LmProvider>)
         };
-        let gated = gated_fallback("peer:Nova", false, build);
+        let gated = gated_fallback("peer:Nova", false, true, build);
 
         let err = invoke_turn_with_refusal_fallback(
             &mut data, &RefusingMock, gated, &tools, "sys", 1024, "corr",

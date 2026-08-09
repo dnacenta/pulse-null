@@ -78,6 +78,12 @@ pub struct HealthCounters {
     /// Number of times the circuit breaker fired in this session.
     #[serde(default)]
     pub circuit_breaker_count: u32,
+    /// Number of times a refused turn was re-run on the fallback model in this
+    /// session (PN-88, SEC-002). Capped at `MAX_FALLBACKS_PER_SESSION` to bound
+    /// runaway or repeated refusals from driving unbounded expensive opus
+    /// tool-loops. Reset with the other health counters on session reset.
+    #[serde(default)]
+    pub fallback_count_this_session: u32,
 }
 
 /// Compaction metrics tracking token recovery and context management.
