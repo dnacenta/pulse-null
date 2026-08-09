@@ -491,17 +491,18 @@ pub async fn chat(
     // Commit the turn to the WAL now that it succeeded. Write-ahead is deferred
     // until success (see the user-message push above) so a refused or failed
     // turn leaves no entry — "user-message-not-committed-until-success"
-    // ordering keeps WAL replay consistent with the in-memory trunk. User
-    // first, then assistant. (Shed in isolation.) A quarantined turn is not on
-    // the trunk, so it must not be replayed into it — its WAL commit lands on
-    // the quarantine lane in a later step.
-    if let Some(wal) = state
-        .wal
-        .as_ref()
-        .filter(|_| !isolated && !committed_to_quarantine)
-    {
+    // ordering keeps WAL replay consistent with the in-memory lanes. A
+    // quarantined turn carries the quarantine lane marker so replay
+    // reconstructs the split and never poisons the trunk. User first, then
+    // assistant. (Shed in isolation.)
+    if let Some(wal) = state.wal.as_ref().filter(|_| !isolated) {
+        let lane = if committed_to_quarantine {
+            crate::wal::WalLane::Quarantine
+        } else {
+            crate::wal::WalLane::Trunk
+        };
         let user_seq = session.data.wal.wal_seq + 1;
-        match wal.append(
+        match wal.append_with_lane(
             &session_key,
             user_seq,
             Role::User,
@@ -510,17 +511,19 @@ pub async fn chat(
                 channel: Some(req.channel.clone()),
                 sender: req.sender.clone(),
             }),
+            lane,
         ) {
             Ok(()) => session.data.wal.wal_seq = user_seq,
             Err(e) => tracing::warn!("WAL append failed for user message: {}", e),
         }
         let asst_seq = session.data.wal.wal_seq + 1;
-        match wal.append(
+        match wal.append_with_lane(
             &session_key,
             asst_seq,
             Role::Assistant,
             &MessageContent::Text(text.clone()),
             None,
+            lane,
         ) {
             Ok(()) => session.data.wal.wal_seq = asst_seq,
             Err(e) => tracing::warn!("WAL append failed for assistant message: {}", e),
@@ -791,7 +794,8 @@ async fn invoke_turn_with_refusal_fallback<F>(
     correlation_id: &str,
 ) -> Result<TurnResult, Box<dyn std::error::Error + Send + Sync>>
 where
-    F: FnOnce() -> Result<Box<dyn pulse_system_types::llm::LmProvider>, crate::errors::ProviderError>,
+    F: FnOnce()
+        -> Result<Box<dyn pulse_system_types::llm::LmProvider>, crate::errors::ProviderError>,
 {
     // The user message is the trunk tail: compaction only rewrites older
     // messages, never the newest turn.
@@ -1125,9 +1129,7 @@ mod tests {
     use crate::errors::{ProviderError, RefusalError};
     use crate::session_store::{Session, SessionData};
     use crate::tools::ToolRegistry;
-    use pulse_system_types::llm::{
-        ContentBlock, LlmResponse, LlmResult, LmProvider, StopReason,
-    };
+    use pulse_system_types::llm::{ContentBlock, LlmResponse, LlmResult, LmProvider, StopReason};
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Mutex;
 
@@ -1188,7 +1190,8 @@ mod tests {
                 Err(Box::new(RefusalError {
                     model: "fable".to_string(),
                     detail: "violates our Usage Policy".to_string(),
-                }) as Box<dyn std::error::Error + Send + Sync>)
+                })
+                    as Box<dyn std::error::Error + Send + Sync>)
             })
         }
         fn name(&self) -> &str {
@@ -1240,7 +1243,9 @@ mod tests {
         data
     }
 
-    fn no_fallback() -> Option<fn() -> Result<Box<dyn LmProvider>, ProviderError>> {
+    type FallbackBuilder = fn() -> Result<Box<dyn LmProvider>, ProviderError>;
+
+    fn no_fallback() -> Option<FallbackBuilder> {
         None
     }
 

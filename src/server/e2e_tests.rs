@@ -112,9 +112,7 @@ impl LmProvider for FailingProvider {
         _max_tokens: u32,
         _tools: Option<&[serde_json::Value]>,
     ) -> LlmResult<'_> {
-        Box::pin(async {
-            Err("network drop while calling the model".into())
-        })
+        Box::pin(async { Err("network drop while calling the model".into()) })
     }
 
     fn name(&self) -> &str {
@@ -984,7 +982,11 @@ async fn e2e_isolation_parks_coordinator_and_resumes() {
 
 /// The trunk length of the "chat"/anonymous session (0 when absent).
 async fn trunk_len(state: &Arc<AppState>) -> usize {
-    match state.session_store.get_existing_by_key("guest:anonymous").await {
+    match state
+        .session_store
+        .get_existing_by_key("guest:anonymous")
+        .await
+    {
         Some(arc) => arc.read().await.data.messages.len(),
         None => 0,
     }
@@ -1016,7 +1018,11 @@ async fn e2e_generic_error_rolls_back_user_turn() {
     // A second failed turn must also not accumulate anything.
     let (status, _body) = post_chat(&app, "still there?").await;
     assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
-    assert_eq!(trunk_len(&state).await, 0, "second failed turn poisoned the session");
+    assert_eq!(
+        trunk_len(&state).await,
+        0,
+        "second failed turn poisoned the session"
+    );
 }
 
 /// AC5: an AUP refusal with the fallback disabled (no `fallback_model`) takes

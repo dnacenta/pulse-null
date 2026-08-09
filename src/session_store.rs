@@ -1593,7 +1593,10 @@ mod tests {
 
         let archive = reset_session(&mut session.data, tmp.path(), "TestEntity");
 
-        assert!(archive.is_some(), "reset should archive when history exists");
+        assert!(
+            archive.is_some(),
+            "reset should archive when history exists"
+        );
         assert!(
             session.data.quarantine.is_empty(),
             "quarantine lane not cleared on reset"
