@@ -1,3 +1,27 @@
+//! Write-ahead log for crash-resilient conversation persistence.
+//!
+//! # Commit semantics (PN-88)
+//!
+//! Despite the "write-ahead" name, the WAL is now **commit-on-success**
+//! (write-behind): a turn's entries are appended by the chat handler only
+//! *after* the turn succeeds, not before the provider is called. A crash in the
+//! middle of an in-flight turn therefore loses that one turn rather than
+//! replaying a half-written user message onto the trunk — this is the fix for
+//! the 2026-08-09 session-poisoning bug, where a refused turn left a
+//! half-appended user message that re-tripped the classifier on every later
+//! turn. The trade-off is deliberate: durability of the *last* in-flight turn is
+//! given up in exchange for never replaying a partial/poisoned one.
+//!
+//! # Downgrade caveat
+//!
+//! [`WalLane`] is written with `#[serde(skip_serializing_if)]` so trunk entries
+//! stay byte-compatible with pre-PN-88 WAL files. The consequence for a rolling
+//! downgrade (relevant to the shared `/opt/pulse-null` checkout + rolling
+//! restarts): an OLDER binary replaying a NEWER WAL will not recognise the
+//! `lane` field, so it silently drops it and replays quarantined
+//! (policy-refused) turns back onto the trunk — re-poisoning the default model's
+//! context. Do not downgrade across the PN-88 boundary while quarantine WAL
+//! entries may exist.
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufRead, BufReader, Write as IoWrite};
 use std::path::{Path, PathBuf};
