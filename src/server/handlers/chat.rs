@@ -224,14 +224,27 @@ pub async fn chat(
         if session.data.isolation_ephemeral_from.is_none() {
             session.data.isolation_ephemeral_from = Some(session.data.messages.len());
         }
-    } else if let Some(watermark) = session.data.isolation_ephemeral_from.take() {
-        let dropped = session.data.messages.len().saturating_sub(watermark);
-        session.data.messages.truncate(watermark);
-        session.data.compaction.estimated_tokens =
-            crate::context::estimate_conversation_tokens(&session.data.messages);
-        tracing::info!(
-            "[chat] dropped {dropped} ephemeral isolation message(s) on return to normal"
-        );
+        // SEC-004: track the quarantine lane the same way, so a fallback tangent
+        // created during this isolation window is shed on return to normal.
+        if session.data.isolation_quarantine_from.is_none() {
+            session.data.isolation_quarantine_from = Some(session.data.quarantine.len());
+        }
+    } else {
+        if let Some(watermark) = session.data.isolation_ephemeral_from.take() {
+            let dropped = session.data.messages.len().saturating_sub(watermark);
+            session.data.messages.truncate(watermark);
+            session.data.compaction.estimated_tokens =
+                crate::context::estimate_conversation_tokens(&session.data.messages);
+            tracing::info!(
+                "[chat] dropped {dropped} ephemeral isolation message(s) on return to normal"
+            );
+        }
+        let dropped_q = shed_isolation_quarantine(&mut session.data);
+        if dropped_q > 0 {
+            tracing::info!(
+                "[chat] dropped {dropped_q} ephemeral isolation quarantine entry(ies) on return to normal"
+            );
+        }
     }
 
     // === Session limit check ===
@@ -239,6 +252,7 @@ pub async fn chat(
     // time cap, or hallucination threshold). If so, archive the current conversation
     // with a structured handoff and start fresh before processing this message.
     let pre_turn_len = session.data.messages.len();
+    let pre_turn_quarantine_len = session.data.quarantine.len();
     let limits = state.config.sessions.get_identity_limits(&resolved_key);
     // Session resets archive to disk — shed in isolation (the in-memory
     // session simply keeps growing for the duration of the diagnosis).
@@ -504,8 +518,25 @@ pub async fn chat(
     // Re-sample: a turn admitted just before the marker appeared must not
     // write after it. OR of the two samples drives every gate below.
     let isolated = isolated || crate::server::isolation::is_active(&state.root_dir);
-    if isolated && session.data.isolation_ephemeral_from.is_none() {
-        session.data.isolation_ephemeral_from = Some(pre_turn_len);
+    if isolated {
+        if session.data.isolation_ephemeral_from.is_none() {
+            session.data.isolation_ephemeral_from = Some(pre_turn_len);
+        }
+        // SEC-004: a turn that flipped to isolated mid-flight must not commit its
+        // fallback tangent to the quarantine lane. Anchor the watermark at this
+        // turn's pre-turn quarantine length (if not already anchored earlier in
+        // the isolation window) and drop anything the fallback just pushed —
+        // don't wait for the next normal turn to shed it.
+        if session.data.isolation_quarantine_from.is_none() {
+            session.data.isolation_quarantine_from = Some(pre_turn_quarantine_len);
+        }
+        if committed_to_quarantine {
+            let from = session
+                .data
+                .isolation_quarantine_from
+                .unwrap_or(pre_turn_quarantine_len);
+            session.data.quarantine.truncate(from);
+        }
     }
 
     let text = result.text.clone();
@@ -832,6 +863,21 @@ fn gated_fallback<F>(resolved_key: &str, isolated: bool, under_cap: bool, build:
     (!isolated && resolved_key == "owner" && under_cap).then_some(build)
 }
 
+/// Shed the quarantine entries added during an isolation window, truncating the
+/// lane back to its entry-time watermark and clearing the watermark (SEC-004).
+/// Mirrors the message-lane ephemeral shed. Returns the number of entries
+/// dropped (0 when no isolation window was open).
+fn shed_isolation_quarantine(data: &mut crate::session_store::SessionData) -> usize {
+    match data.isolation_quarantine_from.take() {
+        Some(watermark) => {
+            let dropped = data.quarantine.len().saturating_sub(watermark);
+            data.quarantine.truncate(watermark);
+            dropped
+        }
+        None => 0,
+    }
+}
+
 /// Run one interactive turn with reactive refusal fallback (PN-88).
 ///
 /// The default (fable) model runs first, appending to the trunk (`data.messages`).
@@ -865,11 +911,7 @@ where
     // integer underflow panic / out-of-bounds index (SEC-005).
     let user_index = match data.messages.len().checked_sub(1) {
         Some(index) => index,
-        None => {
-            return Err(
-                "invoke_turn_with_refusal_fallback called with an empty trunk".into(),
-            )
-        }
+        None => return Err("invoke_turn_with_refusal_fallback called with an empty trunk".into()),
     };
 
     let default_outcome = crate::task_context::scope(
@@ -1526,6 +1568,38 @@ mod tests {
         assert!(data.quarantine.is_empty());
     }
 
+    /// SEC-004: the quarantine-lane shed drops exactly the entries added during
+    /// an isolation window (back to the entry-time watermark) and clears the
+    /// watermark, leaving anything present before isolation intact.
+    #[test]
+    fn shed_isolation_quarantine_drops_only_in_window_entries() {
+        let mut data = session_with(&[], "current turn");
+        // A quarantine tangent that predates the isolation window.
+        data.quarantine.push(user("pre-isolation q"));
+        // Isolation begins here.
+        data.isolation_quarantine_from = Some(data.quarantine.len());
+        // Two entries pushed while isolated (e.g. a mid-flight fallback commit).
+        data.quarantine.push(user("in-isolation spicy"));
+        data.quarantine.push(user("in-isolation opus reply"));
+
+        let dropped = shed_isolation_quarantine(&mut data);
+
+        assert_eq!(dropped, 2);
+        assert_eq!(data.quarantine.len(), 1);
+        assert!(
+            data.isolation_quarantine_from.is_none(),
+            "watermark not cleared after shedding"
+        );
+        match &data.quarantine[0].content {
+            MessageContent::Text(t) => assert_eq!(t, "pre-isolation q"),
+            _ => panic!("unexpected content"),
+        }
+
+        // A second shed with no open window is a no-op.
+        assert_eq!(shed_isolation_quarantine(&mut data), 0);
+        assert_eq!(data.quarantine.len(), 1);
+    }
+
     /// A convenience builder for gate tests — an owner+under_cap combination
     /// should arm, everything else should not.
     fn dummy_build() -> Result<Box<dyn LmProvider>, ProviderError> {
@@ -1568,7 +1642,13 @@ mod tests {
         let gated = gated_fallback("owner", false, false, build);
 
         let err = invoke_turn_with_refusal_fallback(
-            &mut data, &RefusingMock, gated, &tools, "sys", 1024, "corr",
+            &mut data,
+            &RefusingMock,
+            gated,
+            &tools,
+            "sys",
+            1024,
+            "corr",
         )
         .await
         .unwrap_err();
@@ -1604,7 +1684,13 @@ mod tests {
         let gated = gated_fallback("guest:stranger", false, true, build);
 
         let err = invoke_turn_with_refusal_fallback(
-            &mut data, &RefusingMock, gated, &tools, "sys", 1024, "corr",
+            &mut data,
+            &RefusingMock,
+            gated,
+            &tools,
+            "sys",
+            1024,
+            "corr",
         )
         .await
         .unwrap_err();
@@ -1637,7 +1723,13 @@ mod tests {
         let gated = gated_fallback("peer:Nova", false, true, build);
 
         let err = invoke_turn_with_refusal_fallback(
-            &mut data, &RefusingMock, gated, &tools, "sys", 1024, "corr",
+            &mut data,
+            &RefusingMock,
+            gated,
+            &tools,
+            "sys",
+            1024,
+            "corr",
         )
         .await
         .unwrap_err();

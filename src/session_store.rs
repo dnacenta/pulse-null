@@ -158,6 +158,13 @@ pub struct SessionData {
     /// the first normal turn truncates back to this watermark.
     #[serde(skip)]
     pub isolation_ephemeral_from: Option<usize>,
+    /// Index into `quarantine` of the first entry added while isolated (PN-88,
+    /// SEC-004). Parallels `isolation_ephemeral_from` for the quarantine lane:
+    /// never serialized, and the first normal turn truncates the lane back to
+    /// this watermark so a fallback tangent created during an isolation window
+    /// never survives to disk.
+    #[serde(skip)]
+    pub isolation_quarantine_from: Option<usize>,
     /// Quarantine lane (PN-88): refused turns re-run on the fallback model.
     /// This is a genuine record of what was said, but it is excluded from the
     /// default model's context so its safety classifier does not re-trip on
@@ -511,6 +518,7 @@ impl Session {
                 health: HealthCounters::default(),
                 compaction: CompactionMetrics::default(),
                 isolation_ephemeral_from: None,
+                isolation_quarantine_from: None,
                 quarantine: Vec::new(),
             },
             dirty: false,
