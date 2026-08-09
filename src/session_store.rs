@@ -33,6 +33,11 @@ pub const MAX_REINJECTION_FILE_BYTES: usize = 20_000;
 /// When exceeded, the oldest messages are drained to keep the most recent ones.
 pub const MAX_MESSAGES_PER_SESSION: usize = 200;
 
+/// Hard cap on the quarantine lane (refused turns handled by the fallback
+/// model). Bounds growth on a long cybersec/AI-philosophy session; when
+/// exceeded, the oldest quarantined messages are drained.
+pub const MAX_QUARANTINE_MESSAGES: usize = 50;
+
 /// WAL (write-ahead log) tracking state for a session.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WalState {
@@ -147,6 +152,13 @@ pub struct SessionData {
     /// the first normal turn truncates back to this watermark.
     #[serde(skip)]
     pub isolation_ephemeral_from: Option<usize>,
+    /// Quarantine lane (PN-88): refused turns re-run on the fallback model.
+    /// This is a genuine record of what was said, but it is excluded from the
+    /// default model's context so its safety classifier does not re-trip on
+    /// later benign turns. The fallback model, by contrast, sees the trunk plus
+    /// this lane. `#[serde(default)]` keeps pre-PN-88 session files loadable.
+    #[serde(default)]
+    pub quarantine: Vec<Message>,
 }
 
 impl SessionData {
@@ -155,6 +167,15 @@ impl SessionData {
         if self.messages.len() > MAX_MESSAGES_PER_SESSION {
             let excess = self.messages.len() - MAX_MESSAGES_PER_SESSION;
             self.messages.drain(..excess);
+        }
+    }
+
+    /// Enforce the quarantine cap, draining the oldest quarantined messages
+    /// when exceeded (mirrors [`enforce_message_cap`](Self::enforce_message_cap)).
+    pub fn enforce_quarantine_cap(&mut self) {
+        if self.quarantine.len() > MAX_QUARANTINE_MESSAGES {
+            let excess = self.quarantine.len() - MAX_QUARANTINE_MESSAGES;
+            self.quarantine.drain(..excess);
         }
     }
 
@@ -330,7 +351,7 @@ pub fn reset_session(
     root_dir: &Path,
     entity_name: &str,
 ) -> Option<PathBuf> {
-    if data.messages.is_empty() {
+    if data.messages.is_empty() && data.quarantine.is_empty() {
         return None;
     }
 
@@ -340,11 +361,15 @@ pub fn reset_session(
     let msg_count = data.messages.len();
     let compactions = data.compaction.compaction_count;
 
-    // Archive current session (full end: archive + EPHEMERAL + LOGBOOK)
+    // Archive current session (full end: archive + EPHEMERAL + LOGBOOK). The
+    // quarantine lane is a genuine record of what was said, so it is archived
+    // alongside the trunk (appended after it).
+    let mut archive_messages = data.messages.clone();
+    archive_messages.extend(data.quarantine.iter().cloned());
     let archive_path = crate::session::end_session(
         root_dir,
         entity_name,
-        &data.messages,
+        &archive_messages,
         &data.channel,
         "session-reset",
         Some(&data.key),
@@ -358,8 +383,9 @@ pub fn reset_session(
         data.health.hallucination_count,
     );
 
-    // Clear messages and reset counters
+    // Clear both lanes and reset counters
     data.messages.clear();
+    data.quarantine.clear();
     data.message_count = 0;
     data.created_at = Utc::now();
     data.last_active = Utc::now();
@@ -477,6 +503,7 @@ impl Session {
                 health: HealthCounters::default(),
                 compaction: CompactionMetrics::default(),
                 isolation_ephemeral_from: None,
+                quarantine: Vec::new(),
             },
             dirty: false,
         }
@@ -998,15 +1025,18 @@ impl SessionStore {
 
         for (key, session_arc) in sessions.iter() {
             let session = session_arc.read().await;
-            if session.data.messages.is_empty() {
+            if session.data.messages.is_empty() && session.data.quarantine.is_empty() {
                 continue;
             }
 
-            // Full session end: archive + EPHEMERAL + LOGBOOK
+            // Full session end: archive + EPHEMERAL + LOGBOOK. The quarantine
+            // lane is archived alongside the trunk (appended after it).
+            let mut archive_messages = session.data.messages.clone();
+            archive_messages.extend(session.data.quarantine.iter().cloned());
             if let Some(path) = crate::session::end_session(
                 root_dir,
                 entity_name,
-                &session.data.messages,
+                &archive_messages,
                 &session.data.channel,
                 "server-shutdown",
                 Some(key),
@@ -1477,5 +1507,98 @@ mod tests {
         let s = session.read().await;
         assert_eq!(s.data.messages.len(), 1);
         assert!(s.dirty);
+    }
+
+    fn user_msg(text: &str) -> Message {
+        Message {
+            role: Role::User,
+            content: MessageContent::Text(text.into()),
+            source: Some(MessageSource::Human {
+                channel: "chat".into(),
+                sender: "owner".into(),
+            }),
+        }
+    }
+
+    fn asst_msg(text: &str) -> Message {
+        Message {
+            role: Role::Assistant,
+            content: MessageContent::Text(text.into()),
+            source: None,
+        }
+    }
+
+    #[test]
+    fn quarantine_defaults_empty_on_new_session() {
+        let session = Session::new("chat:owner".into(), "chat".into(), "owner".into());
+        assert!(session.data.quarantine.is_empty());
+    }
+
+    #[test]
+    fn quarantine_survives_serde_round_trip() {
+        let mut session = Session::new("chat:owner".into(), "chat".into(), "owner".into());
+        session.data.messages.push(user_msg("trunk turn"));
+        session.data.quarantine.push(user_msg("spicy question"));
+        session.data.quarantine.push(asst_msg("opus answer"));
+
+        let json = serde_json::to_string(&session.data).unwrap();
+        let restored: SessionData = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(restored.messages.len(), 1);
+        assert_eq!(restored.quarantine.len(), 2);
+    }
+
+    #[test]
+    fn legacy_session_without_quarantine_field_loads_empty() {
+        // A pre-PN-88 session file: no `quarantine` key at all.
+        let legacy = r#"{
+            "key": "chat:owner",
+            "channel": "chat",
+            "sender": "owner",
+            "messages": [],
+            "created_at": "2026-01-01T00:00:00Z",
+            "last_active": "2026-01-01T00:00:00Z",
+            "message_count": 0,
+            "wal_seq": 0,
+            "messages_since_checkpoint": 0,
+            "last_checkpoint_time": "2026-01-01T00:00:00Z"
+        }"#;
+        let data: SessionData = serde_json::from_str(legacy).unwrap();
+        assert!(data.quarantine.is_empty());
+    }
+
+    #[test]
+    fn enforce_quarantine_cap_drains_oldest() {
+        let mut session = Session::new("chat:owner".into(), "chat".into(), "owner".into());
+        for i in 0..(MAX_QUARANTINE_MESSAGES + 10) {
+            session.data.quarantine.push(user_msg(&format!("q{i}")));
+        }
+        session.data.enforce_quarantine_cap();
+        assert_eq!(session.data.quarantine.len(), MAX_QUARANTINE_MESSAGES);
+        // Oldest drained: the surviving head is q10.
+        match &session.data.quarantine[0].content {
+            MessageContent::Text(t) => assert_eq!(t, "q10"),
+            _ => panic!("unexpected content"),
+        }
+    }
+
+    #[test]
+    fn reset_session_archives_and_clears_both_lanes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut session = Session::new("chat:owner".into(), "chat".into(), "owner".into());
+        session.data.messages.push(user_msg("hello"));
+        session.data.messages.push(asst_msg("hi"));
+        session.data.quarantine.push(user_msg("spicy"));
+        session.data.quarantine.push(asst_msg("opus reply"));
+
+        let archive = reset_session(&mut session.data, tmp.path(), "TestEntity");
+
+        assert!(archive.is_some(), "reset should archive when history exists");
+        assert!(
+            session.data.quarantine.is_empty(),
+            "quarantine lane not cleared on reset"
+        );
+        // Trunk is cleared, then a handoff message is inserted.
+        assert!(session.data.messages.len() <= 1);
     }
 }

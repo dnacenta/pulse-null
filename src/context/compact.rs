@@ -927,6 +927,7 @@ mod tests {
             health: crate::session_store::HealthCounters::default(),
             compaction: crate::session_store::CompactionMetrics::default(),
             isolation_ephemeral_from: None,
+            quarantine: Vec::new(),
         }
     }
 

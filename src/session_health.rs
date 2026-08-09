@@ -239,6 +239,7 @@ mod tests {
             health: HealthCounters::default(),
             compaction: CompactionMetrics::default(),
             isolation_ephemeral_from: None,
+            quarantine: Vec::new(),
         }
     }
 
