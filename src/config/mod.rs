@@ -85,6 +85,33 @@ pub struct LlmConfig {
     /// Maximum estimated tokens in conversation before compaction triggers (0 = default 150k).
     #[serde(default)]
     pub context_budget: usize,
+    /// Model to fall back to when the default `model` refuses a turn on an
+    /// Anthropic Usage-Policy (AUP) refusal. Empty/absent disables the
+    /// fallback. Typically `"claude-opus-5"` — matches the scheduled-task pins.
+    #[serde(default)]
+    pub fallback_model: Option<String>,
+    /// Master switch for the reactive refusal fallback (default true). When
+    /// false, a refusal returns the normal error path (with turn rollback).
+    #[serde(default = "default_fallback_on_refusal")]
+    pub fallback_on_refusal: bool,
+}
+
+impl LlmConfig {
+    /// The model to retry a refused turn on, or `None` when the fallback is
+    /// disabled or unconfigured.
+    ///
+    /// Returns `Some(model)` only when `fallback_on_refusal` is true **and**
+    /// `fallback_model` is a non-empty, non-whitespace string.
+    #[must_use]
+    pub fn fallback_target(&self) -> Option<&str> {
+        if !self.fallback_on_refusal {
+            return None;
+        }
+        self.fallback_model
+            .as_deref()
+            .map(str::trim)
+            .filter(|m| !m.is_empty())
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -334,6 +361,10 @@ fn default_max_tokens() -> u32 {
 }
 
 fn default_true() -> bool {
+    true
+}
+
+fn default_fallback_on_refusal() -> bool {
     true
 }
 
@@ -966,6 +997,8 @@ pub mod test_support {
                 base_url: None,
                 claude_bin: None,
                 context_budget: 0,
+                fallback_model: None,
+                fallback_on_refusal: true,
             },
             security: SecurityConfig {
                 secret: None,
@@ -989,5 +1022,74 @@ pub mod test_support {
             peers: HashMap::new(),
             plugins: HashMap::new(),
         }
+    }
+}
+
+#[cfg(test)]
+mod fallback_tests {
+    use super::*;
+
+    fn llm(model: Option<&str>, on: bool) -> LlmConfig {
+        LlmConfig {
+            provider: default_provider(),
+            api_key: None,
+            model: default_model(),
+            max_tokens: default_max_tokens(),
+            base_url: None,
+            claude_bin: None,
+            context_budget: 0,
+            fallback_model: model.map(str::to_string),
+            fallback_on_refusal: on,
+        }
+    }
+
+    #[test]
+    fn enabled_with_model_returns_target() {
+        assert_eq!(
+            llm(Some("claude-opus-5"), true).fallback_target(),
+            Some("claude-opus-5")
+        );
+    }
+
+    #[test]
+    fn disabled_returns_none_even_with_model() {
+        assert_eq!(llm(Some("claude-opus-5"), false).fallback_target(), None);
+    }
+
+    #[test]
+    fn enabled_without_model_returns_none() {
+        assert_eq!(llm(None, true).fallback_target(), None);
+    }
+
+    #[test]
+    fn enabled_with_empty_model_returns_none() {
+        assert_eq!(llm(Some(""), true).fallback_target(), None);
+    }
+
+    #[test]
+    fn enabled_with_whitespace_model_returns_none() {
+        assert_eq!(llm(Some("   "), true).fallback_target(), None);
+    }
+
+    #[test]
+    fn target_is_trimmed() {
+        assert_eq!(
+            llm(Some("  claude-opus-5  "), true).fallback_target(),
+            Some("claude-opus-5")
+        );
+    }
+
+    #[test]
+    fn serde_defaults_disable_fallback_when_absent() {
+        // A [llm] block without the new fields: fallback_on_refusal defaults
+        // true but no model ⇒ fallback disabled.
+        let toml = r#"
+            provider = "claude-code"
+            model = "claude-fable-5"
+        "#;
+        let cfg: LlmConfig = toml::from_str(toml).unwrap();
+        assert!(cfg.fallback_on_refusal);
+        assert_eq!(cfg.fallback_model, None);
+        assert_eq!(cfg.fallback_target(), None);
     }
 }
