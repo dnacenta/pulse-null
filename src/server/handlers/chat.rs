@@ -258,42 +258,20 @@ pub async fn chat(
     // Build user message content
     let user_content = MessageContent::Text(user_message);
 
-    // WAL: append user message BEFORE adding to session (write-ahead).
-    // Only increment wal_seq on success to keep it in sync with the WAL file.
-    // (Shed in isolation: the diagnostic conversation is deliberately
-    // ephemeral — nothing that writes.)
-    if let Some(wal) = state.wal.as_ref().filter(|_| !isolated) {
-        let next_seq = session.data.wal.wal_seq + 1;
-        match wal.append(
-            &session_key,
-            next_seq,
-            Role::User,
-            &user_content,
-            Some(crate::wal::WalMeta {
-                channel: Some(req.channel.clone()),
-                sender: req.sender.clone(),
-            }),
-        ) {
-            Ok(()) => session.data.wal.wal_seq = next_seq,
-            Err(e) => tracing::warn!("WAL append failed for user message: {}", e),
-        }
-    }
-
-    // Add user message to session and reset hallucination guard counter
+    // Push the user message onto the in-memory trunk so compaction and the
+    // provider call see it, but DEFER every commit (WAL entry, counters) until
+    // the turn actually succeeds. A failed or refused turn is rolled back to
+    // this point so it can never poison later turns — the 2026-08-09
+    // session-poisoning bug, where a refused turn left a half-appended user
+    // message that made fable re-trip on every subsequent benign turn.
     session.data.messages.push(Message {
         role: Role::User,
-        content: user_content,
+        content: user_content.clone(),
         source: Some(MessageSource::Human {
             channel: req.channel.clone(),
             sender: resolved_key.clone(),
         }),
     });
-    session.data.message_count += 1;
-    if !isolated {
-        session.data.wal.messages_since_checkpoint += 1;
-    }
-    // Real human message arrived — reset the autonomous round counter
-    session.data.health.rounds_since_human_input = 0;
 
     // MicroCompact (Tier 1): cheap mechanical compaction before checking
     // whether expensive LLM-based summarization is needed.
@@ -440,7 +418,11 @@ pub async fn chat(
     };
     let active_tools = readonly_tools.as_ref().unwrap_or(&state.tools);
 
-    let result = crate::task_context::scope(
+    // Index of the just-pushed user message: it is always the trunk tail here
+    // (compaction only ever rewrites older messages, never the newest turn).
+    let user_index = session.data.messages.len() - 1;
+
+    let turn_outcome = crate::task_context::scope(
         Some(correlation_id.clone()),
         tool_loop::invoke_with_tool_loop(
             state.provider.as_ref(),
@@ -451,18 +433,26 @@ pub async fn chat(
             MAX_TOOL_ROUNDS,
         ),
     )
-    .await
-    .map_err(|e| {
-        tracing::error!("LLM invocation failed: {}", e);
-        // Keep the banner sticky even on the failure path — while isolated
-        // the provider is precisely the suspect.
-        let msg = if crate::server::isolation::is_active(&state.root_dir) {
-            format!("{} {}", crate::server::isolation::BANNER, e)
-        } else {
-            e.to_string()
-        };
-        (StatusCode::INTERNAL_SERVER_ERROR, msg)
-    })?;
+    .await;
+
+    let result = match turn_outcome {
+        Ok(r) => r,
+        Err(e) => {
+            // Roll the turn back to the pre-turn trunk: drop the user message
+            // and anything the tool loop appended, and commit nothing to the
+            // WAL. The session is left exactly as it was pre-turn (AC7).
+            session.data.messages.truncate(user_index);
+            tracing::error!("LLM invocation failed: {}", e);
+            // Keep the banner sticky even on the failure path — while isolated
+            // the provider is precisely the suspect.
+            let msg = if crate::server::isolation::is_active(&state.root_dir) {
+                format!("{} {}", crate::server::isolation::BANNER, e)
+            } else {
+                e.to_string()
+            };
+            return Err((StatusCode::INTERNAL_SERVER_ERROR, msg));
+        }
+    };
 
     // Re-sample: a turn admitted just before the marker appeared must not
     // write after it. OR of the two samples drives every gate below.
@@ -471,7 +461,17 @@ pub async fn chat(
         session.data.isolation_ephemeral_from = Some(pre_turn_len);
     }
 
-    let text = result.text;
+    let text = result.text.clone();
+
+    // The turn succeeded — commit the counters that were deferred from the
+    // user-message push (so a rolled-back turn leaves them untouched).
+    session.data.message_count += 1;
+    if !isolated {
+        session.data.wal.messages_since_checkpoint += 1;
+    }
+    // Real human message arrived and was answered — reset the autonomous
+    // round counter.
+    session.data.health.rounds_since_human_input = 0;
 
     // Track recently accessed files from tool use (for post-compaction re-injection).
     // Scan all messages (the tool loop may have added tool-use/tool-result pairs).
@@ -482,17 +482,35 @@ pub async fn chat(
         }
     }
 
-    // WAL: append assistant response. (Shed in isolation.)
+    // Commit the turn to the WAL now that it succeeded. Write-ahead is deferred
+    // until success (see the user-message push above) so a refused or failed
+    // turn leaves no entry — "user-message-not-committed-until-success"
+    // ordering keeps WAL replay consistent with the in-memory trunk. User
+    // first, then assistant. (Shed in isolation.)
     if let Some(wal) = state.wal.as_ref().filter(|_| !isolated) {
-        let next_seq = session.data.wal.wal_seq + 1;
+        let user_seq = session.data.wal.wal_seq + 1;
         match wal.append(
             &session_key,
-            next_seq,
+            user_seq,
+            Role::User,
+            &user_content,
+            Some(crate::wal::WalMeta {
+                channel: Some(req.channel.clone()),
+                sender: req.sender.clone(),
+            }),
+        ) {
+            Ok(()) => session.data.wal.wal_seq = user_seq,
+            Err(e) => tracing::warn!("WAL append failed for user message: {}", e),
+        }
+        let asst_seq = session.data.wal.wal_seq + 1;
+        match wal.append(
+            &session_key,
+            asst_seq,
             Role::Assistant,
             &MessageContent::Text(text.clone()),
             None,
         ) {
-            Ok(()) => session.data.wal.wal_seq = next_seq,
+            Ok(()) => session.data.wal.wal_seq = asst_seq,
             Err(e) => tracing::warn!("WAL append failed for assistant message: {}", e),
         }
     }
