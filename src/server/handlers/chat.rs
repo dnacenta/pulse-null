@@ -450,7 +450,15 @@ pub async fn chat(
         // compaction ran before the helper, and its side-effects (summarized
         // older messages, compaction counters, the compaction signal/archive)
         // are intentionally retained.
-        tracing::error!("LLM turn failed: {}", e);
+        //
+        // SEC-007: on the fallback-also-failed path the full detail is logged
+        // here at ERROR, but the client body (`e.to_string()`, below) is the
+        // generic "upstream model error" — provider internals never leak out.
+        if let Some(ff) = e.downcast_ref::<crate::errors::FallbackFailedError>() {
+            tracing::error!("refusal fallback failed: {}", ff.detail);
+        } else {
+            tracing::error!("LLM turn failed: {}", e);
+        }
         // Keep the banner sticky even on the failure path — while isolated
         // the provider is precisely the suspect.
         let msg = if crate::server::isolation::is_active(&state.root_dir) {
@@ -860,8 +868,12 @@ where
     let fallback_provider = match build() {
         Ok(p) => p,
         Err(build_err) => {
-            // The trunk is already rolled back — surface one error.
-            return Err(build_err.into());
+            // The trunk is already rolled back — surface one error. Wrap the
+            // provider-build detail so its internals never reach the client
+            // (SEC-007); the caller logs `detail` server-side at ERROR.
+            return Err(Box::new(crate::errors::FallbackFailedError {
+                detail: build_err.to_string(),
+            }));
         }
     };
 
@@ -904,8 +916,12 @@ where
         }
         Err(fallback_err) => {
             // AC8: the fallback also failed. The trunk is already rolled back;
-            // surface a single error and leave no partial quarantine entry.
-            Err(fallback_err)
+            // surface a single error and leave no partial quarantine entry. Wrap
+            // the detail so opus provider internals never reach the client
+            // (SEC-007); the caller logs `detail` server-side at ERROR.
+            Err(Box::new(crate::errors::FallbackFailedError {
+                detail: fallback_err.to_string(),
+            }))
         }
     }
 }

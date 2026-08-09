@@ -149,6 +149,22 @@ pub struct RefusalError {
     pub detail: String,
 }
 
+/// The reactive refusal fallback itself failed — either the fallback provider
+/// could not be built or its invocation errored (PN-88, SEC-007).
+///
+/// Its [`Display`](std::fmt::Display) is deliberately generic ("upstream model
+/// error") so provider internals — binary paths, model names, subprocess
+/// diagnostics — never reach the HTTP client on this path. The underlying
+/// `detail` is carried for server-side logging at ERROR only. Kept distinct from
+/// [`RefusalError`], whose Display is Anthropic's canned, non-sensitive AUP text.
+#[derive(Debug, Error)]
+#[error("upstream model error")]
+pub struct FallbackFailedError {
+    /// The underlying failure detail — logged server-side, never returned to the
+    /// client.
+    pub detail: String,
+}
+
 /// Top-level error type for CLI and binary boundaries.
 #[derive(Debug, Error)]
 pub enum PulseError {
