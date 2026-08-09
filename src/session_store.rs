@@ -367,19 +367,21 @@ pub fn reset_session(
     let msg_count = data.messages.len();
     let compactions = data.compaction.compaction_count;
 
-    // Archive current session (full end: archive + EPHEMERAL + LOGBOOK). The
-    // quarantine lane is a genuine record of what was said, so it is archived
-    // alongside the trunk (appended after it).
-    let mut archive_messages = data.messages.clone();
-    archive_messages.extend(data.quarantine.iter().cloned());
+    // Archive the CLEAN TRUNK through the full pipeline (archive + EPHEMERAL +
+    // LOGBOOK + later graph ingestion). The quarantine lane is policy-refused
+    // content: it is written to a SEPARATE dead-end file (SEC-003) so it never
+    // reaches EPHEMERAL — which auto-loads into the default model next session —
+    // nor the graph. Passing it to `end_session` here would re-poison fable's
+    // context across the session boundary.
     let archive_path = crate::session::end_session(
         root_dir,
         entity_name,
-        &archive_messages,
+        &data.messages,
         &data.channel,
         "session-reset",
         Some(&data.key),
     );
+    crate::session::archive_quarantine(root_dir, entity_name, &data.key, &data.quarantine);
 
     tracing::info!(
         "[session-reset] key={} msgs={} compactions={} hallucinations={} → fresh session",
@@ -1035,14 +1037,14 @@ impl SessionStore {
                 continue;
             }
 
-            // Full session end: archive + EPHEMERAL + LOGBOOK. The quarantine
-            // lane is archived alongside the trunk (appended after it).
-            let mut archive_messages = session.data.messages.clone();
-            archive_messages.extend(session.data.quarantine.iter().cloned());
+            // Full session end for the CLEAN TRUNK only: archive + EPHEMERAL +
+            // LOGBOOK + later graph ingestion. The quarantine lane is
+            // policy-refused content and goes to a separate dead-end file
+            // (SEC-003) so it never reaches EPHEMERAL or the graph.
             if let Some(path) = crate::session::end_session(
                 root_dir,
                 entity_name,
-                &archive_messages,
+                &session.data.messages,
                 &session.data.channel,
                 "server-shutdown",
                 Some(key),
@@ -1050,6 +1052,12 @@ impl SessionStore {
                 tracing::info!("Archived session {} to {}", key, path.display());
                 archived_paths.push(path);
             }
+            crate::session::archive_quarantine(
+                root_dir,
+                entity_name,
+                key,
+                &session.data.quarantine,
+            );
         }
 
         // Persist all to disk so they can be restored on restart
@@ -1609,5 +1617,76 @@ mod tests {
         );
         // Trunk is cleared, then a handoff message is inserted.
         assert!(session.data.messages.len() <= 1);
+    }
+
+    #[test]
+    fn reset_keeps_quarantine_out_of_ephemeral_but_archives_trunk() {
+        let tmp = tempfile::tempdir().unwrap();
+        // write_ephemeral_summary writes to memory/EPHEMERAL.md — the dir must
+        // exist for the write to land.
+        std::fs::create_dir_all(tmp.path().join("memory")).unwrap();
+
+        let mut session = Session::new("chat:owner".into(), "chat".into(), "owner".into());
+        session
+            .data
+            .messages
+            .push(user_msg("clean trunk question about rust"));
+        session.data.messages.push(asst_msg("a clean answer"));
+        session
+            .data
+            .quarantine
+            .push(user_msg("QUARANTINED_SPICY_SECRET"));
+        session
+            .data
+            .quarantine
+            .push(asst_msg("opus reply to the spicy question"));
+
+        reset_session(&mut session.data, tmp.path(), "TestEntity");
+
+        // EPHEMERAL must contain the clean trunk topic and NOT the quarantined
+        // content (SEC-003) — EPHEMERAL auto-loads into the default model.
+        let ephemeral =
+            std::fs::read_to_string(tmp.path().join("memory").join("EPHEMERAL.md")).unwrap();
+        assert!(
+            ephemeral.contains("clean trunk question"),
+            "trunk topic missing from EPHEMERAL: {ephemeral}"
+        );
+        assert!(
+            !ephemeral.contains("QUARANTINED_SPICY_SECRET"),
+            "quarantined content leaked into EPHEMERAL: {ephemeral}"
+        );
+
+        // The trunk was archived to the conversations pipeline; the quarantine
+        // went to its own dead-end file, not the conversation archive.
+        let conv_dir = tmp.path().join("archives").join("conversations");
+        let conv_dump: String = std::fs::read_dir(&conv_dir)
+            .unwrap()
+            .flatten()
+            .filter(|e| {
+                e.path().extension().and_then(|x| x.to_str()) == Some("md")
+                    && e.file_name().to_string_lossy().starts_with("conversation-")
+            })
+            .map(|e| std::fs::read_to_string(e.path()).unwrap_or_default())
+            .collect();
+        assert!(
+            conv_dump.contains("clean trunk question"),
+            "trunk not archived to conversations"
+        );
+        assert!(
+            !conv_dump.contains("QUARANTINED_SPICY_SECRET"),
+            "quarantined content leaked into the conversation archive (graph-ingested)"
+        );
+
+        // The quarantine is preserved as a record in its own dead-end file.
+        let q_dir = tmp.path().join("archives").join("quarantine");
+        let q_dump: String = std::fs::read_dir(&q_dir)
+            .unwrap()
+            .flatten()
+            .map(|e| std::fs::read_to_string(e.path()).unwrap_or_default())
+            .collect();
+        assert!(
+            q_dump.contains("QUARANTINED_SPICY_SECRET"),
+            "quarantine record was not written to archives/quarantine/"
+        );
     }
 }
