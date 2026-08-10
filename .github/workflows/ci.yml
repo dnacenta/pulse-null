@@ -1,3 +1,6 @@
+# CI = the deterministic gate, server-side. The checks themselves live in
+# scripts/gate.sh (single source of truth, shared with the local pre-push
+# hook) so local and CI verdicts cannot drift.
 name: CI
 
 on:
@@ -22,14 +25,8 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
-      - name: Format
-        run: cargo fmt --check
-
-      - name: Lint
-        run: cargo clippy -- -D warnings -A dead_code
-
-      - name: Test
-        run: cargo test
+      - name: Gate (fmt, clippy, tests)
+        run: scripts/gate.sh
 
       - name: Build (release)
         run: cargo build --release

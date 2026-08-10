@@ -125,6 +125,10 @@ impl DurableLeaseTable {
         self.table.all().cloned().collect()
     }
 
+    /// Direct read access to the underlying table. Not yet called anywhere
+    /// (`leases()` is the consumer path today); kept as the documented public
+    /// read API. Targeted allow per CONTRIBUTING — no blanket `-A dead_code`.
+    #[allow(dead_code)]
     pub fn table(&self) -> &LeaseTable {
         &self.table
     }

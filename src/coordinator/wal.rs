@@ -371,6 +371,10 @@ impl LeaseWal {
 
     /// Read all events, failing closed on anything but an unterminated
     /// (torn) final line.
+    // Not yet called anywhere (replay() is the consumer path today); kept as
+    // the documented public read API. Explicit allow instead of a blanket
+    // `-A dead_code` in CI so future dead code still fails the gate.
+    #[allow(dead_code)]
     pub fn read(&self) -> Result<Vec<LeaseEvent>, ReplayError> {
         Ok(self.read_numbered()?.into_iter().map(|(_, e)| e).collect())
     }
@@ -388,6 +392,10 @@ impl LeaseWal {
         Ok(table)
     }
 
+    /// Filesystem location of the WAL. Not yet called anywhere; kept as the
+    /// documented public accessor. Targeted allow per CONTRIBUTING — no
+    /// blanket `-A dead_code`.
+    #[allow(dead_code)]
     pub fn path(&self) -> &Path {
         &self.path
     }

@@ -106,6 +106,10 @@ impl Default for FarmCaps {
 pub struct SubtaskResult {
     pub sub_id: String,
     pub text: String,
+    /// How many attempts the subtask took. Populated for diagnostics; no
+    /// consumer reads it yet. Targeted allow per CONTRIBUTING — no blanket
+    /// `-A dead_code`.
+    #[allow(dead_code)]
     pub attempts: u32,
 }
 
