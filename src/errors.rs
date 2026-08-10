@@ -132,6 +132,39 @@ pub enum ClaudeCliError {
     },
 }
 
+/// An Anthropic Usage-Policy (AUP) refusal from the underlying model.
+///
+/// Emitted by the claude-code provider when `claude -p` exits non-zero with an
+/// `is_error: true` result body matching the Usage-Policy signature. It is boxed
+/// into the provider's `Box<dyn Error + Send + Sync>` error channel and
+/// downcast by the chat handler to decide whether to fall back to another model.
+/// It is deliberately distinct from generic provider failures (network,
+/// timeout, empty result), which must never trigger a fallback.
+#[derive(Debug, Error)]
+#[error("model '{model}' refused the turn (Usage Policy): {detail}")]
+pub struct RefusalError {
+    /// The model that issued the refusal (e.g. `claude-fable-5`).
+    pub model: String,
+    /// The refusal body reported by the CLI, truncated for logging.
+    pub detail: String,
+}
+
+/// The reactive refusal fallback itself failed — either the fallback provider
+/// could not be built or its invocation errored (PN-88, SEC-007).
+///
+/// Its [`Display`](std::fmt::Display) is deliberately generic ("upstream model
+/// error") so provider internals — binary paths, model names, subprocess
+/// diagnostics — never reach the HTTP client on this path. The underlying
+/// `detail` is carried for server-side logging at ERROR only. Kept distinct from
+/// [`RefusalError`], whose Display is Anthropic's canned, non-sensitive AUP text.
+#[derive(Debug, Error)]
+#[error("upstream model error")]
+pub struct FallbackFailedError {
+    /// The underlying failure detail — logged server-side, never returned to the
+    /// client.
+    pub detail: String,
+}
+
 /// Top-level error type for CLI and binary boundaries.
 #[derive(Debug, Error)]
 pub enum PulseError {

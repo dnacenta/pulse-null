@@ -1,3 +1,27 @@
+//! Write-ahead log for crash-resilient conversation persistence.
+//!
+//! # Commit semantics (PN-88)
+//!
+//! Despite the "write-ahead" name, the WAL is now **commit-on-success**
+//! (write-behind): a turn's entries are appended by the chat handler only
+//! *after* the turn succeeds, not before the provider is called. A crash in the
+//! middle of an in-flight turn therefore loses that one turn rather than
+//! replaying a half-written user message onto the trunk — this is the fix for
+//! the 2026-08-09 session-poisoning bug, where a refused turn left a
+//! half-appended user message that re-tripped the classifier on every later
+//! turn. The trade-off is deliberate: durability of the *last* in-flight turn is
+//! given up in exchange for never replaying a partial/poisoned one.
+//!
+//! # Downgrade caveat
+//!
+//! [`WalLane`] is written with `#[serde(skip_serializing_if)]` so trunk entries
+//! stay byte-compatible with pre-PN-88 WAL files. The consequence for a rolling
+//! downgrade (relevant to the shared `/opt/pulse-null` checkout + rolling
+//! restarts): an OLDER binary replaying a NEWER WAL will not recognise the
+//! `lane` field, so it silently drops it and replays quarantined
+//! (policy-refused) turns back onto the trunk — re-poisoning the default model's
+//! context. Do not downgrade across the PN-88 boundary while quarantine WAL
+//! entries may exist.
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufRead, BufReader, Write as IoWrite};
 use std::path::{Path, PathBuf};
@@ -6,6 +30,30 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
 use pulse_system_types::llm::{Message, MessageContent, Role};
+
+/// Which conversation lane a WAL entry belongs to (PN-88).
+///
+/// The default `Trunk` is the clean history visible to the default model.
+/// `Quarantine` marks a refused turn that was re-run on the fallback model; on
+/// replay it must be reconstructed into the quarantine lane, never the trunk,
+/// so the default model's classifier does not re-trip on it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WalLane {
+    /// The clean trunk visible to the default model.
+    #[default]
+    Trunk,
+    /// A quarantined refusal tangent (fallback-model only).
+    Quarantine,
+}
+
+impl WalLane {
+    /// Whether this is the default trunk lane (used to omit the field for
+    /// ordinary entries, keeping pre-PN-88 WAL files byte-compatible).
+    fn is_trunk(&self) -> bool {
+        matches!(self, WalLane::Trunk)
+    }
+}
 
 /// A single entry in the write-ahead log.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -21,6 +69,10 @@ pub struct WalEntry {
     /// Optional metadata (channel, sender, etc.).
     #[serde(default, skip_serializing_if = "WalMeta::is_empty")]
     pub meta: WalMeta,
+    /// Conversation lane. Omitted for trunk entries (the common case), so
+    /// existing WAL files load unchanged.
+    #[serde(default, skip_serializing_if = "WalLane::is_trunk")]
+    pub lane: WalLane,
 }
 
 /// Optional metadata attached to a WAL entry.
@@ -80,8 +132,8 @@ impl WalWriter {
         self.dir.join(Self::key_to_filename(session_key))
     }
 
-    /// Append a message to the session's WAL. Creates the file if needed.
-    /// Uses O_APPEND for atomicity on single writes.
+    /// Append a message to the session's WAL on the trunk lane. Creates the
+    /// file if needed. Uses O_APPEND for atomicity on single writes.
     pub fn append(
         &self,
         session_key: &str,
@@ -90,12 +142,26 @@ impl WalWriter {
         content: &MessageContent,
         meta: Option<WalMeta>,
     ) -> io::Result<()> {
+        self.append_with_lane(session_key, seq, role, content, meta, WalLane::Trunk)
+    }
+
+    /// Append a message to the session's WAL on an explicit lane (PN-88).
+    pub fn append_with_lane(
+        &self,
+        session_key: &str,
+        seq: u64,
+        role: Role,
+        content: &MessageContent,
+        meta: Option<WalMeta>,
+        lane: WalLane,
+    ) -> io::Result<()> {
         let entry = WalEntry {
             ts: Utc::now(),
             seq,
             role: role.clone(),
             content: content.clone(),
             meta: meta.unwrap_or_default(),
+            lane,
         };
 
         let mut line = serde_json::to_string(&entry)
@@ -185,16 +251,23 @@ impl WalWriter {
         Ok(entries)
     }
 
-    /// Convert WAL entries back into Messages for archiving.
-    pub fn entries_to_messages(entries: &[WalEntry]) -> Vec<Message> {
-        entries
-            .iter()
-            .map(|e| Message {
+    /// Split WAL entries into `(trunk, quarantine)` by lane (PN-88), so replay
+    /// reconstructs the same lane split the session had in memory.
+    pub fn entries_to_lanes(entries: &[WalEntry]) -> (Vec<Message>, Vec<Message>) {
+        let mut trunk = Vec::new();
+        let mut quarantine = Vec::new();
+        for e in entries {
+            let msg = Message {
                 role: e.role.clone(),
                 content: e.content.clone(),
                 source: None,
-            })
-            .collect()
+            };
+            match e.lane {
+                WalLane::Trunk => trunk.push(msg),
+                WalLane::Quarantine => quarantine.push(msg),
+            }
+        }
+        (trunk, quarantine)
     }
 
     /// Check if a WAL file exists for a session.
@@ -310,7 +383,12 @@ pub async fn recover_orphans(
             continue;
         }
 
-        let messages = WalWriter::entries_to_messages(&entries);
+        // Reconstruct the lane split (PN-88): the trunk is archived first, then
+        // the quarantined tangent, so a crash mid-fallback recovers a faithful
+        // record without the quarantined turn poisoning the trunk.
+        let (trunk, quarantine) = WalWriter::entries_to_lanes(&entries);
+        let mut messages = trunk;
+        messages.extend(quarantine);
 
         // Extract channel from the first entry's meta, or from the session key
         let channel = entries[0]
@@ -419,9 +497,82 @@ mod tests {
         assert_eq!(entries[1].seq, 2);
         assert!(matches!(entries[1].role, Role::Assistant));
 
-        // Convert to messages
-        let messages = WalWriter::entries_to_messages(&entries);
-        assert_eq!(messages.len(), 2);
+        // Convert to messages (both on the trunk lane by default).
+        let (trunk, quarantine) = WalWriter::entries_to_lanes(&entries);
+        assert_eq!(trunk.len(), 2);
+        assert!(quarantine.is_empty());
+    }
+
+    #[test]
+    fn lane_marker_survives_write_and_replay_split() {
+        let tmp = tempfile::tempdir().unwrap();
+        let sessions_dir = tmp.path().join("sessions");
+        fs::create_dir_all(&sessions_dir).unwrap();
+        let wal = WalWriter::new(&sessions_dir, WalFsync::None).unwrap();
+        let key = "chat:owner";
+
+        // A clean trunk turn.
+        wal.append(key, 1, Role::User, &MessageContent::Text("hi".into()), None)
+            .unwrap();
+        wal.append(
+            key,
+            2,
+            Role::Assistant,
+            &MessageContent::Text("hello".into()),
+            None,
+        )
+        .unwrap();
+        // A quarantined (refused → fallback) turn.
+        wal.append_with_lane(
+            key,
+            3,
+            Role::User,
+            &MessageContent::Text("spicy".into()),
+            None,
+            WalLane::Quarantine,
+        )
+        .unwrap();
+        wal.append_with_lane(
+            key,
+            4,
+            Role::Assistant,
+            &MessageContent::Text("opus reply".into()),
+            None,
+            WalLane::Quarantine,
+        )
+        .unwrap();
+
+        let entries = wal.read(key).unwrap();
+        assert_eq!(entries.len(), 4);
+        let (trunk, quarantine) = WalWriter::entries_to_lanes(&entries);
+        assert_eq!(trunk.len(), 2);
+        assert_eq!(quarantine.len(), 2);
+        assert!(matches!(&trunk[0].content, MessageContent::Text(t) if t == "hi"));
+        assert!(matches!(&quarantine[0].content, MessageContent::Text(t) if t == "spicy"));
+    }
+
+    #[test]
+    fn trunk_entries_omit_lane_field_for_backward_compat() {
+        // A trunk entry serializes without a `lane` key; a legacy entry without
+        // the key deserializes as trunk.
+        let entry = WalEntry {
+            ts: Utc::now(),
+            seq: 1,
+            role: Role::User,
+            content: MessageContent::Text("hi".into()),
+            meta: WalMeta::default(),
+            lane: WalLane::Trunk,
+        };
+        let json = serde_json::to_string(&entry).unwrap();
+        assert!(
+            !json.contains("lane"),
+            "trunk entry should omit the lane key"
+        );
+
+        // Since trunk entries omit the field, a serialized trunk entry has the
+        // exact shape of a pre-PN-88 WAL line; it must load back as Trunk.
+        let parsed: WalEntry = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.lane, WalLane::Trunk);
     }
 
     #[test]

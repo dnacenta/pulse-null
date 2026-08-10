@@ -33,6 +33,11 @@ pub const MAX_REINJECTION_FILE_BYTES: usize = 20_000;
 /// When exceeded, the oldest messages are drained to keep the most recent ones.
 pub const MAX_MESSAGES_PER_SESSION: usize = 200;
 
+/// Hard cap on the quarantine lane (refused turns handled by the fallback
+/// model). Bounds growth on a long cybersec/AI-philosophy session; when
+/// exceeded, the oldest quarantined messages are drained.
+pub const MAX_QUARANTINE_MESSAGES: usize = 50;
+
 /// WAL (write-ahead log) tracking state for a session.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WalState {
@@ -73,6 +78,12 @@ pub struct HealthCounters {
     /// Number of times the circuit breaker fired in this session.
     #[serde(default)]
     pub circuit_breaker_count: u32,
+    /// Number of times a refused turn was re-run on the fallback model in this
+    /// session (PN-88, SEC-002). Capped at `MAX_FALLBACKS_PER_SESSION` to bound
+    /// runaway or repeated refusals from driving unbounded expensive opus
+    /// tool-loops. Reset with the other health counters on session reset.
+    #[serde(default)]
+    pub fallback_count_this_session: u32,
 }
 
 /// Compaction metrics tracking token recovery and context management.
@@ -147,6 +158,20 @@ pub struct SessionData {
     /// the first normal turn truncates back to this watermark.
     #[serde(skip)]
     pub isolation_ephemeral_from: Option<usize>,
+    /// Index into `quarantine` of the first entry added while isolated (PN-88,
+    /// SEC-004). Parallels `isolation_ephemeral_from` for the quarantine lane:
+    /// never serialized, and the first normal turn truncates the lane back to
+    /// this watermark so a fallback tangent created during an isolation window
+    /// never survives to disk.
+    #[serde(skip)]
+    pub isolation_quarantine_from: Option<usize>,
+    /// Quarantine lane (PN-88): refused turns re-run on the fallback model.
+    /// This is a genuine record of what was said, but it is excluded from the
+    /// default model's context so its safety classifier does not re-trip on
+    /// later benign turns. The fallback model, by contrast, sees the trunk plus
+    /// this lane. `#[serde(default)]` keeps pre-PN-88 session files loadable.
+    #[serde(default)]
+    pub quarantine: Vec<Message>,
 }
 
 impl SessionData {
@@ -155,6 +180,15 @@ impl SessionData {
         if self.messages.len() > MAX_MESSAGES_PER_SESSION {
             let excess = self.messages.len() - MAX_MESSAGES_PER_SESSION;
             self.messages.drain(..excess);
+        }
+    }
+
+    /// Enforce the quarantine cap, draining the oldest quarantined messages
+    /// when exceeded (mirrors [`enforce_message_cap`](Self::enforce_message_cap)).
+    pub fn enforce_quarantine_cap(&mut self) {
+        if self.quarantine.len() > MAX_QUARANTINE_MESSAGES {
+            let excess = self.quarantine.len() - MAX_QUARANTINE_MESSAGES;
+            self.quarantine.drain(..excess);
         }
     }
 
@@ -330,7 +364,7 @@ pub fn reset_session(
     root_dir: &Path,
     entity_name: &str,
 ) -> Option<PathBuf> {
-    if data.messages.is_empty() {
+    if data.messages.is_empty() && data.quarantine.is_empty() {
         return None;
     }
 
@@ -340,7 +374,12 @@ pub fn reset_session(
     let msg_count = data.messages.len();
     let compactions = data.compaction.compaction_count;
 
-    // Archive current session (full end: archive + EPHEMERAL + LOGBOOK)
+    // Archive the CLEAN TRUNK through the full pipeline (archive + EPHEMERAL +
+    // LOGBOOK + later graph ingestion). The quarantine lane is policy-refused
+    // content: it is written to a SEPARATE dead-end file (SEC-003) so it never
+    // reaches EPHEMERAL — which auto-loads into the default model next session —
+    // nor the graph. Passing it to `end_session` here would re-poison fable's
+    // context across the session boundary.
     let archive_path = crate::session::end_session(
         root_dir,
         entity_name,
@@ -349,6 +388,7 @@ pub fn reset_session(
         "session-reset",
         Some(&data.key),
     );
+    crate::session::archive_quarantine(root_dir, entity_name, &data.key, &data.quarantine);
 
     tracing::info!(
         "[session-reset] key={} msgs={} compactions={} hallucinations={} → fresh session",
@@ -358,8 +398,9 @@ pub fn reset_session(
         data.health.hallucination_count,
     );
 
-    // Clear messages and reset counters
+    // Clear both lanes and reset counters
     data.messages.clear();
+    data.quarantine.clear();
     data.message_count = 0;
     data.created_at = Utc::now();
     data.last_active = Utc::now();
@@ -458,7 +499,7 @@ pub struct Session {
 }
 
 impl Session {
-    fn new(key: String, channel: String, sender: String) -> Self {
+    pub(crate) fn new(key: String, channel: String, sender: String) -> Self {
         let now = Utc::now();
         Self {
             data: SessionData {
@@ -477,6 +518,8 @@ impl Session {
                 health: HealthCounters::default(),
                 compaction: CompactionMetrics::default(),
                 isolation_ephemeral_from: None,
+                isolation_quarantine_from: None,
+                quarantine: Vec::new(),
             },
             dirty: false,
         }
@@ -998,11 +1041,14 @@ impl SessionStore {
 
         for (key, session_arc) in sessions.iter() {
             let session = session_arc.read().await;
-            if session.data.messages.is_empty() {
+            if session.data.messages.is_empty() && session.data.quarantine.is_empty() {
                 continue;
             }
 
-            // Full session end: archive + EPHEMERAL + LOGBOOK
+            // Full session end for the CLEAN TRUNK only: archive + EPHEMERAL +
+            // LOGBOOK + later graph ingestion. The quarantine lane is
+            // policy-refused content and goes to a separate dead-end file
+            // (SEC-003) so it never reaches EPHEMERAL or the graph.
             if let Some(path) = crate::session::end_session(
                 root_dir,
                 entity_name,
@@ -1014,6 +1060,12 @@ impl SessionStore {
                 tracing::info!("Archived session {} to {}", key, path.display());
                 archived_paths.push(path);
             }
+            crate::session::archive_quarantine(
+                root_dir,
+                entity_name,
+                key,
+                &session.data.quarantine,
+            );
         }
 
         // Persist all to disk so they can be restored on restart
@@ -1477,5 +1529,172 @@ mod tests {
         let s = session.read().await;
         assert_eq!(s.data.messages.len(), 1);
         assert!(s.dirty);
+    }
+
+    fn user_msg(text: &str) -> Message {
+        Message {
+            role: Role::User,
+            content: MessageContent::Text(text.into()),
+            source: Some(MessageSource::Human {
+                channel: "chat".into(),
+                sender: "owner".into(),
+            }),
+        }
+    }
+
+    fn asst_msg(text: &str) -> Message {
+        Message {
+            role: Role::Assistant,
+            content: MessageContent::Text(text.into()),
+            source: None,
+        }
+    }
+
+    #[test]
+    fn quarantine_defaults_empty_on_new_session() {
+        let session = Session::new("chat:owner".into(), "chat".into(), "owner".into());
+        assert!(session.data.quarantine.is_empty());
+    }
+
+    #[test]
+    fn quarantine_survives_serde_round_trip() {
+        let mut session = Session::new("chat:owner".into(), "chat".into(), "owner".into());
+        session.data.messages.push(user_msg("trunk turn"));
+        session.data.quarantine.push(user_msg("spicy question"));
+        session.data.quarantine.push(asst_msg("opus answer"));
+
+        let json = serde_json::to_string(&session.data).unwrap();
+        let restored: SessionData = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(restored.messages.len(), 1);
+        assert_eq!(restored.quarantine.len(), 2);
+    }
+
+    #[test]
+    fn legacy_session_without_quarantine_field_loads_empty() {
+        // A pre-PN-88 session file: no `quarantine` key at all.
+        let legacy = r#"{
+            "key": "chat:owner",
+            "channel": "chat",
+            "sender": "owner",
+            "messages": [],
+            "created_at": "2026-01-01T00:00:00Z",
+            "last_active": "2026-01-01T00:00:00Z",
+            "message_count": 0,
+            "wal_seq": 0,
+            "messages_since_checkpoint": 0,
+            "last_checkpoint_time": "2026-01-01T00:00:00Z"
+        }"#;
+        let data: SessionData = serde_json::from_str(legacy).unwrap();
+        assert!(data.quarantine.is_empty());
+    }
+
+    #[test]
+    fn enforce_quarantine_cap_drains_oldest() {
+        let mut session = Session::new("chat:owner".into(), "chat".into(), "owner".into());
+        for i in 0..(MAX_QUARANTINE_MESSAGES + 10) {
+            session.data.quarantine.push(user_msg(&format!("q{i}")));
+        }
+        session.data.enforce_quarantine_cap();
+        assert_eq!(session.data.quarantine.len(), MAX_QUARANTINE_MESSAGES);
+        // Oldest drained: the surviving head is q10.
+        match &session.data.quarantine[0].content {
+            MessageContent::Text(t) => assert_eq!(t, "q10"),
+            _ => panic!("unexpected content"),
+        }
+    }
+
+    #[test]
+    fn reset_session_archives_and_clears_both_lanes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut session = Session::new("chat:owner".into(), "chat".into(), "owner".into());
+        session.data.messages.push(user_msg("hello"));
+        session.data.messages.push(asst_msg("hi"));
+        session.data.quarantine.push(user_msg("spicy"));
+        session.data.quarantine.push(asst_msg("opus reply"));
+
+        let archive = reset_session(&mut session.data, tmp.path(), "TestEntity");
+
+        assert!(
+            archive.is_some(),
+            "reset should archive when history exists"
+        );
+        assert!(
+            session.data.quarantine.is_empty(),
+            "quarantine lane not cleared on reset"
+        );
+        // Trunk is cleared, then a handoff message is inserted.
+        assert!(session.data.messages.len() <= 1);
+    }
+
+    #[test]
+    fn reset_keeps_quarantine_out_of_ephemeral_but_archives_trunk() {
+        let tmp = tempfile::tempdir().unwrap();
+        // write_ephemeral_summary writes to memory/EPHEMERAL.md — the dir must
+        // exist for the write to land.
+        std::fs::create_dir_all(tmp.path().join("memory")).unwrap();
+
+        let mut session = Session::new("chat:owner".into(), "chat".into(), "owner".into());
+        session
+            .data
+            .messages
+            .push(user_msg("clean trunk question about rust"));
+        session.data.messages.push(asst_msg("a clean answer"));
+        session
+            .data
+            .quarantine
+            .push(user_msg("QUARANTINED_SPICY_SECRET"));
+        session
+            .data
+            .quarantine
+            .push(asst_msg("opus reply to the spicy question"));
+
+        reset_session(&mut session.data, tmp.path(), "TestEntity");
+
+        // EPHEMERAL must contain the clean trunk topic and NOT the quarantined
+        // content (SEC-003) — EPHEMERAL auto-loads into the default model.
+        let ephemeral =
+            std::fs::read_to_string(tmp.path().join("memory").join("EPHEMERAL.md")).unwrap();
+        assert!(
+            ephemeral.contains("clean trunk question"),
+            "trunk topic missing from EPHEMERAL: {ephemeral}"
+        );
+        assert!(
+            !ephemeral.contains("QUARANTINED_SPICY_SECRET"),
+            "quarantined content leaked into EPHEMERAL: {ephemeral}"
+        );
+
+        // The trunk was archived to the conversations pipeline; the quarantine
+        // went to its own dead-end file, not the conversation archive.
+        let conv_dir = tmp.path().join("archives").join("conversations");
+        let conv_dump: String = std::fs::read_dir(&conv_dir)
+            .unwrap()
+            .flatten()
+            .filter(|e| {
+                e.path().extension().and_then(|x| x.to_str()) == Some("md")
+                    && e.file_name().to_string_lossy().starts_with("conversation-")
+            })
+            .map(|e| std::fs::read_to_string(e.path()).unwrap_or_default())
+            .collect();
+        assert!(
+            conv_dump.contains("clean trunk question"),
+            "trunk not archived to conversations"
+        );
+        assert!(
+            !conv_dump.contains("QUARANTINED_SPICY_SECRET"),
+            "quarantined content leaked into the conversation archive (graph-ingested)"
+        );
+
+        // The quarantine is preserved as a record in its own dead-end file.
+        let q_dir = tmp.path().join("archives").join("quarantine");
+        let q_dump: String = std::fs::read_dir(&q_dir)
+            .unwrap()
+            .flatten()
+            .map(|e| std::fs::read_to_string(e.path()).unwrap_or_default())
+            .collect();
+        assert!(
+            q_dump.contains("QUARANTINED_SPICY_SECRET"),
+            "quarantine record was not written to archives/quarantine/"
+        );
     }
 }

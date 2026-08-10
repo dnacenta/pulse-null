@@ -271,6 +271,80 @@ pub fn end_session(
     archive_path
 }
 
+/// Persist a session's quarantine lane (policy-refused turns re-run on the
+/// fallback model) to a standalone dead-end file under `archives/quarantine/`.
+///
+/// Unlike [`end_session`], this deliberately does NOT feed the durable memory
+/// pipeline (SEC-003): it is never summarized into EPHEMERAL (which auto-loads
+/// into the DEFAULT model's context next session), never written to the
+/// conversation INDEX or LOGBOOK, and never returned for graph ingestion.
+/// Quarantined content is policy-flagged; routing it through those channels
+/// would re-inject it into the default model's context across the session
+/// boundary and defeat the whole point of quarantining it.
+///
+/// Returns the path written, or `None` if the lane was empty or the write failed
+/// (best-effort: a quarantine archive failure must not abort a session reset).
+pub fn archive_quarantine(
+    root_dir: &Path,
+    entity_name: &str,
+    session_key: &str,
+    quarantine: &[Message],
+) -> Option<PathBuf> {
+    if quarantine.is_empty() {
+        return None;
+    }
+
+    let dir = root_dir.join("archives").join("quarantine");
+    if let Err(e) = fs::create_dir_all(&dir) {
+        tracing::warn!("Failed to create quarantine archive dir: {}", e);
+        return None;
+    }
+
+    let safe_key = session_key.replace(':', "--");
+    let now = Utc::now();
+
+    // Claim a filename with O_EXCL so concurrent writers never collide.
+    let mut n = 1u32;
+    let (mut file, path) = loop {
+        let candidate = dir.join(format!("quarantine-{safe_key}-{n:03}.md"));
+        match fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&candidate)
+        {
+            Ok(f) => break (f, candidate),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => n += 1,
+            Err(e) => {
+                tracing::warn!("Failed to create quarantine archive: {}", e);
+                return None;
+            }
+        }
+    };
+
+    let body = conversation_to_markdown(quarantine);
+    let content = format!(
+        "---\ndate: \"{date}\"\nentity: \"{entity}\"\nsession_key: \"{key}\"\nlane: quarantine\nmessage_count: {count}\n---\n\n# Quarantine {key} ({n:03})\n\n{body}",
+        date = now.format("%Y-%m-%dT%H:%M:%SZ"),
+        entity = entity_name,
+        key = session_key,
+        count = quarantine.len(),
+    );
+
+    if let Err(e) = file.write_all(content.as_bytes()) {
+        drop(file);
+        let _ = fs::remove_file(&path);
+        tracing::warn!("Failed to write quarantine archive: {}", e);
+        return None;
+    }
+
+    tracing::info!(
+        "Quarantine lane archived to {} ({} message(s))",
+        path.display(),
+        quarantine.len()
+    );
+    Some(path)
+}
+
 /// Archive a comms (peer-to-peer) conversation transcript.
 /// Takes (entity_name, text) pairs and writes to the shared conversation archive.
 pub fn archive_comms_conversation(

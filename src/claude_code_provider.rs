@@ -38,7 +38,7 @@ const PROBE_TIMEOUT: Duration = Duration::from_secs(30);
 /// What a CLI without the flag prints when it parses `--system-prompt-file`.
 const UNKNOWN_OPTION_MARKER: &str = "unknown option";
 
-use crate::errors::ClaudeCliError;
+use crate::errors::{ClaudeCliError, RefusalError};
 use crate::session::strip_system_prefixes;
 use crate::streaming::{self, StreamResult, StreamingProvider};
 
@@ -330,6 +330,27 @@ impl LmProvider for ClaudeCodeProvider {
                 let stderr = String::from_utf8_lossy(&output.stderr);
                 let stdout = String::from_utf8_lossy(&output.stdout);
 
+                // An AUP refusal is a distinct, recoverable signal: the chat
+                // handler falls back to another model on it. Everything else
+                // (network, timeout, empty) stays a generic error.
+                match classify_nonzero_exit(&stdout) {
+                    RefusalCheck::Refusal(detail) => {
+                        return Err(Box::new(RefusalError {
+                            model: model.clone(),
+                            detail: truncate(&detail, 500).to_string(),
+                        })
+                            as Box<dyn std::error::Error + Send + Sync>);
+                    }
+                    RefusalCheck::ErrorFlagButNoPolicyMatch => {
+                        warn!(
+                            model = %model,
+                            "claude -p exited non-zero with is_error=true but did not match \
+                             the AUP Usage-Policy signature — refusal detection may have drifted"
+                        );
+                    }
+                    RefusalCheck::NotRefusal => {}
+                }
+
                 // Build the most informative error message possible.
                 // claude -p often puts errors in stdout (JSON) rather than stderr.
                 let detail = if !stderr.trim().is_empty() {
@@ -444,6 +465,38 @@ fn serialize_messages(messages: &[Message]) -> String {
 }
 
 /// Parse the JSON response from `claude -p --output-format json`.
+/// Classification of a non-zero `claude -p` exit body.
+#[derive(Debug, PartialEq, Eq)]
+enum RefusalCheck {
+    /// An AUP Usage-Policy refusal; carries the refusal detail body.
+    Refusal(String),
+    /// The body reported `is_error == true` but did not match the AUP
+    /// signature — logged at WARN so a future signature drift is visible.
+    ErrorFlagButNoPolicyMatch,
+    /// Not a structured refusal (non-JSON, `is_error` absent/false, etc.).
+    NotRefusal,
+}
+
+/// Classify a non-zero-exit stdout body as an AUP refusal or a plain error.
+///
+/// A refusal is valid JSON with `is_error == true` **and** a `result` body
+/// containing the Usage-Policy signature. Anything else (non-JSON stderr,
+/// `is_error` absent/false) is a generic error and must not trigger fallback.
+fn classify_nonzero_exit(stdout: &str) -> RefusalCheck {
+    let Ok(parsed) = serde_json::from_str::<serde_json::Value>(stdout.trim()) else {
+        return RefusalCheck::NotRefusal;
+    };
+    if parsed["is_error"].as_bool() != Some(true) {
+        return RefusalCheck::NotRefusal;
+    }
+    let result = parsed["result"].as_str().unwrap_or("");
+    if result.to_lowercase().contains("usage policy") {
+        RefusalCheck::Refusal(result.to_string())
+    } else {
+        RefusalCheck::ErrorFlagButNoPolicyMatch
+    }
+}
+
 fn parse_response(
     stdout: &str,
     model: &str,
@@ -525,6 +578,70 @@ mod tests {
     fn parse_empty_result_is_error() {
         let json = r#"{"result": "", "session_id": "abc"}"#;
         assert!(parse_response(json, "opus").is_err());
+    }
+
+    // The real refusal body captured from prod on 2026-08-09.
+    const REAL_REFUSAL_JSON: &str = r#"{"type":"result","subtype":"success","is_error":true,"duration_ms":3047,"num_turns":1,"result":"API Error: Claude Code is unable to respond to this request, which appears to violate our Usage Policy (https://www.anthropic.com/legal/aup). Try rephrasing...","stop_reason":"stop_sequence","session_id":"abc-123"}"#;
+
+    #[test]
+    fn classify_detects_real_aup_refusal() {
+        match classify_nonzero_exit(REAL_REFUSAL_JSON) {
+            RefusalCheck::Refusal(detail) => {
+                assert!(detail.contains("Usage Policy"));
+            }
+            other => panic!("expected Refusal, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn classify_ignores_plain_json_error() {
+        // is_error present but false — a normal non-refusal failure.
+        let json = r#"{"is_error":false,"result":"some transient failure"}"#;
+        assert_eq!(classify_nonzero_exit(json), RefusalCheck::NotRefusal);
+    }
+
+    #[test]
+    fn classify_ignores_missing_is_error() {
+        let json = r#"{"result":"boom"}"#;
+        assert_eq!(classify_nonzero_exit(json), RefusalCheck::NotRefusal);
+    }
+
+    #[test]
+    fn classify_ignores_non_json() {
+        assert_eq!(
+            classify_nonzero_exit("error: connection reset by peer"),
+            RefusalCheck::NotRefusal
+        );
+    }
+
+    #[test]
+    fn classify_flags_error_without_policy_text_for_drift() {
+        // is_error true but no Usage-Policy signature: drift-catch branch.
+        let json = r#"{"is_error":true,"result":"API Error: overloaded"}"#;
+        assert_eq!(
+            classify_nonzero_exit(json),
+            RefusalCheck::ErrorFlagButNoPolicyMatch
+        );
+    }
+
+    #[test]
+    fn classify_is_case_insensitive_on_policy_text() {
+        let json = r#"{"is_error":true,"result":"violates our usage policy"}"#;
+        assert!(matches!(
+            classify_nonzero_exit(json),
+            RefusalCheck::Refusal(_)
+        ));
+    }
+
+    #[test]
+    fn refusal_error_displays_model_and_detail() {
+        let err = RefusalError {
+            model: "claude-fable-5".to_string(),
+            detail: "violates our Usage Policy".to_string(),
+        };
+        let s = err.to_string();
+        assert!(s.contains("claude-fable-5"));
+        assert!(s.contains("Usage Policy"));
     }
 
     #[test]

@@ -122,6 +122,8 @@ mod tests {
             base_url: None,
             claude_bin: Some("/usr/bin/claude".into()),
             context_budget: 4096,
+            fallback_model: None,
+            fallback_on_refusal: true,
         };
         config
     }

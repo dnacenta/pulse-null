@@ -98,6 +98,8 @@ mod tests {
                 base_url: None,
                 claude_bin: None,
                 context_budget: 0,
+                fallback_model: None,
+                fallback_on_refusal: true,
             },
             security: SecurityConfig {
                 secret: None,

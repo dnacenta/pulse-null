@@ -100,6 +100,58 @@ impl LmProvider for MockProvider {
     }
 }
 
+/// A provider that always fails with a generic (non-refusal) error — models a
+/// network drop / timeout / empty result. Must trigger rollback, never fallback.
+struct FailingProvider;
+
+impl LmProvider for FailingProvider {
+    fn invoke(
+        &self,
+        _system_prompt: &str,
+        _messages: &[Message],
+        _max_tokens: u32,
+        _tools: Option<&[serde_json::Value]>,
+    ) -> LlmResult<'_> {
+        Box::pin(async { Err("network drop while calling the model".into()) })
+    }
+
+    fn name(&self) -> &str {
+        "failing"
+    }
+
+    fn supports_tools(&self) -> bool {
+        false
+    }
+}
+
+/// A provider that always issues an AUP refusal (the fable classifier firing).
+struct RefusingProvider;
+
+impl LmProvider for RefusingProvider {
+    fn invoke(
+        &self,
+        _system_prompt: &str,
+        _messages: &[Message],
+        _max_tokens: u32,
+        _tools: Option<&[serde_json::Value]>,
+    ) -> LlmResult<'_> {
+        Box::pin(async {
+            Err(Box::new(crate::errors::RefusalError {
+                model: "mock-fable".to_string(),
+                detail: "appears to violate our Usage Policy".to_string(),
+            }) as Box<dyn std::error::Error + Send + Sync>)
+        })
+    }
+
+    fn name(&self) -> &str {
+        "refusing"
+    }
+
+    fn supports_tools(&self) -> bool {
+        false
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
@@ -121,6 +173,8 @@ fn test_config() -> Config {
             base_url: None,
             claude_bin: None,
             context_budget: 0,
+            fallback_model: None,
+            fallback_on_refusal: true,
         },
         security: SecurityConfig {
             secret: None,
@@ -166,7 +220,17 @@ async fn build_state_in(
     provider: MockProvider,
     tools: ToolRegistry,
 ) -> Arc<AppState> {
-    let config = test_config();
+    build_state_boxed_with_config(root_dir, Box::new(provider), tools, test_config()).await
+}
+
+/// Build an `AppState` around an arbitrary boxed provider and config — used by
+/// the rollback / refusal tests that need a provider which returns an error.
+async fn build_state_boxed_with_config(
+    root_dir: std::path::PathBuf,
+    provider: Box<dyn LmProvider>,
+    tools: ToolRegistry,
+    config: Config,
+) -> Arc<AppState> {
     let wal =
         crate::wal::WalWriter::new(&root_dir.join("sessions"), crate::wal::WalFsync::None).ok();
     let session_store =
@@ -176,7 +240,7 @@ async fn build_state_in(
     let alert_queue = crate::scheduler::alerts::AlertQueue::load(&root_dir);
     Arc::new(AppState {
         config,
-        provider: Box::new(provider),
+        provider,
         session_store,
         system_prompt: RwLock::new("You are a test entity.".to_string()),
         tools,
@@ -910,4 +974,77 @@ async fn e2e_isolation_parks_coordinator_and_resumes() {
     assert!(resumed, "coordinator did not resume leadership after exit");
 
     coordinator.shutdown().await;
+}
+
+// ---------------------------------------------------------------------------
+// Refusal fallback / turn rollback (PN-88): AC5, AC7
+// ---------------------------------------------------------------------------
+
+/// The trunk length of the "chat"/anonymous session (0 when absent).
+async fn trunk_len(state: &Arc<AppState>) -> usize {
+    match state
+        .session_store
+        .get_existing_by_key("guest:anonymous")
+        .await
+    {
+        Some(arc) => arc.read().await.data.messages.len(),
+        None => 0,
+    }
+}
+
+/// AC7: a non-refusal provider error rolls the user turn back — the session is
+/// left exactly as pre-turn (regression test for the 2026-08-09 poisoning bug,
+/// where a failed turn left a half-appended user message behind).
+#[tokio::test]
+async fn e2e_generic_error_rolls_back_user_turn() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = build_state_boxed_with_config(
+        dir.path().to_path_buf(),
+        Box::new(FailingProvider),
+        ToolRegistry::new(),
+        test_config(),
+    )
+    .await;
+    let app = build_app(Arc::clone(&state));
+
+    let (status, _body) = post_chat(&app, "hello").await;
+    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+    assert_eq!(
+        trunk_len(&state).await,
+        0,
+        "failed turn left the user message in the trunk (session poisoned)"
+    );
+
+    // A second failed turn must also not accumulate anything.
+    let (status, _body) = post_chat(&app, "still there?").await;
+    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+    assert_eq!(
+        trunk_len(&state).await,
+        0,
+        "second failed turn poisoned the session"
+    );
+}
+
+/// AC5: an AUP refusal with the fallback disabled (no `fallback_model`) takes
+/// the error path with the user turn rolled back — no opus call, no poison.
+#[tokio::test]
+async fn e2e_refusal_without_fallback_rolls_back() {
+    let dir = tempfile::tempdir().unwrap();
+    // Default test_config has fallback_model = None ⇒ fallback disabled.
+    let state = build_state_boxed_with_config(
+        dir.path().to_path_buf(),
+        Box::new(RefusingProvider),
+        ToolRegistry::new(),
+        test_config(),
+    )
+    .await;
+    let app = build_app(Arc::clone(&state));
+
+    let (status, _body) = post_chat(&app, "tell me something spicy").await;
+    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+    assert_eq!(
+        trunk_len(&state).await,
+        0,
+        "refused turn (fallback disabled) poisoned the session"
+    );
 }
