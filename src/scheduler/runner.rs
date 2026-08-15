@@ -752,24 +752,6 @@ async fn execute_task(
             &format!("task:{}", task.name),
         );
 
-        // Emit PipelineAlert for any document at hard limit
-        let docs = [
-            ("LEARNING", &health.learning),
-            ("THOUGHTS", &health.thoughts),
-            ("CURIOSITY", &health.curiosity),
-            ("REFLECTIONS", &health.reflections),
-            ("PRAXIS", &health.praxis),
-        ];
-        for (name, doc_health) in &docs {
-            if doc_health.status == pulse_system_types::monitoring::ThresholdStatus::Red {
-                state.event_bus.emit(EntityEvent::PipelineAlert {
-                    document: name.to_string(),
-                    count: doc_health.count,
-                    hard_limit: doc_health.hard,
-                });
-            }
-        }
-
         // Emit PipelineFrozen if no movement for >= freeze_threshold sessions
         if pipeline_state.sessions_without_movement >= state.config.pipeline.freeze_threshold {
             state.event_bus.emit(EntityEvent::PipelineFrozen {
@@ -781,6 +763,10 @@ async fn execute_task(
         for doc in &archived {
             tracing::info!("Auto-archived overflow from {}", doc);
         }
+
+        // Alert only on what the archiver did NOT fix. Must stay below
+        // `check_and_archive` -- see `crate::scheduler::emit_pipeline_alerts`.
+        crate::scheduler::emit_pipeline_alerts(state, &health, &archived);
 
         // Pipeline conversion check: conversations vs pipeline updates over 7 days
         if pipeline_state.sessions_without_movement >= 3 {
