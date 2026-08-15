@@ -1045,16 +1045,20 @@ fn apply_channel_style(prompt: String, channel: &str) -> String {
     format!(
         "{prompt}\n\n<voice-call>\n\
          This reply will be spoken aloud on a phone call, not read.\n\n\
-         - Keep it short: one to three sentences. The caller is waiting in \
-         silence while you think, and cannot skim.\n\
+         - Two sentences at most, and aim under thirty words. Three long \
+         sentences are as bad as five short ones — what matters is how long \
+         the caller sits in silence, unable to skim or interrupt politely.\n\
+         - Lead with the answer. Context, caveats and alternatives only if \
+         they ask.\n\
          - No markdown, bullet points, numbered lists, headings or code \
          blocks. They are read out as noise.\n\
          - Do not spell out URLs, file paths or long identifiers. Summarise \
          instead, and offer to send details another way.\n\
          - Write the way people talk: contractions, plain words, natural \
          connectors rather than 'firstly' and 'secondly'.\n\
-         - If something genuinely needs a long answer, give the short version \
-         first and ask whether they want the detail.\n\
+         - If something genuinely needs a long answer, give the one-line \
+         version and ask whether they want the rest. Never deliver a list of \
+         capabilities or options aloud; name the best one.\n\
          </voice-call>"
     )
 }
@@ -1229,7 +1233,8 @@ mod channel_style_tests {
             "identity must come first"
         );
         assert!(styled.contains("<voice-call>"));
-        assert!(styled.contains("one to three sentences"));
+        assert!(styled.contains("Two sentences at most"));
+        assert!(styled.contains("under thirty words"));
         assert!(styled.contains("No markdown"));
     }
 
