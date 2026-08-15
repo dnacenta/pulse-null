@@ -403,7 +403,8 @@ pub async fn chat(
     // holding it across the LLM call would block system prompt refreshes.
     let system_prompt = {
         let base = state.system_prompt.read().await;
-        build_identity_system_prompt(&base, &resolved_key, sender_label)
+        let identity = build_identity_system_prompt(&base, &resolved_key, sender_label);
+        apply_channel_style(identity, &channel)
     };
 
     // Phase 6: Track system prompt token count on the session.
@@ -1027,6 +1028,37 @@ fn conversation_trust_from_identity(resolved_key: &str) -> crate::events::Conver
     }
 }
 
+/// Adapt the system prompt to the medium the reply will arrive through.
+///
+/// A reply that reads well in a chat window is unbearable spoken aloud: a
+/// caller cannot skim, cannot scroll back, and hears markdown as noise.
+/// Measured through the voice pipeline, replies ran to roughly twenty seconds
+/// of speech per turn — several paragraphs the caller had to sit through
+/// before they could say anything.
+///
+/// The identity prompt is left untouched; this only says how to speak, never
+/// who to be.
+fn apply_channel_style(prompt: String, channel: &str) -> String {
+    if !channel.eq_ignore_ascii_case("voice") {
+        return prompt;
+    }
+    format!(
+        "{prompt}\n\n<voice-call>\n\
+         This reply will be spoken aloud on a phone call, not read.\n\n\
+         - Keep it short: one to three sentences. The caller is waiting in \
+         silence while you think, and cannot skim.\n\
+         - No markdown, bullet points, numbered lists, headings or code \
+         blocks. They are read out as noise.\n\
+         - Do not spell out URLs, file paths or long identifiers. Summarise \
+         instead, and offer to send details another way.\n\
+         - Write the way people talk: contractions, plain words, natural \
+         connectors rather than 'firstly' and 'secondly'.\n\
+         - If something genuinely needs a long answer, give the short version \
+         first and ask whether they want the detail.\n\
+         </voice-call>"
+    )
+}
+
 /// Build an identity-aware system prompt by appending identity-class-specific
 /// context to the base system prompt. This replaces the old trust-tag system
 /// with sender resolution at the session boundary.
@@ -1183,6 +1215,40 @@ fn extract_recent_session_texts(
             }
         })
         .collect()
+}
+
+#[cfg(test)]
+mod channel_style_tests {
+    use super::apply_channel_style;
+
+    #[test]
+    fn voice_calls_get_spoken_reply_guidance() {
+        let styled = apply_channel_style("BASE PERSONA".to_string(), "voice");
+        assert!(
+            styled.starts_with("BASE PERSONA"),
+            "identity must come first"
+        );
+        assert!(styled.contains("<voice-call>"));
+        assert!(styled.contains("one to three sentences"));
+        assert!(styled.contains("No markdown"));
+    }
+
+    #[test]
+    fn other_channels_are_untouched() {
+        for channel in ["discord", "tui", "system", "reflection", ""] {
+            let styled = apply_channel_style("BASE PERSONA".to_string(), channel);
+            assert_eq!(
+                styled, "BASE PERSONA",
+                "{channel:?} must not receive voice guidance"
+            );
+        }
+    }
+
+    #[test]
+    fn channel_match_is_case_insensitive() {
+        assert!(apply_channel_style("P".to_string(), "Voice").contains("<voice-call>"));
+        assert!(apply_channel_style("P".to_string(), "VOICE").contains("<voice-call>"));
+    }
 }
 
 #[cfg(test)]
