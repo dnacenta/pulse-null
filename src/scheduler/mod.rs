@@ -22,26 +22,54 @@ use crate::server::AppState;
 // Re-export shared types from pulse-system-types
 pub use pulse_system_types::{OutputRouting, ScheduledTask, TaskCreator};
 
+/// Re-measure pipeline health after the automatic archiver has run, so that
+/// alerting sees the residual rather than the trigger.
+///
+/// `pre` is the health that was handed to `check_and_archive`; `archived` is
+/// its return value. The re-measure is skipped when the archiver did nothing,
+/// which is the common case and keeps the file scan off the hot path.
+///
+/// Deliberately *not* implemented as "suppress every document named in
+/// `archived`". `archive_document` halves the section count and reports
+/// success; it does not promise to bring a document back under its hard limit,
+/// and it returns `Ok(())` without writing anything when the document has no
+/// splittable sections. Filtering on the name would therefore silence exactly
+/// the document that is furthest over the limit — turning a false-positive
+/// defect into a false-negative one. Only a fresh measurement distinguishes
+/// "cured" from "attempted".
+pub fn post_archive_health(
+    pre: pulse_system_types::monitoring::PipelineHealth,
+    archived: &[String],
+    remeasure: impl FnOnce() -> pulse_system_types::monitoring::PipelineHealth,
+) -> pulse_system_types::monitoring::PipelineHealth {
+    if archived.is_empty() {
+        pre
+    } else {
+        remeasure()
+    }
+}
+
 /// Emit a [`PipelineAlert`](crate::events::EntityEvent::PipelineAlert) for each
-/// document that is at its hard limit **and was not cured** by the automatic
-/// archiver in this same pass.
+/// document still at its hard limit.
 ///
-/// `archived` is the return value of `check_and_archive`, whose entries are
-/// file names (`"LEARNING.md"`); `health` is keyed by bare document name
-/// (`"LEARNING"`), hence the `.md` suffixing on comparison.
-///
-/// Call this *after* `check_and_archive`, never before. The two share a
-/// predicate, so an alert raised ahead of the remedy reports a condition that
-/// the remedy then resolves microseconds later, while the resulting intent is
-/// not read for tens of seconds. Alarming on the trigger instead of the
-/// residual drives positive predictive value to zero as a matter of ordering
-/// rather than of tuning.
+/// Call this with a *post*-archive health, never with the health that was fed
+/// to `check_and_archive`. The archiver and the alert share a predicate
+/// (`status == Red`), so an alert raised ahead of the remedy reports a
+/// condition that the remedy then resolves microseconds later, while the
+/// resulting intent is not read for tens of seconds. Alarming on the trigger
+/// instead of the residual drives positive predictive value to zero as a
+/// matter of ordering rather than of tuning.
 pub fn emit_pipeline_alerts(
     state: &Arc<AppState>,
     health: &pulse_system_types::monitoring::PipelineHealth,
-    archived: &[String],
 ) {
-    for (name, count, hard) in pipeline_alert_residual(health, archived) {
+    for (name, count, hard) in pipeline_alert_residual(health) {
+        tracing::warn!(
+            "{} still at {}/{} after the automatic archive sweep — alerting",
+            name,
+            count,
+            hard
+        );
         state
             .event_bus
             .emit(crate::events::EntityEvent::PipelineAlert {
@@ -52,13 +80,12 @@ pub fn emit_pipeline_alerts(
     }
 }
 
-/// The pure decision behind [`emit_pipeline_alerts`]: which documents are still
-/// at their hard limit once `archived` has been applied.
+/// The pure decision behind [`emit_pipeline_alerts`]: which documents are at
+/// their hard limit in the health passed in.
 ///
-/// Split out so the ordering guarantee is testable without an `AppState`.
+/// Split out so the residual rule is testable without an `AppState`.
 fn pipeline_alert_residual(
     health: &pulse_system_types::monitoring::PipelineHealth,
-    archived: &[String],
 ) -> Vec<(&'static str, usize, usize)> {
     use pulse_system_types::monitoring::ThresholdStatus;
 
@@ -70,24 +97,10 @@ fn pipeline_alert_residual(
         ("PRAXIS", &health.praxis),
     ];
 
-    let mut residual = Vec::new();
-    for (name, doc_health) in docs {
-        if doc_health.status != ThresholdStatus::Red {
-            continue;
-        }
-        if archived.iter().any(|a| a == &format!("{name}.md")) {
-            tracing::debug!(
-                "{} was at hard limit ({}/{}) but the automatic archiver cured it; \
-                 suppressing PipelineAlert",
-                name,
-                doc_health.count,
-                doc_health.hard
-            );
-            continue;
-        }
-        residual.push((name, doc_health.count, doc_health.hard));
-    }
-    residual
+    docs.into_iter()
+        .filter(|(_, d)| d.status == ThresholdStatus::Red)
+        .map(|(name, d)| (name, d.count, d.hard))
+        .collect()
 }
 
 /// One line of `schedule.json`: a task definition plus the overrides that
@@ -421,31 +434,34 @@ mod tests {
         }
     }
 
-    /// A document the automatic archiver cured in the same pass must not also
-    /// raise an alert. Emitting one gives an advisory whose positive
-    /// predictive value is zero by construction: measured over 14 days of
-    /// production logs, 28/28 alerts were cured within 5ms (median 2.5ms)
-    /// while the resulting intent went unread for a median of 60s.
+    /// A document the automatic archiver actually cured must not alert. This is
+    /// the measured defect: over 14 days of production logs, 28/28 alerts were
+    /// cured within 5ms (median 2.5ms) while the resulting intent went unread
+    /// for a median of 60s, giving a positive predictive value of 0/28.
     #[test]
     fn cured_documents_do_not_alert() {
-        let health = health_with_red(&["LEARNING", "THOUGHTS"]);
+        let pre = health_with_red(&["LEARNING", "THOUGHTS"]);
         let archived = vec!["LEARNING.md".to_string(), "THOUGHTS.md".to_string()];
 
+        let post = post_archive_health(pre, &archived, || health_with_red(&[]));
+
         assert!(
-            pipeline_alert_residual(&health, &archived).is_empty(),
+            pipeline_alert_residual(&post).is_empty(),
             "alert raised for a document the archiver already cured"
         );
     }
 
-    /// The alert must survive when the archiver did *not* handle the document
-    /// -- that is the whole condition worth a human's attention, and a fix
-    /// that suppressed it too would be worse than the defect.
+    /// The alert must survive when the archiver did not touch the document --
+    /// that is the whole condition worth a human's attention, and a fix that
+    /// suppressed it too would be worse than the defect.
     #[test]
-    fn uncured_documents_still_alert() {
-        let health = health_with_red(&["LEARNING", "PRAXIS"]);
+    fn untouched_documents_still_alert() {
+        let pre = health_with_red(&["LEARNING", "PRAXIS"]);
         let archived = vec!["LEARNING.md".to_string()];
 
-        let residual = pipeline_alert_residual(&health, &archived);
+        // The sweep cleared LEARNING; PRAXIS is not archivable and stays Red.
+        let post = post_archive_health(pre, &archived, || health_with_red(&["PRAXIS"]));
+        let residual = pipeline_alert_residual(&post);
 
         assert_eq!(residual.len(), 1);
         assert_eq!(residual[0].0, "PRAXIS");
@@ -453,28 +469,49 @@ mod tests {
         assert_eq!(residual[0].2, 8);
     }
 
-    /// Green documents never alert, cured or not.
+    /// The reason this re-measures instead of filtering on the names in
+    /// `archived`: `archive_document` halves the section count and reports
+    /// success, and returns `Ok(())` having written nothing when the document
+    /// has no splittable sections. A document can therefore appear in
+    /// `archived` and still be over its hard limit. Suppressing on the name
+    /// would silence precisely the worst-off document -- swapping a
+    /// false-positive defect for a false-negative one.
     #[test]
-    fn green_documents_never_alert() {
-        let health = health_with_red(&[]);
-        assert!(pipeline_alert_residual(&health, &[]).is_empty());
-        assert!(pipeline_alert_residual(&health, &["LEARNING.md".to_string()]).is_empty());
+    fn archived_but_still_over_limit_alerts() {
+        let pre = health_with_red(&["LEARNING"]);
+        let archived = vec!["LEARNING.md".to_string()];
+
+        // Archiver ran, halved the doc, and it is *still* Red.
+        let post = post_archive_health(pre, &archived, || health_with_red(&["LEARNING"]));
+        let residual = pipeline_alert_residual(&post);
+
+        assert_eq!(
+            residual.len(),
+            1,
+            "a document the archiver attempted but did not cure must still alert"
+        );
+        assert_eq!(residual[0].0, "LEARNING");
     }
 
-    /// `check_and_archive` returns file names while `PipelineHealth` is keyed
-    /// by bare document name. A regression on that suffixing would silently
-    /// restore the original defect, so pin it.
+    /// Green documents never alert.
     #[test]
-    fn suppression_matches_on_md_suffixed_names() {
-        let health = health_with_red(&["CURIOSITY"]);
+    fn green_documents_never_alert() {
+        assert!(pipeline_alert_residual(&health_with_red(&[])).is_empty());
+    }
 
-        // Bare name must NOT suppress -- it is not what check_and_archive returns.
-        assert_eq!(
-            pipeline_alert_residual(&health, &["CURIOSITY".to_string()]).len(),
-            1
-        );
-        // The real return value must suppress.
-        assert!(pipeline_alert_residual(&health, &["CURIOSITY.md".to_string()]).is_empty());
+    /// The re-measure is skipped when the archiver did nothing -- the common
+    /// case, and the one where a second full file scan would be pure cost.
+    #[test]
+    fn no_archive_means_no_remeasure() {
+        let pre = health_with_red(&["CURIOSITY"]);
+
+        let post = post_archive_health(pre, &[], || {
+            panic!("re-measured despite the archiver having archived nothing")
+        });
+
+        let residual = pipeline_alert_residual(&post);
+        assert_eq!(residual.len(), 1);
+        assert_eq!(residual[0].0, "CURIOSITY");
     }
 
     /// MEDIUM-3 regression: concurrent save_delta callers must not lose

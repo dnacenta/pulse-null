@@ -766,7 +766,10 @@ async fn execute_task(
 
         // Alert only on what the archiver did NOT fix. Must stay below
         // `check_and_archive` -- see `crate::scheduler::emit_pipeline_alerts`.
-        crate::scheduler::emit_pipeline_alerts(state, &health, &archived);
+        let health = crate::scheduler::post_archive_health(health, &archived, || {
+            monitor.calculate(&root_dir, &thresholds)
+        });
+        crate::scheduler::emit_pipeline_alerts(state, &health);
 
         // Pipeline conversion check: conversations vs pipeline updates over 7 days
         if pipeline_state.sessions_without_movement >= 3 {
