@@ -174,21 +174,66 @@ impl PipelineState {
 // Pipeline health calculation
 // ---------------------------------------------------------------------------
 
-/// Count entries in a markdown file by counting ## and ### headers
-/// (excluding known structural headers).
+/// Tracks header nesting while scanning a markdown document line by line.
+///
+/// "What counts as one entry" has to be identical for `count_entries` (which
+/// drives the pipeline thresholds, i.e. *when* the archiver fires) and for
+/// `split_by_headers` (which decides *where* the archiver cuts). When the two
+/// disagree, the health check counts slots the archiver cannot cut on. This
+/// scanner is the single source of truth for both.
+///
+/// Nesting rule: a `### ` line inside a non-structural `## ` entry is a
+/// subsection of that entry, not an entry of its own. A `### ` outside one is
+/// an entry in its own right — CURIOSITY.md keeps its entries under structural
+/// `## ` headings, and those must still be counted and archivable.
+#[derive(Default)]
+struct EntryScanner {
+    /// Currently inside a non-structural `## ` entry.
+    in_entry: bool,
+}
+
+impl EntryScanner {
+    /// Returns true if `line` begins a new entry.
+    fn starts_entry(&mut self, line: &str) -> bool {
+        let trimmed = line.trim_start();
+
+        // `### ` is checked first for readability; it does not match the `"## "`
+        // prefix anyway, since its third byte is `#` rather than a space.
+        if trimmed.starts_with("### ") {
+            return !self.in_entry;
+        }
+
+        if trimmed.starts_with("## ") {
+            if is_structural_header(trimmed) {
+                // Structural headings are document furniture, never entries,
+                // and they close any open entry: `### ` lines following one are
+                // top-level again.
+                self.in_entry = false;
+                return false;
+            }
+            self.in_entry = true;
+            return true;
+        }
+
+        false
+    }
+}
+
+/// Count entries in a markdown file.
+///
+/// One entry is one non-structural `## ` heading together with all of its
+/// `### ` subsections, or a `### ` heading with no `## ` entry open above it.
+/// See [`EntryScanner`].
 fn count_entries(path: &Path) -> usize {
     let content = match std::fs::read_to_string(path) {
         Ok(c) => c,
         Err(_) => return 0,
     };
 
+    let mut scanner = EntryScanner::default();
     content
         .lines()
-        .filter(|line| {
-            let trimmed = line.trim_start();
-            (trimmed.starts_with("## ") || trimmed.starts_with("### "))
-                && !is_structural_header(trimmed)
-        })
+        .filter(|line| scanner.starts_entry(line))
         .count()
 }
 
@@ -438,18 +483,22 @@ pub fn archive_document_by_name(
     Ok(format!("Archived entries from {}", source))
 }
 
-/// Split markdown content into a header (everything before first ##) and sections.
+/// Split markdown content into a header (everything before the first entry)
+/// and one string per entry.
+///
+/// Subsections travel with their parent: a `### ` inside a `## ` entry is part
+/// of that entry's string, so the archiver can never cut between a parent and
+/// its children. Boundaries come from [`EntryScanner`], the same rule
+/// `count_entries` uses.
 fn split_by_headers(content: &str) -> (String, Vec<String>) {
     let mut header = String::new();
     let mut sections: Vec<String> = Vec::new();
     let mut current_section = String::new();
     let mut in_header = true;
+    let mut scanner = EntryScanner::default();
 
     for line in content.lines() {
-        let trimmed = line.trim_start();
-        if (trimmed.starts_with("## ") || trimmed.starts_with("### "))
-            && !is_structural_header(trimmed)
-        {
+        if scanner.starts_entry(line) {
             if in_header {
                 in_header = false;
             } else if !current_section.is_empty() {
@@ -727,6 +776,10 @@ mod tests {
         assert_eq!(count, 0);
     }
 
+    // Deliberately changed from 3 to 2: `### Sub-thought` is a subsection of
+    // `## Second thought`, not a third entry. Counting it separately was what
+    // made a structured entry cost one slot per subsection and pushed the
+    // document to its hard limit early.
     #[test]
     fn test_count_entries_with_headers() {
         let dir = TempDir::new().unwrap();
@@ -736,7 +789,20 @@ mod tests {
             "# Thoughts\n\n## First thought\n\nContent.\n\n## Second thought\n\nMore content.\n\n### Sub-thought\n\nDetail.\n",
         );
         let count = count_entries(&dir.path().join("journal/THOUGHTS.md"));
-        assert_eq!(count, 3);
+        assert_eq!(count, 2);
+    }
+
+    #[test]
+    fn test_count_entries_subsections_cost_one_slot() {
+        let dir = TempDir::new().unwrap();
+        setup_journal(
+            dir.path(),
+            "LEARNING.md",
+            "# Learning\n\n## c794\n\nIntro.\n\n### Q1\n\na\n\n### Q2\n\nb\n\n### Q3\n\nc\n",
+        );
+        // One entry with k subsections costs 1 slot, not k + 1.
+        let count = count_entries(&dir.path().join("journal/LEARNING.md"));
+        assert_eq!(count, 1);
     }
 
     #[test]
@@ -852,6 +918,45 @@ mod tests {
     }
 
     #[test]
+    fn test_split_by_headers_nests_subsections() {
+        let content = "# Title\n\nPreamble.\n\n## Entry 1\n\nIntro.\n\n### Part A\n\na\n\n### Part B\n\nb\n\n## Entry 2\n\nContent 2.\n";
+        let (header, sections) = split_by_headers(content);
+        assert!(header.contains("Preamble"));
+        assert_eq!(sections.len(), 2);
+        // Both subsections travel inside their parent's section.
+        assert!(sections[0].contains("Entry 1"));
+        assert!(sections[0].contains("Part A"));
+        assert!(sections[0].contains("Part B"));
+        assert!(sections[1].contains("Entry 2"));
+        assert!(!sections[1].contains("Part"));
+    }
+
+    #[test]
+    fn test_split_by_headers_h3_without_parent_is_an_entry() {
+        // CURIOSITY.md's shape: entries live as `###` under structural `##`
+        // headings, so those must still be their own sections.
+        let content =
+            "# Curiosity\n\n## Open Questions\n\n### What is X?\n\na\n\n### What is Y?\n\nb\n";
+        let (_, sections) = split_by_headers(content);
+        assert_eq!(sections.len(), 2);
+        assert!(sections[0].contains("What is X?"));
+        assert!(sections[1].contains("What is Y?"));
+    }
+
+    #[test]
+    fn test_split_by_headers_structural_header_closes_an_entry() {
+        // A structural heading is not a boundary (it stays with the preceding
+        // entry), but it does end the nesting region, so a later `###` is an
+        // entry again rather than a subsection of the entry before it.
+        let content = "# Curiosity\n\n## Real entry\n\na\n\n## Explored\n\n### Old question\n\nb\n";
+        let (_, sections) = split_by_headers(content);
+        assert_eq!(sections.len(), 2);
+        assert!(sections[0].contains("Real entry"));
+        assert!(sections[0].contains("## Explored"));
+        assert!(sections[1].contains("Old question"));
+    }
+
+    #[test]
     fn test_archive_document() {
         let dir = TempDir::new().unwrap();
         let journal = dir.path().join("journal");
@@ -872,6 +977,53 @@ mod tests {
 
         let archive_files: Vec<_> = fs::read_dir(&archives).unwrap().flatten().collect();
         assert_eq!(archive_files.len(), 1);
+    }
+
+    /// Regression test for the split that cut an entry in half: the `##`
+    /// parent was archived while its `###` children stayed resident, with
+    /// neither half referencing the other.
+    #[test]
+    fn test_archive_document_keeps_subsections_with_parent() {
+        let dir = TempDir::new().unwrap();
+        let journal = dir.path().join("journal");
+        let archives = dir.path().join("archives/learning");
+        fs::create_dir_all(&journal).unwrap();
+        fs::create_dir_all(&archives).unwrap();
+
+        // Four entries; the second and third each carry subsections, and the
+        // midpoint falls between them.
+        fs::write(
+            journal.join("LEARNING.md"),
+            "# Learning\n\nPreamble.\n\n\
+             ## Topic 1\n\nOldest.\n\n\
+             ## Topic 2\n\nOld.\n\n### old-child-a\n\naa\n\n### old-child-b\n\nbb\n\n\
+             ## Topic 3\n\nNew.\n\n### new-child-a\n\ncc\n\n\
+             ## Topic 4\n\nNewest.\n",
+        )
+        .unwrap();
+
+        archive_document(dir.path(), "journal/LEARNING.md", "archives/learning").unwrap();
+
+        let remaining = fs::read_to_string(journal.join("LEARNING.md")).unwrap();
+        let archive_file = fs::read_dir(&archives).unwrap().flatten().next().unwrap();
+        let archived = fs::read_to_string(archive_file.path()).unwrap();
+
+        // Half the entries moved, counted as entries rather than as headers.
+        let (_, sections) = split_by_headers(&remaining);
+        assert_eq!(sections.len(), 2);
+
+        // The archived entry went whole: parent and both children together,
+        // and no orphaned child left behind.
+        assert!(archived.contains("Topic 2"));
+        assert!(archived.contains("old-child-a"));
+        assert!(archived.contains("old-child-b"));
+        assert!(!remaining.contains("old-child-a"));
+        assert!(!remaining.contains("old-child-b"));
+
+        // The retained entry kept its own child rather than shedding it.
+        assert!(remaining.contains("Topic 3"));
+        assert!(remaining.contains("new-child-a"));
+        assert!(!archived.contains("new-child-a"));
     }
 
     #[test]
