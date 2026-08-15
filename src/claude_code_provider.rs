@@ -40,7 +40,7 @@ const UNKNOWN_OPTION_MARKER: &str = "unknown option";
 
 use crate::errors::{ClaudeCliError, RefusalError};
 use crate::session::strip_system_prefixes;
-use crate::streaming::{self, StreamResult, StreamingProvider};
+use crate::streaming::{StreamEvent, StreamResult, StreamingProvider};
 
 pub struct ClaudeCodeProvider {
     model: String,
@@ -102,6 +102,85 @@ fn invoke_args(
         args.push(ISOLATION_DISALLOWED_TOOLS.into());
     }
     args
+}
+
+/// Argv for a *streaming* invocation.
+///
+/// `stream-json` alone emits one object per completed message, which would
+/// still deliver the reply in a single lump. `--include-partial-messages` is
+/// what turns it into token-level deltas, and the CLI only honours it
+/// alongside `--verbose`.
+fn stream_invoke_args(
+    model: &str,
+    system_prompt_file: &std::path::Path,
+    restricted: bool,
+) -> Vec<std::ffi::OsString> {
+    let mut args: Vec<std::ffi::OsString> = vec![
+        "-p".into(),
+        "-".into(),
+        "--model".into(),
+        model.into(),
+        "--output-format".into(),
+        "stream-json".into(),
+        "--include-partial-messages".into(),
+        "--verbose".into(),
+        "--system-prompt-file".into(),
+        system_prompt_file.into(),
+        "--no-session-persistence".into(),
+        "--dangerously-skip-permissions".into(),
+    ];
+    if restricted {
+        args.push("--disallowedTools".into());
+        args.push(ISOLATION_DISALLOWED_TOOLS.into());
+    }
+    args
+}
+
+/// One line of `--output-format stream-json` output.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum StreamLine {
+    /// Incremental text as the model produces it.
+    Delta(String),
+    /// The terminal record, carrying the assembled reply.
+    Result { text: String, is_error: bool },
+    /// Structure we do not consume (tool events, init, usage records).
+    Other,
+}
+
+/// Classify one NDJSON line from the streaming CLI.
+///
+/// Written defensively: the CLI's event vocabulary is broader than what we
+/// consume and grows between releases, so anything unrecognised becomes
+/// `Other` rather than an error. Only two shapes matter — a text delta and the
+/// terminal result.
+pub(crate) fn parse_stream_line(line: &str) -> StreamLine {
+    let line = line.trim();
+    if line.is_empty() {
+        return StreamLine::Other;
+    }
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(line) else {
+        return StreamLine::Other;
+    };
+
+    match value["type"].as_str() {
+        // Partial message: an Anthropic-shaped SSE event wrapped by the CLI.
+        Some("stream_event") => {
+            let event = &value["event"];
+            if event["type"].as_str() == Some("content_block_delta") {
+                if let Some(text) = event["delta"]["text"].as_str() {
+                    if !text.is_empty() {
+                        return StreamLine::Delta(text.to_string());
+                    }
+                }
+            }
+            StreamLine::Other
+        }
+        Some("result") => StreamLine::Result {
+            text: value["result"].as_str().unwrap_or("").trim().to_string(),
+            is_error: value["is_error"].as_bool().unwrap_or(false),
+        },
+        _ => StreamLine::Other,
+    }
 }
 
 /// A private on-disk copy of the system prompt for a single CLI invocation.
@@ -394,17 +473,139 @@ impl LmProvider for ClaudeCodeProvider {
 
 impl StreamingProvider for ClaudeCodeProvider {
     fn supports_streaming(&self) -> bool {
-        false
+        true
     }
 
     fn invoke_streaming(
         &self,
         system_prompt: &str,
         messages: &[Message],
-        max_tokens: u32,
-        tools: Option<&[serde_json::Value]>,
+        _max_tokens: u32,
+        _tools: Option<&[serde_json::Value]>,
     ) -> StreamResult<'_> {
-        streaming::invoke_as_stream(self, system_prompt, messages, max_tokens, tools)
+        let system_prompt = system_prompt.to_string();
+        let messages = messages.to_vec();
+        let model = self.model.clone();
+        let claude_bin = self.claude_bin.clone();
+        let restricted = self
+            .isolation_root
+            .as_deref()
+            .is_some_and(crate::server::isolation::is_active);
+
+        Box::pin(async_stream::stream! {
+            let prompt = serialize_messages(&messages);
+
+            if let Err(e) = ensure_system_prompt_file_support(&claude_bin).await {
+                yield StreamEvent::Error(format!("{e}"));
+                return;
+            }
+            // Dropped when this stream is dropped — success, error, or the
+            // consumer walking away mid-reply — which unlinks the prompt.
+            let system_prompt_file = match SystemPromptFile::create(&system_prompt) {
+                Ok(file) => file,
+                Err(e) => {
+                    yield StreamEvent::Error(format!("{e}"));
+                    return;
+                }
+            };
+
+            let mut cmd = tokio::process::Command::new(&claude_bin);
+            cmd.args(stream_invoke_args(&model, system_prompt_file.path(), restricted))
+                .env_remove("CLAUDECODE")
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped());
+            // The caller hanging up must not leave a model running.
+            cmd.kill_on_drop(true);
+
+            let mut child = match cmd.spawn() {
+                Ok(child) => child,
+                Err(e) => {
+                    yield StreamEvent::Error(format!("failed to spawn claude: {e}"));
+                    return;
+                }
+            };
+
+            if let Some(mut stdin) = child.stdin.take() {
+                use tokio::io::AsyncWriteExt;
+                if let Err(e) = stdin.write_all(prompt.as_bytes()).await {
+                    yield StreamEvent::Error(format!("failed to write to claude stdin: {e}"));
+                    return;
+                }
+                // Dropped here: closing stdin is what tells the CLI to start.
+            }
+
+            let Some(stdout) = child.stdout.take() else {
+                yield StreamEvent::Error("claude produced no stdout".to_string());
+                return;
+            };
+
+            use tokio::io::{AsyncBufReadExt, BufReader};
+            let mut lines = BufReader::new(stdout).lines();
+            let mut assembled = String::new();
+            let mut terminal: Option<(String, bool)> = None;
+
+            loop {
+                match lines.next_line().await {
+                    Ok(Some(line)) => match parse_stream_line(&line) {
+                        StreamLine::Delta(text) => {
+                            assembled.push_str(&text);
+                            yield StreamEvent::TextDelta(text);
+                        }
+                        StreamLine::Result { text, is_error } => {
+                            terminal = Some((text, is_error));
+                        }
+                        StreamLine::Other => {}
+                    },
+                    Ok(None) => break,
+                    Err(e) => {
+                        yield StreamEvent::Error(format!("reading claude output: {e}"));
+                        break;
+                    }
+                }
+            }
+
+            let _ = child.wait().await;
+
+            match terminal {
+                // The CLI reports failures in the terminal record rather than
+                // by exiting non-zero mid-stream; quota exhaustion and policy
+                // refusals both arrive this way.
+                Some((text, true)) => {
+                    yield StreamEvent::Error(text);
+                }
+                Some((text, false)) => {
+                    // Prefer the assembled deltas; fall back to the terminal
+                    // text if partial messages were unavailable.
+                    let final_text = if assembled.trim().is_empty() { text } else { assembled };
+                    if final_text.trim().is_empty() {
+                        yield StreamEvent::Error("claude returned empty output".to_string());
+                    } else {
+                        yield StreamEvent::Done(LlmResponse {
+                            content: vec![ContentBlock::Text { text: final_text }],
+                            stop_reason: StopReason::EndTurn,
+                            model: model.clone(),
+                            // The streaming CLI reports usage in records we do
+                            // not consume; token counts stay with /chat.
+                            input_tokens: None,
+                            output_tokens: None,
+                        });
+                    }
+                }
+                None if !assembled.trim().is_empty() => {
+                    yield StreamEvent::Done(LlmResponse {
+                        content: vec![ContentBlock::Text { text: assembled }],
+                        stop_reason: StopReason::EndTurn,
+                        model: model.clone(),
+                        input_tokens: None,
+                        output_tokens: None,
+                    });
+                }
+                None => {
+                    yield StreamEvent::Error("claude stream ended without a result".to_string());
+                }
+            }
+        })
     }
 }
 
@@ -591,6 +792,83 @@ mod tests {
             }
             other => panic!("expected Refusal, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn stream_delta_is_extracted_from_a_partial_message() {
+        let line = r#"{"type":"stream_event","event":{"type":"content_block_delta","delta":{"type":"text_delta","text":"Hello"}}}"#;
+        assert_eq!(
+            parse_stream_line(line),
+            StreamLine::Delta("Hello".to_string())
+        );
+    }
+
+    #[test]
+    fn stream_result_carries_text_and_error_flag() {
+        let ok = r#"{"type":"result","subtype":"success","result":"  done  ","is_error":false}"#;
+        assert_eq!(
+            parse_stream_line(ok),
+            StreamLine::Result {
+                text: "done".to_string(),
+                is_error: false
+            }
+        );
+
+        // How quota exhaustion actually arrives — observed live 2026-08-13.
+        let quota = r#"{"type":"result","subtype":"success","is_error":true,"result":"You're out of extra usage \u00b7 resets Aug 19, 6am (UTC)"}"#;
+        match parse_stream_line(quota) {
+            StreamLine::Result { text, is_error } => {
+                assert!(is_error, "an is_error body must not be spoken as a reply");
+                assert!(text.contains("out of extra usage"));
+            }
+            other => panic!("expected a result line, got {other:?}"),
+        }
+    }
+
+    /// The CLI emits far more event types than we consume, and adds more
+    /// between releases; unknown shapes must be skipped, never fatal.
+    #[test]
+    fn unconsumed_and_malformed_lines_are_ignored() {
+        for line in [
+            r#"{"type":"system","subtype":"init","session_id":"abc"}"#,
+            r#"{"type":"assistant","message":{"content":[]}}"#,
+            r#"{"type":"stream_event","event":{"type":"content_block_start"}}"#,
+            r#"{"type":"stream_event","event":{"type":"content_block_delta","delta":{"type":"input_json_delta","partial_json":"{"}}}"#,
+            r#"{"type":"stream_event","event":{"type":"content_block_delta","delta":{"type":"text_delta","text":""}}}"#,
+            "not json at all",
+            "",
+            "   ",
+        ] {
+            assert_eq!(
+                parse_stream_line(line),
+                StreamLine::Other,
+                "line should be ignored: {line}"
+            );
+        }
+    }
+
+    #[test]
+    fn streaming_argv_asks_for_token_level_output() {
+        let args = stream_invoke_args("claude-opus-5", std::path::Path::new("/tmp/p.md"), false);
+        let joined: Vec<String> = args
+            .iter()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+        assert!(joined.contains(&"stream-json".to_string()));
+        // Without these two the CLI emits whole messages, not tokens.
+        assert!(joined.contains(&"--include-partial-messages".to_string()));
+        assert!(joined.contains(&"--verbose".to_string()));
+    }
+
+    #[test]
+    fn streaming_argv_keeps_isolation_restrictions() {
+        let args = stream_invoke_args("claude-opus-5", std::path::Path::new("/tmp/p.md"), true);
+        let joined: Vec<String> = args
+            .iter()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+        assert!(joined.contains(&"--disallowedTools".to_string()));
+        assert!(joined.contains(&ISOLATION_DISALLOWED_TOOLS.to_string()));
     }
 
     #[test]
