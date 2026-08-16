@@ -16,8 +16,162 @@ use crate::scheduler::intent::{Intent, IntentOutput, IntentPriority, IntentQueue
 /// Cooldown period for event-sourced intents (prevents death spirals).
 const EVENT_COOLDOWN_MINUTES: i64 = 60;
 
-/// Maximum consecutive fires of the same event without pipeline movement before giving up.
+/// Shorter cooldown for post-interaction events — each interaction is a unique
+/// trigger, so they are spaced rather than rate-limited.
+const POST_CONVERSATION_COOLDOWN_MINUTES: i64 = 5;
+
+/// Maximum fires of the same event within the breaker window before the
+/// channel is held open.
 const MAX_CONSECUTIVE_FIRES: u32 = 3;
+
+/// Quiet period after which an event's fire count decays back to zero and an
+/// open breaker closes again.
+///
+/// Must exceed `EVENT_COOLDOWN_MINUTES`, or the count could never reach
+/// `MAX_CONSECUTIVE_FIRES` and the breaker would be unreachable.
+const BREAKER_RESET_MINUTES: i64 = 6 * 60;
+
+/// Compile-time guard for the relationship above: if the reset window ever
+/// drops to or below the cooldown, the fire count can never reach
+/// `MAX_CONSECUTIVE_FIRES` and the fire limit silently becomes dead code.
+const _: () = assert!(BREAKER_RESET_MINUTES > EVENT_COOLDOWN_MINUTES);
+
+/// What the circuit breaker decided about an incoming event.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum BreakerDecision {
+    /// Let the event through.
+    Pass,
+    /// Inside the per-event cooldown window.
+    Cooldown { minutes_remaining: i64 },
+    /// Breaker is open — the channel fired too often without going quiet.
+    Open {
+        fires: u32,
+        resets_at: DateTime<Utc>,
+    },
+}
+
+/// Per-event-type breaker state.
+#[derive(Debug, Clone)]
+struct BreakerEntry {
+    /// When this event last successfully queued an intent.
+    last_queued: DateTime<Utc>,
+    /// Fires since the channel last went quiet for `BREAKER_RESET_MINUTES`.
+    fires: u32,
+    /// Whether the trip into the open state has already been reported, so the
+    /// transition is logged once instead of on every suppressed arrival.
+    open_reported: bool,
+}
+
+/// Circuit breaker for event-sourced intents.
+///
+/// Two independent gates per event type:
+/// - a **cooldown**, which spaces repeated fires, and
+/// - a **fire limit**, which holds the channel open when it keeps firing.
+///
+/// The fire count decays to zero after `BREAKER_RESET_MINUTES` without a
+/// successful queue, so an open breaker always closes again.
+///
+/// That decay is the fix for a real outage. The count previously only ever
+/// incremented — there was no decrement, removal, or reset anywhere — which
+/// made the limit a once-per-process quota rather than a rate limit: three
+/// fires killed the channel for the lifetime of the listener task, and only a
+/// process restart cleared it. In the two weeks before this change three
+/// channels died that way (`pipeline_frozen`, `pipeline_alert_LEARNING`,
+/// `pipeline_alert_PRAXIS`), so a genuine document overflow could not be
+/// reported at all.
+///
+/// Note the limit counts *fires*, not *unresolved* fires. The previous doc
+/// comment described it as consecutive fires "without pipeline movement", but
+/// no movement signal reaches this task — the listener sees events, never
+/// whether the intent it queued was acted on. For the event types that have
+/// one, the movement test already lives in the evaluator (`PipelineDocEval`
+/// compares document mtimes and resets them on fire); this breaker is the
+/// coarser backstop underneath it, and going quiet is the only resolution
+/// signal available here.
+#[derive(Debug, Default)]
+struct EventBreaker {
+    entries: HashMap<String, BreakerEntry>,
+}
+
+impl EventBreaker {
+    fn cooldown_minutes(is_post_conversation: bool) -> i64 {
+        if is_post_conversation {
+            POST_CONVERSATION_COOLDOWN_MINUTES
+        } else {
+            EVENT_COOLDOWN_MINUTES
+        }
+    }
+
+    /// Decide whether `event_type` may proceed at `now`, decaying a stale fire
+    /// count first.
+    fn check(
+        &mut self,
+        event_type: &str,
+        is_post_conversation: bool,
+        now: DateTime<Utc>,
+    ) -> BreakerDecision {
+        let Some(entry) = self.entries.get_mut(event_type) else {
+            return BreakerDecision::Pass;
+        };
+
+        let elapsed = now - entry.last_queued;
+
+        // Decay first: a channel quiet for the reset window is healthy again
+        // regardless of what it did before.
+        if entry.fires > 0 && elapsed >= Duration::minutes(BREAKER_RESET_MINUTES) {
+            if entry.open_reported {
+                tracing::info!(
+                    "Event '{}' circuit breaker CLOSED — channel quiet for {} min, resuming",
+                    event_type,
+                    elapsed.num_minutes()
+                );
+            }
+            entry.fires = 0;
+            entry.open_reported = false;
+        }
+
+        let cooldown_mins = Self::cooldown_minutes(is_post_conversation);
+        if elapsed < Duration::minutes(cooldown_mins) {
+            return BreakerDecision::Cooldown {
+                minutes_remaining: cooldown_mins - elapsed.num_minutes(),
+            };
+        }
+
+        // PostInteraction is exempt from the fire limit — each interaction is a
+        // unique trigger, not a retry of the previous one.
+        if !is_post_conversation && entry.fires >= MAX_CONSECUTIVE_FIRES {
+            return BreakerDecision::Open {
+                fires: entry.fires,
+                resets_at: entry.last_queued + Duration::minutes(BREAKER_RESET_MINUTES),
+            };
+        }
+
+        BreakerDecision::Pass
+    }
+
+    /// Returns true the first time an open breaker is reported, so a trip is
+    /// logged as a transition rather than once per suppressed arrival.
+    fn should_report_open(&mut self, event_type: &str) -> bool {
+        match self.entries.get_mut(event_type) {
+            Some(entry) if !entry.open_reported => {
+                entry.open_reported = true;
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// Record that an event successfully queued an intent.
+    fn record_fire(&mut self, event_type: String, now: DateTime<Utc>) {
+        let entry = self.entries.entry(event_type).or_insert(BreakerEntry {
+            last_queued: now,
+            fires: 0,
+            open_reported: false,
+        });
+        entry.last_queued = now;
+        entry.fires += 1;
+    }
+}
 
 /// Listen for events and translate them into queued intents.
 pub async fn event_listener(
@@ -29,8 +183,8 @@ pub async fn event_listener(
 ) {
     tracing::info!("Event listener started");
 
-    // Circuit breaker state: event_type → (last_queued, consecutive_fires)
-    let mut cooldowns: HashMap<String, (DateTime<Utc>, u32)> = HashMap::new();
+    // Circuit breaker state: cooldown + decaying fire count, per event type.
+    let mut breaker = EventBreaker::default();
 
     // Load evaluator state for structural precondition checks
     let mut eval_state = SchedulerState::load(&root_dir);
@@ -41,34 +195,43 @@ pub async fn event_listener(
             Ok(event) => {
                 let event_type = event.event_type();
 
-                // Check cooldown — PostInteraction is exempt from consecutive
-                // fire limits since each interaction is a unique trigger
+                // Check cooldown — PostInteraction is exempt from the fire
+                // limit since each interaction is a unique trigger.
                 let is_post_conversation = matches!(event, EntityEvent::PostInteraction { .. });
+                let now = Utc::now();
 
-                if let Some((last_queued, fires)) = cooldowns.get(&event_type) {
-                    let elapsed = Utc::now() - *last_queued;
-
-                    // Apply cooldown for all events (5 min for post_conversation, full window for others)
-                    let cooldown_mins = if is_post_conversation {
-                        5
-                    } else {
-                        EVENT_COOLDOWN_MINUTES
-                    };
-                    if elapsed < Duration::minutes(cooldown_mins) {
+                match breaker.check(&event_type, is_post_conversation, now) {
+                    BreakerDecision::Pass => {}
+                    BreakerDecision::Cooldown { minutes_remaining } => {
                         tracing::debug!(
                             "Event '{}' on cooldown ({} min remaining), skipping",
                             event_type,
-                            cooldown_mins - elapsed.num_minutes()
+                            minutes_remaining
                         );
                         continue;
                     }
-
-                    // Circuit breaker: skip consecutive fire check for post_conversation
-                    if !is_post_conversation && *fires >= MAX_CONSECUTIVE_FIRES {
-                        tracing::warn!(
-                            "Event '{}' fired {} consecutive times without resolution — circuit breaker tripped",
-                            event_type, fires
-                        );
+                    BreakerDecision::Open { fires, resets_at } => {
+                        // Log the trip as a transition, once, at error level —
+                        // a suppression nothing reports is the same failure
+                        // class as the alert it replaces. Repeats go to debug
+                        // so the one line that matters is not buried.
+                        if breaker.should_report_open(&event_type) {
+                            tracing::error!(
+                                "Event '{}' fired {} times without going quiet — circuit breaker \
+                                 OPEN, channel suppressed until {} ({} min); intents from this \
+                                 event are being dropped until then",
+                                event_type,
+                                fires,
+                                resets_at.to_rfc3339(),
+                                (resets_at - now).num_minutes().max(0)
+                            );
+                        } else {
+                            tracing::debug!(
+                                "Event '{}' suppressed — breaker open until {}",
+                                event_type,
+                                resets_at.to_rfc3339()
+                            );
+                        }
                         continue;
                     }
                 }
@@ -144,9 +307,7 @@ pub async fn event_listener(
                         }
 
                         // Update cooldown tracking
-                        let entry = cooldowns.entry(event_type).or_insert((Utc::now(), 0));
-                        entry.0 = Utc::now();
-                        entry.1 += 1;
+                        breaker.record_fire(event_type, Utc::now());
                     } else {
                         // PostInteraction rejections are more significant — a real
                         // conversation's self-assessment didn't queue.
@@ -445,6 +606,215 @@ fn is_better_or_equal(current: &str, previous: &str) -> bool {
         _ => 3, // unknown = assume healthy
     };
     rank(current) >= rank(previous)
+}
+
+#[cfg(test)]
+mod breaker_tests {
+    use super::*;
+
+    const EV: &str = "pipeline_alert_LEARNING";
+
+    fn t0() -> DateTime<Utc> {
+        DateTime::parse_from_rfc3339("2026-08-15T12:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc)
+    }
+
+    /// Drive the breaker to the fire limit, honouring the cooldown between
+    /// fires. Returns the time of the last fire.
+    fn trip(breaker: &mut EventBreaker, start: DateTime<Utc>) -> DateTime<Utc> {
+        let mut now = start;
+        for _ in 0..MAX_CONSECUTIVE_FIRES {
+            assert_eq!(breaker.check(EV, false, now), BreakerDecision::Pass);
+            breaker.record_fire(EV.to_string(), now);
+            now += Duration::minutes(EVENT_COOLDOWN_MINUTES);
+        }
+        now - Duration::minutes(EVENT_COOLDOWN_MINUTES)
+    }
+
+    #[test]
+    fn unknown_event_passes() {
+        let mut b = EventBreaker::default();
+        assert_eq!(b.check(EV, false, t0()), BreakerDecision::Pass);
+    }
+
+    #[test]
+    fn cooldown_blocks_rapid_refire() {
+        let mut b = EventBreaker::default();
+        b.record_fire(EV.to_string(), t0());
+
+        match b.check(EV, false, t0() + Duration::minutes(10)) {
+            BreakerDecision::Cooldown { minutes_remaining } => {
+                assert_eq!(minutes_remaining, EVENT_COOLDOWN_MINUTES - 10);
+            }
+            other => panic!("expected cooldown, got {:?}", other),
+        }
+
+        // Once the window elapses the event is allowed through again.
+        assert_eq!(
+            b.check(EV, false, t0() + Duration::minutes(EVENT_COOLDOWN_MINUTES)),
+            BreakerDecision::Pass
+        );
+    }
+
+    #[test]
+    fn opens_after_max_fires() {
+        let mut b = EventBreaker::default();
+        let last = trip(&mut b, t0());
+
+        match b.check(EV, false, last + Duration::minutes(EVENT_COOLDOWN_MINUTES)) {
+            BreakerDecision::Open { fires, resets_at } => {
+                assert_eq!(fires, MAX_CONSECUTIVE_FIRES);
+                assert_eq!(resets_at, last + Duration::minutes(BREAKER_RESET_MINUTES));
+            }
+            other => panic!("expected open breaker, got {:?}", other),
+        }
+    }
+
+    /// The regression test for the outage: before the decay existed, the fire
+    /// count only ever incremented, so an open breaker stayed open for the
+    /// lifetime of the listener task and the channel was silently dead.
+    #[test]
+    fn closes_after_quiet_period_rather_than_staying_dead_forever() {
+        let mut b = EventBreaker::default();
+        let last = trip(&mut b, t0());
+
+        // Still open just before the reset window elapses.
+        assert!(matches!(
+            b.check(
+                EV,
+                false,
+                last + Duration::minutes(BREAKER_RESET_MINUTES - 1)
+            ),
+            BreakerDecision::Open { .. }
+        ));
+
+        // Closed once it does.
+        assert_eq!(
+            b.check(EV, false, last + Duration::minutes(BREAKER_RESET_MINUTES)),
+            BreakerDecision::Pass
+        );
+
+        // And the channel is genuinely usable again, not merely one-shot.
+        let reopened = last + Duration::minutes(BREAKER_RESET_MINUTES);
+        b.record_fire(EV.to_string(), reopened);
+        assert_eq!(b.entries[EV].fires, 1);
+        assert!(!b.entries[EV].open_reported);
+    }
+
+    /// A day later — the state the live process was stuck in — must be usable.
+    #[test]
+    fn recovers_a_day_after_tripping() {
+        let mut b = EventBreaker::default();
+        let last = trip(&mut b, t0());
+        assert_eq!(
+            b.check(EV, false, last + Duration::hours(24)),
+            BreakerDecision::Pass
+        );
+    }
+
+    #[test]
+    fn quiet_channel_decays_before_reaching_the_limit() {
+        let mut b = EventBreaker::default();
+        b.record_fire(EV.to_string(), t0());
+        b.record_fire(
+            EV.to_string(),
+            t0() + Duration::minutes(EVENT_COOLDOWN_MINUTES),
+        );
+        assert_eq!(b.entries[EV].fires, 2);
+
+        // A quiet gap wipes the partial count, so unrelated fires spread over
+        // weeks never accumulate into a trip.
+        assert_eq!(
+            b.check(
+                EV,
+                false,
+                t0() + Duration::minutes(BREAKER_RESET_MINUTES * 2)
+            ),
+            BreakerDecision::Pass
+        );
+        assert_eq!(b.entries[EV].fires, 0);
+    }
+
+    #[test]
+    fn post_conversation_is_exempt_from_the_fire_limit() {
+        let mut b = EventBreaker::default();
+        let ev = "post_interaction";
+        let mut now = t0();
+
+        for _ in 0..(MAX_CONSECUTIVE_FIRES * 3) {
+            assert_eq!(b.check(ev, true, now), BreakerDecision::Pass);
+            b.record_fire(ev.to_string(), now);
+            now += Duration::minutes(POST_CONVERSATION_COOLDOWN_MINUTES);
+        }
+    }
+
+    #[test]
+    fn post_conversation_still_honours_its_short_cooldown() {
+        let mut b = EventBreaker::default();
+        let ev = "post_interaction";
+        b.record_fire(ev.to_string(), t0());
+
+        assert!(matches!(
+            b.check(ev, true, t0() + Duration::minutes(1)),
+            BreakerDecision::Cooldown { .. }
+        ));
+        assert_eq!(
+            b.check(
+                ev,
+                true,
+                t0() + Duration::minutes(POST_CONVERSATION_COOLDOWN_MINUTES)
+            ),
+            BreakerDecision::Pass
+        );
+    }
+
+    #[test]
+    fn open_transition_is_reported_once_then_stays_quiet() {
+        let mut b = EventBreaker::default();
+        trip(&mut b, t0());
+
+        assert!(b.should_report_open(EV), "first trip must be reported");
+        assert!(
+            !b.should_report_open(EV),
+            "repeat suppressions must not re-report"
+        );
+    }
+
+    #[test]
+    fn recovery_rearms_the_open_report() {
+        let mut b = EventBreaker::default();
+        let last = trip(&mut b, t0());
+        assert!(b.should_report_open(EV));
+
+        // Decay clears the reported flag, so a second outage is announced too.
+        assert_eq!(
+            b.check(EV, false, last + Duration::minutes(BREAKER_RESET_MINUTES)),
+            BreakerDecision::Pass
+        );
+        let last2 = trip(&mut b, last + Duration::minutes(BREAKER_RESET_MINUTES));
+        assert!(matches!(
+            b.check(EV, false, last2 + Duration::minutes(EVENT_COOLDOWN_MINUTES)),
+            BreakerDecision::Open { .. }
+        ));
+        assert!(
+            b.should_report_open(EV),
+            "a second outage must be announced"
+        );
+    }
+
+    #[test]
+    fn breakers_are_tracked_per_event_type() {
+        let mut b = EventBreaker::default();
+        trip(&mut b, t0());
+        let other = "pipeline_alert_PRAXIS";
+
+        // One dead channel must not silence a different document's alerts.
+        assert_eq!(
+            b.check(other, false, t0() + Duration::hours(3)),
+            BreakerDecision::Pass
+        );
+    }
 }
 
 #[cfg(test)]
