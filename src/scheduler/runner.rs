@@ -936,6 +936,10 @@ async fn route_output_markers(
         }
     }
 
+    // [SALIENCE:] — raise outreach candidates (PN-94). Nothing is sent from
+    // here: the event listener runs the gate, quiet hours and the daily cap.
+    intent::emit_salience_markers(state, parsed, &task.id);
+
     // [SHARE:] — route via alert queue + legacy webhook
     for content in &parsed.share_content {
         let alert = super::alerts::alert_from_share(&task.name, content);

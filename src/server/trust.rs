@@ -77,8 +77,8 @@ mod tests {
     use super::*;
     use crate::config::{
         AutonomyConfig, Config, EntityConfig, GraphConfig, LlmConfig, MemoryConfig,
-        MonitoringConfig, PipelineConfig, PredictionConfig, PulseConfig, SchedulerConfig,
-        SecurityConfig, ServerConfig, SessionConfig, TrustConfig,
+        MonitoringConfig, OutreachConfig, PipelineConfig, PredictionConfig, PulseConfig,
+        SchedulerConfig, SecurityConfig, ServerConfig, SessionConfig, TrustConfig,
     };
 
     fn test_config() -> Config {
@@ -119,6 +119,7 @@ mod tests {
             graph: GraphConfig::default(),
             prediction: PredictionConfig::default(),
             tension: Default::default(),
+            outreach: OutreachConfig::default(),
             sessions: SessionConfig::default(),
             context_buffer: crate::context_buffer::ContextBufferConfig::default(),
             session_health: crate::session_health::SessionHealthConfig::default(),

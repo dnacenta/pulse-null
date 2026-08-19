@@ -195,15 +195,16 @@ pub fn spawn_event_listener(
     if config.autonomy.enabled {
         let listener_rx = event_bus.subscribe();
         let listener_queue = Arc::clone(intent_queue);
-        let events_config = config.autonomy.events.clone();
-        let max_queue_size = config.autonomy.max_queue_size;
+        // The whole config, not a slice of it: the listener now also owns the
+        // outreach admission, which needs the caps, the quiet window and the
+        // share webhook the tightening notice goes out on.
+        let listener_config = Arc::new(config.clone());
         let root_dir = root_dir.to_path_buf();
         tokio::spawn(async move {
             crate::events::listener::event_listener(
                 listener_rx,
                 listener_queue,
-                events_config,
-                max_queue_size,
+                listener_config,
                 root_dir,
             )
             .await;

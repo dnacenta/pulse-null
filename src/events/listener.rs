@@ -1,12 +1,13 @@
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use chrono::{DateTime, Duration, Utc};
 use tokio::sync::RwLock;
 
-use super::{ConversationTrust, EntityEvent, InteractionSource};
-use crate::config::EventsConfig;
+use super::{ConversationTrust, EntityEvent, InteractionSource, SalienceKind};
+use crate::config::{Config, EventsConfig};
+use crate::outreach::{self, Decision, OutreachCandidate};
 use crate::scheduler::evaluator::{
     resolve_docs_dir, CognitiveEval, EvalDecision, Evaluator, PipelineDocEval, PostInteractionEval,
     SchedulerState,
@@ -23,11 +24,13 @@ const MAX_CONSECUTIVE_FIRES: u32 = 3;
 pub async fn event_listener(
     mut rx: tokio::sync::broadcast::Receiver<EntityEvent>,
     intent_queue: Arc<RwLock<IntentQueue>>,
-    events_config: EventsConfig,
-    max_queue_size: usize,
+    config: Arc<Config>,
     root_dir: PathBuf,
 ) {
     tracing::info!("Event listener started");
+
+    let events_config = config.autonomy.events.clone();
+    let max_queue_size = config.autonomy.max_queue_size;
 
     // Circuit breaker state: event_type → (last_queued, consecutive_fires)
     let mut cooldowns: HashMap<String, (DateTime<Utc>, u32)> = HashMap::new();
@@ -45,7 +48,17 @@ pub async fn event_listener(
                 // fire limits since each interaction is a unique trigger
                 let is_post_conversation = matches!(event, EntityEvent::PostInteraction { .. });
 
-                if let Some((last_queued, fires)) = cooldowns.get(&event_type) {
+                // Salience carries its own admission control: the quality
+                // gate, quiet hours and per-kind daily caps (PN-94 §2.2–2.5).
+                // A blanket 60-minute cooldown on top of those would silently
+                // throttle `Blocking`, which the spec requires to be uncapped,
+                // and the circuit breaker would retire the channel after three
+                // messages. The caps are the control; this is not.
+                let self_governed = matches!(event, EntityEvent::Salience { .. });
+
+                if let Some((last_queued, fires)) =
+                    cooldowns.get(&event_type).filter(|_| !self_governed)
+                {
                     let elapsed = Utc::now() - *last_queued;
 
                     // Apply cooldown for all events (5 min for post_conversation, full window for others)
@@ -117,6 +130,14 @@ pub async fn event_listener(
                 if crate::server::isolation::is_active(&root_dir) {
                     continue;
                 }
+
+                // Outreach admission runs after the isolation shed (it writes
+                // outreach.json) and before translation: a candidate that
+                // does not clear the gate never becomes an intent at all.
+                if self_governed && !admit_salience(&event, &config, &root_dir).await {
+                    continue;
+                }
+
                 if let Some(intent) = translate_event(&event, &events_config) {
                     // Delta against disk (reconcile) + refresh the shared copy,
                     // so this push survives a concurrent daemon write and vice versa.
@@ -147,6 +168,16 @@ pub async fn event_listener(
                         let entry = cooldowns.entry(event_type).or_insert((Utc::now(), 0));
                         entry.0 = Utc::now();
                         entry.1 += 1;
+                    } else if self_governed {
+                        // The outreach already counted against the daily cap
+                        // at admission, so a dropped intent spends budget on
+                        // a message D never sees. Loud, not debug: this is
+                        // the channel silently under-delivering.
+                        tracing::warn!(
+                            "Admitted outreach not queued (queue full or duplicate) — \
+                             the send is already counted against today's cap: '{}'",
+                            description
+                        );
                     } else {
                         // PostInteraction rejections are more significant — a real
                         // conversation's self-assessment didn't queue.
@@ -172,6 +203,88 @@ pub async fn event_listener(
                 break;
             }
         }
+    }
+}
+
+/// Run the outreach admission on a `Salience` event (PN-94, spec §2.3–§2.5).
+///
+/// Returns true only when the candidate cleared the quality gate, the quiet
+/// window and its daily cap. Every rejection is logged with its reason and
+/// recorded in `outreach.json`: a gate whose rejections are invisible cannot
+/// be audited by anyone, and the rejection rate is one of the spec's success
+/// criteria (§8).
+///
+/// Any pending cap-tightening notice is delivered here, before the decision
+/// is acted on, and is marked announced only once delivery succeeds — a
+/// notice lost to a failing webhook must be retried, not assumed seen.
+async fn admit_salience(event: &EntityEvent, config: &Arc<Config>, root_dir: &Path) -> bool {
+    let Some(candidate) = OutreachCandidate::from_event(event) else {
+        return false;
+    };
+
+    let admission = outreach::admit_async(
+        root_dir.to_path_buf(),
+        Arc::clone(config),
+        candidate.clone(),
+        Utc::now(),
+    )
+    .await;
+
+    if let Some(ref tightening) = admission.pending_notice {
+        announce_tightening(tightening, config, root_dir).await;
+    }
+
+    match admission.decision {
+        Decision::Admitted { id } => {
+            tracing::info!(
+                outreach_id = %id,
+                kind = %candidate.kind,
+                "Outreach admitted: {}",
+                candidate.headline
+            );
+            true
+        }
+        Decision::Rejected(reason) => {
+            tracing::info!(
+                kind = %candidate.kind,
+                "Outreach rejected ({reason}): {}",
+                candidate.headline
+            );
+            false
+        }
+    }
+}
+
+/// Deliver a cap-tightening notice to D and record that it went out.
+///
+/// Delivery is reported (unlike the fire-and-forget share router) because a
+/// tightening D never learns about is precisely the silent self-throttling
+/// spec §2.4 forbids. A failed delivery leaves the announcement unrecorded,
+/// so the next candidate of that kind tries again.
+async fn announce_tightening(
+    tightening: &crate::outreach::feedback::Tightening,
+    config: &Config,
+    root_dir: &Path,
+) {
+    let notice = crate::outreach::feedback::tightening_notice(tightening);
+    let webhook = config.scheduler.output.share_webhook.as_deref();
+
+    match crate::scheduler::output::deliver_liveness_alert(&notice, webhook).await {
+        Ok(()) => {
+            if let Err(e) =
+                crate::outreach::feedback::mark_announced(root_dir, tightening, Utc::now()).await
+            {
+                tracing::error!(
+                    error = %e,
+                    "Cap tightening announced but not recorded — D may be told twice"
+                );
+            }
+        }
+        Err(e) => tracing::error!(
+            error = %e,
+            kind = %tightening.kind,
+            "Cap tightening notice undelivered — will retry on the next candidate"
+        ),
     }
 }
 
@@ -432,6 +545,94 @@ fn translate_event(event: &EntityEvent, config: &EventsConfig) -> Option<Intent>
         // reflection-window prompt augmentation, not via an autonomous LLM
         // intent. The event exists for vigil-pulse and future listeners.
         EntityEvent::PredictionPressure { .. } => None,
+
+        // Salience has already cleared the outreach admission by the time it
+        // gets here (see `admit_salience`), so this only shapes the message.
+        // Routing is `Share`: `Call` stays manual until the Discord channel
+        // has a track record (spec §2.5, `allow_call_routing = false`).
+        EntityEvent::Salience {
+            kind,
+            thread_id,
+            headline,
+            evidence,
+            confidence,
+        } => Some(salience_intent(SalienceIntentParts {
+            kind: *kind,
+            thread_id: thread_id.as_deref(),
+            headline,
+            evidence,
+            confidence: *confidence,
+        })),
+    }
+}
+
+/// The parts of a `Salience` event that shape its outreach message.
+struct SalienceIntentParts<'a> {
+    kind: SalienceKind,
+    thread_id: Option<&'a str>,
+    headline: &'a str,
+    evidence: &'a str,
+    confidence: f64,
+}
+
+/// Build the intent that writes the admitted outreach message.
+///
+/// The prompt hands the entity the material it already committed to — the
+/// headline, the evidence, the stated cost — and asks it to write the message
+/// around them. It is explicitly not asked to reconsider whether to send:
+/// that judgement was made mechanically and re-opening it here would put the
+/// decision back in the hands of the faculty under audit.
+fn salience_intent(parts: SalienceIntentParts<'_>) -> Intent {
+    let SalienceIntentParts {
+        kind,
+        thread_id,
+        headline,
+        evidence,
+        confidence,
+    } = parts;
+
+    // Blocking means D's work is stalled pending a decision from him; it
+    // jumps the queue for the same reason it is uncapped.
+    let priority = if kind == SalienceKind::Blocking {
+        IntentPriority::Urgent
+    } else {
+        IntentPriority::Normal
+    };
+
+    let thread_note = thread_id.map_or_else(String::new, |id| {
+        format!("\nThis continues thread '{id}' — say so if the continuation is the point.\n")
+    });
+
+    Intent {
+        id: format!("event-salience-{}", &uuid::Uuid::new_v4().to_string()[..8]),
+        description: format!("Outreach ({kind}): {headline}"),
+        prompt: format!(
+            "You raised this as worth telling D unprompted, and it cleared the outreach \
+            quality gate. Write the message.\n\n\
+            Kind: {kind}\n\
+            Headline: {headline}\n\
+            Confidence: {confidence:.2}\n\
+            Evidence you cited:\n{evidence}\n{thread_note}\n\
+            Write it as a short Discord message and emit it with a [SHARE:] marker. \
+            Requirements, all of them load-bearing:\n\
+            1. Lead with the claim itself, not with the fact that you are reaching out. \
+            No preamble, no 'I've been thinking about'.\n\
+            2. Carry the external referent through verbatim — the file and line, URL, \
+            prediction id or measured number. It is the part of this D can check, and \
+            the part you did not author.\n\
+            3. End with the cost line exactly as stated above: what you are asking for \
+            is nothing, a read, or a decision.\n\
+            4. Keep it under 150 words. If it does not fit, the claim is not sharp yet.\n\
+            5. Do not restate the evidence twice, and do not pad with hedging.\n\n\
+            Emit exactly one [SHARE:] marker. Do not queue intents or schedule tasks \
+            from this — it is one message, not a work item.",
+        ),
+        source: IntentSource::Event(format!("salience_{kind}")),
+        priority,
+        created_at: Utc::now(),
+        chain: None,
+        output_routing: IntentOutput::Share,
+        depth: 0,
     }
 }
 
@@ -656,6 +857,82 @@ mod tests {
         let intent = translate_event(&event, &config).unwrap();
         assert!(intent.description.contains("comms with Nova"));
         assert!(intent.prompt.contains("remote peer"));
+    }
+
+    fn salience(kind: SalienceKind) -> EntityEvent {
+        EntityEvent::Salience {
+            kind,
+            thread_id: None,
+            headline: "The gate rejects self-authored evidence".to_string(),
+            evidence: "src/outreach/mod.rs:312\nCost: read".to_string(),
+            confidence: 0.8,
+        }
+    }
+
+    #[test]
+    fn salience_translates_to_a_share_routed_intent() {
+        let intent = translate_event(&salience(SalienceKind::Finding), &EventsConfig::default())
+            .expect("an admitted salience event must produce an intent");
+        assert_eq!(intent.output_routing, IntentOutput::Share);
+        assert!(intent.description.starts_with("Outreach (finding)"));
+        assert!(intent.prompt.contains("[SHARE:]"));
+    }
+
+    #[test]
+    fn salience_carries_the_referent_and_the_cost_into_the_prompt() {
+        // The referent is the part D can check and the entity did not author;
+        // dropping it here would undo gate 2 one step after it passed.
+        let intent =
+            translate_event(&salience(SalienceKind::Callback), &EventsConfig::default()).unwrap();
+        assert!(intent.prompt.contains("src/outreach/mod.rs:312"));
+        assert!(intent.prompt.contains("Cost: read"));
+    }
+
+    #[test]
+    fn blocking_outreach_jumps_the_queue() {
+        let blocking =
+            translate_event(&salience(SalienceKind::Blocking), &EventsConfig::default()).unwrap();
+        assert_eq!(blocking.priority, IntentPriority::Urgent);
+
+        let finding =
+            translate_event(&salience(SalienceKind::Finding), &EventsConfig::default()).unwrap();
+        assert_eq!(finding.priority, IntentPriority::Normal);
+    }
+
+    #[test]
+    fn salience_is_not_gated_by_the_generic_events_config() {
+        // Every toggle off: outreach is governed by [outreach] enabled, not
+        // by the health-event switches, and must not be silently disabled by
+        // an unrelated knob.
+        let all_off = EventsConfig {
+            post_conversation: false,
+            pipeline_alert: false,
+            pipeline_frozen: false,
+            cognitive_decline: false,
+            pipeline_conversion_low: false,
+            provider_error: false,
+        };
+        assert!(translate_event(&salience(SalienceKind::Finding), &all_off).is_some());
+    }
+
+    #[test]
+    fn salience_thread_id_is_mentioned_only_when_present() {
+        let mut event = salience(SalienceKind::Development);
+        assert!(!translate_event(&event, &EventsConfig::default())
+            .unwrap()
+            .prompt
+            .contains("continues thread"));
+
+        if let EntityEvent::Salience {
+            ref mut thread_id, ..
+        } = event
+        {
+            *thread_id = Some("tension-7".to_string());
+        }
+        assert!(translate_event(&event, &EventsConfig::default())
+            .unwrap()
+            .prompt
+            .contains("tension-7"));
     }
 
     #[test]
