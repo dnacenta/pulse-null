@@ -597,6 +597,10 @@ async fn execute_intent(
     // Capture start time for accurate duration tracking
     let started_at = Utc::now();
 
+    // An intent execution is a cognitive cycle too — the substrate must not
+    // mean one thing on the task path and another here (PN-95).
+    super::tension_cycle::open_cycle(state, &root_dir).await;
+
     let exec_config = ExecutionConfig {
         max_tool_rounds: config.max_tool_rounds,
         max_tokens: state.config.llm.max_tokens,
@@ -638,6 +642,7 @@ async fn execute_intent(
     // the task path in runner.rs, so predictions and resolutions emitted
     // during intent sessions never reached predictions.json. Applies via
     // the store's locked load-apply-save, racing task fires safely.
+    let mut resolved_prediction_ids: Vec<String> = Vec::new();
     if state.config.prediction.enabled {
         let intent_id = intent.id.clone();
         // Raw response, not clean_content: the lazy SHARE/CALL regexes can
@@ -676,6 +681,7 @@ async fn execute_intent(
                     );
                     state.alert_queue.lock().await.push(alert);
                 }
+                resolved_prediction_ids = summary.resolved_prediction_ids;
             }
             Err(e) => {
                 // Infrastructure failure loses the resolutions AND their
@@ -691,6 +697,23 @@ async fn execute_intent(
             }
         }
     }
+
+    // Persistent cognition substrate (PN-95) — same ordering as the task
+    // path: after prediction post-processing, so resolutions are available
+    // as discharge evidence and new errors are visible to ingest.
+    super::tension_cycle::close_cycle(
+        state,
+        &root_dir,
+        super::tension_cycle::CycleOutcome {
+            cycle_id: &intent.id,
+            cycle_label: &intent.description,
+            raw_output: &result.response_text,
+            resolved_prediction_ids: &resolved_prediction_ids,
+            tool_rounds: result.tool_rounds_used,
+            started_at,
+        },
+    )
+    .await;
 
     // Handle [SCHEDULE:] markers
     for schedule_json in &parsed.schedule_requests {

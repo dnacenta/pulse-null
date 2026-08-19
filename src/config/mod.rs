@@ -34,6 +34,8 @@ pub struct Config {
     #[serde(default)]
     pub prediction: PredictionConfig,
     #[serde(default)]
+    pub tension: TensionConfig,
+    #[serde(default)]
     pub sessions: SessionConfig,
     #[serde(default)]
     pub context_buffer: crate::context_buffer::ContextBufferConfig,
@@ -667,6 +669,64 @@ impl Default for PredictionConfig {
     }
 }
 
+/// Configuration for the tension store (Persistent Cognition Substrate).
+/// See `persistent-cognition-substrate-spec.md` §5.
+///
+/// The tick period the accrual constants are quoted against is
+/// [`crate::tension::TICK_INTERVAL_MINUTES`], not a knob: accrual is
+/// integrated over wall-clock time so that a restart neither loses nor
+/// double-counts pressure, which makes the sampling period an
+/// implementation detail rather than a tuning surface.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct TensionConfig {
+    /// Enable the tension store: per-tick accrual, salience gating and
+    /// top-k thread injection into cycle prompts.
+    pub enabled: bool,
+
+    // INITIAL GUESS — calibration pending. All four constants below are
+    // unfounded until 100 cycles of data exist. Do not cite them as tuned.
+    /// Tension added per tick to a live thread.
+    pub base_rate: f64,
+    /// Hours; accrual doubles per this interval untouched.
+    pub age_weight_half: f64,
+    /// Discharge for a thread actually worked.
+    pub work_credit: f64,
+    /// Tension above which a cycle is worth spending.
+    pub cycle_threshold: f64,
+
+    /// STARVATION GUARD — run regardless below this rate.
+    ///
+    /// Without it a quiet period silently becomes a period of no cognition,
+    /// and the system looks healthy from inside because nothing is
+    /// reporting. Setting this to 0 disarms the guard and is never correct.
+    pub floor_interval_hours: u64,
+    /// Beyond this, forced triage, NOT silent eviction.
+    ///
+    /// The store admits the thread and raises a [`crate::tension::TriageDemand`]
+    /// the entity has to answer. Dropping at the cap is the defect in the
+    /// intent queue's `push()` and in the `predictions.json` prune; this is
+    /// the third store and it does not reproduce it.
+    pub max_live_threads: usize,
+    /// Threads injected into each cycle prompt, highest tension first.
+    pub top_k_injected: usize,
+}
+
+impl Default for TensionConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            base_rate: 0.05,
+            age_weight_half: 72.0,
+            work_credit: 1.0,
+            cycle_threshold: 2.0,
+            floor_interval_hours: 6,
+            max_live_threads: 40,
+            top_k_injected: 5,
+        }
+    }
+}
+
 /// Configuration for session persistence
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
@@ -1014,6 +1074,7 @@ pub mod test_support {
             pulse: PulseConfig::default(),
             graph: GraphConfig::default(),
             prediction: PredictionConfig::default(),
+            tension: TensionConfig::default(),
             sessions: SessionConfig::default(),
             context_buffer: crate::context_buffer::ContextBufferConfig::default(),
             session_health: crate::session_health::SessionHealthConfig::default(),

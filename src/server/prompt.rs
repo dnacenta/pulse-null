@@ -1457,6 +1457,7 @@ mod tests {
             pulse: PulseConfig::default(),
             graph: GraphConfig::default(),
             prediction: PredictionConfig::default(),
+            tension: TensionConfig::default(),
             sessions: SessionConfig::default(),
             context_buffer: crate::context_buffer::ContextBufferConfig::default(),
             session_health: crate::session_health::SessionHealthConfig::default(),

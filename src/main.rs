@@ -36,6 +36,7 @@ mod session_store;
 mod streaming;
 mod surrealdb_manager;
 mod task_context;
+mod tension;
 mod tool_loop;
 mod tools;
 mod tui;

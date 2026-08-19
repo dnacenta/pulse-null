@@ -121,7 +121,12 @@ pub async fn run_task_loop(
                 .await
                 .unwrap_or_default();
 
-            let decision = match resolve_task_evaluator(evaluator_type, &docs_dir) {
+            let decision = match resolve_task_evaluator(
+                evaluator_type,
+                &root_dir,
+                &docs_dir,
+                &state.config.tension,
+            ) {
                 Some(eval) => eval.evaluate(&eval_state),
                 None => {
                     tracing::warn!(
@@ -380,6 +385,13 @@ async fn execute_task(
 
     // Capture start time for accurate duration tracking in InteractionRecord
     let started_at = Utc::now();
+
+    // A cognitive cycle is starting. Recorded here, after the prompt (and
+    // with it the top-k thread selection) is assembled and before the
+    // provider call, because that is the moment the selection was actually
+    // made — recording it afterwards would measure the ordering the cycle
+    // produced rather than the one it acted on (PN-95 §3).
+    super::tension_cycle::open_cycle(state, &root_dir).await;
 
     // Execute with or without tools based on autonomy config
     let (
@@ -702,9 +714,29 @@ async fn execute_task(
     // RAW response, not clean_content: the lazy SHARE/CALL regexes can
     // swallow an embedded [RESOLVE:] span while stripping, silently
     // destroying the resolution before prediction parsing ran (SEC-013).
-    if prediction_stack.is_some() {
-        post_process_predictions(state, task, &root_dir, &response_text).await;
-    }
+    let resolved_prediction_ids = if prediction_stack.is_some() {
+        post_process_predictions(state, task, &root_dir, &response_text).await
+    } else {
+        Vec::new()
+    };
+
+    // Post-execution: the persistent cognition substrate (PN-95). Runs after
+    // prediction post-processing so that predictions resolved this cycle are
+    // available as discharge evidence and new prediction errors are visible
+    // to ingest.
+    super::tension_cycle::close_cycle(
+        state,
+        &root_dir,
+        super::tension_cycle::CycleOutcome {
+            cycle_id: &task.id,
+            cycle_label: &task.name,
+            raw_output: &response_text,
+            resolved_prediction_ids: &resolved_prediction_ids,
+            tool_rounds,
+            started_at,
+        },
+    )
+    .await;
 
     // Post-execution: extract cognitive signals and check for health changes
     if let Some(ref monitor) = state.cognitive_monitor {
@@ -942,10 +974,16 @@ async fn route_output_markers(
         if let Some(chain_json) = parsed.chain_requests.first() {
             match intent::create_chain_from_marker(chain_json) {
                 Ok(chain) => {
+                    // Both marker grammars are stripped: leaving either in
+                    // creates a replay channel where the child copies what it
+                    // was shown and re-emits discharge claims against threads
+                    // it never worked (SEC-007, PN-95).
                     let chain_prompt = chain.prompt.replace(
                         "{result}",
-                        &crate::prediction::resolve::strip_prediction_markers(
-                            &parsed.clean_content,
+                        &crate::tension::ingest::strip_thread_markers(
+                            &crate::prediction::resolve::strip_prediction_markers(
+                                &parsed.clean_content,
+                            ),
                         ),
                     );
                     let chain_intent = intent::Intent {
@@ -1083,12 +1121,17 @@ fn inject_reflection_pressure_directive(
 /// updates. The pre-LLM stack (Q-H3) remains read-only pressure input.
 ///
 /// Extracted from `execute_task` (Q-H1).
+///
+/// Returns the ids of predictions that actually transitioned to resolved, so
+/// the tension substrate can credit the threads they opened (PN-95). An
+/// empty vec on the failure path is correct: no confirmed resolution, no
+/// discharge evidence.
 async fn post_process_predictions(
     state: &Arc<AppState>,
     task: &ScheduledTask,
     root_dir: &std::path::Path,
     raw_output: &str,
-) {
+) -> Vec<String> {
     let task_id = task.id.clone();
     let timescale = super::tasks::default_timescale_for(&task.id);
     let content = raw_output.to_string();
@@ -1121,6 +1164,7 @@ async fn post_process_predictions(
                 );
                 state.alert_queue.lock().await.push(alert);
             }
+            summary.resolved_prediction_ids
         }
         Err(e) => {
             // Infrastructure failure loses the resolutions AND their skip
@@ -1128,6 +1172,7 @@ async fn post_process_predictions(
             tracing::error!("Failed to save prediction stack: {e}");
             let alert = super::alerts::alert_from_store_failure(&task.name, &e.to_string());
             state.alert_queue.lock().await.push(alert);
+            Vec::new()
         }
     }
 }

@@ -10,6 +10,7 @@ pub mod liveness;
 pub mod output;
 pub mod runner;
 pub mod tasks;
+pub mod tension_cycle;
 
 use std::path::Path;
 use std::sync::Arc;
@@ -213,9 +214,22 @@ pub async fn start(
     leases: crate::coordinator::control::SharedLeases,
     tenure_holder: String,
 ) -> Result<Vec<tokio::task::JoinHandle<()>>, crate::errors::SchedulerError> {
+    let mut handles = Vec::new();
+
+    // Layer 1 of the persistent cognition substrate. Started before the
+    // `[scheduler] enabled` check on purpose: the whole claim of the tension
+    // store is that pressure accumulates *while nothing is running*, so a
+    // paused schedule must not also pause accrual. Costs no tokens.
+    if state.config.tension.enabled {
+        let tick_state = Arc::clone(&state);
+        handles.push(tokio::spawn(async move {
+            tension_tick_loop(tick_state).await;
+        }));
+    }
+
     if !state.config.scheduler.enabled {
         tracing::info!("Scheduler disabled in config");
-        return Ok(vec![]);
+        return Ok(handles);
     }
 
     let tz: chrono_tz::Tz = state.config.scheduler.timezone.parse().map_err(|_| {
@@ -239,8 +253,6 @@ pub async fn start(
         enabled_tasks.len(),
         tz
     );
-
-    let mut handles = Vec::new();
 
     // Liveness store: one shared handle for every task loop and the
     // watchdog, so a failure streak is visible across tasks and restarts.
@@ -301,6 +313,67 @@ pub async fn start(
     }
 
     Ok(handles)
+}
+
+/// The per-tick tension update — the arithmetic layer the entity has never
+/// had (spec §1.2).
+///
+/// Between the end of one cognitive cycle and the start of the next, the
+/// entity's state currently changes only if an LLM call changes it, so every
+/// inter-cycle transition has to be paid for in tokens and in practice none
+/// happen. This loop is that missing primitive: it wakes every
+/// [`crate::tension::TICK_INTERVAL_MINUTES`], adds accrual to every live
+/// thread, and writes the store back. No provider, no prompt, no tokens.
+///
+/// It cannot discharge — [`crate::tension::TensionStore::tick`] has no
+/// negative term — so a failure here can only ever make threads louder,
+/// never quieter.
+async fn tension_tick_loop(state: Arc<AppState>) {
+    let period = std::time::Duration::from_secs(
+        u64::try_from(crate::tension::TICK_INTERVAL_MINUTES).unwrap_or(20) * 60,
+    );
+    let root_dir = state.root_dir.clone();
+    tracing::info!(
+        tick_minutes = crate::tension::TICK_INTERVAL_MINUTES,
+        "Tension tick loop started (arithmetic only, no LLM)"
+    );
+
+    let mut ticker = tokio::time::interval(period);
+    // A missed tick must not fire a burst on catch-up: accrual is already
+    // integrated over wall time, so replaying skipped ticks would
+    // double-count.
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+
+    loop {
+        ticker.tick().await;
+
+        // Isolation means "stop acting". Accrual is not an action against
+        // the world, but writing the store during an isolation window is,
+        // and the substrate is not exempt from the backstop.
+        if crate::server::isolation::is_active(&root_dir) {
+            tracing::debug!("Tension tick skipped — isolation active");
+            continue;
+        }
+
+        let result = crate::tension::store::save_delta_async(
+            root_dir.clone(),
+            state.config.tension.clone(),
+            |store| store.tick(chrono::Utc::now()),
+        )
+        .await;
+
+        match result {
+            Ok(report) if report.live_threads > 0 => tracing::debug!(
+                live_threads = report.live_threads,
+                tick_periods = report.tick_periods,
+                max_tension = report.max_tension,
+                total_tension = report.total_tension,
+                "Tension tick"
+            ),
+            Ok(_) => {}
+            Err(e) => tracing::error!("Tension tick failed to persist: {e}"),
+        }
+    }
 }
 
 /// Normalize a 6-field cron expression so that Sunday `0` becomes `7`.
