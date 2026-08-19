@@ -243,6 +243,92 @@ pub fn alert_from_store_failure(task_name: &str, error: &str) -> Alert {
     }
 }
 
+/// Create an alert reporting an outstanding tension triage demand (PN-95).
+///
+/// The live-thread cap must **surface a decision**, never drop silently —
+/// silent drop-at-cap is the defect that fossilises the intent queue and
+/// zeroes prediction resolution memory. The store admits the thread and
+/// hands the obligation to the owner through this alert.
+pub fn alert_from_tension_triage(source: &str, demand: &crate::tension::TriageDemand) -> Alert {
+    use std::fmt::Write as _;
+    let name = sanitize_alert_text(source, 80);
+    let mut content = format!(
+        "Tension store over cap after '{}': {} live threads against a cap of {}. Nothing was \
+         dropped — resolve or abandon one. Lowest-pressure candidates:",
+        name, demand.live_count, demand.cap
+    );
+    for candidate in demand.candidates.iter().take(MAX_ALERT_SKIP_ENTRIES) {
+        let line = format!(
+            "\n- {} (tension {:.2}, {:.0}h old): {}",
+            sanitize_alert_text(&candidate.id, 64),
+            candidate.tension,
+            candidate.age_hours,
+            sanitize_alert_text(&candidate.label, 120)
+        );
+        if content.len() + line.len() > MAX_ALERT_CONTENT_LEN {
+            break;
+        }
+        content.push_str(&line);
+    }
+    let _ = write!(content, "\n(raised {})", demand.raised_at.to_rfc3339());
+    Alert {
+        id: format!(
+            "alert-{}-{}",
+            slug_for_alert_id(&name),
+            &uuid::Uuid::new_v4().to_string()[..8]
+        ),
+        source_task: name,
+        content,
+        created_at: Utc::now(),
+        target_channel: None,
+    }
+}
+
+/// Create an alert reporting refused tension markers (PN-95).
+///
+/// A discharge claim that is silently ignored reads to the entity exactly
+/// like a granted one, which is how a store quietly stops meaning anything.
+pub fn alert_from_tension_rejections(
+    source: &str,
+    rejections: &[crate::tension::ingest::IngestRejection],
+) -> Alert {
+    use std::fmt::Write as _;
+    let name = sanitize_alert_text(source, 80);
+    let mut content = format!(
+        "{} tension marker(s) refused during '{}' — the threads were NOT discharged:",
+        rejections.len(),
+        name
+    );
+    let mut shown = 0usize;
+    for rejection in rejections.iter().take(MAX_ALERT_SKIP_ENTRIES) {
+        let line = format!(
+            "\n- [{}] {}: {}",
+            rejection.marker,
+            sanitize_alert_text(&rejection.thread_id, 64),
+            sanitize_alert_text(&rejection.reason, 300)
+        );
+        if content.len() + line.len() > MAX_ALERT_CONTENT_LEN {
+            break;
+        }
+        content.push_str(&line);
+        shown += 1;
+    }
+    if shown < rejections.len() {
+        let _ = write!(content, "\n…and {} more", rejections.len() - shown);
+    }
+    Alert {
+        id: format!(
+            "alert-{}-{}",
+            slug_for_alert_id(&name),
+            &uuid::Uuid::new_v4().to_string()[..8]
+        ),
+        source_task: name,
+        content,
+        created_at: Utc::now(),
+        target_channel: None,
+    }
+}
+
 /// Create an alert from [SHARE:] content produced by a scheduled task.
 pub fn alert_from_share(task_name: &str, content: &str) -> Alert {
     Alert {

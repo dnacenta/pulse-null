@@ -483,9 +483,209 @@ impl Evaluator for PostInteractionEval {
     }
 }
 
+// --- Layer 2: salience-gated cycles (PN-95) ---
+
+/// Event key under which the salience gate records its fires.
+pub const SALIENCE_EVENT_KEY: &str = "salience";
+
+/// Which clause of the salience rule carried the decision.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SalienceReason {
+    /// A thread is pressing hard enough to be worth a cognitive cycle.
+    TensionAboveThreshold,
+    /// Vigil reports declining cognitive signals.
+    VigilDeclining,
+    /// The starvation guard: too long since the last cycle.
+    FloorInterval,
+    /// No cycle has ever been recorded — the gate cannot suppress what it
+    /// has never seen run.
+    NoCycleRecorded,
+    /// Nothing is pressing, nothing is declining, and the floor has not
+    /// elapsed.
+    Suppressed,
+}
+
+impl std::fmt::Display for SalienceReason {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::TensionAboveThreshold => write!(f, "tension above threshold"),
+            Self::VigilDeclining => write!(f, "vigil signals declining"),
+            Self::FloorInterval => write!(f, "floor interval elapsed (starvation guard)"),
+            Self::NoCycleRecorded => write!(f, "no cycle recorded yet"),
+            Self::Suppressed => write!(f, "no salience"),
+        }
+    }
+}
+
+/// The salience decision, with the numbers behind it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SalienceDecision {
+    pub decision: EvalDecision,
+    pub reason: SalienceReason,
+    pub max_tension: f64,
+    pub cycle_threshold: f64,
+    pub hours_since_last_cycle: Option<f64>,
+    pub floor_interval_hours: u64,
+    pub vigil_declining: bool,
+    pub live_threads: usize,
+}
+
+impl SalienceDecision {
+    /// One-line rendering for logs.
+    #[must_use]
+    pub fn summary(&self) -> String {
+        format!(
+            "{} (max tension {:.2} vs {:.2}, {} live threads, vigil declining: {}, {} since \
+             last cycle vs {}h floor)",
+            self.reason,
+            self.max_tension,
+            self.cycle_threshold,
+            self.live_threads,
+            self.vigil_declining,
+            self.hours_since_last_cycle
+                .map_or_else(|| "never".to_string(), |h| format!("{h:.1}h")),
+            self.floor_interval_hours,
+        )
+    }
+}
+
+/// The salience rule from spec §2.2:
+///
+/// ```text
+/// run_cycle = (max_tension > cycle_threshold)
+///          || (vigil signal declining)
+///          || (hours_since_last_cycle > floor_interval)
+/// ```
+///
+/// The third clause is a **starvation guard** and is mandatory. Without it a
+/// period of low tension silently becomes a period of no cognition, and the
+/// system's health looks fine from inside because nothing is reporting —
+/// SELF #2: correctives die by starvation in exactly the quiet periods that
+/// look healthy. A `floor_interval_hours` of 0 therefore means "always
+/// fire", not "guard disabled": a misconfigured floor fails toward running,
+/// never toward silence.
+#[must_use]
+pub fn evaluate_salience(
+    store: &crate::tension::TensionStore,
+    vigil_declining: bool,
+    now: DateTime<Utc>,
+) -> SalienceDecision {
+    let max_tension = store.max_tension();
+    let cycle_threshold = store.config.cycle_threshold;
+    let floor_interval_hours = store.config.floor_interval_hours;
+    let hours_since_last_cycle = store.hours_since_last_cycle(now);
+
+    let reason = if max_tension > cycle_threshold {
+        SalienceReason::TensionAboveThreshold
+    } else if vigil_declining {
+        SalienceReason::VigilDeclining
+    } else {
+        match hours_since_last_cycle {
+            None => SalienceReason::NoCycleRecorded,
+            Some(hours) if hours > floor_interval_hours as f64 => SalienceReason::FloorInterval,
+            Some(_) => SalienceReason::Suppressed,
+        }
+    };
+
+    SalienceDecision {
+        decision: if reason == SalienceReason::Suppressed {
+            EvalDecision::Suppress
+        } else {
+            EvalDecision::Fire
+        },
+        reason,
+        max_tension,
+        cycle_threshold,
+        hours_since_last_cycle,
+        floor_interval_hours,
+        vigil_declining,
+        live_threads: store.live_count(),
+    }
+}
+
+/// Whether vigil's latest analysis reports declining cognitive signals.
+///
+/// Reads the same `analysis.json` the metacognitive prompt block reads. A
+/// missing or unreadable analysis is **not** treated as declining: the gate
+/// has two other clauses, and inventing a decline from an absent file would
+/// make the whole rule fire unconditionally and quietly retire itself.
+#[must_use]
+pub fn vigil_signal_declining(root_dir: &Path) -> bool {
+    let path = root_dir.join(".claude").join("vigil").join("analysis.json");
+    let Ok(content) = fs::read_to_string(&path) else {
+        return false;
+    };
+    let Ok(analysis) = serde_json::from_str::<serde_json::Value>(&content) else {
+        return false;
+    };
+    analysis
+        .get("declining_count")
+        .and_then(serde_json::Value::as_u64)
+        .is_some_and(|count| count > 0)
+}
+
+/// Salience gate for cognitive cycles (spec §2.2 / Layer 2).
+///
+/// v2 Phase 5a, now with a real input: the 20-minute cron keeps firing and
+/// this decides whether the cycle is worth spending.
+pub struct SalienceEval {
+    root_dir: PathBuf,
+    docs_dir: PathBuf,
+    config: crate::config::TensionConfig,
+}
+
+impl SalienceEval {
+    pub fn new(root_dir: PathBuf, docs_dir: PathBuf, config: crate::config::TensionConfig) -> Self {
+        Self {
+            root_dir,
+            docs_dir,
+            config,
+        }
+    }
+
+    /// The full decision, for callers that want the numbers as well as the
+    /// verdict.
+    #[must_use]
+    pub fn decide(&self) -> SalienceDecision {
+        let store = crate::tension::store::load(&self.root_dir, self.config.clone());
+        evaluate_salience(&store, vigil_signal_declining(&self.root_dir), Utc::now())
+    }
+}
+
+impl Evaluator for SalienceEval {
+    fn evaluate(&self, _state: &SchedulerState) -> EvalDecision {
+        let decision = self.decide();
+        match decision.decision {
+            EvalDecision::Fire => {
+                tracing::info!(reason = %decision.reason, "salience: firing — {}", decision.summary());
+            }
+            EvalDecision::Suppress => {
+                tracing::info!("salience: suppressed — {}", decision.summary());
+            }
+        }
+        decision.decision
+    }
+
+    fn record_fire(&self, state: &mut SchedulerState) {
+        // The cycle itself is recorded in the tension store by
+        // `tension_cycle::open_cycle`; this only keeps the suppression
+        // bookkeeping consistent with the other evaluators.
+        state.record_fire(SALIENCE_EVENT_KEY, &self.docs_dir);
+    }
+
+    fn event_key(&self) -> &str {
+        SALIENCE_EVENT_KEY
+    }
+}
+
 /// Resolve the evaluator for a scheduled task's evaluator type string.
 /// Returns None for unknown types (task fires without gating).
-pub fn resolve_task_evaluator(evaluator_type: &str, docs_dir: &Path) -> Option<Box<dyn Evaluator>> {
+pub fn resolve_task_evaluator(
+    evaluator_type: &str,
+    root_dir: &Path,
+    docs_dir: &Path,
+    tension: &crate::config::TensionConfig,
+) -> Option<Box<dyn Evaluator>> {
     match evaluator_type {
         "pipeline" => Some(Box::new(PipelineDocEval::new(
             "pipeline_frozen",
@@ -494,6 +694,14 @@ pub fn resolve_task_evaluator(evaluator_type: &str, docs_dir: &Path) -> Option<B
         "pipeline_conversion" => Some(Box::new(PipelineDocEval::new(
             "pipeline_conversion_low",
             docs_dir.to_path_buf(),
+        ))),
+        // A task pinned to the salience gate with the substrate switched off
+        // would be gated by a store that never accrues, i.e. permanently
+        // suppressed. Fall through to ungated instead.
+        "salience" if tension.enabled => Some(Box::new(SalienceEval::new(
+            root_dir.to_path_buf(),
+            docs_dir.to_path_buf(),
+            tension.clone(),
         ))),
         _ => None,
     }
@@ -947,20 +1155,39 @@ mod tests {
     fn resolve_task_evaluator_known_types() {
         let tmp = TempDir::new().unwrap();
         setup_docs(tmp.path());
+        let tension = crate::config::TensionConfig::default();
 
-        let pipeline = resolve_task_evaluator("pipeline", tmp.path());
+        let pipeline = resolve_task_evaluator("pipeline", tmp.path(), tmp.path(), &tension);
         assert!(pipeline.is_some());
         assert_eq!(pipeline.unwrap().event_key(), "pipeline_frozen");
 
-        let conversion = resolve_task_evaluator("pipeline_conversion", tmp.path());
+        let conversion =
+            resolve_task_evaluator("pipeline_conversion", tmp.path(), tmp.path(), &tension);
         assert!(conversion.is_some());
         assert_eq!(conversion.unwrap().event_key(), "pipeline_conversion_low");
+
+        let salience = resolve_task_evaluator("salience", tmp.path(), tmp.path(), &tension);
+        assert!(salience.is_some());
+        assert_eq!(salience.unwrap().event_key(), SALIENCE_EVENT_KEY);
     }
 
     #[test]
     fn resolve_task_evaluator_unknown_type() {
         let tmp = TempDir::new().unwrap();
-        assert!(resolve_task_evaluator("nonexistent", tmp.path()).is_none());
+        let tension = crate::config::TensionConfig::default();
+        assert!(resolve_task_evaluator("nonexistent", tmp.path(), tmp.path(), &tension).is_none());
+    }
+
+    /// Gating a task on a store that never accrues would suppress it
+    /// forever. With the substrate off, the task runs ungated instead.
+    #[test]
+    fn salience_evaluator_is_not_offered_when_the_substrate_is_off() {
+        let tmp = TempDir::new().unwrap();
+        let tension = crate::config::TensionConfig {
+            enabled: false,
+            ..crate::config::TensionConfig::default()
+        };
+        assert!(resolve_task_evaluator("salience", tmp.path(), tmp.path(), &tension).is_none());
     }
 
     // ----- check_importance_pressure tests (spec 2c gate) ----------------
@@ -1022,5 +1249,196 @@ mod tests {
     fn importance_pressure_empty_stack_returns_none() {
         let stack = PredictionStack::with_config(PredictionConfig::default());
         assert!(check_importance_pressure(&stack).is_none());
+    }
+
+    // ----- Layer 2: salience gating (PN-95 §2.2) --------------------------
+
+    use crate::config::TensionConfig;
+    use crate::tension::{TensionStore, ThreadDraft, ThreadOrigin};
+
+    fn tension_store(config: TensionConfig) -> TensionStore {
+        TensionStore::with_config(config)
+    }
+
+    fn with_thread(store: &mut TensionStore, tension: f64, now: DateTime<Utc>) {
+        store.open(
+            ThreadDraft {
+                label: format!("thread at {tension}"),
+                content: "c".to_string(),
+                origin: ThreadOrigin::UserRaised(format!("{tension}")),
+            },
+            now,
+        );
+        let last = store.threads.last_mut().expect("just opened");
+        last.tension = tension;
+    }
+
+    #[test]
+    fn salience_fires_when_a_thread_is_pressing() {
+        let now = Utc::now();
+        let mut store = tension_store(TensionConfig::default());
+        store.record_cycle(now);
+        with_thread(&mut store, 5.0, now);
+
+        let decision = evaluate_salience(&store, false, now);
+        assert_eq!(decision.decision, EvalDecision::Fire);
+        assert_eq!(decision.reason, SalienceReason::TensionAboveThreshold);
+        assert!(decision.summary().contains("5.00"));
+    }
+
+    #[test]
+    fn salience_fires_when_vigil_signals_decline() {
+        let now = Utc::now();
+        let mut store = tension_store(TensionConfig::default());
+        store.record_cycle(now);
+        with_thread(&mut store, 0.1, now);
+
+        assert_eq!(
+            evaluate_salience(&store, true, now).reason,
+            SalienceReason::VigilDeclining
+        );
+    }
+
+    /// The mandatory starvation guard: a quiet store must not become a
+    /// period of no cognition, because from inside it looks perfectly
+    /// healthy (SELF #2).
+    #[test]
+    fn salience_starvation_guard_fires_after_the_floor_interval() {
+        let now = Utc::now();
+        let config = TensionConfig {
+            floor_interval_hours: 6,
+            ..TensionConfig::default()
+        };
+        let mut store = tension_store(config);
+        with_thread(&mut store, 0.0, now);
+
+        // Just cycled, nothing pressing, vigil quiet: suppress.
+        store.record_cycle(now);
+        let quiet = evaluate_salience(&store, false, now);
+        assert_eq!(quiet.decision, EvalDecision::Suppress);
+        assert_eq!(quiet.reason, SalienceReason::Suppressed);
+
+        // Still nothing pressing, but the floor has elapsed: fire anyway.
+        let later = now + chrono::Duration::hours(7);
+        let starved = evaluate_salience(&store, false, later);
+        assert_eq!(starved.decision, EvalDecision::Fire);
+        assert_eq!(starved.reason, SalienceReason::FloorInterval);
+
+        // Exactly at the floor is not yet past it.
+        let boundary = now + chrono::Duration::hours(6);
+        assert_eq!(
+            evaluate_salience(&store, false, boundary).decision,
+            EvalDecision::Suppress
+        );
+    }
+
+    /// A misconfigured floor must fail toward running, never toward silence.
+    #[test]
+    fn salience_zero_floor_means_always_fire_not_guard_disabled() {
+        let now = Utc::now();
+        let mut store = tension_store(TensionConfig {
+            floor_interval_hours: 0,
+            ..TensionConfig::default()
+        });
+        store.record_cycle(now);
+        with_thread(&mut store, 0.0, now);
+
+        let decision = evaluate_salience(&store, false, now + chrono::Duration::minutes(1));
+        assert_eq!(decision.decision, EvalDecision::Fire);
+        assert_eq!(decision.reason, SalienceReason::FloorInterval);
+    }
+
+    #[test]
+    fn salience_fires_when_no_cycle_has_ever_run() {
+        let now = Utc::now();
+        let store = tension_store(TensionConfig::default());
+        let decision = evaluate_salience(&store, false, now);
+        assert_eq!(decision.decision, EvalDecision::Fire);
+        assert_eq!(decision.reason, SalienceReason::NoCycleRecorded);
+    }
+
+    /// An empty store suppresses only once a cycle has been recorded and the
+    /// floor has not elapsed — the gate can never suppress on no evidence.
+    #[test]
+    fn salience_suppresses_only_on_a_quiet_store_within_the_floor() {
+        let now = Utc::now();
+        let mut store = tension_store(TensionConfig::default());
+        store.record_cycle(now);
+        let decision = evaluate_salience(&store, false, now);
+        assert_eq!(decision.decision, EvalDecision::Suppress);
+        assert_eq!(decision.live_threads, 0);
+        assert_eq!(decision.max_tension, 0.0);
+    }
+
+    /// The threshold is strict: sitting exactly on it is not pressing.
+    #[test]
+    fn salience_threshold_is_strictly_greater_than() {
+        let now = Utc::now();
+        let config = TensionConfig::default();
+        let threshold = config.cycle_threshold;
+        let mut store = tension_store(config);
+        store.record_cycle(now);
+        with_thread(&mut store, threshold, now);
+        assert_eq!(
+            evaluate_salience(&store, false, now).decision,
+            EvalDecision::Suppress
+        );
+    }
+
+    #[test]
+    fn vigil_declining_reads_the_analysis_file_and_defaults_to_calm() {
+        let tmp = TempDir::new().unwrap();
+        // No analysis at all: not declining. Inventing a decline from an
+        // absent file would make the whole rule fire unconditionally.
+        assert!(!vigil_signal_declining(tmp.path()));
+
+        let vigil_dir = tmp.path().join(".claude").join("vigil");
+        fs::create_dir_all(&vigil_dir).unwrap();
+        fs::write(vigil_dir.join("analysis.json"), "not json").unwrap();
+        assert!(!vigil_signal_declining(tmp.path()));
+
+        fs::write(
+            vigil_dir.join("analysis.json"),
+            r#"{"alert_level":"Healthy","declining_count":0}"#,
+        )
+        .unwrap();
+        assert!(!vigil_signal_declining(tmp.path()));
+
+        fs::write(
+            vigil_dir.join("analysis.json"),
+            r#"{"alert_level":"Concern","declining_count":3}"#,
+        )
+        .unwrap();
+        assert!(vigil_signal_declining(tmp.path()));
+    }
+
+    /// End to end through the trait: the gate reads the store from disk.
+    #[test]
+    fn salience_eval_reads_the_store_from_disk() {
+        let tmp = TempDir::new().unwrap();
+        let now = Utc::now();
+        let config = TensionConfig::default();
+
+        crate::tension::store::save_delta(tmp.path(), config.clone(), |s| {
+            s.record_cycle(now);
+            s.open(
+                ThreadDraft {
+                    label: "loud".to_string(),
+                    content: "c".to_string(),
+                    origin: ThreadOrigin::UserRaised("d".to_string()),
+                },
+                now,
+            );
+            s.threads.last_mut().unwrap().tension = 99.0;
+        })
+        .unwrap();
+
+        let eval = SalienceEval::new(tmp.path().to_path_buf(), tmp.path().to_path_buf(), config);
+        assert_eq!(
+            eval.evaluate(&SchedulerState::default()),
+            EvalDecision::Fire
+        );
+        assert_eq!(eval.decide().reason, SalienceReason::TensionAboveThreshold);
+        assert_eq!(eval.event_key(), SALIENCE_EVENT_KEY);
     }
 }

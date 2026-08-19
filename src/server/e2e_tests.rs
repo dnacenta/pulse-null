@@ -190,6 +190,7 @@ fn test_config() -> Config {
         pulse: PulseConfig::default(),
         graph: GraphConfig::default(),
         prediction: PredictionConfig::default(),
+        tension: Default::default(),
         outreach: OutreachConfig::default(),
         sessions: SessionConfig::default(),
         context_buffer: crate::context_buffer::ContextBufferConfig::default(),

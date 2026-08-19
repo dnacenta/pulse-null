@@ -66,6 +66,12 @@ pub struct ProcessSummary {
     /// RESOLVE markers that were rejected, with reasons — callers surface
     /// these loudly (alert queue) rather than silently dropping data.
     pub skipped_resolutions: Vec<SkippedResolution>,
+    /// Ids of predictions that actually transitioned to resolved in this
+    /// pass. This is a *state transition in another store*, which is why the
+    /// tension substrate (PN-95) accepts it as non-text evidence that a
+    /// thread was worked — the entity cannot produce one by writing about a
+    /// thread, only by resolving a prediction that was genuinely pending.
+    pub resolved_prediction_ids: Vec<String>,
 }
 
 /// JSON payload inside a `[PREDICT:{...}]` marker.
@@ -360,6 +366,7 @@ pub fn process_task_output(
     // Phase 2: parse and apply resolutions. Same by-value consume pattern.
     let (resolutions, mut skipped_resolutions) = parse_resolutions(task_output);
     let resolutions_count = resolutions.len();
+    let mut resolved_prediction_ids = Vec::new();
     for parsed in resolutions {
         let ParsedResolution {
             prediction_id,
@@ -399,6 +406,7 @@ pub fn process_task_output(
                 direction = %direction,
                 "Prediction resolved"
             );
+            resolved_prediction_ids.push(prediction_id);
         } else {
             // resolve() == false was the last silent drop channel: a
             // well-formed marker against an unknown or already-resolved id
@@ -431,6 +439,7 @@ pub fn process_task_output(
     ProcessSummary {
         new_errors: stack.errors.len() - errors_before,
         skipped_resolutions,
+        resolved_prediction_ids,
     }
 }
 

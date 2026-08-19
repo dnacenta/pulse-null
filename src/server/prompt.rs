@@ -895,6 +895,23 @@ pub fn build_task_system_prompt_budgeted(
         });
     }
 
+    // --- Tier 1 (High): Tension threads (PN-95 Layer 3) ---
+    // What the entity picks up is chosen by an accumulator it cannot edit in
+    // prose, rather than by whatever survived the last fold. High rather
+    // than Low: under budget pressure this may be truncated, but dropping it
+    // outright would put selection straight back in the hands of document
+    // layout, which is the defect Layer 3 exists to remove.
+    if let Some(block) = build_tension_context(root_dir, config) {
+        let tokens = estimate_tokens(&block);
+        components.push(PromptComponent {
+            name: "tension-context",
+            content: block,
+            tokens,
+            tier: PromptTier::High,
+            cap: TENSION_CONTEXT_CAP,
+        });
+    }
+
     // --- Tier 0 (Essential): Task isolation notice + hallucination guard ---
     // Essential because dropping it is how autonomous runs start inventing
     // user turns (Layer 1b).
@@ -921,6 +938,95 @@ pub fn build_task_system_prompt_budgeted(
     });
 
     enforce_budget_and_assemble(components, budget_cfg, "task")
+}
+
+/// Token cap for the `<tension-context>` block. Wide enough for
+/// `top_k_injected` threads with their self-contained content at the
+/// sanitizer's 800-char ceiling, which is what §8 Q4 costs.
+const TENSION_CONTEXT_CAP: usize = 1_500;
+
+/// Layer 3 (spec §2.3): the top-k threads by tension, plus the §3
+/// discriminator, injected into the cycle prompt.
+///
+/// # Why this is not in the system-prompt snapshot
+///
+/// `AppState.system_prompt` is a **boot-time snapshot** — it has no writer,
+/// so anything assembled into it is frozen until the service restarts.
+/// Injecting threads there would mean the entity spent every cycle looking
+/// at whatever the store held the last time systemd restarted it, which is
+/// strictly worse than the document reading this replaces. This function is
+/// called from [`build_task_system_prompt_budgeted`], which
+/// `runner::execute_task` and `intent::execute_intent` rebuild on **every**
+/// fire, so the block is as fresh as the store.
+///
+/// Returns `None` when the substrate is off or there is nothing to say.
+fn build_tension_context(root_dir: &Path, config: &Config) -> Option<String> {
+    if !config.tension.enabled {
+        return None;
+    }
+    // Sync IO: this runs inside the spawn_blocking issued by
+    // `build_task_system_prompt_async`, same as the prediction context.
+    let store = crate::tension::store::load(root_dir, config.tension.clone());
+    let now = chrono::Utc::now();
+    let top = store.top_k(config.tension.top_k_injected);
+    let metrics = store.metrics(now);
+
+    if top.is_empty() && store.triage.is_none() {
+        return None;
+    }
+
+    use std::fmt::Write as _;
+    let mut block = String::new();
+    let _ = writeln!(
+        &mut block,
+        "<tension-context live=\"{}\" cap=\"{}\">",
+        store.live_count(),
+        config.tension.max_live_threads
+    );
+    if top.is_empty() {
+        block.push_str("No live threads.\n");
+    } else {
+        let _ = writeln!(
+            &mut block,
+            "What is pulling at you, ordered by accumulated pressure (this ordering \
+             is arithmetic, not something you wrote):"
+        );
+        for (index, thread) in top.iter().enumerate() {
+            let _ = writeln!(
+                &mut block,
+                "{}",
+                crate::tension::ingest::render_thread(thread, index + 1, now)
+            );
+        }
+    }
+
+    // §3 metrics inline in the routine payload, not in a separate report —
+    // a coverage denominator that ships separately does not get read.
+    let _ = writeln!(&mut block, "[TENSION METRICS: {}]", metrics.summary());
+
+    if let Some(demand) = &store.triage {
+        let _ = write!(
+            &mut block,
+            "[TENSION TRIAGE: {} live threads against a cap of {}. Nothing was dropped — \
+             retire one this cycle with [THREAD-RESOLVE:]. Lowest-pressure candidates:",
+            demand.live_count, demand.cap
+        );
+        for candidate in &demand.candidates {
+            let _ = write!(
+                &mut block,
+                " {} ({:.2}: {});",
+                candidate.id, candidate.tension, candidate.label
+            );
+        }
+        block.push_str("]\n");
+    }
+
+    block.push_str(
+        "Tension falls only for work with an artifact behind it — a file changed outside \
+         the journal, a prediction resolved, a tool that ran. Writing about a thread does \
+         not lower it.\n</tension-context>",
+    );
+    Some(block)
 }
 
 /// Load THOUGHT_STACK.md bounded by both line count and bytes, wrapped for the
@@ -1398,6 +1504,26 @@ pub fn build_autonomy_context(root_dir: &Path, config: &Config) -> String {
             .to_string(),
     );
 
+    // Tension marker grammar (PN-95). Documented separately from the
+    // routing markers above because these three are not routing at all —
+    // they mutate an accumulator, and two of the three are refused unless
+    // they name something outside this text.
+    if config.tension.enabled {
+        sections.push(
+            "Tension threads accumulate pressure between cycles. Three markers act on them:\n\
+            - [THREAD: {\"label\": \"short name\", \"content\": \"self-contained statement of the open thing — it must still make sense after the journal folds\", \"origin\": \"open_question|callback|adverse|user_raised\", \"ref\": \"optional source\"}] — open a thread\n\
+            - [THREAD-WORK: {\"id\": \"t-abc12345\", \"file\": \"relative/path/you/changed\"}] — claim a discharge. Instead of \"file\" you may name \"prediction\" (an id you resolved this cycle) or \"tool\" (a tool that ran this cycle).\n\
+            - [THREAD-RESOLVE: {\"id\": \"t-abc12345\", \"resolution\": \"answered|dissolved|superseded|abandoned\", \"reason\": \"...\", \"by\": \"...\"}] — retire a thread\n\n\
+            Discharge requires an artifact, not a description. A [THREAD-WORK:] or \"answered\" \
+            claim is checked against the filesystem, the prediction store and the executor's \
+            tool count, and is refused if it does not check out — writing about a thread does \
+            not lower its tension, and a thread mentioned but never worked is recorded as \
+            exactly that. \"abandoned\" and \"dissolved\" need a reason instead of an artifact; \
+            they are honest give-ups, they are kept as tombstones, and D sees them."
+                .to_string(),
+        );
+    }
+
     // Outreach marker (PN-94). Documented only when the channel is on, so the
     // entity is never told about a marker that will be discarded.
     if config.outreach.enabled {
@@ -1484,6 +1610,7 @@ mod tests {
             pulse: PulseConfig::default(),
             graph: GraphConfig::default(),
             prediction: PredictionConfig::default(),
+            tension: TensionConfig::default(),
             outreach: OutreachConfig::default(),
             sessions: SessionConfig::default(),
             context_buffer: crate::context_buffer::ContextBufferConfig::default(),
@@ -2154,5 +2281,139 @@ mod tests {
         // Token count should be reasonable (CLAUDE.md ~100 tokens + memory-curation ~100 tokens)
         assert!(result.estimated_tokens > 50);
         assert!(result.estimated_tokens < 1000);
+    }
+
+    // ----- Layer 3: tension injection (PN-95 §2.3) ------------------------
+
+    use crate::tension::{ThreadDraft, ThreadOrigin};
+
+    fn seed_tension(
+        root: &Path,
+        config: &Config,
+        apply: impl FnOnce(&mut crate::tension::TensionStore),
+    ) {
+        crate::tension::store::save_delta(root, config.tension.clone(), apply).unwrap();
+    }
+
+    #[test]
+    fn tension_context_is_absent_when_the_substrate_is_off() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = minimal_config();
+        config.tension.enabled = false;
+        assert!(build_tension_context(dir.path(), &config).is_none());
+    }
+
+    #[test]
+    fn tension_context_is_absent_when_there_is_nothing_to_say() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(build_tension_context(dir.path(), &minimal_config()).is_none());
+    }
+
+    /// The payoff: the cycle prompt receives threads ordered by an
+    /// accumulator, and carries the §3 metrics inline rather than in a
+    /// separate report.
+    #[test]
+    fn tension_context_injects_top_k_by_tension_with_metrics_inline() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = minimal_config();
+        config.tension.top_k_injected = 2;
+
+        seed_tension(dir.path(), &config, |store| {
+            let now = chrono::Utc::now();
+            for (label, tension) in [("quiet one", 0.1), ("loud one", 9.0), ("middling", 3.0)] {
+                store.open(
+                    ThreadDraft {
+                        label: label.to_string(),
+                        content: format!("self-contained content for {label}"),
+                        origin: ThreadOrigin::UserRaised(label.to_string()),
+                    },
+                    now,
+                );
+                store.threads.last_mut().unwrap().tension = tension;
+            }
+        });
+
+        let block = build_tension_context(dir.path(), &config).expect("threads exist");
+        assert!(block.starts_with("<tension-context"));
+        assert!(block.ends_with("</tension-context>"));
+        assert!(block.contains("loud one"));
+        assert!(block.contains("middling"));
+        assert!(!block.contains("quiet one"), "top_k must truncate: {block}");
+        assert!(
+            block.find("loud one") < block.find("middling"),
+            "ordering must be by tension"
+        );
+        // §8 Q4: the content travels with the thread.
+        assert!(block.contains("self-contained content for loud one"));
+        // §3 metrics inline in the routine payload.
+        assert!(block.contains("[TENSION METRICS:"));
+        assert!(block.contains("rho="));
+        assert!(block.contains("reach="));
+        // And the discharge contract is restated where the entity will read it.
+        assert!(block.contains("Writing about a thread does not lower it"));
+    }
+
+    #[test]
+    fn tension_context_surfaces_an_outstanding_triage_demand() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = minimal_config();
+        config.tension.max_live_threads = 1;
+
+        seed_tension(dir.path(), &config, |store| {
+            let now = chrono::Utc::now();
+            for label in ["one", "two"] {
+                store.open(
+                    ThreadDraft {
+                        label: label.to_string(),
+                        content: "c".to_string(),
+                        origin: ThreadOrigin::UserRaised(label.to_string()),
+                    },
+                    now,
+                );
+            }
+        });
+
+        let block = build_tension_context(dir.path(), &config).expect("threads exist");
+        assert!(block.contains("[TENSION TRIAGE:"));
+        assert!(block.contains("Nothing was dropped"));
+    }
+
+    /// The block has to reach the prompt the cycle actually runs on — the
+    /// task prompt, rebuilt per fire — and not the boot-time snapshot.
+    #[test]
+    fn task_system_prompt_carries_the_tension_block() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = minimal_config();
+        std::fs::write(dir.path().join("CLAUDE.md"), "be useful").unwrap();
+
+        seed_tension(dir.path(), &config, |store| {
+            store.open(
+                ThreadDraft {
+                    label: "prediction-store amnesia".to_string(),
+                    content: "resolved predictions are evicted at the cap".to_string(),
+                    origin: ThreadOrigin::UserRaised("d".to_string()),
+                },
+                chrono::Utc::now(),
+            );
+            store.threads.last_mut().unwrap().tension = 4.0;
+        });
+
+        let prompt = build_task_system_prompt(dir.path(), &config).unwrap();
+        assert!(prompt.contains("prediction-store amnesia"));
+        assert!(prompt.contains("[TENSION METRICS:"));
+    }
+
+    #[test]
+    fn autonomy_context_documents_the_marker_grammar_and_the_artifact_rule() {
+        let dir = tempfile::tempdir().unwrap();
+        let context = build_autonomy_context(dir.path(), &minimal_config());
+        assert!(context.contains("[THREAD:"));
+        assert!(context.contains("[THREAD-WORK:"));
+        assert!(context.contains("[THREAD-RESOLVE:"));
+        assert!(context.contains("Discharge requires an artifact, not a description"));
+
+        let mut off = minimal_config();
+        off.tension.enabled = false;
+        assert!(!build_autonomy_context(dir.path(), &off).contains("[THREAD:"));
     }
 }

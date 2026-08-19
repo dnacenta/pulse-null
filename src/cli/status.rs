@@ -56,8 +56,110 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
     println!("Status: {}", status);
 
     print_task_liveness(&config, &root_dir);
+    print_tension(&config, &root_dir);
     Ok(())
 }
+
+/// What the entity is currently carrying (spec §8 Q2, answered yes).
+///
+/// The tension store is the cheapest possible window into what is actually
+/// nagging the entity, and — unlike every journal document — it is a
+/// channel the entity cannot edit in prose. The §3 discriminator ships here
+/// too, so the question "is this accumulator doing any independent work?"
+/// is answerable from an SSH glance rather than from a report nobody opens.
+fn print_tension(config: &Config, root_dir: &std::path::Path) {
+    if !config.tension.enabled {
+        return;
+    }
+    let store = crate::tension::store::load(root_dir, config.tension.clone());
+    let now = Utc::now();
+    // Show exactly what the entity itself is shown, so D and Echo are
+    // looking at the same list rather than two differently-truncated ones.
+    let top_k = config.tension.top_k_injected;
+
+    println!();
+    println!("{}", style("Tension (live threads by pressure)").bold());
+
+    let live = store.live_count();
+    if live == 0 {
+        println!("  {}", style("no live threads").dim());
+    } else {
+        for (index, thread) in store.top_k(top_k).iter().enumerate() {
+            let line = crate::tension::ingest::render_thread(thread, index + 1, now);
+            let styled = if thread.tension >= config.tension.cycle_threshold {
+                style(line).yellow()
+            } else {
+                style(line).white()
+            };
+            println!("  {styled}");
+        }
+        if live > top_k {
+            println!("  … and {} more live", live - top_k);
+        }
+    }
+
+    // Tombstones are retained rather than deleted (§8 Q3), so show the most
+    // recent ones: an abandonment nobody ever reads is a deletion with extra
+    // bytes, and "what did the entity give up on, and why" is exactly the
+    // question this store exists to answer honestly.
+    let mut retired: Vec<_> = store.tombstones().collect();
+    retired.sort_by_key(|t| std::cmp::Reverse(t.resolved_at));
+    if !retired.is_empty() {
+        println!("  {}", style("recently retired").dim());
+        for thread in retired.iter().take(RETIRED_SHOWN) {
+            println!(
+                "  {}",
+                style(format!(
+                    "  {}",
+                    crate::tension::ingest::render_tombstone(thread)
+                ))
+                .dim()
+            );
+        }
+    }
+
+    println!(
+        "  {} live / cap {} · {} tombstoned · max tension {:.2} (cycle threshold {:.2})",
+        live,
+        config.tension.max_live_threads,
+        retired.len(),
+        store.max_tension(),
+        config.tension.cycle_threshold,
+    );
+    println!("  {}", store.metrics(now).summary());
+
+    if let Some(demand) = &store.triage {
+        println!(
+            "  {}",
+            style(format!(
+                "TRIAGE REQUIRED: {} live against a cap of {} — nothing was dropped. \
+                 Lowest-pressure candidates:",
+                demand.live_count, demand.cap,
+            ))
+            .red()
+            .bold()
+        );
+        for candidate in &demand.candidates {
+            // Read the candidate's tension live rather than from the demand
+            // snapshot: the demand may have been raised hours ago, and every
+            // untouched thread has been climbing since.
+            let current = store
+                .find(&candidate.id)
+                .map_or(candidate.tension, |t| t.tension);
+            println!(
+                "    {}",
+                style(format!(
+                    "{} (tension {:.2} now, {:.2} when raised): {}",
+                    candidate.id, current, candidate.tension, candidate.label
+                ))
+                .red()
+            );
+        }
+    }
+}
+
+/// Retired threads shown by `pulse-null status`.
+const RETIRED_SHOWN: usize = 3;
 
 /// Per-task liveness: last-success age, failure streak, staleness and
 /// flapping markers.
