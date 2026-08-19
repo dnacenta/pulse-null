@@ -148,6 +148,18 @@ pub fn stated_cost(evidence: &str) -> Option<Cost> {
         .find_map(|c| Cost::from_label(&c[1]))
 }
 
+/// Append a normalized `Cost:` line to `evidence` unless one is already there.
+///
+/// Used when a marker supplies `cost` as its own field: the gate then sees a
+/// single canonical form regardless of how the candidate was authored.
+#[must_use]
+pub fn with_cost_line(evidence: &str, cost: Cost) -> String {
+    if stated_cost(evidence).is_some() {
+        return evidence.to_string();
+    }
+    format!("{}\nCost: {cost}", evidence.trim_end())
+}
+
 // ---------------------------------------------------------------------------
 // Gate 2 — external referent
 // ---------------------------------------------------------------------------
@@ -166,8 +178,8 @@ pub enum ExternalReferent {
     PredictionId(String),
     /// A fetched source, cited by URL.
     Url(String),
-    /// A number attributed to a tool run — a digit inside a backticked span
-    /// or a `$ `-prefixed shell line.
+    /// A number attributed to a tool run — reported on the same line as the
+    /// command that produced it.
     ToolMeasurement(String),
 }
 
@@ -922,6 +934,16 @@ mod tests {
     fn missing_cost_line_is_none() {
         assert_eq!(stated_cost("no declaration anywhere"), None);
         assert_eq!(stated_cost("Cost: something unparseable"), None);
+    }
+
+    #[test]
+    fn with_cost_line_does_not_duplicate() {
+        let already = "evidence\nCost: read";
+        assert_eq!(with_cost_line(already, Cost::Decision), already);
+        assert_eq!(
+            with_cost_line("evidence", Cost::Nothing),
+            "evidence\nCost: nothing"
+        );
     }
 
     // --- the gate as a whole ---------------------------------------------

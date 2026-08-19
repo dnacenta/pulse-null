@@ -1370,7 +1370,7 @@ pub fn write_awareness_file(
 
 /// Build context block for autonomous sessions (scheduled tasks and intents).
 /// Includes: tool list, output markers, queue status, cost status.
-pub fn build_autonomy_context(root_dir: &Path, _config: &Config) -> String {
+pub fn build_autonomy_context(root_dir: &Path, config: &Config) -> String {
     let mut sections = Vec::new();
 
     // Tool documentation
@@ -1397,6 +1397,33 @@ pub fn build_autonomy_context(root_dir: &Path, _config: &Config) -> String {
         Use markers sparingly. Only share content worth surfacing. Only queue intents for genuine follow-up work."
             .to_string(),
     );
+
+    // Outreach marker (PN-94). Documented only when the channel is on, so the
+    // entity is never told about a marker that will be discarded.
+    if config.outreach.enabled {
+        sections.push(
+            "You can also raise unprompted outreach — telling the owner something you judge \
+            worth telling, without being asked:\n\
+            - [SALIENCE: {\"kind\": \"finding|development|blocking|callback\", \
+            \"headline\": \"one sentence, the actual claim\", \
+            \"evidence\": \"what makes it non-obvious\", \
+            \"cost\": \"nothing|read|decision\", \"confidence\": 0.0-1.0}]\n\n\
+            Raising it is not sending it. A mechanical gate decides, and it rejects more than \
+            it passes:\n\
+            1. The headline must not restate anything already in your journal or a previous \
+            outreach message.\n\
+            2. The evidence must cite something you did not write: a file path with a line \
+            number, a URL you fetched, the id of a prediction that resolved, or a number from \
+            a command you ran (quote the command). Prose about your own thinking is not \
+            evidence, and this check is stricter for 'development', not looser.\n\
+            3. The cost must be stated: are you asking for nothing, a read, or a decision?\n\n\
+            Kinds carry different budgets. 'blocking' means the owner's work is stalled \
+            pending his decision — it is uncapped and ignores quiet hours, so using it for \
+            anything else spends the channel's credibility. 'development' is capped at one a \
+            day. Under-using this is recoverable; over-using it is not."
+                .to_string(),
+        );
+    }
 
     // Intent queue status
     let queue = IntentQueue::load(root_dir);

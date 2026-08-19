@@ -87,6 +87,22 @@ impl SalienceKind {
             Self::Callback => "callback",
         }
     }
+
+    /// Parse a `[SALIENCE:]` marker's `kind` field.
+    ///
+    /// Returns `None` for anything unrecognised rather than defaulting: a
+    /// typo must not silently inherit `Blocking`'s uncapped, quiet-hours
+    /// overriding budget, nor dodge `Development`'s stricter gate.
+    #[must_use]
+    pub fn from_label(label: &str) -> Option<Self> {
+        match label.trim().to_ascii_lowercase().as_str() {
+            "finding" => Some(Self::Finding),
+            "development" => Some(Self::Development),
+            "blocking" => Some(Self::Blocking),
+            "callback" => Some(Self::Callback),
+            _ => None,
+        }
+    }
 }
 
 impl std::fmt::Display for SalienceKind {
@@ -327,6 +343,24 @@ mod tests {
             vec!["finding", "development", "blocking", "callback"]
         );
         assert_eq!(SalienceKind::Development.to_string(), "development");
+    }
+
+    #[test]
+    fn salience_kind_labels_round_trip() {
+        for kind in SalienceKind::ALL {
+            assert_eq!(SalienceKind::from_label(kind.as_str()), Some(kind));
+        }
+        assert_eq!(
+            SalienceKind::from_label("  DEVELOPMENT "),
+            Some(SalienceKind::Development)
+        );
+    }
+
+    #[test]
+    fn salience_kind_rejects_unknown_label() {
+        // Defaulting a typo would hand it Blocking's uncapped budget.
+        assert_eq!(SalienceKind::from_label("blockng"), None);
+        assert_eq!(SalienceKind::from_label(""), None);
     }
 
     #[test]
