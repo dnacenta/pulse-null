@@ -310,6 +310,97 @@ pub fn create_intent_from_marker(
     })
 }
 
+/// Parse a `[SALIENCE: {...}]` JSON marker into a `Salience` event (PN-94).
+///
+/// This is Phase 1's trigger, and knowingly the weak version: the entity
+/// decides when it is interesting, which is unaudited. It ships first anyway
+/// because it makes the behaviour observable, and observable behaviour is
+/// what makes Phase 2 falsifiable (spec §3).
+///
+/// Emitting the marker is not sending anything. The event goes on the bus and
+/// the listener runs the quality gate, quiet hours and the daily cap before
+/// any of it reaches D.
+///
+/// Fields: `kind` and `headline` and `evidence` are required; `confidence`
+/// (default 0.5), `thread_id` and `cost` are optional. A `cost` field is
+/// normalized onto the evidence as a `Cost:` line, so gate 3 stays a pure
+/// check on the event whatever raised it — the marker today, the tension
+/// store in Phase 2.
+///
+/// `kind` is never defaulted: a typo must not silently inherit `Blocking`'s
+/// uncapped, quiet-hours-overriding budget.
+pub fn create_salience_from_marker(
+    json_str: &str,
+) -> Result<EntityEvent, crate::errors::PulseError> {
+    let value: serde_json::Value = serde_json::from_str(json_str)?;
+
+    let kind_label = value["kind"]
+        .as_str()
+        .ok_or("Missing 'kind' in salience marker")?;
+    let kind = crate::events::SalienceKind::from_label(kind_label).ok_or_else(|| {
+        format!("Unknown salience kind '{kind_label}' (finding|development|blocking|callback)")
+    })?;
+
+    let headline = value["headline"]
+        .as_str()
+        .map(str::trim)
+        .filter(|h| !h.is_empty())
+        .ok_or("Missing 'headline' in salience marker")?
+        .to_string();
+
+    let evidence = value["evidence"]
+        .as_str()
+        .map(str::trim)
+        .filter(|e| !e.is_empty())
+        .ok_or("Missing 'evidence' in salience marker")?
+        .to_string();
+
+    let evidence = match value["cost"]
+        .as_str()
+        .and_then(crate::outreach::Cost::from_label)
+    {
+        Some(cost) => crate::outreach::with_cost_line(&evidence, cost),
+        None => evidence,
+    };
+
+    let confidence = value["confidence"].as_f64().unwrap_or(0.5).clamp(0.0, 1.0);
+    let thread_id = value["thread_id"]
+        .as_str()
+        .map(str::trim)
+        .filter(|t| !t.is_empty())
+        .map(str::to_string);
+
+    Ok(EntityEvent::Salience {
+        kind,
+        thread_id,
+        headline,
+        evidence,
+        confidence,
+    })
+}
+
+/// Raise every `[SALIENCE:]` marker in a response onto the event bus.
+///
+/// Shared by the task path and the intent path so a marker means the same
+/// thing wherever it is written. Invalid markers are warned about and
+/// dropped: a malformed candidate is not a silent one, but it is not an
+/// outreach either.
+pub fn emit_salience_markers(state: &Arc<AppState>, parsed: &output::ParsedOutput, origin: &str) {
+    for salience_json in &parsed.salience_requests {
+        match create_salience_from_marker(salience_json) {
+            Ok(event) => {
+                tracing::info!(
+                    origin,
+                    event_type = %event.event_type(),
+                    "Salience candidate raised"
+                );
+                state.event_bus.emit(event);
+            }
+            Err(e) => tracing::warn!(origin, "Invalid [SALIENCE:] marker: {e}"),
+        }
+    }
+}
+
 /// Parse a [CHAIN: {...}] JSON marker into an IntentChain.
 pub fn create_chain_from_marker(json_str: &str) -> Result<IntentChain, crate::errors::PulseError> {
     let value: serde_json::Value = serde_json::from_str(json_str)?;
@@ -736,6 +827,10 @@ async fn execute_intent(
             Err(e) => tracing::warn!("Invalid [INTENT:] marker from intent: {}", e),
         }
     }
+
+    // [SALIENCE:] — raise outreach candidates (PN-94). Nothing is sent from
+    // here: the event listener runs the gate, quiet hours and the daily cap.
+    emit_salience_markers(state, &parsed, &intent.id);
 
     // Handle [SHARE:] content
     for content in &parsed.share_content {
@@ -1431,6 +1526,89 @@ mod tests {
 
         let json = r#"{"prompt": "No description"}"#;
         assert!(create_intent_from_marker(json, IntentSource::EntityMarker).is_err());
+    }
+
+    // --- [SALIENCE:] marker (PN-94) --------------------------------------
+
+    fn salience_parts(event: &EntityEvent) -> (crate::events::SalienceKind, String, String, f64) {
+        match event {
+            EntityEvent::Salience {
+                kind,
+                headline,
+                evidence,
+                confidence,
+                ..
+            } => (*kind, headline.clone(), evidence.clone(), *confidence),
+            other => panic!("expected a Salience event, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn create_salience_from_valid_marker() {
+        let json = r#"{"kind":"finding","headline":"The listener sheds during isolation","evidence":"src/events/listener.rs:117\nCost: read","confidence":0.8,"thread_id":"t-1"}"#;
+        let event = create_salience_from_marker(json).unwrap();
+        let (kind, headline, evidence, confidence) = salience_parts(&event);
+        assert_eq!(kind, crate::events::SalienceKind::Finding);
+        assert_eq!(headline, "The listener sheds during isolation");
+        assert!(evidence.contains("listener.rs:117"));
+        assert!((confidence - 0.8).abs() < f64::EPSILON);
+        assert_eq!(event.event_type(), "salience_finding");
+    }
+
+    #[test]
+    fn salience_marker_rejects_an_unknown_kind() {
+        // Defaulting would hand a typo Blocking's uncapped budget.
+        let json = r#"{"kind":"urgent","headline":"h","evidence":"e"}"#;
+        assert!(create_salience_from_marker(json).is_err());
+
+        let json = r#"{"headline":"h","evidence":"e"}"#;
+        assert!(create_salience_from_marker(json).is_err());
+    }
+
+    #[test]
+    fn salience_marker_requires_a_headline_and_evidence() {
+        assert!(create_salience_from_marker(r#"{"kind":"finding","evidence":"e"}"#).is_err());
+        assert!(create_salience_from_marker(r#"{"kind":"finding","headline":"h"}"#).is_err());
+        assert!(
+            create_salience_from_marker(r#"{"kind":"finding","headline":"  ","evidence":"e"}"#)
+                .is_err(),
+            "whitespace is not a headline"
+        );
+    }
+
+    #[test]
+    fn salience_marker_folds_the_cost_field_onto_the_evidence() {
+        // Gate 3 checks the event, so a marker-level cost has to land there.
+        let json = r#"{"kind":"callback","headline":"h","evidence":"https://example.com/x","cost":"a decision"}"#;
+        let (_, _, evidence, _) = salience_parts(&create_salience_from_marker(json).unwrap());
+        assert!(evidence.ends_with("Cost: decision"), "{evidence}");
+        assert_eq!(
+            crate::outreach::stated_cost(&evidence),
+            Some(crate::outreach::Cost::Decision)
+        );
+    }
+
+    #[test]
+    fn salience_marker_does_not_duplicate_an_inline_cost_line() {
+        let json = r#"{"kind":"callback","headline":"h","evidence":"https://example.com/x\nCost: nothing","cost":"decision"}"#;
+        let (_, _, evidence, _) = salience_parts(&create_salience_from_marker(json).unwrap());
+        assert_eq!(evidence.matches("Cost:").count(), 1);
+        assert_eq!(
+            crate::outreach::stated_cost(&evidence),
+            Some(crate::outreach::Cost::Nothing),
+            "the inline line is the one the entity wrote in context"
+        );
+    }
+
+    #[test]
+    fn salience_marker_clamps_and_defaults_confidence() {
+        let json = r#"{"kind":"finding","headline":"h","evidence":"e"}"#;
+        let (_, _, _, confidence) = salience_parts(&create_salience_from_marker(json).unwrap());
+        assert!((confidence - 0.5).abs() < f64::EPSILON);
+
+        let json = r#"{"kind":"finding","headline":"h","evidence":"e","confidence":9.0}"#;
+        let (_, _, _, confidence) = salience_parts(&create_salience_from_marker(json).unwrap());
+        assert!((confidence - 1.0).abs() < f64::EPSILON);
     }
 
     #[test]

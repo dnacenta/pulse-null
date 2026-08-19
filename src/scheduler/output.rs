@@ -24,6 +24,8 @@ pub struct ParsedOutput {
     pub chain_requests: Vec<String>,
     /// JSON content extracted from [FARM:] markers (Stage 3 subtask farming)
     pub farm_requests: Vec<String>,
+    /// JSON content extracted from [SALIENCE:] markers (PN-94 outreach)
+    pub salience_requests: Vec<String>,
 }
 
 static SHARE_RE: LazyLock<Regex> =
@@ -114,7 +116,14 @@ pub fn parse_output(content: &str) -> ParsedOutput {
     // FARM first: its payload legitimately contains `}]`, which the simple
     // lazy regexes below would mis-slice if they ran across it.
     let (farm_requests, content_no_farm) = extract_json_markers(content, "FARM");
-    let content = content_no_farm.as_str();
+
+    // SALIENCE uses the same brace-balanced scan: its `evidence` field
+    // carries free-form text that routinely contains brackets (file paths,
+    // citations, `[SHARE:]` examples), and a lazy regex would truncate it —
+    // which would silently strip the very external referent gate 2 checks for.
+    let (salience_requests, content_no_salience) =
+        extract_json_markers(&content_no_farm, "SALIENCE");
+    let content = content_no_salience.as_str();
 
     let share_content: Vec<String> = SHARE_RE
         .captures_iter(content)
@@ -158,6 +167,7 @@ pub fn parse_output(content: &str) -> ParsedOutput {
         intent_requests,
         chain_requests,
         farm_requests,
+        salience_requests,
     }
 }
 
@@ -320,6 +330,21 @@ mod tests {
         assert!(!parsed.clean_content.contains("FARM"));
         assert!(parsed.clean_content.contains("Delegating."));
         assert!(parsed.clean_content.contains("Done."));
+    }
+
+    #[test]
+    fn salience_marker_survives_brackets_in_its_evidence() {
+        // The evidence field is where the external referent lives; a lazy
+        // regex stopping at the first `}]` would cut it off.
+        let content = r#"Thinking done. [SALIENCE: {"kind":"finding","headline":"The gate never fires","evidence":"src/outreach/mod.rs:12 shows the check [never runs] when {enabled} is false.\nCost: read","confidence":0.8}] Continuing."#;
+        let parsed = parse_output(content);
+        assert_eq!(parsed.salience_requests.len(), 1);
+        let value: serde_json::Value = serde_json::from_str(&parsed.salience_requests[0])
+            .expect("captured JSON must be complete");
+        assert!(value["evidence"].as_str().unwrap().contains("[never runs]"));
+        assert!(!parsed.clean_content.contains("SALIENCE"));
+        assert!(parsed.clean_content.contains("Thinking done."));
+        assert!(parsed.clean_content.contains("Continuing."));
     }
 
     #[test]

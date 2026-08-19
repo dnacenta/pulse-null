@@ -19,6 +19,7 @@ mod intake_audit;
 mod interaction;
 mod logbook;
 mod ollama_provider;
+mod outreach;
 mod peer;
 mod persist;
 mod pidfile;
@@ -96,6 +97,11 @@ enum Commands {
     Intent {
         #[command(subcommand)]
         action: IntentAction,
+    },
+    /// Interest-triggered outreach — caps, response rates, rejections
+    Outreach {
+        #[command(subcommand)]
+        action: OutreachAction,
     },
     /// Memory dashboard and tools
     Recall {
@@ -224,6 +230,20 @@ enum IntentAction {
     },
     /// Clear all pending intents
     Clear,
+}
+
+#[derive(Subcommand)]
+enum OutreachAction {
+    /// Show caps, response rates, and recent gate rejections
+    Status,
+    /// Record that D responded to an outreach message
+    Respond {
+        /// Outreach message ID (from `outreach status`)
+        id: String,
+        /// Optional explicit rating: useful or noise
+        #[arg(long)]
+        rating: Option<String>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -415,6 +435,16 @@ async fn main() {
                 } => cli::intent::add(description, prompt, priority).await,
                 IntentAction::Remove { id } => cli::intent::remove(id).await,
                 IntentAction::Clear => cli::intent::clear().await,
+            };
+            if let Err(e) = result {
+                eprintln!("Error: {e}");
+                std::process::exit(1);
+            }
+        }
+        Commands::Outreach { action } => {
+            let result = match action {
+                OutreachAction::Status => cli::outreach::status().await,
+                OutreachAction::Respond { id, rating } => cli::outreach::respond(id, rating).await,
             };
             if let Err(e) = result {
                 eprintln!("Error: {e}");

@@ -46,6 +46,71 @@ impl std::fmt::Display for PluginStateChange {
     }
 }
 
+/// What an unprompted outreach message is about (PN-94, spec §2.1).
+///
+/// The kinds are not cosmetic. Each carries its own threshold and daily
+/// budget because they fail in opposite directions: `Blocking` under-firing
+/// stalls work silently, so it is uncapped; `Development` over-firing is the
+/// failure that erodes the channel, so it is the tightest and the one whose
+/// external-referent check is strictest (spec §2.2, §6.1).
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum SalienceKind {
+    /// "I found something you didn't know."
+    Finding,
+    /// "I've been chewing on this and it changed shape."
+    Development,
+    /// "I need a decision from you and I'm blocked without it."
+    Blocking,
+    /// "Something I predicted about your work resolved."
+    Callback,
+}
+
+impl SalienceKind {
+    /// Every kind, in the order `outreach status` reports them.
+    pub const ALL: [Self; 4] = [
+        Self::Finding,
+        Self::Development,
+        Self::Blocking,
+        Self::Callback,
+    ];
+
+    /// Stable lowercase label used on the wire, on disk, and in log lines.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Finding => "finding",
+            Self::Development => "development",
+            Self::Blocking => "blocking",
+            Self::Callback => "callback",
+        }
+    }
+
+    /// Parse a `[SALIENCE:]` marker's `kind` field.
+    ///
+    /// Returns `None` for anything unrecognised rather than defaulting: a
+    /// typo must not silently inherit `Blocking`'s uncapped, quiet-hours
+    /// overriding budget, nor dodge `Development`'s stricter gate.
+    #[must_use]
+    pub fn from_label(label: &str) -> Option<Self> {
+        match label.trim().to_ascii_lowercase().as_str() {
+            "finding" => Some(Self::Finding),
+            "development" => Some(Self::Development),
+            "blocking" => Some(Self::Blocking),
+            "callback" => Some(Self::Callback),
+            _ => None,
+        }
+    }
+}
+
+impl std::fmt::Display for SalienceKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
 /// Internal entity events that can trigger autonomous actions.
 #[derive(Debug, Clone)]
 #[allow(dead_code)]
@@ -107,6 +172,24 @@ pub enum EntityEvent {
         triggering_prediction_id: String,
         triggering_surprise: f64,
     },
+
+    /// Emitted when the entity's own cognition produces something it judges
+    /// worth telling the owner about, unprompted (PN-94, spec §2.1).
+    ///
+    /// This is the only event in the bus that is about *content* rather than
+    /// the health of the machinery. Raising it is not the same as sending it:
+    /// every candidate goes through the outreach quality gate, quiet hours
+    /// and the per-kind daily cap before it becomes an intent.
+    Salience {
+        kind: SalienceKind,
+        /// Links to the tension store when Phase 2 supplies one.
+        thread_id: Option<String>,
+        /// One sentence — the actual claim.
+        headline: String,
+        /// What makes it non-obvious. Must carry an external referent.
+        evidence: String,
+        confidence: f64,
+    },
 }
 
 impl EntityEvent {
@@ -130,6 +213,7 @@ impl EntityEvent {
             }
             EntityEvent::ProviderError { .. } => "provider_error".into(),
             EntityEvent::PredictionPressure { .. } => "prediction_pressure".into(),
+            EntityEvent::Salience { kind, .. } => format!("salience_{kind}"),
         }
     }
 }
@@ -235,6 +319,48 @@ mod tests {
             output_tokens: 0,
         };
         assert_eq!(event.event_type(), "post_task_reflection");
+    }
+
+    #[test]
+    fn salience_event_type_is_per_kind() {
+        // The cooldown/telemetry key separates kinds, because their budgets
+        // are separate — one noisy Finding must not mask a Blocking.
+        let event = EntityEvent::Salience {
+            kind: SalienceKind::Blocking,
+            thread_id: None,
+            headline: "h".to_string(),
+            evidence: "e".to_string(),
+            confidence: 0.9,
+        };
+        assert_eq!(event.event_type(), "salience_blocking");
+    }
+
+    #[test]
+    fn salience_kind_labels_are_stable_and_distinct() {
+        let labels: Vec<&str> = SalienceKind::ALL.iter().map(|k| k.as_str()).collect();
+        assert_eq!(
+            labels,
+            vec!["finding", "development", "blocking", "callback"]
+        );
+        assert_eq!(SalienceKind::Development.to_string(), "development");
+    }
+
+    #[test]
+    fn salience_kind_labels_round_trip() {
+        for kind in SalienceKind::ALL {
+            assert_eq!(SalienceKind::from_label(kind.as_str()), Some(kind));
+        }
+        assert_eq!(
+            SalienceKind::from_label("  DEVELOPMENT "),
+            Some(SalienceKind::Development)
+        );
+    }
+
+    #[test]
+    fn salience_kind_rejects_unknown_label() {
+        // Defaulting a typo would hand it Blocking's uncapped budget.
+        assert_eq!(SalienceKind::from_label("blockng"), None);
+        assert_eq!(SalienceKind::from_label(""), None);
     }
 
     #[test]

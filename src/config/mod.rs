@@ -34,6 +34,8 @@ pub struct Config {
     #[serde(default)]
     pub prediction: PredictionConfig,
     #[serde(default)]
+    pub outreach: OutreachConfig,
+    #[serde(default)]
     pub sessions: SessionConfig,
     #[serde(default)]
     pub context_buffer: crate::context_buffer::ContextBufferConfig,
@@ -667,6 +669,76 @@ impl Default for PredictionConfig {
     }
 }
 
+/// Configuration for interest-triggered outreach (PN-94).
+///
+/// See `interest-triggered-outreach-spec.md` §5. The caps are deliberately
+/// tighter than feels necessary: under-firing this channel is recoverable,
+/// over-firing it is not — once D starts skimming past unprompted messages,
+/// no config change brings the channel back (spec §6.4).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct OutreachConfig {
+    /// Master switch. When false no salience candidate is ever admitted.
+    pub enabled: bool,
+    /// Discord channel key the outreach lands on.
+    pub channel: String,
+    /// First hour of the quiet window, in `scheduler.timezone` local time.
+    pub quiet_hours_start: u32,
+    /// First hour *after* the quiet window.
+    pub quiet_hours_end: u32,
+    /// Daily cap for `Finding`.
+    pub cap_finding: u32,
+    /// Daily cap for `Development` — the kind most likely to become slop.
+    pub cap_development: u32,
+    /// Daily cap for `Callback`.
+    pub cap_callback: u32,
+    /// Messages per kind the rolling response rate is measured over.
+    pub feedback_window: usize,
+    /// Response rate below which the daily cap is halved and D is told.
+    pub response_rate_floor: f64,
+    /// Cosine similarity at or above which a headline is a restatement.
+    pub novelty_similarity_max: f64,
+    /// Automatic `Call` routing. Stays off until the Discord channel has a
+    /// track record — an unprompted phone call has a wildly different cost
+    /// profile (spec §2.5).
+    pub allow_call_routing: bool,
+}
+
+impl OutreachConfig {
+    /// Daily cap configured for `kind`, or `None` when the kind is uncapped.
+    ///
+    /// `Blocking` is uncapped by design: its failure mode is under-firing,
+    /// which stalls D's work silently (spec §2.2).
+    #[must_use]
+    pub fn cap_for(&self, kind: crate::events::SalienceKind) -> Option<u32> {
+        use crate::events::SalienceKind;
+        match kind {
+            SalienceKind::Finding => Some(self.cap_finding),
+            SalienceKind::Development => Some(self.cap_development),
+            SalienceKind::Callback => Some(self.cap_callback),
+            SalienceKind::Blocking => None,
+        }
+    }
+}
+
+impl Default for OutreachConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            channel: "echo".to_string(),
+            quiet_hours_start: 23,
+            quiet_hours_end: 8,
+            cap_finding: 2,
+            cap_development: 1,
+            cap_callback: 2,
+            feedback_window: 20,
+            response_rate_floor: 0.3,
+            novelty_similarity_max: 0.85,
+            allow_call_routing: false,
+        }
+    }
+}
+
 /// Configuration for session persistence
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
@@ -1014,6 +1086,7 @@ pub mod test_support {
             pulse: PulseConfig::default(),
             graph: GraphConfig::default(),
             prediction: PredictionConfig::default(),
+            outreach: OutreachConfig::default(),
             sessions: SessionConfig::default(),
             context_buffer: crate::context_buffer::ContextBufferConfig::default(),
             session_health: crate::session_health::SessionHealthConfig::default(),
@@ -1022,6 +1095,52 @@ pub mod test_support {
             peers: HashMap::new(),
             plugins: HashMap::new(),
         }
+    }
+}
+
+#[cfg(test)]
+mod outreach_config_tests {
+    use super::*;
+    use crate::events::SalienceKind;
+
+    #[test]
+    fn defaults_match_the_spec() {
+        let cfg = OutreachConfig::default();
+        assert!(cfg.enabled);
+        assert_eq!(cfg.channel, "echo");
+        assert_eq!(cfg.quiet_hours_start, 23);
+        assert_eq!(cfg.quiet_hours_end, 8);
+        assert_eq!(cfg.cap_finding, 2);
+        assert_eq!(cfg.cap_development, 1);
+        assert_eq!(cfg.cap_callback, 2);
+        assert_eq!(cfg.feedback_window, 20);
+        assert!((cfg.response_rate_floor - 0.3).abs() < f64::EPSILON);
+        assert!((cfg.novelty_similarity_max - 0.85).abs() < f64::EPSILON);
+        assert!(!cfg.allow_call_routing);
+    }
+
+    #[test]
+    fn blocking_is_uncapped_every_other_kind_is_not() {
+        let cfg = OutreachConfig::default();
+        assert_eq!(cfg.cap_for(SalienceKind::Blocking), None);
+        assert_eq!(cfg.cap_for(SalienceKind::Finding), Some(2));
+        assert_eq!(cfg.cap_for(SalienceKind::Development), Some(1));
+        assert_eq!(cfg.cap_for(SalienceKind::Callback), Some(2));
+    }
+
+    #[test]
+    fn absent_section_deserializes_to_defaults() {
+        let cfg: OutreachConfig = toml::from_str("").unwrap();
+        assert_eq!(cfg.cap_development, 1);
+        assert!(!cfg.allow_call_routing);
+    }
+
+    #[test]
+    fn partial_section_keeps_unspecified_defaults() {
+        let cfg: OutreachConfig = toml::from_str("cap_development = 0\nenabled = false\n").unwrap();
+        assert_eq!(cfg.cap_development, 0);
+        assert!(!cfg.enabled);
+        assert_eq!(cfg.quiet_hours_start, 23);
     }
 }
 
