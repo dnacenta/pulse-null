@@ -99,11 +99,10 @@ fn print_kind(status: &KindStatus) {
     };
 
     let rate = match status.response_rate {
-        Some(rate) => format!("{:.0}% over {}", rate * 100.0, status.window_size),
+        Some(rate) => format!("{:.0}% over {}", rate * 100.0, status.window_filled),
         None => format!(
             "n/a ({}/{} messages — window not full)",
-            status.window_size,
-            status.window_size.max(1)
+            status.window_filled, status.window_target
         ),
     };
 

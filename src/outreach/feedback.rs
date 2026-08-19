@@ -175,7 +175,10 @@ pub struct KindStatus {
     pub effective_cap: Option<u32>,
     pub sent_today: u32,
     pub response_rate: Option<f64>,
-    pub window_size: usize,
+    /// Messages of this kind currently in the window.
+    pub window_filled: usize,
+    /// Messages the window needs before the rate is acted on.
+    pub window_target: usize,
     pub tightened: bool,
     pub announced: bool,
 }
@@ -197,7 +200,8 @@ pub fn kind_status(
         effective_cap: effective_cap(store, config, kind),
         sent_today: store.sent_today(kind, tz, now),
         response_rate: response_rate(store, kind, config.feedback_window),
-        window_size: store.recent(kind, config.feedback_window).len(),
+        window_filled: store.recent(kind, config.feedback_window).len(),
+        window_target: config.feedback_window,
         tightened: tightening.is_some(),
         announced: store.announced(kind).is_some(),
     }
@@ -415,6 +419,20 @@ mod tests {
         assert!(status.tightened);
         assert!(!status.announced, "nothing has been announced yet");
         assert_eq!(status.sent_today, 4);
-        assert_eq!(status.window_size, 4);
+        assert_eq!(status.window_filled, 4);
+        assert_eq!(status.window_target, config.feedback_window);
+    }
+
+    #[test]
+    fn status_reports_a_partly_filled_window_against_its_target() {
+        let config = config();
+        let now: DateTime<Utc> = "2026-08-02T12:00:00Z".parse().unwrap();
+        let store = store_with(SalienceKind::Finding, 1, 0);
+        let status = kind_status(&store, &config, SalienceKind::Finding, "UTC", now);
+
+        assert_eq!(status.response_rate, None);
+        assert_eq!(status.window_filled, 1);
+        assert_eq!(status.window_target, 4);
+        assert!(!status.tightened, "one silent message must not halve a cap");
     }
 }
