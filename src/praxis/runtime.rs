@@ -439,6 +439,13 @@ pub fn archive_document_by_name(
 }
 
 /// Split markdown content into a header (everything before first ##) and sections.
+///
+/// Sections are cut at `##` (entry) boundaries only. `###` sub-headings belong to
+/// the entry above them and must travel with it: cutting at `###` too lets
+/// `archive_document`'s midpoint split land *inside* an entry, sending the `##`
+/// heading (which carries the entry's identifier and its lead paragraph) to the
+/// archive while leaving its `###` children resident and parentless. That has
+/// happened at least four times in practice (c811, c817, c938, c939).
 fn split_by_headers(content: &str) -> (String, Vec<String>) {
     let mut header = String::new();
     let mut sections: Vec<String> = Vec::new();
@@ -447,9 +454,8 @@ fn split_by_headers(content: &str) -> (String, Vec<String>) {
 
     for line in content.lines() {
         let trimmed = line.trim_start();
-        if (trimmed.starts_with("## ") || trimmed.starts_with("### "))
-            && !is_structural_header(trimmed)
-        {
+        // NB: the trailing space in "## " is load-bearing — "### x" does not match it.
+        if trimmed.starts_with("## ") && !is_structural_header(trimmed) {
             if in_header {
                 in_header = false;
             } else if !current_section.is_empty() {
@@ -849,6 +855,52 @@ mod tests {
         assert_eq!(sections.len(), 2);
         assert!(sections[0].contains("Entry 1"));
         assert!(sections[1].contains("Entry 2"));
+    }
+
+    /// Regression: `###` sub-headings must not open a new section. Every fixture in
+    /// this module was flat, so the splitter's treatment of nested documents was
+    /// untested while every real journal document is nested.
+    #[test]
+    fn test_split_by_headers_keeps_subsections_with_their_entry() {
+        let content = "# Title\n\nPreamble.\n\n## Entry 1\n\nLead.\n\n### Sub A\n\nA.\n\n\
+                       ### Sub B\n\nB.\n\n## Entry 2\n\nContent 2.\n";
+        let (_, sections) = split_by_headers(content);
+        assert_eq!(sections.len(), 2, "### must not open a section");
+        assert!(sections[0].contains("Sub A"));
+        assert!(sections[0].contains("Sub B"));
+    }
+
+    /// Regression: archiving a nested document must never separate a `##` heading
+    /// from its `###` children — the failure that decapitated live entries c811,
+    /// c817, c938 and c939.
+    #[test]
+    fn test_archive_document_does_not_decapitate_entries() {
+        let dir = TempDir::new().unwrap();
+        let journal = dir.path().join("journal");
+        fs::create_dir_all(&journal).unwrap();
+        fs::create_dir_all(dir.path().join("archives/learning")).unwrap();
+
+        fs::write(
+            journal.join("LEARNING.md"),
+            "# Learning\n\nPreamble.\n\n## Topic 1\n\nLead 1.\n\n### One-a\n\nx.\n\n\
+             ### One-b\n\ny.\n\n## Topic 2\n\nLead 2.\n\n### Two-a\n\nz.\n",
+        )
+        .unwrap();
+
+        archive_document(dir.path(), "journal/LEARNING.md", "archives/learning").unwrap();
+
+        let remaining = fs::read_to_string(journal.join("LEARNING.md")).unwrap();
+        // Topic 1 left whole-or-not-at-all; its children must not outlive its heading.
+        assert!(
+            !remaining.contains("One-a"),
+            "orphaned subsection left behind"
+        );
+        assert!(
+            !remaining.contains("One-b"),
+            "orphaned subsection left behind"
+        );
+        assert!(remaining.contains("## Topic 2"));
+        assert!(remaining.contains("Two-a"));
     }
 
     #[test]
