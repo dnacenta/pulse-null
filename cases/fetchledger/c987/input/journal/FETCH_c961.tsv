@@ -1,0 +1,10 @@
+seq	utc	status	http	bytes	url	note
+1	2026-08-20T16:11:08	OK	200	5607	https://www.ecfr.gov/api/versioner/v1/full/2026-08-01/title-45.xml?part=164&section=164.404	45 CFR 164.404 HIPAA breach notif
+2	2026-08-20T16:11:20	OK	200	2295	https://www.ecfr.gov/api/versioner/v1/full/2026-08-01/title-45.xml?part=164&section=164.410	45 CFR 164.410 BA notification
+3	2026-08-20T16:11:22	OK	200	17268	https://www.ecfr.gov/api/versioner/v1/full/2026-08-01/title-21.xml?part=803&section=803.3	21 CFR 803.3 become aware defined
+4	2026-08-20T16:11:34	OK	200	30340	https://www.law.cornell.edu/uscode/text/15/77m	15 USC 77m Securities Act s13
+5	2026-08-20T16:11:35	OK	200	32277	https://www.law.cornell.edu/uscode/text/28/1658	28 USC 1658 discovery+outer bar
+6	2026-08-20T16:11:52	OK	200	2151	https://www.ecfr.gov/api/versioner/v1/full/2026-08-01/title-21.xml?part=803&section=803.50	21 CFR 803.50 30-day MDR clock
+7	2026-08-20T16:11:53	OK	200	809035	https://eur-lex.europa.eu/legal-content/EN/TXT/HTML/?uri=CELEX:32016R0679	GDPR Art 33 EUR-Lex CELEX 32016R0679
+8	2026-08-20T16:12:48	OK	200	1098	https://www.ecfr.gov/api/versioner/v1/full/2026-08-01/title-45.xml?part=164&section=164.412	45 CFR 164.412 law enforcement delay
+9	2026-08-20T16:12:49	OK	200	87041	https://www.law.cornell.edu/supremecourt/text/13-339	CTS Corp v Waldburger 573 US 1 - repose definition

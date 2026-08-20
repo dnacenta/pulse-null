@@ -1,0 +1,13 @@
+n	url	host_grade	http	outcome	note
+1	https://eur-lex.europa.eu/legal-content/EN/TXT/HTML/?uri=CELEX:32013R0952	primary	200	REACHED	Union Customs Code consolidated HTML; 1.27 MB; stripped to raw text locally, Arts. 103 and 124 read verbatim. DECLARED PRIMARY (i).
+2	https://www.gesetze-im-internet.de/ao_1977/BJNR006130976.html	primary	200	REACHED	Abgabenordnung full text (official BMJ host); 1.29 MB; ss. 47, 169, 110, 171 read verbatim in German. DECLARED PRIMARIES (ii) and (iii).
+3	https://www.gesetze-im-internet.de/englisch_ao/englisch_ao.html	primary	200	REACHED	Official English translation of the AO on the same official host; used ONLY to cross-check the German operative verbs per the frozen TRANSLATION POLICY.
+4	https://www.legifrance.gouv.fr/codes/article_lc/LEGIARTI000006450051	primary	403	NOT-REACHED	Cloudflare interstitial ("Just a moment..."), 5609 B. DECLARED PRIMARY (iv) — Code civil arts. 2219/2224/2247.
+5	https://codes.droit.org/CodV3/civil.pdf	near-primary	404	NOT-REACHED	Mirror attempt for the same Code civil articles.
+6	https://uncitral.un.org/sites/uncitral.un.org/files/media-documents/uncitral/en/limit-conv-e.pdf	primary	404	NOT-REACHED	DECLARED PRIMARY (v) — 1974 Limitation Convention, Arts. 24 and 25(1).
+7	https://uncitral.un.org/en/texts/salegoods/conventions/limitation_period	primary	404	NOT-REACHED	Landing page for the same convention; also 404.
+8	https://web.archive.org/web/2022id_/https://www.legifrance.gouv.fr/codes/section_lc/LEGITEXT000006070721/LEGISCTA000006118136/	near-primary	404	NOT-REACHED	c859 Wayback id_ fallback for primary (iv). Body returned but contained no article text.
+9	https://www.fedlex.admin.ch/eli/cc/27/317_321_377/de	primary	200	NOT-REACHED	OPPORTUNISTIC EXTRA (Swiss CO). HTTP 200 but the ELI page is a JavaScript shell; no statutory text in the payload. Graded NOT-REACHED, not reached-with-nothing.
+10	https://www.gesetze-im-internet.de/bgb/__214.html	primary	200	REACHED	OPPORTUNISTIC EXTRA. BGB s. 214 read verbatim. Fetched ADVERSARIALLY: to find the row most likely to contradict my FREE codings.
+11	https://www.legisquebec.gouv.qc.ca/fr/document/lc/ccq-1991	primary	403	NOT-REACHED	OPPORTUNISTIC EXTRA (Civil Code of Quebec, art. 2878 companion shape).
+12	https://www.legis.la.gov/legis/Law.aspx?d=110635	primary	200	NOT-REACHED	OPPORTUNISTIC EXTRA (Louisiana Civil Code prescription). HTTP 200 but the document id was wrong; payload contained no article text. CAP 12/12 SPENT — BOUND. No further fetch attempted.

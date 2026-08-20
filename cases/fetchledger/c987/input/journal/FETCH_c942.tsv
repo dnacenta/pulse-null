@@ -1,0 +1,16 @@
+#	probe	url	status	bytes	note
+1	WebFetch	https://supreme.justia.com/cases/federal/us/397/532/	403	-	blocked to WebFetch UA
+2	curl	https://tile.loc.gov/storage-services/service/ll/usrep/usrep397/usrep397532/usrep397532.pdf	200	642293	American Farm Lines v. Black Ball, 397 U.S. 532 (1970) — PRIMARY
+3	curl	https://tile.loc.gov/storage-services/service/ll/usrep/usrep440/usrep440741/usrep440741.pdf	200	980996	United States v. Caceres, 440 U.S. 741 (1979) — PRIMARY
+4	curl	https://tile.loc.gov/storage-services/service/ll/usrep/usrep415/usrep415199/usrep415199.pdf	200	1226510	Morton v. Ruiz, 415 U.S. 199 (1974) — PRIMARY
+5	curl	https://tile.loc.gov/storage-services/service/ll/usrep/usrep450/usrep450785/usrep450785.pdf	200	359658	Schweiker v. Hansen, 450 U.S. 785 (1981) — PRIMARY
+6	curl	https://www.courtlistener.com/api/rest/v3/search/?q=%22American+Farm+Lines%22+%22Accardi%22	403	70	"Anonymous users don't have permission to access the API."
+7	curl	https://supreme.justia.com/cases/federal/us/397/532/	403	5526	blocked to curl UA also
+8	curl	https://www.courtlistener.com/?q=%22American+Farm+Lines%22&type=o	403	919	HTML search blocked
+9	curl	https://caselaw.findlaw.com/court/us-dc-circuit/1301049.html	403	5548	blocked
+10	curl	https://law.resource.org/pub/us/case/reporter/F3/314/314.F3d.633.html	404	118538	wrong filename convention (docket suffix required)
+11	curl	https://law.resource.org/pub/us/case/reporter/F3/318/318.F3d.242.html	404	118538	same
+12	curl	https://law.resource.org/pub/us/case/reporter/F3/314/	200	145407	volume index — revealed convention <vol>.F3d.<page>.<docket>.html
+13	curl	https://law.resource.org/pub/us/case/reporter/F3/314/314.F3d.633.01-1331.html	200	27550	Steenholdt v. FAA, 314 F.3d 633 (D.C. Cir. 2003) — PRIMARY, MODERN. Probe 13 authorised by AMENDMENT 1 to prereg-c942.md, written before the fetch.
+#	SUMMARY	5 primary texts obtained (4 US Reports, 1 F.3d); 6x403 + 2x404 recorded.
+#	UNCHECKED	Shepardizing/citator: no free citator reachable (CourtListener API 403). "Has AFL been overruled" is answered only by what the reached texts say, not by a negative-citation search. Post-2003 circuit law: UNCHECKED, not silent.

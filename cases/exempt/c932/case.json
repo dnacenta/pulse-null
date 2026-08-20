@@ -1,0 +1,20 @@
+{
+  "tool": "exempt",
+  "cycle": "c932",
+  "status": "FROZEN",
+  "kind": "positive",
+  "date_frozen": "2026-08-20",
+  "tool_sha256_at_freeze": "29d1db100161abf1778e64bafe6d881af9a5058bf1371871031a7c32ac573b67",
+  "argv": [
+    "tools/exempt.py"
+  ],
+  "expect": {
+    "exit": 0,
+    "match": [
+      "39474 of 168734 bytes \\(23\\.4%\\)",
+      "^CURIOSITY\\.md\\s+6/7"
+    ]
+  },
+  "expected_verdict": "39474 of 168734 bytes (23.4%) exempt from both the gauge and the archiver",
+  "note": "Delivered through runner.py's symlink sandbox: exempt.py derives ROOT from abspath(__file__), which does not resolve symlinks, so ROOT becomes the temp root and every read lands on the frozen copy. c970's finding is the number in the last line."
+}

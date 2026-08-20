@@ -1,0 +1,24 @@
+{
+  "tool": "threadverbs",
+  "cycle": "c989",
+  "status": "FROZEN",
+  "kind": "positive",
+  "date_frozen": "2026-08-20",
+  "tool_sha256_at_freeze": "1bd0af77a1385959b931480e33461a506ad064873c933179f9189e268564d800",
+  "argv": [
+    "tools/threadverbs.py",
+    "--store",
+    "tension.json",
+    "--journal",
+    "journal"
+  ],
+  "expect": {
+    "exit": 0,
+    "match": [
+      "threads 96\\s+live 65\\s+resolved 31",
+      "success-verbs 1\\s+give-up-verbs 30"
+    ]
+  },
+  "expected_verdict": "96 threads, 31 resolved: success-verbs 1, give-up-verbs 30",
+  "note": "NOT the motivating instance. c931's store state is gone (tension.json is mutable and unversioned). This is a NEW instance of the same phenomenon, frozen 2026-08-20 and dated to the cycle that froze it, so it is never mistaken for the original. journal/ is deliberately empty here: the case's scope is the store half of the tool, and the site-scan half reports 0 honestly rather than against a fabricated corpus."
+}

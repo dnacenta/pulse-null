@@ -1,0 +1,25 @@
+{
+  "tool": "countercmp",
+  "cycle": "c976",
+  "status": "FROZEN",
+  "kind": "positive",
+  "date_frozen": "2026-08-20",
+  "tool_sha256_at_freeze": "8977fe17847c5167b326559dd6154640f5ce878b85d52ecb3894d4cde13f73a2",
+  "argv": [
+    "tools/countercmp.py",
+    "journal/LEARNING.md",
+    "journal/THOUGHTS.md",
+    "journal/CURIOSITY.md",
+    "journal/REFLECTIONS.md",
+    "journal/PRAXIS.md"
+  ],
+  "expect": {
+    "exit": 0,
+    "match": [
+      "5/5 documents: the parser-side counter \\(B\\) reads exactly ZERO",
+      "^CURIOSITY\\.md\\s+7\\s+6\\s+0\\s+6"
+    ]
+  },
+  "expected_verdict": "5/5 docs: parser-side counter B reads exactly ZERO; A reads 6/8/6/11/9",
+  "note": "The five pipeline documents as they stood when c976 found that scan_* returns 0 on every one of them while count_entries returns 6/8/6/11/9. Unrepaired in the runtime at freeze time: if the Rust is fixed, this python reimplementation still holds the instance, and the case will keep passing \u2014 it pins the DETECTOR, not the defect."
+}

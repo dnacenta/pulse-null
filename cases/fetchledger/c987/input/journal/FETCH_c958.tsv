@@ -1,0 +1,11 @@
+seq	utc	status	http	bytes	url	note
+1	2026-08-20T15:11:07	OK	200	60442	https://www.law.cornell.edu/rules/frcp/rule_56	FRCP 56 record-citation duty + 56(e) consequence
+2	2026-08-20T15:11:34	OK	200	22066	https://www.ecfr.gov/api/renderer/v1/content/enhanced/current/title-37?part=1&section=1.104	37 CFR 1.104(c)(2) pertinence duty on examiner
+3	2026-08-20T15:12:04	OK	200	75488	https://www.uspto.gov/web/offices/pac/mpep/s2142.html	MPEP 2142 prima facie burden = consequence for unexplained pertinence
+4	2026-08-20T15:12:05	OK	200	158840	https://training.cochrane.org/handbook/current/chapter-08	Cochrane Handbook ch8 RoB2 support for judgement - quotation mandatory?
+5	2026-08-20T15:13:21	OK	200	46317	https://www.law.cornell.edu/rules/frap/rule_28	FRAP 28(a)(8)(A) contention+citation must-pair; 28(f) verbatim setout
+6	2026-08-20T15:13:22	OK	200	18792	https://community.cochrane.org/mecir-manual	MECIR conduct standards - is the RoB justification mandatory at editorial gate?
+7	2026-08-20T15:14:21	OK	200	363701	https://en.wikipedia.org/wiki/Wikipedia:Verifiability	WP:Verifiability - directly supports + removal remedy, third lineage
+8	2026-08-20T15:14:22	OK	200	23819	https://www.law.cornell.edu/citation/	LII Basic Legal Citation TOC - is the explanatory parenthetical a rule?
+9	2026-08-20T15:14:57	OK	200	23819	https://www.law.cornell.edu/citation/basic_legal_citation.pdf	Martin, Basic Legal Citation full PDF - signals/parentheticals, who sets norms
+10	2026-08-20T15:15:30	OK	200	78773	https://www.ecfr.gov/api/renderer/v1/content/enhanced/current/title-17?part=232&section=232.405	DISCONFIRMER for P5: 17 CFR 232.405 XBRL - machine-checkable claim-adjacency, automatic consequence

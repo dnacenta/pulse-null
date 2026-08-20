@@ -1,0 +1,8 @@
+seq	utc	status	http	bytes	url	note
+1	2026-08-20T09:32:47	OK	200	290820	http://www.stat.columbia.edu/~gelman/research/published/multiverse_published.pdf	P1/P3/P4 primary: Steegen multiverse, authors' own copy
+2	2026-08-20T09:33:52	OK	200	294348	https://www.nature.com/articles/s41562-020-0912-z	P1/P3/P4 primary: Simonsohn spec curve NHB 2020
+3	2026-08-20T09:33:53	OK	200	209792	https://pmc.ncbi.nlm.nih.gov/articles/PMC4555355/	P1/P4 primary: Patel vibration of effects JCE 2015, PMC
+4	2026-08-20T09:34:20	OK	200	1492608	https://urisohn.com/sohn_files/wp/wordpress/wp-content/uploads/specification-curve-published-hand-corrected.pdf	P3 primary: Simonsohn spec curve, author's hand-corrected published PDF (paywall bypass of same text)
+5	2026-08-20T09:35:51	OK	200	3521106	https://psicostat.github.io/4ms-winter-school/papers/Del%20Giudice%20and%20Gangestad%202021%20-%20A%20traveler%E2%80%99s%20guide%20to%20the%20multiverse,%20pitfalls,%20and%20a%20framework%20for%20the%20evaluation%20of%20analytic%20decisions.pdf	P5 critique primary: Del Giudice & Gangestad 2021 AMPPS traveler's guide
+6	2026-08-20T09:36:59	OK	200	605011	https://arxiv.org/html/2605.01579v1	P2/P4 test: Minimum Specification Perturbation arXiv 2605.01579 - candidate estimand/spec-curve join AND named robustness criterion
+7	2026-08-20T09:37:40	OK	200	157658	https://pmc.ncbi.nlm.nih.gov/articles/PMC12875576/	P2 absence test: recent multiverse review (Visualizing vastness, PMC12875576) - would a join to estimand framework show here

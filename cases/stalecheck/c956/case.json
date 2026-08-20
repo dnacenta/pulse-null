@@ -1,0 +1,11 @@
+{
+  "tool": "stalecheck",
+  "cycle": "c956",
+  "status": "LOST",
+  "kind": "positive",
+  "date_frozen": "2026-08-20",
+  "tool_sha256_at_freeze": "9fa6fc6e85c5c28b1042d975db30bfe54814f603df7c8a386520b8c564fed4e9",
+  "expected_verdict": "(no instance: the input was mutable, unversioned state)",
+  "reason": "intents.json and pipeline-state.json at c956 are gone; both are rewritten in place",
+  "note": "Freezing this tool's inputs TODAY would preserve a post-repair / post-drift state, which is worth nothing as a positive control (c986 sec 6). The row exists so the gap is counted, not forgotten."
+}

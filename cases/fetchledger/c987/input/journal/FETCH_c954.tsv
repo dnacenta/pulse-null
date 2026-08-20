@@ -1,0 +1,10 @@
+seq	utc	status	http	bytes	url	note
+1	2026-08-20T11:47:34	OK	200	517406	https://www.ncsc.gov.uk/files/cyber-essentials-requirements-for-it-infrastructure-v3-2.pdf	UK NCSC/IASME Cyber Essentials Requirements for IT Infrastructure v3.2 - non-US, non-healthcare, certification-body enforcer
+2	2026-08-20T11:47:39	OK	200	62714	https://www.acsac.org/2006/papers/77.pdf	Rostad & Edsberg ACSAC 2006 - empirical exception-based access rate with denominator (P5)
+3	2026-08-20T11:47:40	FAIL	403	78161	https://docs-prv.pcisecuritystandards.org/PCI%20DSS/Standard/PCI-DSS-v4_0_1.pdf	PCI DSS v4.0.1 - QSA/assessor-enforced, contractual, non-healthcare
+4	2026-08-20T11:47:56	FAIL	403	78125	https://web.archive.org/web/2024id_/https://docs-prv.pcisecuritystandards.org/PCI%20DSS/Standard/PCI-DSS-v4_0_1.pdf	PCI DSS v4.0.1 retry via wayback id_ (c857 ops recovery for 403 hosts)
+5	2026-08-20T11:48:59	OK	200	374173	https://www.nerc.com/pa/Stand/Reliability%20Standards/CIP-004-7.pdf	NERC CIP-004-7 personnel & training - non-healthcare, ERO-enforced, CIP Exceptional Circumstances + revocation deadlines
+6	2026-08-20T11:49:00	OK	200	126596	https://www.etsi.org/deliver/etsi_en/319400_319499/319401/02.03.01_60/en_319401v020301p.pdf	ETSI EN 319 401 general policy requirements for trust service providers - EU, non-healthcare, conformity assessment body enforcer
+7	2026-08-20T11:49:58	FAIL	403	5495	https://www.iso.org/obp/ui/en/#iso:std:iso-iec:27002:ed-3:v2:en	ISO/IEC 27002:2022 OBP preview - 8.2 privileged access rights (declared in c945 prereg, never fetched; expected paywalled)
+8	2026-08-20T11:50:12	FAIL	202	0	https://eur-lex.europa.eu/legal-content/EN/TXT/PDF/?uri=CELEX:32014R0910	EU Reg 910/2014 (eIDAS) Art 20 - qualified TSP audited at least every 24 months: the scheme-level clock behind ETSI EN 319 401
+9	2026-08-20T11:50:36	FAIL	202	0	https://eur-lex.europa.eu/legal-content/EN/TXT/HTML/?uri=CELEX:32014R0910	eIDAS 910/2014 retry as HTML after the c939 202+0-byte case (empty_floor fired on seq 8) - Art 20 audit cadence

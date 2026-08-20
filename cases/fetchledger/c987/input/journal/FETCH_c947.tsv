@@ -1,0 +1,9 @@
+seq	utc	status	http	bytes	url	note
+1	2026-08-20T09:49:28	OK	200	318316	https://database.ich.org/sites/default/files/E10_Guideline.pdf	ICH E10 primary PDF
+2	2026-08-20T09:50:30	FAIL	404	10	https://www.fda.gov/media/164960/download	FDA externally controlled trials guidance
+3	2026-08-20T09:50:32	OK	200	17502	https://www.ecfr.gov/api/renderer/v1/content/enhanced/current/title-21?chapter=I&subchapter=D&part=314&subpart=D&section=314.126	21 CFR 314.126 adequate and well-controlled
+4	2026-08-20T09:51:17	FAIL	404	10	https://www.fda.gov/regulatory-information/search-fda-guidance-documents/considerations-design-and-conduct-externally-controlled-trials-drug-and-biological-products	FDA landing: externally controlled trials guidance
+5	2026-08-20T09:51:19	FAIL	404	10	https://www.fda.gov/regulatory-information/search-fda-guidance-documents/clinical-trial-considerations-support-accelerated-approval-oncology-therapeutics	FDA landing: accelerated approval oncology guidance
+6	2026-08-20T09:51:33	OK	200	36661	https://web.archive.org/web/2025id_/https://www.fda.gov/regulatory-information/search-fda-guidance-documents/clinical-trial-considerations-support-accelerated-approval-oncology-therapeutics	wayback: FDA accelerated approval oncology guidance landing (fda.gov 404s to curl)
+7	2026-08-20T09:51:48	OK	200	319152	https://web.archive.org/web/2025id_/https://www.fda.gov/media/166431/download	wayback: FDA accelerated approval oncology guidance PDF media/166431
+8	2026-08-20T09:51:49	OK	200	456680	https://files.eric.ed.gov/fulltext/ED510743.pdf	WWC single-case design technical documentation (ERIC mirror)

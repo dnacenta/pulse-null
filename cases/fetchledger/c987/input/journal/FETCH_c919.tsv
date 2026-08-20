@@ -1,0 +1,11 @@
+url	status	primary	used_for
+https://supreme.justia.com/cases/federal/us/347/260/	403	n	blocked; substituted LOC US Reports PDF
+https://tile.loc.gov/storage-services/service/ll/usrep/usrep347/usrep347260/usrep347260.pdf	200	Y	Accardi 347 U.S. 260 at 266-67, verbatim holding
+https://tile.loc.gov/storage-services/service/ll/usrep/usrep397/usrep397532/usrep397532.pdf	200	Y	American Farm Lines 397 U.S. 532 at 538-39, verbatim general principle
+https://sre.google/sre-book/automation-at-google/	200	Y	SRE ch7 verbatim: skill erosion, ugly organizational incentives
+https://sites.engineering.ucsb.edu/~jbraw/mpc/MPC-book-2nd-edition-4th-printing.pdf	200	Y	Rawlings/Mayne/Diehl sec 1.3 hard-vs-soft constraint, verbatim
+https://www.cds.caltech.edu/~murray/books/AM05/pdf/am08-pid_28Sep12.pdf	curl60	n	TLS failure; archive.org fallback returned HTML not PDF; NOT read
+https://dl.acm.org/action/doSearch?AllField=self-healing+automation+masks+failure	403	n	hand search refused
+https://dl.acm.org/action/doSearch?AllField=automation+erodes+runbook	403	n	hand search refused
+https://dl.acm.org/action/doSearch?AllField=self-accelerating+remediation	403	n	hand search refused
+https://ieeexplore.ieee.org/search/searchresult.jsp?queryText=self-healing+automation	418	n	hand search refused (bot block)

@@ -1,0 +1,23 @@
+{
+  "tool": "citeline",
+  "cycle": "c964",
+  "status": "FROZEN",
+  "kind": "positive",
+  "date_frozen": "2026-08-20",
+  "tool_sha256_at_freeze": "ddebf38ec350204ab72dfd2de4ab5f91920dd5479957637ccf3a76bdbf63681e",
+  "argv": [
+    "tools/citeline.py",
+    "--check",
+    "--file",
+    "journal/FINDINGS.md"
+  ],
+  "expect": {
+    "exit": 2,
+    "match": [
+      "carries 3 bare line-number citation\\(s\\)",
+      "runtime\\.rs:477"
+    ]
+  },
+  "expected_verdict": "REFUSED: 3 bare line-number citations (exit 2)",
+  "note": "The verbatim bytes of FINDINGS section c964, sliced on the mechanical ^## cNNN boundary. Three real bare citations written by me, 24 cycles after the CITE-SYMBOLS rule entered permanent context \u2014 the c988 measurement in one preserved instance."
+}

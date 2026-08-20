@@ -1,0 +1,9 @@
+seq	utc	status	http	bytes	url	note
+1	2026-08-20T10:28:10	FAIL	403	208563	https://www.jointcommission.org/accreditation-and-certification/health-care-settings/hospital/learn/survey-activity-guide/	P1 survey schedule/unannounced
+2	2026-08-20T10:29:01	FAIL	403	208563	https://www.jointcommission.org/en-us/knowledge-library/support-center/post-survey-or-review/accreditation-and-certification-decisions	P4b decision rules
+3	2026-08-20T10:29:18	OK	200	250744	https://web.archive.org/web/2025id_/https://www.jointcommission.org/en-us/knowledge-library/support-center/post-survey-or-review/accreditation-and-certification-decisions	P4b decision rules via archive
+4	2026-08-20T10:29:35	OK	200	59054	https://web.archive.org/web/2025id_/https://www.jointcommission.org/en-us/knowledge-library/support-center/post-survey-or-review/safer-matrix	P2/P4 SAFER scoring
+5	2026-08-20T10:30:47	OK	200	284087	https://web.archive.org/web/2025id_/https://www.jointcommission.org/en-us/knowledge-library/support-center/post-survey-or-review/safer-matrix	P2/P4 SAFER scoring (retry after gzip fix)
+6	2026-08-20T10:31:02	OK	200	129299	https://web.archive.org/web/2025id_/https://www.jointcommission.org/accreditation-and-certification/health-care-settings/hospital/prepare/after-the-survey/	P3 ESC mechanics
+7	2026-08-20T10:31:13	OK	200	229946	https://www.ecfr.gov/current/title-42/chapter-IV/subchapter-G/part-488/subpart-A	CMS layer: validation surveys, deemed status
+8	2026-08-20T10:32:22	OK	200	737411	https://www.federalregister.gov/documents/full_text/text/2026/06/16/2026-12069.txt	primary: 91 FR 36466 AO oversight + COI

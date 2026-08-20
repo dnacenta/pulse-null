@@ -1,0 +1,11 @@
+seq	utc	status	http	bytes	url	note
+1	2026-08-20T10:50:57	FAIL	403	5649	https://www.jclinepi.com/article/S0895-4356(16)00058-5/fulltext	PRESS 2015 guideline statement, J Clin Epidemiol full text (frame-primary)
+2	2026-08-20T10:51:04	FAIL	403	5709	https://www.cadth.ca/sites/default/files/pdf/CP0015_PRESS_Update_Report_2016.pdf	CADTH PRESS 2015 full report (E&E) PDF
+3	2026-08-20T10:51:15	OK	200	1247117	https://web.archive.org/web/2019id_/https://www.cadth.ca/sites/default/files/pdf/CP0015_PRESS_Update_Report_2016.pdf	CADTH PRESS 2015 report via wayback id_ replay (c857 ops)
+4	2026-08-20T10:52:26	OK	200	3038	https://bmcmedresmethodol.biomedcentral.com/articles/10.1186/1471-2288-6-33	Sampson 2006 relative recall primary
+5	2026-08-20T10:52:27	OK	200	72758	https://www.ecfr.gov/current/title-42/section-493.1253	42 CFR 493.1253 establishment/verification of performance specifications
+6	2026-08-20T10:53:14	OK	200	265851	https://web.archive.org/web/2020id_/https://bmcmedresmethodol.biomedcentral.com/articles/10.1186/1471-2288-6-33	Sampson 2006 relative recall via wayback (BMC bot-walled)
+7	2026-08-20T10:53:15	OK	200	68758	https://www.ecfr.gov/current/title-42/section-493.1806	42 CFR 493.1806 principal sanctions — the consequence for P40
+8	2026-08-20T10:53:50	OK	200	18792	https://community.cochrane.org/mecir-manual	Cochrane MECIR manual index — Mandatory vs Highly desirable grading
+9	2026-08-20T10:53:51	OK	200	2259768	https://www.iqwig.de/methoden/general-methods_version-7-0.pdf	IQWiG General Methods v7.0 — candidate mandate for reference-set validation
+10	2026-08-20T10:54:53	OK	200	283619	https://web.archive.org/web/2023id_/https://training.cochrane.org/handbook/current/chapter-04	Cochrane Handbook ch4 (searching) via wayback — MECIR boxes, Mandatory vs Highly desirable

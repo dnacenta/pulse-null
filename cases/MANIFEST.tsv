@@ -1,0 +1,15 @@
+tool	cycle	status	date_frozen	expected_verdict	tool_sha256_at_freeze	input_bytes	case_path
+alertrate	c960	LOST	2026-08-20	(no instance: the input was mutable, unversioned state)	ad2af4637d271bd7d5736c389888da7cd564ca47522abf15019ab10b9c1309f3	0	cases/alertrate/c960
+bandsample	c803	LOST	2026-08-20	(no instance: the input was mutable, unversioned state)	01efd1ab1d736d246909ab56f998514323604a536c908cf35c8ec63e90c4d5bc	0	cases/bandsample/c803
+citefor	c958	FROZEN	2026-08-20	8 pointers, 0 carry a [for:] clause (0.0%), 5 unattributable and EXCLUDED	6fd5293523235572cbc0ec2b3db1d576828f10a5d826a334fbf3ce3ce8cc913c	53055	cases/citefor/c958
+citeline	c964	FROZEN	2026-08-20	REFUSED: 3 bare line-number citations (exit 2)	ddebf38ec350204ab72dfd2de4ab5f91920dd5479957637ccf3a76bdbf63681e	10755	cases/citeline/c964
+citeline	c977	FROZEN	2026-08-20	ok: no bare line-number citations (exit 0)	ddebf38ec350204ab72dfd2de4ab5f91920dd5479957637ccf3a76bdbf63681e	10091	cases/citeline/c977
+countercmp	c976	FROZEN	2026-08-20	5/5 docs: parser-side counter B reads exactly ZERO; A reads 6/8/6/11/9	8977fe17847c5167b326559dd6154640f5ce878b85d52ecb3894d4cde13f73a2	168734	cases/countercmp/c976
+exempt	c932	FROZEN	2026-08-20	39474 of 168734 bytes (23.4%) exempt from both the gauge and the archiver	29d1db100161abf1778e64bafe6d881af9a5058bf1371871031a7c32ac573b67	168734	cases/exempt/c932
+fetchledger	c987	FROZEN	2026-08-20	32 ledgers: 19 admitted, 13 refused (10 UNDECLARED-SCHEMA); REACHED 113/153	4fec946070595475bd4fc2fc0fd17d50331f1d92c500b59259b878267490bf39	60715	cases/fetchledger/c987
+markercheck	c750	LOST	2026-08-20	(no instance: the input was mutable, unversioned state)	2efac8f96c86e6782ef5e3ef575e0f3402aa0a0a0e59592ae7c3e837881d28c9	0	cases/markercheck/c750
+pipeflow	c943	LOST	2026-08-20	(no instance: the input was mutable, unversioned state)	85e2e2bb6a9a70966793aec74ef1af024363d79ac379a0523d21b3b562a7a109	0	cases/pipeflow/c943
+stalecheck	c956	LOST	2026-08-20	(no instance: the input was mutable, unversioned state)	9fa6fc6e85c5c28b1042d975db30bfe54814f603df7c8a386520b8c564fed4e9	0	cases/stalecheck/c956
+threadevidence	c953	LOST	2026-08-20	(no instance: the input was mutable, unversioned state)	8c2c8cbbbb32bceb008b82577ae9eef75edc3c256e3c9dfeda2c0a4d1f5ee34f	0	cases/threadevidence/c953
+threadverbs	c931	LOST	2026-08-20	(no instance: the input was mutable, unversioned state)	1bd0af77a1385959b931480e33461a506ad064873c933179f9189e268564d800	0	cases/threadverbs/c931
+threadverbs	c989	FROZEN	2026-08-20	96 threads, 31 resolved: success-verbs 1, give-up-verbs 30	1bd0af77a1385959b931480e33461a506ad064873c933179f9189e268564d800	104813	cases/threadverbs/c989

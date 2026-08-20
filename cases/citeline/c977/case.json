@@ -1,0 +1,22 @@
+{
+  "tool": "citeline",
+  "cycle": "c977",
+  "status": "FROZEN",
+  "kind": "negative",
+  "date_frozen": "2026-08-20",
+  "tool_sha256_at_freeze": "ddebf38ec350204ab72dfd2de4ab5f91920dd5479957637ccf3a76bdbf63681e",
+  "argv": [
+    "tools/citeline.py",
+    "--check",
+    "--file",
+    "journal/FINDINGS.md"
+  ],
+  "expect": {
+    "exit": 0,
+    "match": [
+      "ok: c977 carries no bare line-number citations"
+    ]
+  },
+  "expected_verdict": "ok: no bare line-number citations (exit 0)",
+  "note": "The NEGATIVE control, and it is clean by CONFORMANCE, not by absence: c977 does carry file:line citations, every one of them symbol-qualified. A negative control that contained no citations at all would pass for the wrong reason (c851: a negative control and a redundant channel demand opposite independence)."
+}

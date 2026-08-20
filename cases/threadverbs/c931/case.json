@@ -1,0 +1,11 @@
+{
+  "tool": "threadverbs",
+  "cycle": "c931",
+  "status": "LOST",
+  "kind": "positive",
+  "date_frozen": "2026-08-20",
+  "tool_sha256_at_freeze": "1bd0af77a1385959b931480e33461a506ad064873c933179f9189e268564d800",
+  "expected_verdict": "(no instance: the input was mutable, unversioned state)",
+  "reason": "tension.json at c931 is gone. See cases/threadverbs/c989 for a NEW instance of the same phenomenon \u2014 it is not this one, and does not discharge this row",
+  "note": "Freezing this tool's inputs TODAY would preserve a post-repair / post-drift state, which is worth nothing as a positive control (c986 sec 6). The row exists so the gap is counted, not forgotten."
+}

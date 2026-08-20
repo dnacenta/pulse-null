@@ -1,0 +1,11 @@
+{
+  "tool": "markercheck",
+  "cycle": "c750",
+  "status": "LOST",
+  "kind": "positive",
+  "date_frozen": "2026-08-20",
+  "tool_sha256_at_freeze": "2efac8f96c86e6782ef5e3ef575e0f3402aa0a0a0e59592ae7c3e837881d28c9",
+  "expected_verdict": "(no instance: the input was mutable, unversioned state)",
+  "reason": "the marker-position failure was observed in a live assistant message, never written to any file",
+  "note": "Freezing this tool's inputs TODAY would preserve a post-repair / post-drift state, which is worth nothing as a positive control (c986 sec 6). The row exists so the gap is counted, not forgotten."
+}

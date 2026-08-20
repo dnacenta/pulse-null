@@ -1,0 +1,12 @@
+seq	utc	status	http	bytes	url	note
+1	2026-08-20T15:42:32	OK	200	27482	https://www.law.cornell.edu/ucc/2/2-209	UCC 2-209 primary text + official comment (LII)
+2	2026-08-20T15:43:21	OK	200	29222	https://www.law.cornell.edu/ucc/1/1-303	UCC 1-303 course of performance/dealing as waiver (LII)
+3	2026-08-20T15:44:06	FAIL	000	0	https://www.legis.state.pa.us/cfdocs/legis/LI/consCheck.cfm?txtType=HTM&ttl=13&div=0&chpt=22&sctn=9&subsctn=0	13 Pa.C.S. 2209 - state enactment carrying UCC Official Comment
+4	2026-08-20T15:45:23	FAIL	000	0	https://www.legis.state.pa.us/WU01/LI/LI/CT/HTM/13/00.022.009.000..HTM	13 Pa.C.S. 2209 alt URL - UCC Official Comment attempt 2
+5	2026-08-20T15:45:24	FAIL	202	0	https://www.courtlistener.com/c/F.2d/781/1280/	Wisconsin Knife Works 781 F.2d 1280 via CourtListener citation redirect - tests whether CL HTML is reachable where its API 403d at c942
+6	2026-08-20T15:45:57	OK	200	71073	https://www.law.cornell.edu/supremecourt/text/346/100	DC v. John R. Thompson Co., 346 US 100 (1953) - federal rejection of desuetude (LII)
+7	2026-08-20T15:46:05	FAIL	403	0	https://law.justia.com/cases/west-virginia/supreme-court/1992/20456-3.html	Printz via WebFetch (curl-gate bypassed; row appended by hand to keep the cap binding) - Justia 403 to WebFetch too, same as c942
+8	2026-08-20T15:47:11	FAIL	404	118538	https://law.resource.org/pub/us/case/reporter/F2/781/781.F2d.1280.html	Wisconsin Knife Works v National Metal Crafters 781 F.2d 1280 (7th Cir 1986) - UCC 2-209(4)(5) vs no-oral-modification clause (public.resource.org)
+9	2026-08-20T15:47:40	OK	200	17483	https://code.dccouncil.gov/us/dc/council/code/sections/28:2-209	DC Official Code 28:2-209 - DC publishes UCC Official Comments as code notes; official comment attempt 3
+10	2026-08-20T15:48:29	OK	200	119734	https://www.law.cornell.edu/supremecourt/text/440/741	US v Caceres 440 US 741 (1979) - re-check c942 s3's use of it; majority holding vs Marshall dissent (LII)
+11	2026-08-20T15:48:30	OK	200	132305	https://www.law.cornell.edu/supremecourt/text/12-1315	Petrella v MGM 572 US 663 (2014) - laches built from claimant's own delay, register (4) (LII)

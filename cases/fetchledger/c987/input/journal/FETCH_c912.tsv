@@ -1,0 +1,12 @@
+n	url	result	purpose
+1	psychrights.org/.../AbstractInnacuracy(PitkinJAMA1999).pdf (WebFetch)	FAIL binary PDF	Pitkin JAMA 1999
+2	www.ncbi.nlm.nih.gov/pmc/articles/PMC5101263/ (WebFetch)	FAIL 301 host redirect	Nuijten 2016
+3	psychrights.org/.../AbstractInnacuracy(PitkinJAMA1999).pdf (curl+pdftotext)	OK full text	Pitkin JAMA 1999 - P1/P2/P3
+4	pmc.ncbi.nlm.nih.gov/articles/PMC5101263/ (WebFetch)	OK	Nuijten 2016 - direction numbers
+5	pubmed.ncbi.nlm.nih.gov/9676677/ (WebFetch)	FAIL cookie wall	Pitkin 1998 RCT
+6	link.springer.com/article/10.1186/s12874-017-0459-5 (WebFetch)	FAIL 303	scoping review
+7	pmc.ncbi.nlm.nih.gov/articles/PMC5508680/ (curl)	FAIL wrong article (endometriosis)	scoping review - recalled PMCID wrong
+8	bmcmedresmethodol.biomedcentral.com/articles/10.1186/s12874-017-0459-5 (curl)	FAIL 3 kB stub	scoping review
+9	ebi.ac.uk/europepmc REST TITLE:"Do not make clinical decisions..."	OK abstract	Vieira 2021 JCE overview-of-overviews
+10	ebi.ac.uk/europepmc REST ABSTRACT:"2.66"	OK but 0 relevant hits	chase RR 2.66 to a primary - FAILED
+11	ebi.ac.uk/europepmc REST EXT_ID:18760766	OK abstract	Alasbali 2009 AJO - the two-sided design

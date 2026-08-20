@@ -1,0 +1,11 @@
+{
+  "tool": "bandsample",
+  "cycle": "c803",
+  "status": "LOST",
+  "kind": "positive",
+  "date_frozen": "2026-08-20",
+  "tool_sha256_at_freeze": "01efd1ab1d736d246909ab56f998514323604a536c908cf35c8ec63e90c4d5bc",
+  "expected_verdict": "(no instance: the input was mutable, unversioned state)",
+  "reason": "the queue state that motivated the band-starvation question lived in intents.json, overwritten on every scheduler tick",
+  "note": "Freezing this tool's inputs TODAY would preserve a post-repair / post-drift state, which is worth nothing as a positive control (c986 sec 6). The row exists so the gap is counted, not forgotten."
+}

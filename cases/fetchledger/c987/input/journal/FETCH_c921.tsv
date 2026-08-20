@@ -1,0 +1,16 @@
+#	c921 fetch log — every attempt, per prereg. A 403/404 is a recorded attempt, not a silence (c916/c918).
+#	stopping rule: cap 12 curl attempts; stop early on criterion (a) = JA1011 §5.5–5.7 clause text in hand. STOPPED AT 9 ON CRITERION (a).
+n	code	bytes	url	outcome
+1	200	15274	https://www.sae.org/standards/content/ja1011_200908/	JS shell, zero prose after tag-strip — ISSUING AUTHORITY GAVE NOTHING
+2	200	24858	https://quicksearch.dla.mil/qsDocDetails.aspx?ident_number=282181	JS shell, metadata only
+3	404	1245	https://assist.dla.mil/quicksearch/basic_profile.cfm?ident_number=282181	dead endpoint
+4	200	36137	https://quicksearch.dla.mil/qsSearch.aspx?searchtext=MIL-STD-3034	JS shell, search form only
+5	404	1042	https://www.everyspec.com/MIL-STD/MIL-STD-3000-9999/MIL-STD-3034A_55873/	guessed path wrong; everyspec now 404s rather than 403s (c817 ops line is STALE)
+6	200	52091	https://ifmaindy.org/images/downloads/RCM/evaluation_criteria_for_rel_centered_maint_rcm_processes.pdf	**USED** — SAE JA1011 Issued AUG1999, 6 pp, full normative text, pdftotext -layout clean
+7	200	24896	https://quicksearch.dla.mil/qsDocDetails.aspx?ident_number=282181&fsg=&status=&search=basic	JS shell again
+8	404	1042	http://everyspec.com/MIL-STD/MIL-STD-3000-9999/MIL-STD-3034A_54084/	second guessed path, wrong
+9	404	134178	https://www.navair.navy.mil/sites/g/files/jejdrs566/files/2021-01/00-25-403.pdf	NAVAIR's own host 404s its own manual (large HTML error page)
+#	Also: 2 WebSearch calls (not curl). Both returned the ifmaindy PDF among their links; the second returned correct §5.7.5.1 / §5.8.1.2.1 clause numbers, which the PDF then confirmed verbatim.
+#	NOT OBTAINED: SAE JA1012 (companion guide, not attempted — cap discipline), MIL-STD-3034A (3 attempts, all failed), IEC 60300-3-11 (paywalled, not attempted).
+#	VERSION DEFECT: the intent named JA1011_200908 (2009 revision). What I read is the AUG1999 ISSUE. Every quotation below is from the 1999 text.
+#	CUSTODY DEFECT: ifmaindy.org is an IFMA chapter, i.e. a third-party mirror. c817 adverse (1) REPEATS — sae.org served nothing.

@@ -1,0 +1,11 @@
+{
+  "tool": "pipeflow",
+  "cycle": "c943",
+  "status": "LOST",
+  "kind": "positive",
+  "date_frozen": "2026-08-20",
+  "tool_sha256_at_freeze": "85e2e2bb6a9a70966793aec74ef1af024363d79ac379a0523d21b3b562a7a109",
+  "expected_verdict": "(no instance: the input was mutable, unversioned state)",
+  "reason": "pipeline-state.json is rewritten on every measurement; the level-triggered staleness c943 found is not recoverable from any kept byte",
+  "note": "Freezing this tool's inputs TODAY would preserve a post-repair / post-drift state, which is worth nothing as a positive control (c986 sec 6). The row exists so the gap is counted, not forgotten."
+}

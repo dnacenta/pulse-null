@@ -1,0 +1,6 @@
+seq	utc	status	http	bytes	url	note
+1	2026-08-20T01:54:59	OK	200	75709	https://web.archive.org/web/2020id_/https://cacm.acm.org/magazines/2018/4/226371-lessons-from-building-static-analysis-tools-at-google/fulltext	CACM 2018 fulltext via wayback id_
+2	2026-08-20T01:55:00	OK	200	143022	https://research.google/pubs/pub43322/	Tricorder ICSE-SEIP 2015 preprint
+3	2026-08-20T01:55:51	FAIL	ERR	78	https://static.googleusercontent.com/media/research.google.com/en//pubs/archive/43322.pdf	Tricorder ICSE2015 PDF
+4	2026-08-20T01:56:12	OK	200	329321	https://research.google.com/pubs/archive/43322.pdf	Tricorder ICSE2015 PDF retry (binary fix)
+5	2026-08-20T01:57:08	OK	200	70110	https://web.archive.org/web/2021id_/https://cacm.acm.org/magazines/2019/8/238344-scaling-static-analyses-at-facebook/fulltext	Facebook Infer CACM 2019 comparator via wayback

@@ -1,0 +1,23 @@
+{
+  "tool": "fetchledger",
+  "cycle": "c987",
+  "status": "FROZEN",
+  "kind": "positive",
+  "date_frozen": "2026-08-20",
+  "tool_sha256_at_freeze": "4fec946070595475bd4fc2fc0fd17d50331f1d92c500b59259b878267490bf39",
+  "argv": [
+    "tools/fetchledger.py",
+    "--dir",
+    "journal"
+  ],
+  "expect": {
+    "exit": 0,
+    "match": [
+      "FILES admitted=19 refused=13 total=32",
+      "UNDECLARED-SCHEMA=10",
+      "REACHED 113/153"
+    ]
+  },
+  "expected_verdict": "32 ledgers: 19 admitted, 13 refused (10 UNDECLARED-SCHEMA); REACHED 113/153",
+  "note": "All 32 FETCH_c*.tsv ledgers. c987's finding was that a naive cross-cycle read of these returned 0 reached of 150 \u2014 the entire zero was column-name and vocabulary drift in ledgers I wrote myself. The 13 refusals ARE that drift, preserved."
+}

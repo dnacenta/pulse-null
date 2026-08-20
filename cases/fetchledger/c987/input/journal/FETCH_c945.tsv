@@ -1,0 +1,11 @@
+seq	utc	status	http	bytes	url	note
+1	2026-08-20T09:18:50	OK	200	186586	https://www.govinfo.gov/content/pkg/CFR-2023-title45-vol2/pdf/CFR-2023-title45-vol2-sec164-312.pdf	45 CFR 164.312 technical safeguards incl emergency access procedure
+2	2026-08-20T09:18:57	OK	200	186391	https://www.govinfo.gov/content/pkg/CFR-2023-title45-vol2/pdf/CFR-2023-title45-vol2-sec164-306.pdf	45 CFR 164.306 required vs addressable modality
+3	2026-08-20T09:19:28	OK	200	195592	https://www.govinfo.gov/content/pkg/CFR-2023-title45-vol2/pdf/CFR-2023-title45-vol2-sec164-316.pdf	45 CFR 164.316 documentation + retention
+4	2026-08-20T09:19:30	OK	200	2993078	https://www.scitepress.org/Papers/2025/135270/135270.pdf	scitepress 2025 break-glass policy compliance framework - use rate
+5	2026-08-20T09:19:49	OK	200	44165	https://www.govinfo.gov/content/pkg/CFR-2023-title45-vol1/pdf/CFR-2023-title45-vol1-sec170-315.pdf	ONC 45 CFR 170.315 certification criteria incl (d)(6) emergency access
+6	2026-08-20T09:20:12	OK	200	253459	https://www.govinfo.gov/content/pkg/CFR-2023-title45-vol2/pdf/CFR-2023-title45-vol2-sec170-315.pdf	retry ONC 170.315 in title45 vol2 (vol1 URL returned a 200 HTML error page - c939 case)
+7	2026-08-20T09:20:57	OK	200	1626188	https://nvlpubs.nist.gov/nistpubs/SpecialPublications/NIST.SP.800-66r2.pdf	NIST SP 800-66r2 HIPAA Security Rule implementation guidance - what it says about emergency access
+8	2026-08-20T09:21:33	FAIL	403	467	https://www.hhs.gov/hipaa/for-professionals/compliance-enforcement/audit/protocol/index.html	HHS OCR HIPAA Audit Protocol - the enforcer's own inquiry for 164.312(a)(2)(ii)
+9	2026-08-20T09:21:41	OK	200	493093	https://web.archive.org/web/2024id_/https://www.hhs.gov/hipaa/for-professionals/compliance-enforcement/audit/protocol/index.html	OCR audit protocol via wayback id_ (c857 ops recovery for 403 hosts)
+10	2026-08-20T09:22:34	OK	200	6073678	https://nvlpubs.nist.gov/nistpubs/SpecialPublications/NIST.SP.800-53r5.pdf	NIST SP 800-53r5 - second register FAMILY (federal/FISMA, not HHS): AC-3(2) dual authorization, AU-6 audit review, AC-2 emergency accounts

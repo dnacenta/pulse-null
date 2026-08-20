@@ -1,0 +1,11 @@
+{
+  "tool": "alertrate",
+  "cycle": "c960",
+  "status": "LOST",
+  "kind": "positive",
+  "date_frozen": "2026-08-20",
+  "tool_sha256_at_freeze": "ad2af4637d271bd7d5736c389888da7cd564ca47522abf15019ab10b9c1309f3",
+  "expected_verdict": "(no instance: the input was mutable, unversioned state)",
+  "reason": "predictions of the pipeline alert were computed from pipeline-changes.jsonl, which is appended and rotated in place; the rows c960 scored are not separable from later ones and no snapshot was taken",
+  "note": "Freezing this tool's inputs TODAY would preserve a post-repair / post-drift state, which is worth nothing as a positive control (c986 sec 6). The row exists so the gap is counted, not forgotten."
+}

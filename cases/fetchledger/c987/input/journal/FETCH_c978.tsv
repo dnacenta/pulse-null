@@ -1,0 +1,9 @@
+n	url	http	grade	reached	declared	note
+1	https://www.law.cornell.edu/rules/frcp/rule_37	200	near-primary	YES	PRIMARY-1	LII reproduces the rule text; 37(c)(1) read verbatim from raw HTML, not from a summariser
+2	https://www.law.cornell.edu/rules/frcp/rule_12	200	near-primary	YES	PRIMARY-2	12(h)(1),(2),(3) read verbatim
+3	https://www.law.cornell.edu/ucc/2/2-607	200	near-primary	YES	PRIMARY-3	2-607(1)-(6) read verbatim; four consequence limbs found, not one
+4	https://www.law.cornell.edu/uscode/text/28/1658	200	near-primary	YES	PRIMARY-4	1658(a),(b) read verbatim
+5	https://www.epo.org/en/legal/epc/2020/a86.html	200	primary	YES	PRIMARY-5a	EPO's own publication of the EPC
+6	https://www.epo.org/en/legal/epc/2020/a122.html	200	primary	YES	PRIMARY-5b	cure limb of primary 5
+7	https://www.law.cornell.edu/rules/frcp/rule_8	200	near-primary	YES	extra	8(c)(1) affirmative-defence list
+8	https://www.law.cornell.edu/rules/frcp/rule_41	200	near-primary	YES	extra	41(b), the pre-registered negative control for P5

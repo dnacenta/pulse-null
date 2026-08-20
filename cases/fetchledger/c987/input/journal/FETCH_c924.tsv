@@ -1,0 +1,19 @@
+#	c924 — inference-rule audit of a behavioural proxy. Every fetch attempt, in order.
+#	Registers pre-registered in prereg-c924.md, priority order: (1) surrogate endpoints,
+#	(2) psychometric validity, (3) IR click models, (4) scientometrics.
+#	Stop rule: 3 registers at full weight. Reached. Register (4) NOT FETCHED — no claim is made
+#	about it anywhere in this cycle (c764/c870).
+n	register	url	method	result	what it gave
+1	surrogate	websearch: Prentice 1989 criteria surrogate endpoint	WebSearch	OK (secondary)	pointed to primaries; two-part correlation/capture summary
+2	psychometric	websearch: Messick construct-irrelevant variance	WebSearch	OK (secondary)	pointed to PMC4803101
+3	surrogate	https://pubmed.ncbi.nlm.nih.gov/2727467/	WebFetch	FAIL — cookie challenge	nothing; Prentice 1989 abstract not obtained directly
+4	psychometric	https://pmc.ncbi.nlm.nih.gov/articles/PMC4803101/	WebFetch	OK	Standards definition of validity; 5 sources of evidence; CIV + underrepresentation, all verbatim
+5	surrogate	https://www.nationalacademies.org/read/12869/chapter/3	WebFetch	THIN	only the 2-part correlation/capture gloss; nothing on validation samples or observers
+6	surrogate	https://arxiv.org/abs/1712.08732	WebFetch	FAIL — abstract page only	no body text
+7	surrogate	https://arxiv.org/pdf/1712.08732 (curl+pdftotext)	curl	OK 90247 B	surrogate paradox; Prentice criterion as T ⟂ Y | S; Chen 2007 / Pearl & Bareinboim 2010
+8	surrogate	https://arxiv.org/pdf/2504.15273 (curl+pdftotext)	curl	OK 144198 B	fetched, NOT USED — no claim rests on it
+9	surrogate	websearch: "Prentice criteria" criterion 4 Freedman PTE	WebSearch	OK (secondary)	pointed to the MSKCC copy
+10	surrogate	https://www.mskcc.org/.../an-initial-evaluation-of-a-surrogate-endpoint-...-2015.pdf	curl	OK 28656 B	PRIMARY-WEIGHT: the four criteria verbatim; the fallacy-of-acceptance passage; the equivalence-test fix
+11	IR	https://arxiv.org/pdf/1608.04468 (curl+pdftotext)	curl	OK 77816 B	Joachims et al., swap-intervention for propensity estimation; cost of randomization
+#	Register (3) fetched at ONE source. Weight is accordingly lower than (1) and (2); the convergence
+#	claim in FINDINGS §3 is stated as 3-register but register 3 rests on a single paper.

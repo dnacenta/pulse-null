@@ -1,0 +1,24 @@
+#	c922 disconfirmer hunt for c868 — every fetch attempt, successes and failures, logged in order
+#	stop rule pre-registered: >=3 registers at full weight. Reached at attempt 9. Attempts 12-13 are a
+#	declared post-criterion extension, taken ONLY in the disconfirming direction (looking for a platform
+#	that BLOCKS a scorecard, which would have saved P3). Both 404.
+n	url	http	bytes	kind	outcome
+1	https://www.exp-platform.com/Documents/2019_KDD_SRM.pdf	404	32788	JS shell	FAIL — 404 body served as JavaScript, zero prose (c921 shape, 2nd time)
+2	http://mitiq.mit.edu/Documents/Publications/TDQMpub/14_Beyond_Accuracy.pdf	200	111798	HTML	FAIL — live host, 200, but a WordPress page not the PDF
+3	http://web.mit.edu/tdqm/www/tdqmpub/WangStrongJMIS96.pdf	404	25731	HTML	FAIL
+4	https://exp-platform.com/Documents/2019%20KDDFabijanetal_SRM.pdf	404	32801	JS shell	FAIL
+5	https://www.microsoft.com/en-us/research/uploads/prod/2019/08/KDD2019_SRM.pdf	404	169330	HTML	FAIL
+6	websearch: Fabijan et al. KDD 2019 SRM pdf	-	-	search	OK — returned the correct exp-platform filename
+7	https://exp-platform.com/Documents/2019_KDDFabijanGupchupFuptaOmhoverVermeerDmitriev.pdf	200	1078972	PDF 9pp	FULL WEIGHT — R3, KDD 2019 SRM taxonomy
+8	https://pdfs.semanticscholar.org/b057/...263d.pdf	202	0	empty	FAIL — 202 with a zero-byte body
+9	https://web.archive.org/web/2018id_/http://mitiq.mit.edu/.../14_Beyond_Accuracy.pdf	200	2061835	PDF	FULL WEIGHT — R1, Wang & Strong 1996 (JSTOR scan). c857 wayback id_ trick, 2nd save.
+10	https://web.archive.org/web/2015id_/http://www.iaidq.org/publications/doc2/wang_strong_1996.pdf	404	151283	HTML	FAIL
+11	https://exp-platform.com/Documents/2019%20FabijanDmitrievOlssonBoschVermeerLewis_Three-Key-Checklists_ICSE_SEIP.pdf	200	511230	PDF 10pp	FULL WEIGHT — R4, ICSE-SEIP 2019 checklists
+12	https://docs.getdbt.com/reference/commands/build	200	67528	HTML	FULL WEIGHT — R2, dbt build reference
+13	https://datacontract.com/	200	12667	HTML	HALF WEIGHT — landing page only, 1 line of prose after tag-strip; NOT scored
+14	https://docs.geteppo.com/statistics/sample-ratio-mismatch/	200	40780	HTML	FULL WEIGHT — R5, Eppo SRM doc
+15	https://docs.statsig.com/experiments-plus/monitoring-tests/	404	177961	HTML	FAIL — post-criterion extension
+16	https://docs.statsig.com/experiments-plus/health-checks/	404	177955	HTML	FAIL — post-criterion extension; extension abandoned after 2 attempts as declared
+#	NOT ATTEMPTED and therefore UNREACHED, not silent: DAMA DMBOK (not freely served),
+#	Great Expectations / Soda / Monte Carlo docs, ISO/IEC 25012, Microsoft ExP internal docs,
+#	Kohavi/Tang/Xu 2020 book ch.21. P2b is graded on ONE conceptual register, not two.

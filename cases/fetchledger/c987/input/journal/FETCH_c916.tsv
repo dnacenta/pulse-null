@@ -1,0 +1,7 @@
+seq	utc	status	http	bytes	url	note
+1	2026-08-20T02:33:47	OK	200	889354	https://mediaratingcouncil.org/sites/default/files/Standards/IVT%20Addendum%20Update%20062520.pdf	MRC IVT 2.0 Addendum primary
+2	2026-08-20T02:33:47	FAIL	403	5569	https://supreme.justia.com/cases/federal/us/318/109/	Palmer v Hoffman 318 US 109 primary opinion
+3	2026-08-20T02:34:16	OK	200	135470	https://www.law.cornell.edu/rules/fre/rule_803	FRE 803 text + advisory committee notes (Palmer v Hoffman)
+4	2026-08-20T02:34:41	OK	200	271136	https://pmc.ncbi.nlm.nih.gov/articles/PMC11573736/	registry-RCT contamination of registry data; trial participation flag
+5	2026-08-20T02:35:27	FAIL	404	3451	https://www150.statcan.gc.ca/n1/pub/12-539-x/2009001/frame-base-eng.htm	StatCan Quality Guidelines: frames, overcoverage, out-of-scope units
+6	2026-08-20T02:35:47	OK	200	30462	https://www150.statcan.gc.ca/n1/pub/12-539-x/2009001/coverage-couverture-eng.htm	StatCan Quality Guidelines: Coverage and frames (primary)

@@ -1,0 +1,8 @@
+seq	utc	status	http	bytes	url	note
+1	2026-08-20T16:26:16	OK	200	324708	https://web.archive.org/web/2023id_/https://www.fda.gov/media/162416/download	FDA Multiple Endpoints in Clinical Trials final Oct 2022, via wayback id_
+2	2026-08-20T16:26:16	OK	200	291493	https://database.ich.org/sites/default/files/E9_Guideline.pdf	ICH E9 Statistical Principles for Clinical Trials, 1998
+3	2026-08-20T16:28:12	FAIL	404	54396	https://www.ema.europa.eu/en/documents/scientific-guideline/guideline-multiplicity-issues-clinical-trials_en.pdf	EMA Guideline on multiplicity issues in clinical trials 2017 - third register, tests P4 gaming clause
+4	2026-08-20T16:28:27	FAIL	403	5528	https://www.bmj.com/content/341/bmj.c3920	Cordoba BMJ 2010;341:c3920 composite outcomes systematic review
+5	2026-08-20T16:28:43	OK	200	194065	https://www.ema.europa.eu/en/documents/scientific-guideline/draft-guideline-multiplicity-issues-clinical-trials_en.pdf	EMA draft guideline multiplicity issues EMA/CHMP/44762/2017 - DRAFT per search result
+6	2026-08-20T16:28:44	OK	200	28550	https://europepmc.org/article/MED/20719825	Cordoba 2010 composite outcomes via europepmc
+7	2026-08-20T16:29:32	OK	200	5675	https://www.ebi.ac.uk/europepmc/webservices/rest/search?query=DOI:%2210.1136/bmj.c3920%22&resultType=core&format=json	Cordoba 2010 via EuropePMC REST core (abstract) - BMJ 403, EPMC page was JS shell

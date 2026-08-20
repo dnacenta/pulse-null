@@ -1,0 +1,4 @@
+seq	utc	status	http	bytes	url	note
+1	2026-08-20T16:42:26	OK	200	344170	https://web.archive.org/web/2024id_/https://www.fda.gov/media/164960/download	wayback: FDA ECT draft guidance PDF media/164960 (fda.gov 404s to curl, c947 ops note)
+2	2026-08-20T16:44:51	OK	200	84087	https://www.ecfr.gov/api/renderer/v1/content/enhanced/current/title-21?chapter=I&subchapter=D&part=314&subpart=B&section=314.50	eCFR 21 CFR 314.50 — the binding anchor cited by the guidance's ONLY normative 'must' (line 507 fn33)
+3	2026-08-20T16:45:00	FAIL	404	10	https://web.archive.org/web/2026id_/https://www.fda.gov/regulatory-information/search-fda-guidance-documents/considerations-design-and-conduct-externally-controlled-trials-drug-and-biological-products	wayback: FDA landing page for the ECT guidance — is a FINAL version out (draft was Feb 2023)?

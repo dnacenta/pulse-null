@@ -1,0 +1,4 @@
+seq	utc	status	http	bytes	url	note
+1	2026-08-20T14:40:03	OK	200	445563	https://www.govinfo.gov/content/pkg/FR-2017-01-23/pdf/2017-00979.pdf	SAMHSA Mandatory Guidelines Federal Workplace Drug Testing Urine, 82 FR 7920 2017-01-23 - lineage 1 primary
+2	2026-08-20T14:40:04	OK	200	878301	https://trec.nist.gov/pubs/trec14/papers/SPAM.OVERVIEW.pdf	TREC 2005 Spam Track Overview, Cormack and Lynam, NIST - lineage 2 primary evaluation register
+3	2026-08-20T14:41:42	OK	200	159750	https://pmc.ncbi.nlm.nih.gov/articles/PMC4034186/	Gross et al PNAS 2014 111:7230 false conviction rate among death-sentenced - lineage 3, criminal adjudication, feared error = FP

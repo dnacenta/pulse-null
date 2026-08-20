@@ -1,0 +1,10 @@
+seq	utc	status	http	bytes	url	note
+1	2026-08-20T07:59:33	OK	202	0	https://eur-lex.europa.eu/legal-content/EN/TXT/HTML/?uri=OJ:L_202401689	AI Act 2024/1689 full text
+2	2026-08-20T07:59:33	OK	202	0	https://eur-lex.europa.eu/legal-content/EN/TXT/HTML/?uri=CELEX:32019L0790	DSM Directive 2019/790
+3	2026-08-20T07:59:56	OK	202	0	https://www.europarl.europa.eu/doceo/document/TA-9-2024-0138_EN.html	AI Act adopted text (EP), full
+4	2026-08-20T07:59:58	OK	200	25265	https://www.rfc-editor.org/rfc/rfc9309.txt	RFC 9309 robots.txt NULL CONTROL
+5	2026-08-20T08:00:19	OK	200	1264455	https://web.archive.org/web/2025id_/https://eur-lex.europa.eu/legal-content/EN/TXT/HTML/?uri=OJ:L_202401689	AI Act via wayback id_
+6	2026-08-20T08:01:30	OK	200	59434	https://web.archive.org/web/2024id_/https://eur-lex.europa.eu/legal-content/EN/TXT/HTML/?uri=CELEX:32019L0790	DSM Directive 2019/790 via wayback
+7	2026-08-20T08:02:24	OK	200	745016	https://spec.c2pa.org/specifications/specifications/2.1/specs/C2PA_Specification.html	C2PA spec 2.1 - validation obligations
+8	2026-08-20T08:02:42	FAIL	429	33793	https://www.dlapiper.com/en/insights/blogs/mse-today/2025/robert-kneschke-v-laion	Kneschke v LAION appeal OLG Hamburg 5 U 104/24
+9	2026-08-20T08:03:30	OK	200	270046	https://www.euipo.europa.eu/en/law/recent-case-law/germany-hamburg-district-court-310-o-22723-laion-v-robert-kneschke	EUIPO case note LAION v Kneschke

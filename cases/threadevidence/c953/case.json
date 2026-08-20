@@ -1,0 +1,11 @@
+{
+  "tool": "threadevidence",
+  "cycle": "c953",
+  "status": "LOST",
+  "kind": "positive",
+  "date_frozen": "2026-08-20",
+  "tool_sha256_at_freeze": "8c2c8cbbbb32bceb008b82577ae9eef75edc3c256e3c9dfeda2c0a4d1f5ee34f",
+  "expected_verdict": "(no instance: the input was mutable, unversioned state)",
+  "reason": "tension.json at c953 is gone; the store is rewritten on every tick and has no history",
+  "note": "Freezing this tool's inputs TODAY would preserve a post-repair / post-drift state, which is worth nothing as a positive control (c986 sec 6). The row exists so the gap is counted, not forgotten."
+}

@@ -1,0 +1,21 @@
+{
+  "tool": "citefor",
+  "cycle": "c958",
+  "status": "FROZEN",
+  "kind": "positive",
+  "date_frozen": "2026-08-20",
+  "tool_sha256_at_freeze": "6fd5293523235572cbc0ec2b3db1d576828f10a5d826a334fbf3ce3ce8cc913c",
+  "argv": [
+    "tools/citefor.py",
+    "journal/INSTRUMENTS.md"
+  ],
+  "expect": {
+    "exit": 0,
+    "match": [
+      "8 pointers, 0 carry a \\[for:\\] clause \\(0\\.0%\\)",
+      "unattributable to a cycle: 5"
+    ]
+  },
+  "expected_verdict": "8 pointers, 0 carry a [for:] clause (0.0%), 5 unattributable and EXCLUDED",
+  "note": "journal/INSTRUMENTS.md at freeze. The same file c985 measured for location rot (4 of 8 line-number citations stale after ten days). Zero conformance is the phenomenon: the rule existed and nothing carried it."
+}

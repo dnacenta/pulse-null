@@ -1,0 +1,10 @@
+seq	utc	status	http	bytes	url	note
+1	2026-08-20T08:16:10	OK	203	5565	https://pubmed.ncbi.nlm.nih.gov/9267312/	Plebani & Carraro 1997 Clin Chem, pre-analytical error fraction
+2	2026-08-20T08:16:12	OK	200	230212	https://aclanthology.org/W18-6319.pdf	Post 2018 sacreBLEU WMT18 - genre breaker
+3	2026-08-20T08:16:31	OK	200	17265	https://www.ebi.ac.uk/europepmc/webservices/rest/search?query=%22stat%20laboratory%22%20AND%20AUTH%3A%22Plebani%22&resultType=core&format=json&pageSize=10	EuropePMC core records: Plebani/Carraro stat laboratory 1997 + 2007 replication
+4	2026-08-20T08:16:33	OK	200	7989	https://www.ecfr.gov/api/renderer/v1/content/enhanced/current/title-42?chapter=IV&subchapter=G&part=493&subpart=K&section=493.1253	eCFR 42 CFR 493.1253 - modification of manufacturer test system
+5	2026-08-20T08:17:03	FAIL	404	0	https://www.ecfr.gov/api/renderer/v1/content/enhanced/current/title-42?chapter=IV&subchapter=G&part=493&subpart=J&section=493.1242	eCFR 42 CFR 493.1242 specimen submission handling referral - is preprocessing inside regulated scope
+6	2026-08-20T08:17:03	OK	200	566206	https://arthurspirling.org/documents/preprocessing.pdf	Denny & Spirling 2018 Political Analysis preprocessing - author copy
+7	2026-08-20T08:17:11	OK	200	5258	https://www.ecfr.gov/api/renderer/v1/content/enhanced/current/title-42?chapter=IV&subchapter=G&part=493&subpart=K&section=493.1242	eCFR 42 CFR 493.1242 specimen submission/handling - subpart K retry after 404
+8	2026-08-20T08:17:40	OK	200	936421	https://www.nature.com/articles/s41586-020-2314-9	Botvinik-Nezer 2020 Nature 582:84 NARPS 70 teams
+9	2026-08-20T08:18:24	FAIL	403	5495	https://www.iso.org/obp/ui/en/#\!iso:std:76677:en	ISO 15189:2022 clause list - is pre-examination inside accredited scope
