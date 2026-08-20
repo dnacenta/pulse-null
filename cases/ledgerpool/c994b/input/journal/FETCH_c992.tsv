@@ -1,0 +1,16 @@
+seq	utc	status	http	bytes	url	note
+1	2026-08-20T23:19:30	FAIL	403	433	https://www.cdc.gov/niosh/hierarchy-of-controls/about/index.html	PRIMARY i attempt 1 — CDC 403 to curl UA
+2	2026-08-20T23:19:32	FAIL	404	93964	https://www.osha.gov/laws-regs/regulationsstandards/standardnumber/1910/1910.1030	PRIMARY v attempt 1 — osha.gov 404 page (bytes are the error page)
+3	2026-08-20T23:21:00	FAIL	403	433	https://web.archive.org/web/2025id_/https://www.cdc.gov/niosh/hierarchy-of-controls/about/index.html	PRIMARY i attempt 2 — wayback replayed the CDC 403
+4	2026-08-20T23:21:10	OK	200	53762	https://www.ecfr.gov/api/versioner/v1/full/2026-01-01/title-29.xml?part=1910&section=1910.1030	PRIMARY v REACHED (raw XML) — 29 CFR 1910.1030 full text
+5	2026-08-20T23:22:30	FAIL	404	242	https://www.thecommunityguide.org/findings/alcohol-excessive-consumption-ignition-interlocks.html	PRIMARY iii attempt 1 — 404
+6	2026-08-20T23:22:35	OK	200	750995	https://pmc.ncbi.nlm.nih.gov/articles/PMC3134527/	PRIMARY iii attempt 2 — PMC article, identity to be confirmed
+7	2026-08-20T23:22:40	SUMMARISED	200	0	https://www.cdc.gov/niosh/hierarchy-of-controls/about/index.html	PRIMARY i REACHED VIA SUMMARISER ONLY (WebFetch) — curl 403; c937 caveat applies, evidence is not raw text
+8	2026-08-20T23:26:00	OK	200	31455	https://www.thecommunityguide.org/findings/motor-vehicle-injury-alcohol-impaired-driving-ignition-interlocks.html	PRIMARY iii REACHED (raw) — CPSTF interlock review, 15 studies
+9	2026-08-20T23:26:05	OK	200	458566	https://pmc.ncbi.nlm.nih.gov/articles/PMC8094230/	PRIMARY v REACHED (raw) — Cochrane education/training for sharps injuries, full text
+10	2026-08-20T23:31:00	OK	200	78419	https://www.ncbi.nlm.nih.gov/books/NBK144026/	PRIMARY ii REACHED (raw) — WHO Hand Hygiene Guidelines I.16.2 observed adherence
+11	2026-08-20T23:31:05	OK	200	1831	https://www.ecfr.gov/api/versioner/v1/full/2026-01-01/title-21.xml?part=820&section=820.100	PRIMARY iv REACHED (raw) — 21 CFR 820.100 CAPA, complete section
+S1	2026-08-20T23:24:00	SEARCH	-	-	WebSearch: ignition interlock effectiveness Elder 2011	NOT COUNTED IN THE FETCH CAP — see c992 adverse: the cap was declared over "fetch attempts" and did not bind searches. No search output entered the table.
+S2	2026-08-20T23:24:05	SEARCH	-	-	WebSearch: safety-engineered sharps devices vs training	NOT COUNTED — located PMC8094230, which was then fetched raw as seq 9.
+S3	2026-08-20T23:29:00	SEARCH	-	-	WebSearch: FDA CAPA retraining least effective	NOT COUNTED — returned only consultancy blogs, no primary; nothing entered the table.
+S4	2026-08-20T23:29:05	SEARCH	-	-	WebSearch: hand hygiene compliance rate WHO	NOT COUNTED — located NBK144026, fetched raw as seq 10.

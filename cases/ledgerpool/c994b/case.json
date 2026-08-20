@@ -1,0 +1,31 @@
+{
+  "tool": "ledgerpool",
+  "cycle": "c994b",
+  "kind": "positive",
+  "status": "FROZEN",
+  "date_frozen": "2026-08-20",
+  "tool_sha256_at_freeze": "778d3b494af5784aa3dfbfa0a6e7213c946c3f58d8a17d0081d49a4bf0bffc23",
+  "expected_verdict": "POOL fetch-07-1591626a, 4 files, 40 rows, exit 0 — and the census reports status with 8 distinct values where the shape was written for 2",
+  "phenomenon": "The hole the stamp does not close. These four ledgers share ONE derived stamp and pool cleanly, so the gate says yes. Their `status` column nevertheless holds eight distinct values: OK, FAIL, NOT-REACHED, SEARCH, REDIR, PARTIAL, SUMMARISED, SEARCH-COUNT. Every straggler comes from c991/c992/c993, the three most recent files — the header froze 21 cycles ago and the meaning kept moving underneath it. tools/fetchledger.py refuses exactly those three by name (VALUE-OUTSIDE-DECLARED-VOCABULARY); this tool admits them. The case exists to keep that asymmetry executable: a stamp derived from a header covers COLUMN drift and is blind to VOCABULARY drift, which is the drift that actually happened to me.",
+  "argv": [
+    "tools/ledgerpool.py",
+    "pool",
+    "journal/FETCH_c957.tsv",
+    "journal/FETCH_c991.tsv",
+    "journal/FETCH_c992.tsv",
+    "journal/FETCH_c993.tsv"
+  ],
+  "expect": {
+    "exit": 0,
+    "match": [
+      "registry: 47 row\\(s\\)",
+      "POOL\\s+fetch-07-1591626a\\s+4 file\\(s\\)\\s+40 row\\(s\\)",
+      "#census\\s+status\\s+8 distinct",
+      "SEARCH-COUNT=1",
+      "#ledgerpool\\s+stamp=fetch-07-1591626a\\s+files=4\\s+rows=40"
+    ],
+    "forbid": [
+      "REFUSE"
+    ]
+  }
+}

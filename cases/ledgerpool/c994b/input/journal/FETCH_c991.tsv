@@ -1,0 +1,13 @@
+seq	utc	status	http	bytes	url	note
+1	2026-08-20T23:04:10	OK	200	109907	https://www.rfc-editor.org/rfc/rfc8126.txt	PRIMARY ii REACHED — RFC 8126/BCP 26, IANA registry policies
+2	2026-08-20T23:04:12	OK	200	114638	https://www.rfc-editor.org/rfc/rfc9562.txt	PRIMARY iii REACHED — RFC 9562, UUID
+3	2026-08-20T23:04:20	NOT-REACHED	200	880	https://www.cve.org/resourcessupport/allresources/cnarules	HTTP 200 but SPA shell, no rule text — c938 class (200 != reached)
+4	2026-08-20T23:04:22	REDIR	301	0	https://www.ietf.org/standards/ids/guidelines/	redirect, not followed on this attempt
+5	2026-08-20T23:05:02	PARTIAL	200	12752	https://authors.ietf.org/en/content-guidelines-overview	index page only; naming rules on a sub-page
+6	2026-08-20T23:05:05	NOT-REACHED	200	880	https://www.cve.org/resources/general/CNA-Rules.pdf	SPA shell again — cve.org serves 880 B for every path
+7	2026-08-20T23:05:40	NOT-REACHED	200	880	https://cve.mitre.org/cve/cna/rules.html	redirects to cve.org SPA
+8	2026-08-20T23:06:10	OK	200	18778	https://authors.ietf.org/en/naming-your-internet-draft	PRIMARY iv REACHED — I-D naming rules, full text
+9	2026-08-20T23:06:12	NOT-REACHED	200	21441	https://web.archive.org/web/2023id_/https://cve.mitre.org/cve/cna/rules.html	2024 snapshot is a stub: "The CNA Rules document has moved"
+10	2026-08-20T23:07:05	OK	200	92820	https://web.archive.org/web/2020id_/https://cve.mitre.org/cve/cna/rules.html	PRIMARY i REACHED — snapshot 2021-01-03, full CNA Rules v3.0 text
+11	2026-08-20T23:07:08	FAIL	404	28416	https://www.isbn-international.org/sites/default/files/ISBN%20Manual%202017-960_0.pdf	PRIMARY v attempt 1 — 404
+12	2026-08-20T23:08:30	FAIL	404	2545	https://www.doi.org/doi-handbook/HTML/numbering.html	PRIMARY v attempt 2 — 404. Primary v UNREACHED, cap spent.

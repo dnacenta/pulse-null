@@ -1,0 +1,11 @@
+seq	utc	status	http	bytes	url	note
+1	2026-08-20T23:36:10	OK	200	39696	https://www.ecfr.gov/api/versioner/v1/full/2026-01-01/title-29.xml?part=1910&section=1910.1020	PRIMARY iii REACHED (raw XML) — 29 CFR 1910.1020 complete section
+2	2026-08-20T23:36:12	OK	200	10053	https://www.ecfr.gov/api/versioner/v1/full/2026-01-01/title-42.xml?part=493&section=493.1274	PRIMARY iv REACHED (raw XML) — 42 CFR 493.1274, the declared negative control, complete section
+3	2026-08-20T23:36:40	OK	200	60416	https://www.law.cornell.edu/rules/frcp/rule_34	PRIMARY ii-a REACHED (raw HTML) — FRCP 34 operative text + advisory notes
+4	2026-08-20T23:36:44	OK	200	264492	https://www.law.cornell.edu/rules/frcp/rule_26	PRIMARY ii-b REACHED (raw HTML) — FRCP 26, incl. 26(g) signature
+5	2026-08-20T23:37:50	FAIL	000	0	https://uscode.house.gov/view.xhtml?req=granuleid:USC-prelim-title5-section552&num=0&edition=prelim	PRIMARY i attempt 1 — connection timed out after 60s, no bytes. Host unreachable on this tooling.
+6	2026-08-20T23:38:20	OK	200	480165	https://www.law.cornell.edu/uscode/text/5/552	PRIMARY i REACHED (raw HTML) — 5 U.S.C. 552 full text incl. (a)(3), (a)(6)(A)-(C). NEAR-PRIMARY host, not the official uscode.house.gov copy: recorded as an adverse item, see FINDINGS c993 adverse (ii).
+7	2026-08-20T23:39:05	OK	200	809034	https://eur-lex.europa.eu/legal-content/EN/TXT/HTML/?uri=CELEX:32016R0679	PRIMARY v REACHED (raw HTML) — GDPR consolidated text, Arts. 12 and 15 read in the official EUR-Lex copy
+8	2026-08-20T23:41:30	OK	200	179104	https://www.law.cornell.edu/rules/frcp/rule_4	EXTRA (declared permitted) REACHED — FRCP 4, for 4(l) proof of service; fetched only after all five primaries were attempted, per the stopping rule
+9	2026-08-20T23:41:34	OK	200	13308	https://www.ecfr.gov/api/versioner/v1/full/2026-01-01/title-45.xml?part=164&section=164.524	EXTRA (declared permitted) REACHED (raw XML) — 45 CFR 164.524 HIPAA right of access, complete section
+—	—	SEARCH-COUNT	—	—	(no WebSearch was issued this cycle)	Search cap was 4 and 0 were used. c992's adverse was that the cap did not bind searches; this cycle the cap is reported whether or not it fired, and it did not fire because no search was needed.

@@ -7,6 +7,8 @@ citeline	c977	FROZEN	2026-08-20	ok: no bare line-number citations (exit 0)	ddebf
 countercmp	c976	FROZEN	2026-08-20	5/5 docs: parser-side counter B reads exactly ZERO; A reads 6/8/6/11/9	8977fe17847c5167b326559dd6154640f5ce878b85d52ecb3894d4cde13f73a2	168734	cases/countercmp/c976
 exempt	c932	FROZEN	2026-08-20	39474 of 168734 bytes (23.4%) exempt from both the gauge and the archiver	29d1db100161abf1778e64bafe6d881af9a5058bf1371871031a7c32ac573b67	168734	cases/exempt/c932
 fetchledger	c987	FROZEN	2026-08-20	32 ledgers: 19 admitted, 13 refused (10 UNDECLARED-SCHEMA); REACHED 113/153	4fec946070595475bd4fc2fc0fd17d50331f1d92c500b59259b878267490bf39	60715	cases/fetchledger/c987
+ledgerpool	c994	FROZEN	2026-08-20	REFUSE MIXED-STAMPS: 3 distinct stamps over 3 files (exit 2), no rows emitted	778d3b494af5784aa3dfbfa0a6e7213c946c3f58d8a17d0081d49a4bf0bffc23	29599	cases/ledgerpool/c994
+ledgerpool	c994b	FROZEN	2026-08-20	POOL fetch-07-1591626a, 4 files, 40 rows, exit 0 — and the census reports status with 8 distinct values where the shape was written for 2	778d3b494af5784aa3dfbfa0a6e7213c946c3f58d8a17d0081d49a4bf0bffc23	16113	cases/ledgerpool/c994b
 markercheck	c750	LOST	2026-08-20	(no instance: the input was mutable, unversioned state)	2efac8f96c86e6782ef5e3ef575e0f3402aa0a0a0e59592ae7c3e837881d28c9	0	cases/markercheck/c750
 pipeflow	c943	LOST	2026-08-20	(no instance: the input was mutable, unversioned state)	85e2e2bb6a9a70966793aec74ef1af024363d79ac379a0523d21b3b562a7a109	0	cases/pipeflow/c943
 stalecheck	c956	LOST	2026-08-20	(no instance: the input was mutable, unversioned state)	9fa6fc6e85c5c28b1042d975db30bfe54814f603df7c8a386520b8c564fed4e9	0	cases/stalecheck/c956

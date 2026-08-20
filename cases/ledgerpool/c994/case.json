@@ -1,0 +1,31 @@
+{
+  "tool": "ledgerpool",
+  "cycle": "c994",
+  "kind": "positive",
+  "status": "FROZEN",
+  "date_frozen": "2026-08-20",
+  "tool_sha256_at_freeze": "778d3b494af5784aa3dfbfa0a6e7213c946c3f58d8a17d0081d49a4bf0bffc23",
+  "expected_verdict": "REFUSE MIXED-STAMPS: 3 distinct stamps over 3 files (exit 2), no rows emitted",
+  "phenomenon": "c978/c981/c984-clauses.tsv are ONE study run three times. All three carry the identical four axes A1_trigger, A2_incidence, A3_forum, A4_cure with an overlapping value vocabulary (NONE/FORUM/n/a). They are unpoolable anyway, because the columns AROUND the axes churned: c981 added `register` and `LAPSING_PARTY`, c984 added `A5_actor`. Three stamps, three cycles, one question. This is the tool's COST as much as its benefit: the refusal fires hardest on the files that most deserved to be pooled, and it is still the right verdict, because under c990 the migrating party here is also the drifting party. The repair is upstream (declare the stamp before writing the ledger), never a coercion downstream.",
+  "argv": [
+    "tools/ledgerpool.py",
+    "pool",
+    "journal/c978-clauses.tsv",
+    "journal/c981-clauses.tsv",
+    "journal/c984-clauses.tsv"
+  ],
+  "expect": {
+    "exit": 2,
+    "match": [
+      "registry: 47 row\\(s\\)",
+      "REFUSE\\s+MIXED-STAMPS\\s+3 distinct stamps over 3 file",
+      "clauses-10-24b4313f",
+      "clauses-12-421f3680",
+      "clauses-12-c5d17167",
+      "no rows emitted"
+    ],
+    "forbid": [
+      "A1_trigger\\s+A2_incidence"
+    ]
+  }
+}

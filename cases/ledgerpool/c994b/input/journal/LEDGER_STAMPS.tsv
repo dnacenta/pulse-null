@@ -1,0 +1,55 @@
+# journal/LEDGER_STAMPS.tsv — schema stamp per ledger. Written by
+# tools/ledgerpool.py (c994). The stamp is DERIVED from each file's header
+# bytes, not asserted here: tools/ledgerpool.py pool re-derives it and
+# refuses (STAMP-MISMATCH) if this file disagrees. Never trusted, only
+# checked. origin=OBSERVED means the shape was read off the bytes after
+# the fact; no cycle declared it in advance. Do NOT normalise the ledgers
+# to agree with each other (c990: the migrating party is the drifting one).
+path	family	stamp	ncols	origin	header_sha256	header_columns
+journal/FETCH_c912.tsv	fetch	fetch-04-9e9bb291	4	OBSERVED	9e9bb2914500283c19f8f00ccb2438dbe44bbb89e7314b1c765ee5a1f838ff88	n,url,result,purpose
+journal/FETCH_c913b.tsv	fetch	fetch-07-1591626a	7	OBSERVED	1591626ab71f2ae4bbee75ad241eca40b5ce29a3b1a4b838de0dd29ec1e92430	seq,utc,status,http,bytes,url,note
+journal/FETCH_c916.tsv	fetch	fetch-07-1591626a	7	OBSERVED	1591626ab71f2ae4bbee75ad241eca40b5ce29a3b1a4b838de0dd29ec1e92430	seq,utc,status,http,bytes,url,note
+journal/FETCH_c919.tsv	fetch	fetch-04-2698845f	4	OBSERVED	2698845f8d78d9f433f1b92b362dc91273256ffd43d0d5e46e50c7e49a622367	url,status,primary,used_for
+journal/FETCH_c921.tsv	fetch	fetch-05-1e0640a4	5	OBSERVED	1e0640a4fc8f4a6fa517761fbc5f8ec4b76943724aaf60931d7e5779ef242712	n,code,bytes,url,outcome
+journal/FETCH_c922.tsv	fetch	fetch-06-601df9f2	6	OBSERVED	601df9f26903b25cfce9c91532ce48c3e7592ac00565dd596a4b58b0fc3a3424	n,url,http,bytes,kind,outcome
+journal/FETCH_c924.tsv	fetch	fetch-06-840b7d7c	6	OBSERVED	840b7d7cb7cadc9b2cfd9948b96985037b84a0f4942465a86f5e5c6ee6a0122c	n,register,url,method,result,what it gave
+journal/FETCH_c939.tsv	fetch	fetch-07-1591626a	7	OBSERVED	1591626ab71f2ae4bbee75ad241eca40b5ce29a3b1a4b838de0dd29ec1e92430	seq,utc,status,http,bytes,url,note
+journal/FETCH_c940.tsv	fetch	fetch-07-1591626a	7	OBSERVED	1591626ab71f2ae4bbee75ad241eca40b5ce29a3b1a4b838de0dd29ec1e92430	seq,utc,status,http,bytes,url,note
+journal/FETCH_c942.tsv	fetch	fetch-NOHEADER	6	OBSERVED		(NO-HEADER-ROW)
+journal/FETCH_c944.tsv	fetch	fetch-07-1591626a	7	OBSERVED	1591626ab71f2ae4bbee75ad241eca40b5ce29a3b1a4b838de0dd29ec1e92430	seq,utc,status,http,bytes,url,note
+journal/FETCH_c945.tsv	fetch	fetch-07-1591626a	7	OBSERVED	1591626ab71f2ae4bbee75ad241eca40b5ce29a3b1a4b838de0dd29ec1e92430	seq,utc,status,http,bytes,url,note
+journal/FETCH_c946.tsv	fetch	fetch-07-1591626a	7	OBSERVED	1591626ab71f2ae4bbee75ad241eca40b5ce29a3b1a4b838de0dd29ec1e92430	seq,utc,status,http,bytes,url,note
+journal/FETCH_c947.tsv	fetch	fetch-07-1591626a	7	OBSERVED	1591626ab71f2ae4bbee75ad241eca40b5ce29a3b1a4b838de0dd29ec1e92430	seq,utc,status,http,bytes,url,note
+journal/FETCH_c950.tsv	fetch	fetch-07-1591626a	7	OBSERVED	1591626ab71f2ae4bbee75ad241eca40b5ce29a3b1a4b838de0dd29ec1e92430	seq,utc,status,http,bytes,url,note
+journal/FETCH_c951.tsv	fetch	fetch-07-1591626a	7	OBSERVED	1591626ab71f2ae4bbee75ad241eca40b5ce29a3b1a4b838de0dd29ec1e92430	seq,utc,status,http,bytes,url,note
+journal/FETCH_c954.tsv	fetch	fetch-07-1591626a	7	OBSERVED	1591626ab71f2ae4bbee75ad241eca40b5ce29a3b1a4b838de0dd29ec1e92430	seq,utc,status,http,bytes,url,note
+journal/FETCH_c957.tsv	fetch	fetch-07-1591626a	7	OBSERVED	1591626ab71f2ae4bbee75ad241eca40b5ce29a3b1a4b838de0dd29ec1e92430	seq,utc,status,http,bytes,url,note
+journal/FETCH_c958.tsv	fetch	fetch-07-1591626a	7	OBSERVED	1591626ab71f2ae4bbee75ad241eca40b5ce29a3b1a4b838de0dd29ec1e92430	seq,utc,status,http,bytes,url,note
+journal/FETCH_c959.tsv	fetch	fetch-07-1591626a	7	OBSERVED	1591626ab71f2ae4bbee75ad241eca40b5ce29a3b1a4b838de0dd29ec1e92430	seq,utc,status,http,bytes,url,note
+journal/FETCH_c961.tsv	fetch	fetch-07-1591626a	7	OBSERVED	1591626ab71f2ae4bbee75ad241eca40b5ce29a3b1a4b838de0dd29ec1e92430	seq,utc,status,http,bytes,url,note
+journal/FETCH_c962.tsv	fetch	fetch-07-1591626a	7	OBSERVED	1591626ab71f2ae4bbee75ad241eca40b5ce29a3b1a4b838de0dd29ec1e92430	seq,utc,status,http,bytes,url,note
+journal/FETCH_c963.tsv	fetch	fetch-07-1591626a	7	OBSERVED	1591626ab71f2ae4bbee75ad241eca40b5ce29a3b1a4b838de0dd29ec1e92430	seq,utc,status,http,bytes,url,note
+journal/FETCH_c972.tsv	fetch	fetch-07-379fb6c8	7	OBSERVED	379fb6c8a32ce640beae40d287d844e166faa152509bc36b58094db140014967	n,target,url,http,bytes,verdict,note
+journal/FETCH_c973.tsv	fetch	fetch-NOHEADER	7	OBSERVED		(NO-HEADER-ROW)
+journal/FETCH_c975.tsv	fetch	fetch-08-a7adccbf	8	OBSERVED	a7adccbf5e960ca3f482724e2ea830d38f61f28775bdf96f99441ef99f518eac	n,target,url,http,bytes,grade,verdict,note
+journal/FETCH_c978.tsv	fetch	fetch-07-4c49a7ef	7	OBSERVED	4c49a7efe727dde2ebbf204587f7501989d8bbac4fce961042bf598d321c901a	n,url,http,grade,reached,declared,note
+journal/FETCH_c980.tsv	fetch	fetch-07-379fb6c8	7	OBSERVED	379fb6c8a32ce640beae40d287d844e166faa152509bc36b58094db140014967	n,target,url,http,bytes,verdict,note
+journal/FETCH_c981.tsv	fetch	fetch-06-cf341569	6	OBSERVED	cf34156931cb5a409e713c3dd428e72d5b9407abffb50ac55feb400f4f4177e6	n,url,host_grade,http,outcome,note
+journal/FETCH_c983.tsv	fetch	fetch-08-fc6b0910	8	OBSERVED	fc6b09108cb62dd7f5ee7c5ca603f2d294d148f352e64c98fb66585431bd8b86	n,target,url,grade,http,bytes,outcome,note
+journal/FETCH_c984.tsv	fetch	fetch-08-fc6b0910	8	OBSERVED	fc6b09108cb62dd7f5ee7c5ca603f2d294d148f352e64c98fb66585431bd8b86	n,target,url,grade,http,bytes,outcome,note
+journal/FETCH_c986.tsv	fetch	fetch-08-fc6b0910	8	OBSERVED	fc6b09108cb62dd7f5ee7c5ca603f2d294d148f352e64c98fb66585431bd8b86	n,target,url,grade,http,bytes,outcome,note
+journal/FETCH_c990.tsv	fetch	fetch-07-1591626a	7	OBSERVED	1591626ab71f2ae4bbee75ad241eca40b5ce29a3b1a4b838de0dd29ec1e92430	seq,utc,status,http,bytes,url,note
+journal/FETCH_c991.tsv	fetch	fetch-07-1591626a	7	OBSERVED	1591626ab71f2ae4bbee75ad241eca40b5ce29a3b1a4b838de0dd29ec1e92430	seq,utc,status,http,bytes,url,note
+journal/FETCH_c992.tsv	fetch	fetch-07-1591626a	7	OBSERVED	1591626ab71f2ae4bbee75ad241eca40b5ce29a3b1a4b838de0dd29ec1e92430	seq,utc,status,http,bytes,url,note
+journal/FETCH_c993.tsv	fetch	fetch-07-1591626a	7	OBSERVED	1591626ab71f2ae4bbee75ad241eca40b5ce29a3b1a4b838de0dd29ec1e92430	seq,utc,status,http,bytes,url,note
+journal/c961-clauses.tsv	clauses	clauses-13-81ffb474	13	OBSERVED	81ffb474a6cace02f92a48713dc32c73e6cfd2a12df299d442eaa243b576838d	clause_id,instrument,reached,reached_prior,duration,origin_text,origin_delegated,r1,r2,r3,r3_grantor,devices,notes
+journal/c963-clauses.tsv	clauses	clauses-06-ac2beb80	6	OBSERVED	ac2beb809c9bb4208e710b2a4d93bd4c21a39ebd7ef93fc39316e4a04f8ae6e1	id,locator,clause,class_tiebreak,class_raw,marker
+journal/c971-clauses.tsv	clauses	clauses-09-bbca9f8e	9	OBSERVED	bbca9f8ea620d2dfbc1ebc3b89ff0566e30d09f34feb92ce628a4ce4e91f5d2c	id,register,provision,verbatim_frequency_language,unit_of_recurrence,index,origin_of_frequency,register_set_numeric_bar,in_analysis_set
+journal/c975-clauses.tsv	clauses	clauses-07-79623134	7	OBSERVED	796231347f4f5ce6705d22ad0d6b640c72df3d6ea99f77a5156c483d5f725033	row,instrument,provision,in_set,class,verbatim_fragment,classification_note
+journal/c978-clauses.tsv	clauses	clauses-10-24b4313f	10	OBSERVED	24b4313fbf495d488ef442009299c44fb81299663a703f565b71a9c0cd46161d	id,provision,source_kind,verbatim_fragment,a1_trigger,a2_incidence,a3_forum,a4_cure,in_set,note
+journal/c981-clauses.tsv	clauses	clauses-12-421f3680	12	OBSERVED	421f36805974cfda6a5d129f00be899e75196b7e10f4ba86c84b6e19b3d88056	id,provision,register,source_kind,verbatim_fragment,a1_trigger,a2_incidence,a3_forum,a4_cure,lapsing_party,in_set,note
+journal/c983-clauses.tsv	clauses	clauses-11-4830eb1d	11	OBSERVED	4830eb1d3399fb1ba2b95822df00d1f3c2aadf1e90d0a80002be8ec569c50d7e	id,register,provision,verbatim_fragment,a1_criterion,a2_origin,a3_consequence,a4_demonstrability,duty_type,in_set,note
+journal/c984-clauses.tsv	clauses	clauses-12-c5d17167	12	OBSERVED	c5d171679756a4940a56ad5d9400abeeb6d1fdb8ea0e610f6bfb5a60940750bd	id,register,provision,verbatim_fragment,a1_trigger,a2_incidence,a3_forum,a4_cure,a5_actor,lapsing_party,in_set,note
+journal/c986-clauses.tsv	clauses	clauses-11-43927bac	11	OBSERVED	43927bace5449e04a556b63871f4523b23126810c9ef9f458468a1b331a01bfa	n,register,clause,in_set,b1_kept,b2_trigger,b3_duration,b4_demander,b5_reuse,custodian,verbatim_fragment
+journal/c990-clauses.tsv	clauses	clauses-11-8498f593	11	OBSERVED	8498f5931fbf783abbdac83c940c9f5c430887be48c21cbc74d3c6b70b0ddfa1	id,carrier,registered,cite,axisa_locus,axisb_object,axisc_consequence,axisc_trigger,axisd_bytes,axise_migrator,clause_quote
+journal/c993-clauses.tsv	clauses	clauses-10-740980aa	10	OBSERVED	740980aa27b5ff332da755b8372f7e7d29dd3adb45bad8220cbbffc492334559	row,register,clause,a1_initiator,a2_transfer_artefact_producer,a3_dating,a4_demander,a5_holder_inaction,occasion,verbatim_fragment
