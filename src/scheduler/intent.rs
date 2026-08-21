@@ -647,6 +647,21 @@ pub(crate) async fn commit_intent_completion(
     true
 }
 
+/// The prompt header an executing intent sees.
+///
+/// `Id` is the intent's own identifier, minted at emission in `parse_intent`
+/// and disposable. Without it a cycle could read its *parent's* id — it is
+/// right there in `Source: Chain(..)` — but had no way to name itself, so
+/// anything it wrote about its own execution had to borrow a name from
+/// somewhere else. This is rendered unconditionally on every intent
+/// execution; there is no flag and nothing to remember to switch on.
+fn intent_header(intent: &Intent) -> String {
+    format!(
+        "[Intent: {} | Id: {} | Priority: {:?} | Source: {:?}]",
+        intent.description, intent.id, intent.priority, intent.source
+    )
+}
+
 /// Execute a single intent with tools.
 async fn execute_intent(
     intent: &Intent,
@@ -681,8 +696,10 @@ async fn execute_intent(
     // Build user message with autonomy context
     let autonomy_context = prompt::build_autonomy_context(&root_dir, &state.config);
     let user_message = format!(
-        "[Intent: {} | Priority: {:?} | Source: {:?}]\n\n{}\n\n{}",
-        intent.description, intent.priority, intent.source, intent.prompt, autonomy_context
+        "{}\n\n{}\n\n{}",
+        intent_header(intent),
+        intent.prompt,
+        autonomy_context
     );
 
     // Capture start time for accurate duration tracking
@@ -1268,6 +1285,35 @@ mod tests {
             output_routing: IntentOutput::Silent,
             depth: 0,
         }
+    }
+
+    #[test]
+    fn header_renders_the_intents_own_id() {
+        let intent = make_intent("intent-do-a-thing-667ce4e4", IntentPriority::Normal);
+        let header = intent_header(&intent);
+
+        assert!(
+            header.contains("Id: intent-do-a-thing-667ce4e4"),
+            "own id missing from header: {header}"
+        );
+        assert!(header.contains("Intent: Intent intent-do-a-thing-667ce4e4"));
+        assert!(header.contains("Priority: Normal"));
+        assert!(header.contains("Source: UserCli"));
+    }
+
+    #[test]
+    fn header_distinguishes_own_id_from_parent_id() {
+        // The failure this guards: a chained intent could see its parent's id
+        // via Source and mistake it for its own.
+        let mut intent = make_intent("intent-child-aaaaaaaa", IntentPriority::Normal);
+        intent.source = IntentSource::Chain("intent-parent-bbbbbbbb".into());
+        let header = intent_header(&intent);
+
+        assert!(header.contains("Id: intent-child-aaaaaaaa"));
+        assert!(header.contains("intent-parent-bbbbbbbb"));
+        let own = header.find("intent-child-aaaaaaaa").unwrap();
+        let parent = header.find("intent-parent-bbbbbbbb").unwrap();
+        assert!(own < parent, "own id must precede the parent's: {header}");
     }
 
     fn shared_leases(dir: &Path) -> crate::coordinator::control::SharedLeases {
