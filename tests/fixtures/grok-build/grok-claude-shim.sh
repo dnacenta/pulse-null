@@ -29,6 +29,10 @@ while [[ $# -gt 0 ]]; do
       sp_file="${2:-}"; shift 2 ;;
     --no-session-persistence)
       shift ;;
+    --output-format)
+      # Always force the streaming-messages format regardless of what the
+      # provider asked for — the final-message extraction below depends on it.
+      args+=(--output-format streaming-messages-json); shift 2 ;;
     *) args+=("$1"); shift ;;
   esac
 done
@@ -63,11 +67,23 @@ elif [[ $bare_p -eq 1 ]]; then
 fi
 
 # Die before pulse-null's 900s subprocess kill so no orphaned grok survives
-# (kill_on_drop SIGKILLs only the shim, not its children).
-out=$(timeout 850 "$GROK" "${args[@]}")
+# (kill_on_drop SIGKILLs only the shim, not its children). RUST_LOG=warn keeps
+# grok's INFO startup logs off stderr, where they pollute pulse-null's error
+# detail on non-zero exits (seen on the first intent timeout, exit 124).
+#
+# streaming-messages-json instead of json: grok's plain-json `text` field
+# CONCATENATES every assistant turn — pre-tool narration ("I'll check X...")
+# included — which leaked process talk into Echo's Discord replies
+# (2026-08-24). The stream's final `result` event carries only the last
+# assistant message plus aggregate usage; everything before it is dropped
+# here, structurally, instead of asking the model not to narrate.
+out=$(RUST_LOG=warn timeout 850 "$GROK" "${args[@]}")
 rc=$?
 if [[ $rc -eq 0 && -n "$out" ]]; then
-  printf '%s' "$out" | jq '. + {result: (.text // "")}' 2>/dev/null || printf '%s' "$out"
+  # The stream's result event is already Claude Code wire format: `result`,
+  # `usage` (snake_case), `is_error`, `stop_reason` — emit it verbatim.
+  final=$(printf '%s\n' "$out" | jq -cs '[.[] | select(.type=="result")] | last | select(. != null)' 2>/dev/null)
+  if [[ -n "$final" ]]; then printf '%s' "$final"; else printf '%s' "$out"; fi
 else
   printf '%s' "$out"
 fi

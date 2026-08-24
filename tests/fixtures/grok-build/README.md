@@ -34,3 +34,13 @@ Deployed copy of `/usr/local/bin/grok-claude-shim` — the translation layer
 that let the unmodified claude-code provider drive Grok for the 2026-08-24
 Echo-on-grok live test. Reference input for the Phase 2 native
 `grok_build_provider.rs`; the shim's bridged gaps are the adapter's spec.
+
+## 2026-08-24 addendum — final-message extraction
+
+`--output-format json`'s `text` field CONCATENATES every assistant turn, so
+pre-tool narration ("I'll check X...") leaked into chat replies. The stream
+format's final `result` event (see `probe-streaming-messages.ndjson`) is
+already Claude Code wire format — `result` holds ONLY the last assistant
+message, with snake_case `usage`, `is_error`, `stop_reason`. Shim v2 forces
+`streaming-messages-json` and emits that event verbatim; the adapter should
+do the same.
