@@ -56,6 +56,11 @@ pub trait StreamingProvider: LmProvider {
 
 /// Wrap a non-streaming invoke() call as a stream that emits one TextDelta + Done.
 /// Clones all parameters upfront so the returned stream only borrows `provider`.
+///
+/// Currently unused: the Claude Code provider streams natively since PN-92.
+/// Kept as the adapter any future provider without native streaming should
+/// use, which is the contract the trait's default behaviour advertises.
+#[allow(dead_code)]
 pub fn invoke_as_stream<'a>(
     provider: &'a dyn LmProvider,
     system_prompt: &str,
