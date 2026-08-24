@@ -1,0 +1,7 @@
+error: unexpected argument '--no-session-persistence' found
+
+  tip: a similar argument exists: '--fork-session'
+
+Usage: grok --single <PROMPT> --model <MODEL> --output-format <OUTPUT_FORMAT> --system-prompt-override <PROMPT> --fork-session [PROMPT]
+
+For more information, try '--help'.

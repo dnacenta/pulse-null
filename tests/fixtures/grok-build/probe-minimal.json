@@ -1,0 +1,28 @@
+{
+  "text": "Empty query. What do you need?",
+  "stopReason": "end_turn",
+  "sessionId": "01a03551-5de8-77d1-9f63-966c875e2d96",
+  "requestId": "8a6b4189-1433-4df0-89b9-d026ca321ba1",
+  "thought": "The user sent a query that's just \"-\". That's a very minimal query. Looking at the system prompt, I'm a \"probe responder\" and I should \"Answer tersely.\"\n",
+  "usage": {
+    "input_tokens": 10433,
+    "cache_read_input_tokens": 128,
+    "cache_creation_input_tokens": 0,
+    "output_tokens": 169,
+    "reasoning_tokens": 157,
+    "total_tokens": 10730
+  },
+  "num_turns": 1,
+  "total_cost_usd": 0.00373048,
+  "total_cost_usd_ticks": 37304800,
+  "modelUsage": {
+    "grok-4.6-build": {
+      "inputTokens": 10433,
+      "outputTokens": 169,
+      "cacheReadInputTokens": 128,
+      "cacheCreationInputTokens": 0,
+      "modelCalls": 1,
+      "costUSD": 0.00373048
+    }
+  }
+}
