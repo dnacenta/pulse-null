@@ -1,0 +1,7 @@
+error: unexpected argument '--system-prompt-file' found
+
+  tip: a similar argument exists: '--system-prompt'
+
+Usage: grok --single <PROMPT> --model <MODEL> --output-format <OUTPUT_FORMAT> --system-prompt-override <PROMPT> [PROMPT]
+
+For more information, try '--help'.

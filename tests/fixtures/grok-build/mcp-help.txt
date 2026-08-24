@@ -1,0 +1,18 @@
+Manage MCP server configurations
+
+Usage: grok mcp [OPTIONS] <COMMAND>
+
+Commands:
+  list     List configured MCP servers
+  add      Add or update an MCP server
+  remove   Remove an MCP server
+  enable   Enable an MCP server
+  disable  Disable an MCP server
+  doctor   Diagnose MCP server configuration and connectivity
+  help     Print this message or the help of the given subcommand(s)
+
+Options:
+      --debug                 Enable debug logging
+      --debug-file <FILE>     Write debug logs to FILE
+  -h, --help                  Print help
+      --leader-socket <PATH>  Use a custom leader socket path instead of the default `~/.grok/leader.sock`

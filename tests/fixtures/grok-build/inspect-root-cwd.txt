@@ -1,0 +1,65 @@
+
+  Environment
+  └ Version: 1.0.0 [unknown]
+  └ CWD: /root
+  └ Project trusted: no
+
+  Project Instructions (2)
+  └ /home/pulse/.claude/rules/recall-echo.md (global, ~858 tokens) [claude]
+  └ /home/pulse/.claude/rules/self-work.md (global, ~680 tokens) [claude]
+
+  Permissions
+  └ Source: (none)
+  └ 0 loaded, 0 skipped
+
+  Login Policy
+  └ disable_api_key_auth: (unset)
+  └ force_login_team_uuid: (none)
+  └ api_key_auth_disabled: false
+
+  Skills (0)
+  └ (none)
+
+  Agents (3)
+  └ general-purpose  builtin
+  └ explore          builtin
+  └ plan             builtin
+
+  Plugins (0)
+  └ (none)
+
+  Marketplaces (0)
+  └ (none)
+
+  MCP Servers (0)
+  └ (none) — see `grok mcp add --help`
+
+  LSP Servers (0)
+  └ (none)
+
+  Hooks (2)
+  └ command  user [claude]
+  └ command  user [claude]
+
+  Config Sources
+  └ User: /home/pulse/.grok/config.toml
+  └ Project: (none)
+
+  Harness Compatibility
+  └ cursor
+    └ skills     on   (default)
+    └ rules      on   (default)
+    └ agents     on   (default)
+    └ mcps       on   (default)
+    └ hooks      on   (default)
+    └ sessions   on   (default)
+  └ claude
+    └ skills     on   (default)
+    └ rules      on   (default)
+    └ agents     on   (default)
+    └ mcps       on   (default)
+    └ hooks      on   (default)
+    └ sessions   on   (default)
+  └ codex
+    └ sessions   on   (default)
+

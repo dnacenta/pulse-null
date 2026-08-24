@@ -1,0 +1,11 @@
+Sign in to Grok
+
+Usage: grok login [OPTIONS]
+
+Options:
+      --oauth                 Use Grok OAuth via auth.x.ai
+      --device-auth           Use device-code authentication for headless/remote environments [aliases: --device-code]
+      --debug                 Enable debug logging
+      --debug-file <FILE>     Write debug logs to FILE
+  -h, --help                  Print help
+      --leader-socket <PATH>  Use a custom leader socket path instead of the default `~/.grok/leader.sock`
