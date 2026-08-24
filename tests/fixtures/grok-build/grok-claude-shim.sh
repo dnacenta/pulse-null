@@ -31,8 +31,18 @@ while [[ $# -gt 0 ]]; do
       shift ;;
     --output-format)
       # Always force the streaming-messages format regardless of what the
-      # provider asked for — the final-message extraction below depends on it.
+      # provider asked for (json or PN-92's stream-json) — the final-message
+      # extraction below depends on it.
       args+=(--output-format streaming-messages-json); shift 2 ;;
+    --verbose)
+      # PN-92's streaming argv; grok has no such flag (exit 2 if passed).
+      shift ;;
+    --include-partial-messages)
+      # Grok accepts it, but this shim buffers stdout and keeps only the
+      # final result event — token deltas are dropped anyway, so skip the
+      # extra stream volume. Streaming degrades to one buffered reply here;
+      # real token streaming needs the Phase 2 native adapter.
+      shift ;;
     *) args+=("$1"); shift ;;
   esac
 done
