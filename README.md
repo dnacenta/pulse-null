@@ -184,13 +184,15 @@ The init wizard walks you through naming your entity, defining its personality, 
 
 ### LLM Providers
 
+pulse-null is not tied to Claude, and there is no baked-in default: **you choose the entity's brain in the init wizard**. The wizard preselects `claude-code` — the subscription-CLI route — but all three are one keystroke away:
+
 | Provider | Description |
 |----------|-------------|
-| `claude` | Anthropic Claude API (default) |
-| `claude-code` | Claude Code CLI integration |
-| `ollama` | Local inference via Ollama |
+| `claude-code` | Drives an agent CLI as a subprocess — no API key, uses the CLI's own auth |
+| `claude` | Anthropic Claude API — per-token billing, needs an API key |
+| `ollama` | Local inference via Ollama — fully offline |
 
-Providers are pluggable via a factory pattern — adding a new one means implementing a single trait.
+The `claude-code` provider spawns any binary that speaks the Claude Code CLI's flag convention (`-p`, `--model`, `--output-format text`), set via `llm.claude_bin`. That means it also drives other vendors' CLIs — for example xAI's Grok Build CLI behind a thin argument-translating shim — so an entity can run on a Claude, Grok, or other subscription instead of per-token API billing. Providers are pluggable via a factory pattern — adding a first-class one means implementing a single trait.
 
 ## Entity Structure
 
@@ -255,10 +257,15 @@ Each entity's directory is the source of truth. The vault provides a unified vie
 | `entity` | `owner_alias` | — | How the entity addresses you |
 | `server` | `host` | `127.0.0.1` | Bind address |
 | `server` | `port` | `3100` | Bind port |
-| `llm` | `provider` | `claude` | LLM backend (`claude`, `claude-code`, `ollama`) |
-| `llm` | `api_key` | — | API key (or use env var) |
-| `llm` | `model` | `claude-sonnet-4-20250514` | Model name |
+| `llm` | `provider` | set at init | LLM backend (`claude`, `claude-code`, `ollama`) — chosen in the wizard; a config missing the key falls back to `claude` |
+| `llm` | `api_key` | — | API key (or use env var; not needed for `claude-code`/`ollama`) |
+| `llm` | `model` | set at init | Model name, passed through to the provider — the wizard suggests a per-provider default |
 | `llm` | `max_tokens` | `4096` | Max response tokens |
+| `llm` | `base_url` | `http://localhost:11434` | API base URL (used by `ollama`) |
+| `llm` | `claude_bin` | `claude` | CLI binary for `claude-code` — any Claude-CLI-compatible binary or shim |
+| `llm` | `context_budget` | `150000` | Estimated-token ceiling before conversation compaction |
+| `llm` | `fallback_model` | — | Model retried on a usage-policy refusal (empty disables) |
+| `llm` | `fallback_on_refusal` | `true` | Master switch for the refusal fallback |
 | `security` | `secret` | — | Auth secret (enables `X-Echo-Secret` header) |
 | `security` | `injection_detection` | `true` | Prompt injection scanning |
 | `trust` | `trusted` | `["reflection", "system"]` | Channels with full access |
@@ -333,7 +340,7 @@ Response:
 ```json
 {
   "response": "I'm doing well, thanks for asking.",
-  "model": "claude-sonnet-4-20250514",
+  "model": "claude-opus-5",
   "input_tokens": 242,
   "output_tokens": 89
 }
@@ -357,9 +364,10 @@ Plugins extend the entity with new interfaces to the world. The plugin system us
 
 | Plugin | Feature Flag | Description | Status |
 |--------|-------------|-------------|--------|
-| `voice-echo` | `voice` | Phone calls via Twilio | Coming soon |
-| `discord-voice-echo` | `discord` | Discord voice bot | Coming soon |
-| `discord-echo` | `discord-text` | Discord text bot | Coming soon |
+| `voice-echo` | `voice` | Phone calls via Twilio | Available |
+| `discord-echo` | `discord-text` | Discord text bot | Available — running in production |
+
+Discord *voice* is handled by a separate sidecar binary (`discord-voice-echo`), not a feature flag.
 
 Enable plugins via Cargo feature flags:
 
@@ -374,7 +382,7 @@ cargo build --release --features all-plugins
 ## Prerequisites
 
 - [Rust](https://rustup.rs/) 1.80+
-- An [Anthropic](https://console.anthropic.com/) API key (or Ollama for local inference)
+- A brain: an [Anthropic](https://console.anthropic.com/) API key, an installed agent CLI (Grok, Claude, ChatGPT — see [LLM Providers](#llm-providers)), or Ollama for local inference
 
 > **Note on toolchain:** CI lints with the **latest stable** Rust toolchain, so new clippy
 > lints land as Rust releases. Before pushing, run `rustup update stable` and CI's exact
