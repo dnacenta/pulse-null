@@ -95,7 +95,7 @@ impl AlertQueue {
         if self.alerts.is_empty() {
             return Vec::new();
         }
-        let drained: Vec<Alert> = self.alerts.drain(..).collect();
+        let drained: Vec<Alert> = std::mem::take(&mut self.alerts);
         tracing::info!("Drained {} alert(s)", drained.len());
         if let Err(e) = self.save() {
             tracing::error!("Failed to persist empty alert queue: {}", e);
