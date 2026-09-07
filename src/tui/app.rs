@@ -1,174 +1,286 @@
-use std::path::{Path, PathBuf};
-use std::sync::Arc;
-use std::time::Instant;
+//! Application state and the one render function. The loop in `mod.rs`
+//! feeds it keys, daemon updates and ticks; it decides what to draw.
 
-use tokio::sync::{Mutex, RwLock};
+use std::time::{Duration, Instant};
 
-use crate::config::Config;
-use crate::events::EventBus;
-use crate::peer::PeerClient;
-use crate::registry::EntityRegistry;
-use crate::session_store::SessionStore;
-use crate::streaming::StreamingProvider;
-use crate::tools::ToolRegistry;
+use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+use ratatui::layout::{Constraint, Layout, Rect};
+use ratatui::style::Style;
+use ratatui::text::Line;
+use ratatui::widgets::Paragraph;
+use ratatui::Frame;
+use tachyonfx::Motion as Sweep;
 
-/// Shared state accessible to all screens.
-pub struct AppContext {
-    pub config: Option<Config>,
-    pub entity_name: Option<String>,
-    pub model_name: Option<String>,
-    pub root_dir: Option<PathBuf>,
-    pub config_path: Option<PathBuf>,
-    pub provider: Option<Arc<dyn StreamingProvider>>,
-    pub tools: Option<Arc<ToolRegistry>>,
-    pub system_prompt: Option<String>,
-    pub peer_client: Option<Arc<Mutex<PeerClient>>>,
-    pub event_bus: Option<Arc<EventBus>>,
-    pub tokens_in: u32,
-    pub tokens_out: u32,
-    pub session_start: Instant,
+use super::bar::{self, BarState, DaemonState, Glyphs};
+use super::boot::Boot;
+use super::motion::{Key, Moment, Motion, MotionLevel, Palette};
+use super::pages::talk::Talk;
+use super::pane::{neighbour, Dir, PaneId};
+use super::theme::{ThemeWatcher, Tokens, BUILTIN_NAMES};
 
-    /// Session store for TUI conversation persistence.
-    pub session_store: Option<Arc<SessionStore>>,
+/// Smallest terminal the shell draws in.
+pub const MIN_COLS: u16 = 60;
+pub const MIN_ROWS: u16 = 20;
 
-    // Multi-entity state (used by comms tab for local peer auto-discovery)
-    #[allow(dead_code)]
-    pub registry: Option<Arc<RwLock<EntityRegistry>>>,
-    #[allow(dead_code)]
-    pub entity_home: Option<PathBuf>,
+/// Which top-level screen is showing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Screen {
+    Boot,
+    Talk,
 }
 
-impl AppContext {
-    /// Create context for single-entity mode (existing behavior).
+/// What the loop should do after a key.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Action {
+    None,
+    Quit,
+}
+
+pub struct App {
+    pub screen: Screen,
+    pub focus: PaneId,
+    pub fullscreen: bool,
+    pub bar: BarState,
+    pub glyphs: Glyphs,
+    pub theme: ThemeWatcher,
+    pub motion: Motion,
+    pub boot: Boot,
+    pub talk: Talk,
+    pub owner: String,
+    tick: u64,
+    last_frame: Instant,
+    /// Index into `BUILTIN_NAMES` for the temporary theme-cycle key.
+    theme_cycle: usize,
+    /// The area the last frame was drawn in, for effect targeting.
+    last_area: Rect,
+    /// Screen to show once the boot dissolve has finished.
+    pending: Option<Screen>,
+}
+
+impl App {
+    #[must_use]
     pub fn new(
-        config: Option<Config>,
-        root_dir: Option<PathBuf>,
-        provider: Option<Arc<dyn StreamingProvider>>,
-        tools: Option<Arc<ToolRegistry>>,
-        system_prompt: Option<String>,
-        event_bus: Option<Arc<EventBus>>,
+        entity: &str,
+        model: &str,
+        owner: &str,
+        theme: ThemeWatcher,
+        motion_level: MotionLevel,
+        glyphs: Glyphs,
     ) -> Self {
-        let entity_name = config.as_ref().map(|c| c.entity.name.clone());
-        let model_name = config.as_ref().map(|c| c.llm.model.clone());
-
-        let peer_client = config.as_ref().map(|c| {
-            Arc::new(Mutex::new(PeerClient::new(
-                c.peers.clone(),
-                c.entity.name.clone(),
-            )))
-        });
-
-        let config_path = Config::find_config().ok();
-
         Self {
-            config,
-            entity_name,
-            model_name,
-            root_dir,
-            config_path,
-            provider,
-            tools,
-            system_prompt,
-            peer_client,
-            event_bus,
-            session_store: None,
-            tokens_in: 0,
-            tokens_out: 0,
-            session_start: Instant::now(),
-            registry: None,
-            entity_home: None,
+            screen: Screen::Boot,
+            focus: PaneId::Prompt,
+            fullscreen: false,
+            bar: BarState::new(entity, model),
+            glyphs,
+            theme,
+            motion: Motion::new(motion_level),
+            boot: Boot::new("connecting to the daemon"),
+            talk: Talk,
+            owner: owner.to_string(),
+            tick: 0,
+            last_frame: Instant::now(),
+            theme_cycle: 0,
+            last_area: Rect::default(),
+            pending: None,
         }
     }
 
-    /// Create context for multi-entity mode (no entity selected yet).
-    pub fn new_multi(registry: Arc<RwLock<EntityRegistry>>, entity_home: PathBuf) -> Self {
-        Self {
-            config: None,
-            entity_name: None,
-            model_name: None,
-            root_dir: None,
-            config_path: None,
-            provider: None,
-            tools: None,
-            system_prompt: None,
-            peer_client: None,
-            event_bus: None,
-            session_store: None,
-            tokens_in: 0,
-            tokens_out: 0,
-            session_start: Instant::now(),
-            registry: Some(registry),
-            entity_home: Some(entity_home),
+    fn palette(&self) -> Palette {
+        let t = self.theme.tokens();
+        Palette {
+            ground: t.ground,
+            ink: t.ink,
+            dim: t.dim,
+            accent: t.accent,
         }
     }
 
-    /// Load entity-specific state into the context.
-    pub fn load_entity(
-        &mut self,
-        config: &Config,
-        root_dir: &Path,
-    ) -> Result<(), Box<dyn std::error::Error>> {
-        let provider = crate::providers::create_streaming_provider(config)?;
-        let provider: Arc<dyn StreamingProvider> = Arc::from(provider);
-
-        let system_prompt =
-            crate::server::prompt::build_system_prompt(root_dir, config, None, None)?;
-
-        let mut tools = ToolRegistry::new();
-        tools.register(Box::new(crate::tools::file_read::FileReadTool::new(
-            root_dir.to_path_buf(),
-        )));
-        tools.register(Box::new(crate::tools::file_write::FileWriteTool::new(
-            root_dir.to_path_buf(),
-        )));
-        tools.register(Box::new(crate::tools::file_list::FileListTool::new(
-            root_dir.to_path_buf(),
-        )));
-        tools.register(Box::new(crate::tools::grep::GrepTool::new(
-            root_dir.to_path_buf(),
-        )));
-        tools.register(Box::new(crate::tools::web_fetch::WebFetchTool::new()));
-        if config.graph.enabled {
-            tools.register(Box::new(crate::tools::graph_query::GraphQueryTool::new(
-                root_dir.to_path_buf(),
-            )));
+    /// The daemon answered: dissolve the boot screen, then show Talk.
+    pub fn attached(&mut self) {
+        if self.screen == Screen::Boot && self.pending.is_none() {
+            self.bar.daemon = DaemonState::Connected;
+            self.motion
+                .add(Key::Boot, Moment::BootOut, self.last_area, self.palette());
+            self.pending = Some(Screen::Talk);
+            if !self.motion.has(&Key::Boot) {
+                // Motion is off or reduced dropped it: switch now.
+                self.switch_pending();
+            }
         }
-
-        let peer_client = Arc::new(Mutex::new(PeerClient::new(
-            config.peers.clone(),
-            config.entity.name.clone(),
-        )));
-
-        self.config = Some(config.clone());
-        self.entity_name = Some(config.entity.name.clone());
-        self.model_name = Some(config.llm.model.clone());
-        self.root_dir = Some(root_dir.to_path_buf());
-        self.config_path = Some(root_dir.join("pulse-null.toml"));
-        self.provider = Some(provider);
-        self.tools = Some(Arc::new(tools));
-        self.system_prompt = Some(system_prompt);
-        self.peer_client = Some(peer_client);
-        self.tokens_in = 0;
-        self.tokens_out = 0;
-        self.session_start = Instant::now();
-
-        Ok(())
     }
 
-    /// Clear entity-specific state (when returning to welcome screen).
-    pub fn unload_entity(&mut self) {
-        self.config = None;
-        self.entity_name = None;
-        self.model_name = None;
-        self.root_dir = None;
-        self.config_path = None;
-        self.provider = None;
-        self.tools = None;
-        self.system_prompt = None;
-        self.peer_client = None;
-        self.event_bus = None;
-        self.session_store = None;
-        self.tokens_in = 0;
-        self.tokens_out = 0;
+    /// Complete a screen change that was waiting on the boot dissolve.
+    fn switch_pending(&mut self) {
+        if let Some(next) = self.pending.take() {
+            self.screen = next;
+            self.motion.add(
+                Key::Page,
+                Moment::PageSweep(Sweep::LeftToRight),
+                self.last_area,
+                self.palette(),
+            );
+        }
+    }
+
+    /// Start the boot coalesce once the first frame has a real area.
+    pub fn boot_started(&mut self, area: Rect) {
+        self.motion.add(
+            Key::Boot,
+            Moment::BootIn,
+            Boot::logo_area(area),
+            self.palette(),
+        );
+    }
+
+    /// Periodic tick from the loop (spinner, aurora).
+    pub fn tick(&mut self) {
+        self.tick = self.tick.wrapping_add(1);
+        if self.screen == Screen::Boot {
+            self.boot.tick();
+        }
+    }
+
+    /// Theme poll result: crossfade from the previous palette.
+    pub fn theme_changed(&mut self, previous: Tokens) {
+        self.motion.add(
+            Key::Theme,
+            Moment::ThemeFade {
+                from_ink: previous.ink,
+                from_ground: previous.ground,
+            },
+            self.last_area,
+            self.palette(),
+        );
+    }
+
+    pub fn on_key(&mut self, key: KeyEvent) -> Action {
+        if key.kind != KeyEventKind::Press {
+            return Action::None;
+        }
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        match (key.code, ctrl) {
+            (KeyCode::Char('c'), true) | (KeyCode::Char('q'), false) => return Action::Quit,
+            (KeyCode::Char('h'), true) => self.move_focus(Dir::Left),
+            (KeyCode::Char('j'), true) => self.move_focus(Dir::Down),
+            (KeyCode::Char('k'), true) => self.move_focus(Dir::Up),
+            (KeyCode::Char('l'), true) => self.move_focus(Dir::Right),
+            (KeyCode::Char('f'), false) => self.fullscreen = !self.fullscreen,
+            // Temporary until `:theme` lands: cycle the built-in palettes.
+            (KeyCode::Char('T'), false) => {
+                self.theme_cycle = (self.theme_cycle + 1) % BUILTIN_NAMES.len();
+                let before = self.theme.tokens();
+                if self.theme.set_builtin(BUILTIN_NAMES[self.theme_cycle]) {
+                    self.theme_changed(before);
+                }
+            }
+            _ => {}
+        }
+        Action::None
+    }
+
+    fn move_focus(&mut self, dir: Dir) {
+        if self.screen != Screen::Talk || self.fullscreen {
+            return;
+        }
+        let panes = Talk::layout(self.content_area(self.last_area));
+        let next = neighbour(self.focus, dir, &panes);
+        if next != self.focus {
+            self.focus = next;
+            if let Some(&(_, rect)) = panes.iter().find(|(id, _)| *id == next) {
+                self.motion
+                    .add(Key::Focus, Moment::Focus, rect, self.palette());
+            }
+        }
+    }
+
+    /// Everything between the bar and the hints.
+    fn content_area(&self, area: Rect) -> Rect {
+        if self.fullscreen {
+            return area;
+        }
+        let [_, content, _] = Layout::vertical([
+            Constraint::Length(1),
+            Constraint::Fill(1),
+            Constraint::Length(1),
+        ])
+        .areas(area);
+        content
+    }
+
+    fn hints(&self) -> Vec<(&'static str, &'static str)> {
+        match self.screen {
+            Screen::Boot => vec![("q", "quit")],
+            Screen::Talk => vec![
+                ("Ctrl+hjkl", "focus"),
+                ("f", "fullscreen"),
+                ("T", "cycle theme"),
+                ("q", "quit"),
+            ],
+        }
+    }
+
+    /// Draw one frame and run the effects over it.
+    pub fn render(&mut self, frame: &mut Frame) {
+        let area = frame.area();
+        let t = self.theme.tokens();
+        let elapsed = self.last_frame.elapsed();
+        self.last_frame = Instant::now();
+        let first_frame = self.last_area == Rect::default();
+        self.last_area = area;
+
+        frame.render_widget(
+            Paragraph::new("").style(Style::default().bg(t.ground)),
+            area,
+        );
+
+        if area.width < MIN_COLS || area.height < MIN_ROWS {
+            let msg = format!(
+                "terminal is {}×{}; pulse-null needs at least {MIN_COLS}×{MIN_ROWS}",
+                area.width, area.height
+            );
+            frame.render_widget(
+                Paragraph::new(Line::from(msg)).style(Style::default().fg(t.warn).bg(t.ground)),
+                Rect::new(area.x, area.y, area.width, 1),
+            );
+            return;
+        }
+
+        match self.screen {
+            Screen::Boot => {
+                if first_frame {
+                    self.boot_started(area);
+                }
+                if self.pending.is_some() && !self.motion.has(&Key::Boot) {
+                    // The dissolve finished on the previous frame.
+                    self.switch_pending();
+                    self.render(frame);
+                    return;
+                }
+                self.boot.render(frame, area, t, self.tick);
+            }
+            Screen::Talk => {
+                if self.fullscreen {
+                    self.talk.render(frame, area, self.focus, t, &self.owner);
+                } else {
+                    let [top, content, bottom] = Layout::vertical([
+                        Constraint::Length(1),
+                        Constraint::Fill(1),
+                        Constraint::Length(1),
+                    ])
+                    .areas(area);
+                    bar::draw_top(frame, top, &self.bar, &[("talk", true)], t, self.glyphs);
+                    self.talk.render(frame, content, self.focus, t, &self.owner);
+                    bar::draw_hints(frame, bottom, &self.hints(), t);
+                }
+            }
+        }
+
+        self.motion.process(elapsed, frame.buffer_mut(), area);
+    }
+
+    /// Called by the loop after `draw` returns.
+    pub fn frame_done(&mut self, took: Duration) {
+        self.motion.record_frame(took);
     }
 }

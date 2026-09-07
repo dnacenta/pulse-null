@@ -347,6 +347,8 @@ pub fn archive_quarantine(
 
 /// Archive a comms (peer-to-peer) conversation transcript.
 /// Takes (entity_name, text) pairs and writes to the shared conversation archive.
+/// Consumed again by `/api/comms` in PN-102 phase 4.
+#[allow(dead_code)]
 pub fn archive_comms_conversation(
     root_dir: &Path,
     messages: &[(String, String)],

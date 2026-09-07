@@ -151,6 +151,7 @@ mod tests {
             system_prompt_budget: crate::config::SystemPromptBudgetConfig::default(),
             peers: std::collections::HashMap::new(),
             plugins: std::collections::HashMap::new(),
+            tui: crate::config::TuiConfig::default(),
         };
         let session_store = crate::session_store::SessionStore::new(
             &root_dir,
@@ -328,6 +329,7 @@ mod tests {
             system_prompt_budget: crate::config::SystemPromptBudgetConfig::default(),
             peers,
             plugins: std::collections::HashMap::new(),
+            tui: crate::config::TuiConfig::default(),
         };
         let session_store = crate::session_store::SessionStore::new(
             &root_dir,

@@ -54,7 +54,7 @@ fn default_channel() -> String {
 }
 
 /// Maximum number of tool-use round trips before we force a text response.
-const MAX_TOOL_ROUNDS: u32 = 25;
+const MAX_TOOL_ROUNDS: u32 = tool_loop::DEFAULT_MAX_TOOL_ROUNDS;
 
 /// Maximum number of refusal-fallback invocations per session (SEC-002).
 /// Once reached, further refusals take the ordinary rollback + error path

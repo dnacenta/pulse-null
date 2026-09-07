@@ -205,6 +205,7 @@ fn test_config() -> Config {
         system_prompt_budget: crate::config::SystemPromptBudgetConfig::default(),
         peers: HashMap::new(),
         plugins: HashMap::new(),
+        tui: crate::config::TuiConfig::default(),
     }
 }
 

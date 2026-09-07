@@ -1141,21 +1141,6 @@ impl SessionStore {
         snapshots
     }
 
-    /// Replace a session's messages and persist the change.
-    ///
-    /// Used by the TUI to sync its conversation back into the session store
-    /// after each completion. The session is marked dirty so it will be
-    /// flushed to disk on the next persist cycle.
-    pub async fn update_messages(&self, key: &str, messages: Vec<Message>) {
-        if let Some(session_arc) = self.get_existing_by_key(key).await {
-            let mut session = session_arc.write().await;
-            session.data.message_count = session.data.message_count.max(messages.len());
-            session.data.messages = messages;
-            session.data.last_active = Utc::now();
-            session.mark_dirty();
-        }
-    }
-
     /// Get the total number of active sessions.
     pub async fn count(&self) -> usize {
         self.sessions.read().await.len()
@@ -1496,39 +1481,6 @@ mod tests {
         let peers = std::collections::HashMap::new();
         let key = resolve_sender("discord", Some("stranger"), &owner, &peers);
         assert_eq!(key, "guest:stranger");
-    }
-
-    #[tokio::test]
-    async fn update_messages_replaces_and_marks_dirty() {
-        let store = SessionStore::new(
-            std::path::Path::new("/tmp/pulse-test-update-msgs"),
-            &crate::config::SessionConfig::default(),
-            "test-entity",
-        )
-        .await;
-
-        // Create a session first
-        let session = store.get_or_create_by_key("owner", "tui", "D").await;
-        {
-            let s = session.read().await;
-            assert!(s.data.messages.is_empty());
-        }
-
-        // Update messages
-        let msgs = vec![Message {
-            role: Role::User,
-            content: MessageContent::Text("hello".into()),
-            source: Some(MessageSource::Human {
-                channel: "tui".into(),
-                sender: "owner".into(),
-            }),
-        }];
-        store.update_messages("owner", msgs).await;
-
-        // Verify
-        let s = session.read().await;
-        assert_eq!(s.data.messages.len(), 1);
-        assert!(s.dirty);
     }
 
     fn user_msg(text: &str) -> Message {

@@ -134,6 +134,7 @@ impl WalWriter {
 
     /// Append a message to the session's WAL on the trunk lane. Creates the
     /// file if needed. Uses O_APPEND for atomicity on single writes.
+    #[cfg(test)]
     pub fn append(
         &self,
         session_key: &str,

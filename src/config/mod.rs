@@ -29,6 +29,9 @@ pub struct Config {
     pub autonomy: AutonomyConfig,
     #[serde(default)]
     pub pulse: PulseConfig,
+    /// Terminal UI look and motion (PN-102).
+    #[serde(default)]
+    pub tui: TuiConfig,
     #[serde(default)]
     pub graph: GraphConfig,
     #[serde(default)]
@@ -1087,6 +1090,36 @@ impl Default for SystemPromptBudgetConfig {
     }
 }
 
+/// Terminal UI configuration (PN-102).
+///
+/// ```toml
+/// [tui]
+/// theme = "system"      # "system" follows Omarchy; or a built-in name
+/// motion = "full"       # full | reduced | off
+/// nerd_font = "auto"    # auto | on | off
+/// ```
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct TuiConfig {
+    /// `"system"` reads the Omarchy current theme (falling back to
+    /// `tokyo-night`); any other value names a built-in palette.
+    pub theme: String,
+    /// `"full"`, `"reduced"` or `"off"`.
+    pub motion: String,
+    /// `"auto"`, `"on"` or `"off"` — whether to draw Nerd Font glyphs.
+    pub nerd_font: String,
+}
+
+impl Default for TuiConfig {
+    fn default() -> Self {
+        Self {
+            theme: "system".to_string(),
+            motion: "full".to_string(),
+            nerd_font: "auto".to_string(),
+        }
+    }
+}
+
 /// Configuration for caliber-echo outcome tracking
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
@@ -1155,6 +1188,7 @@ pub mod test_support {
             system_prompt_budget: SystemPromptBudgetConfig::default(),
             peers: HashMap::new(),
             plugins: HashMap::new(),
+            tui: TuiConfig::default(),
         }
     }
 }

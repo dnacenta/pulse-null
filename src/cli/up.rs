@@ -14,7 +14,8 @@ pub async fn run(headless: bool) -> Result<(), Box<dyn std::error::Error>> {
     }
 }
 
-/// Single-entity mode: unchanged behavior.
+/// Single-entity mode. Headless runs the daemon in the foreground; otherwise
+/// the TUI attaches to a running daemon or starts one in-process (PN-102).
 async fn run_single_entity(headless: bool) -> Result<(), Box<dyn std::error::Error>> {
     let config = Config::load()?;
 
@@ -28,43 +29,24 @@ async fn run_single_entity(headless: bool) -> Result<(), Box<dyn std::error::Err
         return server::start(config).await;
     }
 
-    let provider = crate::providers::create_streaming_provider(&config)?;
-    let provider: Arc<dyn crate::streaming::StreamingProvider> = Arc::from(provider);
-
-    let root_dir = config.root_dir()?;
-    let system_prompt = crate::server::prompt::build_system_prompt(&root_dir, &config, None, None)?;
-
-    let mut tools = crate::tools::ToolRegistry::new();
-    tools.register(Box::new(crate::tools::file_read::FileReadTool::new(
-        root_dir.clone(),
-    )));
-    tools.register(Box::new(crate::tools::file_write::FileWriteTool::new(
-        root_dir.clone(),
-    )));
-    tools.register(Box::new(crate::tools::file_list::FileListTool::new(
-        root_dir.clone(),
-    )));
-    tools.register(Box::new(crate::tools::grep::GrepTool::new(
-        root_dir.clone(),
-    )));
-    tools.register(Box::new(crate::tools::web_fetch::WebFetchTool::new()));
-    let tools = Arc::new(tools);
-
-    crate::tui::run(
-        Some(&config),
-        Some(&root_dir),
-        Some(provider),
-        Some(tools),
-        Some(&system_prompt),
-    )
-    .await
+    crate::tui::run(config).await
 }
 
-/// Multi-entity mode: discover, boot all, show welcome screen.
+/// Multi-entity mode: discover and boot every entity. Headless only — the
+/// multi-entity TUI was removed in PN-102; run `pulse-null up` inside one
+/// entity directory for the interactive shell.
 async fn run_multi_entity(
     headless: bool,
     entity_home: PathBuf,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    if !headless {
+        return Err(format!(
+            "{} holds several entities. Run `pulse-null up --headless` here, or `pulse-null up` inside one entity directory for the TUI.",
+            entity_home.display()
+        )
+        .into());
+    }
+
     let discovered = crate::discovery::discover_entities(&entity_home);
 
     tracing::info!(
@@ -108,20 +90,10 @@ async fn run_multi_entity(
         }
     }
 
-    if headless {
-        let count = registry.read().await.count();
-        tracing::info!("{} entity(ies) running in headless mode", count);
-        tokio::signal::ctrl_c().await?;
-        tracing::info!("Shutting down all entities...");
-        registry.write().await.shutdown_all().await;
-        return Ok(());
-    }
-
-    // Launch TUI with welcome screen
-    crate::tui::run_multi(Arc::clone(&registry), entity_home).await?;
-
-    // Shutdown all entities on TUI exit
+    let count = registry.read().await.count();
+    tracing::info!("{} entity(ies) running in headless mode", count);
+    tokio::signal::ctrl_c().await?;
+    tracing::info!("Shutting down all entities...");
     registry.write().await.shutdown_all().await;
-
     Ok(())
 }

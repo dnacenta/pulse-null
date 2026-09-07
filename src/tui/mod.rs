@@ -1,773 +1,278 @@
+//! The terminal UI (v2, PN-102): a client of the running daemon.
+//!
+//! `run` attaches to the daemon named in the config, or starts one in this
+//! process when none answers, then drives an event-driven render loop: it
+//! draws only when a key, a daemon event, a theme change or a running effect
+//! says something changed.
+
 pub mod app;
-pub mod screens;
-pub mod tabs;
+pub mod bar;
+pub mod boot;
+pub mod client;
+pub mod motion;
+pub mod pages;
+pub mod pane;
+pub mod text;
 pub mod theme;
-pub mod widgets;
 
-use std::io;
-use std::path::{Path, PathBuf};
-use std::sync::Arc;
-use std::time::Duration;
+use std::io::Write as _;
+use std::time::{Duration, Instant};
 
-use crossterm::event::{self, Event, MouseEventKind};
+use crossterm::event::{Event, EventStream, KeyboardEnhancementFlags};
 use crossterm::execute;
-use crossterm::terminal::{self, EnterAlternateScreen, LeaveAlternateScreen};
-use ratatui::backend::CrosstermBackend;
-use ratatui::layout::Rect;
-use ratatui::Terminal;
-use tokio::sync::RwLock;
-use tokio_stream::StreamExt;
+use tokio_stream::StreamExt as _;
 
 use crate::config::Config;
-use crate::registry::EntityRegistry;
-use crate::session_store::SessionStore;
-use crate::streaming::StreamingProvider;
-use crate::tools::ToolRegistry;
 
-use app::AppContext;
-use screens::main_screen::MainScreen;
-use screens::splash::SplashScreen;
-use screens::welcome::WelcomeScreen;
-use screens::wizard::WizardScreen;
-use screens::{AppScreen, Screen, ScreenAction};
+use app::{Action, App};
+use bar::{DaemonState, Glyphs};
+use client::Client;
+use motion::MotionLevel;
+use theme::ThemeWatcher;
 
-/// Launch the full TUI application (splash screen -> main workspace).
-/// Single-entity mode.
-pub async fn run(
-    config: Option<&Config>,
-    root_dir: Option<&Path>,
-    provider: Option<Arc<dyn StreamingProvider>>,
-    tools: Option<Arc<ToolRegistry>>,
-    system_prompt: Option<&str>,
-) -> Result<(), Box<dyn std::error::Error>> {
-    // Terminal setup
-    terminal::enable_raw_mode()?;
-    let mut stdout = io::stdout();
-    execute!(
-        stdout,
-        EnterAlternateScreen,
-        event::EnableBracketedPaste,
-        event::EnableMouseCapture
-    )?;
-    let backend = CrosstermBackend::new(stdout);
-    let mut terminal = Terminal::new(backend)?;
+/// The live `/api/events` stream, boxed so the loop can hold it in an `Option`.
+type LedgerStream = std::pin::Pin<
+    Box<dyn futures_core::Stream<Item = Result<client::SseEvent, client::ClientError>> + Send>,
+>;
 
-    let original_hook = std::panic::take_hook();
-    std::panic::set_hook(Box::new(move |info| {
-        let _ = terminal::disable_raw_mode();
+/// How long to wait for a daemon we started ourselves.
+const ATTACH_TIMEOUT: Duration = Duration::from_secs(10);
+/// Frame cadence while an effect is running.
+const FX_TICK: Duration = Duration::from_millis(16);
+/// Spinner / aurora cadence on the boot screen.
+const BOOT_TICK: Duration = Duration::from_millis(80);
+/// Bar refresh cadence (`/health`, `/api/dashboard`, `/api/alerts/peek`).
+const BAR_TICK: Duration = Duration::from_secs(5);
+/// Omarchy theme file poll cadence.
+const THEME_TICK: Duration = Duration::from_secs(2);
+
+/// Run the TUI for the entity described by `config`.
+pub async fn run(config: Config) -> Result<(), Box<dyn std::error::Error>> {
+    let client = Client::new(
+        &config.server.host,
+        config.server.port,
+        config.security.secret.clone(),
+    );
+
+    // Attach or spawn. The daemon owns the provider, tools and sessions;
+    // this process only ever talks to it over HTTP.
+    let mut daemon_task = None;
+    let attached_at_start = client.probe().await;
+    if !attached_at_start {
+        tracing::info!("no daemon at {}; starting one in-process", client.base());
+        let cfg = config.clone();
+        daemon_task = Some(tokio::spawn(async move {
+            if let Err(e) = crate::server::start(cfg).await {
+                tracing::error!("daemon exited with error: {e}");
+            }
+        }));
+    }
+
+    let mut terminal = ratatui::init();
+    let keyboard_enhanced = crossterm::terminal::supports_keyboard_enhancement().unwrap_or(false);
+    if keyboard_enhanced {
         let _ = execute!(
-            io::stdout(),
-            LeaveAlternateScreen,
-            event::DisableBracketedPaste,
-            event::DisableMouseCapture
-        );
-        original_hook(info);
-    }));
-
-    // Create session store if config is available (with identity for key migration)
-    let session_store = if let (Some(cfg), Some(rd)) = (config, root_dir) {
-        let store = Arc::new(
-            SessionStore::with_identity(
-                rd,
-                &cfg.sessions,
-                &cfg.entity.name,
-                &cfg.owner,
-                &cfg.peers,
+            std::io::stdout(),
+            crossterm::event::PushKeyboardEnhancementFlags(
+                KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
             )
-            .await,
         );
-        Some(store)
-    } else {
-        None
-    };
-
-    let mut ctx = AppContext::new(
-        config.cloned(),
-        root_dir.map(|p| p.to_path_buf()),
-        provider,
-        tools,
-        system_prompt.map(|s| s.to_string()),
-        None,
-    );
-    ctx.session_store = session_store.clone();
-
-    let entity_available = config.is_some();
-    let entity_name = config.map(|c| c.entity.name.as_str());
-    let owner_alias = config.map(|c| c.entity.owner_alias.as_str());
-
-    let mut current_screen = AppScreen::Splash;
-    let mut splash = SplashScreen::new(entity_available, entity_name);
-    let mut main_screen: Option<MainScreen> = None;
-    let mut wizard_screen: Option<WizardScreen> = None;
-
-    let mut events = event::EventStream::new();
-    let mut tick = tokio::time::interval(Duration::from_millis(100));
-
-    loop {
-        terminal.draw(|f| {
-            let area = f.area();
-            match current_screen {
-                AppScreen::Splash => splash.render(f, area, &ctx),
-                AppScreen::Wizard => {
-                    if let Some(ref wiz) = wizard_screen {
-                        wiz.render(f, area, &ctx);
-                    }
-                }
-                AppScreen::Main => {
-                    if let Some(ref main) = main_screen {
-                        main.render(f, area, &ctx);
-                    }
-                }
-                AppScreen::Welcome => {} // not used in single-entity mode
-            }
-        })?;
-
-        tokio::select! {
-            Some(event) = StreamExt::next(&mut events) => {
-                if let Ok(Event::Key(key)) = event {
-                    let action = match current_screen {
-                        AppScreen::Splash => splash.handle_key(key, &mut ctx),
-                        AppScreen::Wizard => {
-                            if let Some(ref mut wiz) = wizard_screen {
-                                wiz.handle_key(key, &mut ctx)
-                            } else {
-                                ScreenAction::None
-                            }
-                        }
-                        AppScreen::Main => {
-                            if let Some(ref mut main) = main_screen {
-                                main.handle_key(key, &mut ctx)
-                            } else {
-                                ScreenAction::None
-                            }
-                        }
-                        AppScreen::Welcome => ScreenAction::None,
-                    };
-
-                    match action {
-                        ScreenAction::Quit => break,
-                        ScreenAction::SwitchTo(screen) => {
-                            if screen == AppScreen::Wizard && wizard_screen.is_none() {
-                                let target = root_dir.unwrap_or(Path::new("."));
-                                wizard_screen = Some(WizardScreen::new(target));
-                            }
-                            if screen == AppScreen::Main && main_screen.is_none() {
-                                let name = entity_name.unwrap_or("entity");
-                                let alias = owner_alias.unwrap_or("you");
-                                let mut main = MainScreen::new(name, alias);
-                                if let (Some(cfg), Some(ref store)) = (config, &session_store) {
-                                    main.load_session(cfg, store).await;
-                                }
-                                main_screen = Some(main);
-                            }
-                            current_screen = screen;
-                        }
-                        ScreenAction::SwitchToEntity(_) => {} // not used in single-entity mode
-                        ScreenAction::None => {}
-                    }
-                } else if let Ok(Event::Paste(text)) = event {
-                    if current_screen == AppScreen::Main {
-                        if let Some(ref mut main) = main_screen {
-                            if main.active_tab == crate::tui::tabs::Tab::Chat {
-                                main.chat.insert_paste_text(&text);
-                            }
-                        }
-                    }
-                } else if let Ok(Event::Mouse(mouse)) = event {
-                    if current_screen == AppScreen::Main {
-                        if let Some(ref mut main) = main_screen {
-                            handle_mouse(mouse, main);
-                        }
-                    }
-                }
-            }
-            _ = tick.tick() => {
-                match current_screen {
-                    AppScreen::Splash => splash.handle_tick(&mut ctx),
-                    AppScreen::Wizard => {
-                        if let Some(ref mut wiz) = wizard_screen {
-                            wiz.handle_tick(&mut ctx);
-                        }
-                    }
-                    AppScreen::Main => {
-                        if let Some(ref mut main) = main_screen {
-                            main.handle_tick(&mut ctx);
-                        }
-                    }
-                    AppScreen::Welcome => {}
-                }
-            }
-        }
     }
+    let _ = execute!(std::io::stdout(), crossterm::event::EnableBracketedPaste);
 
-    // Cleanup terminal
-    terminal::disable_raw_mode()?;
-    execute!(
-        terminal.backend_mut(),
-        LeaveAlternateScreen,
-        event::DisableBracketedPaste,
-        event::DisableMouseCapture
-    )?;
-    let _ = std::panic::take_hook();
-
-    // Persist session store and archive session
-    if let (Some(rd), Some(cfg)) = (root_dir, config) {
-        if let Some(ref main) = main_screen {
-            // Save conversation to session store before archiving
-            if let Some(ref store) = session_store {
-                main.save_session(store).await;
-                store.persist_all().await;
-            }
-
-            if let Some(archive_path) = crate::session::end_session(
-                rd,
-                &cfg.entity.name,
-                &main.chat.conversation,
-                "tui",
-                "session-end",
-                Some("owner"),
-            ) {
-                if cfg.graph.enabled && cfg.graph.auto_ingest {
-                    let root = rd.to_path_buf();
-                    let provider_clone = ctx.provider.clone();
-                    tokio::task::spawn_blocking(move || {
-                        let rt = match tokio::runtime::Runtime::new() {
-                            Ok(rt) => rt,
-                            Err(e) => {
-                                tracing::warn!("graph ingest: failed to create runtime: {}", e);
-                                return;
-                            }
-                        };
-                        rt.block_on(async {
-                            let provider_ref: Option<&dyn pulse_system_types::llm::LmProvider> =
-                                provider_clone.as_ref().map(|p| {
-                                    p.as_ref() as &dyn pulse_system_types::llm::LmProvider
-                                });
-                            crate::session::graph_ingest_archive(
-                                &root,
-                                &archive_path,
-                                provider_ref,
-                            )
-                            .await;
-                        });
-                    });
-                }
-            }
-        }
-    }
-
-    Ok(())
-}
-
-/// Launch the TUI in multi-entity mode.
-pub async fn run_multi(
-    registry: Arc<RwLock<EntityRegistry>>,
-    entity_home: PathBuf,
-) -> Result<(), Box<dyn std::error::Error>> {
-    // Terminal setup
-    terminal::enable_raw_mode()?;
-    let mut stdout = io::stdout();
-    execute!(
-        stdout,
-        EnterAlternateScreen,
-        event::EnableBracketedPaste,
-        event::EnableMouseCapture
-    )?;
-    let backend = CrosstermBackend::new(stdout);
-    let mut terminal = Terminal::new(backend)?;
-
-    let original_hook = std::panic::take_hook();
-    std::panic::set_hook(Box::new(move |info| {
-        let _ = terminal::disable_raw_mode();
-        let _ = execute!(
-            io::stdout(),
-            LeaveAlternateScreen,
-            event::DisableBracketedPaste,
-            event::DisableMouseCapture
-        );
-        original_hook(info);
-    }));
-
-    let mut ctx = AppContext::new_multi(Arc::clone(&registry), entity_home.clone());
-
-    // Get initial entity list
-    let entities = registry.read().await.list();
-
-    let mut current_screen = AppScreen::Welcome;
-    let mut welcome = WelcomeScreen::new(entities);
-    let mut main_screen: Option<MainScreen> = None;
-    let mut wizard_screen: Option<WizardScreen> = None;
-
-    let mut events = event::EventStream::new();
-    let mut tick = tokio::time::interval(Duration::from_millis(100));
-
-    loop {
-        terminal.draw(|f| {
-            let area = f.area();
-            match current_screen {
-                AppScreen::Welcome => welcome.render(f, area, &ctx),
-                AppScreen::Wizard => {
-                    if let Some(ref wiz) = wizard_screen {
-                        wiz.render(f, area, &ctx);
-                    }
-                }
-                AppScreen::Main => {
-                    if let Some(ref main) = main_screen {
-                        main.render(f, area, &ctx);
-                    }
-                }
-                AppScreen::Splash => {} // not used in multi-entity mode
-            }
-        })?;
-
-        tokio::select! {
-            Some(event) = StreamExt::next(&mut events) => {
-                if let Ok(Event::Key(key)) = event {
-                    let action = match current_screen {
-                        AppScreen::Welcome => welcome.handle_key(key, &mut ctx),
-                        AppScreen::Wizard => {
-                            if let Some(ref mut wiz) = wizard_screen {
-                                wiz.handle_key(key, &mut ctx)
-                            } else {
-                                ScreenAction::None
-                            }
-                        }
-                        AppScreen::Main => {
-                            if let Some(ref mut main) = main_screen {
-                                main.handle_key(key, &mut ctx)
-                            } else {
-                                ScreenAction::None
-                            }
-                        }
-                        AppScreen::Splash => ScreenAction::None,
-                    };
-
-                    match action {
-                        ScreenAction::Quit => {
-                            if current_screen == AppScreen::Wizard {
-                                // ESC from wizard goes back to welcome, not full quit
-                                wizard_screen = None;
-                                let entities = registry.read().await.list();
-                                welcome.update_entities(entities);
-                                current_screen = AppScreen::Welcome;
-                            } else {
-                                break;
-                            }
-                        }
-
-                        ScreenAction::SwitchToEntity(name) => {
-                            // Load entity context
-                            let entity_info = registry.read().await.get(&name);
-                            if let Some(info) = entity_info {
-                                let config = match Config::load_from(&info.dir) {
-                                    Ok(c) => c,
-                                    Err(e) => {
-                                        tracing::error!("Failed to load config for {}: {}", name, e);
-                                        continue;
-                                    }
-                                };
-                                if let Err(e) = ctx.load_entity(&config, &info.dir) {
-                                    tracing::error!("Failed to load entity {}: {}", name, e);
-                                    continue;
-                                }
-                                // Inject local peers from registry
-                                inject_local_peers(&ctx, &registry, &name).await;
-
-                                // Create session store for this entity (with identity for key migration)
-                                let store = Arc::new(
-                                    SessionStore::with_identity(
-                                        &info.dir,
-                                        &config.sessions,
-                                        &config.entity.name,
-                                        &config.owner,
-                                        &config.peers,
-                                    )
-                                    .await,
-                                );
-                                ctx.session_store = Some(Arc::clone(&store));
-
-                                let mut main =
-                                    MainScreen::new(&config.entity.name, &config.entity.owner_alias)
-                                        .with_multi_entity(true);
-                                main.load_session(&config, &store).await;
-                                main_screen = Some(main);
-                                current_screen = AppScreen::Main;
-                            }
-                        }
-
-                        ScreenAction::SwitchTo(screen) => {
-                            match screen {
-                                AppScreen::Welcome => {
-                                    // Save session store before archiving
-                                    if let (Some(ref store), Some(ref main)) =
-                                        (&ctx.session_store, &main_screen)
-                                    {
-                                        main.save_session(store).await;
-                                        store.persist_all().await;
-                                    }
-                                    // Returning from MainScreen — archive session first
-                                    archive_current_session(&ctx, &main_screen);
-                                    ctx.unload_entity();
-                                    main_screen = None;
-                                    // Refresh entity list
-                                    let entities = registry.read().await.list();
-                                    welcome.update_entities(entities);
-                                    current_screen = AppScreen::Welcome;
-                                }
-                                AppScreen::Wizard => {
-                                    wizard_screen = Some(WizardScreen::new(&entity_home));
-                                    current_screen = AppScreen::Wizard;
-                                }
-                                AppScreen::Main if current_screen == AppScreen::Wizard => {
-                                    // Wizard completed — boot the new entity and auto-enter it
-                                    if let Some(ref wiz) = wizard_screen {
-                                        if let Some(ref created_dir) = wiz.created_dir {
-                                            match boot_and_enter(
-                                                &registry,
-                                                created_dir,
-                                                &mut ctx,
-                                                &mut main_screen,
-                                            )
-                                            .await
-                                            {
-                                                Ok(_) => {
-                                                    current_screen = AppScreen::Main;
-                                                }
-                                                Err(e) => {
-                                                    tracing::error!(
-                                                        "Failed to boot new entity: {}",
-                                                        e
-                                                    );
-                                                    let entities = registry.read().await.list();
-                                                    welcome.update_entities(entities);
-                                                    current_screen = AppScreen::Welcome;
-                                                }
-                                            }
-                                        }
-                                    }
-                                    wizard_screen = None;
-                                }
-                                _ => {
-                                    current_screen = screen;
-                                }
-                            }
-                        }
-                        ScreenAction::None => {}
-                    }
-                } else if let Ok(Event::Paste(text)) = event {
-                    if current_screen == AppScreen::Main {
-                        if let Some(ref mut main) = main_screen {
-                            if main.active_tab == crate::tui::tabs::Tab::Chat {
-                                main.chat.insert_paste_text(&text);
-                            }
-                        }
-                    }
-                } else if let Ok(Event::Mouse(mouse)) = event {
-                    if current_screen == AppScreen::Main {
-                        if let Some(ref mut main) = main_screen {
-                            handle_mouse(mouse, main);
-                        }
-                    }
-                }
-            }
-            _ = tick.tick() => {
-                match current_screen {
-                    AppScreen::Welcome => welcome.handle_tick(&mut ctx),
-                    AppScreen::Wizard => {
-                        if let Some(ref mut wiz) = wizard_screen {
-                            wiz.handle_tick(&mut ctx);
-                        }
-                    }
-                    AppScreen::Main => {
-                        if let Some(ref mut main) = main_screen {
-                            main.handle_tick(&mut ctx);
-                        }
-                    }
-                    AppScreen::Splash => {}
-                }
-            }
-        }
-    }
-
-    // Cleanup terminal
-    terminal::disable_raw_mode()?;
-    execute!(
-        terminal.backend_mut(),
-        LeaveAlternateScreen,
-        event::DisableBracketedPaste,
-        event::DisableMouseCapture
-    )?;
-    let _ = std::panic::take_hook();
-
-    // Save session store before archiving
-    if let (Some(ref store), Some(ref main)) = (&ctx.session_store, &main_screen) {
-        main.save_session(store).await;
-        store.persist_all().await;
-    }
-
-    // Archive current entity session if active
-    archive_current_session(&ctx, &main_screen);
-
-    Ok(())
-}
-
-/// Archive the current entity's chat session before switching.
-/// Also triggers graph ingestion when enabled.
-fn archive_current_session(ctx: &AppContext, main_screen: &Option<MainScreen>) {
-    if let (Some(rd), Some(cfg), Some(ref main)) = (&ctx.root_dir, &ctx.config, main_screen) {
-        if let Some(archive_path) = crate::session::end_session(
-            rd,
-            &cfg.entity.name,
-            &main.chat.conversation,
-            "tui",
-            "entity-switch",
-            Some("owner"),
-        ) {
-            if cfg.graph.enabled && cfg.graph.auto_ingest {
-                let root = rd.to_path_buf();
-                let provider_clone = ctx.provider.clone();
-                tokio::task::spawn_blocking(move || {
-                    let rt = match tokio::runtime::Runtime::new() {
-                        Ok(rt) => rt,
-                        Err(e) => {
-                            tracing::warn!("graph ingest: failed to create runtime: {}", e);
-                            return;
-                        }
-                    };
-                    rt.block_on(async {
-                        let provider_ref: Option<&dyn pulse_system_types::llm::LmProvider> =
-                            provider_clone
-                                .as_ref()
-                                .map(|p| p.as_ref() as &dyn pulse_system_types::llm::LmProvider);
-                        crate::session::graph_ingest_archive(&root, &archive_path, provider_ref)
-                            .await;
-                    });
-                });
-            }
-        }
-    }
-}
-
-/// Boot a newly created entity and enter its TUI.
-async fn boot_and_enter(
-    registry: &Arc<RwLock<EntityRegistry>>,
-    created_dir: &Path,
-    ctx: &mut AppContext,
-    main_screen: &mut Option<MainScreen>,
-) -> Result<(), Box<dyn std::error::Error>> {
-    let config = Config::load_from(created_dir)?;
-    let port = registry.write().await.next_port();
-
-    let booted =
-        crate::server::boot::boot_entity(config.clone(), created_dir.to_path_buf(), port).await?;
-
-    let entity_name = config.entity.name.clone();
-    let owner_alias = config.entity.owner_alias.clone();
-
-    registry
-        .write()
-        .await
-        .register(crate::registry::RunningEntity {
-            name: entity_name.clone(),
-            dir: created_dir.to_path_buf(),
-            config: config.clone(),
-            port: booted.actual_port,
-            server_handle: booted.server_handle,
-            coordinator: booted.coordinator,
-            event_bus: booted.event_bus,
-            persist_coordinator: booted.persist_coordinator,
-        });
-
-    ctx.load_entity(&config, created_dir)?;
-    inject_local_peers(ctx, registry, &entity_name).await;
-    *main_screen = Some(MainScreen::new(&entity_name, &owner_alias).with_multi_entity(true));
-
-    tracing::info!(
-        "Booted and entered entity \"{}\" on :{}",
-        entity_name,
-        booted.actual_port
-    );
-    Ok(())
-}
-
-/// Inject local entities as peers in the current entity's PeerClient.
-async fn inject_local_peers(
-    ctx: &AppContext,
-    registry: &Arc<RwLock<EntityRegistry>>,
-    current_entity: &str,
-) {
-    if let Some(ref peer_client) = ctx.peer_client {
-        let entities = registry.read().await.list();
-        let mut client = peer_client.lock().await;
-        for entity in entities {
-            if entity.name != current_entity {
-                client.add_local_peer(entity.name, entity.port);
-            }
-        }
-    }
-}
-
-/// Launch directly into chat (skip splash). Used by `pulse-null chat`.
-pub async fn run_chat(
-    config: &Config,
-    root_dir: &Path,
-    provider: Arc<dyn StreamingProvider>,
-    tools: Arc<ToolRegistry>,
-    system_prompt: &str,
-    session_store: Arc<SessionStore>,
-) -> Result<(), Box<dyn std::error::Error>> {
-    terminal::enable_raw_mode()?;
-    let mut stdout = io::stdout();
-    execute!(
-        stdout,
-        EnterAlternateScreen,
-        event::EnableBracketedPaste,
-        event::EnableMouseCapture
-    )?;
-    let backend = CrosstermBackend::new(stdout);
-    let mut terminal = Terminal::new(backend)?;
-
-    let original_hook = std::panic::take_hook();
-    std::panic::set_hook(Box::new(move |info| {
-        let _ = terminal::disable_raw_mode();
-        let _ = execute!(
-            io::stdout(),
-            LeaveAlternateScreen,
-            event::DisableBracketedPaste,
-            event::DisableMouseCapture
-        );
-        original_hook(info);
-    }));
-
-    let event_bus = Arc::new(crate::events::EventBus::new(64));
-
-    let mut ctx = AppContext::new(
-        Some(config.clone()),
-        Some(root_dir.to_path_buf()),
-        Some(provider),
-        Some(tools),
-        Some(system_prompt.to_string()),
-        Some(Arc::clone(&event_bus)),
-    );
-    ctx.session_store = Some(Arc::clone(&session_store));
-
-    // Load session and initialize chat with persisted conversation
-    let mut main = MainScreen::new(&config.entity.name, &config.entity.owner_alias);
-    main.load_session(config, &session_store).await;
-
-    let mut events = event::EventStream::new();
-    let mut tick = tokio::time::interval(Duration::from_millis(100));
-
-    loop {
-        terminal.draw(|f| main.render(f, f.area(), &ctx))?;
-
-        tokio::select! {
-            Some(event) = StreamExt::next(&mut events) => {
-                if let Ok(Event::Key(key)) = event {
-                    if let ScreenAction::Quit = main.handle_key(key, &mut ctx) { break }
-                } else if let Ok(Event::Paste(text)) = event {
-                    if main.active_tab == crate::tui::tabs::Tab::Chat {
-                        main.chat.insert_paste_text(&text);
-                    }
-                } else if let Ok(Event::Mouse(mouse)) = event {
-                    handle_mouse(mouse, &mut main);
-                }
-            }
-            _ = tick.tick() => {
-                main.handle_tick(&mut ctx);
-            }
-        }
-    }
-
-    terminal::disable_raw_mode()?;
-    execute!(
-        terminal.backend_mut(),
-        LeaveAlternateScreen,
-        event::DisableBracketedPaste,
-        event::DisableMouseCapture
-    )?;
-    let _ = std::panic::take_hook();
-
-    // Persist session store before archiving
-    main.save_session(&session_store).await;
-    session_store.persist_all().await;
-
-    if let Some(archive_path) = crate::session::end_session(
-        root_dir,
+    let mut app = App::new(
         &config.entity.name,
-        &main.chat.conversation,
-        "tui",
-        "session-end",
-        Some("owner"),
-    ) {
-        if config.graph.enabled && config.graph.auto_ingest {
-            let root = root_dir.to_path_buf();
-            let provider_clone = ctx.provider.clone();
-            tokio::task::spawn_blocking(move || {
-                let rt = match tokio::runtime::Runtime::new() {
-                    Ok(rt) => rt,
-                    Err(e) => {
-                        tracing::warn!("graph ingest: failed to create runtime: {}", e);
-                        return;
-                    }
-                };
-                rt.block_on(async {
-                    let provider_ref: Option<&dyn pulse_system_types::llm::LmProvider> =
-                        provider_clone
-                            .as_ref()
-                            .map(|p| p.as_ref() as &dyn pulse_system_types::llm::LmProvider);
-                    crate::session::graph_ingest_archive(&root, &archive_path, provider_ref).await;
-                });
-            });
+        &config.llm.model,
+        &config.entity.owner_alias,
+        ThemeWatcher::from_setting(&config.tui.theme),
+        MotionLevel::parse(&config.tui.motion),
+        Glyphs::from_setting(&config.tui.nerd_font),
+    );
+    if !attached_at_start {
+        app.boot.status = "starting the daemon".to_string();
+    }
+
+    let result = event_loop(&mut terminal, &mut app, &client, attached_at_start).await;
+
+    if keyboard_enhanced {
+        let _ = execute!(
+            std::io::stdout(),
+            crossterm::event::PopKeyboardEnhancementFlags
+        );
+    }
+    let _ = execute!(std::io::stdout(), crossterm::event::DisableBracketedPaste);
+    ratatui::restore();
+
+    // We started the daemon: shut it down the way systemd would, so sessions
+    // archive and the pidfile is removed. The handler tokio installed in
+    // `server::start` turns the signal into a graceful shutdown.
+    if let Some(task) = daemon_task {
+        // SAFETY: raise() is async-signal-safe and only delivers SIGTERM to
+        // this process, whose handler is already installed by the daemon task.
+        unsafe {
+            libc::raise(libc::SIGTERM);
+        }
+        match tokio::time::timeout(Duration::from_secs(40), task).await {
+            Ok(_) => tracing::info!("in-process daemon stopped"),
+            Err(_) => tracing::warn!("in-process daemon did not stop within 40 s"),
         }
     }
 
-    Ok(())
+    result
 }
 
-/// Handle mouse events for the main screen.
-fn handle_mouse(mouse: crossterm::event::MouseEvent, main: &mut MainScreen) {
-    match mouse.kind {
-        MouseEventKind::ScrollUp => match main.active_tab {
-            tabs::Tab::Chat => main.chat.scroll_down(3),
-            tabs::Tab::Files => main.files.scroll_down(3),
-            tabs::Tab::Evolution => main.evolution.scroll_down(3),
-            tabs::Tab::Comms => main.comms.scroll_down(3),
-            _ => {}
-        },
-        MouseEventKind::ScrollDown => match main.active_tab {
-            tabs::Tab::Chat => main.chat.scroll_up(3),
-            tabs::Tab::Files => main.files.scroll_up(3),
-            tabs::Tab::Evolution => main.evolution.scroll_up(3),
-            tabs::Tab::Comms => main.comms.scroll_up(3),
-            _ => {}
-        },
-        MouseEventKind::Down(crossterm::event::MouseButton::Left) => {
-            if main.active_tab == tabs::Tab::Comms && mouse.row > 10 {
-                let term = crossterm::terminal::size().unwrap_or((80, 24));
-                let content_area = Rect::new(0, 11, term.0, term.1.saturating_sub(12));
-                main.comms
-                    .handle_mouse(mouse.row, mouse.column, content_area);
+async fn event_loop(
+    terminal: &mut ratatui::DefaultTerminal,
+    app: &mut App,
+    client: &Client,
+    mut attached: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let mut events = EventStream::new();
+    let mut fx_tick = tokio::time::interval(FX_TICK);
+    let mut boot_tick = tokio::time::interval(BOOT_TICK);
+    let mut bar_tick = tokio::time::interval(BAR_TICK);
+    let mut theme_tick = tokio::time::interval(THEME_TICK);
+    let attach_deadline = Instant::now() + ATTACH_TIMEOUT;
+    let mut probe_tick = tokio::time::interval(Duration::from_millis(250));
+    let mut dirty = true;
+
+    // Ledger stream: opened once attached; rows arrive as they happen.
+    let mut ledger: Option<LedgerStream> = None;
+    let mut last_event_id: Option<u64> = None;
+
+    if attached {
+        app.attached();
+        refresh_bar(app, client).await;
+    }
+
+    loop {
+        if dirty {
+            let started = Instant::now();
+            let _ = execute!(
+                std::io::stdout(),
+                crossterm::terminal::BeginSynchronizedUpdate
+            );
+            terminal.draw(|f| app.render(f))?;
+            let _ = execute!(
+                std::io::stdout(),
+                crossterm::terminal::EndSynchronizedUpdate
+            );
+            let _ = std::io::stdout().flush();
+            app.frame_done(started.elapsed());
+            // The frame that retires the last effect is drawn mid-effect;
+            // one more pass paints the settled state.
+            dirty = app.motion.take_settled();
+        }
+
+        if attached && ledger.is_none() {
+            match client.events(last_event_id).await {
+                Ok(s) => ledger = Some(Box::pin(s)),
+                Err(e) => tracing::warn!("ledger stream unavailable: {e}"),
             }
-            if mouse.row >= 8 && mouse.row <= 10 && !main.fullscreen {
-                let mut col_start = 2u16;
-                let col = mouse.column;
-                let mut clicked_tab = None;
-                for i in 0..tabs::Tab::COUNT {
-                    let tab = tabs::Tab::from_index(i);
-                    let label_len = tab.label().len() as u16 + 2;
-                    let col_end = col_start + label_len;
-                    if col >= col_start && col < col_end {
-                        clicked_tab = Some(tab);
-                        break;
+        }
+
+        tokio::select! {
+            ev = events.next() => {
+                match ev {
+                    Some(Ok(Event::Key(key))) => {
+                        if app.on_key(key) == Action::Quit {
+                            return Ok(());
+                        }
+                        dirty = true;
                     }
-                    col_start = col_end + 3;
+                    Some(Ok(Event::Resize(_, _))) => dirty = true,
+                    Some(Ok(_)) => {}
+                    Some(Err(e)) => return Err(e.into()),
+                    None => return Ok(()),
                 }
-                if let Some(t) = clicked_tab {
-                    main.active_tab = t;
+            }
+            row = async {
+                match ledger.as_mut() {
+                    Some(s) => s.next().await,
+                    None => std::future::pending().await,
+                }
+            } => {
+                match row {
+                    Some(Ok(ev)) => {
+                        if let Some(id) = ev.id.as_deref().and_then(|s| s.parse().ok()) {
+                            last_event_id = Some(id);
+                        }
+                        // Rows feed the Watch page in the next plan; today a
+                        // new row refreshes the alert count.
+                        refresh_bar(app, client).await;
+                        dirty = true;
+                    }
+                    Some(Err(e)) => {
+                        tracing::warn!("ledger stream error: {e}");
+                        ledger = None;
+                        app.bar.daemon = DaemonState::Unreachable;
+                        attached = false;
+                        dirty = true;
+                    }
+                    None => {
+                        ledger = None;
+                        dirty = true;
+                    }
+                }
+            }
+            _ = probe_tick.tick(), if !attached => {
+                if client.probe().await {
+                    attached = true;
+                    app.attached();
+                    refresh_bar(app, client).await;
+                    dirty = true;
+                } else if Instant::now() > attach_deadline && app.screen == app::Screen::Boot {
+                    app.boot.status = format!("no daemon at {} — still trying (q to quit)", client.base());
+                    dirty = true;
+                }
+            }
+            _ = boot_tick.tick(), if app.screen == app::Screen::Boot => {
+                app.tick();
+                dirty = true;
+            }
+            _ = fx_tick.tick(), if app.motion.is_running() => {
+                dirty = true;
+            }
+            _ = bar_tick.tick(), if attached => {
+                refresh_bar(app, client).await;
+                dirty = true;
+            }
+            _ = theme_tick.tick() => {
+                if let Some(previous) = app.theme.poll() {
+                    app.theme_changed(previous);
+                    dirty = true;
                 }
             }
         }
-        _ => {}
+    }
+}
+
+/// Pull the bar's facts from the daemon. Failures leave the last values and
+/// mark the daemon unreachable.
+async fn refresh_bar(app: &mut App, client: &Client) {
+    match client.health().await {
+        Ok(h) => {
+            app.bar.daemon = DaemonState::Connected;
+            app.bar.isolation = h["isolation"].as_bool().unwrap_or(false);
+        }
+        Err(e) => {
+            tracing::debug!("health: {e}");
+            app.bar.daemon = DaemonState::Unreachable;
+            return;
+        }
+    }
+    if let Ok(d) = client.dashboard().await {
+        // The dashboard reports "healthy" before it has enough signal frames to
+        // judge; the bar says so instead of borrowing a verdict it cannot back.
+        let ch = &d["cognitive_health"];
+        let sufficient = ch["sufficient_data"].as_bool().unwrap_or(false);
+        app.bar.health = if sufficient {
+            ch["status"].as_str().map(str::to_string)
+        } else {
+            None
+        };
+    }
+    if let Ok(n) = client.alerts_count().await {
+        app.bar.alerts = Some(n);
     }
 }

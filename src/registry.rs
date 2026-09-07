@@ -11,22 +11,17 @@ use crate::persist::PersistCoordinator;
 /// Runtime information about a single booted entity.
 pub struct RunningEntity {
     pub name: String,
+    /// Recorded for operators; nothing reads it since the Welcome screen went.
+    #[allow(dead_code)]
     pub dir: PathBuf,
     pub config: Config,
+    #[allow(dead_code)]
     pub port: u16,
     pub server_handle: JoinHandle<()>,
     pub coordinator: crate::coordinator::control::Coordinator,
     #[allow(dead_code)]
     pub event_bus: Arc<EventBus>,
     pub persist_coordinator: Arc<PersistCoordinator>,
-}
-
-/// Snapshot of an entity for display in the TUI (no handles, cheap to clone).
-#[derive(Clone, Debug)]
-pub struct EntityInfo {
-    pub name: String,
-    pub dir: PathBuf,
-    pub port: u16,
 }
 
 /// In-memory registry of all running entities.
@@ -57,30 +52,6 @@ impl EntityRegistry {
     /// Register a booted entity.
     pub fn register(&mut self, entity: RunningEntity) {
         self.entities.insert(entity.name.clone(), entity);
-    }
-
-    /// Get a sorted snapshot of all entities for TUI display.
-    pub fn list(&self) -> Vec<EntityInfo> {
-        let mut infos: Vec<EntityInfo> = self
-            .entities
-            .values()
-            .map(|e| EntityInfo {
-                name: e.name.clone(),
-                dir: e.dir.clone(),
-                port: e.port,
-            })
-            .collect();
-        infos.sort_by(|a, b| a.name.cmp(&b.name));
-        infos
-    }
-
-    /// Get entity info by name.
-    pub fn get(&self, name: &str) -> Option<EntityInfo> {
-        self.entities.get(name).map(|e| EntityInfo {
-            name: e.name.clone(),
-            dir: e.dir.clone(),
-            port: e.port,
-        })
     }
 
     /// Get the full config for a named entity.

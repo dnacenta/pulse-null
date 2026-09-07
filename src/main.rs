@@ -1,7 +1,6 @@
 use clap::{Parser, Subcommand};
 
 mod caliber;
-mod chat;
 mod claude_code_provider;
 mod claude_provider;
 mod cli;
@@ -323,16 +322,44 @@ enum ArchiveAction {
     },
 }
 
+/// Where the TUI sends its logs: stdout belongs to the screen while the TUI
+/// runs, so `pulse-null up` (without `--headless`) and `pulse-null chat` log
+/// to `logs/tui.log` under the current directory instead.
+fn open_tui_log() -> Option<std::fs::File> {
+    let dir = std::path::Path::new("logs");
+    std::fs::create_dir_all(dir).ok()?;
+    std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(dir.join("tui.log"))
+        .ok()
+}
+
 #[tokio::main]
 async fn main() {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "pulse_null=info".into()),
-        )
-        .init();
-
     let cli = Cli::parse();
+
+    let filter = tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| "pulse_null=info".into());
+    let tui_mode = matches!(
+        cli.command,
+        Commands::Up { headless: false } | Commands::Chat
+    );
+    if tui_mode {
+        match open_tui_log() {
+            Some(file) => tracing_subscriber::fmt()
+                .with_env_filter(filter)
+                .with_ansi(false)
+                .with_writer(std::sync::Arc::new(file))
+                .init(),
+            None => tracing_subscriber::fmt()
+                .with_env_filter(filter)
+                .with_writer(std::io::sink)
+                .init(),
+        }
+    } else {
+        tracing_subscriber::fmt().with_env_filter(filter).init();
+    }
 
     match cli.command {
         Commands::Init { dir } => {
