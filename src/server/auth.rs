@@ -181,6 +181,7 @@ mod tests {
             alert_queue: tokio::sync::Mutex::new(alert_queue),
             provider_status: crate::provider_status::new_shared(),
             leadership: std::sync::atomic::AtomicBool::new(false),
+            ledger: Arc::new(crate::ledger::LedgerRing::new(16)),
         })
     }
 
@@ -357,6 +358,7 @@ mod tests {
             alert_queue: tokio::sync::Mutex::new(alert_queue),
             provider_status: crate::provider_status::new_shared(),
             leadership: std::sync::atomic::AtomicBool::new(false),
+            ledger: Arc::new(crate::ledger::LedgerRing::new(16)),
         })
     }
 

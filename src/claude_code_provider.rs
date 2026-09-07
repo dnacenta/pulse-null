@@ -141,8 +141,14 @@ fn stream_invoke_args(
 pub(crate) enum StreamLine {
     /// Incremental text as the model produces it.
     Delta(String),
-    /// The terminal record, carrying the assembled reply.
-    Result { text: String, is_error: bool },
+    /// The terminal record, carrying the assembled reply and, when the CLI
+    /// reports it, the turn's token usage.
+    Result {
+        text: String,
+        is_error: bool,
+        input_tokens: Option<u32>,
+        output_tokens: Option<u32>,
+    },
     /// Structure we do not consume (tool events, init, usage records).
     Other,
 }
@@ -178,6 +184,8 @@ pub(crate) fn parse_stream_line(line: &str) -> StreamLine {
         Some("result") => StreamLine::Result {
             text: value["result"].as_str().unwrap_or("").trim().to_string(),
             is_error: value["is_error"].as_bool().unwrap_or(false),
+            input_tokens: value["usage"]["input_tokens"].as_u64().map(|v| v as u32),
+            output_tokens: value["usage"]["output_tokens"].as_u64().map(|v| v as u32),
         },
         _ => StreamLine::Other,
     }
@@ -544,6 +552,7 @@ impl StreamingProvider for ClaudeCodeProvider {
             let mut lines = BufReader::new(stdout).lines();
             let mut assembled = String::new();
             let mut terminal: Option<(String, bool)> = None;
+            let mut usage: (Option<u32>, Option<u32>) = (None, None);
 
             loop {
                 match lines.next_line().await {
@@ -552,8 +561,9 @@ impl StreamingProvider for ClaudeCodeProvider {
                             assembled.push_str(&text);
                             yield StreamEvent::TextDelta(text);
                         }
-                        StreamLine::Result { text, is_error } => {
+                        StreamLine::Result { text, is_error, input_tokens, output_tokens } => {
                             terminal = Some((text, is_error));
+                            usage = (input_tokens, output_tokens);
                         }
                         StreamLine::Other => {}
                     },
@@ -572,7 +582,7 @@ impl StreamingProvider for ClaudeCodeProvider {
                 // by exiting non-zero mid-stream; quota exhaustion and policy
                 // refusals both arrive this way.
                 Some((text, true)) => {
-                    yield StreamEvent::Error(text);
+                    yield classify_stream_failure(&model, text);
                 }
                 Some((text, false)) => {
                     // Prefer the assembled deltas; fall back to the terminal
@@ -585,10 +595,8 @@ impl StreamingProvider for ClaudeCodeProvider {
                             content: vec![ContentBlock::Text { text: final_text }],
                             stop_reason: StopReason::EndTurn,
                             model: model.clone(),
-                            // The streaming CLI reports usage in records we do
-                            // not consume; token counts stay with /chat.
-                            input_tokens: None,
-                            output_tokens: None,
+                            input_tokens: usage.0,
+                            output_tokens: usage.1,
                         });
                     }
                 }
@@ -597,8 +605,8 @@ impl StreamingProvider for ClaudeCodeProvider {
                         content: vec![ContentBlock::Text { text: assembled }],
                         stop_reason: StopReason::EndTurn,
                         model: model.clone(),
-                        input_tokens: None,
-                        output_tokens: None,
+                        input_tokens: usage.0,
+                        output_tokens: usage.1,
                     });
                 }
                 None => {
@@ -676,6 +684,21 @@ enum RefusalCheck {
     ErrorFlagButNoPolicyMatch,
     /// Not a structured refusal (non-JSON, `is_error` absent/false, etc.).
     NotRefusal,
+}
+
+/// Map a streamed terminal record with `is_error == true` to the stream event
+/// the chat handler expects: a typed [`StreamEvent::Refused`] for AUP
+/// refusals (so PN-88's fallback fires for streamed turns too), a plain
+/// [`StreamEvent::Error`] for everything else (quota, timeout, empty).
+fn classify_stream_failure(model: &str, text: String) -> StreamEvent {
+    if text.to_lowercase().contains("usage policy") {
+        StreamEvent::Refused {
+            model: model.to_string(),
+            detail: truncate(&text, 500).to_string(),
+        }
+    } else {
+        StreamEvent::Error(text)
+    }
 }
 
 /// Classify a non-zero-exit stdout body as an AUP refusal or a plain error.
@@ -804,20 +827,53 @@ mod tests {
     }
 
     #[test]
+    fn stream_result_carries_usage_when_present() {
+        let line = r#"{"type":"result","subtype":"success","is_error":false,"result":"hi","usage":{"input_tokens":120,"output_tokens":7}}"#;
+        match parse_stream_line(line) {
+            StreamLine::Result {
+                input_tokens,
+                output_tokens,
+                ..
+            } => {
+                assert_eq!(input_tokens, Some(120));
+                assert_eq!(output_tokens, Some(7));
+            }
+            other => panic!("expected result, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn stream_failure_with_policy_text_is_a_typed_refusal() {
+        match classify_stream_failure("m", "This request violates our Usage Policy.".into()) {
+            StreamEvent::Refused { model, detail } => {
+                assert_eq!(model, "m");
+                assert!(detail.contains("Usage Policy"));
+            }
+            other => panic!("expected Refused, got {other:?}"),
+        }
+        assert!(matches!(
+            classify_stream_failure("m", "You're out of extra usage".into()),
+            StreamEvent::Error(_)
+        ));
+    }
+
+    #[test]
     fn stream_result_carries_text_and_error_flag() {
         let ok = r#"{"type":"result","subtype":"success","result":"  done  ","is_error":false}"#;
         assert_eq!(
             parse_stream_line(ok),
             StreamLine::Result {
                 text: "done".to_string(),
-                is_error: false
+                is_error: false,
+                input_tokens: None,
+                output_tokens: None,
             }
         );
 
         // How quota exhaustion actually arrives — observed live 2026-08-13.
         let quota = r#"{"type":"result","subtype":"success","is_error":true,"result":"You're out of extra usage \u00b7 resets Aug 19, 6am (UTC)"}"#;
         match parse_stream_line(quota) {
-            StreamLine::Result { text, is_error } => {
+            StreamLine::Result { text, is_error, .. } => {
                 assert!(is_error, "an is_error body must not be spoken as a reply");
                 assert!(text.contains("out of extra usage"));
             }

@@ -34,7 +34,7 @@ pub async fn boot_entity(
     super::ensure_infrastructure(&root_dir);
 
     // Create LLM provider
-    let provider = crate::providers::create_provider(&config)?;
+    let provider = crate::providers::create_streaming_provider(&config)?;
 
     // Monitoring
     let monitors = super::setup::create_monitors(&config);
@@ -105,6 +105,9 @@ pub async fn boot_entity(
         alert_queue: tokio::sync::Mutex::new(alert_queue),
         provider_status: crate::provider_status::new_shared(),
         leadership: std::sync::atomic::AtomicBool::new(false),
+        ledger: Arc::new(crate::ledger::LedgerRing::new(
+            crate::ledger::DEFAULT_RING_CAPACITY,
+        )),
     });
 
     // Pipeline health check

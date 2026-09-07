@@ -681,6 +681,10 @@ async fn conversation_task(
                     response = Some(resp);
                     break;
                 }
+                StreamEvent::Refused { detail, .. } => {
+                    let _ = tx.send(UiEvent::Error(detail));
+                    return;
+                }
                 StreamEvent::Error(e) => {
                     let _ = tx.send(UiEvent::Error(e));
                     return;

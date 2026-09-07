@@ -28,6 +28,11 @@ pub enum StreamEvent {
 
     /// An error occurred during streaming.
     Error(String),
+
+    /// The provider refused the turn on Usage-Policy grounds (PN-88). Kept
+    /// distinct from `Error` so the chat handler's refusal fallback fires for
+    /// streamed turns exactly as it does for buffered ones.
+    Refused { model: String, detail: String },
 }
 
 /// Stream type returned by streaming providers.
@@ -45,13 +50,47 @@ pub trait StreamingProvider: LmProvider {
     }
 
     /// Stream a response token by token.
+    ///
+    /// The default wraps [`LmProvider::invoke`] as one `TextDelta` followed by
+    /// `Done`, so a provider without native streaming still satisfies the
+    /// contract (mocks, future backends).
     fn invoke_streaming(
         &self,
         system_prompt: &str,
         messages: &[Message],
         max_tokens: u32,
         tools: Option<&[serde_json::Value]>,
-    ) -> StreamResult<'_>;
+    ) -> StreamResult<'_> {
+        let system_prompt = system_prompt.to_string();
+        let messages = messages.to_vec();
+        let tools = tools.map(|t| t.to_vec());
+        Box::pin(async_stream::stream! {
+            match self
+                .invoke(&system_prompt, &messages, max_tokens, tools.as_deref())
+                .await
+            {
+                Ok(response) => {
+                    let text = response.text();
+                    if !text.is_empty() {
+                        yield StreamEvent::TextDelta(text);
+                    }
+                    for block in &response.content {
+                        if let ContentBlock::ToolUse { id, name, input } = block {
+                            yield StreamEvent::ToolUse {
+                                id: id.clone(),
+                                name: name.clone(),
+                                input: input.clone(),
+                            };
+                        }
+                    }
+                    yield StreamEvent::Done(response);
+                }
+                Err(e) => {
+                    yield StreamEvent::Error(e.to_string());
+                }
+            }
+        })
+    }
 }
 
 /// Wrap a non-streaming invoke() call as a stream that emits one TextDelta + Done.

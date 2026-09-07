@@ -56,6 +56,8 @@ impl MockProvider {
     }
 }
 
+impl crate::streaming::StreamingProvider for MockProvider {}
+
 impl LmProvider for MockProvider {
     fn invoke(
         &self,
@@ -104,6 +106,8 @@ impl LmProvider for MockProvider {
 /// network drop / timeout / empty result. Must trigger rollback, never fallback.
 struct FailingProvider;
 
+impl crate::streaming::StreamingProvider for FailingProvider {}
+
 impl LmProvider for FailingProvider {
     fn invoke(
         &self,
@@ -126,6 +130,8 @@ impl LmProvider for FailingProvider {
 
 /// A provider that always issues an AUP refusal (the fable classifier firing).
 struct RefusingProvider;
+
+impl crate::streaming::StreamingProvider for RefusingProvider {}
 
 impl LmProvider for RefusingProvider {
     fn invoke(
@@ -206,6 +212,8 @@ fn build_app(state: Arc<AppState>) -> Router {
     Router::new()
         .route("/health", get(handlers::health::health))
         .route("/chat", post(handlers::chat::chat))
+        .route("/api/chat/stream", post(handlers::chat::chat_stream))
+        .route("/api/events", get(handlers::events::events))
         .route_layer(middleware::from_fn_with_state(
             Arc::clone(&state),
             crate::server::auth::require_auth,
@@ -229,7 +237,7 @@ async fn build_state_in(
 /// the rollback / refusal tests that need a provider which returns an error.
 async fn build_state_boxed_with_config(
     root_dir: std::path::PathBuf,
-    provider: Box<dyn LmProvider>,
+    provider: Box<dyn crate::streaming::StreamingProvider>,
     tools: ToolRegistry,
     config: Config,
 ) -> Arc<AppState> {
@@ -258,6 +266,7 @@ async fn build_state_boxed_with_config(
         alert_queue: tokio::sync::Mutex::new(alert_queue),
         provider_status: crate::provider_status::new_shared(),
         leadership: std::sync::atomic::AtomicBool::new(false),
+        ledger: Arc::new(crate::ledger::LedgerRing::new(64)),
     })
 }
 
@@ -1049,4 +1058,202 @@ async fn e2e_refusal_without_fallback_rolls_back() {
         0,
         "refused turn (fallback disabled) poisoned the session"
     );
+}
+
+// ---------------------------------------------------------------------------
+// Streaming chat (PN-102): delta/done framing, disconnect rollback, SSE auth
+// ---------------------------------------------------------------------------
+
+/// Yields one delta and then never finishes — the shape of a turn whose
+/// client walks away mid-stream.
+struct HangingProvider;
+
+impl LmProvider for HangingProvider {
+    fn invoke(
+        &self,
+        _system_prompt: &str,
+        _messages: &[Message],
+        _max_tokens: u32,
+        _tools: Option<&[serde_json::Value]>,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<
+                    Output = Result<LlmResponse, Box<dyn std::error::Error + Send + Sync>>,
+                > + Send
+                + '_,
+        >,
+    > {
+        Box::pin(async { std::future::pending().await })
+    }
+    fn name(&self) -> &str {
+        "hanging"
+    }
+}
+
+impl crate::streaming::StreamingProvider for HangingProvider {
+    fn supports_streaming(&self) -> bool {
+        true
+    }
+    fn invoke_streaming(
+        &self,
+        _system_prompt: &str,
+        _messages: &[Message],
+        _max_tokens: u32,
+        _tools: Option<&[serde_json::Value]>,
+    ) -> crate::streaming::StreamResult<'_> {
+        Box::pin(async_stream::stream! {
+            yield crate::streaming::StreamEvent::TextDelta("partial".to_string());
+            std::future::pending::<()>().await;
+        })
+    }
+}
+
+async fn post_chat_stream(app: &Router, message: &str) -> axum::response::Response {
+    let body = serde_json::json!({ "message": message });
+    let req = Request::builder()
+        .method("POST")
+        .uri("/api/chat/stream")
+        .header("Content-Type", "application/json")
+        .body(Body::from(serde_json::to_string(&body).unwrap()))
+        .unwrap();
+    app.clone().oneshot(req).await.unwrap()
+}
+
+/// A buffered provider streams through the default adapter as one delta, and
+/// the stream closes with a `done` carrying the same text.
+#[tokio::test]
+async fn e2e_chat_stream_emits_delta_then_done() {
+    let dir = tempfile::tempdir().unwrap();
+    let provider = MockProvider::new(vec![LlmResponse {
+        content: vec![ContentBlock::Text {
+            text: "hello world".to_string(),
+        }],
+        stop_reason: StopReason::EndTurn,
+        model: "mock".to_string(),
+        input_tokens: Some(5),
+        output_tokens: Some(2),
+    }]);
+    let state = build_state_in(dir.path().to_path_buf(), provider, ToolRegistry::new()).await;
+    let app = build_app(Arc::clone(&state));
+
+    let response = post_chat_stream(&app, "hi").await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let text = String::from_utf8_lossy(&bytes);
+
+    let delta_at = text.find("event: delta").expect("no delta event");
+    let done_at = text.find("event: done").expect("no done event");
+    assert!(delta_at < done_at, "delta must precede done:\n{text}");
+    assert!(text.contains("event: status"), "no status event:\n{text}");
+    assert!(
+        text.contains(r#""text":"hello world""#),
+        "delta/done text missing:\n{text}"
+    );
+    assert!(text.contains(r#""tokens_in":5"#), "usage missing:\n{text}");
+    assert!(!text.contains("event: error"), "unexpected error:\n{text}");
+
+    // The daemon persisted the turn: user + assistant on the trunk.
+    assert_eq!(trunk_len(&state).await, 2);
+}
+
+/// Dropping the SSE response mid-turn aborts the turn and rolls the user
+/// message back, exactly like a failed turn — no dangling user turn, no
+/// partial assistant message.
+#[tokio::test]
+async fn e2e_chat_stream_disconnect_rolls_back_user_turn() {
+    use tokio_stream::StreamExt as _;
+
+    let dir = tempfile::tempdir().unwrap();
+    let state = build_state_boxed_with_config(
+        dir.path().to_path_buf(),
+        Box::new(HangingProvider),
+        ToolRegistry::new(),
+        test_config(),
+    )
+    .await;
+    let app = build_app(Arc::clone(&state));
+
+    let response = post_chat_stream(&app, "are you there?").await;
+    assert_eq!(response.status(), StatusCode::OK);
+
+    // Read until the partial delta has arrived, proving the turn is mid-flight
+    // with the user message on the trunk.
+    let mut body = response.into_body().into_data_stream();
+    let mut seen = String::new();
+    while !seen.contains("partial") {
+        let chunk = tokio::time::timeout(std::time::Duration::from_secs(5), body.next())
+            .await
+            .expect("stream stalled before the first delta")
+            .expect("stream ended before the first delta")
+            .expect("body error");
+        seen.push_str(&String::from_utf8_lossy(&chunk));
+    }
+    // The turn holds the session write lock while it streams, so the trunk
+    // cannot be read here without deadlocking; the delta having arrived is the
+    // proof that the user message is on the trunk mid-turn.
+
+    // The client walks away.
+    drop(body);
+
+    // The abort guard fires on drop; the rollback task needs the session lock,
+    // which the aborted turn releases as it unwinds.
+    let mut rolled_back = false;
+    for _ in 0..50 {
+        if trunk_len(&state).await == 0 {
+            rolled_back = true;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    assert!(rolled_back, "disconnect left the user message on the trunk");
+}
+
+/// `/api/events` sits behind the same auth as `/chat`: no secret, no stream.
+#[tokio::test]
+async fn e2e_events_requires_secret_when_configured() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut config = test_config();
+    config.security.secret = Some("s3cret".to_string());
+    let state = build_state_boxed_with_config(
+        dir.path().to_path_buf(),
+        Box::new(MockProvider::new(vec![])),
+        ToolRegistry::new(),
+        config,
+    )
+    .await;
+    let app = build_app(Arc::clone(&state));
+
+    let denied = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/api/events")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(denied.status(), StatusCode::UNAUTHORIZED);
+
+    let allowed = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/api/events")
+                .header("X-Echo-Secret", "s3cret")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(allowed.status(), StatusCode::OK);
+    assert!(allowed
+        .headers()
+        .get("content-type")
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|v| v.starts_with("text/event-stream")));
 }

@@ -17,6 +17,7 @@ mod graph_feedback;
 mod init;
 mod intake_audit;
 mod interaction;
+mod ledger;
 mod logbook;
 mod ollama_provider;
 mod outreach;

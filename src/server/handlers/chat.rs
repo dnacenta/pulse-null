@@ -6,10 +6,17 @@ use axum::Json;
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
 
+use std::convert::Infallible;
+
+use axum::response::sse::{Event, KeepAlive, Sse};
+use futures_core::Stream;
+use tokio::sync::{mpsc, RwLock};
+
 use crate::interaction::InteractionRecord;
 use crate::server::{injection, AppState};
-use crate::session_store::resolve_sender;
-use crate::tool_loop;
+use crate::session_store::{resolve_sender, Session};
+use crate::streaming::StreamingProvider;
+use crate::tool_loop::{self, TurnEvent, TurnSink, TurnStatus};
 use pulse_system_types::llm::{Message, MessageContent, MessageSource, Role};
 
 #[derive(Deserialize)]
@@ -35,6 +42,11 @@ pub struct ChatResponse {
     /// sees the posture.
     #[serde(skip_serializing_if = "std::ops::Not::not", default)]
     pub isolation: bool,
+    /// True when the hallucination guard cut the reply short. A streaming
+    /// client uses it to know the `done` text is authoritative over the
+    /// deltas it already showed.
+    #[serde(skip_serializing_if = "std::ops::Not::not", default)]
+    pub truncated: bool,
 }
 
 fn default_channel() -> String {
@@ -104,6 +116,25 @@ pub async fn chat(
     State(state): State<Arc<AppState>>,
     Json(req): Json<ChatRequest>,
 ) -> Result<Json<ChatResponse>, (StatusCode, String)> {
+    run_turn(state, req, None).await.map(Json)
+}
+
+/// Run one conversation turn end to end: identity, isolation, context buffer,
+/// session limits, compaction, the provider call (with refusal fallback),
+/// guards, persistence, and the post-interaction event.
+///
+/// `/chat` calls this with no sink and returns the response as JSON.
+/// `/api/chat/stream` passes a [`TurnSink`] and forwards every
+/// [`TurnEvent`] to the client as it happens; the turn itself is identical.
+///
+/// Cancellation: if this future is dropped mid-turn (a streaming client went
+/// away) the user message is rolled back exactly as a failed turn is, so the
+/// trunk never carries a dangling user turn. Nothing is persisted.
+pub(crate) async fn run_turn(
+    state: Arc<AppState>,
+    req: ChatRequest,
+    sink: Option<TurnSink>,
+) -> Result<ChatResponse, (StatusCode, String)> {
     validate_request(&req)?;
 
     // Auth is enforced by middleware (server/auth.rs)
@@ -127,13 +158,14 @@ pub async fn chat(
         sender_label,
     ) {
         crate::server::isolation::Intercept::Handled { response, isolated } => {
-            return Ok(Json(ChatResponse {
+            return Ok(ChatResponse {
                 response,
                 model: "isolation-control".to_string(),
                 input_tokens: None,
                 output_tokens: None,
                 isolation: isolated,
-            }));
+                truncated: false,
+            });
         }
         crate::server::isolation::Intercept::None => {}
     }
@@ -283,6 +315,7 @@ pub async fn chat(
     // this point so it can never poison later turns — the 2026-08-09
     // session-poisoning bug, where a refused turn left a half-appended user
     // message that made fable re-trip on every subsequent benign turn.
+    let trunk_len_before_push = session.data.messages.len();
     session.data.messages.push(Message {
         role: Role::User,
         content: user_content.clone(),
@@ -291,6 +324,9 @@ pub async fn chat(
             sender: resolved_key.clone(),
         }),
     });
+    // PN-102: a dropped future (streaming client disconnected) rolls the user
+    // message back the same way a failed turn does. Disarmed on success.
+    let rollback = TurnRollback::arm(Arc::clone(&session_arc), trunk_len_before_push);
 
     // A real human message just arrived — reset the autonomous round counter
     // now, pre-turn, so that even a turn that later refuses or errors still
@@ -474,6 +510,7 @@ pub async fn chat(
         &system_prompt,
         state.config.llm.max_tokens,
         &correlation_id,
+        sink.as_ref(),
     )
     .await
     .map_err(|e| {
@@ -816,7 +853,8 @@ pub async fn chat(
     // Sticky banner for trusted consumers; concealed from guests (the
     // operating posture is not their business).
     let reveal = isolated && !resolved_key.starts_with("guest:");
-    Ok(Json(ChatResponse {
+    rollback.disarm();
+    Ok(ChatResponse {
         response: if reveal {
             crate::server::isolation::banner_wrap(text)
         } else {
@@ -826,7 +864,157 @@ pub async fn chat(
         input_tokens: Some(result.input_tokens),
         output_tokens: Some(result.output_tokens),
         isolation: reveal,
-    }))
+        truncated: result.was_truncated,
+    })
+}
+
+/// Rolls a pushed-but-uncommitted user message back if the turn future is
+/// dropped before it succeeds.
+///
+/// The guard cannot lock the session synchronously in `Drop` (the turn holds
+/// the write guard at that moment), so it schedules the truncate on the
+/// runtime; it runs as soon as the turn's guard is released.
+struct TurnRollback {
+    session: Option<Arc<RwLock<Session>>>,
+    len: usize,
+}
+
+impl TurnRollback {
+    fn arm(session: Arc<RwLock<Session>>, len: usize) -> Self {
+        Self {
+            session: Some(session),
+            len,
+        }
+    }
+
+    fn disarm(mut self) {
+        self.session = None;
+    }
+}
+
+impl Drop for TurnRollback {
+    fn drop(&mut self) {
+        let Some(session) = self.session.take() else {
+            return;
+        };
+        let len = self.len;
+        let Ok(handle) = tokio::runtime::Handle::try_current() else {
+            return;
+        };
+        handle.spawn(async move {
+            let mut guard = session.write().await;
+            let now = guard.data.messages.len();
+            if now > len {
+                guard.data.messages.truncate(len);
+                guard.data.compaction.estimated_tokens =
+                    crate::context::estimate_conversation_tokens(&guard.data.messages);
+                tracing::info!(
+                    "[chat] turn cancelled — rolled back {} uncommitted message(s)",
+                    now - len
+                );
+            }
+        });
+    }
+}
+
+/// Aborts the turn task when the SSE response body is dropped, which is how a
+/// client disconnect reaches us.
+struct AbortOnDrop(tokio::task::AbortHandle);
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
+/// Capacity of the progress channel between the turn and its SSE stream.
+/// Full means the client is slower than the model; the turn then waits.
+const STREAM_CHANNEL_CAPACITY: usize = 256;
+
+fn sse_json(name: &str, value: serde_json::Value) -> Event {
+    // A serde_json::Value always serializes; the Err arm is unreachable.
+    Event::default()
+        .event(name)
+        .json_data(value)
+        .unwrap_or_else(|_| Event::default().event(name).data("{}"))
+}
+
+/// Encode one turn event for the wire.
+fn turn_event_to_sse(event: TurnEvent) -> Event {
+    match event {
+        TurnEvent::Status(TurnStatus::Thinking) => {
+            sse_json("status", serde_json::json!({ "status": "thinking" }))
+        }
+        TurnEvent::Status(TurnStatus::Responding) => {
+            sse_json("status", serde_json::json!({ "status": "responding" }))
+        }
+        TurnEvent::Status(TurnStatus::Tool(name)) => sse_json(
+            "status",
+            serde_json::json!({ "status": "tool", "name": name }),
+        ),
+        TurnEvent::Delta(text) => sse_json("delta", serde_json::json!({ "text": text })),
+    }
+}
+
+fn done_to_sse(resp: ChatResponse) -> Event {
+    sse_json(
+        "done",
+        serde_json::json!({
+            "text": resp.response,
+            "model": resp.model,
+            "tokens_in": resp.input_tokens,
+            "tokens_out": resp.output_tokens,
+            "isolation": resp.isolation,
+            "truncated": resp.truncated,
+        }),
+    )
+}
+
+fn error_to_sse(status: StatusCode, message: String) -> Event {
+    sse_json(
+        "error",
+        serde_json::json!({ "status": status.as_u16(), "message": message }),
+    )
+}
+
+/// `POST /api/chat/stream` — the same turn as [`chat`], delivered as SSE.
+///
+/// Events: `status {status: thinking|responding|tool, name?}`, `delta {text}`
+/// (as the provider yields them; the client coalesces), then exactly one of
+/// `done {text, model, tokens_in, tokens_out, isolation, truncated}` or
+/// `error {status, message}`. Dropping the connection aborts the turn: the
+/// provider child is killed and the user message is rolled back.
+pub async fn chat_stream(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<ChatRequest>,
+) -> Result<Sse<impl Stream<Item = Result<Event, Infallible>>>, (StatusCode, String)> {
+    validate_request(&req)?;
+
+    let (tx, rx) = mpsc::channel::<TurnEvent>(STREAM_CHANNEL_CAPACITY);
+    let (done_tx, done_rx) = tokio::sync::oneshot::channel();
+    let task = tokio::spawn(async move {
+        let outcome = run_turn(state, req, Some(tx)).await;
+        let _ = done_tx.send(outcome);
+    });
+    let guard = AbortOnDrop(task.abort_handle());
+
+    let stream = async_stream::stream! {
+        let _guard = guard;
+        let mut rx = rx;
+        while let Some(event) = rx.recv().await {
+            yield Ok(turn_event_to_sse(event));
+        }
+        match done_rx.await {
+            Ok(Ok(resp)) => yield Ok(done_to_sse(resp)),
+            Ok(Err((status, message))) => yield Ok(error_to_sse(status, message)),
+            Err(_) => yield Ok(error_to_sse(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "turn ended without a result".to_string(),
+            )),
+        }
+    };
+
+    Ok(Sse::new(stream).keep_alive(KeepAlive::new().interval(std::time::Duration::from_secs(15))))
 }
 
 /// Outcome of one interactive turn after the refusal-fallback dance.
@@ -892,14 +1080,16 @@ fn shed_isolation_quarantine(data: &mut crate::session_store::SessionData) -> us
 /// caller performed before invoking the helper is not reverted.
 ///
 /// Precondition: the current user message is the last element of `data.messages`.
+#[allow(clippy::too_many_arguments)]
 async fn invoke_turn_with_refusal_fallback<F>(
     data: &mut crate::session_store::SessionData,
-    default_provider: &dyn pulse_system_types::llm::LmProvider,
+    default_provider: &dyn StreamingProvider,
     build_fallback: Option<F>,
     tools: &crate::tools::ToolRegistry,
     system_prompt: &str,
     max_tokens: u32,
     correlation_id: &str,
+    sink: Option<&TurnSink>,
 ) -> Result<TurnResult, Box<dyn std::error::Error + Send + Sync>>
 where
     F: FnOnce()
@@ -914,18 +1104,37 @@ where
         None => return Err("invoke_turn_with_refusal_fallback called with an empty trunk".into()),
     };
 
-    let default_outcome = crate::task_context::scope(
-        Some(correlation_id.to_string()),
-        tool_loop::invoke_with_tool_loop(
-            default_provider,
-            tools,
-            system_prompt,
-            &mut data.messages,
-            max_tokens,
-            MAX_TOOL_ROUNDS,
-        ),
-    )
-    .await;
+    let default_outcome = match sink {
+        Some(sink) => {
+            crate::task_context::scope(
+                Some(correlation_id.to_string()),
+                tool_loop::invoke_with_tool_loop_streaming(
+                    default_provider,
+                    tools,
+                    system_prompt,
+                    &mut data.messages,
+                    max_tokens,
+                    MAX_TOOL_ROUNDS,
+                    sink,
+                ),
+            )
+            .await
+        }
+        None => {
+            crate::task_context::scope(
+                Some(correlation_id.to_string()),
+                tool_loop::invoke_with_tool_loop(
+                    default_provider,
+                    tools,
+                    system_prompt,
+                    &mut data.messages,
+                    max_tokens,
+                    MAX_TOOL_ROUNDS,
+                ),
+            )
+            .await
+        }
+    };
 
     let refusal = match default_outcome {
         Ok(result) => {
@@ -975,6 +1184,11 @@ where
     fallback_ctx.extend(data.quarantine.iter().cloned());
     fallback_ctx.push(user_msg.clone());
 
+    // The fallback provider is buffered; a streaming client learns it is
+    // thinking again and then gets the whole reply as one delta.
+    if let Some(sink) = sink {
+        let _ = sink.send(TurnEvent::Status(TurnStatus::Thinking)).await;
+    }
     let fallback_outcome = crate::task_context::scope(
         Some(correlation_id.to_string()),
         tool_loop::invoke_with_tool_loop(
@@ -990,6 +1204,10 @@ where
 
     match fallback_outcome {
         Ok(result) => {
+            if let Some(sink) = sink {
+                let _ = sink.send(TurnEvent::Status(TurnStatus::Responding)).await;
+                let _ = sink.send(TurnEvent::Delta(result.text.clone())).await;
+            }
             // Quarantine the exchange: the trunk stays clean so the default
             // model does not re-trip on later benign turns.
             data.quarantine.push(user_msg);
@@ -1261,6 +1479,7 @@ mod tests {
         seen: Arc<Mutex<Vec<String>>>,
     }
 
+    impl crate::streaming::StreamingProvider for RecordingProvider {}
     impl LmProvider for RecordingProvider {
         fn invoke(
             &self,
@@ -1299,6 +1518,7 @@ mod tests {
 
     /// Always issues an AUP refusal.
     struct RefusingMock;
+    impl crate::streaming::StreamingProvider for RefusingMock {}
     impl LmProvider for RefusingMock {
         fn invoke(
             &self,
@@ -1325,6 +1545,7 @@ mod tests {
 
     /// Always fails with a generic (non-refusal) error.
     struct FailingMock;
+    impl crate::streaming::StreamingProvider for FailingMock {}
     impl LmProvider for FailingMock {
         fn invoke(
             &self,
@@ -1391,6 +1612,7 @@ mod tests {
             "sys",
             1024,
             "corr",
+            None,
         )
         .await
         .unwrap();
@@ -1423,6 +1645,7 @@ mod tests {
             "sys",
             1024,
             "corr",
+            None,
         )
         .await
         .unwrap();
@@ -1442,6 +1665,7 @@ mod tests {
             "sys",
             1024,
             "corr",
+            None,
         )
         .await
         .unwrap();
@@ -1474,6 +1698,7 @@ mod tests {
             "sys",
             1024,
             "corr",
+            None,
         )
         .await
         .unwrap();
@@ -1494,6 +1719,7 @@ mod tests {
             "sys",
             1024,
             "corr",
+            None,
         )
         .await
         .unwrap();
@@ -1523,6 +1749,7 @@ mod tests {
             "sys",
             1024,
             "corr",
+            None,
         )
         .await
         .unwrap_err();
@@ -1555,6 +1782,7 @@ mod tests {
             "sys",
             1024,
             "corr",
+            None,
         )
         .await
         .unwrap_err();
@@ -1649,6 +1877,7 @@ mod tests {
             "sys",
             1024,
             "corr",
+            None,
         )
         .await
         .unwrap_err();
@@ -1691,6 +1920,7 @@ mod tests {
             "sys",
             1024,
             "corr",
+            None,
         )
         .await
         .unwrap_err();
@@ -1730,6 +1960,7 @@ mod tests {
             "sys",
             1024,
             "corr",
+            None,
         )
         .await
         .unwrap_err();
@@ -1759,6 +1990,7 @@ mod tests {
             "sys",
             1024,
             "corr",
+            None,
         )
         .await
         .unwrap_err();

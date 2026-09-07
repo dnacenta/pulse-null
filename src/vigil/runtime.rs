@@ -371,8 +371,9 @@ pub fn render(health: &CognitiveHealth) -> String {
 /// Returns a suggestion string if a significant gap is detected (>0.20 average),
 /// None otherwise.
 fn check_calibration_gap(root_dir: &Path) -> Option<String> {
-    // Read CALIBER.md capabilities
-    let caliber_path = root_dir.join("CALIBER.md");
+    // Read CALIBER.md capabilities. One resolver, so this read and the
+    // trajectory miner's write can never drift onto different files.
+    let caliber_path = crate::caliber::caliber_md(root_dir);
     let caliber_content = std::fs::read_to_string(&caliber_path).ok()?;
     let doc = crate::caliber::document::parse_caliber_md(&caliber_content);
 

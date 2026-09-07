@@ -28,14 +28,16 @@ use crate::provider_status::SharedProviderStatus;
 use crate::scheduler::intent::IntentQueue;
 use crate::scheduler::Schedule;
 use crate::session_store::SessionStore;
+use crate::streaming::StreamingProvider;
 use crate::tools::ToolRegistry;
-use pulse_system_types::llm::LmProvider;
 use pulse_system_types::monitoring::{CognitiveMonitor, OutcomeTracker, PipelineMonitor};
 
 /// Shared application state
 pub struct AppState {
     pub config: Config,
-    pub provider: Box<dyn LmProvider>,
+    /// The entity's model. Streaming-capable so `/api/chat/stream` can forward
+    /// deltas; every non-streaming call site upcasts to `&dyn LmProvider`.
+    pub provider: Box<dyn StreamingProvider>,
     pub session_store: SessionStore,
     pub system_prompt: RwLock<String>,
     pub tools: ToolRegistry,
@@ -56,6 +58,8 @@ pub struct AppState {
     /// Written by the coordinator, read by /health — the data plane never
     /// depends on it.
     pub leadership: std::sync::atomic::AtomicBool,
+    /// Live ledger rows for `/api/events` replay.
+    pub ledger: Arc<crate::ledger::LedgerRing>,
 }
 
 /// Rebuild AWARENESS.md from the current plugin and tool state.
@@ -120,7 +124,7 @@ pub async fn awareness_listener(
 }
 
 pub async fn start(config: Config) -> Result<(), Box<dyn std::error::Error>> {
-    let provider = crate::providers::create_provider(&config)?;
+    let provider = crate::providers::create_streaming_provider(&config)?;
 
     let root_dir = config.root_dir()?;
 
@@ -201,6 +205,12 @@ pub async fn start(config: Config) -> Result<(), Box<dyn std::error::Error>> {
     // Create event bus
     let event_bus = Arc::new(EventBus::new(64));
 
+    // Ledger ring: projects bus events into rows for /api/events replay.
+    let ledger = Arc::new(crate::ledger::LedgerRing::new(
+        crate::ledger::DEFAULT_RING_CAPACITY,
+    ));
+    crate::ledger::spawn_projector(event_bus.subscribe(), Arc::clone(&ledger));
+
     // Create the persist coordinator (tracks fire-and-forget writes for graceful shutdown)
     let persist_coordinator = Arc::new(PersistCoordinator::new());
 
@@ -271,6 +281,7 @@ pub async fn start(config: Config) -> Result<(), Box<dyn std::error::Error>> {
         alert_queue: tokio::sync::Mutex::new(alert_queue),
         provider_status: crate::provider_status::new_shared(),
         leadership: std::sync::atomic::AtomicBool::new(false),
+        ledger,
     });
 
     // Startup pipeline health check
@@ -473,6 +484,19 @@ pub fn build_router(state: Arc<AppState>, plugin_routes: Router<()>) -> Router {
         .route("/api/status", get(handlers::status::status))
         .route("/api/dashboard", get(handlers::dashboard::dashboard))
         .route("/chat", post(handlers::chat::chat))
+        .route("/api/chat/stream", post(handlers::chat::chat_stream))
+        .route("/api/events", get(handlers::events::events))
+        .route("/api/ledger", get(handlers::events::ledger))
+        .route("/api/schedule", get(handlers::schedule::list))
+        .route(
+            "/api/schedule/{id}/enable",
+            post(handlers::schedule::enable),
+        )
+        .route(
+            "/api/schedule/{id}/disable",
+            post(handlers::schedule::disable),
+        )
+        .route("/api/schedule/{id}/last", get(handlers::schedule::last))
         .route(
             "/api/sessions/reset",
             post(handlers::sessions::reset_session),
