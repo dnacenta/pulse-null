@@ -12,8 +12,10 @@ pub mod client;
 pub mod motion;
 pub mod pages;
 pub mod pane;
+pub mod prompt;
 pub mod text;
 pub mod theme;
+pub mod transcript;
 
 use std::io::Write as _;
 use std::time::{Duration, Instant};
@@ -41,6 +43,8 @@ const ATTACH_TIMEOUT: Duration = Duration::from_secs(10);
 const FX_TICK: Duration = Duration::from_millis(16);
 /// Spinner / aurora cadence on the boot screen.
 const BOOT_TICK: Duration = Duration::from_millis(80);
+/// Spinner / elapsed-time cadence while a reply is in flight.
+const TURN_TICK: Duration = Duration::from_millis(100);
 /// Bar refresh cadence (`/health`, `/api/dashboard`, `/api/alerts/peek`).
 const BAR_TICK: Duration = Duration::from_secs(5);
 /// Omarchy theme file poll cadence.
@@ -139,10 +143,19 @@ async fn event_loop(
     // Ledger stream: opened once attached; rows arrive as they happen.
     let mut ledger: Option<LedgerStream> = None;
     let mut last_event_id: Option<u64> = None;
+    // The in-flight chat turn, if any: its event receiver and the task that
+    // pumps the SSE stream into it. Dropping the task drops the response body,
+    // which is what cancels the turn on the daemon.
+    let mut turn_rx: Option<
+        tokio::sync::mpsc::Receiver<Result<client::ChatEvent, client::ClientError>>,
+    > = None;
+    let mut turn_task: Option<tokio::task::JoinHandle<()>> = None;
+    let mut turn_tick = tokio::time::interval(TURN_TICK);
 
     if attached {
         app.attached();
         refresh_bar(app, client).await;
+        load_history(app, client).await;
     }
 
     loop {
@@ -180,6 +193,10 @@ async fn event_loop(
                         }
                         dirty = true;
                     }
+                    Some(Ok(Event::Paste(text))) => {
+                        app.on_paste(&text);
+                        dirty = true;
+                    }
                     Some(Ok(Event::Resize(_, _))) => dirty = true,
                     Some(Ok(_)) => {}
                     Some(Err(e)) => return Err(e.into()),
@@ -215,11 +232,38 @@ async fn event_loop(
                     }
                 }
             }
+            turn = async {
+                match turn_rx.as_mut() {
+                    Some(rx) => rx.recv().await,
+                    None => std::future::pending().await,
+                }
+            } => {
+                match turn {
+                    Some(Ok(ev)) => app.talk.on_event(ev),
+                    Some(Err(e)) => {
+                        tracing::warn!("chat stream error: {e}");
+                        app.talk.stream_closed();
+                        turn_rx = None;
+                        turn_task = None;
+                    }
+                    None => {
+                        app.talk.stream_closed();
+                        turn_rx = None;
+                        turn_task = None;
+                    }
+                }
+                dirty = true;
+            }
+            _ = turn_tick.tick(), if app.talk.turn_active() || app.talk.transcript.is_animating() => {
+                app.talk.tick();
+                dirty = true;
+            }
             _ = probe_tick.tick(), if !attached => {
                 if client.probe().await {
                     attached = true;
                     app.attached();
                     refresh_bar(app, client).await;
+                    load_history(app, client).await;
                     dirty = true;
                 } else if Instant::now() > attach_deadline && app.screen == app::Screen::Boot {
                     app.boot.status = format!("no daemon at {} — still trying (q to quit)", client.base());
@@ -244,6 +288,61 @@ async fn event_loop(
                 }
             }
         }
+
+        // The page asked for a send or a cancel; the loop owns the sockets.
+        if app.talk.take_cancel() {
+            if let Some(task) = turn_task.take() {
+                task.abort();
+            }
+            turn_rx = None;
+            app.talk.cancelled();
+            dirty = true;
+        }
+        if let Some(text) = app.talk.take_outbox() {
+            if let Some(task) = turn_task.take() {
+                task.abort();
+            }
+            let (tx, rx) = tokio::sync::mpsc::channel(256);
+            let c = client.clone();
+            turn_task = Some(tokio::spawn(async move {
+                match c.chat_stream("tui", &text).await {
+                    Ok(stream) => {
+                        let mut stream = std::pin::pin!(stream);
+                        while let Some(item) = stream.next().await {
+                            if tx.send(item).await.is_err() {
+                                break;
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        let _ = tx.send(Err(e)).await;
+                    }
+                }
+            }));
+            turn_rx = Some(rx);
+            dirty = true;
+        }
+    }
+}
+
+/// Load the owner's conversation on the `tui` channel into Talk.
+async fn load_history(app: &mut App, client: &Client) {
+    match client.history("tui").await {
+        Ok(msgs) => {
+            let items = msgs
+                .into_iter()
+                .map(|m| {
+                    let who = if m.role == "user" {
+                        transcript::Who::Owner
+                    } else {
+                        transcript::Who::Entity
+                    };
+                    (who, m.text, m.tools)
+                })
+                .collect();
+            app.talk.load_history(items);
+        }
+        Err(e) => tracing::warn!("history unavailable: {e}"),
     }
 }
 

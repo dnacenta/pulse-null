@@ -37,6 +37,59 @@ struct PeekResponse {
     count: usize,
 }
 
+/// One event of a streamed chat turn (`POST /api/chat/stream`).
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(tag = "event", content = "data", rename_all = "lowercase")]
+pub enum ChatEvent {
+    Status {
+        status: String,
+        #[serde(default)]
+        name: Option<String>,
+    },
+    Delta {
+        text: String,
+    },
+    Done {
+        text: String,
+        model: String,
+        #[serde(default)]
+        tokens_in: Option<u32>,
+        #[serde(default)]
+        tokens_out: Option<u32>,
+        #[serde(default)]
+        truncated: bool,
+    },
+    Error {
+        status: u16,
+        message: String,
+    },
+}
+
+impl ChatEvent {
+    /// Decode a raw SSE event from the chat stream. Unknown event names and
+    /// undecodable payloads are `None`; the caller ignores them.
+    #[must_use]
+    pub fn from_sse(ev: &SseEvent) -> Option<Self> {
+        let name = ev.event.as_deref()?;
+        let data: serde_json::Value = serde_json::from_str(&ev.data).ok()?;
+        serde_json::from_value(serde_json::json!({ "event": name, "data": data })).ok()
+    }
+}
+
+/// One message of `/api/session/{channel}`.
+#[derive(Debug, Clone, Deserialize)]
+pub struct HistoryMessage {
+    pub role: String,
+    pub text: String,
+    #[serde(default)]
+    pub tools: Vec<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct HistoryResponse {
+    messages: Vec<HistoryMessage>,
+}
+
 impl Client {
     #[must_use]
     pub fn new(host: &str, port: u16, secret: Option<String>) -> Self {
@@ -103,6 +156,53 @@ impl Client {
         let v = self.json("/api/alerts/peek").await?;
         let peek: PeekResponse = serde_json::from_value(v)?;
         Ok(peek.count)
+    }
+
+    /// The conversation on `channel` as the daemon has it.
+    pub async fn history(&self, channel: &str) -> Result<Vec<HistoryMessage>, ClientError> {
+        let v = self.json(&format!("/api/session/{channel}")).await?;
+        let h: HistoryResponse = serde_json::from_value(v)?;
+        Ok(h.messages)
+    }
+
+    /// Open a streamed turn on `channel`. Dropping the stream cancels the
+    /// turn on the daemon.
+    pub async fn chat_stream(
+        &self,
+        channel: &str,
+        message: &str,
+    ) -> Result<impl Stream<Item = Result<ChatEvent, ClientError>> + Send, ClientError> {
+        let mut req = self
+            .http
+            .post(format!("{}/api/chat/stream", self.base))
+            .header("Accept", "text/event-stream")
+            .json(&serde_json::json!({ "message": message, "channel": channel }));
+        if let Some(s) = &self.secret {
+            req = req.header("X-Echo-Secret", s);
+        }
+        let resp = req.send().await?;
+        if !resp.status().is_success() {
+            let status = resp.status().as_u16();
+            let body = resp.text().await.unwrap_or_default();
+            return Err(ClientError::Status { status, body });
+        }
+        let events = sse_stream(resp);
+        Ok(async_stream::stream! {
+            let mut events = std::pin::pin!(events);
+            while let Some(item) = events.next().await {
+                match item {
+                    Ok(ev) => {
+                        if let Some(ce) = ChatEvent::from_sse(&ev) {
+                            yield Ok(ce);
+                        }
+                    }
+                    Err(e) => {
+                        yield Err(e);
+                        return;
+                    }
+                }
+            }
+        })
     }
 
     /// Open `GET /api/events`, resuming after `after` when given.
@@ -254,6 +354,47 @@ mod tests {
         assert_eq!(evs.len(), 1, "a comment-only block is not an event");
         assert_eq!(evs[0].data, "ok");
         assert!(evs[0].id.is_none());
+    }
+
+    #[test]
+    fn chat_events_decode_from_sse() {
+        let ev = |name: &str, data: &str| SseEvent {
+            id: None,
+            event: Some(name.into()),
+            data: data.into(),
+        };
+        assert_eq!(
+            ChatEvent::from_sse(&ev("status", r#"{"status":"tool","name":"file_read"}"#)),
+            Some(ChatEvent::Status {
+                status: "tool".into(),
+                name: Some("file_read".into())
+            })
+        );
+        assert_eq!(
+            ChatEvent::from_sse(&ev("delta", r#"{"text":"hi"}"#)),
+            Some(ChatEvent::Delta { text: "hi".into() })
+        );
+        assert_eq!(
+            ChatEvent::from_sse(&ev(
+                "done",
+                r#"{"text":"hi","model":"m","tokens_in":3,"tokens_out":null,"isolation":false,"truncated":false}"#
+            )),
+            Some(ChatEvent::Done {
+                text: "hi".into(),
+                model: "m".into(),
+                tokens_in: Some(3),
+                tokens_out: None,
+                truncated: false
+            })
+        );
+        assert_eq!(
+            ChatEvent::from_sse(&ev("error", r#"{"status":500,"message":"boom"}"#)),
+            Some(ChatEvent::Error {
+                status: 500,
+                message: "boom".into()
+            })
+        );
+        assert_eq!(ChatEvent::from_sse(&ev("row", "{}")), None);
     }
 
     #[test]

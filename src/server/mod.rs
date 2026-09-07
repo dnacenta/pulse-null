@@ -497,6 +497,7 @@ pub fn build_router(state: Arc<AppState>, plugin_routes: Router<()>) -> Router {
             post(handlers::schedule::disable),
         )
         .route("/api/schedule/{id}/last", get(handlers::schedule::last))
+        .route("/api/session/{channel}", get(handlers::sessions::history))
         .route(
             "/api/sessions/reset",
             post(handlers::sessions::reset_session),

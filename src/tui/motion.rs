@@ -72,6 +72,10 @@ pub enum Moment {
     Breathe,
     /// A new transcript line fades in from dim.
     LineIn,
+    /// A transcript row fades in after `delay_ms` — the reveal cascade.
+    Reveal { delay_ms: u32 },
+    /// The streaming cursor cell glows.
+    Cursor,
     /// A new ledger row slides in with a decaying highlight.
     RowIn,
     /// A float opens over a darkened backdrop.
@@ -99,6 +103,7 @@ pub enum Key {
     Breathe,
     Line(u64),
     Row(u64),
+    Cursor,
     Float,
     Theme,
     Shake(u64),
@@ -161,6 +166,7 @@ impl Motion {
                 moment,
                 Moment::Focus
                     | Moment::LineIn
+                    | Moment::Reveal { .. }
                     | Moment::FloatOpen
                     | Moment::FloatClose
                     | Moment::ThemeFade { .. }
@@ -192,9 +198,7 @@ impl Motion {
         std::mem::take(&mut self.settled)
     }
 
-    /// Stop the effect under `key`, if any — Talk cancels `Breathe` on the
-    /// first token (PN-102 increment 3).
-    #[allow(dead_code)]
+    /// Stop the effect under `key`, if any.
     pub fn cancel(&mut self, key: &Key) {
         self.effects.retain(|(k, _)| k != key);
     }
@@ -266,6 +270,18 @@ fn build(moment: Moment, p: Palette) -> Effect {
         )))
         .with_filter(CellFilter::Outer(ratatui::layout::Margin::new(1, 1))),
         Moment::LineIn => fx::fade_from_fg(p.dim, timer(200, Interpolation::QuintOut)),
+        Moment::Reveal { delay_ms } => {
+            let fade = fx::fade_from_fg(p.dim, timer(200, Interpolation::QuintOut));
+            if delay_ms == 0 {
+                fade
+            } else {
+                fx::delay(timer(delay_ms, Interpolation::Linear), fade)
+            }
+        }
+        Moment::Cursor => fx::repeating(fx::ping_pong(fx::hsl_shift_fg(
+            [0.0, 0.0, 25.0],
+            timer(450, Interpolation::SineInOut),
+        ))),
         Moment::RowIn => fx::parallel(&[
             fx::slide_in(
                 Dir::LeftToRight,

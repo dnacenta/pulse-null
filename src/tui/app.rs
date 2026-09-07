@@ -14,7 +14,7 @@ use tachyonfx::Motion as Sweep;
 use super::bar::{self, BarState, DaemonState, Glyphs};
 use super::boot::Boot;
 use super::motion::{Key, Moment, Motion, MotionLevel, Palette};
-use super::pages::talk::Talk;
+use super::pages::talk::{Talk, TalkAction};
 use super::pane::{neighbour, Dir, PaneId};
 use super::theme::{ThemeWatcher, Tokens, BUILTIN_NAMES};
 
@@ -76,7 +76,7 @@ impl App {
             theme,
             motion: Motion::new(motion_level),
             boot: Boot::new("connecting to the daemon"),
-            talk: Talk,
+            talk: Talk::new(),
             owner: owner.to_string(),
             tick: 0,
             last_frame: Instant::now(),
@@ -159,38 +159,76 @@ impl App {
             return Action::None;
         }
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        // Global chords first: Ctrl+hjkl never conflicts with typing.
         match (key.code, ctrl) {
-            (KeyCode::Char('c'), true) | (KeyCode::Char('q'), false) => return Action::Quit,
-            (KeyCode::Char('h'), true) => self.move_focus(Dir::Left),
-            (KeyCode::Char('j'), true) => self.move_focus(Dir::Down),
-            (KeyCode::Char('k'), true) => self.move_focus(Dir::Up),
-            (KeyCode::Char('l'), true) => self.move_focus(Dir::Right),
-            (KeyCode::Char('f'), false) => self.fullscreen = !self.fullscreen,
-            // Temporary until `:theme` lands: cycle the built-in palettes.
-            (KeyCode::Char('T'), false) => {
-                self.theme_cycle = (self.theme_cycle + 1) % BUILTIN_NAMES.len();
-                let before = self.theme.tokens();
-                if self.theme.set_builtin(BUILTIN_NAMES[self.theme_cycle]) {
-                    self.theme_changed(before);
-                }
-            }
+            (KeyCode::Char('h'), true) => return self.move_focus(Dir::Left),
+            (KeyCode::Char('j'), true) => return self.move_focus(Dir::Down),
+            (KeyCode::Char('k'), true) => return self.move_focus(Dir::Up),
+            (KeyCode::Char('l'), true) => return self.move_focus(Dir::Right),
             _ => {}
         }
+        if self.screen == Screen::Boot {
+            return match key.code {
+                KeyCode::Char('q') => Action::Quit,
+                KeyCode::Char('c') if ctrl => Action::Quit,
+                _ => Action::None,
+            };
+        }
+        // Plain letters belong to the prompt while it has focus.
+        if self.focus != PaneId::Prompt {
+            match (key.code, ctrl) {
+                (KeyCode::Char('f'), false) => {
+                    self.fullscreen = !self.fullscreen;
+                    return Action::None;
+                }
+                // Temporary until `:theme` lands: cycle the built-in palettes.
+                (KeyCode::Char('T'), false) => {
+                    self.theme_cycle = (self.theme_cycle + 1) % BUILTIN_NAMES.len();
+                    let before = self.theme.tokens();
+                    if self.theme.set_builtin(BUILTIN_NAMES[self.theme_cycle]) {
+                        self.theme_changed(before);
+                    }
+                    return Action::None;
+                }
+                _ => {}
+            }
+        }
+        match self.talk.on_key(key, self.focus) {
+            TalkAction::Quit => Action::Quit,
+            TalkAction::Focus(id) => {
+                self.set_focus(id);
+                Action::None
+            }
+            TalkAction::None => Action::None,
+        }
+    }
+
+    fn move_focus(&mut self, dir: Dir) -> Action {
+        if self.screen != Screen::Talk || self.fullscreen {
+            return Action::None;
+        }
+        let panes = self.talk.layout(self.content_area(self.last_area));
+        let next = neighbour(self.focus, dir, &panes);
+        self.set_focus(next);
         Action::None
     }
 
-    fn move_focus(&mut self, dir: Dir) {
-        if self.screen != Screen::Talk || self.fullscreen {
+    fn set_focus(&mut self, next: PaneId) {
+        if next == self.focus {
             return;
         }
-        let panes = Talk::layout(self.content_area(self.last_area));
-        let next = neighbour(self.focus, dir, &panes);
-        if next != self.focus {
-            self.focus = next;
-            if let Some(&(_, rect)) = panes.iter().find(|(id, _)| *id == next) {
-                self.motion
-                    .add(Key::Focus, Moment::Focus, rect, self.palette());
-            }
+        self.focus = next;
+        let panes = self.talk.layout(self.content_area(self.last_area));
+        if let Some(&(_, rect)) = panes.iter().find(|(id, _)| *id == next) {
+            self.motion
+                .add(Key::Focus, Moment::Focus, rect, self.palette());
+        }
+    }
+
+    /// Bracketed paste lands in the prompt.
+    pub fn on_paste(&mut self, text: &str) {
+        if self.screen == Screen::Talk {
+            self.talk.on_paste(text);
         }
     }
 
@@ -211,10 +249,26 @@ impl App {
     fn hints(&self) -> Vec<(&'static str, &'static str)> {
         match self.screen {
             Screen::Boot => vec![("q", "quit")],
-            Screen::Talk => vec![
+            Screen::Talk if self.focus == PaneId::Prompt => vec![
+                ("Enter", "send"),
+                ("Shift+Enter", "newline"),
+                (
+                    "Ctrl+c",
+                    if self.talk.turn_active() {
+                        "cancel"
+                    } else {
+                        "quit"
+                    },
+                ),
+                ("Esc", "transcript"),
                 ("Ctrl+hjkl", "focus"),
+            ],
+            Screen::Talk => vec![
+                ("j/k", "scroll"),
+                ("G", "tail"),
+                ("i", "prompt"),
                 ("f", "fullscreen"),
-                ("T", "cycle theme"),
+                ("T", "theme"),
                 ("q", "quit"),
             ],
         }
@@ -260,8 +314,20 @@ impl App {
                 self.boot.render(frame, area, t, self.tick);
             }
             Screen::Talk => {
+                let palette = self.palette();
+                let entity = self.bar.entity.clone();
+                let owner = self.owner.clone();
                 if self.fullscreen {
-                    self.talk.render(frame, area, self.focus, t, &self.owner);
+                    self.talk.render(
+                        frame,
+                        area,
+                        self.focus,
+                        t,
+                        &owner,
+                        &entity,
+                        &mut self.motion,
+                        palette,
+                    );
                 } else {
                     let [top, content, bottom] = Layout::vertical([
                         Constraint::Length(1),
@@ -270,7 +336,16 @@ impl App {
                     ])
                     .areas(area);
                     bar::draw_top(frame, top, &self.bar, &[("talk", true)], t, self.glyphs);
-                    self.talk.render(frame, content, self.focus, t, &self.owner);
+                    self.talk.render(
+                        frame,
+                        content,
+                        self.focus,
+                        t,
+                        &owner,
+                        &entity,
+                        &mut self.motion,
+                        palette,
+                    );
                     bar::draw_hints(frame, bottom, &self.hints(), t);
                 }
             }
@@ -282,5 +357,6 @@ impl App {
     /// Called by the loop after `draw` returns.
     pub fn frame_done(&mut self, took: Duration) {
         self.motion.record_frame(took);
+        self.talk.record_frame(took);
     }
 }

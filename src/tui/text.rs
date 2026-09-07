@@ -19,7 +19,6 @@ pub fn width(s: &str) -> usize {
 /// Hard newlines are preserved as paragraph breaks. `cols` below 2 is treated
 /// as 2 so a double-width grapheme always has somewhere to go; as a result
 /// every returned line has width `<= max(cols, 2)`.
-#[allow(dead_code)] // transcript + prompt land in PN-102 increment 3
 #[must_use]
 pub fn wrap(s: &str, cols: usize) -> Vec<String> {
     let cols = cols.max(2);
@@ -72,7 +71,6 @@ pub fn wrap(s: &str, cols: usize) -> Vec<String> {
 
 /// `s` cut to at most `cols` cells, ending in `ellipsis` when anything was
 /// removed. Never splits a grapheme.
-#[allow(dead_code)] // ledger columns land with the Watch page
 #[must_use]
 pub fn truncate(s: &str, cols: usize, ellipsis: &str) -> String {
     if width(s) <= cols {

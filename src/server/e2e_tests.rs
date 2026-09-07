@@ -215,6 +215,7 @@ fn build_app(state: Arc<AppState>) -> Router {
         .route("/chat", post(handlers::chat::chat))
         .route("/api/chat/stream", post(handlers::chat::chat_stream))
         .route("/api/events", get(handlers::events::events))
+        .route("/api/session/{channel}", get(handlers::sessions::history))
         .route_layer(middleware::from_fn_with_state(
             Arc::clone(&state),
             crate::server::auth::require_auth,
@@ -1257,4 +1258,49 @@ async fn e2e_events_requires_secret_when_configured() {
         .get("content-type")
         .and_then(|v| v.to_str().ok())
         .is_some_and(|v| v.starts_with("text/event-stream")));
+}
+
+/// `/api/session/tui` returns the owner conversation the TUI will show,
+/// with the daemon's user-message wrapper removed.
+#[tokio::test]
+async fn e2e_session_history_reflects_a_chat_turn() {
+    let dir = tempfile::tempdir().unwrap();
+    let provider = MockProvider::new(vec![LlmResponse {
+        content: vec![ContentBlock::Text {
+            text: "hello back".to_string(),
+        }],
+        stop_reason: StopReason::EndTurn,
+        model: "mock".to_string(),
+        input_tokens: Some(1),
+        output_tokens: Some(1),
+    }]);
+    let state = build_state_in(dir.path().to_path_buf(), provider, ToolRegistry::new()).await;
+    let app = build_app(Arc::clone(&state));
+
+    let (status, _) = post_chat_on(&app, "tui", "hi there").await;
+    assert_eq!(status, StatusCode::OK);
+
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/api/session/tui")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(v["key"], "owner");
+    let msgs = v["messages"].as_array().unwrap();
+    assert_eq!(msgs.len(), 2, "{v}");
+    assert_eq!(msgs[0]["role"], "user");
+    assert_eq!(msgs[0]["text"], "hi there", "wrapper stripped");
+    assert_eq!(msgs[1]["role"], "assistant");
+    assert_eq!(msgs[1]["text"], "hello back");
 }
