@@ -140,15 +140,17 @@ pub async fn boot_entity(
     // The entity's own host:port when the port is free; the registry's
     // fallback otherwise, said out loud (PN-104).
     let entity_name = config.entity.name.clone();
-    let (port, fallback_note) = choose_port(
-        config.server.port,
-        fallback_port,
-        crate::registry::port_available,
-    );
+    let (host, host_note) = bind_host(&config.server.host, config.security.secret.is_some());
+    if let Some(note) = host_note {
+        tracing::warn!("Entity \"{}\": {}", entity_name, note);
+    }
+    let (port, fallback_note) = choose_port(config.server.port, fallback_port, |p| {
+        crate::registry::port_available_on(&host, p)
+    });
     if let Some(note) = fallback_note {
         tracing::warn!("Entity \"{}\": {}", entity_name, note);
     }
-    let addr = format!("{}:{}", config.server.host, port);
+    let addr = format!("{host}:{port}");
     let listener = tokio::net::TcpListener::bind(&addr).await?;
     let actual_port = listener.local_addr()?.port();
 
@@ -168,6 +170,26 @@ pub async fn boot_entity(
         actual_port,
         persist_coordinator: Arc::clone(&state.persist_coordinator),
     })
+}
+
+/// The host an entity binds in multi-entity mode. Its configured host, unless
+/// that would expose an entity with no `security.secret` beyond loopback —
+/// then loopback, with a note. `pulse-null.toml` is entity-writable data, so
+/// the socket must not be the only thing standing between it and the network.
+fn bind_host(configured: &str, has_secret: bool) -> (String, Option<String>) {
+    let loopback = configured == "localhost"
+        || configured
+            .parse::<std::net::IpAddr>()
+            .is_ok_and(|ip| ip.is_loopback());
+    if loopback || has_secret {
+        return (configured.to_string(), None);
+    }
+    (
+        "127.0.0.1".to_string(),
+        Some(format!(
+            "configured host {configured} is not loopback and no [security] secret is set — binding 127.0.0.1 instead"
+        )),
+    )
 }
 
 /// Pick the port an entity binds in multi-entity mode: its configured port
@@ -190,7 +212,22 @@ fn choose_port(
 
 #[cfg(test)]
 mod tests {
-    use super::choose_port;
+    use super::{bind_host, choose_port};
+
+    #[test]
+    fn bind_host_keeps_loopback_and_secured_hosts() {
+        assert_eq!(bind_host("127.0.0.1", false), ("127.0.0.1".into(), None));
+        assert_eq!(bind_host("localhost", false), ("localhost".into(), None));
+        assert_eq!(bind_host("::1", false), ("::1".into(), None));
+        assert_eq!(bind_host("0.0.0.0", true), ("0.0.0.0".into(), None));
+    }
+
+    #[test]
+    fn bind_host_refuses_public_host_without_secret() {
+        let (host, note) = bind_host("0.0.0.0", false);
+        assert_eq!(host, "127.0.0.1");
+        assert!(note.expect("a note").contains("0.0.0.0"));
+    }
 
     #[test]
     fn choose_port_prefers_config_when_free() {
