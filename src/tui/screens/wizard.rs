@@ -56,6 +56,51 @@ impl WizardStep {
     const TOTAL: usize = 6; // steps the user interacts with (not Creating/Done)
 }
 
+// ─── Provider choices ───
+
+/// One selectable brain: (config provider, adapter, suggested model, label).
+struct ProviderChoice {
+    provider: &'static str,
+    adapter: Option<&'static str>,
+    default_model: &'static str,
+    label: String,
+}
+
+/// The brains the wizard offers: every shipped agent-CLI adapter, then the
+/// HTTP providers. Built from the adapter registry so the list never names
+/// a vendor itself.
+fn provider_choices() -> Vec<ProviderChoice> {
+    let mut choices: Vec<ProviderChoice> = crate::cli_provider::adapters::NAMES
+        .iter()
+        .filter_map(|name| crate::cli_provider::adapters::by_name(name))
+        .map(|adapter| ProviderChoice {
+            provider: "cli",
+            adapter: Some(adapter.name()),
+            default_model: adapter.default_model(),
+            label: format!("Agent CLI — {} (uses the CLI's own login)", adapter.name()),
+        })
+        .collect();
+    choices.push(ProviderChoice {
+        provider: "anthropic",
+        adapter: None,
+        default_model: crate::anthropic_provider::DEFAULT_MODEL,
+        label: "Anthropic API (per-token, needs an API key)".into(),
+    });
+    choices.push(ProviderChoice {
+        provider: "ollama",
+        adapter: None,
+        default_model: "llama3.2:latest",
+        label: "Ollama (local, requires Ollama running)".into(),
+    });
+    choices
+}
+
+fn choice(idx: usize) -> ProviderChoice {
+    let mut all = provider_choices();
+    let idx = idx.min(all.len() - 1);
+    all.swap_remove(idx)
+}
+
 // ─── Wizard State ───
 
 pub struct WizardScreen {
@@ -74,7 +119,7 @@ pub struct WizardScreen {
     values_field: usize, // 0=values, 1=traits
 
     // Provider
-    provider_idx: usize, // 0=claude-code, 1=claude, 2=ollama
+    provider_idx: usize, // index into provider_choices(): adapters…, anthropic, ollama
     model: TextArea<'static>,
     api_key: TextArea<'static>,
     provider_field: usize, // 0=provider select, 1=model/api_key
@@ -167,7 +212,7 @@ impl WizardScreen {
             },
             WizardStep::Provider => {
                 if self.provider_field == 1 {
-                    if self.provider_idx == 1 {
+                    if choice(self.provider_idx).provider == "anthropic" {
                         Some(&mut self.api_key)
                     } else {
                         Some(&mut self.model)
@@ -211,14 +256,10 @@ impl WizardScreen {
             }
             WizardStep::Values => self.step = WizardStep::Provider,
             WizardStep::Provider => {
-                // Set default model based on provider
-                if self.provider_idx == 2 {
-                    let m = get_text(&self.model);
-                    if m.is_empty() || m == "opus" || m == "sonnet" || m == "haiku" {
-                        self.model.select_all();
-                        self.model.cut();
-                        self.model.insert_str("llama3.2:latest");
-                    }
+                // An empty model means the chosen brain's suggestion.
+                if get_text(&self.model).is_empty() {
+                    self.model
+                        .insert_str(choice(self.provider_idx).default_model);
                 }
                 self.step = WizardStep::Server;
             }
@@ -263,15 +304,11 @@ impl WizardScreen {
             .filter(|l| !l.is_empty())
             .collect();
 
-        let provider = match self.provider_idx {
-            0 => "claude-code",
-            1 => "claude",
-            2 => "ollama",
-            _ => "claude-code",
-        };
+        let chosen = choice(self.provider_idx);
+        let provider = chosen.provider;
 
         let model = get_text(&self.model);
-        let api_key = if self.provider_idx == 1 {
+        let api_key = if chosen.provider == "anthropic" {
             let k = get_text(&self.api_key);
             if k.is_empty() {
                 None
@@ -359,13 +396,13 @@ impl WizardScreen {
             timezone,
             plugins: selected_plugins,
             rules_dir: None,
-            adapter: None,
+            adapter: chosen.adapter.map(str::to_string),
         };
 
         let files = vec![
             ("pulse-null.toml", templates::render_config(&config)),
             ("SELF.md", templates::render_self_md(&identity)),
-            ("CLAUDE.md", templates::render_claude_md(&identity)),
+            ("INSTRUCTIONS.md", templates::render_instructions(&identity)),
             ("memory/MEMORY.md", templates::render_memory_md(&identity)),
             ("memory/EPHEMERAL.md", String::new()),
             ("memory/ARCHIVE.md", "# Archive Index\n".to_string()),
@@ -417,7 +454,7 @@ impl WizardScreen {
 
         // Same entity-local Claude Code wiring the CLI wizard does (PN-104).
         // Anything that did not land is said on the Done screen, not buried.
-        if let Some(adapter) = crate::cli_provider::adapters::for_config(provider, None) {
+        if let Some(adapter) = crate::cli_provider::adapters::for_config(provider, chosen.adapter) {
             use crate::init::agent_bootstrap::ItemStatus;
             let integration = adapter.integration();
             let mut items = crate::init::agent_bootstrap::ensure_common(
@@ -588,12 +625,7 @@ impl Screen for WizardScreen {
                 WizardStep::Provider if self.provider_field == 0 => {
                     self.provider_field = 1;
                     // Set default model for selected provider
-                    let default_model = match self.provider_idx {
-                        0 => "opus",
-                        1 => "claude-sonnet-4-20250514",
-                        2 => "llama3.2:latest",
-                        _ => "opus",
-                    };
+                    let default_model = choice(self.provider_idx).default_model;
                     self.model.select_all();
                     self.model.cut();
                     self.model.insert_str(default_model);
@@ -622,12 +654,7 @@ impl Screen for WizardScreen {
                 WizardStep::Provider => {
                     if self.provider_field == 0 {
                         self.provider_field = 1;
-                        let default_model = match self.provider_idx {
-                            0 => "opus",
-                            1 => "claude-sonnet-4-20250514",
-                            2 => "llama3.2:latest",
-                            _ => "opus",
-                        };
+                        let default_model = choice(self.provider_idx).default_model;
                         self.model.select_all();
                         self.model.cut();
                         self.model.insert_str(default_model);
@@ -650,7 +677,7 @@ impl Screen for WizardScreen {
                     KeyCode::Up => {
                         self.provider_idx = self.provider_idx.saturating_sub(1);
                     }
-                    KeyCode::Down if self.provider_idx < 2 => {
+                    KeyCode::Down if self.provider_idx + 1 < provider_choices().len() => {
                         self.provider_idx += 1;
                     }
                     _ => {}
@@ -802,11 +829,7 @@ impl WizardScreen {
             rows[0],
         );
 
-        let providers = [
-            "Claude Code (uses claude CLI — no API key)",
-            "Claude API (requires Anthropic API key)",
-            "Ollama (local, requires Ollama running)",
-        ];
+        let providers: Vec<String> = provider_choices().into_iter().map(|c| c.label).collect();
 
         let lines: Vec<Line> = providers
             .iter()
@@ -959,11 +982,10 @@ impl WizardScreen {
         let model = get_text(&self.model);
         let port = get_text(&self.port);
 
-        let provider = match self.provider_idx {
-            0 => "claude-code",
-            1 => "claude",
-            2 => "ollama",
-            _ => "claude-code",
+        let chosen = choice(self.provider_idx);
+        let provider = match chosen.adapter {
+            Some(adapter) => format!("{} ({})", chosen.provider, adapter),
+            None => chosen.provider.to_string(),
         };
         let timezone = TIMEZONES[self.timezone_idx.min(TIMEZONES.len() - 1)];
 

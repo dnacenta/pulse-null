@@ -44,7 +44,7 @@ pub fn validate(config: &Config) -> Result<(), ConfigError> {
     }
     // Pre-PN-106 spellings are folded by `LlmConfig::normalize` at load time;
     // a struct built by hand may still carry them, so accept both here.
-    let valid_providers = ["cli", "anthropic", "ollama", "claude-code", "claude"];
+    let valid_providers = ["cli", "anthropic", "ollama", "claude-code", "claude"]; // vendor-ok: legacy aliases
     if !valid_providers.contains(&config.llm.provider.as_str()) {
         return Err(ConfigError::Validation(format!(
             "Unknown LLM provider: {}. Valid: cli, anthropic, ollama",

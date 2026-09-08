@@ -86,7 +86,9 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
 
         let stale = integration.user_hooks_missing_root(&home);
         if !stale.is_empty() {
-            let settings = home.join(".claude/settings.json");
+            let settings = integration
+                .user_hooks_location(&home)
+                .unwrap_or_else(|| home.join("settings"));
             println!();
             println!(
                 "  {} {} has recall-echo hooks without an entity root.",
@@ -94,7 +96,7 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 settings.display()
             );
             println!("    They fire for every entity this user runs and resolve to the wrong one.");
-            println!("    The entity now carries its own hooks in .claude/settings.json — remove these by hand:");
+            println!("    The entity now carries its own hooks — remove these by hand:");
             for command in &stale {
                 println!("      {}", printable(command));
             }

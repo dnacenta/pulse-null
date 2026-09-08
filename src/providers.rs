@@ -45,6 +45,7 @@ pub fn create_provider(
 ) -> Result<Box<dyn LmProvider>, ProviderError> {
     match config.llm.provider.as_str() {
         "anthropic" | "claude" => {
+            // vendor-ok: pre-PN-106 alias
             let api_key = config.resolve_api_key().ok_or_else(|| {
                 ProviderError::MissingApiKey(
                     "No API key found. Set it in pulse-null.toml or ANTHROPIC_API_KEY env var."
@@ -60,7 +61,7 @@ pub fn create_provider(
             config.llm.model.clone(),
             config.llm.base_url.clone(),
         ))),
-        "cli" | "claude-code" => Ok(Box::new(cli_provider_for(config, entity_root)?)),
+        "cli" | "claude-code" => Ok(Box::new(cli_provider_for(config, entity_root)?)), // vendor-ok: pre-PN-106 alias
         other => Err(ProviderError::Unknown(other.to_string())),
     }
 }
@@ -72,6 +73,7 @@ pub fn create_streaming_provider(
 ) -> Result<Box<dyn StreamingProvider>, ProviderError> {
     match config.llm.provider.as_str() {
         "anthropic" | "claude" => {
+            // vendor-ok: pre-PN-106 alias
             let api_key = config.resolve_api_key().ok_or_else(|| {
                 ProviderError::MissingApiKey(
                     "No API key found. Set it in pulse-null.toml or ANTHROPIC_API_KEY env var."
@@ -87,7 +89,7 @@ pub fn create_streaming_provider(
             config.llm.model.clone(),
             config.llm.base_url.clone(),
         ))),
-        "cli" | "claude-code" => Ok(Box::new(cli_provider_for(config, entity_root)?)),
+        "cli" | "claude-code" => Ok(Box::new(cli_provider_for(config, entity_root)?)), // vendor-ok: pre-PN-106 alias
         other => Err(ProviderError::Unknown(other.to_string())),
     }
 }

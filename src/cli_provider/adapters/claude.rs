@@ -39,6 +39,10 @@ impl CliAdapter for Claude {
         "claude"
     }
 
+    fn default_model(&self) -> &'static str {
+        "opus"
+    }
+
     /// An enclosing Claude Code session sets `CLAUDECODE`; a child that sees
     /// it thinks it is nested and behaves differently.
     fn env_remove(&self) -> &'static [&'static str] {
@@ -224,6 +228,15 @@ impl AgentIntegration for Claude {
 
     fn user_hooks_missing_root(&self, home: &Path) -> Vec<String> {
         claude_hooks::user_hooks_missing_root(home)
+    }
+
+    fn user_hooks_location(&self, home: &Path) -> Option<PathBuf> {
+        Some(home.join(".claude/settings.json"))
+    }
+
+    /// Claude Code resolves `@AWARENESS.md` inside `CLAUDE.md` itself.
+    fn imports_awareness(&self) -> bool {
+        true
     }
 }
 

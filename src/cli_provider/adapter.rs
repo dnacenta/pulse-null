@@ -129,6 +129,10 @@ pub trait CliAdapter: Send + Sync {
     /// Binary name to spawn when `[llm] cli_bin` is unset.
     fn default_bin(&self) -> &'static str;
 
+    /// The model the wizard suggests for this CLI. Empty means "let the CLI
+    /// pick", and the adapter then omits its model flag.
+    fn default_model(&self) -> &'static str;
+
     /// Environment variables to strip from the child, e.g. a marker that
     /// would make the CLI think it is nested inside itself.
     fn env_remove(&self) -> &'static [&'static str] {
@@ -189,6 +193,18 @@ pub trait AgentIntegration: Send + Sync {
     /// this entity — candidates for `repair` to retire.
     fn legacy_home_links(&self, _entity_root: &Path, _home: &Path) -> Vec<PathBuf> {
         Vec::new()
+    }
+
+    /// Where this CLI keeps user-level hooks, if it has such a file.
+    fn user_hooks_location(&self, _home: &Path) -> Option<PathBuf> {
+        None
+    }
+
+    /// Does this CLI resolve the `@AWARENESS.md` import in the entity's
+    /// instruction file itself? When false, the prompt builder inlines
+    /// AWARENESS.md into the system prompt.
+    fn imports_awareness(&self) -> bool {
+        false
     }
 
     /// User-level hook commands for this CLI that carry no entity root and

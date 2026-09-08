@@ -299,6 +299,15 @@ pub(super) fn ensure_files(entity_root: &Path, recall_bin: &str) -> Vec<Bootstra
     let ok = |item: &BootstrapItem| matches!(item.status, ItemStatus::Created | ItemStatus::Exists);
 
     let mut items = Vec::new();
+    // Claude Code reads CLAUDE.md; the entity's instructions live in the
+    // generic INSTRUCTIONS.md, so CLAUDE.md is a one-line import of it.
+    // Entities created before PN-106 already have a full CLAUDE.md, which
+    // `ensure_config` leaves alone.
+    items.push(ensure_config(
+        &entity_root.join("CLAUDE.md"),
+        "@INSTRUCTIONS.md\n",
+        &entity_root,
+    ));
     let claude = ensure_dir(&claude_dir);
     let claude_ok = ok(&claude);
     items.push(claude);

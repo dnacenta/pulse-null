@@ -118,6 +118,9 @@ fn stage_prepends_when_the_cli_has_no_system_prompt_channel() {
         fn default_bin(&self) -> &'static str {
             "prep"
         }
+        fn default_model(&self) -> &'static str {
+            ""
+        }
         fn prompt_delivery(&self) -> adapter::PromptDelivery {
             adapter::PromptDelivery::Stdin
         }
@@ -157,6 +160,9 @@ fn stage_refuses_an_oversized_argv_system_prompt() {
         }
         fn default_bin(&self) -> &'static str {
             "argv"
+        }
+        fn default_model(&self) -> &'static str {
+            ""
         }
         fn prompt_delivery(&self) -> adapter::PromptDelivery {
             adapter::PromptDelivery::File

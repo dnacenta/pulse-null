@@ -69,6 +69,10 @@ impl CliAdapter for Grok {
         "grok"
     }
 
+    fn default_model(&self) -> &'static str {
+        "grok-4.6"
+    }
+
     /// Grok logs at INFO on startup, which lands on stderr and pollutes the
     /// error detail pulse-null reports for a non-zero exit (first seen on an
     /// intent timeout, exit 124).

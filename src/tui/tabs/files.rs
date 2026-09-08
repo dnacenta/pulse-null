@@ -61,7 +61,7 @@ impl FilesTab {
         self.files.clear();
 
         // Root-level documents
-        let root_files = ["SELF.md", "PRAXIS.md", "CLAUDE.md"];
+        let root_files = ["SELF.md", "PRAXIS.md", "INSTRUCTIONS.md", "CLAUDE.md"]; // vendor-ok: pre-PN-106 instruction file
         for name in &root_files {
             let entity_path = root_dir.join(format!("entity/{}", name));
             let root_path = root_dir.join(name);
@@ -116,7 +116,7 @@ impl FilesTab {
         let memory_dirs = [
             root_dir.join("entity/memory"),
             root_dir.join("memory"),
-            root_dir.join(".claude/memory"),
+            root_dir.join(".claude/memory"), // vendor-ok: pre-PN-104 layout
         ];
         if let Some(mdir) = memory_dirs.iter().find(|d| d.exists()) {
             let mut entries = Vec::new();

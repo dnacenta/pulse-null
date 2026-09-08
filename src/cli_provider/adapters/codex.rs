@@ -42,6 +42,12 @@ impl CliAdapter for Codex {
         "codex"
     }
 
+    /// Codex picks its own default model when `-m` is omitted; we do not
+    /// second-guess it.
+    fn default_model(&self) -> &'static str {
+        ""
+    }
+
     fn prompt_delivery(&self) -> PromptDelivery {
         PromptDelivery::Stdin
     }
@@ -62,8 +68,10 @@ impl CliAdapter for Codex {
         // The prompt positional: read from stdin.
         args.push("-".into());
         args.push("--json".into());
-        args.push("-m".into());
-        args.push(inv.model.into());
+        if !inv.model.is_empty() {
+            args.push("-m".into());
+            args.push(inv.model.into());
+        }
         args.push("--ephemeral".into());
         args.push("--skip-git-repo-check".into());
         args.push("-C".into());

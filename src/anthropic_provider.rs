@@ -7,6 +7,9 @@ use tokio_stream::StreamExt;
 use crate::session::strip_system_prefixes;
 use crate::streaming::{self, StreamEvent, StreamResult, StreamingProvider};
 
+/// The model the wizard suggests for the Anthropic API.
+pub const DEFAULT_MODEL: &str = "claude-sonnet-4-20250514";
+
 pub struct AnthropicProvider {
     api_key: String,
     model: String,

@@ -89,7 +89,7 @@ pub struct LlmConfig {
     pub adapter: Option<String>,
     /// Path to the agent CLI binary; defaults to the adapter's own name on
     /// `PATH`. `claude_bin` is the pre-PN-106 spelling and still loads.
-    #[serde(default, alias = "claude_bin")]
+    #[serde(default, alias = "claude_bin")] // vendor-ok: pre-PN-106 key
     pub cli_bin: Option<String>,
     /// Reasoning effort hint for CLIs that take one (the grok adapter maps it
     /// to `--reasoning-effort`; default "low" — high cost ~20s of hidden
@@ -119,19 +119,21 @@ impl LlmConfig {
         let mut notices = Vec::new();
         match self.provider.as_str() {
             "claude-code" => {
+                // vendor-ok: pre-PN-106 alias
                 self.provider = "cli".into();
                 if self.adapter.is_none() {
-                    self.adapter = Some("claude".into());
+                    self.adapter = Some("claude".into()); // vendor-ok: what claude-code meant
                 }
                 notices.push(
-                    "[llm] provider = \"claude-code\" is deprecated — use provider = \"cli\" with adapter = \"claude\""
+                    "[llm] provider = \"claude-code\" is deprecated — use provider = \"cli\" with adapter = \"claude\"" // vendor-ok: alias notice
                         .into(),
                 );
             }
             "claude" => {
+                // vendor-ok: pre-PN-106 alias
                 self.provider = "anthropic".into();
                 notices.push(
-                    "[llm] provider = \"claude\" is deprecated — use provider = \"anthropic\""
+                    "[llm] provider = \"claude\" is deprecated — use provider = \"anthropic\"" // vendor-ok: alias notice
                         .into(),
                 );
             }
@@ -143,8 +145,8 @@ impl LlmConfig {
     /// The adapter name when this config drives an agent CLI.
     pub fn cli_adapter(&self) -> Option<&str> {
         match self.provider.as_str() {
-            "cli" => self.adapter.as_deref().or(Some("claude")),
-            "claude-code" => Some("claude"),
+            "cli" => self.adapter.as_deref(),
+            "claude-code" => Some("claude"), // vendor-ok: pre-PN-106 alias
             _ => None,
         }
     }
@@ -411,7 +413,7 @@ fn default_provider() -> String {
 }
 
 fn default_model() -> String {
-    "claude-sonnet-4-20250514".to_string()
+    crate::anthropic_provider::DEFAULT_MODEL.to_string()
 }
 
 fn default_max_tokens() -> u32 {
@@ -1084,7 +1086,7 @@ impl Default for ChannelLimits {
 /// components are progressively trimmed.
 ///
 /// Priority tiers (highest to lowest):
-/// 1. CLAUDE.md + rules/protocol files (essential — never trimmed)
+/// 1. The instruction file + rules/protocol files (essential — never trimmed)
 /// 2. SELF.md, MEMORY.md (high priority — trimmed only as last resort)
 /// 3. EPHEMERAL.md, FINDINGS.md, pipeline health, cognitive health, caliber (trimmable)
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1097,7 +1099,8 @@ pub struct SystemPromptBudgetConfig {
     pub token_budget: usize,
     /// Per-component token caps. Components exceeding their cap are truncated.
     /// Set to 0 to use the default for that component.
-    pub claude_md_cap: usize,
+    #[serde(alias = "claude_md_cap")] // vendor-ok: pre-PN-106 key
+    pub instructions_cap: usize,
     pub rules_cap: usize,
     pub self_md_cap: usize,
     pub memory_cap: usize,
@@ -1125,7 +1128,7 @@ impl Default for SystemPromptBudgetConfig {
         Self {
             enabled: true,
             token_budget: 17_000,
-            claude_md_cap: 5_000,
+            instructions_cap: 5_000,
             rules_cap: 3_000,
             self_md_cap: 4_000,
             memory_cap: 4_000,
