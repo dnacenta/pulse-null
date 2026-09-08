@@ -72,12 +72,13 @@ fn is_entity_child(entry: &std::fs::DirEntry) -> bool {
 }
 
 /// Booting an entity runs its configured binaries with our rights; only
-/// directories we own qualify.
-fn owned_by_us(path: &Path) -> bool {
+/// directories we own qualify. `DirEntry::metadata` does not follow
+/// symlinks, so it describes the same thing `is_entity_child` judged.
+fn owned_by_us(entry: &std::fs::DirEntry) -> bool {
     use std::os::unix::fs::MetadataExt;
     // SAFETY: geteuid has no preconditions and cannot fail.
     let me = unsafe { libc::geteuid() };
-    std::fs::metadata(path).is_ok_and(|m| m.uid() == me)
+    entry.metadata().is_ok_and(|m| m.uid() == me)
 }
 
 /// Scan the entity home directory for valid entity directories.
@@ -94,7 +95,7 @@ pub fn discover_entities(entity_home: &Path) -> Vec<DiscoveredEntity> {
         if !is_entity_child(&entry) {
             continue;
         }
-        if !owned_by_us(&path) {
+        if !owned_by_us(&entry) {
             tracing::warn!(
                 "Skipping {}: not owned by the running user — an entity is booted with this user's rights",
                 path.display()

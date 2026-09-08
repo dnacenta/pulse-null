@@ -60,8 +60,30 @@ impl fmt::Display for BootstrapItem {
             ItemStatus::Wrong(reason) => format!(" wrong: {reason}"),
             ItemStatus::Skipped(reason) => format!(" skipped: {reason}"),
         };
-        write!(f, "  {} {}{}", icon, self.path.display(), detail)
+        write!(
+            f,
+            "  {} {}{}",
+            icon,
+            printable(&self.path.display().to_string()),
+            printable(&detail)
+        )
     }
+}
+
+/// Paths and reasons can come from files we did not write. Keep terminal
+/// control sequences and bidi overrides out of what we print about them.
+pub fn printable(s: &str) -> String {
+    s.chars()
+        .map(|c| {
+            if c.is_control()
+                || matches!(c, '\u{200B}'..='\u{200F}' | '\u{202A}'..='\u{202E}' | '\u{2066}'..='\u{2069}')
+            {
+                '\u{FFFD}'
+            } else {
+                c
+            }
+        })
+        .collect()
 }
 
 /// The three recall-echo hook subcommands, in the event order Claude Code
@@ -134,20 +156,53 @@ fn render_hooks(recall_bin: &str, root: &Path) -> serde_json::Value {
     serde_json::Value::Object(hooks)
 }
 
+/// The first two shell words of a hook command, honouring single quotes
+/// (the only quoting `hook_command` emits). Enough to recognise our own
+/// output whatever the binary path contains; not a general shell parser.
+fn first_two_words(command: &str) -> Option<(String, String)> {
+    let mut words = Vec::new();
+    let mut cur = String::new();
+    let mut in_quote = false;
+    let mut chars = command.chars();
+    while let Some(c) = chars.next() {
+        match c {
+            '\'' => in_quote = !in_quote,
+            // Outside quotes a backslash escapes the next character — this is
+            // how `shell_quote` spells a literal quote (`'\''`).
+            '\\' if !in_quote => {
+                if let Some(next) = chars.next() {
+                    cur.push(next);
+                }
+            }
+            c if c.is_whitespace() && !in_quote => {
+                if !cur.is_empty() {
+                    words.push(std::mem::take(&mut cur));
+                    if words.len() == 2 {
+                        break;
+                    }
+                }
+            }
+            c => cur.push(c),
+        }
+    }
+    if !cur.is_empty() && words.len() < 2 {
+        words.push(cur);
+    }
+    let mut it = words.into_iter();
+    Some((it.next()?, it.next()?))
+}
+
 /// Is this command a recall-echo `sub` invocation? Anchored: the *first*
-/// token must be the recall-echo binary (quoted or not, any path) and the
+/// word must be the recall-echo binary (quoted or not, any path) and the
 /// second the subcommand. A command that merely mentions recall-echo
 /// somewhere is not ours to touch.
 fn is_recall_command(command: &str, sub: &str) -> bool {
-    let mut tokens = command.split_whitespace();
-    let (Some(bin), Some(first_arg)) = (tokens.next(), tokens.next()) else {
-        return false;
-    };
-    let bin = bin.trim_matches('\'');
-    Path::new(bin)
-        .file_name()
-        .is_some_and(|f| f == "recall-echo")
-        && first_arg == sub
+    first_two_words(command).is_some_and(|(bin, first_arg)| {
+        Path::new(&bin)
+            .file_name()
+            .is_some_and(|f| f == "recall-echo")
+            && first_arg == sub
+    })
 }
 
 /// Drop recall-echo `sub` hooks from one event entry, keeping every other
@@ -208,42 +263,84 @@ fn merge_hooks(mut existing: serde_json::Value, ours: &serde_json::Value) -> ser
 const MAX_CONFIG_BYTES: u64 = 1024 * 1024;
 
 /// Read a small regular file. `Ok(None)` when absent; an error names why a
-/// present path was refused (symlink, not a regular file, too large).
+/// present path was refused (symlink, not a regular file, too large). The
+/// file is opened once with `O_NOFOLLOW` and inspected through the handle,
+/// so nothing can be swapped in between the check and the read.
 fn read_small_file(path: &Path) -> Result<Option<String>, String> {
-    let meta = match path.symlink_metadata() {
-        Ok(m) => m,
+    use std::io::Read;
+    use std::os::unix::fs::OpenOptionsExt;
+    let file = match std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(path)
+    {
+        Ok(f) => f,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) if e.raw_os_error() == Some(libc::ELOOP) => {
+            return Err("is a symlink — refusing to follow it".into())
+        }
         Err(e) => return Err(e.to_string()),
     };
-    if meta.file_type().is_symlink() {
-        return Err("is a symlink — refusing to follow it".into());
-    }
+    let meta = file.metadata().map_err(|e| e.to_string())?;
     if !meta.is_file() {
         return Err("not a regular file".into());
     }
     if meta.len() > MAX_CONFIG_BYTES {
         return Err(format!("larger than {MAX_CONFIG_BYTES} bytes"));
     }
-    std::fs::read_to_string(path)
-        .map(Some)
-        .map_err(|e| e.to_string())
+    let mut text = String::new();
+    file.take(MAX_CONFIG_BYTES)
+        .read_to_string(&mut text)
+        .map_err(|e| e.to_string())?;
+    Ok(Some(text))
 }
 
-/// Write `content` to `path` atomically (temp file + rename in the same
-/// directory), never through a symlink.
-fn write_regular_file(path: &Path, content: &str) -> Result<(), String> {
-    if path
-        .symlink_metadata()
-        .is_ok_and(|m| m.file_type().is_symlink())
-    {
-        return Err("is a symlink — refusing to write through it".into());
-    }
+/// Write `content` to `path` atomically, never through a symlink at any
+/// component: the parent must already exist and canonicalise inside
+/// `within`; the temp file is created `O_EXCL` with a random name and
+/// mode 0600 (or the mode of the file it replaces), fsynced, then renamed.
+fn write_regular_file(path: &Path, content: &str, within: &Path) -> Result<(), String> {
+    use std::io::Write;
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+    let existing = match path.symlink_metadata() {
+        Ok(m) if m.file_type().is_symlink() => {
+            return Err("is a symlink — refusing to write through it".into());
+        }
+        Ok(m) => Some(m),
+        Err(_) => None,
+    };
     let parent = path.parent().ok_or("no parent directory")?;
-    std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+    let parent_real = parent
+        .canonicalize()
+        .map_err(|e| format!("parent directory: {e}"))?;
+    if !parent_real.starts_with(within) {
+        return Err(format!(
+            "parent {} resolves outside the entity ({})",
+            parent.display(),
+            parent_real.display()
+        ));
+    }
     let name = path.file_name().ok_or("no file name")?.to_string_lossy();
-    let tmp = parent.join(format!(".{name}.tmp-{}", std::process::id()));
-    std::fs::write(&tmp, content).map_err(|e| e.to_string())?;
-    std::fs::rename(&tmp, path).map_err(|e| {
+    let tmp = parent_real.join(format!(".{name}.tmp-{}", uuid::Uuid::new_v4().simple()));
+    let mode = existing
+        .map(|m| m.permissions().mode() & 0o777)
+        .unwrap_or(0o600);
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(mode)
+        .open(&tmp)
+        .map_err(|e| e.to_string())?;
+    let written = file
+        .write_all(content.as_bytes())
+        .and_then(|()| file.sync_all())
+        .map_err(|e| e.to_string());
+    drop(file);
+    if let Err(e) = written {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e);
+    }
+    std::fs::rename(&tmp, parent_real.join(&*name)).map_err(|e| {
         let _ = std::fs::remove_file(&tmp);
         e.to_string()
     })
@@ -251,7 +348,7 @@ fn write_regular_file(path: &Path, content: &str) -> Result<(), String> {
 
 /// Bring `.claude/settings.json` up to date without clobbering anything else
 /// in it.
-fn ensure_settings(path: &Path, ours: &serde_json::Value) -> BootstrapItem {
+fn ensure_settings(path: &Path, ours: &serde_json::Value, within: &Path) -> BootstrapItem {
     let item = |status| BootstrapItem {
         path: path.to_path_buf(),
         kind: ItemKind::ConfigFile,
@@ -274,7 +371,7 @@ fn ensure_settings(path: &Path, ours: &serde_json::Value) -> BootstrapItem {
         Ok(text) => text + "\n",
         Err(e) => return item(ItemStatus::Skipped(format!("could not serialise: {e}"))),
     };
-    match write_regular_file(path, &rendered) {
+    match write_regular_file(path, &rendered, within) {
         Ok(()) if was_present => item(ItemStatus::Updated),
         Ok(()) => item(ItemStatus::Created),
         Err(e) => item(ItemStatus::Skipped(e)),
@@ -315,7 +412,7 @@ fn ensure_dir(path: &Path) -> BootstrapItem {
 /// Write a config file if it doesn't exist. Never overwrites: an existing
 /// file may carry hand-tuned settings (Echo's graph config lives in its
 /// `.recall-echo.toml`).
-fn ensure_config(path: &Path, content: &str) -> BootstrapItem {
+fn ensure_config(path: &Path, content: &str, within: &Path) -> BootstrapItem {
     let item = |status| BootstrapItem {
         path: path.to_path_buf(),
         kind: ItemKind::ConfigFile,
@@ -328,7 +425,7 @@ fn ensure_config(path: &Path, content: &str) -> BootstrapItem {
             ItemStatus::Exists
         });
     }
-    match write_regular_file(path, content) {
+    match write_regular_file(path, content, within) {
         Ok(()) => item(ItemStatus::Created),
         Err(e) => item(ItemStatus::Skipped(e)),
     }
@@ -488,7 +585,9 @@ current conversation.
 }
 
 /// Create all Claude Code integration files for one entity.
-/// Safe to run multiple times — skips anything already correct.
+/// Safe to run multiple times — skips anything already correct. A parent
+/// that is not a real directory (a symlink, say) stops everything under it:
+/// nothing is created through a component we did not verify.
 pub fn ensure(entity_root: &Path) -> Vec<BootstrapItem> {
     let entity_root = entity_root
         .canonicalize()
@@ -503,23 +602,43 @@ pub fn ensure(entity_root: &Path) -> Vec<BootstrapItem> {
         }];
     }
     let claude_dir = entity_root.join(".claude");
+    let memory_dir = entity_root.join("memory");
     let recall_bin = find_recall_echo_bin();
+    let ok = |item: &BootstrapItem| matches!(item.status, ItemStatus::Created | ItemStatus::Exists);
 
-    vec![
-        ensure_dir(&claude_dir),
-        ensure_dir(&claude_dir.join("rules")),
-        ensure_dir(&entity_root.join("memory")),
-        ensure_settings(
+    let mut items = Vec::new();
+    let claude = ensure_dir(&claude_dir);
+    let claude_ok = ok(&claude);
+    items.push(claude);
+    if claude_ok {
+        let rules = ensure_dir(&claude_dir.join("rules"));
+        let rules_ok = ok(&rules);
+        items.push(rules);
+        items.push(ensure_settings(
             &claude_dir.join("settings.json"),
             &render_hooks(&recall_bin, &entity_root),
-        ),
-        ensure_config(&claude_dir.join("rules/recall-echo.md"), render_rules_md()),
-        ensure_config(
-            &entity_root.join("memory/.recall-echo.toml"),
+            &entity_root,
+        ));
+        if rules_ok {
+            items.push(ensure_config(
+                &claude_dir.join("rules/recall-echo.md"),
+                render_rules_md(),
+                &entity_root,
+            ));
+        }
+    }
+    let memory = ensure_dir(&memory_dir);
+    let memory_ok = ok(&memory);
+    items.push(memory);
+    if memory_ok {
+        items.push(ensure_config(
+            &memory_dir.join(".recall-echo.toml"),
             &render_recall_echo_toml(&entity_root),
-        ),
-        ensure_conversations_link(&entity_root),
-    ]
+            &entity_root,
+        ));
+        items.push(ensure_conversations_link(&entity_root));
+    }
+    items
 }
 
 /// Verify Claude Code integration without creating anything. Also reports
@@ -1005,6 +1124,66 @@ mod tests {
     fn hook_commands_quote_the_binary() {
         let cmd = hook_command("/opt/my tools/recall-echo", "consume", Path::new("/e"));
         assert_eq!(cmd, "'/opt/my tools/recall-echo' consume '/e'");
+        // …and we still recognise our own output.
+        assert!(is_recall_command(&cmd, "consume"));
+        let odd = hook_command(
+            "/opt/it's here/recall-echo",
+            "archive-session",
+            Path::new("/e"),
+        );
+        assert!(is_recall_command(&odd, "archive-session"));
+        assert!(!is_recall_command(
+            "sh -c 'recall-echo consume /e'",
+            "consume"
+        ));
+    }
+
+    #[test]
+    fn writes_never_follow_a_symlinked_parent_or_temp() {
+        let dir = entity();
+        let root = dir.path().canonicalize().unwrap();
+        let elsewhere = tempfile::tempdir().unwrap();
+        // `.claude` itself is a link out of the tree.
+        std::os::unix::fs::symlink(elsewhere.path(), root.join(".claude")).unwrap();
+        let items = ensure(&root);
+        let claude = items.iter().find(|i| i.path.ends_with(".claude")).unwrap();
+        assert!(matches!(claude.status, ItemStatus::Skipped(_)));
+        assert!(
+            !items.iter().any(|i| i.path.ends_with("settings.json")),
+            "nothing under a refused parent is attempted: {items:?}"
+        );
+        assert!(std::fs::read_dir(elsewhere.path())
+            .unwrap()
+            .next()
+            .is_none());
+
+        // A direct write whose parent resolves outside the entity is refused.
+        let err = write_regular_file(&elsewhere.path().join("x.json"), "{}", &root).unwrap_err();
+        assert!(err.contains("outside the entity"), "{err}");
+
+        // Temp files are O_EXCL: a planted name cannot be written through.
+        std::fs::remove_file(root.join(".claude")).unwrap();
+        std::fs::create_dir_all(root.join(".claude")).unwrap();
+        write_regular_file(&root.join(".claude/settings.json"), "{}\n", &root).unwrap();
+        let leftovers: Vec<_> = std::fs::read_dir(root.join(".claude"))
+            .unwrap()
+            .flatten()
+            .filter(|e| e.file_name().to_string_lossy().contains(".tmp-"))
+            .collect();
+        assert!(leftovers.is_empty(), "no temp files left behind");
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(root.join(".claude/settings.json"))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o600);
+    }
+
+    #[test]
+    fn printable_scrubs_control_and_bidi_but_keeps_unicode() {
+        assert_eq!(printable("a\u{1b}[2Kb\u{202E}c"), "a\u{FFFD}[2Kb\u{FFFD}c");
+        assert_eq!(printable("café 日本 🦀"), "café 日本 🦀");
     }
 
     #[test]

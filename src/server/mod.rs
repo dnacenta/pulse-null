@@ -312,7 +312,13 @@ pub async fn start(config: Config) -> Result<(), Box<dyn std::error::Error>> {
 
     let app = build_router(Arc::clone(&state), plugin_routes);
 
-    let addr = format!("{}:{}", config.server.host, config.server.port);
+    // Same rule as multi-entity boot: an entity with no usable secret stays
+    // on loopback whatever its config says (PN-104 audit SEC-001).
+    let (host, host_note) = boot::bind_host(&config.server.host, boot::has_usable_secret(&config));
+    if let Some(note) = host_note {
+        tracing::warn!("{}", note);
+    }
+    let addr = format!("{}:{}", host, config.server.port);
     let listener = tokio::net::TcpListener::bind(&addr).await?;
 
     // Write PID file so `pulse-null down` can find us

@@ -140,7 +140,7 @@ pub async fn boot_entity(
     // The entity's own host:port when the port is free; the registry's
     // fallback otherwise, said out loud (PN-104).
     let entity_name = config.entity.name.clone();
-    let (host, host_note) = bind_host(&config.server.host, config.security.secret.is_some());
+    let (host, host_note) = bind_host(&config.server.host, has_usable_secret(&config));
     if let Some(note) = host_note {
         tracing::warn!("Entity \"{}\": {}", entity_name, note);
     }
@@ -172,11 +172,20 @@ pub async fn boot_entity(
     })
 }
 
+/// A secret that actually protects something: present and not blank.
+pub(crate) fn has_usable_secret(config: &Config) -> bool {
+    config
+        .security
+        .secret
+        .as_deref()
+        .is_some_and(|s| !s.trim().is_empty())
+}
+
 /// The host an entity binds in multi-entity mode. Its configured host, unless
 /// that would expose an entity with no `security.secret` beyond loopback —
 /// then loopback, with a note. `pulse-null.toml` is entity-writable data, so
 /// the socket must not be the only thing standing between it and the network.
-fn bind_host(configured: &str, has_secret: bool) -> (String, Option<String>) {
+pub(crate) fn bind_host(configured: &str, has_secret: bool) -> (String, Option<String>) {
     let loopback = configured == "localhost"
         || configured
             .parse::<std::net::IpAddr>()

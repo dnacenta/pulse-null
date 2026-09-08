@@ -1,15 +1,7 @@
 use console::style;
 
-/// Paths and hook commands come from files the user did not necessarily
-/// write. Keep terminal control sequences out of what we print about them.
-fn printable(s: &str) -> String {
-    s.chars()
-        .map(|c| if c.is_control() { '\u{FFFD}' } else { c })
-        .collect()
-}
-
 use crate::config::Config;
-use crate::init::claude_code_bootstrap::{self, ItemStatus};
+use crate::init::claude_code_bootstrap::{self, printable, ItemStatus};
 
 pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let config = Config::load()?;
