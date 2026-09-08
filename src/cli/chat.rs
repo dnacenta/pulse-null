@@ -9,11 +9,12 @@ use crate::tools::ToolRegistry;
 pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let config = Config::load()?;
 
-    let provider = providers::create_streaming_provider(&config)?;
+    let root_dir = config.root_dir()?;
+
+    let provider = providers::create_streaming_provider(&config, &root_dir)?;
     let provider: Arc<dyn crate::streaming::StreamingProvider> = Arc::from(provider);
 
     // Build system prompt from identity documents
-    let root_dir = config.root_dir()?;
     let system_prompt = prompt::build_system_prompt(&root_dir, &config, None, None)?;
 
     // Initialize session store for TUI persistence (with identity for key migration)

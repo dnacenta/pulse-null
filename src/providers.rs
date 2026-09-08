@@ -1,3 +1,4 @@
+use std::path::Path;
 use std::sync::Arc;
 
 use pulse_system_types::llm::LmProvider;
@@ -10,7 +11,16 @@ use crate::ollama_provider::OllamaProvider;
 use crate::streaming::StreamingProvider;
 
 /// Create a boxed provider based on config.
-pub fn create_provider(config: &Config) -> Result<Box<dyn LmProvider>, ProviderError> {
+///
+/// `entity_root` is the entity the provider speaks for. The claude-code
+/// backend runs every subprocess from inside it (PN-104); the HTTP backends
+/// ignore it. Callers pass the root they already hold rather than letting the
+/// factory re-derive one from the process cwd, which is wrong whenever one
+/// process serves several entities.
+pub fn create_provider(
+    config: &Config,
+    entity_root: &Path,
+) -> Result<Box<dyn LmProvider>, ProviderError> {
     match config.llm.provider.as_str() {
         "claude" => {
             let api_key = config.resolve_api_key().ok_or_else(|| {
@@ -28,16 +38,11 @@ pub fn create_provider(config: &Config) -> Result<Box<dyn LmProvider>, ProviderE
             config.llm.model.clone(),
             config.llm.base_url.clone(),
         ))),
-        "claude-code" => {
-            let mut provider =
-                ClaudeCodeProvider::new(config.llm.model.clone(), config.llm.claude_bin.clone());
-            // Isolation awareness (spec Stage 2): the CLI subprocess brings
-            // its own tools, so the marker must reach the spawn itself.
-            if let Ok(root) = config.root_dir() {
-                provider = provider.with_isolation_root(root);
-            }
-            Ok(Box::new(provider))
-        }
+        "claude-code" => Ok(Box::new(ClaudeCodeProvider::new(
+            config.llm.model.clone(),
+            config.llm.claude_bin.clone(),
+            entity_root.to_path_buf(),
+        ))),
         other => Err(ProviderError::Unknown(other.to_string())),
     }
 }
@@ -45,6 +50,7 @@ pub fn create_provider(config: &Config) -> Result<Box<dyn LmProvider>, ProviderE
 /// Create a streaming-capable provider based on config.
 pub fn create_streaming_provider(
     config: &Config,
+    entity_root: &Path,
 ) -> Result<Box<dyn StreamingProvider>, ProviderError> {
     match config.llm.provider.as_str() {
         "claude" => {
@@ -63,23 +69,21 @@ pub fn create_streaming_provider(
             config.llm.model.clone(),
             config.llm.base_url.clone(),
         ))),
-        "claude-code" => {
-            let mut provider =
-                ClaudeCodeProvider::new(config.llm.model.clone(), config.llm.claude_bin.clone());
-            // Isolation awareness (spec Stage 2): the CLI subprocess brings
-            // its own tools, so the marker must reach the spawn itself.
-            if let Ok(root) = config.root_dir() {
-                provider = provider.with_isolation_root(root);
-            }
-            Ok(Box::new(provider))
-        }
+        "claude-code" => Ok(Box::new(ClaudeCodeProvider::new(
+            config.llm.model.clone(),
+            config.llm.claude_bin.clone(),
+            entity_root.to_path_buf(),
+        ))),
         other => Err(ProviderError::Unknown(other.to_string())),
     }
 }
 
 /// Create an Arc-wrapped provider (for server/plugin usage where shared ownership is needed).
-pub fn create_provider_arc(config: &Config) -> Result<Arc<Box<dyn LmProvider>>, ProviderError> {
-    Ok(Arc::new(create_provider(config)?))
+pub fn create_provider_arc(
+    config: &Config,
+    entity_root: &Path,
+) -> Result<Arc<Box<dyn LmProvider>>, ProviderError> {
+    Ok(Arc::new(create_provider(config, entity_root)?))
 }
 
 /// Create a provider that talks to `model` instead of `[llm] model`.
@@ -91,9 +95,10 @@ pub fn create_provider_arc(config: &Config) -> Result<Arc<Box<dyn LmProvider>>, 
 /// minutes apart, so it is built per execution rather than cached.
 pub fn create_provider_with_model(
     config: &Config,
+    entity_root: &Path,
     model: &str,
 ) -> Result<Box<dyn LmProvider>, ProviderError> {
-    create_provider(&with_model(config, model))
+    create_provider(&with_model(config, model), entity_root)
 }
 
 /// The same configuration, pointed at a different model.
@@ -152,6 +157,18 @@ mod tests {
     fn an_unknown_provider_is_an_error_not_a_silent_default() {
         let mut config = config();
         config.llm.provider = "nonesuch".into();
-        assert!(create_provider_with_model(&config, "claude-opus-4-8").is_err());
+        assert!(
+            create_provider_with_model(&config, &std::env::temp_dir(), "claude-opus-4-8").is_err()
+        );
+    }
+
+    #[test]
+    fn the_claude_code_provider_is_anchored_to_the_given_root() {
+        let root = tempfile::tempdir().unwrap();
+        let provider = create_provider(&config(), root.path()).unwrap();
+        assert_eq!(provider.name(), "claude-code");
+        // The anchoring itself is asserted on `ClaudeCodeProvider` directly
+        // (`base_command_sets_cwd_and_env`); here we only need the factory to
+        // accept an explicit root instead of reading the process cwd.
     }
 }

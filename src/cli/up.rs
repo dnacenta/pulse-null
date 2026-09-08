@@ -28,10 +28,11 @@ async fn run_single_entity(headless: bool) -> Result<(), Box<dyn std::error::Err
         return server::start(config).await;
     }
 
-    let provider = crate::providers::create_streaming_provider(&config)?;
+    let root_dir = config.root_dir()?;
+
+    let provider = crate::providers::create_streaming_provider(&config, &root_dir)?;
     let provider: Arc<dyn crate::streaming::StreamingProvider> = Arc::from(provider);
 
-    let root_dir = config.root_dir()?;
     let system_prompt = crate::server::prompt::build_system_prompt(&root_dir, &config, None, None)?;
 
     let mut tools = crate::tools::ToolRegistry::new();

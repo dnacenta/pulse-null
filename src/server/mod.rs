@@ -120,9 +120,9 @@ pub async fn awareness_listener(
 }
 
 pub async fn start(config: Config) -> Result<(), Box<dyn std::error::Error>> {
-    let provider = crate::providers::create_provider(&config)?;
-
     let root_dir = config.root_dir()?;
+
+    let provider = crate::providers::create_provider(&config, &root_dir)?;
 
     // Ensure required directories and files exist
     ensure_infrastructure(&root_dir);

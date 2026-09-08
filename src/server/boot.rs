@@ -34,7 +34,7 @@ pub async fn boot_entity(
     super::ensure_infrastructure(&root_dir);
 
     // Create LLM provider
-    let provider = crate::providers::create_provider(&config)?;
+    let provider = crate::providers::create_provider(&config, &root_dir)?;
 
     // Monitoring
     let monitors = super::setup::create_monitors(&config);

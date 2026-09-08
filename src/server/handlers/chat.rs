@@ -459,10 +459,15 @@ pub async fn chat(
     let fallback_capped =
         session.data.health.fallback_count_this_session >= MAX_FALLBACKS_PER_SESSION;
     let config_for_fallback = &state.config;
+    let root_for_fallback = &state.root_dir;
     let build_fallback = state.config.llm.fallback_target().and_then(|model| {
         let model = model.to_string();
         gated_fallback(&resolved_key, isolated, !fallback_capped, move || {
-            crate::providers::create_provider_with_model(config_for_fallback, &model)
+            crate::providers::create_provider_with_model(
+                config_for_fallback,
+                root_for_fallback,
+                &model,
+            )
         })
     });
 

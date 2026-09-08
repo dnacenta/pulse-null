@@ -861,7 +861,7 @@ fn resolve_provider_override(
     let Some(model) = override_model.map(str::trim).filter(|m| !m.is_empty()) else {
         return Ok(None);
     };
-    match crate::providers::create_provider_with_model(&state.config, model) {
+    match crate::providers::create_provider_with_model(&state.config, &state.root_dir, model) {
         Ok(provider) => Ok(Some(provider)),
         Err(e) => {
             let message = format!("model override '{model}' could not be applied: {e}");
