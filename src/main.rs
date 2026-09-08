@@ -335,12 +335,20 @@ async fn main() {
 
     match cli.command {
         Commands::Init { dir } => {
+            if let Err(e) = cli::root_guard::refuse_root("init") {
+                eprintln!("Error: {e}");
+                std::process::exit(1);
+            }
             if let Err(e) = cli::init::run(dir).await {
                 eprintln!("Error: {e}");
                 std::process::exit(1);
             }
         }
         Commands::Up { headless } => {
+            if let Err(e) = cli::root_guard::refuse_root("up") {
+                eprintln!("Error: {e}");
+                std::process::exit(1);
+            }
             if let Err(e) = cli::up::run(headless).await {
                 eprintln!("Error: {e}");
                 std::process::exit(1);
