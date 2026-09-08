@@ -49,10 +49,11 @@ pub async fn run(target_dir: &Path) -> Result<(), Box<dyn std::error::Error>> {
 
     println!();
 
-    // LLM provider
+    // LLM provider — the entity's brain. An agent CLI is one of the installed
+    // adapters; which one is the user's choice, never a baked-in default.
     let providers = vec![
-        "Claude Code (uses claude CLI — no API key needed)",
-        "Claude API (requires Anthropic API key)",
+        "Agent CLI (uses an installed CLI's own login — no API key)",
+        "Anthropic API (per-token billing, needs an API key)",
         "Ollama (local, requires Ollama running)",
     ];
     let provider_idx = Select::new()
@@ -61,56 +62,68 @@ pub async fn run(target_dir: &Path) -> Result<(), Box<dyn std::error::Error>> {
         .default(0)
         .interact()?;
 
-    let (provider_name, api_key, model) = match provider_idx {
+    let (provider_name, adapter_name, api_key, model) = match provider_idx {
         0 => {
-            // Claude Code — check binary exists
-            let claude_bin = std::env::var("CLAUDE_BIN").unwrap_or_else(|_| "claude".into());
-            match std::process::Command::new(&claude_bin)
-                .arg("--version")
-                .output()
-            {
+            let names = crate::cli_provider::adapters::NAMES;
+            let adapter_idx = Select::new()
+                .with_prompt("  Agent CLI")
+                .items(&names)
+                .default(0)
+                .interact()?;
+            let adapter = crate::cli_provider::adapters::by_name(names[adapter_idx])
+                .expect("NAMES only lists shipped adapters");
+
+            // Is the CLI installed? Honour the same override the runtime uses.
+            let bin = std::env::var(crate::cli_provider::CLI_BIN_ENV)
+                .unwrap_or_else(|_| adapter.default_bin().to_string());
+            match std::process::Command::new(&bin).arg("--version").output() {
                 Ok(output) if output.status.success() => {
                     let ver = String::from_utf8_lossy(&output.stdout);
-                    println!("    {} claude found: {}", style("✓").green(), ver.trim());
+                    println!(
+                        "    {} {} found: {}",
+                        style("✓").green(),
+                        adapter.name(),
+                        ver.trim()
+                    );
                 }
                 _ => {
                     println!(
-                        "    {} claude CLI not found. Install it and run {} first.",
+                        "    {} {} CLI not found as '{}'. Install it and log in first, or set {}.",
                         style("⚠").yellow(),
-                        style("claude login").cyan()
+                        adapter.name(),
+                        bin,
+                        style(crate::cli_provider::CLI_BIN_ENV).cyan()
                     );
                 }
             }
 
-            let models = vec!["opus", "sonnet", "haiku"];
-            let model_idx = Select::new()
+            let model: String = Input::new()
                 .with_prompt("  Model")
-                .items(&models)
-                .default(0)
-                .interact()?;
+                .default(adapter.default_model().to_string())
+                .allow_empty(true)
+                .interact_text()?;
 
             (
-                "claude-code".to_string(),
+                "cli".to_string(),
+                Some(adapter.name().to_string()),
                 None,
-                models[model_idx].to_string(),
+                model,
             )
         }
         1 => {
-            let key: String = Input::new()
-                .with_prompt("  Anthropic API key")
-                .interact_text()?;
+            let key: String = Input::new().with_prompt("  API key").interact_text()?;
 
             let model: String = Input::new()
                 .with_prompt("  Model")
-                .default("claude-sonnet-4-20250514".into())
+                .default(crate::anthropic_provider::DEFAULT_MODEL.into())
                 .interact_text()?;
 
-            ("claude".to_string(), Some(key), model)
+            ("anthropic".to_string(), None, Some(key), model)
         }
         2 => {
             // Ollama — try to list installed models
             let model = pick_ollama_model()?;
-            ("ollama".to_string(), None, model)
+            ("ollama".to_string(), None, None, model)
         }
         _ => unreachable!(),
     };
@@ -242,13 +255,14 @@ pub async fn run(target_dir: &Path) -> Result<(), Box<dyn std::error::Error>> {
         timezone: timezone.clone(),
         plugins: plugin_configs,
         rules_dir,
+        adapter: adapter_name,
     };
 
     // Write all files
     let files = vec![
         ("pulse-null.toml", templates::render_config(&config)),
         ("SELF.md", templates::render_self_md(&identity)),
-        ("CLAUDE.md", templates::render_claude_md(&identity)),
+        ("INSTRUCTIONS.md", templates::render_instructions(&identity)),
         (
             "memory/MEMORY.md",
             templates::render_memory_md(&identity),
@@ -304,16 +318,27 @@ pub async fn run(target_dir: &Path) -> Result<(), Box<dyn std::error::Error>> {
         );
     }
 
-    // Wire up Claude Code integration if provider is claude-code. Everything
-    // lands inside the entity directory — nothing in $HOME/.claude — so any
-    // number of entities can share one unix user (PN-104).
-    if config.provider == "claude-code" {
+    // Wire the entity for its agent CLI. Everything lands inside the entity
+    // directory — nothing in the user's home — so any number of entities can
+    // share one unix user (PN-104).
+    if let Some(adapter) =
+        crate::cli_provider::adapters::for_config(&config.provider, config.adapter.as_deref())
+    {
+        let integration = adapter.integration();
         println!();
         println!(
             "  {}",
-            style("Setting up Claude Code integration...").bold()
+            style(format!(
+                "Setting up {} agent integration...",
+                adapter.name()
+            ))
+            .bold()
         );
-        let results = super::claude_code_bootstrap::ensure(&entity_dir);
+        let mut results =
+            super::agent_bootstrap::ensure_common(&entity_dir, integration.recall_echo_provider());
+        results.extend(
+            integration.ensure(&entity_dir, &super::agent_bootstrap::find_recall_echo_bin()),
+        );
         for item in &results {
             println!("  {item}");
         }

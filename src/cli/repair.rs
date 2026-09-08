@@ -1,32 +1,40 @@
 use console::style;
 
 use crate::config::Config;
-use crate::init::claude_code_bootstrap::{self, printable, ItemStatus};
+use crate::init::agent_bootstrap::{self, printable, ItemStatus};
 
 pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let config = Config::load()?;
     let root_dir = config.root_dir()?;
 
-    if config.llm.provider != "claude-code" {
+    let Some(adapter) = config
+        .llm
+        .cli_adapter()
+        .and_then(crate::cli_provider::adapters::by_name)
+    else {
         println!(
-            "  Provider is '{}', not 'claude-code'. Nothing to repair.",
+            "  Provider is '{}', not an agent CLI. Nothing to repair.",
             config.llm.provider
         );
         return Ok(());
-    }
+    };
+    let integration = adapter.integration();
+    let recall_bin = agent_bootstrap::find_recall_echo_bin();
 
     println!();
     println!(
         "  {}",
         style(format!(
-            "Checking Claude Code integration for {}...",
+            "Checking {} agent integration for {}...",
+            adapter.name(),
             root_dir.display()
         ))
         .bold()
     );
     println!();
 
-    let results = claude_code_bootstrap::ensure(&root_dir);
+    let mut results = agent_bootstrap::ensure_common(&root_dir, integration.recall_echo_provider());
+    results.extend(integration.ensure(&root_dir, &recall_bin));
 
     let mut changed = 0;
     let mut existing = 0;
@@ -47,7 +55,7 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
     // carry no entity root are only reported (that file is the user's).
     let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
     if let Some(home) = home {
-        let legacy = claude_code_bootstrap::legacy_home_links(&root_dir, &home);
+        let legacy = integration.legacy_home_links(&root_dir, &home);
         if !legacy.is_empty() {
             println!();
             println!(
@@ -76,17 +84,20 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
 
-        let stale = claude_code_bootstrap::user_hooks_missing_root(&home);
+        let stale = integration.user_hooks_missing_root(&home);
         if !stale.is_empty() {
-            let settings = home.join(".claude/settings.json");
+            let settings = integration
+                .user_hooks_location(&home)
+                .map(|p| p.display().to_string())
+                .unwrap_or_else(|| "the user-level hook file".to_string());
             println!();
             println!(
                 "  {} {} has recall-echo hooks without an entity root.",
                 style("⚠").yellow(),
-                settings.display()
+                settings
             );
             println!("    They fire for every entity this user runs and resolve to the wrong one.");
-            println!("    The entity now carries its own hooks in .claude/settings.json — remove these by hand:");
+            println!("    The entity now carries its own hooks — remove these by hand:");
             for command in &stale {
                 println!("      {}", printable(command));
             }

@@ -72,7 +72,7 @@ const ESSENTIAL_MAX_BYTES: usize = 64 * 1024;
 /// Lower number = higher priority = trimmed last.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 enum PromptTier {
-    /// Essential: CLAUDE.md, rules/protocol files, memory curation instructions.
+    /// Essential: the instruction file, rules/protocol files, memory curation instructions.
     /// Never trimmed.
     Essential = 0,
     /// High priority: SELF.md, MEMORY.md. Truncated only as last resort.
@@ -170,22 +170,22 @@ pub fn build_system_prompt_budgeted(
     // Collect all components with their metadata.
     let mut components = Vec::new();
 
-    // --- Tier 0 (Essential): CLAUDE.md ---
-    let claude_path = root_dir.join("CLAUDE.md");
-    if claude_path.exists() {
-        let content = std::fs::read_to_string(&claude_path)?;
-        let capped = if budget_enabled && budget_cfg.claude_md_cap > 0 {
-            truncate_to_token_cap(&content, budget_cfg.claude_md_cap)
+    // --- Tier 0 (Essential): the instruction file ---
+    if let Some(path) = instruction_file(root_dir, config) {
+        let label = instruction_label(&path);
+        let content = std::fs::read_to_string(&path)?;
+        let capped = if budget_enabled && budget_cfg.instructions_cap > 0 {
+            truncate_to_token_cap(&content, budget_cfg.instructions_cap)
         } else {
             content
         };
         let tokens = estimate_tokens(&capped);
         components.push(PromptComponent {
-            name: "CLAUDE.md",
+            name: label,
             content: capped,
             tokens,
             tier: PromptTier::Essential,
-            cap: budget_cfg.claude_md_cap,
+            cap: budget_cfg.instructions_cap,
         });
     }
 
@@ -245,9 +245,11 @@ pub fn build_system_prompt_budgeted(
         });
     }
 
-    // --- AWARENESS.md (for non-Claude-Code providers) ---
-    // This is part of the essential identity for API entities.
-    if config.llm.provider != "claude-code" {
+    // --- AWARENESS.md ---
+    // Part of the essential identity. An agent CLI that resolves the
+    // `@AWARENESS.md` import in the instruction file gets it that way;
+    // everything else gets it inlined here.
+    if !awareness_via_import(config) {
         let awareness_path = root_dir.join("AWARENESS.md");
         if awareness_path.exists() {
             let content = std::fs::read_to_string(&awareness_path)?;
@@ -760,9 +762,70 @@ fn compress_to_one_liner(name: &str, content: &str) -> String {
     }
 }
 
+/// The entity's instruction file: the generic `INSTRUCTIONS.md`, else the
+/// pre-PN-106 file for entities created before the split, else the
+/// adapter's own file — but never a *pointer* (a file whose whole content
+/// is a reference to INSTRUCTIONS.md), which would replace the entity's
+/// identity with a one-line stub.
+fn instruction_file(root_dir: &Path, config: &Config) -> Option<std::path::PathBuf> {
+    let mut candidates = vec!["INSTRUCTIONS.md".to_string(), "CLAUDE.md".to_string()]; // vendor-ok: pre-PN-106 entities
+    if let Some(adapter) = config
+        .llm
+        .cli_adapter()
+        .and_then(crate::cli_provider::adapters::by_name)
+    {
+        candidates.push(adapter.integration().instruction_file().to_string());
+    }
+    candidates
+        .into_iter()
+        .map(|name| root_dir.join(name))
+        .filter(|p| p.is_file())
+        .find(|p| !is_pointer_file(p))
+}
+
+/// A file that only points at INSTRUCTIONS.md (what the adapters write as
+/// their own instruction file) carries no instructions of its own.
+fn is_pointer_file(path: &Path) -> bool {
+    std::fs::read_to_string(path)
+        .map(|text| {
+            let body: Vec<&str> = text
+                .lines()
+                .map(str::trim)
+                .filter(|l| !l.is_empty() && !l.starts_with('#'))
+                .collect();
+            // A pointer names INSTRUCTIONS.md in its first line of body text
+            // and says little else; a real instruction file has substance.
+            body.first()
+                .is_some_and(|first| first.contains("INSTRUCTIONS.md"))
+                && body.len() <= 3
+        })
+        .unwrap_or(false)
+}
+
+/// Static label for the instruction file that was actually read, so budget
+/// logs name the right file.
+fn instruction_label(path: &Path) -> &'static str {
+    match path.file_name().and_then(|n| n.to_str()) {
+        Some("INSTRUCTIONS.md") => "INSTRUCTIONS.md",
+        Some("AGENTS.md") => "AGENTS.md",
+        Some("CLAUDE.md") => "CLAUDE.md", // vendor-ok: pre-PN-106 entities
+        _ => "instructions",
+    }
+}
+
+/// Does the entity's agent CLI pull AWARENESS.md in by itself (through an
+/// import in its instruction file)? When not, the prompt builder inlines it.
+fn awareness_via_import(config: &Config) -> bool {
+    config
+        .llm
+        .cli_adapter()
+        .and_then(crate::cli_provider::adapters::by_name)
+        .is_some_and(|adapter| adapter.integration().imports_awareness())
+}
+
 /// Build a minimal system prompt for scheduled tasks (Phase 5: Task Isolation).
 ///
-/// Includes only the identity core: CLAUDE.md + rules + SELF.md.
+/// Includes only the identity core: the instruction file + rules + SELF.md.
 /// Excludes: MEMORY.md, EPHEMERAL.md, FINDINGS.md, pipeline health,
 /// cognitive health, and caliber data. This keeps the task's context
 /// small and focused, leaving more room for the task prompt and tool output.
@@ -785,22 +848,22 @@ pub fn build_task_system_prompt_budgeted(
     let budget_enabled = budget_cfg.enabled;
     let mut components = Vec::new();
 
-    // --- Tier 0 (Essential): CLAUDE.md — behavioral instructions ---
-    let claude_path = root_dir.join("CLAUDE.md");
-    if claude_path.exists() {
-        let content = std::fs::read_to_string(&claude_path)?;
-        let capped = if budget_enabled && budget_cfg.claude_md_cap > 0 {
-            truncate_to_token_cap(&content, budget_cfg.claude_md_cap)
+    // --- Tier 0 (Essential): the instruction file — behavioral instructions ---
+    if let Some(path) = instruction_file(root_dir, config) {
+        let label = instruction_label(&path);
+        let content = std::fs::read_to_string(&path)?;
+        let capped = if budget_enabled && budget_cfg.instructions_cap > 0 {
+            truncate_to_token_cap(&content, budget_cfg.instructions_cap)
         } else {
             content
         };
         let tokens = estimate_tokens(&capped);
         components.push(PromptComponent {
-            name: "CLAUDE.md",
+            name: label,
             content: capped,
             tokens,
             tier: PromptTier::Essential,
-            cap: budget_cfg.claude_md_cap,
+            cap: budget_cfg.instructions_cap,
         });
     }
 
@@ -1064,7 +1127,7 @@ fn build_metacognitive_context(root_dir: &Path) -> String {
     let mut sections = Vec::new();
 
     // Vigil analysis (cognitive health)
-    let analysis_path = root_dir.join(".claude").join("vigil").join("analysis.json");
+    let analysis_path = root_dir.join(".claude").join("vigil").join("analysis.json"); // vendor-ok: vigil harness dir
     if let Ok(content) = std::fs::read_to_string(&analysis_path) {
         if let Ok(analysis) = serde_json::from_str::<serde_json::Value>(&content) {
             let alert = analysis
@@ -1086,7 +1149,7 @@ fn build_metacognitive_context(root_dir: &Path) -> String {
 
     // Calibration data (metacognitive accuracy)
     let calibration_path = root_dir
-        .join(".claude")
+        .join(".claude") // vendor-ok: vigil harness dir
         .join("vigil")
         .join("calibration.json");
     if let Ok(content) = std::fs::read_to_string(&calibration_path) {
@@ -1455,8 +1518,9 @@ pub fn generate_awareness_document(
 /// Write AWARENESS.md to the entity's root directory.
 ///
 /// Called at startup and on plugin state changes (failure/recovery).
-/// For Claude Code entities, this file is picked up via @import in CLAUDE.md.
-/// For API/Ollama entities, the content is injected directly into the system prompt.
+/// Adapters whose CLI resolves the `@AWARENESS.md` import in the instruction
+/// file get it that way; for every other provider the content is injected
+/// directly into the system prompt.
 pub fn write_awareness_file(
     root_dir: &Path,
     config: &Config,
@@ -1591,7 +1655,9 @@ mod tests {
                 model: "llama3".into(),
                 max_tokens: 1024,
                 base_url: None,
-                claude_bin: None,
+                adapter: None,
+                cli_bin: None,
+                reasoning_effort: None,
                 context_budget: 0,
                 fallback_model: None,
                 fallback_on_refusal: true,
@@ -1889,7 +1955,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mut config = minimal_config();
         config.system_prompt_budget.enabled = true;
-        config.system_prompt_budget.claude_md_cap = 50; // 50 tokens ~ 200 chars
+        config.system_prompt_budget.instructions_cap = 50; // 50 tokens ~ 200 chars
 
         // Write a big CLAUDE.md (1000 chars ~ 250 tokens)
         std::fs::write(dir.path().join("CLAUDE.md"), "x".repeat(1000)).unwrap();
@@ -1909,7 +1975,7 @@ mod tests {
         // Set a very tight budget
         config.system_prompt_budget.token_budget = 200;
         // Per-component caps are generous (so individual components aren't pre-trimmed)
-        config.system_prompt_budget.claude_md_cap = 5000;
+        config.system_prompt_budget.instructions_cap = 5000;
         config.system_prompt_budget.ephemeral_cap = 5000;
         config.system_prompt_budget.findings_cap = 5000;
 
@@ -2018,7 +2084,7 @@ mod tests {
         let cfg = SystemPromptBudgetConfig::default();
         assert!(cfg.enabled);
         assert_eq!(cfg.token_budget, 17_000);
-        assert_eq!(cfg.claude_md_cap, 5_000);
+        assert_eq!(cfg.instructions_cap, 5_000);
         assert_eq!(cfg.self_md_cap, 4_000);
         assert_eq!(cfg.memory_cap, 4_000);
         assert_eq!(cfg.ephemeral_cap, 2_000);
@@ -2256,7 +2322,7 @@ mod tests {
     fn task_prompt_applies_component_caps() {
         let dir = tempfile::tempdir().unwrap();
         let mut config = minimal_config();
-        config.system_prompt_budget.claude_md_cap = 50;
+        config.system_prompt_budget.instructions_cap = 50;
 
         std::fs::write(dir.path().join("CLAUDE.md"), "x".repeat(4_000)).unwrap();
 

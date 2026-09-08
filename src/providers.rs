@@ -3,18 +3,41 @@ use std::sync::Arc;
 
 use pulse_system_types::llm::LmProvider;
 
-use crate::claude_code_provider::ClaudeCodeProvider;
-use crate::claude_provider::ClaudeProvider;
+use crate::anthropic_provider::AnthropicProvider;
+use crate::cli_provider::{adapters, CliProvider};
 use crate::config::Config;
 use crate::errors::ProviderError;
 use crate::ollama_provider::OllamaProvider;
 use crate::streaming::StreamingProvider;
 
+/// Build the subprocess provider for the entity's configured adapter.
+fn cli_provider_for(config: &Config, entity_root: &Path) -> Result<CliProvider, ProviderError> {
+    let name = config
+        .llm
+        .cli_adapter()
+        .ok_or_else(|| ProviderError::Unknown("cli provider without an adapter".into()))?;
+    let adapter = adapters::by_name(name)
+        .ok_or_else(|| ProviderError::Unknown(format!("unknown cli adapter '{name}'")))?;
+    let provider = CliProvider::new(
+        adapter,
+        config.llm.cli_bin.clone(),
+        config.llm.model.clone(),
+        entity_root.to_path_buf(),
+    )
+    .with_reasoning_effort(config.llm.reasoning_effort.clone());
+    tracing::debug!(
+        adapter = provider.adapter_name(),
+        model = %config.llm.model,
+        "cli provider ready"
+    );
+    Ok(provider)
+}
+
 /// Create a boxed provider based on config.
 ///
-/// `entity_root` is the entity the provider speaks for. The claude-code
-/// backend runs every subprocess from inside it (PN-104); the HTTP backends
-/// ignore it. Callers pass the root they already hold rather than letting the
+/// `entity_root` is the entity the provider speaks for. The `cli` backend
+/// runs every subprocess from inside it (PN-104); the HTTP backends ignore
+/// it. Callers pass the root they already hold rather than letting the
 /// factory re-derive one from the process cwd, which is wrong whenever one
 /// process serves several entities.
 pub fn create_provider(
@@ -22,14 +45,15 @@ pub fn create_provider(
     entity_root: &Path,
 ) -> Result<Box<dyn LmProvider>, ProviderError> {
     match config.llm.provider.as_str() {
-        "claude" => {
+        "anthropic" | "claude" => {
+            // vendor-ok: pre-PN-106 alias
             let api_key = config.resolve_api_key().ok_or_else(|| {
                 ProviderError::MissingApiKey(
                     "No API key found. Set it in pulse-null.toml or ANTHROPIC_API_KEY env var."
                         .into(),
                 )
             })?;
-            Ok(Box::new(ClaudeProvider::new(
+            Ok(Box::new(AnthropicProvider::new(
                 api_key,
                 config.llm.model.clone(),
             )))
@@ -38,11 +62,7 @@ pub fn create_provider(
             config.llm.model.clone(),
             config.llm.base_url.clone(),
         ))),
-        "claude-code" => Ok(Box::new(ClaudeCodeProvider::new(
-            config.llm.model.clone(),
-            config.llm.claude_bin.clone(),
-            entity_root.to_path_buf(),
-        ))),
+        "cli" | "claude-code" => Ok(Box::new(cli_provider_for(config, entity_root)?)), // vendor-ok: pre-PN-106 alias
         other => Err(ProviderError::Unknown(other.to_string())),
     }
 }
@@ -53,14 +73,15 @@ pub fn create_streaming_provider(
     entity_root: &Path,
 ) -> Result<Box<dyn StreamingProvider>, ProviderError> {
     match config.llm.provider.as_str() {
-        "claude" => {
+        "anthropic" | "claude" => {
+            // vendor-ok: pre-PN-106 alias
             let api_key = config.resolve_api_key().ok_or_else(|| {
                 ProviderError::MissingApiKey(
                     "No API key found. Set it in pulse-null.toml or ANTHROPIC_API_KEY env var."
                         .into(),
                 )
             })?;
-            Ok(Box::new(ClaudeProvider::new(
+            Ok(Box::new(AnthropicProvider::new(
                 api_key,
                 config.llm.model.clone(),
             )))
@@ -69,11 +90,7 @@ pub fn create_streaming_provider(
             config.llm.model.clone(),
             config.llm.base_url.clone(),
         ))),
-        "claude-code" => Ok(Box::new(ClaudeCodeProvider::new(
-            config.llm.model.clone(),
-            config.llm.claude_bin.clone(),
-            entity_root.to_path_buf(),
-        ))),
+        "cli" | "claude-code" => Ok(Box::new(cli_provider_for(config, entity_root)?)), // vendor-ok: pre-PN-106 alias
         other => Err(ProviderError::Unknown(other.to_string())),
     }
 }
@@ -120,12 +137,14 @@ mod tests {
     fn config() -> Config {
         let mut config = crate::config::test_support::minimal_config();
         config.llm = LlmConfig {
-            provider: "claude-code".into(),
+            provider: "cli".into(),
             api_key: Some("key".into()),
             model: "fable-5".into(),
             max_tokens: 8192,
             base_url: None,
-            claude_bin: Some("/usr/bin/claude".into()),
+            adapter: Some("claude".into()),
+            cli_bin: Some("/usr/bin/claude".into()),
+            reasoning_effort: None,
             context_budget: 4096,
             fallback_model: None,
             fallback_on_refusal: true,
@@ -142,7 +161,7 @@ mod tests {
         assert_eq!(overridden.llm.provider, original.llm.provider);
         assert_eq!(overridden.llm.api_key, original.llm.api_key);
         assert_eq!(overridden.llm.max_tokens, original.llm.max_tokens);
-        assert_eq!(overridden.llm.claude_bin, original.llm.claude_bin);
+        assert_eq!(overridden.llm.cli_bin, original.llm.cli_bin);
         assert_eq!(overridden.llm.context_budget, original.llm.context_budget);
     }
 
@@ -163,12 +182,12 @@ mod tests {
     }
 
     #[test]
-    fn the_claude_code_provider_is_anchored_to_the_given_root() {
+    fn the_cli_provider_is_built_for_the_given_root() {
         let root = tempfile::tempdir().unwrap();
         let provider = create_provider(&config(), root.path()).unwrap();
-        assert_eq!(provider.name(), "claude-code");
-        // The anchoring itself is asserted on `ClaudeCodeProvider` directly
-        // (`base_command_sets_cwd_and_env`); here we only need the factory to
-        // accept an explicit root instead of reading the process cwd.
+        assert_eq!(provider.name(), "cli");
+        // The anchoring itself is asserted in `cli_provider::tests`
+        // (`entity_command_sets_cwd_env_and_scrubs`); here we only need the
+        // factory to accept an explicit root instead of reading the process cwd.
     }
 }

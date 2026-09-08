@@ -153,19 +153,27 @@ pub async fn start(config: Config) -> Result<(), Box<dyn std::error::Error>> {
         crate::graph_context::cache_graph_stats(&root_dir).await;
     }
 
-    // Verify this entity's Claude Code integration if applicable
-    if config.llm.provider == "claude-code" {
-        let items = crate::init::claude_code_bootstrap::verify(&root_dir);
+    // Verify this entity's agent-CLI integration if applicable
+    if let Some(adapter) = config
+        .llm
+        .cli_adapter()
+        .and_then(crate::cli_provider::adapters::by_name)
+    {
+        let mut items = crate::init::agent_bootstrap::verify_common(
+            &root_dir,
+            adapter.integration().recall_echo_provider(),
+        );
+        items.extend(adapter.integration().verify(&root_dir));
         for item in &items {
             match &item.status {
-                crate::init::claude_code_bootstrap::ItemStatus::Missing => {
+                crate::init::agent_bootstrap::ItemStatus::Missing => {
                     tracing::warn!(
-                        "Claude Code: {} missing — run 'pulse-null repair' to fix",
+                        "agent integration: {} missing — run 'pulse-null repair' to fix",
                         item.path.display()
                     );
                 }
-                crate::init::claude_code_bootstrap::ItemStatus::Wrong(reason) => {
-                    tracing::warn!("Claude Code: {} — {}", item.path.display(), reason);
+                crate::init::agent_bootstrap::ItemStatus::Wrong(reason) => {
+                    tracing::warn!("agent integration: {} — {}", item.path.display(), reason);
                 }
                 _ => {}
             }

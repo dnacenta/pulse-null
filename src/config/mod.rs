@@ -83,9 +83,19 @@ pub struct LlmConfig {
     /// Base URL for the LLM API (used by Ollama; defaults to http://localhost:11434).
     #[serde(default)]
     pub base_url: Option<String>,
-    /// Path to the claude CLI binary (used by claude-code provider; defaults to "claude").
+    /// Which agent CLI the `cli` provider drives: `"claude"`, `"grok"` or
+    /// `"codex"`. Required when `provider = "cli"`.
     #[serde(default)]
-    pub claude_bin: Option<String>,
+    pub adapter: Option<String>,
+    /// Path to the agent CLI binary; defaults to the adapter's own name on
+    /// `PATH`. `claude_bin` is the pre-PN-106 spelling and still loads.
+    #[serde(default, alias = "claude_bin")] // vendor-ok: pre-PN-106 key
+    pub cli_bin: Option<String>,
+    /// Reasoning effort hint for CLIs that take one (the grok adapter maps it
+    /// to `--reasoning-effort`; default "low" — high cost ~20s of hidden
+    /// thinking per chat turn on the live entity).
+    #[serde(default)]
+    pub reasoning_effort: Option<String>,
     /// Maximum estimated tokens in conversation before compaction triggers (0 = default 150k).
     #[serde(default)]
     pub context_budget: usize,
@@ -101,6 +111,46 @@ pub struct LlmConfig {
 }
 
 impl LlmConfig {
+    /// Fold pre-PN-106 provider spellings into the current vocabulary,
+    /// returning one deprecation notice per rewrite. `"claude-code"` was the
+    /// name of the subprocess provider before it became `cli` + an adapter;
+    /// `"claude"` was the Anthropic HTTP API.
+    pub fn normalize(&mut self) -> Vec<String> {
+        let mut notices = Vec::new();
+        match self.provider.as_str() {
+            "claude-code" => {
+                // vendor-ok: pre-PN-106 alias
+                self.provider = "cli".into();
+                if self.adapter.is_none() {
+                    self.adapter = Some("claude".into()); // vendor-ok: what claude-code meant
+                }
+                notices.push(
+                    "[llm] provider = \"claude-code\" is deprecated — use provider = \"cli\" with adapter = \"claude\"" // vendor-ok: alias notice
+                        .into(),
+                );
+            }
+            "claude" => {
+                // vendor-ok: pre-PN-106 alias
+                self.provider = "anthropic".into();
+                notices.push(
+                    "[llm] provider = \"claude\" is deprecated — use provider = \"anthropic\"" // vendor-ok: alias notice
+                        .into(),
+                );
+            }
+            _ => {}
+        }
+        notices
+    }
+
+    /// The adapter name when this config drives an agent CLI.
+    pub fn cli_adapter(&self) -> Option<&str> {
+        match self.provider.as_str() {
+            "cli" => self.adapter.as_deref(),
+            "claude-code" => self.adapter.as_deref().or(Some("claude")), // vendor-ok: pre-PN-106 alias
+            _ => None,
+        }
+    }
+
     /// The model to retry a refused turn on, or `None` when the fallback is
     /// disabled or unconfigured.
     ///
@@ -294,7 +344,10 @@ impl Config {
     pub fn load() -> Result<Self, crate::errors::ConfigError> {
         let path = Self::find_config()?;
         let content = std::fs::read_to_string(&path)?;
-        let config: Config = toml::from_str(&content)?;
+        let mut config: Config = toml::from_str(&content)?;
+        for notice in config.llm.normalize() {
+            tracing::warn!("{}: {}", path.display(), notice);
+        }
         validate::validate(&config)?;
         Ok(config)
     }
@@ -303,7 +356,10 @@ impl Config {
     pub fn load_from(dir: &std::path::Path) -> Result<Self, crate::errors::ConfigError> {
         let path = dir.join(CONFIG_FILENAME);
         let content = std::fs::read_to_string(&path)?;
-        let config: Config = toml::from_str(&content)?;
+        let mut config: Config = toml::from_str(&content)?;
+        for notice in config.llm.normalize() {
+            tracing::warn!("{}: {}", path.display(), notice);
+        }
         validate::validate(&config)?;
         Ok(config)
     }
@@ -353,11 +409,11 @@ fn default_port() -> u16 {
 }
 
 fn default_provider() -> String {
-    "claude".to_string()
+    "anthropic".to_string()
 }
 
 fn default_model() -> String {
-    "claude-sonnet-4-20250514".to_string()
+    crate::anthropic_provider::DEFAULT_MODEL.to_string()
 }
 
 fn default_max_tokens() -> u32 {
@@ -1030,7 +1086,7 @@ impl Default for ChannelLimits {
 /// components are progressively trimmed.
 ///
 /// Priority tiers (highest to lowest):
-/// 1. CLAUDE.md + rules/protocol files (essential — never trimmed)
+/// 1. The instruction file + rules/protocol files (essential — never trimmed)
 /// 2. SELF.md, MEMORY.md (high priority — trimmed only as last resort)
 /// 3. EPHEMERAL.md, FINDINGS.md, pipeline health, cognitive health, caliber (trimmable)
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1043,7 +1099,8 @@ pub struct SystemPromptBudgetConfig {
     pub token_budget: usize,
     /// Per-component token caps. Components exceeding their cap are truncated.
     /// Set to 0 to use the default for that component.
-    pub claude_md_cap: usize,
+    #[serde(alias = "claude_md_cap")] // vendor-ok: pre-PN-106 key
+    pub instructions_cap: usize,
     pub rules_cap: usize,
     pub self_md_cap: usize,
     pub memory_cap: usize,
@@ -1071,7 +1128,7 @@ impl Default for SystemPromptBudgetConfig {
         Self {
             enabled: true,
             token_budget: 17_000,
-            claude_md_cap: 5_000,
+            instructions_cap: 5_000,
             rules_cap: 3_000,
             self_md_cap: 4_000,
             memory_cap: 4_000,
@@ -1127,7 +1184,9 @@ pub mod test_support {
                 model: default_model(),
                 max_tokens: default_max_tokens(),
                 base_url: None,
-                claude_bin: None,
+                adapter: None,
+                cli_bin: None,
+                reasoning_effort: None,
                 context_budget: 0,
                 fallback_model: None,
                 fallback_on_refusal: true,
@@ -1216,7 +1275,9 @@ mod fallback_tests {
             model: default_model(),
             max_tokens: default_max_tokens(),
             base_url: None,
-            claude_bin: None,
+            adapter: None,
+            cli_bin: None,
+            reasoning_effort: None,
             context_budget: 0,
             fallback_model: model.map(str::to_string),
             fallback_on_refusal: on,
@@ -1271,5 +1332,75 @@ mod fallback_tests {
         assert!(cfg.fallback_on_refusal);
         assert_eq!(cfg.fallback_model, None);
         assert_eq!(cfg.fallback_target(), None);
+    }
+    // --- PN-106: provider vocabulary and its deprecated spellings ---
+
+    fn llm_cfg(provider: &str, adapter: Option<&str>) -> LlmConfig {
+        LlmConfig {
+            provider: provider.into(),
+            api_key: None,
+            model: "m".into(),
+            max_tokens: 100,
+            base_url: None,
+            adapter: adapter.map(str::to_string),
+            cli_bin: None,
+            reasoning_effort: None,
+            context_budget: 0,
+            fallback_model: None,
+            fallback_on_refusal: true,
+        }
+    }
+
+    #[test]
+    fn normalize_folds_deprecated_provider_spellings() {
+        let mut legacy_cli = llm_cfg("claude-code", None); // vendor-ok: alias under test
+        let notices = legacy_cli.normalize();
+        assert_eq!(legacy_cli.provider, "cli");
+        assert_eq!(legacy_cli.adapter.as_deref(), Some("claude")); // vendor-ok: what the alias meant
+        assert_eq!(notices.len(), 1);
+        assert!(notices[0].contains("deprecated"));
+
+        let mut legacy_http = llm_cfg("claude", None); // vendor-ok: alias under test
+        assert_eq!(legacy_http.normalize().len(), 1);
+        assert_eq!(legacy_http.provider, "anthropic");
+
+        let mut current = llm_cfg("cli", Some("grok")); // vendor-ok: adapter under test
+        assert!(current.normalize().is_empty());
+        assert_eq!(current.cli_adapter(), Some("grok")); // vendor-ok: adapter under test
+        assert_eq!(llm_cfg("ollama", None).cli_adapter(), None);
+        assert_eq!(llm_cfg("cli", None).cli_adapter(), None);
+    }
+
+    #[test]
+    fn config_aliases_load_from_toml() {
+        let llm: LlmConfig = toml::from_str(
+            "provider = \"cli\"\nadapter = \"codex\"\nmodel = \"m\"\nclaude_bin = \"/opt/bin/codex\"\n", // vendor-ok: aliases under test
+        )
+        .unwrap();
+        assert_eq!(llm.cli_bin.as_deref(), Some("/opt/bin/codex")); // vendor-ok: alias under test
+        let budget: SystemPromptBudgetConfig = toml::from_str("claude_md_cap = 1234\n").unwrap(); // vendor-ok: alias under test
+        assert_eq!(budget.instructions_cap, 1234);
+        // An explicit adapter survives the legacy provider spelling, folded or not.
+        let mut legacy_grok = llm_cfg("claude-code", Some("grok")); // vendor-ok: alias under test
+        assert_eq!(legacy_grok.cli_adapter(), Some("grok")); // vendor-ok: adapter under test
+        legacy_grok.normalize();
+        assert_eq!(legacy_grok.cli_adapter(), Some("grok")); // vendor-ok: adapter under test
+    }
+
+    #[test]
+    fn validate_requires_a_known_adapter_for_cli() {
+        let mut config = test_support::minimal_config();
+        config.llm = llm_cfg("cli", None);
+        let err = validate::validate(&config).unwrap_err().to_string();
+        assert!(err.contains("needs an adapter"), "{err}");
+
+        config.llm = llm_cfg("cli", Some("nonesuch"));
+        let err = validate::validate(&config).unwrap_err().to_string();
+        assert!(err.contains("Unknown [llm] adapter"), "{err}");
+
+        config.llm = llm_cfg("cli", Some("grok")); // vendor-ok: adapter under test
+        validate::validate(&config).unwrap();
+        config.llm = llm_cfg("nonesuch", None);
+        assert!(validate::validate(&config).is_err());
     }
 }

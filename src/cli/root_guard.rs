@@ -2,7 +2,7 @@
 //!
 //! Two things go wrong under root and neither is recoverable later without
 //! hand-fixing: every file the entity writes is root-owned, so the unix user
-//! meant to run it cannot touch its own memory; and Claude Code refuses
+//! meant to run it cannot touch its own memory; and agent CLIs refuse
 //! `--dangerously-skip-permissions` under root, so a claude-code entity can
 //! never talk to its provider. Seen live 2026-09-03 (PN-104). Checked before
 //! any filesystem work so a mistake leaves nothing behind.
@@ -28,8 +28,8 @@ fn root_decision(command: &str, euid: u32, allow: bool) -> Result<(), String> {
         "`pulse-null {command}` refuses to run as root.\n\
          \n\
          An entity created or started by root ends up root-owned, so the user meant to run it\n\
-         cannot write its own memory; and Claude Code rejects --dangerously-skip-permissions\n\
-         under root, so a claude-code entity can never reach its provider.\n\
+         cannot write its own memory; and agent CLIs refuse to skip permission prompts under\n\
+         root, so a cli entity can never reach its provider.\n\
          \n\
          Run it as the entity's user instead, e.g. `sudo -u pulse -H pulse-null {command}`.\n\
          Set {ALLOW_ROOT_ENV}=1 to override (CI, smoke tests)."
@@ -44,7 +44,7 @@ mod tests {
     fn root_decision_refuses_euid_zero() {
         let err = root_decision("init", 0, false).unwrap_err();
         assert!(err.contains("refuses to run as root"));
-        assert!(err.contains("--dangerously-skip-permissions"));
+        assert!(err.contains("refuse to skip permission prompts"));
         assert!(err.contains(ALLOW_ROOT_ENV));
     }
 

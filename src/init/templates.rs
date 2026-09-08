@@ -20,6 +20,8 @@ pub struct ConfigData {
     pub plugins: Vec<(String, Vec<(String, String)>)>,
     /// Path to shared rule/protocol files
     pub rules_dir: Option<String>,
+    /// Which agent CLI drives the `cli` provider.
+    pub adapter: Option<String>,
 }
 
 pub fn render_config(data: &ConfigData) -> String {
@@ -29,7 +31,10 @@ pub fn render_config(data: &ConfigData) -> String {
     };
 
     let provider_extras = match data.provider.as_str() {
-        "claude-code" => "# claude_bin = \"claude\"  # Override path to claude CLI".to_string(),
+        "cli" => format!(
+            "adapter = \"{}\"\n# cli_bin = \"/path/to/binary\"  # Override the CLI binary\n# reasoning_effort = \"low\"  # For CLIs that take one",
+            data.adapter.as_deref().unwrap_or_default()
+        ),
         "ollama" => "base_url = \"http://localhost:11434\"  # Ollama endpoint".to_string(),
         _ => "# base_url = \"http://localhost:11434\"  # Override for Ollama or custom endpoints"
             .to_string(),
@@ -220,7 +225,7 @@ A record of how my thinking has shifted through dialogue.
     )
 }
 
-pub fn render_claude_md(identity: &Identity) -> String {
+pub fn render_instructions(identity: &Identity) -> String {
     format!(
         r#"# {entity_name} — System Instructions
 

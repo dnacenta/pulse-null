@@ -123,7 +123,9 @@ mod tests {
                 model: "test".into(),
                 max_tokens: 1024,
                 base_url: None,
-                claude_bin: None,
+                adapter: None,
+                cli_bin: None,
+                reasoning_effort: None,
                 context_budget: 0,
                 fallback_model: None,
                 fallback_on_refusal: true,
@@ -162,7 +164,7 @@ mod tests {
         let alert_queue = crate::scheduler::alerts::AlertQueue::load(&root_dir);
         Arc::new(AppState {
             config,
-            provider: Box::new(crate::claude_provider::ClaudeProvider::new(
+            provider: Box::new(crate::anthropic_provider::AnthropicProvider::new(
                 "fake".into(),
                 "test".into(),
             )),
@@ -299,7 +301,9 @@ mod tests {
                 model: "test".into(),
                 max_tokens: 1024,
                 base_url: None,
-                claude_bin: None,
+                adapter: None,
+                cli_bin: None,
+                reasoning_effort: None,
                 context_budget: 0,
                 fallback_model: None,
                 fallback_on_refusal: true,
@@ -338,7 +342,7 @@ mod tests {
         let alert_queue = crate::scheduler::alerts::AlertQueue::load(&root_dir);
         Arc::new(AppState {
             config,
-            provider: Box::new(crate::claude_provider::ClaudeProvider::new(
+            provider: Box::new(crate::anthropic_provider::AnthropicProvider::new(
                 "fake".into(),
                 "test".into(),
             )),

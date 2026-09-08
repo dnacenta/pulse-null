@@ -1,10 +1,10 @@
 use clap::{Parser, Subcommand};
 
+mod anthropic_provider;
 mod caliber;
 mod chat;
-mod claude_code_provider;
-mod claude_provider;
 mod cli;
+mod cli_provider;
 mod config;
 mod context;
 mod context_buffer;
@@ -119,7 +119,7 @@ enum Commands {
         #[command(subcommand)]
         action: VigilAction,
     },
-    /// Verify and repair Claude Code integration (symlinks, hooks, config)
+    /// Verify and repair the entity's agent-CLI integration (instruction file, hooks, config)
     Repair,
     /// Isolation mode — the minimal-core diagnostic retreat
     Isolate {

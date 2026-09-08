@@ -611,7 +611,7 @@ pub fn evaluate_salience(
 /// make the whole rule fire unconditionally and quietly retire itself.
 #[must_use]
 pub fn vigil_signal_declining(root_dir: &Path) -> bool {
-    let path = root_dir.join(".claude").join("vigil").join("analysis.json");
+    let path = root_dir.join(".claude").join("vigil").join("analysis.json"); // vendor-ok: vigil harness dir
     let Ok(content) = fs::read_to_string(&path) else {
         return false;
     };
