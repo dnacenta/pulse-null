@@ -45,31 +45,51 @@ use crate::streaming::{StreamEvent, StreamResult, StreamingProvider};
 pub struct ClaudeCodeProvider {
     model: String,
     claude_bin: String,
-    /// Entity root consulted per-invocation for the isolation marker. While
-    /// isolated, the spawned CLI is restricted to read-only tools — the
-    /// in-process tool registry swap cannot reach a subprocess that brings
-    /// its own tools (and normally runs with permission prompts disabled).
-    isolation_root: Option<PathBuf>,
+    /// The entity this provider speaks for. Every `claude` subprocess runs
+    /// with this as its working directory and as `RECALL_ECHO_HOME`, so the
+    /// CLI picks up the entity's own `CLAUDE.md`, `.claude/settings.json`
+    /// hooks and `.claude/rules/`, and recall-echo resolves the entity's
+    /// memory — independent of the daemon's cwd and of `$HOME/.claude`
+    /// (PN-104). It is also consulted per-invocation for the isolation
+    /// marker: while isolated, the spawned CLI is restricted to read-only
+    /// tools, because the in-process tool registry swap cannot reach a
+    /// subprocess that brings its own tools.
+    entity_root: PathBuf,
 }
 
+/// Environment variable recall-echo reads to locate the entity root when a
+/// hook or MCP invocation carries no explicit `--entity-root`.
+pub const RECALL_ECHO_HOME: &str = "RECALL_ECHO_HOME";
+
 impl ClaudeCodeProvider {
-    pub fn new(model: String, claude_bin: Option<String>) -> Self {
+    pub fn new(model: String, claude_bin: Option<String>, entity_root: PathBuf) -> Self {
         let claude_bin = claude_bin
             .or_else(|| std::env::var("CLAUDE_BIN").ok())
             .unwrap_or_else(|| "claude".into());
         Self {
             model,
             claude_bin,
-            isolation_root: None,
+            entity_root,
         }
     }
 
-    /// Enable per-invocation isolation awareness (coordinator spec, Stage 2).
-    #[must_use]
-    pub fn with_isolation_root(mut self, root: PathBuf) -> Self {
-        self.isolation_root = Some(root);
-        self
+    /// The entity root every subprocess is anchored to.
+    #[cfg(test)]
+    pub fn entity_root(&self) -> &Path {
+        &self.entity_root
     }
+}
+
+/// A `claude` command anchored to `entity_root`: cwd and `RECALL_ECHO_HOME`
+/// point at the entity root, and the `CLAUDECODE` marker of any enclosing
+/// Claude Code session is stripped so the child does not think it is nested.
+/// Free function so the spawn shape can be tested without spawning.
+fn entity_command(claude_bin: &str, entity_root: &Path) -> tokio::process::Command {
+    let mut cmd = tokio::process::Command::new(claude_bin);
+    cmd.current_dir(entity_root)
+        .env(RECALL_ECHO_HOME, entity_root)
+        .env_remove("CLAUDECODE");
+    cmd
 }
 
 /// Tools denied to the CLI subprocess while isolated: everything that writes,
@@ -347,10 +367,8 @@ impl LmProvider for ClaudeCodeProvider {
         let messages = messages.to_vec();
         let model = self.model.clone();
         let claude_bin = self.claude_bin.clone();
-        let restricted = self
-            .isolation_root
-            .as_deref()
-            .is_some_and(crate::server::isolation::is_active);
+        let entity_root = self.entity_root.clone();
+        let restricted = crate::server::isolation::is_active(&self.entity_root);
 
         Box::pin(async move {
             let prompt = serialize_messages(&messages);
@@ -360,9 +378,8 @@ impl LmProvider for ClaudeCodeProvider {
             // and cancellation — which unlinks the staged prompt.
             let system_prompt_file = SystemPromptFile::create(&system_prompt)?;
 
-            let mut cmd = tokio::process::Command::new(&claude_bin);
+            let mut cmd = entity_command(&claude_bin, &entity_root);
             cmd.args(invoke_args(&model, system_prompt_file.path(), restricted))
-                .env_remove("CLAUDECODE")
                 .stdin(Stdio::piped())
                 .stdout(Stdio::piped())
                 .stderr(Stdio::piped());
@@ -487,10 +504,8 @@ impl StreamingProvider for ClaudeCodeProvider {
         let messages = messages.to_vec();
         let model = self.model.clone();
         let claude_bin = self.claude_bin.clone();
-        let restricted = self
-            .isolation_root
-            .as_deref()
-            .is_some_and(crate::server::isolation::is_active);
+        let entity_root = self.entity_root.clone();
+        let restricted = crate::server::isolation::is_active(&self.entity_root);
 
         Box::pin(async_stream::stream! {
             let prompt = serialize_messages(&messages);
@@ -509,9 +524,8 @@ impl StreamingProvider for ClaudeCodeProvider {
                 }
             };
 
-            let mut cmd = tokio::process::Command::new(&claude_bin);
+            let mut cmd = entity_command(&claude_bin, &entity_root);
             cmd.args(stream_invoke_args(&model, system_prompt_file.path(), restricted))
-                .env_remove("CLAUDECODE")
                 .stdin(Stdio::piped())
                 .stdout(Stdio::piped())
                 .stderr(Stdio::piped());
@@ -1076,7 +1090,7 @@ mod tests {
 
     #[test]
     fn provider_name() {
-        let provider = ClaudeCodeProvider::new("opus".into(), None);
+        let provider = ClaudeCodeProvider::new("opus".into(), None, std::env::temp_dir());
         assert_eq!(provider.name(), "claude-code");
     }
 
@@ -1148,7 +1162,11 @@ mod tests {
         }
 
         fn provider(&self, model: &str) -> ClaudeCodeProvider {
-            ClaudeCodeProvider::new(model.into(), Some(self.bin.display().to_string()))
+            ClaudeCodeProvider::new(
+                model.into(),
+                Some(self.bin.display().to_string()),
+                self._dir.path().to_path_buf(),
+            )
         }
 
         fn argv(&self) -> Vec<String> {
@@ -1326,9 +1344,38 @@ mod tests {
         assert!(!path.exists(), "guard must unlink the file when dropped");
     }
 
+    // --- PN-104: every subprocess is anchored to the entity ---
+
+    #[test]
+    fn base_command_sets_cwd_and_env() {
+        let root = tempfile::tempdir().unwrap();
+        let provider = ClaudeCodeProvider::new(
+            "opus".into(),
+            Some("/usr/bin/true".into()),
+            root.path().to_path_buf(),
+        );
+        let cmd = entity_command("/usr/bin/true", provider.entity_root());
+        let std_cmd = cmd.as_std();
+
+        assert_eq!(std_cmd.get_current_dir(), Some(root.path()));
+
+        let envs: std::collections::HashMap<_, _> = std_cmd.get_envs().collect();
+        assert_eq!(
+            envs.get(std::ffi::OsStr::new(RECALL_ECHO_HOME)),
+            Some(&Some(root.path().as_os_str())),
+            "RECALL_ECHO_HOME must name the entity root"
+        );
+        assert_eq!(
+            envs.get(std::ffi::OsStr::new("CLAUDECODE")),
+            Some(&None),
+            "an enclosing Claude Code session marker must be stripped"
+        );
+        assert_eq!(provider.entity_root(), root.path());
+    }
+
     #[test]
     fn provider_no_tools() {
-        let provider = ClaudeCodeProvider::new("opus".into(), None);
+        let provider = ClaudeCodeProvider::new("opus".into(), None, std::env::temp_dir());
         assert!(!provider.supports_tools());
     }
 }

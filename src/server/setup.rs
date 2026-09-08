@@ -102,7 +102,7 @@ pub async fn init_and_start_plugins(
     let mut plugin_manager = PluginManager::new(config);
 
     if plugin_manager.count() > 0 {
-        let plugin_provider = crate::providers::create_provider_arc(config)?;
+        let plugin_provider = crate::providers::create_provider_arc(config, root_dir)?;
         plugin_manager
             .init_all(config, root_dir, plugin_provider)
             .await?;

@@ -61,9 +61,9 @@ pub async fn require_auth(
     }
 
     // Fall back to global secret check
-    let secret = match &state.config.security.secret {
-        Some(s) => s,
-        None => return Ok(next.run(req).await),
+    let secret = match state.config.security.secret.as_deref() {
+        Some(s) if !s.trim().is_empty() => s,
+        _ => return Ok(next.run(req).await),
     };
 
     // Check X-Echo-Secret header against global secret

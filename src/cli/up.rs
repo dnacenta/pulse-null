@@ -28,10 +28,11 @@ async fn run_single_entity(headless: bool) -> Result<(), Box<dyn std::error::Err
         return server::start(config).await;
     }
 
-    let provider = crate::providers::create_streaming_provider(&config)?;
+    let root_dir = config.root_dir()?;
+
+    let provider = crate::providers::create_streaming_provider(&config, &root_dir)?;
     let provider: Arc<dyn crate::streaming::StreamingProvider> = Arc::from(provider);
 
-    let root_dir = config.root_dir()?;
     let system_prompt = crate::server::prompt::build_system_prompt(&root_dir, &config, None, None)?;
 
     let mut tools = crate::tools::ToolRegistry::new();
@@ -73,14 +74,19 @@ async fn run_multi_entity(
         entity_home.display()
     );
 
-    // Create registry with base port 3200
+    // Registry hands out fallback ports from 3200 upward; each entity first
+    // tries the port in its own pulse-null.toml (PN-104).
     let registry = Arc::new(RwLock::new(crate::registry::EntityRegistry::new(3200)));
 
     // Boot all discovered entities
     for entity in discovered {
-        let port = registry.write().await.next_port();
-        match crate::server::boot::boot_entity(entity.config.clone(), entity.dir.clone(), port)
-            .await
+        let fallback_port = registry.write().await.next_port();
+        match crate::server::boot::boot_entity(
+            entity.config.clone(),
+            entity.dir.clone(),
+            fallback_port,
+        )
+        .await
         {
             Ok(booted) => {
                 tracing::info!(

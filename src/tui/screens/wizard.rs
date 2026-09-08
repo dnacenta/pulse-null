@@ -90,6 +90,8 @@ pub struct WizardScreen {
 
     // Status
     error_msg: Option<String>,
+    /// Claude Code wiring outcomes worth showing on the Done screen.
+    bootstrap_notice: Option<String>,
     pub created_dir: Option<PathBuf>,
 }
 
@@ -115,7 +117,7 @@ impl WizardScreen {
 
         let mut port = TextArea::default();
         style_input(&mut port, "Port");
-        port.insert_str("3100");
+        port.insert_str(crate::discovery::suggest_port(target_dir).to_string());
 
         // Load available plugins
         let available_plugins: Vec<(String, String, bool)> =
@@ -145,6 +147,7 @@ impl WizardScreen {
             available_plugins,
             plugin_cursor: 0,
             error_msg: None,
+            bootstrap_notice: None,
             created_dir: None,
         }
     }
@@ -289,7 +292,27 @@ impl WizardScreen {
             .map(|(name, _, _)| (name.clone(), Vec::new()))
             .collect();
 
-        let entity_dir = self.target_dir.join(entity_name.to_lowercase());
+        let dir_name = match crate::discovery::validate_entity_name(&entity_name) {
+            Ok(name) => name,
+            Err(reason) => {
+                self.error_msg = Some(format!("Entity name: {reason}"));
+                self.step = WizardStep::Review;
+                return;
+            }
+        };
+        let entity_dir = self.target_dir.join(dir_name);
+
+        // Guard against overwriting an existing entity — the same check the
+        // CLI wizard makes. Memory and identity are not things to clobber.
+        if entity_dir.join("pulse-null.toml").exists() {
+            self.error_msg = Some(format!(
+                "Entity \"{}\" already exists at {} — choose another name.",
+                entity_name,
+                entity_dir.display()
+            ));
+            self.step = WizardStep::Review;
+            return;
+        }
 
         // Create directory structure
         let dirs = [
@@ -389,6 +412,24 @@ impl WizardScreen {
                 self.step = WizardStep::Review;
                 return;
             }
+        }
+
+        // Same entity-local Claude Code wiring the CLI wizard does (PN-104).
+        // Anything that did not land is said on the Done screen, not buried.
+        if provider == "claude-code" {
+            use crate::init::claude_code_bootstrap::ItemStatus;
+            let problems: Vec<String> = crate::init::claude_code_bootstrap::ensure(&entity_dir)
+                .into_iter()
+                .filter(|i| matches!(i.status, ItemStatus::Skipped(_) | ItemStatus::Wrong(_)))
+                .map(|i| i.to_string())
+                .collect();
+            self.bootstrap_notice = (!problems.is_empty()).then(|| {
+                format!(
+                    "Claude Code setup: {} item(s) need attention (run `pulse-null repair`):\n{}",
+                    problems.len(),
+                    problems.join("\n")
+                )
+            });
         }
 
         self.created_dir = Some(entity_dir);
@@ -1010,6 +1051,13 @@ impl WizardScreen {
                 Style::default().fg(COLOR_DIM),
             ),
         ];
+        let mut lines = lines;
+        if let Some(notice) = &self.bootstrap_notice {
+            lines.push(Line::from(""));
+            for l in notice.lines() {
+                lines.push(Line::styled(format!("  {l}"), Style::default().fg(NORD13)));
+            }
+        }
 
         frame.render_widget(Paragraph::new(lines), area);
     }

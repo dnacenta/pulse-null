@@ -108,7 +108,7 @@ impl AppContext {
         config: &Config,
         root_dir: &Path,
     ) -> Result<(), Box<dyn std::error::Error>> {
-        let provider = crate::providers::create_streaming_provider(config)?;
+        let provider = crate::providers::create_streaming_provider(config, root_dir)?;
         let provider: Arc<dyn StreamingProvider> = Arc::from(provider);
 
         let system_prompt =

@@ -29,12 +29,12 @@ pub struct BootedEntity {
 pub async fn boot_entity(
     config: Config,
     root_dir: PathBuf,
-    port_override: u16,
+    fallback_port: u16,
 ) -> Result<BootedEntity, Box<dyn std::error::Error>> {
     super::ensure_infrastructure(&root_dir);
 
     // Create LLM provider
-    let provider = crate::providers::create_provider(&config)?;
+    let provider = crate::providers::create_provider(&config, &root_dir)?;
 
     // Monitoring
     let monitors = super::setup::create_monitors(&config);
@@ -137,12 +137,23 @@ pub async fn boot_entity(
     // Build router (plugin_routes collected before AppState construction)
     let app = super::build_router(Arc::clone(&state), plugin_routes);
 
-    // Bind to the overridden port
-    let addr = format!("127.0.0.1:{}", port_override);
+    // The entity's own host:port when the port is free; the registry's
+    // fallback otherwise, said out loud (PN-104).
+    let entity_name = config.entity.name.clone();
+    let (host, host_note) = bind_host(&config.server.host, has_usable_secret(&config));
+    if let Some(note) = host_note {
+        tracing::warn!("Entity \"{}\": {}", entity_name, note);
+    }
+    let (port, fallback_note) = choose_port(config.server.port, fallback_port, |p| {
+        crate::registry::port_available_on(&host, p)
+    });
+    if let Some(note) = fallback_note {
+        tracing::warn!("Entity \"{}\": {}", entity_name, note);
+    }
+    let addr = format!("{host}:{port}");
     let listener = tokio::net::TcpListener::bind(&addr).await?;
     let actual_port = listener.local_addr()?.port();
 
-    let entity_name = config.entity.name.clone();
     tracing::info!("Entity \"{}\" listening on :{}", entity_name, actual_port);
 
     // Spawn server as background task (non-blocking)
@@ -159,4 +170,89 @@ pub async fn boot_entity(
         actual_port,
         persist_coordinator: Arc::clone(&state.persist_coordinator),
     })
+}
+
+/// A secret that actually protects something: present and not blank.
+pub(crate) fn has_usable_secret(config: &Config) -> bool {
+    config
+        .security
+        .secret
+        .as_deref()
+        .is_some_and(|s| !s.trim().is_empty())
+}
+
+/// The host an entity binds in multi-entity mode. Its configured host, unless
+/// that would expose an entity with no `security.secret` beyond loopback —
+/// then loopback, with a note. `pulse-null.toml` is entity-writable data, so
+/// the socket must not be the only thing standing between it and the network.
+pub(crate) fn bind_host(configured: &str, has_secret: bool) -> (String, Option<String>) {
+    let loopback = configured == "localhost"
+        || configured
+            .parse::<std::net::IpAddr>()
+            .is_ok_and(|ip| ip.is_loopback());
+    if loopback || has_secret {
+        return (configured.to_string(), None);
+    }
+    (
+        "127.0.0.1".to_string(),
+        Some(format!(
+            "configured host {configured} is not loopback and no [security] secret is set — binding 127.0.0.1 instead"
+        )),
+    )
+}
+
+/// Pick the port an entity binds in multi-entity mode: its configured port
+/// when `available`, else `fallback` with a note naming both.
+fn choose_port(
+    configured: u16,
+    fallback: u16,
+    available: impl Fn(u16) -> bool,
+) -> (u16, Option<String>) {
+    if configured == fallback || available(configured) {
+        return (configured, None);
+    }
+    (
+        fallback,
+        Some(format!(
+            "configured port {configured} is already in use — listening on {fallback} instead"
+        )),
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{bind_host, choose_port};
+
+    #[test]
+    fn bind_host_keeps_loopback_and_secured_hosts() {
+        assert_eq!(bind_host("127.0.0.1", false), ("127.0.0.1".into(), None));
+        assert_eq!(bind_host("localhost", false), ("localhost".into(), None));
+        assert_eq!(bind_host("::1", false), ("::1".into(), None));
+        assert_eq!(bind_host("0.0.0.0", true), ("0.0.0.0".into(), None));
+    }
+
+    #[test]
+    fn bind_host_refuses_public_host_without_secret() {
+        let (host, note) = bind_host("0.0.0.0", false);
+        assert_eq!(host, "127.0.0.1");
+        assert!(note.expect("a note").contains("0.0.0.0"));
+    }
+
+    #[test]
+    fn choose_port_prefers_config_when_free() {
+        assert_eq!(choose_port(3300, 3201, |_| true), (3300, None));
+    }
+
+    #[test]
+    fn choose_port_falls_back_when_bound() {
+        let (port, note) = choose_port(3200, 3201, |p| p != 3200);
+        assert_eq!(port, 3201);
+        let note = note.expect("a fallback is announced");
+        assert!(note.contains("3200") && note.contains("3201"), "{note}");
+    }
+
+    #[test]
+    fn choose_port_skips_the_probe_when_config_is_the_fallback() {
+        assert_eq!(choose_port(3201, 3201, |_| false), (3201, None));
+    }
 }
