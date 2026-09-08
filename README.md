@@ -263,6 +263,8 @@ For a quick look at all of them at once, `pulse-null up` from the install root b
 
 When the provider is `claude-code`, the entity runs `claude` from inside its own directory with `RECALL_ECHO_HOME` pointing at it, so Claude Code picks up the entity's `CLAUDE.md`, hooks and rules, and recall-echo reads and writes that entity's memory. `pulse-null repair` re-creates any of those files and retires leftover `~/.claude` symlinks from older installs.
 
+Entities under one unix user share that user's rights: each runs `claude` with permission prompts disabled and can read and write its siblings' directories. They do not collide, but they are not isolated from each other. Where isolation matters, give each entity its own unix user.
+
 **Do not run `init` or `up` as root.** Files would end up root-owned, and Claude Code refuses `--dangerously-skip-permissions` under root, so a claude-code entity could never reach its provider. Both commands refuse and explain; `PULSE_NULL_ALLOW_ROOT=1` overrides for CI.
 
 ## Configuration

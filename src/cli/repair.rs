@@ -1,5 +1,13 @@
 use console::style;
 
+/// Paths and hook commands come from files the user did not necessarily
+/// write. Keep terminal control sequences out of what we print about them.
+fn printable(s: &str) -> String {
+    s.chars()
+        .map(|c| if c.is_control() { '\u{FFFD}' } else { c })
+        .collect()
+}
+
 use crate::config::Config;
 use crate::init::claude_code_bootstrap::{self, ItemStatus};
 
@@ -58,14 +66,18 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 match std::fs::remove_file(link) {
                     Ok(()) => {
                         changed += 1;
-                        println!("    {} {} removed", style("✓").green(), link.display());
+                        println!(
+                            "    {} {} removed",
+                            style("✓").green(),
+                            printable(&link.display().to_string())
+                        );
                     }
                     Err(e) => {
                         skipped += 1;
                         println!(
                             "    {} {} could not be removed: {e}",
                             style("⚠").yellow(),
-                            link.display()
+                            printable(&link.display().to_string())
                         );
                     }
                 }
@@ -84,7 +96,7 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
             println!("    They fire for every entity this user runs and resolve to the wrong one.");
             println!("    The entity now carries its own hooks in .claude/settings.json — remove these by hand:");
             for command in &stale {
-                println!("      {command}");
+                println!("      {}", printable(command));
             }
         }
     }

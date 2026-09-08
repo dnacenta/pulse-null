@@ -85,7 +85,7 @@ fn find_recall_echo_bin_in(home: Option<&Path>) -> String {
     }
     candidates.push(PathBuf::from("/usr/local/bin/recall-echo"));
     for c in &candidates {
-        if c.exists() {
+        if c.is_file() {
             return c.to_string_lossy().to_string();
         }
     }
@@ -105,13 +105,12 @@ fn shell_quote(path: &Path) -> String {
 
 /// The canonical hook command for one subcommand.
 fn hook_command(recall_bin: &str, sub: &str, root: &Path) -> String {
+    let bin = shell_quote(Path::new(recall_bin));
     let root = shell_quote(root);
     match sub {
-        "consume" => format!("{recall_bin} consume {root}"),
-        "checkpoint" => {
-            format!("{recall_bin} checkpoint --trigger precompact --entity-root {root}")
-        }
-        _ => format!("{recall_bin} {sub} --entity-root {root}"),
+        "consume" => format!("{bin} consume {root}"),
+        "checkpoint" => format!("{bin} checkpoint --trigger precompact --entity-root {root}"),
+        _ => format!("{bin} {sub} --entity-root {root}"),
     }
 }
 
@@ -135,33 +134,42 @@ fn render_hooks(recall_bin: &str, root: &Path) -> serde_json::Value {
     serde_json::Value::Object(hooks)
 }
 
-/// Does this hook entry (one element of an event's array) run recall-echo's
-/// `sub` command? Matched loosely on purpose: any binary path, any root, with
-/// or without a wrapper — it is *ours* to replace either way.
-fn is_recall_entry(entry: &serde_json::Value, sub: &str) -> bool {
-    entry["hooks"]
-        .as_array()
-        .map(|hooks| {
-            hooks.iter().any(|h| {
-                h["command"]
-                    .as_str()
-                    .is_some_and(|c| is_recall_command(c, sub))
-            })
-        })
-        .unwrap_or(false)
+/// Is this command a recall-echo `sub` invocation? Anchored: the *first*
+/// token must be the recall-echo binary (quoted or not, any path) and the
+/// second the subcommand. A command that merely mentions recall-echo
+/// somewhere is not ours to touch.
+fn is_recall_command(command: &str, sub: &str) -> bool {
+    let mut tokens = command.split_whitespace();
+    let (Some(bin), Some(first_arg)) = (tokens.next(), tokens.next()) else {
+        return false;
+    };
+    let bin = bin.trim_matches('\'');
+    Path::new(bin)
+        .file_name()
+        .is_some_and(|f| f == "recall-echo")
+        && first_arg == sub
 }
 
-fn is_recall_command(command: &str, sub: &str) -> bool {
-    command
-        .split_whitespace()
-        .collect::<Vec<_>>()
-        .windows(2)
-        .any(|w| {
-            Path::new(w[0])
-                .file_name()
-                .is_some_and(|f| f == "recall-echo")
-                && w[1] == sub
+/// Drop recall-echo `sub` hooks from one event entry, keeping every other
+/// hook in it. `None` when nothing is left worth keeping.
+fn strip_recall_hooks(mut entry: serde_json::Value, sub: &str) -> Option<serde_json::Value> {
+    let Some(hooks) = entry["hooks"].as_array() else {
+        return Some(entry);
+    };
+    let kept: Vec<serde_json::Value> = hooks
+        .iter()
+        .filter(|h| {
+            !h["command"]
+                .as_str()
+                .is_some_and(|c| is_recall_command(c, sub))
         })
+        .cloned()
+        .collect();
+    if kept.is_empty() {
+        return None;
+    }
+    entry["hooks"] = serde_json::Value::Array(kept);
+    Some(entry)
 }
 
 /// Merge our hooks into an existing settings document: every other key and
@@ -185,7 +193,7 @@ fn merge_hooks(mut existing: serde_json::Value, ours: &serde_json::Value) -> ser
             .cloned()
             .unwrap_or_default()
             .into_iter()
-            .filter(|entry| !is_recall_entry(entry, sub))
+            .filter_map(|entry| strip_recall_hooks(entry, sub))
             .collect();
         if let Some(canonical) = ours[event].as_array().and_then(|a| a.first()) {
             entries.push(canonical.clone());
@@ -193,6 +201,52 @@ fn merge_hooks(mut existing: serde_json::Value, ours: &serde_json::Value) -> ser
         hooks.insert(event.to_string(), serde_json::Value::Array(entries));
     }
     existing
+}
+
+/// Largest config file this module will read. These are hand-sized JSON
+/// documents; anything bigger is not one of ours.
+const MAX_CONFIG_BYTES: u64 = 1024 * 1024;
+
+/// Read a small regular file. `Ok(None)` when absent; an error names why a
+/// present path was refused (symlink, not a regular file, too large).
+fn read_small_file(path: &Path) -> Result<Option<String>, String> {
+    let meta = match path.symlink_metadata() {
+        Ok(m) => m,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e.to_string()),
+    };
+    if meta.file_type().is_symlink() {
+        return Err("is a symlink — refusing to follow it".into());
+    }
+    if !meta.is_file() {
+        return Err("not a regular file".into());
+    }
+    if meta.len() > MAX_CONFIG_BYTES {
+        return Err(format!("larger than {MAX_CONFIG_BYTES} bytes"));
+    }
+    std::fs::read_to_string(path)
+        .map(Some)
+        .map_err(|e| e.to_string())
+}
+
+/// Write `content` to `path` atomically (temp file + rename in the same
+/// directory), never through a symlink.
+fn write_regular_file(path: &Path, content: &str) -> Result<(), String> {
+    if path
+        .symlink_metadata()
+        .is_ok_and(|m| m.file_type().is_symlink())
+    {
+        return Err("is a symlink — refusing to write through it".into());
+    }
+    let parent = path.parent().ok_or("no parent directory")?;
+    std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+    let name = path.file_name().ok_or("no file name")?.to_string_lossy();
+    let tmp = parent.join(format!(".{name}.tmp-{}", std::process::id()));
+    std::fs::write(&tmp, content).map_err(|e| e.to_string())?;
+    std::fs::rename(&tmp, path).map_err(|e| {
+        let _ = std::fs::remove_file(&tmp);
+        e.to_string()
+    })
 }
 
 /// Bring `.claude/settings.json` up to date without clobbering anything else
@@ -203,37 +257,45 @@ fn ensure_settings(path: &Path, ours: &serde_json::Value) -> BootstrapItem {
         kind: ItemKind::ConfigFile,
         status,
     };
-    let existing = match std::fs::read_to_string(path) {
-        Ok(text) => match serde_json::from_str::<serde_json::Value>(&text) {
+    let existing = match read_small_file(path) {
+        Ok(Some(text)) => match serde_json::from_str::<serde_json::Value>(&text) {
             Ok(v) => Some(v),
             Err(e) => return item(ItemStatus::Skipped(format!("not valid JSON: {e}"))),
         },
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
-        Err(e) => return item(ItemStatus::Skipped(e.to_string())),
+        Ok(None) => None,
+        Err(e) => return item(ItemStatus::Skipped(e)),
     };
     let was_present = existing.is_some();
     let merged = merge_hooks(existing.clone().unwrap_or(serde_json::json!({})), ours);
     if existing.as_ref() == Some(&merged) {
         return item(ItemStatus::Exists);
     }
-    if let Some(parent) = path.parent() {
-        let _ = std::fs::create_dir_all(parent);
-    }
-    let rendered = serde_json::to_string_pretty(&merged).unwrap_or_default() + "\n";
-    match std::fs::write(path, rendered) {
+    let rendered = match serde_json::to_string_pretty(&merged) {
+        Ok(text) => text + "\n",
+        Err(e) => return item(ItemStatus::Skipped(format!("could not serialise: {e}"))),
+    };
+    match write_regular_file(path, &rendered) {
         Ok(()) if was_present => item(ItemStatus::Updated),
         Ok(()) => item(ItemStatus::Created),
-        Err(e) => item(ItemStatus::Skipped(e.to_string())),
+        Err(e) => item(ItemStatus::Skipped(e)),
     }
 }
 
-/// Create a directory if it doesn't exist.
+/// Create a directory if it doesn't exist. A symlink where the directory
+/// should be is refused, not followed.
 fn ensure_dir(path: &Path) -> BootstrapItem {
-    if path.exists() {
+    if let Ok(meta) = path.symlink_metadata() {
+        let status = if meta.file_type().is_symlink() {
+            ItemStatus::Skipped("is a symlink — refusing to follow it".into())
+        } else if meta.is_dir() {
+            ItemStatus::Exists
+        } else {
+            ItemStatus::Skipped("regular file exists at path".into())
+        };
         return BootstrapItem {
             path: path.to_path_buf(),
             kind: ItemKind::Directory,
-            status: ItemStatus::Exists,
+            status,
         };
     }
     match std::fs::create_dir_all(path) {
@@ -254,27 +316,21 @@ fn ensure_dir(path: &Path) -> BootstrapItem {
 /// file may carry hand-tuned settings (Echo's graph config lives in its
 /// `.recall-echo.toml`).
 fn ensure_config(path: &Path, content: &str) -> BootstrapItem {
-    if path.exists() {
-        return BootstrapItem {
-            path: path.to_path_buf(),
-            kind: ItemKind::ConfigFile,
-            status: ItemStatus::Exists,
-        };
+    let item = |status| BootstrapItem {
+        path: path.to_path_buf(),
+        kind: ItemKind::ConfigFile,
+        status,
+    };
+    if let Ok(meta) = path.symlink_metadata() {
+        return item(if meta.file_type().is_symlink() {
+            ItemStatus::Skipped("is a symlink — refusing to follow it".into())
+        } else {
+            ItemStatus::Exists
+        });
     }
-    if let Some(parent) = path.parent() {
-        let _ = std::fs::create_dir_all(parent);
-    }
-    match std::fs::write(path, content) {
-        Ok(()) => BootstrapItem {
-            path: path.to_path_buf(),
-            kind: ItemKind::ConfigFile,
-            status: ItemStatus::Created,
-        },
-        Err(e) => BootstrapItem {
-            path: path.to_path_buf(),
-            kind: ItemKind::ConfigFile,
-            status: ItemStatus::Skipped(e.to_string()),
-        },
+    match write_regular_file(path, content) {
+        Ok(()) => item(ItemStatus::Created),
+        Err(e) => item(ItemStatus::Skipped(e)),
     }
 }
 
@@ -335,6 +391,9 @@ fn ensure_conversations_link(entity_root: &Path) -> BootstrapItem {
 
 /// Generate the recall-echo.toml config content.
 fn render_recall_echo_toml(entity_root: &Path) -> String {
+    // A TOML string literal, escaped by the toml crate — a quote or newline
+    // in the path must not be able to open a new table.
+    let docs_dir = toml::Value::String(format!("{}/journal", entity_root.display())).to_string();
     format!(
         r#"[ephemeral]
 max_entries = 5
@@ -345,16 +404,15 @@ model = ""
 api_base = ""
 
 [pipeline]
-docs_dir = "{}/journal"
+docs_dir = {docs_dir}
 auto_sync = true
-"#,
-        entity_root.display()
+"#
     )
 }
 
 /// Generate the recall-echo.md rules file. Every path is relative to the
 /// entity root, which is the cwd Claude Code runs in for this entity.
-fn render_rules_md() -> String {
+fn render_rules_md() -> &'static str {
     r#"# recall-echo — Memory Protocol
 
 You have a persistent four-layer memory system. Use it to maintain continuity across sessions.
@@ -427,7 +485,6 @@ current conversation.
 - Archive conversations are immutable. Never modify them.
 - When the user says "we discussed this before" — search archives before saying you don't remember.
 "#
-    .to_string()
 }
 
 /// Create all Claude Code integration files for one entity.
@@ -436,6 +493,15 @@ pub fn ensure(entity_root: &Path) -> Vec<BootstrapItem> {
     let entity_root = entity_root
         .canonicalize()
         .unwrap_or_else(|_| entity_root.to_path_buf());
+    if entity_root.to_str().is_none() {
+        // A lossy conversion would persist a hook pointing at a path that
+        // does not exist. Say so instead.
+        return vec![BootstrapItem {
+            path: entity_root,
+            kind: ItemKind::Directory,
+            status: ItemStatus::Skipped("entity root is not valid UTF-8".into()),
+        }];
+    }
     let claude_dir = entity_root.join(".claude");
     let recall_bin = find_recall_echo_bin();
 
@@ -447,7 +513,7 @@ pub fn ensure(entity_root: &Path) -> Vec<BootstrapItem> {
             &claude_dir.join("settings.json"),
             &render_hooks(&recall_bin, &entity_root),
         ),
-        ensure_config(&claude_dir.join("rules/recall-echo.md"), &render_rules_md()),
+        ensure_config(&claude_dir.join("rules/recall-echo.md"), render_rules_md()),
         ensure_config(
             &entity_root.join("memory/.recall-echo.toml"),
             &render_recall_echo_toml(&entity_root),
@@ -468,8 +534,8 @@ pub fn verify(entity_root: &Path) -> Vec<BootstrapItem> {
 
     // settings.json: present and carrying all three canonical hooks.
     let settings = claude_dir.join("settings.json");
-    let status = match std::fs::read_to_string(&settings) {
-        Ok(text) => match serde_json::from_str::<serde_json::Value>(&text) {
+    let status = match read_small_file(&settings) {
+        Ok(Some(text)) => match serde_json::from_str::<serde_json::Value>(&text) {
             Ok(existing) => {
                 let ours = render_hooks(&recall_bin, &entity_root);
                 if merge_hooks(existing.clone(), &ours) == existing {
@@ -480,7 +546,8 @@ pub fn verify(entity_root: &Path) -> Vec<BootstrapItem> {
             }
             Err(e) => ItemStatus::Wrong(format!("not valid JSON: {e}")),
         },
-        Err(_) => ItemStatus::Missing,
+        Ok(None) => ItemStatus::Missing,
+        Err(e) => ItemStatus::Wrong(e),
     };
     items.push(BootstrapItem {
         path: settings,
@@ -558,7 +625,11 @@ pub fn legacy_home_links(entity_root: &Path, home: &Path) -> Vec<PathBuf> {
             } else {
                 link.parent().unwrap_or(Path::new("/")).join(target)
             };
-            let target = target.canonicalize().unwrap_or(target);
+            // A dangling link cannot be shown to resolve inside the entity
+            // (`..` is not normalised lexically), so it is not ours to remove.
+            let Ok(target) = target.canonicalize() else {
+                return false;
+            };
             target.starts_with(&root)
         })
         .collect()
@@ -570,7 +641,7 @@ pub fn legacy_home_links(entity_root: &Path, home: &Path) -> Vec<PathBuf> {
 /// the wrong one. Reported for the operator to remove — never edited here.
 pub fn user_hooks_missing_root(home: &Path) -> Vec<String> {
     let path = home.join(".claude/settings.json");
-    let Ok(text) = std::fs::read_to_string(&path) else {
+    let Ok(Some(text)) = read_small_file(&path) else {
         return Vec::new();
     };
     let Ok(doc) = serde_json::from_str::<serde_json::Value>(&text) else {
@@ -785,6 +856,8 @@ mod tests {
         let home = tempfile::tempdir().unwrap();
         let claude = home.path().join(".claude");
         std::fs::create_dir_all(&claude).unwrap();
+        std::fs::write(root.join("memory/ARCHIVE.md"), "").unwrap();
+        std::fs::write(other.path().join("memory/EPHEMERAL.md"), "").unwrap();
         std::os::unix::fs::symlink(root.join("memory/ARCHIVE.md"), claude.join("ARCHIVE.md"))
             .unwrap();
         std::os::unix::fs::symlink(root.join("memory"), claude.join("memories")).unwrap();
@@ -800,9 +873,20 @@ mod tests {
             found,
             vec![claude.join("ARCHIVE.md"), claude.join("memories")]
         );
-        assert!(legacy_home_links(other.path(), home.path())
-            .iter()
-            .all(|p| p.ends_with("EPHEMERAL.md")));
+        let for_other = legacy_home_links(other.path(), home.path());
+        assert_eq!(for_other.len(), 1);
+        assert!(for_other[0].ends_with("EPHEMERAL.md"));
+
+        // A dangling link cannot be shown to point inside the entity — even
+        // one whose lexical target escapes through `..` — so it is left alone.
+        std::fs::remove_file(claude.join("ARCHIVE.md")).unwrap();
+        std::os::unix::fs::symlink(root.join("../../etc/passwd"), claude.join("ARCHIVE.md"))
+            .unwrap();
+        std::fs::remove_file(root.join("memory/ARCHIVE.md")).unwrap();
+        assert_eq!(
+            legacy_home_links(&root, home.path()),
+            vec![claude.join("memories")]
+        );
     }
 
     #[test]
@@ -834,6 +918,93 @@ mod tests {
             std::fs::read_to_string(claude.join("settings.json")).unwrap(),
             original
         );
+    }
+
+    #[test]
+    fn recall_match_is_anchored_and_hook_level() {
+        assert!(is_recall_command(
+            "'/usr/local/bin/recall-echo' consume '/e'",
+            "consume"
+        ));
+        assert!(is_recall_command(
+            "recall-echo archive-session || true",
+            "archive-session"
+        ));
+        assert!(!is_recall_command("echo recall-echo consume", "consume"));
+        assert!(!is_recall_command("recall-echo consume", "checkpoint"));
+
+        let entry = serde_json::json!({"hooks": [
+            {"type": "command", "command": "recall-echo consume '/e'"},
+            {"type": "command", "command": "echo sibling"}
+        ]});
+        let kept = strip_recall_hooks(entry, "consume").expect("sibling survives");
+        assert_eq!(kept["hooks"].as_array().unwrap().len(), 1);
+        assert_eq!(kept["hooks"][0]["command"], "echo sibling");
+        let only_ours =
+            serde_json::json!({"hooks": [{"type": "command", "command": "recall-echo consume"}]});
+        assert!(strip_recall_hooks(only_ours, "consume").is_none());
+    }
+
+    #[test]
+    fn bootstrap_refuses_to_write_through_symlinks() {
+        let dir = entity();
+        let root = dir.path().canonicalize().unwrap();
+        let elsewhere = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(root.join(".claude/rules")).unwrap();
+        // Dangling links where the config files should be.
+        std::os::unix::fs::symlink(
+            elsewhere.path().join("pwned.json"),
+            root.join(".claude/settings.json"),
+        )
+        .unwrap();
+        std::os::unix::fs::symlink(
+            elsewhere.path().join("pwned.md"),
+            root.join(".claude/rules/recall-echo.md"),
+        )
+        .unwrap();
+        std::os::unix::fs::symlink(
+            elsewhere.path().join("pwned.toml"),
+            root.join("memory/.recall-echo.toml"),
+        )
+        .unwrap();
+
+        let items = ensure(&root);
+        for name in ["settings.json", "recall-echo.md", ".recall-echo.toml"] {
+            let item = items.iter().find(|i| i.path.ends_with(name)).unwrap();
+            assert!(
+                matches!(item.status, ItemStatus::Skipped(_)),
+                "{name}: {:?}",
+                item.status
+            );
+        }
+        assert!(
+            std::fs::read_dir(elsewhere.path())
+                .unwrap()
+                .next()
+                .is_none(),
+            "nothing written through the links"
+        );
+    }
+
+    #[test]
+    fn recall_toml_escapes_the_path() {
+        let toml_text =
+            render_recall_echo_toml(Path::new("/srv/evil\"\n[llm]\napi_base = \"http://x"));
+        let parsed: toml::Value = toml::from_str(&toml_text).expect("still one document");
+        assert!(parsed
+            .get("llm")
+            .and_then(|l| l.get("api_base"))
+            .is_some_and(|v| v.as_str() == Some("")));
+        assert!(parsed["pipeline"]["docs_dir"]
+            .as_str()
+            .unwrap()
+            .starts_with("/srv/evil\""));
+    }
+
+    #[test]
+    fn hook_commands_quote_the_binary() {
+        let cmd = hook_command("/opt/my tools/recall-echo", "consume", Path::new("/e"));
+        assert_eq!(cmd, "'/opt/my tools/recall-echo' consume '/e'");
     }
 
     #[test]

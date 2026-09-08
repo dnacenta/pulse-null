@@ -61,12 +61,23 @@ fn resolve_entity_home(cwd: &Path, home: Option<&Path>) -> Option<PathBuf> {
 /// Does `dir` hold at least one entity as a direct child?
 pub fn has_entity_children(dir: &Path) -> bool {
     std::fs::read_dir(dir)
-        .map(|entries| {
-            entries
-                .flatten()
-                .any(|e| e.path().is_dir() && e.path().join("pulse-null.toml").exists())
-        })
+        .map(|entries| entries.flatten().any(|e| is_entity_child(&e)))
         .unwrap_or(false)
+}
+
+/// A real subdirectory (not a symlink — a link can point at a tree someone
+/// else controls) holding a `pulse-null.toml`.
+fn is_entity_child(entry: &std::fs::DirEntry) -> bool {
+    entry.file_type().is_ok_and(|t| t.is_dir()) && entry.path().join("pulse-null.toml").exists()
+}
+
+/// Booting an entity runs its configured binaries with our rights; only
+/// directories we own qualify.
+fn owned_by_us(path: &Path) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    // SAFETY: geteuid has no preconditions and cannot fail.
+    let me = unsafe { libc::geteuid() };
+    std::fs::metadata(path).is_ok_and(|m| m.uid() == me)
 }
 
 /// Scan the entity home directory for valid entity directories.
@@ -80,11 +91,14 @@ pub fn discover_entities(entity_home: &Path) -> Vec<DiscoveredEntity> {
 
     for entry in entries.flatten() {
         let path = entry.path();
-        if !path.is_dir() {
+        if !is_entity_child(&entry) {
             continue;
         }
-        let config_path = path.join("pulse-null.toml");
-        if !config_path.exists() {
+        if !owned_by_us(&path) {
+            tracing::warn!(
+                "Skipping {}: not owned by the running user — an entity is booted with this user's rights",
+                path.display()
+            );
             continue;
         }
         match Config::load_from(&path) {
@@ -165,6 +179,17 @@ mod tests {
             Some(cwd.path().to_path_buf())
         );
         assert!(!has_entity_children(cwd.path()));
+    }
+
+    #[test]
+    fn symlinked_children_are_not_entities() {
+        let cwd = tempfile::tempdir().unwrap();
+        let elsewhere = tempfile::tempdir().unwrap();
+        entity_at(elsewhere.path(), "real");
+        std::os::unix::fs::symlink(elsewhere.path().join("real"), cwd.path().join("linked"))
+            .unwrap();
+        assert!(!has_entity_children(cwd.path()));
+        assert!(discover_entities(cwd.path()).is_empty());
     }
 
     #[test]

@@ -488,6 +488,10 @@ async fn main() {
             }
         }
         Commands::Repair => {
+            if let Err(e) = cli::root_guard::refuse_root("repair") {
+                eprintln!("Error: {e}");
+                std::process::exit(1);
+            }
             if let Err(e) = cli::repair::run().await {
                 eprintln!("Error: {e}");
                 std::process::exit(1);
