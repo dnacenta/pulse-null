@@ -391,6 +391,12 @@ impl WizardScreen {
             }
         }
 
+        // Same entity-local Claude Code wiring the CLI wizard does (PN-104).
+        // Item-level outcomes are visible later via `pulse-null repair`.
+        if provider == "claude-code" {
+            let _ = crate::init::claude_code_bootstrap::ensure(&entity_dir);
+        }
+
         self.created_dir = Some(entity_dir);
         self.step = WizardStep::Done;
     }

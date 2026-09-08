@@ -302,19 +302,18 @@ pub async fn run(target_dir: &Path) -> Result<(), Box<dyn std::error::Error>> {
         );
     }
 
-    // Wire up Claude Code integration if provider is claude-code
+    // Wire up Claude Code integration if provider is claude-code. Everything
+    // lands inside the entity directory — nothing in $HOME/.claude — so any
+    // number of entities can share one unix user (PN-104).
     if config.provider == "claude-code" {
-        if let Ok(home) = std::env::var("HOME") {
-            let home_dir = std::path::PathBuf::from(home);
-            println!();
-            println!(
-                "  {}",
-                style("Setting up Claude Code integration...").bold()
-            );
-            let results = super::claude_code_bootstrap::ensure(&entity_dir, &home_dir);
-            for item in &results {
-                println!("  {item}");
-            }
+        println!();
+        println!(
+            "  {}",
+            style("Setting up Claude Code integration...").bold()
+        );
+        let results = super::claude_code_bootstrap::ensure(&entity_dir);
+        for item in &results {
+            println!("  {item}");
         }
     }
 
