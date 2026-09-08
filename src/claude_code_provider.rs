@@ -74,6 +74,7 @@ impl ClaudeCodeProvider {
     }
 
     /// The entity root every subprocess is anchored to.
+    #[cfg(test)]
     pub fn entity_root(&self) -> &Path {
         &self.entity_root
     }

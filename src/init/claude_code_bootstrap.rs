@@ -346,6 +346,26 @@ fn write_regular_file(path: &Path, content: &str, within: &Path) -> Result<(), S
     })
 }
 
+/// Does `existing` already carry our hooks — each event with exactly one
+/// recall-echo hook for its subcommand, in canonical form? Order among an
+/// event's entries does not matter; only `merge_hooks` normalises it.
+fn has_canonical_hooks(existing: &serde_json::Value, ours: &serde_json::Value) -> bool {
+    RECALL_HOOKS.iter().all(|(event, sub)| {
+        let Some(canonical) = ours[event][0]["hooks"][0]["command"].as_str() else {
+            return false;
+        };
+        let commands: Vec<&str> = existing["hooks"][event]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .flat_map(|entry| entry["hooks"].as_array().into_iter().flatten())
+            .filter_map(|h| h["command"].as_str())
+            .filter(|c| is_recall_command(c, sub))
+            .collect();
+        commands == [canonical]
+    })
+}
+
 /// Bring `.claude/settings.json` up to date without clobbering anything else
 /// in it.
 fn ensure_settings(path: &Path, ours: &serde_json::Value, within: &Path) -> BootstrapItem {
@@ -657,7 +677,7 @@ pub fn verify(entity_root: &Path) -> Vec<BootstrapItem> {
         Ok(Some(text)) => match serde_json::from_str::<serde_json::Value>(&text) {
             Ok(existing) => {
                 let ours = render_hooks(&recall_bin, &entity_root);
-                if merge_hooks(existing.clone(), &ours) == existing {
+                if has_canonical_hooks(&existing, &ours) {
                     ItemStatus::Exists
                 } else {
                     ItemStatus::Wrong("recall-echo hooks missing or stale".into())
@@ -786,7 +806,7 @@ pub fn user_hooks_missing_root(home: &Path) -> Vec<String> {
                                 .split_whitespace()
                                 .skip_while(|w| *w != "consume")
                                 .nth(1)
-                                .is_some());
+                                .is_some_and(|arg| !arg.starts_with(['|', '&', ';', '>', '<'])));
                     if !carries_root {
                         found.push(command.to_string());
                     }
@@ -1178,6 +1198,46 @@ mod tests {
             .mode()
             & 0o777;
         assert_eq!(mode, 0o600);
+    }
+
+    #[test]
+    fn verify_accepts_our_hook_in_any_position() {
+        let dir = entity();
+        let root = dir.path().canonicalize().unwrap();
+        ensure(&root);
+        // Move a foreign hook *after* ours in SessionEnd.
+        let path = root.join(".claude/settings.json");
+        let mut doc: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        doc["hooks"]["SessionEnd"]
+            .as_array_mut()
+            .unwrap()
+            .push(serde_json::json!({"hooks": [{"type": "command", "command": "echo bye"}]}));
+        std::fs::write(&path, doc.to_string()).unwrap();
+        let settings = verify(&root)
+            .into_iter()
+            .find(|i| i.path.ends_with("settings.json"))
+            .unwrap();
+        assert_eq!(settings.status, ItemStatus::Exists, "{settings:?}");
+    }
+
+    #[test]
+    fn consume_followed_by_an_operator_carries_no_root() {
+        let home = tempfile::tempdir().unwrap();
+        let claude = home.path().join(".claude");
+        std::fs::create_dir_all(&claude).unwrap();
+        std::fs::write(
+            claude.join("settings.json"),
+            serde_json::json!({"hooks": {"SessionStart": [{"hooks": [
+                {"type": "command", "command": "recall-echo consume || true"}
+            ]}]}})
+            .to_string(),
+        )
+        .unwrap();
+        assert_eq!(
+            user_hooks_missing_root(home.path()),
+            vec!["recall-echo consume || true".to_string()]
+        );
     }
 
     #[test]

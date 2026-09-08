@@ -25,8 +25,13 @@ pub fn find_entity_home() -> Option<PathBuf> {
 
 /// The pure resolution, separated from process state so it can be tested.
 fn resolve_entity_home(cwd: &Path, home: Option<&Path>) -> Option<PathBuf> {
-    // Single entity mode: CWD has pulse-null.toml
-    if cwd.join("pulse-null.toml").exists() {
+    // Single entity mode: CWD is inside an entity (any ancestor holds
+    // pulse-null.toml) — the same walk `Config::load()` does, so `up` agrees
+    // with every other subcommand about which entity a directory belongs to.
+    if cwd
+        .ancestors()
+        .any(|dir| dir.join("pulse-null.toml").exists())
+    {
         return None;
     }
 
@@ -81,7 +86,61 @@ fn owned_by_us(entry: &std::fs::DirEntry) -> bool {
     entry.metadata().is_ok_and(|m| m.uid() == me)
 }
 
-/// Scan the entity home directory for valid entity directories.
+/// A port for a new entity in `entity_home`: the first from 3200 upward
+/// that no sibling's `pulse-null.toml` already claims. Every entity binding
+/// its own configured port is what makes those ports stable.
+pub fn suggest_port(entity_home: &Path) -> u16 {
+    let taken: std::collections::BTreeSet<u16> = std::fs::read_dir(entity_home)
+        .map(|entries| {
+            entries
+                .flatten()
+                .filter(is_entity_child)
+                .filter_map(|e| configured_port(&e.path().join("pulse-null.toml")))
+                .collect()
+        })
+        .unwrap_or_default();
+    (3200..u16::MAX)
+        .find(|p| !taken.contains(p))
+        .unwrap_or(3200)
+}
+
+/// `[server] port` from a config file, read leniently: a sibling whose
+/// config would not pass full validation still holds its port.
+fn configured_port(config_path: &Path) -> Option<u16> {
+    let text = std::fs::read_to_string(config_path).ok()?;
+    let doc: toml::Value = toml::from_str(&text).ok()?;
+    let port = doc.get("server")?.get("port")?.as_integer()?;
+    u16::try_from(port).ok()
+}
+
+/// Entity names become directory names under the entity home, so they are
+/// kept to a safe shape: lowercase ASCII letters, digits, `-` and `_`, 1–32
+/// characters, starting with a letter or digit.
+pub fn validate_entity_name(name: &str) -> Result<String, String> {
+    let name = name.trim().to_lowercase();
+    let ok = !name.is_empty()
+        && name.len() <= 32
+        && name
+            .chars()
+            .next()
+            .is_some_and(|c| c.is_ascii_alphanumeric())
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_');
+    if ok {
+        Ok(name)
+    } else {
+        Err(
+            "use 1–32 lowercase letters, digits, '-' or '_', starting with a letter or digit"
+                .into(),
+        )
+    }
+}
+
+/// Scan the entity home directory for valid entity directories. Two
+/// directories claiming the same entity name would silently shadow each
+/// other in the registry, so only the first (by path) is kept and the
+/// duplicate is reported.
 pub fn discover_entities(entity_home: &Path) -> Vec<DiscoveredEntity> {
     let mut entities = Vec::new();
 
@@ -116,6 +175,20 @@ pub fn discover_entities(entity_home: &Path) -> Vec<DiscoveredEntity> {
         }
     }
 
+    entities.sort_by(|a, b| a.dir.cmp(&b.dir));
+    let mut seen = std::collections::HashSet::new();
+    entities.retain(|e| {
+        if seen.insert(e.name.clone()) {
+            true
+        } else {
+            tracing::warn!(
+                "Skipping {}: another entity directory already uses the name \"{}\"",
+                e.dir.display(),
+                e.name
+            );
+            false
+        }
+    });
     entities.sort_by(|a, b| a.name.cmp(&b.name));
     entities
 }
@@ -199,5 +272,42 @@ mod tests {
         std::fs::write(cwd.path().join("pulse-null.toml"), "").unwrap();
         entity_at(cwd.path(), "nested");
         assert_eq!(resolve_entity_home(cwd.path(), None), None);
+    }
+
+    #[test]
+    fn a_subdirectory_of_an_entity_is_still_that_entity() {
+        let cwd = tempfile::tempdir().unwrap();
+        std::fs::write(cwd.path().join("pulse-null.toml"), "").unwrap();
+        let sub = cwd.path().join("journal");
+        std::fs::create_dir_all(&sub).unwrap();
+        assert_eq!(resolve_entity_home(&sub, None), None);
+    }
+
+    #[test]
+    fn suggest_port_skips_ports_siblings_claim() {
+        let home = tempfile::tempdir().unwrap();
+        assert_eq!(suggest_port(home.path()), 3200);
+        let toml = |port: u16| {
+            format!(
+                "[entity]\nname = \"e{port}\"\nowner_name = \"D\"\n[server]\nhost = \"127.0.0.1\"\nport = {port}\n[llm]\nprovider = \"claude-code\"\nmodel = \"x\"\n"
+            )
+        };
+        for port in [3200u16, 3201] {
+            let d = home.path().join(format!("e{port}"));
+            std::fs::create_dir_all(&d).unwrap();
+            std::fs::write(d.join("pulse-null.toml"), toml(port)).unwrap();
+        }
+        assert_eq!(suggest_port(home.path()), 3202);
+    }
+
+    #[test]
+    fn entity_names_are_validated() {
+        assert_eq!(validate_entity_name(" Synth "), Ok("synth".into()));
+        assert_eq!(validate_entity_name("echo-2_b"), Ok("echo-2_b".into()));
+        assert!(validate_entity_name("").is_err());
+        assert!(validate_entity_name("../x").is_err());
+        assert!(validate_entity_name("a b").is_err());
+        assert!(validate_entity_name("-lead").is_err());
+        assert!(validate_entity_name(&"x".repeat(33)).is_err());
     }
 }

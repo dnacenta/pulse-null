@@ -14,6 +14,7 @@ pub async fn run(target_dir: &Path) -> Result<(), Box<dyn std::error::Error>> {
     // Entity name
     let entity_name: String = Input::new()
         .with_prompt("  What should your entity be called?")
+        .validate_with(|s: &String| crate::discovery::validate_entity_name(s).map(|_| ()))
         .interact_text()?;
 
     // Owner name
@@ -117,7 +118,7 @@ pub async fn run(target_dir: &Path) -> Result<(), Box<dyn std::error::Error>> {
     // Server port
     let port: u16 = Input::new()
         .with_prompt("  Server port")
-        .default(3100)
+        .default(crate::discovery::suggest_port(target_dir))
         .interact_text()?;
 
     println!();
@@ -201,7 +202,8 @@ pub async fn run(target_dir: &Path) -> Result<(), Box<dyn std::error::Error>> {
     );
 
     // Create directory structure
-    let entity_dir = target_dir.join(entity_name.to_lowercase());
+    let dir_name = crate::discovery::validate_entity_name(&entity_name)?;
+    let entity_dir = target_dir.join(dir_name);
 
     // Guard against overwriting an existing entity
     if entity_dir.join("pulse-null.toml").exists() {
