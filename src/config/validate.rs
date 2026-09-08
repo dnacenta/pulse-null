@@ -42,12 +42,32 @@ pub fn validate(config: &Config) -> Result<(), ConfigError> {
     if config.server.port == 0 {
         return Err(ConfigError::Validation("Server port must be > 0".into()));
     }
-    let valid_providers = ["claude", "ollama", "claude-code"];
+    // Pre-PN-106 spellings are folded by `LlmConfig::normalize` at load time;
+    // a struct built by hand may still carry them, so accept both here.
+    let valid_providers = ["cli", "anthropic", "ollama", "claude-code", "claude"];
     if !valid_providers.contains(&config.llm.provider.as_str()) {
         return Err(ConfigError::Validation(format!(
-            "Unknown LLM provider: {}. Valid: {:?}",
-            config.llm.provider, valid_providers
+            "Unknown LLM provider: {}. Valid: cli, anthropic, ollama",
+            config.llm.provider
         )));
+    }
+    if config.llm.provider == "cli" {
+        let adapters = crate::cli_provider::adapters::NAMES;
+        match config.llm.adapter.as_deref() {
+            Some(name) if adapters.contains(&name) => {}
+            Some(name) => {
+                return Err(ConfigError::Validation(format!(
+                    "Unknown [llm] adapter: {name}. Valid: {}",
+                    adapters.join(", ")
+                )))
+            }
+            None => {
+                return Err(ConfigError::Validation(format!(
+                    "[llm] provider = \"cli\" needs an adapter. Valid: {}",
+                    adapters.join(", ")
+                )))
+            }
+        }
     }
     // Validate pipeline thresholds
     if config.pipeline.enabled {

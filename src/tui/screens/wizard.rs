@@ -359,6 +359,7 @@ impl WizardScreen {
             timezone,
             plugins: selected_plugins,
             rules_dir: None,
+            adapter: None,
         };
 
         let files = vec![
@@ -416,16 +417,25 @@ impl WizardScreen {
 
         // Same entity-local Claude Code wiring the CLI wizard does (PN-104).
         // Anything that did not land is said on the Done screen, not buried.
-        if provider == "claude-code" {
-            use crate::init::claude_code_bootstrap::ItemStatus;
-            let problems: Vec<String> = crate::init::claude_code_bootstrap::ensure(&entity_dir)
+        if let Some(adapter) = crate::cli_provider::adapters::for_config(provider, None) {
+            use crate::init::agent_bootstrap::ItemStatus;
+            let integration = adapter.integration();
+            let mut items = crate::init::agent_bootstrap::ensure_common(
+                &entity_dir,
+                integration.recall_echo_provider(),
+            );
+            items.extend(integration.ensure(
+                &entity_dir,
+                &crate::init::agent_bootstrap::find_recall_echo_bin(),
+            ));
+            let problems: Vec<String> = items
                 .into_iter()
                 .filter(|i| matches!(i.status, ItemStatus::Skipped(_) | ItemStatus::Wrong(_)))
                 .map(|i| i.to_string())
                 .collect();
             self.bootstrap_notice = (!problems.is_empty()).then(|| {
                 format!(
-                    "Claude Code setup: {} item(s) need attention (run `pulse-null repair`):\n{}",
+                    "Agent setup: {} item(s) need attention (run `pulse-null repair`):\n{}",
                     problems.len(),
                     problems.join("\n")
                 )

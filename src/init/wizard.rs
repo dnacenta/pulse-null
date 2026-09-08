@@ -242,6 +242,7 @@ pub async fn run(target_dir: &Path) -> Result<(), Box<dyn std::error::Error>> {
         timezone: timezone.clone(),
         plugins: plugin_configs,
         rules_dir,
+        adapter: None,
     };
 
     // Write all files
@@ -304,16 +305,27 @@ pub async fn run(target_dir: &Path) -> Result<(), Box<dyn std::error::Error>> {
         );
     }
 
-    // Wire up Claude Code integration if provider is claude-code. Everything
-    // lands inside the entity directory — nothing in $HOME/.claude — so any
-    // number of entities can share one unix user (PN-104).
-    if config.provider == "claude-code" {
+    // Wire the entity for its agent CLI. Everything lands inside the entity
+    // directory — nothing in the user's home — so any number of entities can
+    // share one unix user (PN-104).
+    if let Some(adapter) =
+        crate::cli_provider::adapters::for_config(&config.provider, config.adapter.as_deref())
+    {
+        let integration = adapter.integration();
         println!();
         println!(
             "  {}",
-            style("Setting up Claude Code integration...").bold()
+            style(format!(
+                "Setting up {} agent integration...",
+                adapter.name()
+            ))
+            .bold()
         );
-        let results = super::claude_code_bootstrap::ensure(&entity_dir);
+        let mut results =
+            super::agent_bootstrap::ensure_common(&entity_dir, integration.recall_echo_provider());
+        results.extend(
+            integration.ensure(&entity_dir, &super::agent_bootstrap::find_recall_echo_bin()),
+        );
         for item in &results {
             println!("  {item}");
         }

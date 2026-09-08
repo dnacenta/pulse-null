@@ -83,9 +83,19 @@ pub struct LlmConfig {
     /// Base URL for the LLM API (used by Ollama; defaults to http://localhost:11434).
     #[serde(default)]
     pub base_url: Option<String>,
-    /// Path to the claude CLI binary (used by claude-code provider; defaults to "claude").
+    /// Which agent CLI the `cli` provider drives: `"claude"`, `"grok"` or
+    /// `"codex"`. Required when `provider = "cli"`.
     #[serde(default)]
-    pub claude_bin: Option<String>,
+    pub adapter: Option<String>,
+    /// Path to the agent CLI binary; defaults to the adapter's own name on
+    /// `PATH`. `claude_bin` is the pre-PN-106 spelling and still loads.
+    #[serde(default, alias = "claude_bin")]
+    pub cli_bin: Option<String>,
+    /// Reasoning effort hint for CLIs that take one (the grok adapter maps it
+    /// to `--reasoning-effort`; default "low" — high cost ~20s of hidden
+    /// thinking per chat turn on the live entity).
+    #[serde(default)]
+    pub reasoning_effort: Option<String>,
     /// Maximum estimated tokens in conversation before compaction triggers (0 = default 150k).
     #[serde(default)]
     pub context_budget: usize,
@@ -101,6 +111,44 @@ pub struct LlmConfig {
 }
 
 impl LlmConfig {
+    /// Fold pre-PN-106 provider spellings into the current vocabulary,
+    /// returning one deprecation notice per rewrite. `"claude-code"` was the
+    /// name of the subprocess provider before it became `cli` + an adapter;
+    /// `"claude"` was the Anthropic HTTP API.
+    pub fn normalize(&mut self) -> Vec<String> {
+        let mut notices = Vec::new();
+        match self.provider.as_str() {
+            "claude-code" => {
+                self.provider = "cli".into();
+                if self.adapter.is_none() {
+                    self.adapter = Some("claude".into());
+                }
+                notices.push(
+                    "[llm] provider = \"claude-code\" is deprecated — use provider = \"cli\" with adapter = \"claude\""
+                        .into(),
+                );
+            }
+            "claude" => {
+                self.provider = "anthropic".into();
+                notices.push(
+                    "[llm] provider = \"claude\" is deprecated — use provider = \"anthropic\""
+                        .into(),
+                );
+            }
+            _ => {}
+        }
+        notices
+    }
+
+    /// The adapter name when this config drives an agent CLI.
+    pub fn cli_adapter(&self) -> Option<&str> {
+        match self.provider.as_str() {
+            "cli" => self.adapter.as_deref().or(Some("claude")),
+            "claude-code" => Some("claude"),
+            _ => None,
+        }
+    }
+
     /// The model to retry a refused turn on, or `None` when the fallback is
     /// disabled or unconfigured.
     ///
@@ -294,7 +342,10 @@ impl Config {
     pub fn load() -> Result<Self, crate::errors::ConfigError> {
         let path = Self::find_config()?;
         let content = std::fs::read_to_string(&path)?;
-        let config: Config = toml::from_str(&content)?;
+        let mut config: Config = toml::from_str(&content)?;
+        for notice in config.llm.normalize() {
+            tracing::warn!("{}: {}", path.display(), notice);
+        }
         validate::validate(&config)?;
         Ok(config)
     }
@@ -303,7 +354,10 @@ impl Config {
     pub fn load_from(dir: &std::path::Path) -> Result<Self, crate::errors::ConfigError> {
         let path = dir.join(CONFIG_FILENAME);
         let content = std::fs::read_to_string(&path)?;
-        let config: Config = toml::from_str(&content)?;
+        let mut config: Config = toml::from_str(&content)?;
+        for notice in config.llm.normalize() {
+            tracing::warn!("{}: {}", path.display(), notice);
+        }
         validate::validate(&config)?;
         Ok(config)
     }
@@ -353,7 +407,7 @@ fn default_port() -> u16 {
 }
 
 fn default_provider() -> String {
-    "claude".to_string()
+    "anthropic".to_string()
 }
 
 fn default_model() -> String {
@@ -1127,7 +1181,9 @@ pub mod test_support {
                 model: default_model(),
                 max_tokens: default_max_tokens(),
                 base_url: None,
-                claude_bin: None,
+                adapter: None,
+                cli_bin: None,
+                reasoning_effort: None,
                 context_budget: 0,
                 fallback_model: None,
                 fallback_on_refusal: true,
@@ -1216,7 +1272,9 @@ mod fallback_tests {
             model: default_model(),
             max_tokens: default_max_tokens(),
             base_url: None,
-            claude_bin: None,
+            adapter: None,
+            cli_bin: None,
+            reasoning_effort: None,
             context_budget: 0,
             fallback_model: model.map(str::to_string),
             fallback_on_refusal: on,

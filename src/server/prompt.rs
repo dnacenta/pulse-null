@@ -247,7 +247,9 @@ pub fn build_system_prompt_budgeted(
 
     // --- AWARENESS.md (for non-Claude-Code providers) ---
     // This is part of the essential identity for API entities.
-    if config.llm.provider != "claude-code" {
+    // Only the claude adapter pulls AWARENESS.md in itself, through the
+    // `@AWARENESS.md` import in its instruction file.
+    if config.llm.cli_adapter() != Some("claude") {
         let awareness_path = root_dir.join("AWARENESS.md");
         if awareness_path.exists() {
             let content = std::fs::read_to_string(&awareness_path)?;
@@ -1591,7 +1593,9 @@ mod tests {
                 model: "llama3".into(),
                 max_tokens: 1024,
                 base_url: None,
-                claude_bin: None,
+                adapter: None,
+                cli_bin: None,
+                reasoning_effort: None,
                 context_budget: 0,
                 fallback_model: None,
                 fallback_on_refusal: true,

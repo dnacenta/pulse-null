@@ -1,10 +1,10 @@
 use clap::{Parser, Subcommand};
 
+mod anthropic_provider;
 mod caliber;
 mod chat;
-mod claude_code_provider;
-mod claude_provider;
 mod cli;
+mod cli_provider;
 mod config;
 mod context;
 mod context_buffer;

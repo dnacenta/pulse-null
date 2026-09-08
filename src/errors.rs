@@ -104,38 +104,42 @@ pub enum PromptError {
     Io(#[from] std::io::Error),
     #[error(
         "essential system prompt components are {bytes} bytes, over the {limit} byte hard limit — \
-         essential content is never auto-trimmed, so trim CLAUDE.md or the rules directory by hand"
+         essential content is never auto-trimmed, so trim the instruction file or the rules directory by hand"
     )]
     EssentialTooLarge { bytes: usize, limit: usize },
 }
 
-/// Errors from driving the Claude Code CLI subprocess.
+/// Errors from driving an agent CLI subprocess.
 #[derive(Debug, Error)]
-pub enum ClaudeCliError {
+pub enum CliError {
     #[error(
-        "claude CLI at '{bin}' does not support --system-prompt-file — upgrade the CLI; \
-         pulse-null requires it to keep the system prompt off argv (a single argv argument is \
-         capped at 128KB and an oversized prompt fails every spawn with E2BIG)"
+        "{adapter} CLI at '{bin}' does not support {capability} — upgrade the CLI; pulse-null \
+         requires it (a weaker transport is the failure mode this check exists to prevent)"
     )]
-    SystemPromptFileUnsupported { bin: String },
-    #[error("failed to probe claude CLI at '{bin}' for --system-prompt-file support: {source}")]
+    UnsupportedCapability {
+        adapter: &'static str,
+        bin: String,
+        capability: &'static str,
+    },
+    #[error("failed to probe {adapter} CLI at '{bin}': {source}")]
     Probe {
+        adapter: &'static str,
         bin: String,
         #[source]
         source: std::io::Error,
     },
-    #[error("failed to stage the system prompt file at '{path}': {source}")]
-    SystemPromptFile {
+    #[error("failed to stage a prompt file at '{path}': {source}")]
+    StagedFile {
         path: String,
         #[source]
         source: std::io::Error,
     },
 }
 
-/// An Anthropic Usage-Policy (AUP) refusal from the underlying model.
+/// A policy refusal from the underlying model.
 ///
-/// Emitted by the claude-code provider when `claude -p` exits non-zero with an
-/// `is_error: true` result body matching the Usage-Policy signature. It is boxed
+/// Emitted by the CLI provider when the adapter classifies a non-zero exit
+/// as a refusal (each adapter owns its own signature). It is boxed
 /// into the provider's `Box<dyn Error + Send + Sync>` error channel and
 /// downcast by the chat handler to decide whether to fall back to another model.
 /// It is deliberately distinct from generic provider failures (network,
@@ -143,7 +147,7 @@ pub enum ClaudeCliError {
 #[derive(Debug, Error)]
 #[error("model '{model}' refused the turn (Usage Policy): {detail}")]
 pub struct RefusalError {
-    /// The model that issued the refusal (e.g. `claude-fable-5`).
+    /// The model that issued the refusal.
     pub model: String,
     /// The refusal body reported by the CLI, truncated for logging.
     pub detail: String,
