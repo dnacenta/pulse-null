@@ -231,20 +231,39 @@ my-entity/
 └── logs/                         # Service logs
 ```
 
-### Multi-Entity Vault
+### Multiple Entities
 
-When running multiple entities, you can organize them in a shared vault with symlinks for centralized visibility (e.g., via Obsidian):
+One unix user can create and run any number of entities. Each entity is a directory holding its own `pulse-null.toml`, memory, journal and Claude Code integration — nothing is shared through `$HOME/.claude`, so entities never collide. The recommended layout is flat, under an install root:
 
 ```
-vault/
-├── entities/
-│   ├── echo  → /home/echo/entity/     # symlink to live entity
-│   ├── nova  → /home/nova/entity/     # symlink to live entity
-│   └── synth → /home/synth/entity/    # symlink to live entity
-└── ...
+~/pulse-null/
+├── echo/                        # one entity
+│   ├── pulse-null.toml
+│   ├── CLAUDE.md  SELF.md  AWARENESS.md
+│   ├── .claude/
+│   │   ├── settings.json        # recall-echo hooks, carrying this entity's root
+│   │   └── rules/recall-echo.md # memory protocol, entity-relative paths
+│   └── memory/  journal/  archives/  …
+└── synth/                       # another entity, same shape, its own port
 ```
 
-Each entity's directory is the source of truth. The vault provides a unified view across all entities without duplicating files. Use Unix groups and ownership to control access — entities can read the entire vault but only write to their own directory.
+Create entities from the install root and run each one from its own directory:
+
+```bash
+cd ~/pulse-null
+pulse-null init                  # creates ~/pulse-null/<name>/
+
+cd ~/pulse-null/echo
+pulse-null up --headless         # single-entity mode: this entity only
+```
+
+Running each entity from its own directory is what production wants: one systemd unit per entity, each with its own `WorkingDirectory`, its own environment file for provider credentials, and independent restarts. Every `pulse-null` subcommand is scoped to the entity whose directory you run it from.
+
+For a quick look at all of them at once, `pulse-null up` from the install root boots every entity in one process and opens the multi-entity TUI. Each entity binds the host and port from its own `pulse-null.toml`; if that port is already taken, it falls back to the next free port from 3200 upward and says so in the log. The older `entities/` subdirectory layout is still recognized.
+
+When the provider is `claude-code`, the entity runs `claude` from inside its own directory with `RECALL_ECHO_HOME` pointing at it, so Claude Code picks up the entity's `CLAUDE.md`, hooks and rules, and recall-echo reads and writes that entity's memory. `pulse-null repair` re-creates any of those files and retires leftover `~/.claude` symlinks from older installs.
+
+**Do not run `init` or `up` as root.** Files would end up root-owned, and Claude Code refuses `--dangerously-skip-permissions` under root, so a claude-code entity could never reach its provider. Both commands refuse and explain; `PULSE_NULL_ALLOW_ROOT=1` overrides for CI.
 
 ## Configuration
 

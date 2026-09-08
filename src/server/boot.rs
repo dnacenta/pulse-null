@@ -29,7 +29,7 @@ pub struct BootedEntity {
 pub async fn boot_entity(
     config: Config,
     root_dir: PathBuf,
-    port_override: u16,
+    fallback_port: u16,
 ) -> Result<BootedEntity, Box<dyn std::error::Error>> {
     super::ensure_infrastructure(&root_dir);
 
@@ -137,12 +137,21 @@ pub async fn boot_entity(
     // Build router (plugin_routes collected before AppState construction)
     let app = super::build_router(Arc::clone(&state), plugin_routes);
 
-    // Bind to the overridden port
-    let addr = format!("127.0.0.1:{}", port_override);
+    // The entity's own host:port when the port is free; the registry's
+    // fallback otherwise, said out loud (PN-104).
+    let entity_name = config.entity.name.clone();
+    let (port, fallback_note) = choose_port(
+        config.server.port,
+        fallback_port,
+        crate::registry::port_available,
+    );
+    if let Some(note) = fallback_note {
+        tracing::warn!("Entity \"{}\": {}", entity_name, note);
+    }
+    let addr = format!("{}:{}", config.server.host, port);
     let listener = tokio::net::TcpListener::bind(&addr).await?;
     let actual_port = listener.local_addr()?.port();
 
-    let entity_name = config.entity.name.clone();
     tracing::info!("Entity \"{}\" listening on :{}", entity_name, actual_port);
 
     // Spawn server as background task (non-blocking)
@@ -159,4 +168,45 @@ pub async fn boot_entity(
         actual_port,
         persist_coordinator: Arc::clone(&state.persist_coordinator),
     })
+}
+
+/// Pick the port an entity binds in multi-entity mode: its configured port
+/// when `available`, else `fallback` with a note naming both.
+fn choose_port(
+    configured: u16,
+    fallback: u16,
+    available: impl Fn(u16) -> bool,
+) -> (u16, Option<String>) {
+    if configured == fallback || available(configured) {
+        return (configured, None);
+    }
+    (
+        fallback,
+        Some(format!(
+            "configured port {configured} is already in use — listening on {fallback} instead"
+        )),
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::choose_port;
+
+    #[test]
+    fn choose_port_prefers_config_when_free() {
+        assert_eq!(choose_port(3300, 3201, |_| true), (3300, None));
+    }
+
+    #[test]
+    fn choose_port_falls_back_when_bound() {
+        let (port, note) = choose_port(3200, 3201, |p| p != 3200);
+        assert_eq!(port, 3201);
+        let note = note.expect("a fallback is announced");
+        assert!(note.contains("3200") && note.contains("3201"), "{note}");
+    }
+
+    #[test]
+    fn choose_port_skips_the_probe_when_config_is_the_fallback() {
+        assert_eq!(choose_port(3201, 3201, |_| false), (3201, None));
+    }
 }

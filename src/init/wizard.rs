@@ -323,14 +323,21 @@ pub async fn run(target_dir: &Path) -> Result<(), Box<dyn std::error::Error>> {
         style(&entity_name).cyan().bold()
     );
 
-    // Show the correct startup command based on context
-    let run_hint = if let Some(project_root) = target_dir.parent() {
-        // target_dir is entities/ — user should run from its parent
-        format!("cd {} && pulse-null up", project_root.display())
+    // Show the correct startup commands: the entity on its own, or all of
+    // them from the entity home (legacy `entities/` trees run from the parent).
+    let entity_home = if target_dir.file_name().is_some_and(|n| n == "entities") {
+        target_dir.parent().unwrap_or(target_dir)
     } else {
-        "pulse-null up".to_string()
+        target_dir
     };
-    println!("  Run {} to start.", style(&run_hint).green());
+    println!(
+        "  Run {} to start it on its own.",
+        style(format!("cd {} && pulse-null up", entity_dir.display())).green()
+    );
+    println!(
+        "  Run {} to start every entity here.",
+        style(format!("cd {} && pulse-null up", entity_home.display())).green()
+    );
     println!(
         "  Manage plugins with: {}",
         style("pulse-null plugin add|remove <name>").green()

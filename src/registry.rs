@@ -129,6 +129,6 @@ impl EntityRegistry {
 }
 
 /// Check if a TCP port is available by attempting to bind.
-fn port_available(port: u16) -> bool {
+pub(crate) fn port_available(port: u16) -> bool {
     std::net::TcpListener::bind(("127.0.0.1", port)).is_ok()
 }
