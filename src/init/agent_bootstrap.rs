@@ -356,6 +356,7 @@ pub fn ensure_common(entity_root: &Path, recall_provider: &str) -> Vec<Bootstrap
     }
     let memory_dir = entity_root.join("memory");
     let mut items = Vec::new();
+    items.extend(migrate_legacy_instructions(&entity_root));
     let memory = ensure_dir(&memory_dir);
     let memory_ok = matches!(memory.status, ItemStatus::Created | ItemStatus::Exists);
     items.push(memory);
@@ -370,20 +371,60 @@ pub fn ensure_common(entity_root: &Path, recall_provider: &str) -> Vec<Bootstrap
     items
 }
 
+/// Entities created before PN-106 keep their instructions in the file one
+/// vendor's CLI reads. Copy it to the generic `INSTRUCTIONS.md` once, so the
+/// prompt builder and every adapter's pointer file have something to point
+/// at. Nothing is copied when INSTRUCTIONS.md exists or the legacy file is
+/// itself only a pointer.
+fn migrate_legacy_instructions(entity_root: &Path) -> Vec<BootstrapItem> {
+    let generic = entity_root.join("INSTRUCTIONS.md");
+    if generic.exists() {
+        return Vec::new();
+    }
+    let legacy = entity_root.join("CLAUDE.md"); // vendor-ok: pre-PN-106 instruction file
+    let Ok(Some(text)) = read_small_file(&legacy) else {
+        return Vec::new();
+    };
+    if text.trim().is_empty() || text.contains("@INSTRUCTIONS.md") {
+        return Vec::new();
+    }
+    vec![ensure_config(&generic, &text, entity_root)]
+}
+
 /// Report the state of the agent-CLI-independent wiring without changing
 /// anything.
-pub fn verify_common(entity_root: &Path) -> Vec<BootstrapItem> {
+pub fn verify_common(entity_root: &Path, recall_provider: &str) -> Vec<BootstrapItem> {
     let entity_root = entity_root
         .canonicalize()
         .unwrap_or_else(|_| entity_root.to_path_buf());
     let mut items = Vec::new();
     let toml_path = entity_root.join("memory/.recall-echo.toml");
-    items.push(BootstrapItem {
-        status: if toml_path.exists() {
-            ItemStatus::Exists
-        } else {
-            ItemStatus::Missing
+    // Present, and naming the entity's own provider: `ensure_config` never
+    // rewrites the file, so an entity whose adapter changed would otherwise
+    // keep recall-echo extracting with the previous CLI.
+    let status = match read_small_file(&toml_path) {
+        Ok(Some(text)) => match toml::from_str::<toml::Value>(&text) {
+            Ok(doc) => {
+                let configured = doc
+                    .get("llm")
+                    .and_then(|l| l.get("provider"))
+                    .and_then(|p| p.as_str());
+                if configured == Some(recall_provider) {
+                    ItemStatus::Exists
+                } else {
+                    ItemStatus::Wrong(format!(
+                        "[llm] provider is {} but this entity's agent is {recall_provider}",
+                        configured.unwrap_or("unset")
+                    ))
+                }
+            }
+            Err(e) => ItemStatus::Wrong(format!("not valid TOML: {e}")),
         },
+        Ok(None) => ItemStatus::Missing,
+        Err(e) => ItemStatus::Wrong(e),
+    };
+    items.push(BootstrapItem {
+        status,
         path: toml_path,
         kind: ItemKind::ConfigFile,
     });

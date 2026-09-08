@@ -26,7 +26,7 @@ use serde_json::Value;
 
 use crate::cli_provider::adapter::{
     AgentIntegration, CliAdapter, ExitClass, Invocation, OutputMode, PromptDelivery, Reply,
-    StreamLine, SystemPromptDelivery,
+    StreamLine, SystemPromptDelivery, Usage,
 };
 use crate::init::agent_bootstrap::{ensure_config, BootstrapItem, ItemKind, ItemStatus};
 
@@ -40,6 +40,11 @@ impl CliAdapter for Codex {
 
     fn default_bin(&self) -> &'static str {
         "codex"
+    }
+
+    /// Its own variables only; auth lives under `CODEX_HOME`.
+    fn env_keep_prefixes(&self) -> &'static [&'static str] {
+        &["CODEX_", "OPENAI_"]
     }
 
     /// Codex picks its own default model when `-m` is omitted; we do not
@@ -77,16 +82,28 @@ impl CliAdapter for Codex {
         args.push("-C".into());
         args.push(inv.entity_root.as_os_str().to_os_string());
 
-        if inv.restricted {
-            // Isolation: the agent may still read its own memory, but nothing
-            // it produces can touch the filesystem or the network.
-            args.push("--sandbox".into());
-            args.push("read-only".into());
-        } else {
-            // pulse-null is the outer sandbox; codex's own approval prompts
-            // would block a headless run forever.
-            args.push("--dangerously-bypass-approvals-and-sandbox".into());
+        // Codex's own sandbox is the containment: writes stay inside the
+        // entity (`-C`), network stays on so research tasks work. Isolation
+        // drops to read-only and offline. `--dangerously-bypass-approvals-
+        // and-sandbox` would rely on an outer sandbox pulse-null does not
+        // provide; `codex exec` has no approval prompts to hang on.
+        args.push("--sandbox".into());
+        args.push(
+            if inv.restricted {
+                "read-only"
+            } else {
+                "workspace-write"
+            }
+            .into(),
+        );
+        if !inv.restricted {
+            args.push("-c".into());
+            args.push("sandbox_workspace_write.network_access=true".into());
         }
+        // The entity is the whole configuration; the user's ~/.codex config
+        // and execpolicy rules must not shape it from outside its root.
+        args.push("--ignore-user-config".into());
+        args.push("--ignore-rules".into());
 
         // Escape codes in a captured reply are noise, and worse in Discord.
         args.push("--color".into());
@@ -116,6 +133,19 @@ impl CliAdapter for Codex {
                     is_error: false,
                     usage: None,
                 },
+                None => StreamLine::Other,
+            },
+            Some("turn.completed") => match value.get("usage") {
+                Some(usage) => StreamLine::Usage(Usage {
+                    input_tokens: usage
+                        .get("input_tokens")
+                        .and_then(Value::as_u64)
+                        .map(|v| v as u32),
+                    output_tokens: usage
+                        .get("output_tokens")
+                        .and_then(Value::as_u64)
+                        .map(|v| v as u32),
+                }),
                 None => StreamLine::Other,
             },
             Some("error") => StreamLine::Result {
@@ -156,6 +186,9 @@ impl AgentIntegration for Codex {
     }
 
     fn ensure(&self, entity_root: &Path, _recall_bin: &str) -> Vec<BootstrapItem> {
+        let entity_root = &entity_root
+            .canonicalize()
+            .unwrap_or_else(|_| entity_root.to_path_buf());
         let path = entity_root.join(self.instruction_file());
         vec![ensure_config(
             &path,
@@ -228,6 +261,7 @@ mod tests {
             restricted: false,
             streaming: false,
             entity_root: root,
+            reasoning_effort: None,
         }
     }
 
@@ -264,22 +298,23 @@ mod tests {
     }
 
     #[test]
-    fn restricted_swaps_the_bypass_for_a_read_only_sandbox() {
+    fn sandbox_is_workspace_write_open_and_read_only_when_isolated() {
         let root = PathBuf::from("/home/pulse/pulse-null/echo");
 
         let open = strings(&Codex.invoke_args(&invocation(&root)));
+        assert_eq!(value_of(&open, "--sandbox"), Some("workspace-write"));
         assert!(open
             .iter()
-            .any(|arg| arg == "--dangerously-bypass-approvals-and-sandbox"));
-        assert!(!open.iter().any(|arg| arg == "--sandbox"));
+            .any(|a| a == "sandbox_workspace_write.network_access=true"));
+        assert!(open.iter().any(|a| a == "--ignore-user-config"));
+        assert!(open.iter().any(|a| a == "--ignore-rules"));
+        assert!(!open.iter().any(|arg| arg.contains("dangerously-bypass")));
 
         let mut inv = invocation(&root);
         inv.restricted = true;
         let isolated = strings(&Codex.invoke_args(&inv));
         assert_eq!(value_of(&isolated, "--sandbox"), Some("read-only"));
-        assert!(!isolated
-            .iter()
-            .any(|arg| arg == "--dangerously-bypass-approvals-and-sandbox"));
+        assert!(!isolated.iter().any(|a| a.contains("network_access")));
     }
 
     #[test]
@@ -296,9 +331,19 @@ mod tests {
     }
 
     #[test]
-    fn turn_completed_carries_usage_we_do_not_capture_yet() {
-        let line = r#"{"type":"turn.completed","usage":{"input_tokens":1200,"output_tokens":48}}"#;
-        assert_eq!(Codex.parse_stream_line(line), StreamLine::Other);
+    fn turn_completed_carries_usage() {
+        let line = r#"{"type":"turn.completed","usage":{"input_tokens":11,"output_tokens":2}}"#;
+        assert_eq!(
+            Codex.parse_stream_line(line),
+            StreamLine::Usage(Usage {
+                input_tokens: Some(11),
+                output_tokens: Some(2)
+            })
+        );
+        assert_eq!(
+            Codex.parse_stream_line(r#"{"type":"turn.completed"}"#),
+            StreamLine::Other
+        );
     }
 
     #[test]

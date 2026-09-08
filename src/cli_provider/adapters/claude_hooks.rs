@@ -295,6 +295,15 @@ pub(super) fn ensure_files(entity_root: &Path, recall_bin: &str) -> Vec<Bootstra
     let entity_root = entity_root
         .canonicalize()
         .unwrap_or_else(|_| entity_root.to_path_buf());
+    if entity_root.to_str().is_none() {
+        // The hook commands embed the root; a lossy conversion would persist
+        // a hook pointing at a path that does not exist. Say so instead.
+        return vec![BootstrapItem {
+            path: entity_root,
+            kind: ItemKind::Directory,
+            status: ItemStatus::Skipped("entity root is not valid UTF-8".into()),
+        }];
+    }
     let claude_dir = entity_root.join(".claude");
     let ok = |item: &BootstrapItem| matches!(item.status, ItemStatus::Created | ItemStatus::Exists);
 
@@ -474,7 +483,7 @@ mod tests {
     }
 
     fn verify_all(root: &Path) -> Vec<BootstrapItem> {
-        let mut items = verify_common(root);
+        let mut items = verify_common(root, "claude-code");
         items.extend(verify_files(root));
         items
     }

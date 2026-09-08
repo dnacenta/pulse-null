@@ -49,6 +49,12 @@ impl CliAdapter for Claude {
         &["CLAUDECODE"]
     }
 
+    /// Its login token (`CLAUDE_CODE_OAUTH_TOKEN`), config dir override and
+    /// API key are the only vendor variables it may see.
+    fn env_keep_prefixes(&self) -> &'static [&'static str] {
+        &["CLAUDE_", "ANTHROPIC_"]
+    }
+
     /// `-p -` reads the prompt from stdin, which sidesteps ARG_MAX.
     fn prompt_delivery(&self) -> PromptDelivery {
         PromptDelivery::Stdin
@@ -66,6 +72,12 @@ impl CliAdapter for Claude {
         } else {
             OutputMode::SingleJson
         }
+    }
+
+    /// The deltas are the answer; the terminal record is the fallback when
+    /// partial messages were unavailable (pre-PN-106 behaviour, kept).
+    fn prefers_terminal_text(&self) -> bool {
+        false
     }
 
     /// Run the CLI with `--system-prompt-file` pointed at a path that cannot
@@ -253,6 +265,7 @@ mod tests {
             restricted: false,
             streaming: false,
             entity_root: root,
+            reasoning_effort: None,
         }
     }
 

@@ -88,12 +88,13 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
         if !stale.is_empty() {
             let settings = integration
                 .user_hooks_location(&home)
-                .unwrap_or_else(|| home.join("settings"));
+                .map(|p| p.display().to_string())
+                .unwrap_or_else(|| "the user-level hook file".to_string());
             println!();
             println!(
                 "  {} {} has recall-echo hooks without an entity root.",
                 style("⚠").yellow(),
-                settings.display()
+                settings
             );
             println!("    They fire for every entity this user runs and resolve to the wrong one.");
             println!("    The entity now carries its own hooks — remove these by hand:");

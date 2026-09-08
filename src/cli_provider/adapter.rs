@@ -58,7 +58,9 @@ pub enum StreamLine {
         is_error: bool,
         usage: Option<Usage>,
     },
-    /// Structure we do not consume (tool events, init, usage-only records).
+    /// A usage-only record; the runner attaches it to the reply.
+    Usage(Usage),
+    /// Structure we do not consume (tool events, init).
     Other,
 }
 
@@ -118,6 +120,8 @@ pub struct Invocation<'a> {
     /// Token-level streaming was requested.
     pub streaming: bool,
     pub entity_root: &'a Path,
+    /// `[llm] reasoning_effort`, for CLIs that take one.
+    pub reasoning_effort: Option<&'a str>,
 }
 
 /// One agent CLI, as seen by the generic runner.
@@ -139,6 +143,14 @@ pub trait CliAdapter: Send + Sync {
         &[]
     }
 
+    /// Prefixes of environment variables this CLI needs beyond the runner's
+    /// base allowlist — its own login/config variables. Everything else the
+    /// daemon was started with is withheld, so one vendor's credential never
+    /// reaches another vendor's binary.
+    fn env_keep_prefixes(&self) -> &'static [&'static str] {
+        &[]
+    }
+
     /// Environment variables to set on the child.
     fn env_set(&self) -> Vec<(String, String)> {
         Vec::new()
@@ -147,6 +159,15 @@ pub trait CliAdapter: Send + Sync {
     fn prompt_delivery(&self) -> PromptDelivery;
     fn system_prompt_delivery(&self) -> SystemPromptDelivery;
     fn output_mode(&self, streaming: bool) -> OutputMode;
+
+    /// When an NDJSON stream carries both text deltas and a terminal
+    /// `Result`, which is the reply? `true` means the terminal record: for a
+    /// CLI whose deltas span every assistant turn (pre-tool narration
+    /// included) only the final record is the answer. `false` prefers the
+    /// assembled deltas and uses the record as a fallback.
+    fn prefers_terminal_text(&self) -> bool {
+        true
+    }
 
     /// A one-off capability probe, run once per binary path and cached.
     /// `absent` is a path that does not exist, for probes that need to name

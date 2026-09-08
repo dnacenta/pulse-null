@@ -172,6 +172,7 @@ pub fn build_system_prompt_budgeted(
 
     // --- Tier 0 (Essential): the instruction file ---
     if let Some(path) = instruction_file(root_dir, config) {
+        let label = instruction_label(&path);
         let content = std::fs::read_to_string(&path)?;
         let capped = if budget_enabled && budget_cfg.instructions_cap > 0 {
             truncate_to_token_cap(&content, budget_cfg.instructions_cap)
@@ -180,7 +181,7 @@ pub fn build_system_prompt_budgeted(
         };
         let tokens = estimate_tokens(&capped);
         components.push(PromptComponent {
-            name: "INSTRUCTIONS.md",
+            name: label,
             content: capped,
             tokens,
             tier: PromptTier::Essential,
@@ -762,10 +763,12 @@ fn compress_to_one_liner(name: &str, content: &str) -> String {
 }
 
 /// The entity's instruction file: the generic `INSTRUCTIONS.md`, else the
-/// adapter's own file name (the CLI reads that one from cwd anyway), else
-/// the pre-PN-106 name for entities created before the split.
+/// pre-PN-106 file for entities created before the split, else the
+/// adapter's own file — but never a *pointer* (a file whose whole content
+/// is a reference to INSTRUCTIONS.md), which would replace the entity's
+/// identity with a one-line stub.
 fn instruction_file(root_dir: &Path, config: &Config) -> Option<std::path::PathBuf> {
-    let mut candidates = vec!["INSTRUCTIONS.md".to_string()];
+    let mut candidates = vec!["INSTRUCTIONS.md".to_string(), "CLAUDE.md".to_string()]; // vendor-ok: pre-PN-106 entities
     if let Some(adapter) = config
         .llm
         .cli_adapter()
@@ -773,11 +776,41 @@ fn instruction_file(root_dir: &Path, config: &Config) -> Option<std::path::PathB
     {
         candidates.push(adapter.integration().instruction_file().to_string());
     }
-    candidates.push("CLAUDE.md".to_string()); // vendor-ok: pre-PN-106 entities
     candidates
         .into_iter()
         .map(|name| root_dir.join(name))
-        .find(|p| p.is_file())
+        .filter(|p| p.is_file())
+        .find(|p| !is_pointer_file(p))
+}
+
+/// A file that only points at INSTRUCTIONS.md (what the adapters write as
+/// their own instruction file) carries no instructions of its own.
+fn is_pointer_file(path: &Path) -> bool {
+    std::fs::read_to_string(path)
+        .map(|text| {
+            let body: Vec<&str> = text
+                .lines()
+                .map(str::trim)
+                .filter(|l| !l.is_empty() && !l.starts_with('#'))
+                .collect();
+            // A pointer names INSTRUCTIONS.md in its first line of body text
+            // and says little else; a real instruction file has substance.
+            body.first()
+                .is_some_and(|first| first.contains("INSTRUCTIONS.md"))
+                && body.len() <= 3
+        })
+        .unwrap_or(false)
+}
+
+/// Static label for the instruction file that was actually read, so budget
+/// logs name the right file.
+fn instruction_label(path: &Path) -> &'static str {
+    match path.file_name().and_then(|n| n.to_str()) {
+        Some("INSTRUCTIONS.md") => "INSTRUCTIONS.md",
+        Some("AGENTS.md") => "AGENTS.md",
+        Some("CLAUDE.md") => "CLAUDE.md", // vendor-ok: pre-PN-106 entities
+        _ => "instructions",
+    }
 }
 
 /// Does the entity's agent CLI pull AWARENESS.md in by itself (through an
@@ -817,6 +850,7 @@ pub fn build_task_system_prompt_budgeted(
 
     // --- Tier 0 (Essential): the instruction file — behavioral instructions ---
     if let Some(path) = instruction_file(root_dir, config) {
+        let label = instruction_label(&path);
         let content = std::fs::read_to_string(&path)?;
         let capped = if budget_enabled && budget_cfg.instructions_cap > 0 {
             truncate_to_token_cap(&content, budget_cfg.instructions_cap)
@@ -825,7 +859,7 @@ pub fn build_task_system_prompt_budgeted(
         };
         let tokens = estimate_tokens(&capped);
         components.push(PromptComponent {
-            name: "INSTRUCTIONS.md",
+            name: label,
             content: capped,
             tokens,
             tier: PromptTier::Essential,

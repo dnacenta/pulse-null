@@ -23,7 +23,8 @@ fn cli_provider_for(config: &Config, entity_root: &Path) -> Result<CliProvider, 
         config.llm.cli_bin.clone(),
         config.llm.model.clone(),
         entity_root.to_path_buf(),
-    );
+    )
+    .with_reasoning_effort(config.llm.reasoning_effort.clone());
     tracing::debug!(
         adapter = provider.adapter_name(),
         model = %config.llm.model,
@@ -181,12 +182,12 @@ mod tests {
     }
 
     #[test]
-    fn the_claude_code_provider_is_anchored_to_the_given_root() {
+    fn the_cli_provider_is_built_for_the_given_root() {
         let root = tempfile::tempdir().unwrap();
         let provider = create_provider(&config(), root.path()).unwrap();
         assert_eq!(provider.name(), "cli");
-        // The anchoring itself is asserted on `ClaudeCodeProvider` directly
-        // (`base_command_sets_cwd_and_env`); here we only need the factory to
-        // accept an explicit root instead of reading the process cwd.
+        // The anchoring itself is asserted in `cli_provider::tests`
+        // (`entity_command_sets_cwd_env_and_scrubs`); here we only need the
+        // factory to accept an explicit root instead of reading the process cwd.
     }
 }

@@ -159,7 +159,10 @@ pub async fn start(config: Config) -> Result<(), Box<dyn std::error::Error>> {
         .cli_adapter()
         .and_then(crate::cli_provider::adapters::by_name)
     {
-        let mut items = crate::init::agent_bootstrap::verify_common(&root_dir);
+        let mut items = crate::init::agent_bootstrap::verify_common(
+            &root_dir,
+            adapter.integration().recall_echo_provider(),
+        );
         items.extend(adapter.integration().verify(&root_dir));
         for item in &items {
             match &item.status {

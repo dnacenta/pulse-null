@@ -146,7 +146,7 @@ impl LlmConfig {
     pub fn cli_adapter(&self) -> Option<&str> {
         match self.provider.as_str() {
             "cli" => self.adapter.as_deref(),
-            "claude-code" => Some("claude"), // vendor-ok: pre-PN-106 alias
+            "claude-code" => self.adapter.as_deref().or(Some("claude")), // vendor-ok: pre-PN-106 alias
             _ => None,
         }
     }
@@ -1332,5 +1332,75 @@ mod fallback_tests {
         assert!(cfg.fallback_on_refusal);
         assert_eq!(cfg.fallback_model, None);
         assert_eq!(cfg.fallback_target(), None);
+    }
+    // --- PN-106: provider vocabulary and its deprecated spellings ---
+
+    fn llm_cfg(provider: &str, adapter: Option<&str>) -> LlmConfig {
+        LlmConfig {
+            provider: provider.into(),
+            api_key: None,
+            model: "m".into(),
+            max_tokens: 100,
+            base_url: None,
+            adapter: adapter.map(str::to_string),
+            cli_bin: None,
+            reasoning_effort: None,
+            context_budget: 0,
+            fallback_model: None,
+            fallback_on_refusal: true,
+        }
+    }
+
+    #[test]
+    fn normalize_folds_deprecated_provider_spellings() {
+        let mut legacy_cli = llm_cfg("claude-code", None); // vendor-ok: alias under test
+        let notices = legacy_cli.normalize();
+        assert_eq!(legacy_cli.provider, "cli");
+        assert_eq!(legacy_cli.adapter.as_deref(), Some("claude")); // vendor-ok: what the alias meant
+        assert_eq!(notices.len(), 1);
+        assert!(notices[0].contains("deprecated"));
+
+        let mut legacy_http = llm_cfg("claude", None); // vendor-ok: alias under test
+        assert_eq!(legacy_http.normalize().len(), 1);
+        assert_eq!(legacy_http.provider, "anthropic");
+
+        let mut current = llm_cfg("cli", Some("grok")); // vendor-ok: adapter under test
+        assert!(current.normalize().is_empty());
+        assert_eq!(current.cli_adapter(), Some("grok")); // vendor-ok: adapter under test
+        assert_eq!(llm_cfg("ollama", None).cli_adapter(), None);
+        assert_eq!(llm_cfg("cli", None).cli_adapter(), None);
+    }
+
+    #[test]
+    fn config_aliases_load_from_toml() {
+        let llm: LlmConfig = toml::from_str(
+            "provider = \"cli\"\nadapter = \"codex\"\nmodel = \"m\"\nclaude_bin = \"/opt/bin/codex\"\n", // vendor-ok: aliases under test
+        )
+        .unwrap();
+        assert_eq!(llm.cli_bin.as_deref(), Some("/opt/bin/codex")); // vendor-ok: alias under test
+        let budget: SystemPromptBudgetConfig = toml::from_str("claude_md_cap = 1234\n").unwrap(); // vendor-ok: alias under test
+        assert_eq!(budget.instructions_cap, 1234);
+        // An explicit adapter survives the legacy provider spelling, folded or not.
+        let mut legacy_grok = llm_cfg("claude-code", Some("grok")); // vendor-ok: alias under test
+        assert_eq!(legacy_grok.cli_adapter(), Some("grok")); // vendor-ok: adapter under test
+        legacy_grok.normalize();
+        assert_eq!(legacy_grok.cli_adapter(), Some("grok")); // vendor-ok: adapter under test
+    }
+
+    #[test]
+    fn validate_requires_a_known_adapter_for_cli() {
+        let mut config = test_support::minimal_config();
+        config.llm = llm_cfg("cli", None);
+        let err = validate::validate(&config).unwrap_err().to_string();
+        assert!(err.contains("needs an adapter"), "{err}");
+
+        config.llm = llm_cfg("cli", Some("nonesuch"));
+        let err = validate::validate(&config).unwrap_err().to_string();
+        assert!(err.contains("Unknown [llm] adapter"), "{err}");
+
+        config.llm = llm_cfg("cli", Some("grok")); // vendor-ok: adapter under test
+        validate::validate(&config).unwrap();
+        config.llm = llm_cfg("nonesuch", None);
+        assert!(validate::validate(&config).is_err());
     }
 }

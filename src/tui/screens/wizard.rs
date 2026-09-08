@@ -95,10 +95,16 @@ fn provider_choices() -> Vec<ProviderChoice> {
     choices
 }
 
-fn choice(idx: usize) -> ProviderChoice {
-    let mut all = provider_choices();
-    let idx = idx.min(all.len() - 1);
-    all.swap_remove(idx)
+/// The choices, built once: the registry is static and the wizard consults
+/// this on every keypress and frame.
+fn choices() -> &'static [ProviderChoice] {
+    static CHOICES: std::sync::OnceLock<Vec<ProviderChoice>> = std::sync::OnceLock::new();
+    CHOICES.get_or_init(provider_choices)
+}
+
+fn choice(idx: usize) -> &'static ProviderChoice {
+    let all = choices();
+    &all[idx.min(all.len().saturating_sub(1))]
 }
 
 // ─── Wizard State ───
@@ -677,7 +683,7 @@ impl Screen for WizardScreen {
                     KeyCode::Up => {
                         self.provider_idx = self.provider_idx.saturating_sub(1);
                     }
-                    KeyCode::Down if self.provider_idx + 1 < provider_choices().len() => {
+                    KeyCode::Down if self.provider_idx + 1 < choices().len() => {
                         self.provider_idx += 1;
                     }
                     _ => {}
@@ -829,7 +835,7 @@ impl WizardScreen {
             rows[0],
         );
 
-        let providers: Vec<String> = provider_choices().into_iter().map(|c| c.label).collect();
+        let providers: Vec<&str> = choices().iter().map(|c| c.label.as_str()).collect();
 
         let lines: Vec<Line> = providers
             .iter()

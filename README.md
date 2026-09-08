@@ -294,7 +294,7 @@ Entities under one unix user share that user's rights: each runs its agent CLI w
 | `llm` | `model` | set at init | Model name, passed through to the provider — the wizard suggests a per-provider default |
 | `llm` | `max_tokens` | `4096` | Max response tokens |
 | `llm` | `base_url` | `http://localhost:11434` | API base URL (used by `ollama`) |
-| `llm` | `cli_bin` | the adapter's binary | Path to the agent CLI binary for the `cli` provider (`PULSE_CLI_BIN` env overrides) |
+| `llm` | `cli_bin` | the adapter's binary | Path to the agent CLI binary for the `cli` provider; when unset, `PULSE_CLI_BIN` fills in before the adapter's default |
 | `llm` | `reasoning_effort` | `low` | Reasoning-effort hint for CLIs that take one |
 | `llm` | `context_budget` | `150000` | Estimated-token ceiling before conversation compaction |
 | `llm` | `fallback_model` | — | Model retried on a usage-policy refusal (empty disables) |

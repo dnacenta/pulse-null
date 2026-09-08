@@ -7,8 +7,8 @@
 # adapters/<vendor>.rs) or in a provider-specific HTTP adapter. This lint
 # fails the gate when a vendor name leaks into generic source.
 #
-# Scope: production lines only — comments (// and ///) and everything after
-# the first `#[cfg(test)]` in a file are skipped. A line that legitimately
+# Scope: production lines only — comments (// and ///) and everything from
+# an inline `#[cfg(test)] mod … {` to the end of the file are skipped. A line that legitimately
 # names a vendor in generic code (a deprecated alias being folded, a vendor
 # subsystem's on-disk path) carries a `vendor-ok:` marker with the reason,
 # on the line itself or on the line just above or below it (rustfmt moves
@@ -32,7 +32,11 @@ while IFS= read -r file; do
   [[ $skip -eq 1 ]] && continue
   awk -v f="$file" -v pat="$pattern" '
     NR == FNR { if ($0 ~ /vendor-ok:/) { ok[FNR-1]=1; ok[FNR]=1; ok[FNR+1]=1 } next }
-    /#\[cfg\(test\)\]/ { intest=1 }
+    # Only an inline test module ends the production part of a file:
+    # `#[cfg(test)]` immediately followed by `mod <name> {`. A test-gated
+    # helper or an external `mod tests;` does not.
+    pending { pending=0; if ($0 ~ /^mod [a-z_]+ \{/) intest=1 }
+    /^#\[cfg\(test\)\]$/ { pending=1 }
     intest { next }
     /^[[:space:]]*\/\// { next }
     tolower($0) ~ pat && !(FNR in ok) { printf "%s:%d: %s\n", f, FNR, $0; bad=1 }

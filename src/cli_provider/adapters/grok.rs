@@ -32,8 +32,10 @@ use crate::cli_provider::adapter::{
 };
 use crate::init::agent_bootstrap::{ensure_config, BootstrapItem, ItemKind, ItemStatus};
 
-/// Tools an isolated entity must not reach. Grok accepts Claude's
-/// `--disallowedTools` spelling as a compat alias for its native `--deny`.
+/// Tools an isolated entity must not reach, as grok's own comma-separated
+/// `--disallowed-tools <TOOLS>` list. (`--disallowed-tools` is grok's compat
+/// alias for a single `--deny <RULE>`, so a list handed to it matched
+/// nothing — the shim had that bug in production.)
 const RESTRICTED_TOOLS: &str = "Write,Edit,MultiEdit,NotebookEdit,Bash,WebFetch,WebSearch,Task";
 
 /// Hidden thinking is billed and unbounded: `high` measured at ~20s per chat
@@ -49,13 +51,21 @@ const REASONING_EFFORT_ENV: &str = "GROK_REASONING_EFFORT";
 pub struct Grok;
 
 impl Grok {
-    /// The effort level for this invocation, from the environment or the
-    /// conservative default.
-    fn reasoning_effort() -> String {
-        std::env::var(REASONING_EFFORT_ENV)
-            .ok()
-            .map(|value| value.trim().to_string())
-            .filter(|value| !value.is_empty())
+    /// The effort level for this invocation: `[llm] reasoning_effort` first,
+    /// then the `GROK_REASONING_EFFORT` environment override, then `low` —
+    /// measured 2026-09-02: `high` cost ~20s of hidden thinking per chat
+    /// turn on the live entity, `low` 4.6s, same one-word answer.
+    fn reasoning_effort(configured: Option<&str>) -> String {
+        configured
+            .map(str::trim)
+            .filter(|v| !v.is_empty())
+            .map(str::to_string)
+            .or_else(|| {
+                std::env::var(REASONING_EFFORT_ENV)
+                    .ok()
+                    .map(|value| value.trim().to_string())
+                    .filter(|value| !value.is_empty())
+            })
             .unwrap_or_else(|| DEFAULT_REASONING_EFFORT.to_string())
     }
 }
@@ -80,6 +90,12 @@ impl CliAdapter for Grok {
         vec![("RUST_LOG".to_string(), "warn".to_string())]
     }
 
+    /// Its own variables only (`GROK_*`, `XAI_*`). Login state lives in
+    /// `~/.grok`, not in the environment.
+    fn env_keep_prefixes(&self) -> &'static [&'static str] {
+        &["GROK_", "XAI_"]
+    }
+
     fn prompt_delivery(&self) -> PromptDelivery {
         PromptDelivery::File
     }
@@ -87,6 +103,12 @@ impl CliAdapter for Grok {
     /// Inline on argv. Linux caps a single argument at 128 KiB; the runner
     /// refuses anything larger rather than silently truncating the entity's
     /// identity.
+    /// Grok has no file channel for the system prompt, so it rides on argv
+    /// (`--system-prompt-override`). That makes the entity's identity and
+    /// memory readable in `/proc/<pid>/cmdline` by any local account while
+    /// a turn runs — an accepted trade-off of this CLI, to be compensated at
+    /// the host (`ProtectProc=invisible`, `hidepid`), not something another
+    /// adapter should copy.
     fn system_prompt_delivery(&self) -> SystemPromptDelivery {
         SystemPromptDelivery::Argv { max_bytes: 120_000 }
     }
@@ -117,14 +139,14 @@ impl CliAdapter for Grok {
         // cross-session memory would be a second, unmanaged store.
         args.push("--no-memory".into());
         args.push("--reasoning-effort".into());
-        args.push(Self::reasoning_effort().into());
+        args.push(Self::reasoning_effort(inv.reasoning_effort).into());
         args.push("--dangerously-skip-permissions".into());
         // Grok refuses to run project hooks in an untrusted directory, and the
         // entity directory is never in its trust store on a fresh host.
         args.push("--trust".into());
 
         if inv.restricted {
-            args.push("--disallowedTools".into());
+            args.push("--disallowed-tools".into());
             args.push(RESTRICTED_TOOLS.into());
         }
         if inv.streaming {
@@ -193,6 +215,9 @@ impl AgentIntegration for Grok {
     }
 
     fn ensure(&self, entity_root: &Path, _recall_bin: &str) -> Vec<BootstrapItem> {
+        let entity_root = &entity_root
+            .canonicalize()
+            .unwrap_or_else(|_| entity_root.to_path_buf());
         let path = entity_root.join(self.instruction_file());
         vec![ensure_config(
             &path,
@@ -208,11 +233,42 @@ impl AgentIntegration for Grok {
         } else {
             ItemStatus::Missing
         };
-        vec![BootstrapItem {
+        let mut items = vec![BootstrapItem {
             path,
             kind: ItemKind::ConfigFile,
             status,
-        }]
+        }];
+        // Grok auto-loads other harnesses' config — rules, hooks, MCPs from
+        // the user's home — unless `[compat.*]` is off in ~/.grok/config.toml.
+        // With it on, a hook in the user's home runs on every turn of every
+        // entity. Report drift; the file is the user's, never edited here.
+        if let Some(home) = std::env::var_os("HOME").map(std::path::PathBuf::from) {
+            let config = home.join(".grok/config.toml");
+            if !compat_disabled(&config) {
+                items.push(BootstrapItem {
+                    path: config,
+                    kind: ItemKind::ConfigFile,
+                    status: ItemStatus::Wrong(
+                        "set every key under [compat.claude], [compat.cursor] and [compat.codex] to false so foreign harness hooks and rules stay out of entity turns".into(),
+                    ),
+                });
+            }
+        }
+        items
+    }
+
+    /// Grok honours the same user-level hook file the claude adapter warns
+    /// about, so the warning applies here too.
+    fn user_hooks_location(&self, home: &Path) -> Option<std::path::PathBuf> {
+        super::claude::Claude
+            .integration()
+            .user_hooks_location(home)
+    }
+
+    fn user_hooks_missing_root(&self, home: &Path) -> Vec<String> {
+        super::claude::Claude
+            .integration()
+            .user_hooks_missing_root(home)
     }
 }
 
@@ -259,6 +315,30 @@ fn token_count(usage: &Value, field: &str) -> Option<u32> {
 /// True when any line of stdout is a JSON object tagged as an error. Grok
 /// emits one such object for a bad model id, whole-document rather than
 /// NDJSON, so both shapes are checked.
+/// Are all foreign-harness compat switches off in grok's user config?
+/// A missing file or missing keys count as "on" — that is grok's default.
+fn compat_disabled(config: &Path) -> bool {
+    let Ok(text) = std::fs::read_to_string(config) else {
+        return false;
+    };
+    let Ok(doc) = toml::from_str::<toml::Value>(&text) else {
+        return false;
+    };
+    let Some(compat) = doc.get("compat").and_then(|c| c.as_table()) else {
+        return false;
+    };
+    ["claude", "cursor", "codex"].iter().all(|harness| {
+        compat
+            .get(*harness)
+            .and_then(|h| h.as_table())
+            .is_some_and(|h| {
+                ["skills", "rules", "agents", "mcps", "hooks", "sessions"]
+                    .iter()
+                    .all(|k| h.get(*k).and_then(|v| v.as_bool()) == Some(false))
+            })
+    })
+}
+
 fn has_error_record(stdout: &str) -> bool {
     fn tagged_error(text: &str) -> bool {
         serde_json::from_str::<Value>(text)
@@ -281,6 +361,7 @@ mod tests {
             restricted: false,
             streaming: false,
             entity_root: root,
+            reasoning_effort: None,
         }
     }
 
@@ -324,6 +405,15 @@ mod tests {
     }
 
     #[test]
+    fn configured_reasoning_effort_wins() {
+        assert_eq!(Grok::reasoning_effort(Some(" high ")), "high");
+        assert_eq!(
+            Grok::reasoning_effort(Some("")),
+            Grok::reasoning_effort(None)
+        );
+    }
+
+    #[test]
     fn reasoning_effort_defaults_to_low() {
         // Read at invoke time, so an operator override in this process's
         // environment is a legitimate reason for the default not to apply.
@@ -342,7 +432,7 @@ mod tests {
         let root = PathBuf::from("/home/pulse/pulse-null/echo");
 
         let plain = strings(&Grok.invoke_args(&invocation(&prompt, &root)));
-        assert!(!plain.iter().any(|arg| arg == "--disallowedTools"));
+        assert!(!plain.iter().any(|arg| arg == "--disallowed-tools"));
         assert!(!plain.iter().any(|arg| arg == "--include-partial-messages"));
 
         let mut inv = invocation(&prompt, &root);
@@ -350,7 +440,7 @@ mod tests {
         inv.streaming = true;
         let guarded = strings(&Grok.invoke_args(&inv));
         assert_eq!(
-            value_of(&guarded, "--disallowedTools"),
+            value_of(&guarded, "--disallowed-tools"),
             Some(RESTRICTED_TOOLS)
         );
         assert!(guarded
@@ -441,6 +531,24 @@ mod tests {
             content,
             "a second ensure must not rewrite the file"
         );
+    }
+
+    #[test]
+    fn compat_switches_are_read_from_grok_config() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = dir.path().join("config.toml");
+        assert!(!compat_disabled(&cfg));
+        let mut text = String::new();
+        for harness in ["claude", "cursor", "codex"] {
+            text.push_str(&format!("[compat.{harness}]\n"));
+            for k in ["skills", "rules", "agents", "mcps", "hooks", "sessions"] {
+                text.push_str(&format!("{k} = false\n"));
+            }
+        }
+        std::fs::write(&cfg, &text).unwrap();
+        assert!(compat_disabled(&cfg));
+        std::fs::write(&cfg, text.replace("hooks = false", "hooks = true")).unwrap();
+        assert!(!compat_disabled(&cfg));
     }
 
     #[test]

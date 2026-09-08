@@ -8,7 +8,11 @@ use pulse_system_types::llm::{LmProvider, Message, MessageContent, MessageSource
 
 use super::adapter::{CliAdapter, Invocation};
 use super::adapters::claude::Claude;
+use super::adapters::codex::Codex;
+use super::adapters::grok::Grok;
 use super::*;
+use crate::streaming::{StreamEvent, StreamingProvider};
+use tokio_stream::StreamExt;
 
 fn user(text: &str) -> Message {
     Message {
@@ -70,7 +74,14 @@ fn entity_command_sets_cwd_env_and_scrubs() {
         envs.get(std::ffi::OsStr::new(RECALL_ECHO_HOME)),
         Some(&Some(root.path().as_os_str()))
     );
-    assert_eq!(envs.get(std::ffi::OsStr::new("CLAUDECODE")), Some(&None));
+    // The child starts from a cleared environment; a vendor variable that
+    // is not this adapter's never appears, and CLAUDECODE is scrubbed even
+    // though it carries this adapter's prefix.
+    assert!(!envs.contains_key(std::ffi::OsStr::new("CLAUDECODE")));
+    assert!(cmd
+        .as_std()
+        .get_envs()
+        .all(|(k, _)| k != "GROK_REASONING_EFFORT"));
 }
 
 #[test]
@@ -198,7 +209,7 @@ fn stage_refuses_an_oversized_argv_system_prompt() {
 // --- NDJSON reduction ---
 
 #[test]
-fn ndjson_last_result_wins_and_deltas_back_it_up() {
+fn ndjson_precedence_follows_the_adapter() {
     let body = concat!(
         r#"{"type":"stream_event","event":{"type":"content_block_delta","delta":{"text":"na"}}}"#,
         "\n",
@@ -207,16 +218,16 @@ fn ndjson_last_result_wins_and_deltas_back_it_up() {
         r#"{"type":"result","result":"final","is_error":false,"usage":{"input_tokens":1,"output_tokens":2}}"#,
         "\n",
     );
-    let reply = reply_from_ndjson(&Claude, body).unwrap();
+    // Grok's deltas span every turn: the last record is the answer.
+    let reply = reply_from_ndjson(&Grok, body).unwrap();
     assert_eq!(reply.text, "final");
     assert_eq!(reply.usage.output_tokens, Some(2));
+    // Claude keeps its pre-PN-106 behaviour: assembled deltas first.
+    assert_eq!(reply_from_ndjson(&Claude, body).unwrap().text, "na");
 
     let deltas_only =
         r#"{"type":"stream_event","event":{"type":"content_block_delta","delta":{"text":"only"}}}"#;
-    assert_eq!(
-        reply_from_ndjson(&Claude, deltas_only).unwrap().text,
-        "only"
-    );
+    assert_eq!(reply_from_ndjson(&Grok, deltas_only).unwrap().text, "only");
 
     let err = r#"{"type":"result","result":"quota","is_error":true}"#;
     assert_eq!(reply_from_ndjson(&Claude, err).unwrap_err(), "quota");
@@ -265,8 +276,12 @@ impl MockCli {
     }
 
     fn provider(&self, model: &str) -> CliProvider {
+        self.provider_for(Box::new(Claude), model)
+    }
+
+    fn provider_for(&self, adapter: Box<dyn CliAdapter>, model: &str) -> CliProvider {
         CliProvider::new(
-            Box::new(Claude),
+            adapter,
             Some(self.bin.display().to_string()),
             model.into(),
             self._dir.path().to_path_buf(),
@@ -343,21 +358,6 @@ async fn unsupported_cli_fails_with_a_named_error() {
     );
 }
 
-#[test]
-fn args_for_is_the_adapter_argv() {
-    let root = tempfile::tempdir().unwrap();
-    let inv = Invocation {
-        model: "m",
-        system_prompt_file: None,
-        system_prompt: "",
-        prompt_file: None,
-        restricted: false,
-        streaming: false,
-        entity_root: root.path(),
-    };
-    assert_eq!(args_for(&Claude, &inv)[0], "-p");
-}
-
 mod timeout_tests {
     use super::super::subprocess_timeout;
 
@@ -367,4 +367,99 @@ mod timeout_tests {
         std::env::remove_var("RECALL_LLM_TIMEOUT_SECS");
         assert_eq!(subprocess_timeout().as_secs(), 900);
     }
+}
+
+// --- streaming precedence and non-default deliveries, end to end ---
+
+/// A CLI whose stream carries narration deltas and two result records; the
+/// grok adapter must answer with the last record, never the deltas.
+#[tokio::test]
+async fn streaming_prefers_the_terminal_record_when_the_adapter_says_so() {
+    let mock = MockCli::new(concat!(
+        "printf '%s\\n' ",
+        "'{\"type\":\"stream_event\",\"event\":{\"type\":\"content_block_delta\",\"delta\":{\"text\":\"I will check\"}}}' ",
+        "'{\"type\":\"result\",\"result\":\"narration\",\"is_error\":false}' ",
+        "'{\"type\":\"result\",\"result\":\"final answer\",\"is_error\":false,\"usage\":{\"input_tokens\":7,\"output_tokens\":3}}'"
+    ));
+    let provider = mock.provider_for(Box::new(Grok), "grok-x");
+    let mut stream = provider.invoke_streaming("sys", &[user("hi")], 10, None);
+    let mut done = None;
+    while let Some(event) = stream.next().await {
+        if let StreamEvent::Done(reply) = event {
+            done = Some(reply);
+        }
+    }
+    let reply = done.expect("stream completes");
+    assert!(
+        matches!(&reply.content[0], pulse_system_types::llm::ContentBlock::Text { text } if text == "final answer"),
+        "{reply:?}"
+    );
+    assert_eq!(reply.output_tokens, Some(3));
+    let argv = mock.argv();
+    assert!(argv.contains(&"--prompt-file".to_string()));
+    assert!(argv.contains(&"--system-prompt-override".to_string()));
+    assert!(!argv.iter().any(|a| a == "-"), "grok never reads stdin");
+    // The buffered path agrees.
+    let out = mock
+        .provider_for(Box::new(Grok), "grok-x")
+        .invoke("sys", &[user("hi")], 10, None)
+        .await
+        .unwrap();
+    assert!(
+        matches!(&out.content[0], pulse_system_types::llm::ContentBlock::Text { text } if text == "final answer")
+    );
+}
+
+/// Codex takes the prompt on stdin with the system prompt prepended and
+/// reports usage on a separate line.
+#[tokio::test]
+async fn codex_gets_a_prepended_stdin_prompt_and_usage_is_folded() {
+    let mock = MockCli::new(concat!(
+        "printf '%s\\n' ",
+        "'{\"type\":\"item.completed\",\"item\":{\"type\":\"agent_message\",\"text\":\"codex says hi\"}}' ",
+        "'{\"type\":\"turn.completed\",\"usage\":{\"input_tokens\":11,\"output_tokens\":2}}'"
+    ));
+    let out = mock
+        .provider_for(Box::new(Codex), "")
+        .invoke("SYSTEM RULES", &[user("hello")], 10, None)
+        .await
+        .unwrap();
+    assert!(
+        matches!(&out.content[0], pulse_system_types::llm::ContentBlock::Text { text } if text == "codex says hi")
+    );
+    assert_eq!(out.input_tokens, Some(11));
+    let prompt = std::fs::read_to_string(&mock.prompt_copy).unwrap();
+    assert!(prompt.starts_with("SYSTEM RULES\n\n"), "{prompt}");
+    assert!(prompt.contains("[User]: hello"));
+    let argv = mock.argv();
+    assert_eq!(argv[0], "exec");
+    assert!(!argv.iter().any(|a| a == "-m"), "empty model omits -m");
+}
+
+/// A policy refusal surfaces as a downcastable `RefusalError`.
+#[tokio::test]
+async fn refusal_is_a_typed_error() {
+    let mock = MockCli::new(
+        "printf '{\"type\":\"result\",\"is_error\":true,\"result\":\"This violates the Usage Policy\"}'; exit 1",
+    );
+    let err = mock
+        .provider("m")
+        .invoke("sys", &[user("x")], 10, None)
+        .await
+        .unwrap_err();
+    assert!(
+        err.downcast_ref::<crate::errors::RefusalError>().is_some(),
+        "{err}"
+    );
+}
+
+#[test]
+fn env_set_reaches_the_child() {
+    let root = tempfile::tempdir().unwrap();
+    let cmd = entity_command("/usr/bin/true", root.path(), &Grok);
+    let envs: std::collections::HashMap<_, _> = cmd.as_std().get_envs().collect();
+    assert_eq!(
+        envs.get(std::ffi::OsStr::new("RUST_LOG")),
+        Some(&Some(std::ffi::OsStr::new("warn")))
+    );
 }

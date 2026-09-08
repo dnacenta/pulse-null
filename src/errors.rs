@@ -128,6 +128,14 @@ pub enum CliError {
         #[source]
         source: std::io::Error,
     },
+    #[error(
+        "{adapter} takes the system prompt on argv and this one is {bytes} bytes, over its {max} byte cap"
+    )]
+    SystemPromptTooLarge {
+        adapter: &'static str,
+        bytes: usize,
+        max: usize,
+    },
     #[error("failed to stage a prompt file at '{path}': {source}")]
     StagedFile {
         path: String,
@@ -145,7 +153,7 @@ pub enum CliError {
 /// It is deliberately distinct from generic provider failures (network,
 /// timeout, empty result), which must never trigger a fallback.
 #[derive(Debug, Error)]
-#[error("model '{model}' refused the turn (Usage Policy): {detail}")]
+#[error("model '{model}' refused the turn (policy refusal): {detail}")]
 pub struct RefusalError {
     /// The model that issued the refusal.
     pub model: String,
