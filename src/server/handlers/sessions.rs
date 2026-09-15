@@ -203,8 +203,18 @@ pub async fn history(
         &state.config.owner,
         &state.config.peers,
     );
+    // A streamed turn holds the session write lock for its whole duration.
+    // Answer 503 rather than parking a client behind it.
     let messages = match state.session_store.get_existing_by_key(&key).await {
-        Some(arc) => project_history(&arc.read().await.data.messages),
+        Some(arc) => match arc.try_read() {
+            Ok(session) => project_history(&session.data.messages),
+            Err(_) => {
+                return Err((
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "session busy; retry shortly".to_string(),
+                ));
+            }
+        },
         None => Vec::new(),
     };
     Ok(Json(HistoryResponse {

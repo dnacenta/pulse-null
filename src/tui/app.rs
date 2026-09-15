@@ -135,6 +135,14 @@ impl App {
         )));
     }
 
+    /// Fresh bar facts from the poller.
+    pub fn apply_bar(&mut self, u: &super::poller::BarUpdate) {
+        self.bar.daemon = DaemonState::Connected;
+        self.bar.isolation = u.isolation;
+        self.bar.health.clone_from(&u.health);
+        self.bar.alerts = u.alerts;
+    }
+
     /// The daemon is back.
     pub fn daemon_back(&mut self) {
         self.bar.daemon = DaemonState::Connected;

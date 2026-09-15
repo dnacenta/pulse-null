@@ -2,8 +2,10 @@
 //!
 //! `run` attaches to the daemon named in the config, or starts one in this
 //! process when none answers, then drives an event-driven render loop: it
-//! draws only when a key, a daemon event, a theme change or a running effect
-//! says something changed.
+//! draws only when a key, a daemon message, a theme change or a running
+//! effect says something changed, and never faster than one frame per
+//! 16 ms. The loop itself never touches the network: `poller` does, and
+//! reports over a channel.
 
 pub mod app;
 pub mod bar;
@@ -14,6 +16,7 @@ pub mod keymap;
 pub mod motion;
 pub mod pages;
 pub mod pane;
+pub mod poller;
 pub mod prompt;
 pub mod text;
 pub mod theme;
@@ -24,42 +27,28 @@ use std::time::{Duration, Instant};
 
 use crossterm::event::{Event, EventStream, KeyboardEnhancementFlags};
 use crossterm::execute;
+use tokio::time::MissedTickBehavior;
 use tokio_stream::StreamExt as _;
 
 use crate::config::Config;
 
 use app::{Action, App};
-use bar::{DaemonState, Glyphs};
-use client::Client;
+use bar::Glyphs;
+use client::{ChatEvent, Client, ClientError};
 use motion::MotionLevel;
+use poller::{Bg, Ctl};
 use theme::ThemeWatcher;
 
-/// The live `/api/events` stream, boxed so the loop can hold it in an `Option`.
-type LedgerStream = std::pin::Pin<
-    Box<dyn futures_core::Stream<Item = Result<client::SseEvent, client::ClientError>> + Send>,
->;
-
-/// How long to wait for a daemon we started ourselves.
+/// How long the boot screen waits for a daemon we started before it says so.
 const ATTACH_TIMEOUT: Duration = Duration::from_secs(10);
-/// Frame cadence while an effect is running.
-const FX_TICK: Duration = Duration::from_millis(16);
+/// Shortest interval between two frames (62.5 fps ceiling).
+const FRAME: Duration = Duration::from_millis(16);
 /// Spinner / aurora cadence on the boot screen.
 const BOOT_TICK: Duration = Duration::from_millis(80);
 /// Spinner / elapsed-time cadence while a reply is in flight.
 const TURN_TICK: Duration = Duration::from_millis(100);
-/// Bar refresh cadence (`/health`, `/api/dashboard`, `/api/alerts/peek`).
-const BAR_TICK: Duration = Duration::from_secs(5);
 /// Omarchy theme file poll cadence.
 const THEME_TICK: Duration = Duration::from_secs(2);
-/// Reconnect backoff bounds after the daemon stops answering.
-const BACKOFF_MIN: Duration = Duration::from_millis(500);
-const BACKOFF_MAX: Duration = Duration::from_secs(8);
-
-/// The delay after `previous` failed: doubled, capped.
-#[must_use]
-pub fn next_backoff(previous: Duration) -> Duration {
-    (previous * 2).min(BACKOFF_MAX)
-}
 
 /// Run the TUI for the entity described by `config`, starting with the boot
 /// screen (`pulse-null up`).
@@ -119,7 +108,9 @@ async fn run_with(config: Config, skip_boot: bool) -> Result<(), Box<dyn std::er
         app.skip_boot();
     }
 
-    let result = event_loop(&mut terminal, &mut app, &client, attached_at_start).await;
+    let (ctl, bg, poller_task) = poller::spawn(client.clone(), attached_at_start);
+    let result = event_loop(&mut terminal, &mut app, &client, ctl, bg, attached_at_start).await;
+    poller_task.abort();
 
     if keyboard_enhanced {
         let _ = execute!(
@@ -148,44 +139,62 @@ async fn run_with(config: Config, skip_boot: bool) -> Result<(), Box<dyn std::er
     result
 }
 
+/// One item from the chat stream. Returns true when the stream is over.
+fn on_turn_item(app: &mut App, item: Option<Result<ChatEvent, ClientError>>) -> bool {
+    match item {
+        Some(Ok(ev)) => {
+            app.talk.on_event(ev);
+            false
+        }
+        Some(Err(e)) => {
+            tracing::warn!("chat stream error: {e}");
+            app.talk.stream_closed();
+            true
+        }
+        None => {
+            app.talk.stream_closed();
+            true
+        }
+    }
+}
+
 async fn event_loop(
     terminal: &mut ratatui::DefaultTerminal,
     app: &mut App,
     client: &Client,
+    ctl: tokio::sync::mpsc::Sender<Ctl>,
+    mut bg: tokio::sync::mpsc::Receiver<Bg>,
     mut attached: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let mut events = EventStream::new();
-    let mut fx_tick = tokio::time::interval(FX_TICK);
     let mut boot_tick = tokio::time::interval(BOOT_TICK);
-    let mut bar_tick = tokio::time::interval(BAR_TICK);
+    let mut turn_tick = tokio::time::interval(TURN_TICK);
     let mut theme_tick = tokio::time::interval(THEME_TICK);
+    // A ticker that is gated off for a while must not burst when it comes
+    // back; skip the missed periods.
+    for t in [&mut boot_tick, &mut turn_tick, &mut theme_tick] {
+        t.set_missed_tick_behavior(MissedTickBehavior::Delay);
+    }
     let attach_deadline = Instant::now() + ATTACH_TIMEOUT;
-    // Probing: fast while a daemon we started comes up; exponential backoff
-    // once a daemon we had has gone away.
-    let mut backoff = Duration::from_millis(250);
-    let mut next_probe = tokio::time::Instant::now() + backoff;
-    let mut dirty = true;
 
-    // Ledger stream: opened once attached; rows arrive as they happen.
-    let mut ledger: Option<LedgerStream> = None;
-    let mut last_event_id: Option<u64> = None;
     // The in-flight chat turn, if any: its event receiver and the task that
     // pumps the SSE stream into it. Dropping the task drops the response body,
     // which is what cancels the turn on the daemon.
-    let mut turn_rx: Option<
-        tokio::sync::mpsc::Receiver<Result<client::ChatEvent, client::ClientError>>,
-    > = None;
+    let mut turn_rx: Option<tokio::sync::mpsc::Receiver<Result<ChatEvent, ClientError>>> = None;
     let mut turn_task: Option<tokio::task::JoinHandle<()>> = None;
-    let mut turn_tick = tokio::time::interval(TURN_TICK);
+
+    let mut dirty = true;
+    let mut last_draw = Instant::now() - FRAME;
 
     if attached {
         app.attached();
-        refresh_bar(app, client).await;
-        load_history(app, client).await;
     }
 
     loop {
-        if dirty {
+        // Frame pacer: draw when something changed, never more often than
+        // one frame per FRAME. Effects and scroll glides keep asking for the
+        // next frame until they settle.
+        if dirty && last_draw.elapsed() >= FRAME {
             let started = Instant::now();
             let _ = execute!(
                 std::io::stdout(),
@@ -198,16 +207,10 @@ async fn event_loop(
             );
             let _ = std::io::stdout().flush();
             app.frame_done(started.elapsed());
-            // The frame that retires the last effect is drawn mid-effect;
-            // one more pass paints the settled state.
-            dirty = app.motion.take_settled();
-        }
-
-        if attached && ledger.is_none() {
-            match client.events(last_event_id).await {
-                Ok(s) => ledger = Some(Box::pin(s)),
-                Err(e) => tracing::warn!("ledger stream unavailable: {e}"),
-            }
+            last_draw = Instant::now();
+            dirty = app.motion.take_settled()
+                || app.motion.is_running()
+                || app.talk.transcript.is_animating();
         }
 
         tokio::select! {
@@ -229,43 +232,40 @@ async fn event_loop(
                     None => return Ok(()),
                 }
             }
-            row = async {
-                match ledger.as_mut() {
-                    Some(s) => s.next().await,
-                    None => std::future::pending().await,
-                }
-            } => {
-                match row {
-                    Some(Ok(ev)) => {
-                        if let Some(id) = ev.id.as_deref().and_then(|s| s.parse().ok()) {
-                            last_event_id = Some(id);
+            msg = bg.recv() => {
+                match msg {
+                    Some(Bg::Attached) => {
+                        attached = true;
+                        app.attached();
+                        app.daemon_back();
+                    }
+                    Some(Bg::Unreachable { retry_in }) => {
+                        attached = false;
+                        if app.screen != app::Screen::Boot {
+                            app.daemon_lost(retry_in);
                         }
-                        // Rows feed the Watch page in the next plan; today a
-                        // new row refreshes the alert count.
-                        refresh_bar(app, client).await;
-                        dirty = true;
                     }
-                    Some(Err(e)) => {
-                        tracing::warn!("ledger stream error: {e}");
-                        ledger = None;
-                        attached = false;
-                        backoff = BACKOFF_MIN;
-                        next_probe = tokio::time::Instant::now() + backoff;
-                        app.daemon_lost(backoff);
-                        dirty = true;
+                    Some(Bg::Bar(update)) => app.apply_bar(&update),
+                    Some(Bg::History(msgs)) => {
+                        let items = msgs
+                            .into_iter()
+                            .map(|m| {
+                                let who = if m.role == "user" {
+                                    transcript::Who::Owner
+                                } else {
+                                    transcript::Who::Entity
+                                };
+                                (who, m.text, m.tools)
+                            })
+                            .collect();
+                        app.talk.load_history(items);
                     }
-                    None => {
-                        // A clean close is the daemon shutting down: treat it
-                        // like a loss so the bar and prompt say so at once.
-                        tracing::info!("ledger stream closed by the daemon");
-                        ledger = None;
-                        attached = false;
-                        backoff = BACKOFF_MIN;
-                        next_probe = tokio::time::Instant::now() + backoff;
-                        app.daemon_lost(backoff);
-                        dirty = true;
-                    }
+                    // Rows feed the Watch page in the next plan; the poller
+                    // already refreshed the bar for this one.
+                    Some(Bg::Row) => {}
+                    None => return Err("connectivity task stopped".into()),
                 }
+                dirty = true;
             }
             turn = async {
                 match turn_rx.as_mut() {
@@ -273,63 +273,35 @@ async fn event_loop(
                     None => std::future::pending().await,
                 }
             } => {
-                match turn {
-                    Some(Ok(ev)) => app.talk.on_event(ev),
-                    Some(Err(e)) => {
-                        tracing::warn!("chat stream error: {e}");
-                        app.talk.stream_closed();
-                        turn_rx = None;
-                        turn_task = None;
+                let mut ended = on_turn_item(app, turn);
+                // Drain whatever else has already arrived so one frame shows
+                // every delta that came in since the last one.
+                while !ended {
+                    match turn_rx.as_mut().map(|rx| rx.try_recv()) {
+                        Some(Ok(item)) => ended = on_turn_item(app, Some(item)),
+                        Some(Err(tokio::sync::mpsc::error::TryRecvError::Disconnected)) => {
+                            ended = on_turn_item(app, None);
+                        }
+                        _ => break,
                     }
-                    None => {
-                        app.talk.stream_closed();
-                        turn_rx = None;
-                        turn_task = None;
-                    }
+                }
+                if ended {
+                    turn_rx = None;
+                    turn_task = None;
                 }
                 dirty = true;
             }
-            _ = turn_tick.tick(), if app.talk.turn_active() || app.talk.transcript.is_animating() => {
+            _ = turn_tick.tick(), if app.talk.turn_active() => {
                 app.talk.tick();
                 dirty = true;
             }
-            _ = tokio::time::sleep_until(next_probe), if !attached => {
-                if client.probe().await {
-                    attached = true;
-                    backoff = Duration::from_millis(250);
-                    app.attached();
-                    app.daemon_back();
-                    refresh_bar(app, client).await;
-                    load_history(app, client).await;
-                    dirty = true;
-                } else {
-                    if app.screen == app::Screen::Boot {
-                        if Instant::now() > attach_deadline {
-                            app.boot.status = format!("no daemon at {} — still trying (q to quit)", client.base());
-                        }
-                    } else {
-                        backoff = next_backoff(backoff.max(BACKOFF_MIN));
-                        app.daemon_lost(backoff);
-                    }
-                    next_probe = tokio::time::Instant::now() + backoff;
-                    dirty = true;
-                }
-            }
             _ = boot_tick.tick(), if app.screen == app::Screen::Boot => {
                 app.tick();
-                dirty = true;
-            }
-            _ = fx_tick.tick(), if app.motion.is_running() => {
-                dirty = true;
-            }
-            _ = bar_tick.tick(), if attached => {
-                refresh_bar(app, client).await;
-                if app.bar.daemon == DaemonState::Unreachable {
-                    attached = false;
-                    ledger = None;
-                    backoff = BACKOFF_MIN;
-                    next_probe = tokio::time::Instant::now() + backoff;
-                    app.daemon_lost(backoff);
+                if !attached && Instant::now() > attach_deadline {
+                    app.boot.status = format!(
+                        "no daemon at {} — still trying (q to quit)",
+                        client.base()
+                    );
                 }
                 dirty = true;
             }
@@ -339,6 +311,8 @@ async fn event_loop(
                     dirty = true;
                 }
             }
+            // Something is dirty but the pacer said "not yet": wake for it.
+            _ = tokio::time::sleep_until((last_draw + FRAME).into()), if dirty => {}
         }
 
         // The page asked for a send or a cancel; the loop owns the sockets.
@@ -372,77 +346,10 @@ async fn event_loop(
                 }
             }));
             turn_rx = Some(rx);
+            // A finished turn is a ledger row; ask for fresh bar facts once
+            // the poller sees it (debounced there).
+            let _ = ctl.try_send(Ctl::Refresh);
             dirty = true;
         }
-    }
-}
-
-/// Load the owner's conversation on the `tui` channel into Talk.
-async fn load_history(app: &mut App, client: &Client) {
-    match client.history("tui").await {
-        Ok(msgs) => {
-            let items = msgs
-                .into_iter()
-                .map(|m| {
-                    let who = if m.role == "user" {
-                        transcript::Who::Owner
-                    } else {
-                        transcript::Who::Entity
-                    };
-                    (who, m.text, m.tools)
-                })
-                .collect();
-            app.talk.load_history(items);
-        }
-        Err(e) => tracing::warn!("history unavailable: {e}"),
-    }
-}
-
-/// Pull the bar's facts from the daemon. Failures leave the last values and
-/// mark the daemon unreachable.
-async fn refresh_bar(app: &mut App, client: &Client) {
-    match client.health().await {
-        Ok(h) => {
-            app.bar.daemon = DaemonState::Connected;
-            app.bar.isolation = h["isolation"].as_bool().unwrap_or(false);
-        }
-        Err(e) => {
-            tracing::debug!("health: {e}");
-            app.bar.daemon = DaemonState::Unreachable;
-            return;
-        }
-    }
-    if let Ok(d) = client.dashboard().await {
-        // The dashboard reports "healthy" before it has enough signal frames to
-        // judge; the bar says so instead of borrowing a verdict it cannot back.
-        let ch = &d["cognitive_health"];
-        let sufficient = ch["sufficient_data"].as_bool().unwrap_or(false);
-        app.bar.health = if sufficient {
-            ch["status"].as_str().map(str::to_string)
-        } else {
-            None
-        };
-    }
-    if let Ok(n) = client.alerts_count().await {
-        app.bar.alerts = Some(n);
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn backoff_doubles_and_caps() {
-        let mut d = BACKOFF_MIN;
-        let mut seen = vec![d];
-        for _ in 0..6 {
-            d = next_backoff(d);
-            seen.push(d);
-        }
-        assert_eq!(
-            seen.iter().map(|d| d.as_millis()).collect::<Vec<_>>(),
-            vec![500, 1000, 2000, 4000, 8000, 8000, 8000]
-        );
     }
 }
