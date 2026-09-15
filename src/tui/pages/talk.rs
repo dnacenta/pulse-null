@@ -428,10 +428,10 @@ impl Talk {
                         width: inner.width.saturating_sub(1),
                         ..inner
                     };
-                    let lay = self.transcript.layout(text_area, t, owner, entity, status);
-                    let para = Paragraph::new(lay.lines.clone())
-                        .style(Style::default().bg(t.ground))
-                        .scroll((lay.offset as u16, 0));
+                    let mut lay = self.transcript.layout(text_area, t, owner, entity, status);
+                    // `lay.lines` is exactly the visible window; nothing to scroll.
+                    let para = Paragraph::new(std::mem::take(&mut lay.lines))
+                        .style(Style::default().bg(t.ground));
                     frame.render_widget(para, text_area);
 
                     if lay.total_rows > usize::from(inner.height) {

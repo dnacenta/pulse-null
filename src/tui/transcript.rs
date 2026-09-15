@@ -44,6 +44,8 @@ pub struct Entry {
     cache_width: usize,
     cache_rows: Vec<String>,
     cache_paras: usize,
+    /// Rows of the still-growing last paragraph of a streaming entry.
+    tail: Vec<String>,
 }
 
 impl Entry {
@@ -56,17 +58,18 @@ impl Entry {
             cache_width: 0,
             cache_rows: Vec::new(),
             cache_paras: 0,
+            tail: Vec::new(),
         }
     }
 
-    /// Wrapped body rows at `cols`, re-wrapping only what changed.
+    /// Refresh the wrap cache for `cols` and return `(row count, paragraphs
+    /// wrapped this call)`.
     ///
     /// A finished entry is wrapped once and served from cache. A streaming
     /// entry caches every paragraph but its last, which is the only text
-    /// that can still grow. Returns the rows and how many paragraphs were
-    /// (re)wrapped this call — the latter exists for the tests that pin the
-    /// incremental behaviour.
-    fn rows(&mut self, cols: usize) -> (Vec<String>, usize) {
+    /// that can still grow; that one is re-wrapped into `tail`. The second
+    /// number exists for the tests that pin the incremental behaviour.
+    fn prepare(&mut self, cols: usize) -> (usize, usize) {
         let paras: Vec<&str> = self.text.split('\n').collect();
         let n = paras.len();
         let mut wrapped_now = 0usize;
@@ -87,12 +90,22 @@ impl Entry {
             self.cache_paras += 1;
             wrapped_now += 1;
         }
-        let mut rows = self.cache_rows.clone();
         if stable < n {
-            rows.extend(wrap(paras[n - 1], cols));
+            self.tail = wrap(paras[n - 1], cols);
             wrapped_now += 1;
+        } else {
+            self.tail.clear();
         }
-        (rows, wrapped_now)
+        (self.cache_rows.len() + self.tail.len(), wrapped_now)
+    }
+
+    /// Body row `i` after `prepare`.
+    fn row(&self, i: usize) -> &str {
+        if i < self.cache_rows.len() {
+            &self.cache_rows[i]
+        } else {
+            &self.tail[i - self.cache_rows.len()]
+        }
     }
 }
 
@@ -375,8 +388,12 @@ impl Transcript {
 
     /// Lay the transcript out for `inner`, folding pending deltas in first.
     ///
+    /// Two passes: count every entry's rows (cheap — the wrap cache does the
+    /// work once), then build `Line`s only for the rows inside the viewport.
+    /// Per-frame cost is O(entries + viewport), not O(total rows).
+    ///
     /// `owner` and `entity` are the labels; `status` is a live line shown
-    /// under a streaming reply that has no text yet (thinking, tool).
+    /// under a streaming reply (thinking, tool).
     pub fn layout(
         &mut self,
         inner: Rect,
@@ -389,84 +406,146 @@ impl Transcript {
         let cols = usize::from(inner.width).saturating_sub(INDENT).max(2);
         self.viewport = usize::from(inner.height);
 
+        // Pass 1: shape of every entry, and the absolute row it starts on.
+        struct Block {
+            start: usize,
+            blank: bool,
+            header: bool,
+            body: usize,
+            status: bool,
+            interrupted: bool,
+            tools: bool,
+        }
+        impl Block {
+            fn len(&self) -> usize {
+                usize::from(self.blank)
+                    + usize::from(self.header)
+                    + self.body
+                    + usize::from(self.status)
+                    + usize::from(self.interrupted)
+                    + usize::from(self.tools)
+            }
+        }
+        let n = self.entries.len();
+        let mut blocks: Vec<Block> = Vec::with_capacity(n);
+        let mut wrapped_total = 0usize;
+        let mut total = 0usize;
+        for i in 0..n {
+            let is_streaming_entry = i + 1 == n && self.entries[i].state == EntryState::Streaming;
+            let (rows, wrapped) = self.entries[i].prepare(cols);
+            wrapped_total += wrapped;
+            let e = &self.entries[i];
+            let empty_streaming = is_streaming_entry && e.text.is_empty();
+            let block = Block {
+                start: total,
+                blank: i > 0,
+                header: e.who != Who::Notice,
+                body: if empty_streaming { 0 } else { rows },
+                status: is_streaming_entry && status.is_some(),
+                interrupted: e.state == EntryState::Interrupted,
+                tools: !e.tools.is_empty() && e.state != EntryState::Streaming,
+            };
+            total += block.len();
+            blocks.push(block);
+        }
+        self.last_wrapped = wrapped_total;
+        self.total_rows = total;
+
+        let offset = self.current_offset();
+        if self.anim.as_ref().is_some_and(ScrollAnim::done) {
+            self.anim = None;
+        }
+        let end = offset + self.viewport;
+
+        // Pass 2: lines for the visible rows only.
         let label_style = |who: &Who| match who {
             Who::Owner => Style::default().fg(t.accent).add_modifier(Modifier::BOLD),
             Who::Entity => Style::default().fg(t.entity).add_modifier(Modifier::BOLD),
             Who::Notice => Style::default().fg(t.dim).add_modifier(Modifier::ITALIC),
         };
-        let indent = " ".repeat(INDENT);
-
-        let mut lines: Vec<Line<'static>> = Vec::new();
-        let mut wrapped_total = 0usize;
-        let mut cursor_row: Option<(usize, usize)> = None; // (row index, x)
-        let n = self.entries.len();
-        for i in 0..n {
-            let (who, state, tools) = {
-                let e = &self.entries[i];
-                (e.who.clone(), e.state, e.tools.clone())
-            };
-            let (rows, wrapped) = self.entries[i].rows(cols);
-            wrapped_total += wrapped;
-
-            if !lines.is_empty() {
-                lines.push(Line::default());
+        let body_style = |who: &Who| match who {
+            Who::Notice => Style::default().fg(t.dim).add_modifier(Modifier::ITALIC),
+            Who::Owner | Who::Entity => Style::default().fg(t.ink),
+        };
+        let visible = |row: usize| row >= offset && row < end;
+        let mut lines: Vec<Line<'static>> = Vec::with_capacity(self.viewport);
+        let mut cursor_cell: Option<Rect> = None;
+        for (i, b) in blocks.iter().enumerate() {
+            let b_end = b.start + b.len();
+            if b_end <= offset || b.start >= end {
+                continue;
             }
-            let label = match who {
-                Who::Owner => owner.to_string(),
-                Who::Entity => entity.to_string(),
-                Who::Notice => String::new(),
-            };
-            if !label.is_empty() {
-                lines.push(Line::from(vec![
-                    Span::styled(label, label_style(&who)),
-                    Span::styled(" ›", Style::default().fg(t.dim)),
-                ]));
-            }
-            let body_style = match who {
-                Who::Notice => Style::default().fg(t.dim).add_modifier(Modifier::ITALIC),
-                Who::Owner => Style::default().fg(t.ink),
-                Who::Entity => Style::default().fg(t.ink),
-            };
-            let is_streaming_entry = state == EntryState::Streaming && i + 1 == n;
-            let empty_streaming = is_streaming_entry && rows.iter().all(String::is_empty);
-            for (ri, row) in rows.iter().enumerate() {
-                if empty_streaming {
-                    break;
+            let e = &self.entries[i];
+            let is_streaming_entry = i + 1 == n && e.state == EntryState::Streaming;
+            let mut r = b.start;
+            if b.blank {
+                if visible(r) {
+                    lines.push(Line::default());
                 }
+                r += 1;
+            }
+            if b.header {
+                if visible(r) {
+                    let label = match e.who {
+                        Who::Owner => owner.to_string(),
+                        Who::Entity => entity.to_string(),
+                        Who::Notice => String::new(),
+                    };
+                    lines.push(Line::from(vec![
+                        Span::styled(label, label_style(&e.who)),
+                        Span::styled(" ›", Style::default().fg(t.dim)),
+                    ]));
+                }
+                r += 1;
+            }
+            for bi in 0..b.body {
+                let row = r + bi;
+                if !visible(row) {
+                    continue;
+                }
+                let text = e.row(bi);
                 let mut spans = vec![
-                    Span::raw(indent.clone()),
-                    Span::styled(row.clone(), body_style),
+                    Span::raw("  "),
+                    Span::styled(text.to_string(), body_style(&e.who)),
                 ];
-                if is_streaming_entry && ri + 1 == rows.len() {
-                    cursor_row = Some((lines.len(), INDENT + width(row)));
+                if is_streaming_entry && bi + 1 == b.body {
+                    let x = INDENT + width(text);
+                    if x < usize::from(inner.width) {
+                        cursor_cell = Some(Rect::new(
+                            inner.x + x as u16,
+                            inner.y + (row - offset) as u16,
+                            1,
+                            1,
+                        ));
+                    }
                     spans.push(Span::styled("▌", Style::default().fg(t.accent)));
                 }
                 lines.push(Line::from(spans));
             }
-            if is_streaming_entry {
-                if let Some(s) = status.clone() {
-                    lines.push(s);
+            r += b.body;
+            if b.status {
+                if visible(r) {
+                    if let Some(sl) = status.clone() {
+                        lines.push(sl);
+                    }
                 }
+                r += 1;
             }
-            if state == EntryState::Interrupted {
-                lines.push(Line::from(Span::styled(
-                    format!("{indent}interrupted"),
-                    Style::default().fg(t.warn).add_modifier(Modifier::ITALIC),
-                )));
+            if b.interrupted {
+                if visible(r) {
+                    lines.push(Line::from(Span::styled(
+                        "  interrupted",
+                        Style::default().fg(t.warn).add_modifier(Modifier::ITALIC),
+                    )));
+                }
+                r += 1;
             }
-            if !tools.is_empty() && state != EntryState::Streaming {
+            if b.tools && visible(r) {
                 lines.push(Line::from(Span::styled(
-                    format!("{indent}used {}", tools.join(", ")),
+                    format!("  used {}", e.tools.join(", ")),
                     Style::default().fg(t.dim),
                 )));
             }
-        }
-        self.last_wrapped = wrapped_total;
-        self.total_rows = lines.len();
-
-        let offset = self.current_offset();
-        if self.anim.as_ref().is_some_and(ScrollAnim::done) {
-            self.anim = None;
         }
 
         // Rows that are new since the last pass, within the viewport.
@@ -478,7 +557,7 @@ impl Transcript {
             let stagger = if self.reveal_pending { 18 } else { 0 };
             let mut k = 0u32;
             for row in self.faded_rows..self.total_rows {
-                if row >= offset && row < offset + self.viewport {
+                if visible(row) {
                     new_rows.push(NewRow {
                         rect: Rect::new(inner.x, inner.y + (row - offset) as u16, inner.width, 1),
                         delay_ms: k * stagger,
@@ -491,11 +570,6 @@ impl Transcript {
         } else if self.faded_rows > self.total_rows {
             self.faded_rows = self.total_rows;
         }
-
-        let cursor_cell = cursor_row.and_then(|(row, x)| {
-            (row >= offset && row < offset + self.viewport && x < usize::from(inner.width))
-                .then(|| Rect::new(inner.x + x as u16, inner.y + (row - offset) as u16, 1, 1))
-        });
 
         Layout {
             lines,
