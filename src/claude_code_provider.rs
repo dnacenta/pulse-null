@@ -703,14 +703,27 @@ enum RefusalCheck {
 /// refusals (so PN-88's fallback fires for streamed turns too), a plain
 /// [`StreamEvent::Error`] for everything else (quota, timeout, empty).
 fn classify_stream_failure(model: &str, text: String) -> StreamEvent {
-    if text.to_lowercase().contains("usage policy") {
+    if is_aup_refusal(&text) {
         StreamEvent::Refused {
             model: model.to_string(),
             detail: truncate(&text, 500).to_string(),
         }
     } else {
+        // Same drift alarm as the buffered path: an error-flagged result that
+        // does not carry the signature is worth a WARN, not silence.
+        warn!(
+            model = %model,
+            "claude stream ended with is_error=true but did not match the AUP \
+             Usage-Policy signature — refusal detection may have drifted"
+        );
         StreamEvent::Error(text)
     }
+}
+
+/// The one place the AUP refusal signature lives. Both the buffered and the
+/// streamed classifier call this, so the signature cannot drift between them.
+fn is_aup_refusal(body: &str) -> bool {
+    body.to_lowercase().contains("usage policy")
 }
 
 /// Classify a non-zero-exit stdout body as an AUP refusal or a plain error.
@@ -726,7 +739,7 @@ fn classify_nonzero_exit(stdout: &str) -> RefusalCheck {
         return RefusalCheck::NotRefusal;
     }
     let result = parsed["result"].as_str().unwrap_or("");
-    if result.to_lowercase().contains("usage policy") {
+    if is_aup_refusal(result) {
         RefusalCheck::Refusal(result.to_string())
     } else {
         RefusalCheck::ErrorFlagButNoPolicyMatch

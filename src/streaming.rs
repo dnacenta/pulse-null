@@ -85,58 +85,23 @@ pub trait StreamingProvider: LmProvider {
                     }
                     yield StreamEvent::Done(response);
                 }
-                Err(e) => {
-                    yield StreamEvent::Error(e.to_string());
-                }
+                // A typed AUP refusal must stay typed, or the chat handler's
+                // refusal fallback (PN-88) silently never fires for a provider
+                // that relies on this default.
+                Err(e) => match e.downcast_ref::<crate::errors::RefusalError>() {
+                    Some(r) => {
+                        yield StreamEvent::Refused {
+                            model: r.model.clone(),
+                            detail: r.detail.clone(),
+                        };
+                    }
+                    None => {
+                        yield StreamEvent::Error(e.to_string());
+                    }
+                },
             }
         })
     }
-}
-
-/// Wrap a non-streaming invoke() call as a stream that emits one TextDelta + Done.
-/// Clones all parameters upfront so the returned stream only borrows `provider`.
-///
-/// Currently unused: the Claude Code provider streams natively since PN-92.
-/// Kept as the adapter any future provider without native streaming should
-/// use, which is the contract the trait's default behaviour advertises.
-#[allow(dead_code)]
-pub fn invoke_as_stream<'a>(
-    provider: &'a dyn LmProvider,
-    system_prompt: &str,
-    messages: &[Message],
-    max_tokens: u32,
-    tools: Option<&[serde_json::Value]>,
-) -> StreamResult<'a> {
-    let system_prompt = system_prompt.to_string();
-    let messages = messages.to_vec();
-    let tools = tools.map(|t| t.to_vec());
-
-    Box::pin(async_stream::stream! {
-        match provider
-            .invoke(&system_prompt, &messages, max_tokens, tools.as_deref())
-            .await
-        {
-            Ok(response) => {
-                let text = response.text();
-                if !text.is_empty() {
-                    yield StreamEvent::TextDelta(text);
-                }
-                for block in &response.content {
-                    if let ContentBlock::ToolUse { id, name, input } = block {
-                        yield StreamEvent::ToolUse {
-                            id: id.clone(),
-                            name: name.clone(),
-                            input: input.clone(),
-                        };
-                    }
-                }
-                yield StreamEvent::Done(response);
-            }
-            Err(e) => {
-                yield StreamEvent::Error(e.to_string());
-            }
-        }
-    })
 }
 
 /// Helper to assemble a final LlmResponse from accumulated stream data.
@@ -162,5 +127,54 @@ pub fn assemble_response(
         model,
         input_tokens,
         output_tokens,
+    }
+}
+
+#[cfg(test)]
+mod default_adapter_tests {
+    use super::*;
+    use tokio_stream::StreamExt as _;
+
+    struct Refusing;
+    impl LmProvider for Refusing {
+        fn invoke(
+            &self,
+            _s: &str,
+            _m: &[Message],
+            _t: u32,
+            _tools: Option<&[serde_json::Value]>,
+        ) -> std::pin::Pin<
+            Box<
+                dyn std::future::Future<
+                        Output = Result<LlmResponse, Box<dyn std::error::Error + Send + Sync>>,
+                    > + Send
+                    + '_,
+            >,
+        > {
+            Box::pin(async {
+                Err(Box::new(crate::errors::RefusalError {
+                    model: "m".into(),
+                    detail: "Usage Policy".into(),
+                })
+                    as Box<dyn std::error::Error + Send + Sync>)
+            })
+        }
+        fn name(&self) -> &str {
+            "refusing"
+        }
+    }
+    impl StreamingProvider for Refusing {}
+
+    #[tokio::test]
+    async fn default_adapter_keeps_a_refusal_typed() {
+        let p = Refusing;
+        let mut s = p.invoke_streaming("sys", &[], 10, None);
+        match s.next().await {
+            Some(StreamEvent::Refused { model, detail }) => {
+                assert_eq!(model, "m");
+                assert_eq!(detail, "Usage Policy");
+            }
+            other => panic!("expected Refused, got {other:?}"),
+        }
     }
 }
