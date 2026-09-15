@@ -522,7 +522,9 @@ impl StreamingProvider for ClaudeCodeProvider {
                 .env_remove("CLAUDECODE")
                 .stdin(Stdio::piped())
                 .stdout(Stdio::piped())
-                .stderr(Stdio::piped());
+                // Nothing reads stderr on this path; a piped-but-undrained stderr
+                // would block the child once it fills.
+                .stderr(Stdio::null());
             // The caller hanging up must not leave a model running.
             cmd.kill_on_drop(true);
 
@@ -554,9 +556,19 @@ impl StreamingProvider for ClaudeCodeProvider {
             let mut terminal: Option<(String, bool)> = None;
             let mut usage: (Option<u32>, Option<u32>) = (None, None);
 
+            // Same bound as the buffered path: a model that stops talking must
+            // not hold the turn (and the session lock behind it) forever.
+            let deadline = tokio::time::Instant::now() + subprocess_timeout();
             loop {
-                match lines.next_line().await {
-                    Ok(Some(line)) => match parse_stream_line(&line) {
+                match tokio::time::timeout_at(deadline, lines.next_line()).await {
+                    Err(_) => {
+                        yield StreamEvent::Error(format!(
+                            "claude timed out after {}s",
+                            subprocess_timeout().as_secs()
+                        ));
+                        return;
+                    }
+                    Ok(Ok(Some(line))) => match parse_stream_line(&line) {
                         StreamLine::Delta(text) => {
                             assembled.push_str(&text);
                             yield StreamEvent::TextDelta(text);
@@ -567,15 +579,15 @@ impl StreamingProvider for ClaudeCodeProvider {
                         }
                         StreamLine::Other => {}
                     },
-                    Ok(None) => break,
-                    Err(e) => {
+                    Ok(Ok(None)) => break,
+                    Ok(Err(e)) => {
                         yield StreamEvent::Error(format!("reading claude output: {e}"));
                         break;
                     }
                 }
             }
 
-            let _ = child.wait().await;
+            let _ = tokio::time::timeout_at(deadline, child.wait()).await;
 
             match terminal {
                 // The CLI reports failures in the terminal record rather than

@@ -1005,6 +1005,12 @@ fn error_to_sse(status: StatusCode, message: String) -> Event {
 /// `done {text, model, tokens_in, tokens_out, isolation, truncated}` or
 /// `error {status, message}`. Dropping the connection aborts the turn: the
 /// provider child is killed and the user message is rolled back.
+///
+/// Client contract: deltas are best-effort and unvalidated. A consumer that
+/// stops reading loses deltas rather than stalling the turn, and a reply the
+/// hallucination guard cut short is streamed raw first. `done.text` is the
+/// validated, complete reply and must replace whatever was shown; `truncated`
+/// says the guard fired.
 pub async fn chat_stream(
     State(state): State<Arc<AppState>>,
     Json(req): Json<ChatRequest>,
@@ -1208,7 +1214,7 @@ where
     // The fallback provider is buffered; a streaming client learns it is
     // thinking again and then gets the whole reply as one delta.
     if let Some(sink) = sink {
-        let _ = sink.send(TurnEvent::Status(TurnStatus::Thinking)).await;
+        let _ = sink.try_send(TurnEvent::Status(TurnStatus::Thinking));
     }
     let fallback_outcome = crate::task_context::scope(
         Some(correlation_id.to_string()),
@@ -1226,8 +1232,8 @@ where
     match fallback_outcome {
         Ok(result) => {
             if let Some(sink) = sink {
-                let _ = sink.send(TurnEvent::Status(TurnStatus::Responding)).await;
-                let _ = sink.send(TurnEvent::Delta(result.text.clone())).await;
+                let _ = sink.try_send(TurnEvent::Status(TurnStatus::Responding));
+                let _ = sink.try_send(TurnEvent::Delta(result.text.clone()));
             }
             // Quarantine the exchange: the trunk stays clean so the default
             // model does not re-trip on later benign turns.

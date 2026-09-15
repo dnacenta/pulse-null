@@ -127,6 +127,10 @@ pub enum TurnStatus {
 
 /// Progress of one interactive turn (PN-102). Deltas are forwarded exactly as
 /// the provider yields them; the client is responsible for coalescing.
+///
+/// Delivery is best-effort: the turn runs under the session write lock, so
+/// it must never wait on a slow consumer. A full sink drops the event; the
+/// terminal `done` carries the whole text and is always authoritative.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TurnEvent {
     Status(TurnStatus),
@@ -245,7 +249,7 @@ pub async fn invoke_with_tool_loop_streaming(
     let mut rs = RoundState::new();
 
     loop {
-        let _ = sink.send(TurnEvent::Status(TurnStatus::Thinking)).await;
+        let _ = sink.try_send(TurnEvent::Status(TurnStatus::Thinking));
         let result = stream_one_round(
             provider,
             system_prompt,
@@ -280,12 +284,12 @@ async fn stream_one_round(
             StreamEvent::TextDelta(text) => {
                 if !responding {
                     responding = true;
-                    let _ = sink.send(TurnEvent::Status(TurnStatus::Responding)).await;
+                    let _ = sink.try_send(TurnEvent::Status(TurnStatus::Responding));
                 }
-                let _ = sink.send(TurnEvent::Delta(text)).await;
+                let _ = sink.try_send(TurnEvent::Delta(text));
             }
             StreamEvent::ToolUse { name, .. } => {
-                let _ = sink.send(TurnEvent::Status(TurnStatus::Tool(name))).await;
+                let _ = sink.try_send(TurnEvent::Status(TurnStatus::Tool(name)));
             }
             StreamEvent::Done(response) => return Ok(response),
             StreamEvent::Refused { model, detail } => {
@@ -691,6 +695,25 @@ mod streaming_tests {
             panic!("expected the streamed refusal to error")
         };
         assert!(err.downcast_ref::<crate::errors::RefusalError>().is_some());
+    }
+
+    #[tokio::test]
+    async fn full_sink_never_blocks_the_turn() {
+        // 40 words, a 1-slot sink nobody drains: with `send().await` this
+        // would hang forever under the session lock.
+        let text = "word ".repeat(40);
+        let p = Scripted::new(vec![end_turn(text.trim())], false);
+        let tools = ToolRegistry::new();
+        let (tx, _rx) = tokio::sync::mpsc::channel(1);
+        let mut m = vec![user("hi")];
+        let r = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            invoke_with_tool_loop_streaming(&p, &tools, "sys", &mut m, 100, 5, &tx),
+        )
+        .await
+        .expect("turn must not block on a full sink")
+        .unwrap();
+        assert_eq!(r.text, text.trim());
     }
 
     #[tokio::test]

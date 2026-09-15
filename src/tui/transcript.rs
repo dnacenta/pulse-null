@@ -254,7 +254,8 @@ impl Transcript {
         }
     }
 
-    /// The reply finished. `text` is authoritative when the daemon truncated.
+    /// The reply finished. `text` is the daemon's validated reply and replaces
+    /// whatever streamed (deltas are best-effort and may have been dropped).
     ///
     /// A reply that arrived whole (no deltas, or one large delta) is revealed
     /// with a staggered fade instead of popping in.
@@ -262,7 +263,7 @@ impl Transcript {
         self.drain_pending();
         let arrived_whole = self.deltas == 0 || (self.deltas == 1 && text.len() >= 400);
         if let Some(e) = self.streaming_mut() {
-            if truncated || e.text.is_empty() {
+            if truncated || !text.is_empty() {
                 e.text = text.to_string();
             }
             e.state = EntryState::Done;
