@@ -544,10 +544,18 @@ pub(crate) async fn run_turn(
         }
         // Keep the banner sticky even on the failure path — while isolated
         // the provider is precisely the suspect.
-        let msg = if crate::server::isolation::is_active(&state.root_dir) {
-            format!("{} {}", crate::server::isolation::BANNER, e)
+        // SEC-007 applies to every provider failure, not only the fallback
+        // path: the detail is in the log above; the client gets a generic
+        // body (and the isolation banner when relevant).
+        let public = if e.downcast_ref::<crate::errors::RefusalError>().is_some() {
+            "the model declined this request"
         } else {
-            e.to_string()
+            "upstream model error"
+        };
+        let msg = if crate::server::isolation::is_active(&state.root_dir) {
+            format!("{} {}", crate::server::isolation::BANNER, public)
+        } else {
+            public.to_string()
         };
         (StatusCode::INTERNAL_SERVER_ERROR, msg)
     })?;
@@ -1016,6 +1024,14 @@ pub async fn chat_stream(
     Json(req): Json<ChatRequest>,
 ) -> Result<Sse<impl Stream<Item = Result<Event, Infallible>>>, (StatusCode, String)> {
     validate_request(&req)?;
+    let permit = Arc::clone(&state.stream_permits)
+        .try_acquire_owned()
+        .map_err(|_| {
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "too many open streams; try again shortly".to_string(),
+            )
+        })?;
 
     let (tx, rx) = mpsc::channel::<TurnEvent>(STREAM_CHANNEL_CAPACITY);
     let (done_tx, done_rx) = tokio::sync::oneshot::channel();
@@ -1027,6 +1043,7 @@ pub async fn chat_stream(
 
     let stream = async_stream::stream! {
         let _guard = guard;
+        let _permit = permit;
         let mut rx = rx;
         while let Some(event) = rx.recv().await {
             yield Ok(turn_event_to_sse(event));

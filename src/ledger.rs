@@ -263,7 +263,12 @@ pub fn project(event: &EntityEvent, id: u64, at: DateTime<Utc>) -> Option<Ledger
             id,
             at,
             kind: LedgerKind::Provider,
-            name: truncated(&format!("{error_kind}: {error}"), ERROR_MAX_BYTES),
+            // The vendor's wording (binary paths, quota messages) stays in the
+            // daemon log; the wire carries the kind only.
+            name: {
+                let _ = error;
+                truncated(&format!("provider error: {error_kind}"), ERROR_MAX_BYTES)
+            },
             actor: Some(task_id.clone()),
             outcome: LedgerOutcome::Failed,
             tokens: None,
@@ -663,8 +668,11 @@ mod tests {
         assert_eq!(row.kind, LedgerKind::Provider);
         assert_eq!(row.outcome, LedgerOutcome::Failed);
         assert_eq!(row.actor.as_deref(), Some("thinking-loop"));
-        assert!(row.name.starts_with("rate_limit: xxx"));
-        assert_eq!(row.name.len(), ERROR_MAX_BYTES);
+        assert_eq!(row.name, "provider error: rate_limit");
+        assert!(
+            !row.name.contains("xxx"),
+            "vendor text must not reach the wire"
+        );
     }
 
     #[test]

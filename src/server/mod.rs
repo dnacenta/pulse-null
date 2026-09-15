@@ -60,7 +60,12 @@ pub struct AppState {
     pub leadership: std::sync::atomic::AtomicBool,
     /// Live ledger rows for `/api/events` replay.
     pub ledger: Arc<crate::ledger::LedgerRing>,
+    /// Cap on concurrent long-lived streams (`/api/events`, `/api/chat/stream`).
+    pub stream_permits: Arc<tokio::sync::Semaphore>,
 }
+
+/// Concurrent SSE connections the daemon serves before answering 503.
+pub const MAX_STREAMS: usize = 8;
 
 /// Rebuild AWARENESS.md from the current plugin and tool state.
 ///
@@ -125,6 +130,14 @@ pub async fn awareness_listener(
 
 pub async fn start(config: Config) -> Result<(), Box<dyn std::error::Error>> {
     let provider = crate::providers::create_streaming_provider(&config)?;
+
+    if config.security.secret.is_none() {
+        tracing::warn!(
+            "[security] secret is not set: every request on {}:{} is admitted as the owner",
+            config.server.host,
+            config.server.port
+        );
+    }
 
     let root_dir = config.root_dir()?;
 
@@ -281,6 +294,7 @@ pub async fn start(config: Config) -> Result<(), Box<dyn std::error::Error>> {
         alert_queue: tokio::sync::Mutex::new(alert_queue),
         provider_status: crate::provider_status::new_shared(),
         leadership: std::sync::atomic::AtomicBool::new(false),
+        stream_permits: Arc::new(tokio::sync::Semaphore::new(crate::server::MAX_STREAMS)),
         ledger,
     });
 

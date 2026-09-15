@@ -101,8 +101,23 @@ pub struct LastOutputView {
     pub id: String,
     /// When the run that produced this output finished, from the filename.
     pub at: DateTime<Utc>,
-    /// The output body, with the front matter block removed.
+    /// The output body, with the front matter block removed; the tail of it
+    /// when the run was longer than [`OUTPUT_CAP_BYTES`].
     pub output: String,
+    /// True when `output` is the tail of a longer body.
+    pub truncated: bool,
+}
+
+/// Most bytes of a task's output returned in one response.
+pub const OUTPUT_CAP_BYTES: usize = 64 * 1024;
+
+/// Task ids are `[A-Za-z0-9_-]{1,64}`; anything else is refused up front.
+pub fn valid_id(id: &str) -> bool {
+    !id.is_empty()
+        && id.len() <= 64
+        && id
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
 }
 
 // ---------------------------------------------------------------------------
@@ -177,7 +192,19 @@ pub fn last_output(root: &Path, id: &str) -> Option<LastOutputView> {
     Some(LastOutputView {
         id: id.to_string(),
         at,
-        output: strip_front_matter(&content).trim_end().to_string(),
+        output: {
+            let body = strip_front_matter(&content).trim_end();
+            if body.len() > OUTPUT_CAP_BYTES {
+                let mut start = body.len() - OUTPUT_CAP_BYTES;
+                while !body.is_char_boundary(start) {
+                    start += 1;
+                }
+                body[start..].to_string()
+            } else {
+                body.to_string()
+            }
+        },
+        truncated: strip_front_matter(&content).trim_end().len() > OUTPUT_CAP_BYTES,
     })
 }
 
@@ -295,7 +322,11 @@ fn next_fire(cron: &str, timezone: &str) -> Option<DateTime<Utc>> {
 // ---------------------------------------------------------------------------
 
 /// All tasks with cadence, enabled flag, creator, last run, next fire.
-pub async fn list(State(state): State<Arc<AppState>>) -> ApiResult<Vec<ScheduleTaskView>> {
+pub async fn list(
+    State(state): State<Arc<AppState>>,
+    axum::Extension(who): axum::Extension<crate::server::auth::AuthIdentity>,
+) -> ApiResult<Vec<ScheduleTaskView>> {
+    who.require_owner().map_err(forbidden)?;
     let root = state.root_dir.clone();
     let timezone = state.config.scheduler.timezone.clone();
 
@@ -306,20 +337,39 @@ pub async fn list(State(state): State<Arc<AppState>>) -> ApiResult<Vec<ScheduleT
 /// Enable a task through `Schedule::save_delta` (same path as the CLI).
 pub async fn enable(
     State(state): State<Arc<AppState>>,
+    axum::Extension(who): axum::Extension<crate::server::auth::AuthIdentity>,
     UrlPath(id): UrlPath<String>,
 ) -> ApiResult<ToggleResponse> {
+    who.require_owner().map_err(forbidden)?;
     toggle(state, id, true).await
 }
 
 /// Disable a task through `Schedule::save_delta` (same path as the CLI).
 pub async fn disable(
     State(state): State<Arc<AppState>>,
+    axum::Extension(who): axum::Extension<crate::server::auth::AuthIdentity>,
     UrlPath(id): UrlPath<String>,
 ) -> ApiResult<ToggleResponse> {
+    who.require_owner().map_err(forbidden)?;
     toggle(state, id, false).await
 }
 
 async fn toggle(state: Arc<AppState>, id: String, enabled: bool) -> ApiResult<ToggleResponse> {
+    if !valid_id(&id) {
+        return Err(bad_request("task id must be [A-Za-z0-9_-]{1,64}"));
+    }
+    // "Nothing that writes" while isolated — same rule as /api/sessions/reset.
+    if crate::server::isolation::is_active(&state.root_dir) {
+        return Err((
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({
+                "error": format!(
+                    "{} isolation mode active — schedule writes are shed until /resume",
+                    crate::server::isolation::BANNER
+                )
+            })),
+        ));
+    }
     let root = state.root_dir.clone();
     let timezone = state.config.scheduler.timezone.clone();
     let task_id = id.clone();
@@ -338,8 +388,13 @@ async fn toggle(state: Arc<AppState>, id: String, enabled: bool) -> ApiResult<To
 /// The most recent run's output for a task, or 404.
 pub async fn last(
     State(state): State<Arc<AppState>>,
+    axum::Extension(who): axum::Extension<crate::server::auth::AuthIdentity>,
     UrlPath(id): UrlPath<String>,
 ) -> ApiResult<LastOutputView> {
+    who.require_owner().map_err(forbidden)?;
+    if !valid_id(&id) {
+        return Err(bad_request("task id must be [A-Za-z0-9_-]{1,64}"));
+    }
     let root: PathBuf = state.root_dir.clone();
     let task_id = id.clone();
 
@@ -374,10 +429,23 @@ fn not_found(message: String) -> ApiError {
 }
 
 fn internal(error: &dyn std::fmt::Display) -> ApiError {
+    // The detail (file paths, serde positions) goes to the log, not the client.
+    tracing::error!("schedule API: {error}");
     (
         StatusCode::INTERNAL_SERVER_ERROR,
-        Json(serde_json::json!({ "error": error.to_string() })),
+        Json(serde_json::json!({ "error": "internal error" })),
     )
+}
+
+fn bad_request(message: &str) -> ApiError {
+    (
+        StatusCode::BAD_REQUEST,
+        Json(serde_json::json!({ "error": message })),
+    )
+}
+
+fn forbidden(status: StatusCode) -> ApiError {
+    (status, Json(serde_json::json!({ "error": "owner only" })))
 }
 
 #[cfg(test)]

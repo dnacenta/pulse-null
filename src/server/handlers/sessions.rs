@@ -188,8 +188,12 @@ pub fn project_history(messages: &[pulse_system_types::llm::Message]) -> Vec<His
 /// GET /api/session/{channel}
 pub async fn history(
     State(state): State<Arc<AppState>>,
+    axum::Extension(who): axum::Extension<crate::server::auth::AuthIdentity>,
     Path(channel): Path<String>,
 ) -> Result<Json<HistoryResponse>, (StatusCode, String)> {
+    // Conversations are the owner's. A peer credential must not read them.
+    who.require_owner()
+        .map_err(|s| (s, "owner only".to_string()))?;
     if channel.len() > 64 || channel.contains("..") || channel.contains('/') {
         return Err((StatusCode::BAD_REQUEST, "invalid channel".to_string()));
     }

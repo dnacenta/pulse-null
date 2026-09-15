@@ -119,14 +119,33 @@ fn row_event(row: &LedgerRow) -> Option<Event> {
 }
 
 /// SSE stream of ledger rows. Honours `Last-Event-ID` for replay from the ring.
+///
+/// Owner only (rows describe the owner's entity), and capped by
+/// [`crate::server::MAX_STREAMS`] concurrent connections — a 503 beyond that.
 pub async fn events(
     State(state): State<Arc<AppState>>,
+    axum::Extension(who): axum::Extension<crate::server::auth::AuthIdentity>,
     headers: HeaderMap,
-) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
+) -> Result<Sse<impl Stream<Item = Result<Event, Infallible>>>, StatusCode> {
+    who.require_owner()?;
+    let permit = Arc::clone(&state.stream_permits)
+        .try_acquire_owned()
+        .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
     let rows = ledger_stream(state.ledger.clone(), replay_cursor(&headers));
-    let events = rows.filter_map(|row| row_event(&row).map(Ok));
+    let events = async_stream::stream! {
+        let _permit = permit;
+        let mut rows = std::pin::pin!(rows);
+        while let Some(row) = rows.next().await {
+            if let Some(ev) = row_event(&row) {
+                yield Ok(ev);
+            }
+        }
+    };
 
-    Sse::new(events).keep_alive(KeepAlive::new().interval(Duration::from_secs(KEEP_ALIVE_SECS)))
+    Ok(
+        Sse::new(events)
+            .keep_alive(KeepAlive::new().interval(Duration::from_secs(KEEP_ALIVE_SECS))),
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -189,8 +208,17 @@ pub fn parse_ledger_query(query: &LedgerQuery) -> Result<LedgerFilter, String> {
 /// Backfilled rows from disk: `?since=<rfc3339>&kind=<csv>&limit=<n>`.
 pub async fn ledger(
     State(state): State<Arc<AppState>>,
+    axum::Extension(who): axum::Extension<crate::server::auth::AuthIdentity>,
     Query(query): Query<LedgerQuery>,
 ) -> Result<Json<Vec<LedgerRow>>, (StatusCode, Json<LedgerError>)> {
+    who.require_owner().map_err(|s| {
+        (
+            s,
+            Json(LedgerError {
+                error: "owner only".to_string(),
+            }),
+        )
+    })?;
     let (since, kinds, limit) = parse_ledger_query(&query).map_err(bad_request)?;
 
     let root_dir = state.root_dir.clone();

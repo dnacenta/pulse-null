@@ -216,6 +216,11 @@ fn build_app(state: Arc<AppState>) -> Router {
         .route("/api/chat/stream", post(handlers::chat::chat_stream))
         .route("/api/events", get(handlers::events::events))
         .route("/api/session/{channel}", get(handlers::sessions::history))
+        .route("/api/ledger", get(handlers::events::ledger))
+        .route(
+            "/api/schedule/{id}/disable",
+            post(handlers::schedule::disable),
+        )
         .route_layer(middleware::from_fn_with_state(
             Arc::clone(&state),
             crate::server::auth::require_auth,
@@ -268,6 +273,7 @@ async fn build_state_boxed_with_config(
         alert_queue: tokio::sync::Mutex::new(alert_queue),
         provider_status: crate::provider_status::new_shared(),
         leadership: std::sync::atomic::AtomicBool::new(false),
+        stream_permits: Arc::new(tokio::sync::Semaphore::new(crate::server::MAX_STREAMS)),
         ledger: Arc::new(crate::ledger::LedgerRing::new(64)),
     })
 }
@@ -1428,4 +1434,61 @@ async fn e2e_cancelled_stream_does_not_roll_back_a_queued_turn() {
     assert_eq!(msgs.len(), 2, "trunk should hold only turn B: {texts:?}");
     assert!(texts[0].contains("turn b"), "{texts:?}");
     assert!(texts[1].contains("b reply"), "{texts:?}");
+}
+
+/// A peer credential authenticates but must never reach owner-only surfaces:
+/// conversation history, the ledger, schedule writes.
+#[tokio::test]
+async fn e2e_peer_credential_is_refused_on_owner_only_endpoints() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut config = test_config();
+    config.peers.insert(
+        "nova".to_string(),
+        crate::config::PeerConfig {
+            host: "127.0.0.1".to_string(),
+            port: 3201,
+            secret: Some("peer-secret".to_string()),
+        },
+    );
+    let state = build_state_boxed_with_config(
+        dir.path().to_path_buf(),
+        Box::new(MockProvider::new(vec![])),
+        ToolRegistry::new(),
+        config,
+    )
+    .await;
+    let app = build_app(Arc::clone(&state));
+
+    let as_peer = |method: &str, uri: &str| {
+        Request::builder()
+            .method(method)
+            .uri(uri)
+            .header("X-Peer-Name", "nova")
+            .header("X-Echo-Secret", "peer-secret")
+            .body(Body::empty())
+            .unwrap()
+    };
+    for (m, u) in [
+        ("GET", "/api/session/tui"),
+        ("GET", "/api/ledger"),
+        ("POST", "/api/schedule/thinking-loop/disable"),
+        ("GET", "/api/events"),
+    ] {
+        let r = app.clone().oneshot(as_peer(m, u)).await.unwrap();
+        assert_eq!(r.status(), StatusCode::FORBIDDEN, "{m} {u}");
+    }
+
+    // No global secret configured: a plain local request is the owner.
+    let r = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/api/session/tui")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(r.status(), StatusCode::OK);
 }
