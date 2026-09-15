@@ -217,8 +217,9 @@ pub async fn invoke_with_tool_loop(
         let result = provider
             .invoke(system_prompt, messages, max_tokens, tool_defs_ref)
             .await?;
-        if let Some(done) = finish_round(&mut rs, result, tools, messages, max_rounds).await {
-            return Ok(done);
+        match finish_round(&mut rs, result, tools, messages, max_rounds).await {
+            RoundOutcome::Done(done) => return Ok(done),
+            RoundOutcome::Continue => {}
         }
     }
 }
@@ -259,8 +260,9 @@ pub async fn invoke_with_tool_loop_streaming(
             sink,
         )
         .await?;
-        if let Some(done) = finish_round(&mut rs, result, tools, messages, max_rounds).await {
-            return Ok(done);
+        match finish_round(&mut rs, result, tools, messages, max_rounds).await {
+            RoundOutcome::Done(done) => return Ok(done),
+            RoundOutcome::Continue => {}
         }
     }
 }
@@ -301,17 +303,23 @@ async fn stream_one_round(
     Err("provider stream ended without a final response".into())
 }
 
+/// What one provider round decided.
+enum RoundOutcome {
+    /// Tool results were appended; run another round.
+    Continue,
+    /// The turn is over.
+    Done(ToolLoopResult),
+}
+
 /// Consume one provider response: validate, record, execute any tool calls,
 /// and decide whether the turn is over.
-///
-/// Returns `Some(result)` when the loop must stop, `None` to run another round.
 async fn finish_round(
     rs: &mut RoundState,
     result: LlmResponse,
     tools: &ToolRegistry,
     messages: &mut Vec<Message>,
     max_rounds: u32,
-) -> Option<ToolLoopResult> {
+) -> RoundOutcome {
     rs.total_input_tokens += result.input_tokens.unwrap_or(0);
     rs.total_output_tokens += result.output_tokens.unwrap_or(0);
     rs.final_model = result.model.clone();
@@ -343,7 +351,7 @@ async fn finish_round(
             rounds = rs.rounds,
             "Hallucination guard: response validator truncated hallucinated turns, forcing loop exit"
         );
-        return Some(rs.result(true, false, Vec::new()));
+        return RoundOutcome::Done(rs.result(true, false, Vec::new()));
     }
 
     match result.stop_reason {
@@ -362,7 +370,7 @@ async fn finish_round(
                     );
                 }
             }
-            Some(rs.result(false, false, claim_validation.unmatched_claims))
+            RoundOutcome::Done(rs.result(false, false, claim_validation.unmatched_claims))
         }
         StopReason::ToolUse => {
             rs.rounds += 1;
@@ -373,89 +381,12 @@ async fn finish_round(
                     "Hallucination guard: circuit breaker fired — tool loop exceeded {} rounds",
                     max_rounds
                 );
-                return Some(rs.result(false, true, Vec::new()));
+                return RoundOutcome::Done(rs.result(false, true, Vec::new()));
             }
 
-            // Execute all tool_use blocks and collect results
-            let mut tool_results = Vec::new();
-            let mut round_had_failure = false;
-            let mut round_had_success = false;
-            for block in &result.content {
-                if let ContentBlock::ToolUse { id, name, input } = block {
-                    rs.tools_used.push(name.clone());
-                    let tool_result = match tools.get(name) {
-                        Some(tool) => match tool.execute(input.clone()).await {
-                            Ok(output) => {
-                                round_had_success = true;
-                                ContentBlock::ToolResult {
-                                    tool_use_id: id.clone(),
-                                    content: output,
-                                    is_error: None,
-                                }
-                            }
-                            Err(e) => {
-                                round_had_failure = true;
-                                ContentBlock::ToolResult {
-                                    tool_use_id: id.clone(),
-                                    content: format!("Error: {}", e),
-                                    is_error: Some(true),
-                                }
-                            }
-                        },
-                        None => {
-                            round_had_failure = true;
-                            ContentBlock::ToolResult {
-                                tool_use_id: id.clone(),
-                                content: format!("Error: Unknown tool '{}'", name),
-                                is_error: Some(true),
-                            }
-                        }
-                    };
-                    tool_results.push(tool_result);
-                }
-            }
-
-            // Layer 4: Track consecutive tool failures
-            if round_had_success {
-                // Any success resets the failure counter
-                rs.consecutive_tool_failures = 0;
-            }
-            if round_had_failure && !round_had_success {
-                // Only count if ALL tools in the round failed
-                rs.consecutive_tool_failures += 1;
-            }
-
-            // Inject degraded-state warning when threshold is reached
-            if rs.consecutive_tool_failures >= TOOL_FAILURE_THRESHOLD && !rs.tool_degraded {
-                rs.tool_degraded = true;
-                tracing::warn!(
-                    consecutive_failures = rs.consecutive_tool_failures,
-                    "Hallucination guard: tool degraded state triggered — injecting warning"
-                );
-                // Inject the warning as a system-level user message
-                // so the model sees it before generating its next response
-                tool_results.push(ContentBlock::Text {
-                    text: TOOL_DEGRADED_WARNING.to_string(),
-                });
-            }
-
-            // AE-1: Within-session expectation-violation feedback.
-            // When tool results contain errors or empty results, inject a
-            // metacognitive nudge so the entity adjusts its approach in
-            // real-time rather than continuing with a broken assumption.
-            if round_had_failure && round_had_success {
-                // Mixed results — some tools worked, some didn't.
-                // The entity should notice and adapt.
-                tool_results.push(ContentBlock::Text {
-                    text: EXPECTATION_VIOLATION_MIXED.to_string(),
-                });
-            } else if round_had_failure && !rs.tool_degraded {
-                // All tools failed but we haven't hit degraded state yet.
-                // Nudge the entity to reconsider its approach.
-                tool_results.push(ContentBlock::Text {
-                    text: EXPECTATION_VIOLATION_FAILED.to_string(),
-                });
-            }
+            let (mut tool_results, had_success, had_failure) =
+                execute_tool_calls(tools, &result.content, &mut rs.tools_used).await;
+            append_feedback_nudges(rs, &mut tool_results, had_success, had_failure);
 
             // MicroCompact Tier 1: truncate large tool results before they
             // enter the conversation history. This prevents a single large
@@ -486,12 +417,112 @@ async fn finish_round(
                     tool_use_id: first_tool_id,
                 }),
             });
-            None
+            RoundOutcome::Continue
         }
         StopReason::Other(ref reason) => {
             tracing::warn!("Unexpected stop reason: {}", reason);
-            Some(rs.result(false, false, Vec::new()))
+            RoundOutcome::Done(rs.result(false, false, Vec::new()))
         }
+    }
+}
+
+/// Run every `tool_use` block in `content` and collect the results.
+///
+/// Returns the results plus whether any call succeeded and whether any
+/// failed (an unknown tool counts as a failure).
+async fn execute_tool_calls(
+    tools: &ToolRegistry,
+    content: &[ContentBlock],
+    tools_used: &mut Vec<String>,
+) -> (Vec<ContentBlock>, bool, bool) {
+    let mut results = Vec::new();
+    let mut had_failure = false;
+    let mut had_success = false;
+    for block in content {
+        if let ContentBlock::ToolUse { id, name, input } = block {
+            tools_used.push(name.clone());
+            let result = match tools.get(name) {
+                Some(tool) => match tool.execute(input.clone()).await {
+                    Ok(output) => {
+                        had_success = true;
+                        ContentBlock::ToolResult {
+                            tool_use_id: id.clone(),
+                            content: output,
+                            is_error: None,
+                        }
+                    }
+                    Err(e) => {
+                        had_failure = true;
+                        ContentBlock::ToolResult {
+                            tool_use_id: id.clone(),
+                            content: format!("Error: {}", e),
+                            is_error: Some(true),
+                        }
+                    }
+                },
+                None => {
+                    had_failure = true;
+                    ContentBlock::ToolResult {
+                        tool_use_id: id.clone(),
+                        content: format!("Error: Unknown tool '{}'", name),
+                        is_error: Some(true),
+                    }
+                }
+            };
+            results.push(result);
+        }
+    }
+    (results, had_success, had_failure)
+}
+
+/// Layer 4 + AE-1: track consecutive failures, inject the degraded-state
+/// warning at the threshold, and the expectation-violation nudges.
+fn append_feedback_nudges(
+    rs: &mut RoundState,
+    results: &mut Vec<ContentBlock>,
+    had_success: bool,
+    had_failure: bool,
+) {
+    // Layer 4: Track consecutive tool failures
+    if had_success {
+        // Any success resets the failure counter
+        rs.consecutive_tool_failures = 0;
+    }
+    if had_failure && !had_success {
+        // Only count if ALL tools in the round failed
+        rs.consecutive_tool_failures += 1;
+    }
+
+    // Inject degraded-state warning when threshold is reached
+    if rs.consecutive_tool_failures >= TOOL_FAILURE_THRESHOLD && !rs.tool_degraded {
+        rs.tool_degraded = true;
+        tracing::warn!(
+            consecutive_failures = rs.consecutive_tool_failures,
+            "Hallucination guard: tool degraded state triggered — injecting warning"
+        );
+        // Inject the warning as a system-level user message
+        // so the model sees it before generating its next response
+        results.push(ContentBlock::Text {
+            text: TOOL_DEGRADED_WARNING.to_string(),
+        });
+    }
+
+    // AE-1: Within-session expectation-violation feedback.
+    // When tool results contain errors or empty results, inject a
+    // metacognitive nudge so the entity adjusts its approach in
+    // real-time rather than continuing with a broken assumption.
+    if had_failure && had_success {
+        // Mixed results — some tools worked, some didn't.
+        // The entity should notice and adapt.
+        results.push(ContentBlock::Text {
+            text: EXPECTATION_VIOLATION_MIXED.to_string(),
+        });
+    } else if had_failure && !rs.tool_degraded {
+        // All tools failed but we haven't hit degraded state yet.
+        // Nudge the entity to reconsider its approach.
+        results.push(ContentBlock::Text {
+            text: EXPECTATION_VIOLATION_FAILED.to_string(),
+        });
     }
 }
 
