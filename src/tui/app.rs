@@ -528,3 +528,146 @@ impl App {
         self.talk.record_frame(took);
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+    fn app() -> App {
+        let mut a = App::new(
+            "echo",
+            "m",
+            "D",
+            ThemeWatcher::from_setting("gruvbox"),
+            MotionLevel::Off,
+            Glyphs::from_setting("off"),
+        );
+        a.skip_boot();
+        a
+    }
+
+    fn key(code: KeyCode) -> KeyEvent {
+        KeyEvent::new(code, KeyModifiers::NONE)
+    }
+
+    fn ctrl(c: char) -> KeyEvent {
+        KeyEvent::new(KeyCode::Char(c), KeyModifiers::CONTROL)
+    }
+
+    fn type_text(a: &mut App, s: &str) {
+        for c in s.chars() {
+            a.on_key(key(KeyCode::Char(c)));
+        }
+    }
+
+    #[test]
+    fn colon_opens_the_command_line_only_when_the_prompt_is_empty() {
+        let mut a = app();
+        assert_eq!(a.focus, PaneId::Prompt);
+        a.on_key(key(KeyCode::Char(':')));
+        assert!(matches!(a.float, Some(Float::CmdLine(_))));
+        a.on_key(key(KeyCode::Esc));
+        assert!(a.float.is_none());
+
+        type_text(&mut a, "a:b");
+        assert!(a.float.is_none(), "a colon mid-draft is a character");
+        assert_eq!(a.talk.prompt.text(), "a:b");
+    }
+
+    #[test]
+    fn question_mark_opens_help_for_the_focused_pane() {
+        let mut a = app();
+        a.on_key(key(KeyCode::Char('?')));
+        match &a.float {
+            Some(Float::Help(h)) => assert_eq!(h.title, "prompt"),
+            _ => panic!("help float expected"),
+        }
+        a.on_key(key(KeyCode::Esc));
+        a.set_focus(PaneId::Transcript);
+        a.on_key(key(KeyCode::Char('?')));
+        match &a.float {
+            Some(Float::Help(h)) => assert_eq!(h.title, "transcript"),
+            _ => panic!("help float expected"),
+        }
+    }
+
+    #[test]
+    fn a_float_owns_the_keyboard() {
+        let mut a = app();
+        a.on_key(key(KeyCode::Char(':')));
+        let before = a.focus;
+        a.on_key(ctrl('k'));
+        assert_eq!(a.focus, before, "focus chords do not leak through a float");
+        assert!(a.float.is_some());
+        type_text(&mut a, "quit");
+        assert_eq!(a.on_key(key(KeyCode::Enter)), Action::Quit);
+    }
+
+    #[test]
+    fn q_quits_from_the_transcript_and_asks_first_mid_turn() {
+        let mut a = app();
+        a.set_focus(PaneId::Transcript);
+        assert_eq!(a.on_key(key(KeyCode::Char('q'))), Action::Quit);
+
+        let mut a = app();
+        type_text(&mut a, "hello");
+        a.on_key(key(KeyCode::Enter));
+        assert!(a.talk.turn_active());
+        a.set_focus(PaneId::Transcript);
+        assert_eq!(a.on_key(key(KeyCode::Char('q'))), Action::None);
+        assert!(matches!(a.float, Some(Float::Confirm(_))));
+        assert_eq!(a.on_key(key(KeyCode::Esc)), Action::None);
+        assert!(a.float.is_none(), "Esc stays");
+        a.on_key(key(KeyCode::Char('q')));
+        assert_eq!(
+            a.on_key(key(KeyCode::Enter)),
+            Action::Quit,
+            "Enter confirms"
+        );
+    }
+
+    #[test]
+    fn theme_and_motion_commands_apply_and_notice() {
+        let mut a = app();
+        let before = a.theme.tokens();
+        a.on_key(key(KeyCode::Char(':')));
+        type_text(&mut a, "theme nord");
+        a.on_key(key(KeyCode::Enter));
+        assert_ne!(a.theme.tokens(), before);
+        assert_eq!(
+            a.theme.tokens(),
+            super::super::theme::builtin("nord").unwrap()
+        );
+
+        a.on_key(key(KeyCode::Char(':')));
+        type_text(&mut a, "motion reduced");
+        a.on_key(key(KeyCode::Enter));
+        assert_eq!(a.motion.level(), MotionLevel::Reduced);
+
+        a.on_key(key(KeyCode::Char(':')));
+        type_text(&mut a, "watch");
+        a.on_key(key(KeyCode::Enter));
+        assert!(a.float.is_none());
+        let notices = a
+            .talk
+            .transcript
+            .entries()
+            .iter()
+            .filter(|e| e.who == super::super::transcript::Who::Notice)
+            .count();
+        assert_eq!(notices, 3, "theme, motion and the not-yet page each notice");
+    }
+
+    #[test]
+    fn f_toggles_fullscreen_only_off_the_prompt() {
+        let mut a = app();
+        type_text(&mut a, "f");
+        assert!(!a.fullscreen);
+        assert_eq!(a.talk.prompt.text(), "f");
+        let mut a = app();
+        a.set_focus(PaneId::Transcript);
+        a.on_key(key(KeyCode::Char('f')));
+        assert!(a.fullscreen);
+    }
+}
