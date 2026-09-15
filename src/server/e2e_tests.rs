@@ -1304,3 +1304,128 @@ async fn e2e_session_history_reflects_a_chat_turn() {
     assert_eq!(msgs[1]["role"], "assistant");
     assert_eq!(msgs[1]["text"], "hello back");
 }
+
+/// Streams forever on the first call; answers at once on later buffered
+/// calls. Lets a test queue a real turn behind a hanging streamed one.
+struct HangThenAnswer {
+    calls: AtomicUsize,
+}
+
+impl LmProvider for HangThenAnswer {
+    fn invoke(
+        &self,
+        _system_prompt: &str,
+        _messages: &[Message],
+        _max_tokens: u32,
+        _tools: Option<&[serde_json::Value]>,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<
+                    Output = Result<LlmResponse, Box<dyn std::error::Error + Send + Sync>>,
+                > + Send
+                + '_,
+        >,
+    > {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        Box::pin(async {
+            Ok(LlmResponse {
+                content: vec![ContentBlock::Text {
+                    text: "b reply".to_string(),
+                }],
+                stop_reason: StopReason::EndTurn,
+                model: "mock".to_string(),
+                input_tokens: Some(1),
+                output_tokens: Some(1),
+            })
+        })
+    }
+    fn name(&self) -> &str {
+        "hang-then-answer"
+    }
+}
+
+impl crate::streaming::StreamingProvider for HangThenAnswer {
+    fn supports_streaming(&self) -> bool {
+        true
+    }
+    fn invoke_streaming(
+        &self,
+        _system_prompt: &str,
+        _messages: &[Message],
+        _max_tokens: u32,
+        _tools: Option<&[serde_json::Value]>,
+    ) -> crate::streaming::StreamResult<'_> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        Box::pin(async_stream::stream! {
+            yield crate::streaming::StreamEvent::TextDelta("partial".to_string());
+            std::future::pending::<()>().await;
+        })
+    }
+}
+
+/// A turn queued behind a streamed turn that gets cancelled must survive
+/// intact: the cancelled turn rolls back only its own message, while it
+/// still holds the lock — never after the queued turn has run.
+#[tokio::test]
+async fn e2e_cancelled_stream_does_not_roll_back_a_queued_turn() {
+    use tokio_stream::StreamExt as _;
+
+    let dir = tempfile::tempdir().unwrap();
+    let state = build_state_boxed_with_config(
+        dir.path().to_path_buf(),
+        Box::new(HangThenAnswer {
+            calls: AtomicUsize::new(0),
+        }),
+        ToolRegistry::new(),
+        test_config(),
+    )
+    .await;
+    let app = build_app(Arc::clone(&state));
+
+    // Turn A: streamed, hangs after its first delta while holding the lock.
+    let response = post_chat_stream(&app, "turn a").await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let mut body = response.into_body().into_data_stream();
+    let mut seen = String::new();
+    while !seen.contains("partial") {
+        let chunk = tokio::time::timeout(std::time::Duration::from_secs(5), body.next())
+            .await
+            .expect("stream stalled")
+            .expect("stream ended")
+            .expect("body error");
+        seen.push_str(&String::from_utf8_lossy(&chunk));
+    }
+
+    // Turn B: buffered, queues on the session lock behind A.
+    let app_b = app.clone();
+    let b = tokio::spawn(async move { post_chat(&app_b, "turn b").await });
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+    // The client of A walks away: A is aborted and rolls back under its lock,
+    // then B runs.
+    drop(body);
+    let (status, body_b) = tokio::time::timeout(std::time::Duration::from_secs(5), b)
+        .await
+        .expect("turn b stalled")
+        .unwrap();
+    assert_eq!(status, StatusCode::OK, "{body_b}");
+
+    // Give any (wrong) deferred rollback a chance to run, then check the trunk.
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    let arc = state
+        .session_store
+        .get_existing_by_key("guest:anonymous")
+        .await
+        .expect("session exists");
+    let msgs = arc.read().await.data.messages.clone();
+    let texts: Vec<String> = msgs
+        .iter()
+        .map(|m| match &m.content {
+            pulse_system_types::llm::MessageContent::Text(t) => t.clone(),
+            pulse_system_types::llm::MessageContent::Blocks(b) => format!("{b:?}"),
+        })
+        .collect();
+    assert_eq!(msgs.len(), 2, "trunk should hold only turn B: {texts:?}");
+    assert!(texts[0].contains("turn b"), "{texts:?}");
+    assert!(texts[1].contains("b reply"), "{texts:?}");
+}

@@ -10,7 +10,7 @@ use std::convert::Infallible;
 
 use axum::response::sse::{Event, KeepAlive, Sse};
 use futures_core::Stream;
-use tokio::sync::{mpsc, RwLock};
+use tokio::sync::mpsc;
 
 use crate::interaction::InteractionRecord;
 use crate::server::{injection, AppState};
@@ -244,8 +244,10 @@ pub(crate) async fn run_turn(
         .get_or_create_by_key(&resolved_key, &req.channel, sender_label)
         .await;
 
-    // Lock the session for this request
-    let mut session = session_arc.write().await;
+    // Lock the session for this request. The guard also owns the rollback:
+    // if this future is dropped after the user message is pushed and before
+    // the turn succeeds, the guard truncates while it still holds the lock.
+    let mut session = TurnGuard::new(session_arc.write().await);
     session.touch();
 
     // Ephemeral isolation tail (spec Stage 2: "nothing that writes"): while
@@ -325,8 +327,9 @@ pub(crate) async fn run_turn(
         }),
     });
     // PN-102: a dropped future (streaming client disconnected) rolls the user
-    // message back the same way a failed turn does. Disarmed on success.
-    let rollback = TurnRollback::arm(Arc::clone(&session_arc), trunk_len_before_push);
+    // message back the same way a failed turn does. Disarmed the moment the
+    // provider call succeeds.
+    session.arm(trunk_len_before_push);
 
     // A real human message just arrived — reset the autonomous round counter
     // now, pre-turn, so that even a turn that later refuses or errors still
@@ -551,6 +554,9 @@ pub(crate) async fn run_turn(
 
     let committed_to_quarantine = turn.quarantined;
     let result = turn.result;
+    // The turn succeeded: from here on the messages are committed and a
+    // dropped future must not undo them.
+    session.disarm();
 
     // Re-sample: a turn admitted just before the marker appeared must not
     // write after it. OR of the two samples drives every gate below.
@@ -853,7 +859,6 @@ pub(crate) async fn run_turn(
     // Sticky banner for trusted consumers; concealed from guests (the
     // operating posture is not their business).
     let reveal = isolated && !resolved_key.starts_with("guest:");
-    rollback.disarm();
     Ok(ChatResponse {
         response: if reveal {
             crate::server::isolation::banner_wrap(text)
@@ -868,52 +873,68 @@ pub(crate) async fn run_turn(
     })
 }
 
-/// Rolls a pushed-but-uncommitted user message back if the turn future is
-/// dropped before it succeeds.
+/// The session write guard for one turn, plus the rollback watermark.
 ///
-/// The guard cannot lock the session synchronously in `Drop` (the turn holds
-/// the write guard at that moment), so it schedules the truncate on the
-/// runtime; it runs as soon as the turn's guard is released.
-struct TurnRollback {
-    session: Option<Arc<RwLock<Session>>>,
-    len: usize,
+/// Rolling back has to happen while this guard still owns the lock. A
+/// deferred rollback that re-acquires the lock is a race: tokio's `RwLock`
+/// is FIFO, so a turn already queued on the same session runs first, and the
+/// late truncate then deletes *that* turn's committed messages. Here the
+/// guard itself truncates in `Drop`, synchronously, before the lock is
+/// released — a dropped future (streaming client gone) rolls back exactly
+/// the messages this turn pushed and nothing else.
+struct TurnGuard<'a> {
+    inner: tokio::sync::RwLockWriteGuard<'a, Session>,
+    /// Trunk length before this turn's user message; `Some` while armed.
+    watermark: Option<usize>,
 }
 
-impl TurnRollback {
-    fn arm(session: Arc<RwLock<Session>>, len: usize) -> Self {
+impl<'a> TurnGuard<'a> {
+    fn new(inner: tokio::sync::RwLockWriteGuard<'a, Session>) -> Self {
         Self {
-            session: Some(session),
-            len,
+            inner,
+            watermark: None,
         }
     }
 
-    fn disarm(mut self) {
-        self.session = None;
+    /// Roll back to `len` messages if this guard is dropped before `disarm`.
+    fn arm(&mut self, len: usize) {
+        self.watermark = Some(len);
+    }
+
+    /// The turn committed: keep everything.
+    fn disarm(&mut self) {
+        self.watermark = None;
     }
 }
 
-impl Drop for TurnRollback {
+impl std::ops::Deref for TurnGuard<'_> {
+    type Target = Session;
+    fn deref(&self) -> &Session {
+        &self.inner
+    }
+}
+
+impl std::ops::DerefMut for TurnGuard<'_> {
+    fn deref_mut(&mut self) -> &mut Session {
+        &mut self.inner
+    }
+}
+
+impl Drop for TurnGuard<'_> {
     fn drop(&mut self) {
-        let Some(session) = self.session.take() else {
+        let Some(len) = self.watermark.take() else {
             return;
         };
-        let len = self.len;
-        let Ok(handle) = tokio::runtime::Handle::try_current() else {
-            return;
-        };
-        handle.spawn(async move {
-            let mut guard = session.write().await;
-            let now = guard.data.messages.len();
-            if now > len {
-                guard.data.messages.truncate(len);
-                guard.data.compaction.estimated_tokens =
-                    crate::context::estimate_conversation_tokens(&guard.data.messages);
-                tracing::info!(
-                    "[chat] turn cancelled — rolled back {} uncommitted message(s)",
-                    now - len
-                );
-            }
-        });
+        let now = self.inner.data.messages.len();
+        if now > len {
+            self.inner.data.messages.truncate(len);
+            self.inner.data.compaction.estimated_tokens =
+                crate::context::estimate_conversation_tokens(&self.inner.data.messages);
+            tracing::info!(
+                "[chat] turn cancelled — rolled back {} uncommitted message(s)",
+                now - len
+            );
+        }
     }
 }
 
