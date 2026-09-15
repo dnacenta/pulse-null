@@ -61,8 +61,11 @@ impl Entry {
 
     /// Wrapped body rows at `cols`, re-wrapping only what changed.
     ///
-    /// Returns the rows and how many paragraphs were (re)wrapped this call —
-    /// the latter exists for the tests that pin the incremental behaviour.
+    /// A finished entry is wrapped once and served from cache. A streaming
+    /// entry caches every paragraph but its last, which is the only text
+    /// that can still grow. Returns the rows and how many paragraphs were
+    /// (re)wrapped this call — the latter exists for the tests that pin the
+    /// incremental behaviour.
     fn rows(&mut self, cols: usize) -> (Vec<String>, usize) {
         let paras: Vec<&str> = self.text.split('\n').collect();
         let n = paras.len();
@@ -73,16 +76,22 @@ impl Entry {
             self.cache_rows.clear();
             self.cache_paras = 0;
         }
-        // Everything but the last paragraph is stable once written; cache it.
-        while self.cache_paras + 1 < n {
+        let stable = if self.state == EntryState::Streaming {
+            n - 1
+        } else {
+            n
+        };
+        while self.cache_paras < stable {
             let rows = wrap(paras[self.cache_paras], cols);
             self.cache_rows.extend(rows);
             self.cache_paras += 1;
             wrapped_now += 1;
         }
         let mut rows = self.cache_rows.clone();
-        rows.extend(wrap(paras[n - 1], cols));
-        wrapped_now += 1;
+        if stable < n {
+            rows.extend(wrap(paras[n - 1], cols));
+            wrapped_now += 1;
+        }
         (rows, wrapped_now)
     }
 }
@@ -522,9 +531,9 @@ mod tests {
         assert_eq!(t.last_wrapped, 4);
         t.push_delta(" and keeps going with more words");
         lay(&mut t, 20);
-        // Owner: cached prefix has 0 paras, last para re-wrapped (1);
-        // reply: two cached paragraphs untouched, last re-wrapped (1).
-        assert_eq!(t.last_wrapped, 2);
+        // Owner entry is finished and fully cached (0); the reply's two
+        // earlier paragraphs are cached, only its last re-wraps (1).
+        assert_eq!(t.last_wrapped, 1);
     }
 
     #[test]
@@ -617,6 +626,47 @@ mod tests {
         t.push_delta("hallucinated turn marker follows...");
         t.finish_reply("clean text", true);
         assert_eq!(t.entries()[0].text, "clean text");
+    }
+
+    /// AC3a: a frame's layout cost must stay flat as the transcript grows.
+    /// 2,000 body rows, a streaming reply appending deltas; each layout
+    /// re-wraps only the last paragraph, so the per-frame cost is dominated
+    /// by cloning cached rows, not by wrapping. The bound is loose on
+    /// purpose (debug build, shared CI box); the printed number is the
+    /// evidence, the assertion catches an O(n²) regression.
+    #[test]
+    fn layout_of_2000_lines_stays_flat() {
+        let mut t = Transcript::new();
+        for i in 0..1000 {
+            t.push_owner(&format!("owner message number {i} with a few words in it"));
+            t.open_reply();
+            t.push_delta(&format!("entity reply number {i} — also a few words"));
+            t.finish_reply("", false);
+        }
+        t.open_reply();
+        let area = Rect::new(0, 0, 100, 40);
+        // Warm the caches, then time steady-state streaming frames.
+        let _ = t.layout(area, TOKYO_NIGHT, "D", "echo", None);
+        let mut worst = Duration::ZERO;
+        let mut total = Duration::ZERO;
+        let frames = 60;
+        for k in 0..frames {
+            t.push_delta(&format!("word{k} "));
+            let started = Instant::now();
+            let lay = t.layout(area, TOKYO_NIGHT, "D", "echo", None);
+            let took = started.elapsed();
+            worst = worst.max(took);
+            total += took;
+            assert!(lay.total_rows > 2000);
+            assert_eq!(t.last_wrapped, 1, "only the streaming paragraph re-wraps");
+        }
+        eprintln!(
+            "2000-line transcript: {} layouts, avg {:?}, worst {:?}",
+            frames,
+            total / frames,
+            worst
+        );
+        assert!(worst < Duration::from_millis(50), "worst layout {worst:?}");
     }
 
     #[test]
