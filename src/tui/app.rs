@@ -13,10 +13,12 @@ use tachyonfx::Motion as Sweep;
 
 use super::bar::{self, BarState, DaemonState, Glyphs};
 use super::boot::Boot;
+use super::floats::{CmdLine, Command, Confirm, FloatAction, Help};
+use super::keymap::{self, Context};
 use super::motion::{Key, Moment, Motion, MotionLevel, Palette};
 use super::pages::talk::{Talk, TalkAction};
 use super::pane::{neighbour, Dir, PaneId};
-use super::theme::{ThemeWatcher, Tokens, BUILTIN_NAMES};
+use super::theme::{ThemeWatcher, Tokens};
 
 /// Smallest terminal the shell draws in.
 pub const MIN_COLS: u16 = 60;
@@ -36,6 +38,13 @@ pub enum Action {
     Quit,
 }
 
+/// The float on top of the page, if any.
+pub enum Float {
+    CmdLine(CmdLine),
+    Confirm(Confirm),
+    Help(Help),
+}
+
 pub struct App {
     pub screen: Screen,
     pub focus: PaneId,
@@ -49,12 +58,11 @@ pub struct App {
     pub owner: String,
     tick: u64,
     last_frame: Instant,
-    /// Index into `BUILTIN_NAMES` for the temporary theme-cycle key.
-    theme_cycle: usize,
     /// The area the last frame was drawn in, for effect targeting.
     last_area: Rect,
     /// Screen to show once the boot dissolve has finished.
     pending: Option<Screen>,
+    pub float: Option<Float>,
 }
 
 impl App {
@@ -80,9 +88,9 @@ impl App {
             owner: owner.to_string(),
             tick: 0,
             last_frame: Instant::now(),
-            theme_cycle: 0,
             last_area: Rect::default(),
             pending: None,
+            float: None,
         }
     }
 
@@ -108,6 +116,29 @@ impl App {
                 self.switch_pending();
             }
         }
+    }
+
+    /// `pulse-null chat` with a daemon already up: no boot screen at all.
+    pub fn skip_boot(&mut self) {
+        self.bar.daemon = DaemonState::Connected;
+        self.screen = Screen::Talk;
+        self.pending = None;
+    }
+
+    /// The daemon stopped answering: the bar says so and sending is disabled
+    /// until it is back.
+    pub fn daemon_lost(&mut self, retry_in: Duration) {
+        self.bar.daemon = DaemonState::Unreachable;
+        self.talk.set_offline(Some(format!(
+            "daemon unreachable, retrying in {}s",
+            retry_in.as_secs().max(1)
+        )));
+    }
+
+    /// The daemon is back.
+    pub fn daemon_back(&mut self) {
+        self.bar.daemon = DaemonState::Connected;
+        self.talk.set_offline(None);
     }
 
     /// Complete a screen change that was waiting on the boot dissolve.
@@ -159,6 +190,12 @@ impl App {
             return Action::None;
         }
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+
+        // A float owns the keyboard while it is open.
+        if self.float.is_some() {
+            return self.float_key(key);
+        }
+
         // Global chords first: Ctrl+hjkl never conflicts with typing.
         match (key.code, ctrl) {
             (KeyCode::Char('h'), true) => return self.move_focus(Dir::Left),
@@ -174,32 +211,152 @@ impl App {
                 _ => Action::None,
             };
         }
-        // Plain letters belong to the prompt while it has focus.
-        if self.focus != PaneId::Prompt {
-            match (key.code, ctrl) {
-                (KeyCode::Char('f'), false) => {
-                    self.fullscreen = !self.fullscreen;
+        // `:` and `?` open floats from anywhere except an in-progress prompt
+        // draft, where they are ordinary characters.
+        let prompt_typing = self.focus == PaneId::Prompt && !self.talk.prompt.is_empty();
+        if !prompt_typing {
+            match key.code {
+                KeyCode::Char(':') => {
+                    self.open_float(Float::CmdLine(CmdLine::new()));
                     return Action::None;
                 }
-                // Temporary until `:theme` lands: cycle the built-in palettes.
-                (KeyCode::Char('T'), false) => {
-                    self.theme_cycle = (self.theme_cycle + 1) % BUILTIN_NAMES.len();
-                    let before = self.theme.tokens();
-                    if self.theme.set_builtin(BUILTIN_NAMES[self.theme_cycle]) {
-                        self.theme_changed(before);
-                    }
+                KeyCode::Char('?') => {
+                    self.open_help();
                     return Action::None;
                 }
                 _ => {}
             }
         }
+        // Plain letters belong to the prompt while it has focus.
+        if self.focus != PaneId::Prompt {
+            if let (KeyCode::Char('f'), false) = (key.code, ctrl) {
+                self.fullscreen = !self.fullscreen;
+                return Action::None;
+            }
+        }
         match self.talk.on_key(key, self.focus) {
-            TalkAction::Quit => Action::Quit,
+            TalkAction::Quit => self.request_quit(),
             TalkAction::Focus(id) => {
                 self.set_focus(id);
                 Action::None
             }
             TalkAction::None => Action::None,
+        }
+    }
+
+    /// Quit now, or ask first when a reply is still streaming.
+    fn request_quit(&mut self) -> Action {
+        if self.talk.turn_active() {
+            self.open_float(Float::Confirm(Confirm {
+                question: "A reply is still streaming. Quit anyway?".to_string(),
+                yes: "quit",
+            }));
+            Action::None
+        } else {
+            Action::Quit
+        }
+    }
+
+    fn open_help(&mut self) {
+        let (ctx, title) = match (self.screen, self.focus) {
+            (Screen::Boot, _) => (Context::Boot, "boot"),
+            (Screen::Talk, PaneId::Prompt) => (
+                Context::Prompt {
+                    turn_active: self.talk.turn_active(),
+                },
+                "prompt",
+            ),
+            (Screen::Talk, PaneId::Transcript) => (Context::Transcript, "transcript"),
+        };
+        self.open_float(Float::Help(Help { ctx, title }));
+    }
+
+    fn float_rect(&self, area: Rect) -> Rect {
+        match &self.float {
+            Some(Float::CmdLine(_)) => CmdLine::rect(area),
+            Some(Float::Confirm(_)) => Confirm::rect(area),
+            Some(Float::Help(h)) => h.rect(area),
+            None => Rect::default(),
+        }
+    }
+
+    fn open_float(&mut self, float: Float) {
+        self.float = Some(float);
+        let area = self.last_area;
+        let rect = self.float_rect(area);
+        self.motion
+            .add(Key::Float, Moment::FloatOpen, rect, self.palette());
+        self.motion.add(
+            Key::Backdrop,
+            Moment::Backdrop { keep: rect },
+            area,
+            self.palette(),
+        );
+    }
+
+    fn close_float(&mut self) {
+        self.float = None;
+        self.motion.cancel(&Key::Float);
+        self.motion.cancel(&Key::Backdrop);
+    }
+
+    fn float_key(&mut self, key: KeyEvent) -> Action {
+        let action = match self.float.as_mut() {
+            Some(Float::CmdLine(c)) => c.on_key(key),
+            Some(Float::Confirm(_)) => Confirm::on_key(key),
+            Some(Float::Help(_)) => Help::on_key(key),
+            None => FloatAction::Close,
+        };
+        match action {
+            FloatAction::None => Action::None,
+            FloatAction::Close => {
+                self.close_float();
+                Action::None
+            }
+            FloatAction::Notice(text) => {
+                self.close_float();
+                self.talk.notice(&text);
+                Action::None
+            }
+            FloatAction::Run(cmd) => {
+                let was_confirm = matches!(self.float, Some(Float::Confirm(_)));
+                self.close_float();
+                self.run_command(cmd, was_confirm)
+            }
+        }
+    }
+
+    fn run_command(&mut self, cmd: Command, confirmed: bool) -> Action {
+        match cmd {
+            Command::Quit => {
+                if confirmed {
+                    Action::Quit
+                } else {
+                    self.request_quit()
+                }
+            }
+            Command::Help => {
+                self.open_help();
+                Action::None
+            }
+            Command::Theme(name) => {
+                let before = self.theme.tokens();
+                if name == "system" {
+                    self.theme.set_system();
+                } else {
+                    self.theme.set_builtin(&name);
+                }
+                if self.theme.tokens() != before {
+                    self.theme_changed(before);
+                }
+                self.talk.notice(&format!("theme: {name}"));
+                Action::None
+            }
+            Command::Motion(level) => {
+                self.motion.set_level(level);
+                self.talk.notice(&format!("motion: {}", level.as_str()));
+                Action::None
+            }
         }
     }
 
@@ -246,32 +403,29 @@ impl App {
         content
     }
 
+    /// Bottom-line hints, generated from the same keymap as `?`.
     fn hints(&self) -> Vec<(&'static str, &'static str)> {
-        match self.screen {
-            Screen::Boot => vec![("q", "quit")],
-            Screen::Talk if self.focus == PaneId::Prompt => vec![
-                ("Enter", "send"),
-                ("Shift+Enter", "newline"),
-                (
-                    "Ctrl+c",
-                    if self.talk.turn_active() {
-                        "cancel"
-                    } else {
-                        "quit"
-                    },
-                ),
-                ("Esc", "transcript"),
-                ("Ctrl+hjkl", "focus"),
-            ],
-            Screen::Talk => vec![
-                ("j/k", "scroll"),
-                ("G", "tail"),
-                ("i", "prompt"),
-                ("f", "fullscreen"),
-                ("T", "theme"),
-                ("q", "quit"),
-            ],
+        if let Some(reason) = self.talk.offline_reason() {
+            // Sending is off: say why instead of listing keys that will not work.
+            let _ = reason;
+            return vec![("daemon unreachable", "retrying — Ctrl+c quit, ? keys")];
         }
+        let ctx = match (self.screen, self.focus, &self.float) {
+            (_, _, Some(Float::CmdLine(_))) => Context::CmdLine,
+            (_, _, Some(Float::Confirm(_))) => Context::Confirm,
+            (_, _, Some(Float::Help(_))) => Context::Help,
+            (Screen::Boot, _, None) => Context::Boot,
+            (Screen::Talk, PaneId::Prompt, None) => Context::Prompt {
+                turn_active: self.talk.turn_active(),
+            },
+            (Screen::Talk, PaneId::Transcript, None) => Context::Transcript,
+        };
+        let mut h = keymap::hints(ctx, 4);
+        if self.float.is_none() && self.screen == Screen::Talk {
+            h.push((":", "command"));
+            h.push(("?", "keys"));
+        }
+        h
     }
 
     /// Draw one frame and run the effects over it.
@@ -347,6 +501,12 @@ impl App {
                         palette,
                     );
                     bar::draw_hints(frame, bottom, &self.hints(), t);
+                }
+                match self.float.as_mut() {
+                    Some(Float::CmdLine(c)) => c.render(frame, area, t),
+                    Some(Float::Confirm(c)) => c.render(frame, area, t),
+                    Some(Float::Help(h)) => h.render(frame, area, t),
+                    None => {}
                 }
             }
         }

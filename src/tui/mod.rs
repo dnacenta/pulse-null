@@ -9,6 +9,8 @@ pub mod app;
 pub mod bar;
 pub mod boot;
 pub mod client;
+pub mod floats;
+pub mod keymap;
 pub mod motion;
 pub mod pages;
 pub mod pane;
@@ -49,9 +51,28 @@ const TURN_TICK: Duration = Duration::from_millis(100);
 const BAR_TICK: Duration = Duration::from_secs(5);
 /// Omarchy theme file poll cadence.
 const THEME_TICK: Duration = Duration::from_secs(2);
+/// Reconnect backoff bounds after the daemon stops answering.
+const BACKOFF_MIN: Duration = Duration::from_millis(500);
+const BACKOFF_MAX: Duration = Duration::from_secs(8);
 
-/// Run the TUI for the entity described by `config`.
+/// The delay after `previous` failed: doubled, capped.
+#[must_use]
+pub fn next_backoff(previous: Duration) -> Duration {
+    (previous * 2).min(BACKOFF_MAX)
+}
+
+/// Run the TUI for the entity described by `config`, starting with the boot
+/// screen (`pulse-null up`).
 pub async fn run(config: Config) -> Result<(), Box<dyn std::error::Error>> {
+    run_with(config, false).await
+}
+
+/// `pulse-null chat`: when a daemon is already up, open straight into Talk.
+pub async fn run_chat(config: Config) -> Result<(), Box<dyn std::error::Error>> {
+    run_with(config, true).await
+}
+
+async fn run_with(config: Config, skip_boot: bool) -> Result<(), Box<dyn std::error::Error>> {
     let client = Client::new(
         &config.server.host,
         config.server.port,
@@ -94,6 +115,8 @@ pub async fn run(config: Config) -> Result<(), Box<dyn std::error::Error>> {
     );
     if !attached_at_start {
         app.boot.status = "starting the daemon".to_string();
+    } else if skip_boot {
+        app.skip_boot();
     }
 
     let result = event_loop(&mut terminal, &mut app, &client, attached_at_start).await;
@@ -137,7 +160,10 @@ async fn event_loop(
     let mut bar_tick = tokio::time::interval(BAR_TICK);
     let mut theme_tick = tokio::time::interval(THEME_TICK);
     let attach_deadline = Instant::now() + ATTACH_TIMEOUT;
-    let mut probe_tick = tokio::time::interval(Duration::from_millis(250));
+    // Probing: fast while a daemon we started comes up; exponential backoff
+    // once a daemon we had has gone away.
+    let mut backoff = Duration::from_millis(250);
+    let mut next_probe = tokio::time::Instant::now() + backoff;
     let mut dirty = true;
 
     // Ledger stream: opened once attached; rows arrive as they happen.
@@ -222,12 +248,21 @@ async fn event_loop(
                     Some(Err(e)) => {
                         tracing::warn!("ledger stream error: {e}");
                         ledger = None;
-                        app.bar.daemon = DaemonState::Unreachable;
                         attached = false;
+                        backoff = BACKOFF_MIN;
+                        next_probe = tokio::time::Instant::now() + backoff;
+                        app.daemon_lost(backoff);
                         dirty = true;
                     }
                     None => {
+                        // A clean close is the daemon shutting down: treat it
+                        // like a loss so the bar and prompt say so at once.
+                        tracing::info!("ledger stream closed by the daemon");
                         ledger = None;
+                        attached = false;
+                        backoff = BACKOFF_MIN;
+                        next_probe = tokio::time::Instant::now() + backoff;
+                        app.daemon_lost(backoff);
                         dirty = true;
                     }
                 }
@@ -258,15 +293,25 @@ async fn event_loop(
                 app.talk.tick();
                 dirty = true;
             }
-            _ = probe_tick.tick(), if !attached => {
+            _ = tokio::time::sleep_until(next_probe), if !attached => {
                 if client.probe().await {
                     attached = true;
+                    backoff = Duration::from_millis(250);
                     app.attached();
+                    app.daemon_back();
                     refresh_bar(app, client).await;
                     load_history(app, client).await;
                     dirty = true;
-                } else if Instant::now() > attach_deadline && app.screen == app::Screen::Boot {
-                    app.boot.status = format!("no daemon at {} — still trying (q to quit)", client.base());
+                } else {
+                    if app.screen == app::Screen::Boot {
+                        if Instant::now() > attach_deadline {
+                            app.boot.status = format!("no daemon at {} — still trying (q to quit)", client.base());
+                        }
+                    } else {
+                        backoff = next_backoff(backoff.max(BACKOFF_MIN));
+                        app.daemon_lost(backoff);
+                    }
+                    next_probe = tokio::time::Instant::now() + backoff;
                     dirty = true;
                 }
             }
@@ -279,6 +324,13 @@ async fn event_loop(
             }
             _ = bar_tick.tick(), if attached => {
                 refresh_bar(app, client).await;
+                if app.bar.daemon == DaemonState::Unreachable {
+                    attached = false;
+                    ledger = None;
+                    backoff = BACKOFF_MIN;
+                    next_probe = tokio::time::Instant::now() + backoff;
+                    app.daemon_lost(backoff);
+                }
                 dirty = true;
             }
             _ = theme_tick.tick() => {
@@ -373,5 +425,24 @@ async fn refresh_bar(app: &mut App, client: &Client) {
     }
     if let Ok(n) = client.alerts_count().await {
         app.bar.alerts = Some(n);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn backoff_doubles_and_caps() {
+        let mut d = BACKOFF_MIN;
+        let mut seen = vec![d];
+        for _ in 0..6 {
+            d = next_backoff(d);
+            seen.push(d);
+        }
+        assert_eq!(
+            seen.iter().map(|d| d.as_millis()).collect::<Vec<_>>(),
+            vec![500, 1000, 2000, 4000, 8000, 8000, 8000]
+        );
     }
 }

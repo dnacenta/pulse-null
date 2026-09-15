@@ -82,6 +82,8 @@ pub enum Moment {
     FloatOpen,
     /// A float closes.
     FloatClose,
+    /// Everything except `keep` darkens while a float is open.
+    Backdrop { keep: Rect },
     /// The palette changed: crossfade from the previous ink/ground.
     ThemeFade { from_ink: Color, from_ground: Color },
     /// An error row shakes once.
@@ -105,6 +107,7 @@ pub enum Key {
     Row(u64),
     Cursor,
     Float,
+    Backdrop,
     Theme,
     Shake(u64),
     Pop(u64),
@@ -169,6 +172,7 @@ impl Motion {
                     | Moment::Reveal { .. }
                     | Moment::FloatOpen
                     | Moment::FloatClose
+                    | Moment::Backdrop { .. }
                     | Moment::ThemeFade { .. }
                     | Moment::BootOut
             ),
@@ -294,6 +298,12 @@ fn build(moment: Moment, p: Palette) -> Effect {
         ]),
         Moment::FloatOpen => fx::coalesce(timer(220, Interpolation::QuadOut)),
         Moment::FloatClose => fx::dissolve(timer(160, Interpolation::QuadOut)),
+        Moment::Backdrop { keep } => fx::never_complete(fx::darken(
+            Some(0.35),
+            Some(0.35),
+            timer(120, Interpolation::QuadOut),
+        ))
+        .with_filter(CellFilter::Not(Box::new(CellFilter::Area(keep)))),
         Moment::ThemeFade {
             from_ink,
             from_ground,

@@ -128,8 +128,14 @@ impl Client {
         )
     }
 
+    /// Small JSON GETs get a hard timeout so a half-dead daemon cannot stall
+    /// the render loop. Streams (`events`, `chat_stream`) deliberately do not.
     async fn json(&self, path: &str) -> Result<serde_json::Value, ClientError> {
-        let resp = self.get(path).send().await?;
+        let resp = self
+            .get(path)
+            .timeout(std::time::Duration::from_secs(5))
+            .send()
+            .await?;
         let status = resp.status();
         let body = resp.text().await?;
         if !status.is_success() {

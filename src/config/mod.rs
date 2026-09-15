@@ -1094,15 +1094,15 @@ impl Default for SystemPromptBudgetConfig {
 ///
 /// ```toml
 /// [tui]
-/// theme = "system"      # "system" follows Omarchy; or a built-in name
+/// theme = "gruvbox"     # a built-in name, or "system" to follow Omarchy
 /// motion = "full"       # full | reduced | off
 /// nerd_font = "auto"    # auto | on | off
 /// ```
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct TuiConfig {
-    /// `"system"` reads the Omarchy current theme (falling back to
-    /// `tokyo-night`); any other value names a built-in palette.
+    /// A built-in palette name (default `gruvbox`), or `"system"` to read the
+    /// Omarchy current theme (falling back to Gruvbox dark).
     pub theme: String,
     /// `"full"`, `"reduced"` or `"off"`.
     pub motion: String,
@@ -1113,7 +1113,7 @@ pub struct TuiConfig {
 impl Default for TuiConfig {
     fn default() -> Self {
         Self {
-            theme: "system".to_string(),
+            theme: "gruvbox".to_string(),
             motion: "full".to_string(),
             nerd_font: "auto".to_string(),
         }

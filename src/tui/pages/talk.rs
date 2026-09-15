@@ -55,6 +55,8 @@ pub struct Talk {
     throbber: ThrobberState,
     /// Frame times while a turn streams, for the debug summary.
     frame_times: Vec<Duration>,
+    /// Why sending is disabled right now (daemon unreachable), if it is.
+    offline: Option<String>,
 }
 
 impl Default for Talk {
@@ -76,6 +78,7 @@ impl Talk {
             turn_started: None,
             throbber: ThrobberState::default(),
             frame_times: Vec::new(),
+            offline: None,
         }
     }
 
@@ -108,6 +111,21 @@ impl Talk {
     /// Whether the loop should abort the in-flight stream.
     pub fn take_cancel(&mut self) -> bool {
         std::mem::take(&mut self.cancel)
+    }
+
+    /// Disable sending with a reason, or re-enable with `None`.
+    pub fn set_offline(&mut self, reason: Option<String>) {
+        self.offline = reason;
+    }
+
+    #[must_use]
+    pub fn offline_reason(&self) -> Option<&str> {
+        self.offline.as_deref()
+    }
+
+    /// A dim one-line notice in the transcript (command results, errors).
+    pub fn notice(&mut self, text: &str) {
+        self.transcript.push_notice(text);
     }
 
     /// Daemon history replaces the transcript.
@@ -247,6 +265,12 @@ impl Talk {
                     TalkAction::None
                 }
                 (KeyCode::Enter, _, _) => {
+                    if let Some(reason) = &self.offline {
+                        // Keep the draft; say why it did not go.
+                        let r = reason.clone();
+                        self.transcript.push_notice(&format!("not sent — {r}"));
+                        return TalkAction::None;
+                    }
                     let text = self.prompt.take();
                     self.submit(text);
                     TalkAction::None
@@ -612,6 +636,21 @@ mod tests {
             ),
             TalkAction::Quit
         );
+    }
+
+    #[test]
+    fn offline_enter_keeps_the_draft_and_explains() {
+        let mut t = Talk::new();
+        t.set_offline(Some("daemon unreachable".into()));
+        type_text(&mut t, "hello");
+        t.on_key(key(KeyCode::Enter, KeyModifiers::NONE), PaneId::Prompt);
+        assert_eq!(t.prompt.text(), "hello", "draft survives");
+        assert!(t.take_outbox().is_none());
+        assert_eq!(t.transcript.entries().len(), 1);
+        assert_eq!(t.transcript.entries()[0].who, Who::Notice);
+        t.set_offline(None);
+        t.on_key(key(KeyCode::Enter, KeyModifiers::NONE), PaneId::Prompt);
+        assert_eq!(t.take_outbox(), Some("hello".to_string()));
     }
 
     #[test]

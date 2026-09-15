@@ -1,8 +1,9 @@
 //! Palette tokens, built-in themes, and the Omarchy system-theme loader.
 //!
 //! Eight tokens drive every color in the TUI. They come from, in order:
-//! `[tui] theme = "<name>"` (a built-in), the Omarchy current theme when the
-//! config says `"system"`, and finally the built-in Tokyo Night.
+//! `[tui] theme = "<name>"` (a built-in; the default is `gruvbox`), the
+//! Omarchy current theme when the config says `"system"`, and finally the
+//! built-in Gruvbox dark whenever a source cannot be used.
 
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
@@ -25,9 +26,9 @@ pub struct Tokens {
 
 /// Names of the built-in palettes, in `:theme` completion order.
 pub const BUILTIN_NAMES: [&str; 6] = [
+    "gruvbox",
     "tokyo-night",
     "catppuccin",
-    "gruvbox",
     "everforest",
     "rose-pine",
     "nord",
@@ -41,7 +42,20 @@ const fn rgb(hex: u32) -> Color {
     )
 }
 
-/// Tokyo Night — Omarchy's default and the fallback for everything.
+/// Gruvbox dark — the app's own palette and the fallback for everything.
+pub const GRUVBOX_DARK: Tokens = Tokens {
+    ground: rgb(0x282828),
+    ink: rgb(0xebdbb2),
+    dim: rgb(0x928374),
+    accent: rgb(0x83a598),
+    entity: rgb(0x8ec07c),
+    good: rgb(0xb8bb26),
+    warn: rgb(0xfabd2f),
+    bad: rgb(0xfb4934),
+    intent: rgb(0xd3869b),
+};
+
+/// Tokyo Night — Omarchy's default theme.
 pub const TOKYO_NIGHT: Tokens = Tokens {
     ground: rgb(0x1a1b26),
     ink: rgb(0xc0caf5),
@@ -70,17 +84,7 @@ pub fn builtin(name: &str) -> Option<Tokens> {
             bad: rgb(0xf38ba8),
             intent: rgb(0xcba6f7),
         },
-        "gruvbox" => Tokens {
-            ground: rgb(0x282828),
-            ink: rgb(0xebdbb2),
-            dim: rgb(0x928374),
-            accent: rgb(0x83a598),
-            entity: rgb(0x8ec07c),
-            good: rgb(0xb8bb26),
-            warn: rgb(0xfabd2f),
-            bad: rgb(0xfb4934),
-            intent: rgb(0xd3869b),
-        },
+        "gruvbox" | "gruvbox-dark" => GRUVBOX_DARK,
         "everforest" => Tokens {
             ground: rgb(0x2d353b),
             ink: rgb(0xd3c6aa),
@@ -142,7 +146,7 @@ fn parse_hex(s: &str) -> Option<Color> {
 /// `accent`, `cursor`, `selection_*`, `color0`..`color15`. Mapping:
 /// ground←background, ink←foreground, accent←accent (else color4),
 /// dim←color8, entity←color6, good←color2, warn←color3, bad←color1,
-/// intent←color5. Any missing or malformed key falls back to Tokyo Night for
+/// intent←color5. Any missing or malformed key falls back to Gruvbox dark for
 /// that token only; an unreadable or unparsable file is an error, and the
 /// caller falls back wholesale.
 pub fn from_omarchy(path: &Path) -> Result<Tokens, ThemeError> {
@@ -153,7 +157,7 @@ pub fn from_omarchy(path: &Path) -> Result<Tokens, ThemeError> {
 
 fn tokens_from_omarchy_value(value: &toml::Value) -> Tokens {
     let get = |key: &str| value.get(key).and_then(|v| v.as_str()).and_then(parse_hex);
-    let base = TOKYO_NIGHT;
+    let base = GRUVBOX_DARK;
     Tokens {
         ground: get("background").unwrap_or(base.ground),
         ink: get("foreground").unwrap_or(base.ink),
@@ -197,7 +201,7 @@ pub struct ThemeWatcher {
 enum Source {
     /// A named built-in; never changes on its own.
     Builtin,
-    /// Follow the Omarchy file at this path (fallback Tokyo Night).
+    /// Follow the Omarchy file at this path (fallback Gruvbox dark).
     System(PathBuf),
 }
 
@@ -205,23 +209,23 @@ impl ThemeWatcher {
     /// Build from the `[tui] theme` setting.
     ///
     /// `"system"` follows Omarchy when the file exists; an unknown name logs
-    /// a warning and falls back to Tokyo Night.
+    /// a warning and falls back to Gruvbox dark.
     #[must_use]
     pub fn from_setting(setting: &str) -> Self {
         if setting.trim().eq_ignore_ascii_case("system") {
             match omarchy_colors_path() {
                 Some(path) if path.exists() => return Self::system(path),
                 _ => {
-                    tracing::info!("no Omarchy theme found; using built-in tokyo-night");
-                    return Self::builtin(TOKYO_NIGHT);
+                    tracing::info!("no Omarchy theme found; using built-in gruvbox");
+                    return Self::builtin(GRUVBOX_DARK);
                 }
             }
         }
         match builtin(setting) {
             Some(t) => Self::builtin(t),
             None => {
-                tracing::warn!("unknown [tui] theme {setting:?}; using tokyo-night");
-                Self::builtin(TOKYO_NIGHT)
+                tracing::warn!("unknown [tui] theme {setting:?}; using gruvbox");
+                Self::builtin(GRUVBOX_DARK)
             }
         }
     }
@@ -237,7 +241,7 @@ impl ThemeWatcher {
     fn system(path: PathBuf) -> Self {
         let mut w = Self {
             source: Source::System(path),
-            tokens: TOKYO_NIGHT,
+            tokens: GRUVBOX_DARK,
             last_mtime: None,
         };
         w.reload();
@@ -256,7 +260,7 @@ impl ThemeWatcher {
         }
     }
 
-    /// Go back to following the Omarchy theme (or Tokyo Night when absent).
+    /// Go back to following the Omarchy theme (or Gruvbox dark when absent).
     /// Driven by `:theme system` (PN-102 increment 4).
     #[allow(dead_code)]
     pub fn set_system(&mut self) {
@@ -293,8 +297,8 @@ impl ThemeWatcher {
         match from_omarchy(path) {
             Ok(t) => self.tokens = t,
             Err(e) => {
-                tracing::warn!("Omarchy theme unreadable ({e}); using tokyo-night");
-                self.tokens = TOKYO_NIGHT;
+                tracing::warn!("Omarchy theme unreadable ({e}); using gruvbox");
+                self.tokens = GRUVBOX_DARK;
             }
         }
     }
@@ -353,8 +357,8 @@ color8 = "#444b6a"
             toml::from_str("background = \"#000000\"\ncolor2 = \"nonsense\"").unwrap();
         let t = tokens_from_omarchy_value(&v);
         assert_eq!(t.ground, rgb(0x000000));
-        assert_eq!(t.good, TOKYO_NIGHT.good, "malformed value falls back");
-        assert_eq!(t.accent, TOKYO_NIGHT.accent, "missing key falls back");
+        assert_eq!(t.good, GRUVBOX_DARK.good, "malformed value falls back");
+        assert_eq!(t.accent, GRUVBOX_DARK.accent, "missing key falls back");
     }
 
     #[test]
@@ -390,8 +394,16 @@ color8 = "#444b6a"
     }
 
     #[test]
-    fn unknown_setting_falls_back_to_tokyo_night() {
+    fn unknown_setting_falls_back_to_gruvbox() {
         let w = ThemeWatcher::from_setting("does-not-exist");
-        assert_eq!(w.tokens(), TOKYO_NIGHT);
+        assert_eq!(w.tokens(), GRUVBOX_DARK);
+    }
+
+    #[test]
+    fn gruvbox_is_the_default_and_first_builtin() {
+        assert_eq!(BUILTIN_NAMES[0], "gruvbox");
+        assert_eq!(builtin("gruvbox"), Some(GRUVBOX_DARK));
+        assert_eq!(builtin("gruvbox-dark"), Some(GRUVBOX_DARK));
+        assert_eq!(GRUVBOX_DARK.ground, rgb(0x282828));
     }
 }
