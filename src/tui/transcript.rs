@@ -44,6 +44,8 @@ pub struct Entry {
     cache_width: usize,
     cache_rows: Vec<String>,
     cache_paras: usize,
+    /// Every paragraph is in `cache_rows`: `prepare` is a field read.
+    cache_complete: bool,
     /// Rows of the still-growing last paragraph of a streaming entry.
     tail: Vec<String>,
 }
@@ -58,8 +60,24 @@ impl Entry {
             cache_width: 0,
             cache_rows: Vec::new(),
             cache_paras: 0,
+            cache_complete: false,
             tail: Vec::new(),
         }
+    }
+
+    /// Replace the text wholesale (the daemon's authoritative reply). The
+    /// wrap cache describes the old text, so it goes with it.
+    fn set_text(&mut self, text: &str) {
+        self.text.clear();
+        self.text.push_str(text);
+        self.invalidate();
+    }
+
+    fn invalidate(&mut self) {
+        self.cache_rows.clear();
+        self.cache_paras = 0;
+        self.cache_complete = false;
+        self.tail.clear();
     }
 
     /// Refresh the wrap cache for `cols` and return `(row count, paragraphs
@@ -70,15 +88,20 @@ impl Entry {
     /// that can still grow; that one is re-wrapped into `tail`. The second
     /// number exists for the tests that pin the incremental behaviour.
     fn prepare(&mut self, cols: usize) -> (usize, usize) {
+        if self.cache_width != cols {
+            self.cache_width = cols;
+            self.invalidate();
+        }
+        // A finished entry whose cache is complete costs nothing per frame:
+        // no split, no allocation. Text only changes through `push_str` on
+        // a streaming entry or `set_text`, which invalidates.
+        if self.cache_complete {
+            return (self.cache_rows.len(), 0);
+        }
+
         let paras: Vec<&str> = self.text.split('\n').collect();
         let n = paras.len();
         let mut wrapped_now = 0usize;
-
-        if self.cache_width != cols {
-            self.cache_width = cols;
-            self.cache_rows.clear();
-            self.cache_paras = 0;
-        }
         let stable = if self.state == EntryState::Streaming {
             n - 1
         } else {
@@ -95,6 +118,7 @@ impl Entry {
             wrapped_now += 1;
         } else {
             self.tail.clear();
+            self.cache_complete = true;
         }
         (self.cache_rows.len() + self.tail.len(), wrapped_now)
     }
@@ -277,7 +301,7 @@ impl Transcript {
         let arrived_whole = self.deltas == 0 || (self.deltas == 1 && text.len() >= 400);
         if let Some(e) = self.streaming_mut() {
             if truncated || !text.is_empty() {
-                e.text = text.to_string();
+                e.set_text(text);
             }
             e.state = EntryState::Done;
         }
@@ -703,6 +727,67 @@ mod tests {
         assert_eq!(t.entries()[0].text, "clean text");
     }
 
+    /// The wrap cache must go with the text it described: a multi-paragraph
+    /// reply laid out mid-stream, then replaced by a shorter `done.text`,
+    /// renders the replacement — not the cached rows of the cut tail.
+    #[test]
+    fn done_text_replaces_cached_rows_of_a_multi_paragraph_reply() {
+        let mut t = Transcript::new();
+        t.open_reply();
+        t.push_delta("first paragraph\nsecond paragraph\nthird paragraph\nfourth");
+        let mid = lay(&mut t, 20);
+        assert!(
+            mid.total_rows >= 5,
+            "header + 4 body rows: {}",
+            mid.total_rows
+        );
+
+        t.finish_reply("only one", true);
+        let after = lay(&mut t, 20);
+        let text: Vec<String> = after
+            .lines
+            .iter()
+            .map(|l| {
+                l.spans
+                    .iter()
+                    .map(|s| s.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect();
+        assert!(text.iter().any(|l| l.contains("only one")), "{text:?}");
+        assert!(
+            !text
+                .iter()
+                .any(|l| l.contains("second") || l.contains("fourth")),
+            "stale rows survived: {text:?}"
+        );
+        assert_eq!(after.total_rows, mid.total_rows - 3);
+    }
+
+    /// Dropped deltas are repaired by `done.text` even when the reply has
+    /// several paragraphs already cached.
+    #[test]
+    fn done_text_repairs_a_lossy_multi_paragraph_stream() {
+        let mut t = Transcript::new();
+        t.open_reply();
+        t.push_delta("alpha\nbravo\ncharl");
+        let _ = lay(&mut t, 30);
+        t.finish_reply("alpha\nbravo\ncharlie\ndelta", false);
+        let after = lay(&mut t, 30);
+        let text: Vec<String> = after
+            .lines
+            .iter()
+            .map(|l| {
+                l.spans
+                    .iter()
+                    .map(|s| s.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect();
+        assert!(text.iter().any(|l| l.contains("charlie")), "{text:?}");
+        assert!(text.iter().any(|l| l.contains("delta")), "{text:?}");
+    }
+
     /// AC3a: a frame's layout cost must stay flat as the transcript grows.
     /// 2,000 body rows, a streaming reply appending deltas; each layout
     /// re-wraps only the last paragraph, so the per-frame cost is dominated
@@ -734,6 +819,11 @@ mod tests {
             total += took;
             assert!(lay.total_rows > 2000);
             assert_eq!(t.last_wrapped, 1, "only the streaming paragraph re-wraps");
+            assert!(
+                lay.lines.len() <= usize::from(area.height),
+                "layout emits the viewport only, got {} lines",
+                lay.lines.len()
+            );
         }
         eprintln!(
             "2000-line transcript: {} layouts, avg {:?}, worst {:?}",

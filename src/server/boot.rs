@@ -105,7 +105,8 @@ pub async fn boot_entity(
         alert_queue: tokio::sync::Mutex::new(alert_queue),
         provider_status: crate::provider_status::new_shared(),
         leadership: std::sync::atomic::AtomicBool::new(false),
-        stream_permits: Arc::new(tokio::sync::Semaphore::new(crate::server::MAX_STREAMS)),
+        event_permits: crate::server::stream_pools().0,
+        chat_permits: crate::server::stream_pools().1,
         ledger: Arc::new(crate::ledger::LedgerRing::new(
             crate::ledger::DEFAULT_RING_CAPACITY,
         )),

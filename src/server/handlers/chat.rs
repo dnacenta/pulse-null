@@ -13,6 +13,7 @@ use futures_core::Stream;
 use tokio::sync::mpsc;
 
 use crate::interaction::InteractionRecord;
+use crate::server::auth::AuthIdentity;
 use crate::server::{injection, AppState};
 use crate::session_store::{resolve_sender, Session};
 use crate::streaming::StreamingProvider;
@@ -114,9 +115,34 @@ fn validate_request(req: &ChatRequest) -> Result<(), (StatusCode, String)> {
 
 pub async fn chat(
     State(state): State<Arc<AppState>>,
+    axum::Extension(who): axum::Extension<AuthIdentity>,
     Json(req): Json<ChatRequest>,
 ) -> Result<Json<ChatResponse>, (StatusCode, String)> {
-    run_turn(state, req, None).await.map(Json)
+    run_turn(state, req, who, None).await.map(Json)
+}
+
+/// Channels whose session is the owner's by construction.
+fn is_owner_channel(channel: &str) -> bool {
+    matches!(channel, "tui" | "system" | "reflection")
+}
+
+/// A peer credential never reaches an owner channel — 403 before anything
+/// else (the stream endpoint checks this before it opens the stream, so the
+/// refusal is an HTTP status, not an event inside a 200).
+fn refuse_peer_on_owner_channel(
+    who: &AuthIdentity,
+    channel: &str,
+) -> Result<(), (StatusCode, String)> {
+    if let AuthIdentity::Peer(name) = who {
+        if is_owner_channel(channel) {
+            tracing::warn!("peer {name} posted to the owner channel {channel:?}");
+            return Err((
+                StatusCode::FORBIDDEN,
+                "this channel is reserved for the owner".to_string(),
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// Run one conversation turn end to end: identity, isolation, context buffer,
@@ -133,20 +159,29 @@ pub async fn chat(
 pub(crate) async fn run_turn(
     state: Arc<AppState>,
     req: ChatRequest,
+    who: AuthIdentity,
     sink: Option<TurnSink>,
 ) -> Result<ChatResponse, (StatusCode, String)> {
     validate_request(&req)?;
 
-    // Auth is enforced by middleware (server/auth.rs)
-
-    // Resolve sender identity (Phase 1: Unified Session)
+    // Authentication happened in the middleware (server/auth.rs); the
+    // identity it established is what the turn runs as. A peer credential
+    // can never become the owner through the body: the owner channels are
+    // refused, and the session key comes from the credential, not from
+    // `sender` or `channel`.
     let sender_label = req.sender.as_deref().unwrap_or("unknown");
-    let resolved_key = resolve_sender(
-        &req.channel,
-        req.sender.as_deref(),
-        &state.config.owner,
-        &state.config.peers,
-    );
+    let resolved_key = match &who {
+        AuthIdentity::Owner => resolve_sender(
+            &req.channel,
+            req.sender.as_deref(),
+            &state.config.owner,
+            &state.config.peers,
+        ),
+        AuthIdentity::Peer(name) => {
+            refuse_peer_on_owner_channel(&who, &req.channel)?;
+            format!("peer:{name}")
+        }
+    };
 
     // Isolation commands are handled before ANYTHING else touches the turn —
     // including the provider, which may itself be the suspect. Owned by the
@@ -349,6 +384,8 @@ pub(crate) async fn run_turn(
 
     // Tier-2 compaction is shed in isolation: it calls the provider and
     // writes archives — both belong to the subsystems under suspicion.
+    // It can rewrite the trunk under the rollback watermark, so the guard is
+    // re-anchored right after it (see `TurnGuard::rearm_at_last_user`).
     if !isolated {
         // Compact conversation if approaching context budget (Tier 2 — Structured AutoCompact)
         // Extract values before the call to avoid borrow conflicts with &mut messages
@@ -435,6 +472,7 @@ pub(crate) async fn run_turn(
             }
         }
     }
+    session.rearm_at_last_user();
 
     // Invoke LLM with tool loop
     let channel = req.channel.clone();
@@ -913,6 +951,21 @@ impl<'a> TurnGuard<'a> {
     fn disarm(&mut self) {
         self.watermark = None;
     }
+
+    /// Compaction may have replaced older messages with a summary, leaving
+    /// the trunk shorter than the armed watermark; a rollback would then be
+    /// a no-op and the uncommitted user message would survive. Re-anchor at
+    /// the user message we pushed, which compaction keeps as the last entry.
+    fn rearm_at_last_user(&mut self) {
+        let Some(armed) = self.watermark else {
+            return;
+        };
+        let n = self.inner.data.messages.len();
+        let last_is_user = self.inner.data.messages.last().is_some_and(|m| {
+            matches!(m.role, Role::User) && matches!(m.source, Some(MessageSource::Human { .. }))
+        });
+        self.watermark = Some(if last_is_user { n - 1 } else { armed.min(n) });
+    }
 }
 
 impl std::ops::Deref for TurnGuard<'_> {
@@ -957,7 +1010,8 @@ impl Drop for AbortOnDrop {
 }
 
 /// Capacity of the progress channel between the turn and its SSE stream.
-/// Full means the client is slower than the model; the turn then waits.
+/// Full means the client is slower than the model; the event is then dropped
+/// (`try_send`), never awaited — `done.text` is authoritative.
 const STREAM_CHANNEL_CAPACITY: usize = 256;
 
 fn sse_event(ev: &crate::wire::ChatStreamEvent) -> Event {
@@ -1023,10 +1077,12 @@ fn error_to_sse(status: StatusCode, message: String) -> Event {
 /// says the guard fired.
 pub async fn chat_stream(
     State(state): State<Arc<AppState>>,
+    axum::Extension(who): axum::Extension<AuthIdentity>,
     Json(req): Json<ChatRequest>,
 ) -> Result<Sse<impl Stream<Item = Result<Event, Infallible>>>, (StatusCode, String)> {
     validate_request(&req)?;
-    let permit = Arc::clone(&state.stream_permits)
+    refuse_peer_on_owner_channel(&who, &req.channel)?;
+    let permit = Arc::clone(&state.chat_permits)
         .try_acquire_owned()
         .map_err(|_| {
             (
@@ -1038,7 +1094,7 @@ pub async fn chat_stream(
     let (tx, rx) = mpsc::channel::<TurnEvent>(STREAM_CHANNEL_CAPACITY);
     let (done_tx, done_rx) = tokio::sync::oneshot::channel();
     let task = tokio::spawn(async move {
-        let outcome = run_turn(state, req, Some(tx)).await;
+        let outcome = run_turn(state, req, who, Some(tx)).await;
         let _ = done_tx.send(outcome);
     });
     let guard = AbortOnDrop(task.abort_handle());
@@ -1619,6 +1675,42 @@ mod tests {
                 sender: "owner".into(),
             }),
         }
+    }
+
+    /// S2-5: compaction shrinks the trunk under the armed watermark; the
+    /// guard re-anchors at the user message so a cancel still removes it.
+    #[tokio::test]
+    async fn rollback_survives_compaction_under_the_watermark() {
+        let lock =
+            tokio::sync::RwLock::new(Session::new("owner".into(), "tui".into(), "owner".into()));
+        {
+            let mut guard = TurnGuard::new(lock.write().await);
+            for t in ["a", "b", "c", "d"] {
+                guard.data.messages.push(user(t));
+            }
+            let before = guard.data.messages.len();
+            guard.data.messages.push(user("current"));
+            guard.arm(before);
+
+            // Compaction: everything before the current turn folds into one summary.
+            let current = guard.data.messages.pop().unwrap();
+            guard.data.messages.clear();
+            guard.data.messages.push(user("[summary of a..d]"));
+            guard.data.messages.push(current);
+            guard.rearm_at_last_user();
+            // Dropped without disarm: the client went away.
+        }
+        let session = lock.read().await;
+        let texts: Vec<String> = session
+            .data
+            .messages
+            .iter()
+            .map(|m| match &m.content {
+                MessageContent::Text(t) => t.clone(),
+                MessageContent::Blocks(_) => String::new(),
+            })
+            .collect();
+        assert_eq!(texts, vec!["[summary of a..d]".to_string()]);
     }
 
     /// A session whose trunk holds `trunk` then the current user turn `turn`.

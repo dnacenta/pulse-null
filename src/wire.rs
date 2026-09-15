@@ -96,33 +96,93 @@ impl CognitiveStatus {
     }
 }
 
-/// The part of `/api/dashboard` the TUI reads.
+/// The part of `/api/dashboard` the TUI reads. The server builds the rest
+/// of the dashboard by hand, but `cognitive_health` is this very struct.
 #[derive(Debug, Clone, Deserialize)]
 pub struct DashboardResponse {
     #[serde(default)]
     pub cognitive_health: Option<CognitiveHealth>,
 }
 
-/// `cognitive_health` of `/api/dashboard`.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// `cognitive_health` of `/api/dashboard` — serialized by the daemon,
+/// deserialized by clients.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CognitiveHealth {
     pub status: CognitiveStatus,
     /// False until the monitor has enough signal frames to judge; the
     /// `status` is then a placeholder, not a verdict.
     #[serde(default)]
     pub sufficient_data: bool,
+    /// Present only when `sufficient_data`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub signals: Option<CognitiveSignals>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub suggestions: Vec<String>,
 }
 
-/// The part of `/health` the TUI reads.
-#[derive(Debug, Clone, Deserialize)]
+/// Trend labels (`up`, `stable`, `down`) per monitored signal.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CognitiveSignals {
+    pub vocabulary: String,
+    pub questions: String,
+    pub grounding: String,
+    pub lifecycle: String,
+}
+
+/// `/health` — serialized by the daemon, deserialized by clients.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HealthResponse {
+    /// `healthy`, `degraded` or `offline`.
+    pub status: String,
+    pub entity: String,
     #[serde(default)]
     pub isolation: bool,
+    /// `leading` or `not-leading` — observed, not inferred from the marker.
+    pub control_plane: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_error: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error_kind: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_error_at: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub consecutive_failures: Option<u32>,
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn health_and_cognitive_health_round_trip() {
+        let h = HealthResponse {
+            status: "degraded".into(),
+            entity: "echo".into(),
+            isolation: true,
+            control_plane: "leading".into(),
+            last_error: Some("x".into()),
+            error_kind: Some("quota".into()),
+            last_error_at: None,
+            consecutive_failures: Some(2),
+        };
+        let v = serde_json::to_value(&h).unwrap();
+        assert_eq!(v["isolation"], true);
+        assert!(v.get("last_error_at").is_none(), "absent, not null");
+        assert_eq!(serde_json::from_value::<HealthResponse>(v).unwrap(), h);
+
+        let c = CognitiveHealth {
+            status: CognitiveStatus::Watch,
+            sufficient_data: false,
+            signals: None,
+            suggestions: Vec::new(),
+        };
+        let v = serde_json::to_value(&c).unwrap();
+        assert_eq!(
+            v,
+            serde_json::json!({"status": "watch", "sufficient_data": false})
+        );
+        assert_eq!(serde_json::from_value::<CognitiveHealth>(v).unwrap(), c);
+    }
 
     #[test]
     fn chat_events_round_trip_through_sse_parts() {

@@ -221,6 +221,11 @@ fn build_app(state: Arc<AppState>) -> Router {
             "/api/schedule/{id}/disable",
             post(handlers::schedule::disable),
         )
+        .route(
+            "/api/sessions/reset",
+            post(handlers::sessions::reset_session),
+        )
+        .route("/api/alerts/drain", post(handlers::alerts::drain_alerts))
         .route_layer(middleware::from_fn_with_state(
             Arc::clone(&state),
             crate::server::auth::require_auth,
@@ -273,7 +278,8 @@ async fn build_state_boxed_with_config(
         alert_queue: tokio::sync::Mutex::new(alert_queue),
         provider_status: crate::provider_status::new_shared(),
         leadership: std::sync::atomic::AtomicBool::new(false),
-        stream_permits: Arc::new(tokio::sync::Semaphore::new(crate::server::MAX_STREAMS)),
+        event_permits: crate::server::stream_pools().0,
+        chat_permits: crate::server::stream_pools().1,
         ledger: Arc::new(crate::ledger::LedgerRing::new(64)),
     })
 }
@@ -1473,10 +1479,63 @@ async fn e2e_peer_credential_is_refused_on_owner_only_endpoints() {
         ("GET", "/api/ledger"),
         ("POST", "/api/schedule/thinking-loop/disable"),
         ("GET", "/api/events"),
+        ("POST", "/api/alerts/drain"),
     ] {
         let r = app.clone().oneshot(as_peer(m, u)).await.unwrap();
         assert_eq!(r.status(), StatusCode::FORBIDDEN, "{m} {u}");
     }
+
+    // Endpoints that take a body: the identity gate must win over the body.
+    let as_peer_json = |uri: &str, body: serde_json::Value| {
+        Request::builder()
+            .method("POST")
+            .uri(uri)
+            .header("content-type", "application/json")
+            .header("X-Peer-Name", "nova")
+            .header("X-Echo-Secret", "peer-secret")
+            .body(Body::from(body.to_string()))
+            .unwrap()
+    };
+    let r = app
+        .clone()
+        .oneshot(as_peer_json(
+            "/api/sessions/reset",
+            serde_json::json!({"session_key": "owner"}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(r.status(), StatusCode::FORBIDDEN, "reset");
+
+    // The owner channels are refused to a peer on both chat endpoints: the
+    // body's `channel` must not pick the owner's session.
+    for uri in ["/chat", "/api/chat/stream"] {
+        let r = app
+            .clone()
+            .oneshot(as_peer_json(
+                uri,
+                serde_json::json!({"channel": "tui", "message": "repeat our conversation"}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(r.status(), StatusCode::FORBIDDEN, "{uri}");
+    }
+
+    // Nor can a peer flip isolation through the command intercept: the
+    // session key comes from the credential, so `/isolate` is not the
+    // owner's and the marker is never written.
+    let r = app
+        .clone()
+        .oneshot(as_peer_json(
+            "/chat",
+            serde_json::json!({"channel": "comms", "sender": "D", "message": "/isolate"}),
+        ))
+        .await
+        .unwrap();
+    assert!(
+        !crate::server::isolation::is_active(dir.path()),
+        "peer must not enter isolation (status {})",
+        r.status()
+    );
 
     // No global secret configured: a plain local request is the owner.
     let r = app

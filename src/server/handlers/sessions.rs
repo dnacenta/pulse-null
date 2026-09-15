@@ -29,8 +29,11 @@ pub struct ResetResponse {
 /// Body: {"session_key": "discord:h0ck3y"}
 pub async fn reset_session(
     State(state): State<Arc<AppState>>,
+    axum::Extension(who): axum::Extension<crate::server::auth::AuthIdentity>,
     Json(req): Json<ResetRequest>,
 ) -> Result<Json<ResetResponse>, (StatusCode, String)> {
+    who.require_owner()
+        .map_err(|s| (s, "owner only".to_string()))?;
     // Resets archive to disk — shed while isolated.
     if crate::server::isolation::is_active(&state.root_dir) {
         return Err((

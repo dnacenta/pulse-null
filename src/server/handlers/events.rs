@@ -46,15 +46,21 @@ pub fn ledger_stream(
 ) -> impl Stream<Item = LedgerRow> + Send {
     async_stream::stream! {
         let mut live = ring.subscribe();
+        // A cursor from the future (a client-supplied header) is clamped to
+        // the newest id, so it can neither overflow the arithmetic below nor
+        // silence the live stream forever.
+        let after = after.map(|a| a.min(ring.last_id()));
         let replayed = ring.replay(after);
 
         let mut last_id = after.unwrap_or(0);
         // A cursor older than the ring remembers: say how much is gone rather
         // than resuming silently past it. Same id rule as the lag notice.
         if let Some(a) = after {
-            let first_kept = ring.oldest_id().unwrap_or(ring.last_id() + 1);
-            if first_kept > a + 1 {
-                let expired = first_kept - a - 1;
+            let first_kept = ring
+                .oldest_id()
+                .unwrap_or_else(|| ring.last_id().saturating_add(1));
+            let expired = first_kept.saturating_sub(a).saturating_sub(1);
+            if expired > 0 {
                 yield notice(last_id, format!("ledger: {expired} rows expired before reconnect"));
             }
         }
@@ -137,14 +143,14 @@ fn row_event(row: &LedgerRow) -> Option<Event> {
 /// SSE stream of ledger rows. Honours `Last-Event-ID` for replay from the ring.
 ///
 /// Owner only (rows describe the owner's entity), and capped by
-/// [`crate::server::MAX_STREAMS`] concurrent connections — a 503 beyond that.
+/// [`crate::server::MAX_EVENT_STREAMS`] concurrent connections — a 503 beyond that.
 pub async fn events(
     State(state): State<Arc<AppState>>,
     axum::Extension(who): axum::Extension<crate::server::auth::AuthIdentity>,
     headers: HeaderMap,
 ) -> Result<Sse<impl Stream<Item = Result<Event, Infallible>>>, StatusCode> {
     who.require_owner()?;
-    let permit = Arc::clone(&state.stream_permits)
+    let permit = Arc::clone(&state.event_permits)
         .try_acquire_owned()
         .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
     let rows = ledger_stream(state.ledger.clone(), replay_cursor(&headers));
@@ -260,6 +266,7 @@ fn bad_request(error: String) -> (StatusCode, Json<LedgerError>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Duration;
 
     fn row(id: u64) -> LedgerRow {
         LedgerRow {
@@ -343,6 +350,26 @@ mod tests {
         assert_eq!(first.name, "ledger: 2 rows expired before reconnect");
         assert_eq!(stream.next().await.unwrap().id, 4);
         assert_eq!(stream.next().await.unwrap().id, 5);
+    }
+
+    #[tokio::test]
+    async fn stream_clamps_a_cursor_from_the_future() {
+        let ring = Arc::new(LedgerRing::new(8));
+        for _ in 0..3 {
+            let id = ring.next_id();
+            ring.push(row(id));
+        }
+        let stream = ledger_stream(ring.clone(), Some(u64::MAX));
+        tokio::pin!(stream);
+        // No notice, no replay: the first poll (which also subscribes to
+        // live rows) yields nothing...
+        let first = tokio::time::timeout(Duration::from_millis(50), stream.next()).await;
+        assert!(first.is_err(), "nothing to replay for a future cursor");
+        // ...and the next live row still arrives instead of being skipped
+        // forever by an unclamped cursor.
+        let id = ring.next_id();
+        ring.push(row(id));
+        assert_eq!(stream.next().await.unwrap().id, 4);
     }
 
     #[tokio::test]

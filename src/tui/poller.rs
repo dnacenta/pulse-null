@@ -123,6 +123,13 @@ async fn run(
         // cadence until either says the daemon is gone.
         let stream = match client.events(last_id).await {
             Ok(s) => s,
+            Err(super::client::ClientError::Status { status: 503, .. }) => {
+                // The daemon is up but its event pool is full: wait, stay
+                // attached, try again. Not a loss of the daemon.
+                tracing::debug!("event stream pool full; retrying");
+                tokio::time::sleep(BACKOFF_MIN).await;
+                continue;
+            }
             Err(e) => {
                 tracing::warn!("ledger stream unavailable: {e}");
                 attached = false;
