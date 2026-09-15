@@ -5,6 +5,8 @@ use axum::Json;
 
 use pulse_system_types::monitoring::{CognitiveStatus, DocumentHealth, ThresholdStatus, Trend};
 
+use crate::wire::CognitiveStatus as WireStatus;
+
 use crate::server::AppState;
 
 pub async fn dashboard(State(state): State<Arc<AppState>>) -> Json<serde_json::Value> {
@@ -85,13 +87,15 @@ fn doc_json(doc: &DocumentHealth) -> serde_json::Value {
     })
 }
 
+/// The wire form of the monitor's verdict — one definition shared with clients.
 fn status_string(status: &CognitiveStatus) -> &'static str {
     match status {
-        CognitiveStatus::Healthy => "healthy",
-        CognitiveStatus::Watch => "watch",
-        CognitiveStatus::Concern => "concern",
-        CognitiveStatus::Alert => "alert",
+        CognitiveStatus::Healthy => WireStatus::Healthy,
+        CognitiveStatus::Watch => WireStatus::Watch,
+        CognitiveStatus::Concern => WireStatus::Concern,
+        CognitiveStatus::Alert => WireStatus::Alert,
     }
+    .as_str()
 }
 
 fn trend_string(trend: &Trend) -> &'static str {

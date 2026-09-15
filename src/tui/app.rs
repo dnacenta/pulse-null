@@ -139,7 +139,7 @@ impl App {
     pub fn apply_bar(&mut self, u: &super::poller::BarUpdate) {
         self.bar.daemon = DaemonState::Connected;
         self.bar.isolation = u.isolation;
-        self.bar.health.clone_from(&u.health);
+        self.bar.health = u.health;
         self.bar.alerts = u.alerts;
     }
 

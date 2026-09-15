@@ -44,6 +44,7 @@ mod tui;
 mod utils;
 mod vigil;
 mod wal;
+mod wire;
 
 #[derive(Parser)]
 #[command(name = "pulse-null")]

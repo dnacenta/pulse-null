@@ -960,50 +960,52 @@ impl Drop for AbortOnDrop {
 /// Full means the client is slower than the model; the turn then waits.
 const STREAM_CHANNEL_CAPACITY: usize = 256;
 
-fn sse_json(name: &str, value: serde_json::Value) -> Event {
+fn sse_event(ev: &crate::wire::ChatStreamEvent) -> Event {
+    let (name, data) = ev.to_sse_parts();
     // A serde_json::Value always serializes; the Err arm is unreachable.
     Event::default()
-        .event(name)
-        .json_data(value)
+        .event(name.clone())
+        .json_data(data)
         .unwrap_or_else(|_| Event::default().event(name).data("{}"))
 }
 
 /// Encode one turn event for the wire.
 fn turn_event_to_sse(event: TurnEvent) -> Event {
-    match event {
-        TurnEvent::Status(TurnStatus::Thinking) => {
-            sse_json("status", serde_json::json!({ "status": "thinking" }))
-        }
-        TurnEvent::Status(TurnStatus::Responding) => {
-            sse_json("status", serde_json::json!({ "status": "responding" }))
-        }
-        TurnEvent::Status(TurnStatus::Tool(name)) => sse_json(
-            "status",
-            serde_json::json!({ "status": "tool", "name": name }),
-        ),
-        TurnEvent::Delta(text) => sse_json("delta", serde_json::json!({ "text": text })),
-    }
+    use crate::wire::{ChatStreamEvent, TurnPhase};
+    let ev = match event {
+        TurnEvent::Status(TurnStatus::Thinking) => ChatStreamEvent::Status {
+            status: TurnPhase::Thinking,
+            name: None,
+        },
+        TurnEvent::Status(TurnStatus::Responding) => ChatStreamEvent::Status {
+            status: TurnPhase::Responding,
+            name: None,
+        },
+        TurnEvent::Status(TurnStatus::Tool(name)) => ChatStreamEvent::Status {
+            status: TurnPhase::Tool,
+            name: Some(name),
+        },
+        TurnEvent::Delta(text) => ChatStreamEvent::Delta { text },
+    };
+    sse_event(&ev)
 }
 
 fn done_to_sse(resp: ChatResponse) -> Event {
-    sse_json(
-        "done",
-        serde_json::json!({
-            "text": resp.response,
-            "model": resp.model,
-            "tokens_in": resp.input_tokens,
-            "tokens_out": resp.output_tokens,
-            "isolation": resp.isolation,
-            "truncated": resp.truncated,
-        }),
-    )
+    sse_event(&crate::wire::ChatStreamEvent::Done {
+        text: resp.response,
+        model: resp.model,
+        tokens_in: resp.input_tokens,
+        tokens_out: resp.output_tokens,
+        isolation: resp.isolation,
+        truncated: resp.truncated,
+    })
 }
 
 fn error_to_sse(status: StatusCode, message: String) -> Event {
-    sse_json(
-        "error",
-        serde_json::json!({ "status": status.as_u16(), "message": message }),
-    )
+    sse_event(&crate::wire::ChatStreamEvent::Error {
+        status: status.as_u16(),
+        message,
+    })
 }
 
 /// `POST /api/chat/stream` — the same turn as [`chat`], delivered as SSE.

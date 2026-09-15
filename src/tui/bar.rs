@@ -23,8 +23,8 @@ pub struct BarState {
     pub entity: String,
     pub model: String,
     pub daemon: DaemonState,
-    /// Cognitive status from `/api/dashboard`: healthy | watch | concern | alert.
-    pub health: Option<String>,
+    /// Cognitive status from `/api/dashboard`, when it has enough data.
+    pub health: Option<crate::wire::CognitiveStatus>,
     pub isolation: bool,
     pub alerts: Option<usize>,
 }
@@ -128,14 +128,19 @@ pub fn draw_top(
     let (health_glyph, health_color, health_text) = match state.daemon {
         DaemonState::Starting => (g.dot, t.dim, "starting".to_string()),
         DaemonState::Unreachable => (g.dot, t.bad, "daemon unreachable".to_string()),
-        DaemonState::Connected => match state.health.as_deref() {
-            Some("healthy") => (g.dot, t.good, "healthy".to_string()),
-            Some("watch") => (g.dot, t.warn, "watch".to_string()),
-            Some("concern") => (g.dot, t.warn, "concern".to_string()),
-            Some("alert") => (g.dot, t.bad, "alert".to_string()),
-            Some(other) => (g.dot, t.dim, other.to_string()),
-            None => (g.dot, t.dim, "no signal yet".to_string()),
-        },
+        DaemonState::Connected => {
+            use crate::wire::CognitiveStatus as C;
+            match state.health {
+                Some(C::Healthy) => (g.dot, t.good, "healthy".to_string()),
+                Some(C::Watch) | Some(C::Concern) => (
+                    g.dot,
+                    t.warn,
+                    state.health.map_or("", C::as_str).to_string(),
+                ),
+                Some(C::Alert) => (g.dot, t.bad, "alert".to_string()),
+                None => (g.dot, t.dim, "no signal yet".to_string()),
+            }
+        }
     };
     let mut right = vec![Span::styled(
         format!("{health_glyph} {health_text}"),

@@ -160,15 +160,16 @@ impl Talk {
     pub fn on_event(&mut self, ev: ChatEvent) {
         match ev {
             ChatEvent::Status { status, name } => {
-                self.status = match status.as_str() {
-                    "tool" => {
+                use super::super::super::wire::TurnPhase;
+                self.status = match status {
+                    TurnPhase::Tool => {
                         if let Some(n) = &name {
                             self.transcript.note_tool(n);
                         }
                         TurnStatus::Tool(name.unwrap_or_default())
                     }
-                    "responding" => TurnStatus::Responding,
-                    _ => TurnStatus::Thinking,
+                    TurnPhase::Responding => TurnStatus::Responding,
+                    TurnPhase::Thinking => TurnStatus::Thinking,
                 };
             }
             ChatEvent::Delta { text } => {
@@ -567,6 +568,7 @@ mod tests {
             model: "m".into(),
             tokens_in: None,
             tokens_out: None,
+            isolation: false,
             truncated: false,
         });
         assert_eq!(

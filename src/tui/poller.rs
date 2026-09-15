@@ -33,7 +33,7 @@ pub enum Bg {
 pub struct BarUpdate {
     pub isolation: bool,
     /// Cognitive status when the dashboard has enough data; `None` otherwise.
-    pub health: Option<String>,
+    pub health: Option<crate::wire::CognitiveStatus>,
     pub alerts: Option<usize>,
 }
 
@@ -214,19 +214,15 @@ async fn refresh(client: &Client) -> Option<BarUpdate> {
             return None;
         }
     };
-    let cognitive = dashboard.ok().and_then(|d| {
-        // The dashboard reports "healthy" before it has enough signal frames
-        // to judge; the bar says so instead of borrowing a verdict.
-        let ch = &d["cognitive_health"];
-        let sufficient = ch["sufficient_data"].as_bool().unwrap_or(false);
-        if sufficient {
-            ch["status"].as_str().map(str::to_string)
-        } else {
-            None
-        }
-    });
+    // The dashboard reports "healthy" before it has enough signal frames to
+    // judge; the bar says so instead of borrowing a verdict.
+    let cognitive = dashboard
+        .ok()
+        .and_then(|d| d.cognitive_health)
+        .filter(|ch| ch.sufficient_data)
+        .map(|ch| ch.status);
     Some(BarUpdate {
-        isolation: health["isolation"].as_bool().unwrap_or(false),
+        isolation: health.isolation,
         health: cognitive,
         alerts: alerts.ok(),
     })
