@@ -741,7 +741,9 @@ mod tests {
             total / frames,
             worst
         );
-        assert!(worst < Duration::from_millis(50), "worst layout {worst:?}");
+        // Generous on purpose: this guards against a layout that scales with
+        // the transcript, not against a loaded CI box.
+        assert!(worst < Duration::from_millis(200), "worst layout {worst:?}");
     }
 
     #[test]

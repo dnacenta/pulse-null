@@ -325,15 +325,25 @@ enum ArchiveAction {
 
 /// Where the TUI sends its logs: stdout belongs to the screen while the TUI
 /// runs, so `pulse-null up` (without `--headless`) and `pulse-null chat` log
-/// to `logs/tui.log` under the current directory instead.
-fn open_tui_log() -> Option<std::fs::File> {
-    let dir = std::path::Path::new("logs");
-    std::fs::create_dir_all(dir).ok()?;
+/// to `logs/tui.log` under the entity root (where `pulse-null.toml` lives;
+/// the current directory when none is found). The file is owner-only and a
+/// symlink in its place is refused, since the log can carry request details.
+fn open_tui_log() -> Result<std::fs::File, String> {
+    use std::os::unix::fs::OpenOptionsExt as _;
+    let root = config::Config::find_config()
+        .ok()
+        .and_then(|p| p.parent().map(std::path::Path::to_path_buf))
+        .unwrap_or_else(|| std::path::PathBuf::from("."));
+    let dir = root.join("logs");
+    std::fs::create_dir_all(&dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+    let path = dir.join("tui.log");
     std::fs::OpenOptions::new()
         .create(true)
         .append(true)
-        .open(dir.join("tui.log"))
-        .ok()
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(&path)
+        .map_err(|e| format!("{}: {e}", path.display()))
 }
 
 #[tokio::main]
@@ -348,15 +358,18 @@ async fn main() {
     );
     if tui_mode {
         match open_tui_log() {
-            Some(file) => tracing_subscriber::fmt()
+            Ok(file) => tracing_subscriber::fmt()
                 .with_env_filter(filter)
                 .with_ansi(false)
                 .with_writer(std::sync::Arc::new(file))
                 .init(),
-            None => tracing_subscriber::fmt()
-                .with_env_filter(filter)
-                .with_writer(std::io::sink)
-                .init(),
+            Err(e) => {
+                eprintln!("pulse-null: cannot open the TUI log ({e}); logging is off for this run");
+                tracing_subscriber::fmt()
+                    .with_env_filter(filter)
+                    .with_writer(std::io::sink)
+                    .init();
+            }
         }
     } else {
         tracing_subscriber::fmt().with_env_filter(filter).init();

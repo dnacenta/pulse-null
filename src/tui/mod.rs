@@ -71,12 +71,13 @@ async fn run_with(config: Config, skip_boot: bool) -> Result<(), Box<dyn std::er
     // Attach or spawn. The daemon owns the provider, tools and sessions;
     // this process only ever talks to it over HTTP.
     let mut daemon_task = None;
+    let (daemon_stop, stop_rx) = tokio::sync::watch::channel(false);
     let attached_at_start = client.probe().await;
     if !attached_at_start {
         tracing::info!("no daemon at {}; starting one in-process", client.base());
         let cfg = config.clone();
         daemon_task = Some(tokio::spawn(async move {
-            if let Err(e) = crate::server::start(cfg).await {
+            if let Err(e) = crate::server::start_with_shutdown(cfg, Some(stop_rx)).await {
                 tracing::error!("daemon exited with error: {e}");
             }
         }));
@@ -121,15 +122,11 @@ async fn run_with(config: Config, skip_boot: bool) -> Result<(), Box<dyn std::er
     let _ = execute!(std::io::stdout(), crossterm::event::DisableBracketedPaste);
     ratatui::restore();
 
-    // We started the daemon: shut it down the way systemd would, so sessions
-    // archive and the pidfile is removed. The handler tokio installed in
-    // `server::start` turns the signal into a graceful shutdown.
+    // We started the daemon: stop it the way systemd would, so sessions
+    // archive and the pidfile is removed. The stop flag feeds the same
+    // graceful-shutdown path as SIGTERM.
     if let Some(task) = daemon_task {
-        // SAFETY: raise() is async-signal-safe and only delivers SIGTERM to
-        // this process, whose handler is already installed by the daemon task.
-        unsafe {
-            libc::raise(libc::SIGTERM);
-        }
+        let _ = daemon_stop.send(true);
         match tokio::time::timeout(Duration::from_secs(40), task).await {
             Ok(_) => tracing::info!("in-process daemon stopped"),
             Err(_) => tracing::warn!("in-process daemon did not stop within 40 s"),

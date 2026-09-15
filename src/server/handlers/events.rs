@@ -49,6 +49,15 @@ pub fn ledger_stream(
         let replayed = ring.replay(after);
 
         let mut last_id = after.unwrap_or(0);
+        // A cursor older than the ring remembers: say how much is gone rather
+        // than resuming silently past it. Same id rule as the lag notice.
+        if let Some(a) = after {
+            let first_kept = ring.oldest_id().unwrap_or(ring.last_id() + 1);
+            if first_kept > a + 1 {
+                let expired = first_kept - a - 1;
+                yield notice(last_id, format!("ledger: {expired} rows expired before reconnect"));
+            }
+        }
         for row in replayed {
             last_id = last_id.max(row.id);
             yield row;
@@ -69,22 +78,29 @@ pub fn ledger_stream(
                     // a notice about this connection, not a ledger entry, and
                     // handing it an id would move the client's resume point
                     // past a row it never received.
-                    yield LedgerRow {
-                        id: last_id,
-                        at: Utc::now(),
-                        kind: LedgerKind::Alert,
-                        name: format!("ledger: {dropped} rows dropped (stream lagged)"),
-                        actor: None,
-                        outcome: LedgerOutcome::None,
-                        tokens: None,
-                        duration_ms: None,
-                        journal_delta: Vec::new(),
-                        detail_ref: None,
-                    };
+                    yield notice(last_id, format!("ledger: {dropped} rows dropped (stream lagged)"));
                 }
                 Err(RecvError::Closed) => break,
             }
         }
+    }
+}
+
+/// A row about this connection rather than the ledger. It reuses the
+/// client's current id so its resume point never moves past a row it has
+/// not received.
+fn notice(id: u64, name: String) -> LedgerRow {
+    LedgerRow {
+        id,
+        at: Utc::now(),
+        kind: LedgerKind::Alert,
+        name,
+        actor: None,
+        outcome: LedgerOutcome::None,
+        tokens: None,
+        duration_ms: None,
+        journal_delta: Vec::new(),
+        detail_ref: None,
     }
 }
 
@@ -310,6 +326,37 @@ mod tests {
         let stream = ledger_stream(ring.clone(), Some(2));
         tokio::pin!(stream);
         assert_eq!(stream.next().await.unwrap().id, 3);
+    }
+
+    #[tokio::test]
+    async fn stream_notes_rows_the_ring_has_already_forgotten() {
+        let ring = Arc::new(LedgerRing::new(2));
+        for _ in 0..5 {
+            let id = ring.next_id();
+            ring.push(row(id));
+        }
+        // Ring keeps 4 and 5; a client resuming after 1 lost 2 and 3.
+        let stream = ledger_stream(ring.clone(), Some(1));
+        tokio::pin!(stream);
+        let first = stream.next().await.unwrap();
+        assert_eq!(first.id, 1, "the notice does not move the cursor");
+        assert_eq!(first.name, "ledger: 2 rows expired before reconnect");
+        assert_eq!(stream.next().await.unwrap().id, 4);
+        assert_eq!(stream.next().await.unwrap().id, 5);
+    }
+
+    #[tokio::test]
+    async fn stream_is_quiet_when_the_cursor_is_still_in_the_ring() {
+        let ring = Arc::new(LedgerRing::new(8));
+        for _ in 0..3 {
+            let id = ring.next_id();
+            ring.push(row(id));
+        }
+        let stream = ledger_stream(ring.clone(), Some(3));
+        tokio::pin!(stream);
+        let id = ring.next_id();
+        ring.push(row(id));
+        assert_eq!(stream.next().await.unwrap().id, 4);
     }
 
     #[test]

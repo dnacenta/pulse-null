@@ -349,10 +349,15 @@ impl App {
             }
             Command::Theme(name) => {
                 let before = self.theme.tokens();
-                if name == "system" {
+                let known = if name == "system" {
                     self.theme.set_system();
+                    true
                 } else {
-                    self.theme.set_builtin(&name);
+                    self.theme.set_builtin(&name)
+                };
+                if !known {
+                    self.talk.notice(&format!("theme: unknown {name:?}"));
+                    return Action::None;
                 }
                 if self.theme.tokens() != before {
                     self.theme_changed(before);
@@ -413,9 +418,9 @@ impl App {
 
     /// Bottom-line hints, generated from the same keymap as `?`.
     fn hints(&self) -> Vec<(&'static str, &'static str)> {
-        if let Some(reason) = self.talk.offline_reason() {
-            // Sending is off: say why instead of listing keys that will not work.
-            let _ = reason;
+        if self.talk.offline_reason().is_some() {
+            // Sending is off: say so instead of listing keys that will not work
+            // (the reason itself shows on Enter, in the transcript).
             return vec![("daemon unreachable", "retrying — Ctrl+c quit, ? keys")];
         }
         let ctx = match (self.screen, self.focus, &self.float) {

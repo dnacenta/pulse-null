@@ -37,8 +37,7 @@ impl MotionLevel {
         }
     }
 
-    /// Stable label for the bar and `:motion` (PN-102 increment 4).
-    #[allow(dead_code)]
+    /// Stable label for the bar and `:motion`.
     #[must_use]
     pub fn as_str(self) -> &'static str {
         match self {
@@ -136,15 +135,14 @@ impl Motion {
         }
     }
 
-    #[allow(dead_code)]
+    #[cfg(test)]
     #[must_use]
     pub fn level(&self) -> MotionLevel {
         self.level
     }
 
     /// Change the level. Clears running effects when turning motion off.
-    /// Driven by `:motion` (PN-102 increment 4).
-    #[allow(dead_code)]
+    /// Driven by `:motion`.
     pub fn set_level(&mut self, level: MotionLevel) {
         self.level = level;
         if level == MotionLevel::Off {

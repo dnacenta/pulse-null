@@ -113,10 +113,20 @@ pub struct HistoryResponse {
 /// The daemon wraps every user message as `"\nUser message: <text>"` (after an
 /// optional channel-context block) before storing it. The TUI shows what the
 /// person typed, so the wrapper comes off here — once, on the way out.
+///
+/// Anchored to the wrapper's own structure: the marker is looked for after
+/// the last channel-activity block (whose quoted messages may themselves
+/// contain the words), and the first hit wins so a person's own text that
+/// repeats the marker stays whole.
 pub fn display_user_text(stored: &str) -> String {
-    const MARKER: &str = "User message: ";
-    match stored.rfind(MARKER) {
-        Some(i) => stored[i + MARKER.len()..].to_string(),
+    const MARKER: &str = "\nUser message: ";
+    const ACTIVITY_END: &str = "[End channel activity]\n";
+    let start = stored
+        .rfind(ACTIVITY_END)
+        .map_or(0, |i| i + ACTIVITY_END.len());
+    let tail = &stored[start..];
+    match tail.find(MARKER) {
+        Some(i) => tail[i + MARKER.len()..].to_string(),
         None => stored.to_string(),
     }
 }
@@ -239,6 +249,20 @@ mod history_tests {
             "x"
         );
         assert_eq!(display_user_text("plain"), "plain");
+    }
+
+    #[test]
+    fn user_text_that_repeats_the_marker_stays_whole() {
+        assert_eq!(
+            display_user_text("\nUser message: say \nUser message: twice"),
+            "say \nUser message: twice"
+        );
+    }
+
+    #[test]
+    fn marker_inside_quoted_channel_activity_is_skipped() {
+        let stored = "[Channel: discord]\n[Recent channel activity]\nbob: \nUser message: fake\n[End channel activity]\n\nUser message: real";
+        assert_eq!(display_user_text(stored), "real");
     }
 
     #[test]

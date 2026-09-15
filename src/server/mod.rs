@@ -129,6 +129,17 @@ pub async fn awareness_listener(
 }
 
 pub async fn start(config: Config) -> Result<(), Box<dyn std::error::Error>> {
+    start_with_shutdown(config, None).await
+}
+
+/// Like [`start`], plus an optional external stop: when `stop` flips to
+/// `true` the daemon shuts down exactly as it does on SIGTERM. The TUI uses
+/// this for a daemon it started in-process, so leaving the shell never has
+/// to signal its own process.
+pub async fn start_with_shutdown(
+    config: Config,
+    stop: Option<tokio::sync::watch::Receiver<bool>>,
+) -> Result<(), Box<dyn std::error::Error>> {
     let provider = crate::providers::create_streaming_provider(&config)?;
 
     if config.security.secret.is_none() {
@@ -357,14 +368,24 @@ pub async fn start(config: Config) -> Result<(), Box<dyn std::error::Error>> {
     let mut shutdown_rx_axum = shutdown_tx.subscribe();
     let mut shutdown_rx_main = shutdown_tx.subscribe();
 
-    // Signal handler: fires once on SIGTERM or SIGINT
+    // Signal handler: fires once on SIGTERM, SIGINT, or the external stop.
     tokio::spawn(async move {
         let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
             .expect("failed to install SIGTERM handler");
         let sigint = tokio::signal::ctrl_c();
+        let external = async {
+            match stop {
+                Some(mut rx) => {
+                    // A closed sender counts as a stop: the owner is gone.
+                    while rx.changed().await.is_ok() && !*rx.borrow() {}
+                }
+                None => std::future::pending().await,
+            }
+        };
         tokio::select! {
             _ = sigterm.recv() => tracing::info!("Received SIGTERM"),
             _ = sigint => tracing::info!("Received SIGINT"),
+            () = external => tracing::info!("Stop requested by the owning process"),
         }
         let _ = shutdown_tx.send(true);
     });

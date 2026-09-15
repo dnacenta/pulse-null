@@ -249,6 +249,7 @@ impl ThemeWatcher {
     }
 
     /// Switch to a built-in by name. Returns false if the name is unknown.
+    #[must_use]
     pub fn set_builtin(&mut self, name: &str) -> bool {
         match builtin(name) {
             Some(t) => {
@@ -261,8 +262,7 @@ impl ThemeWatcher {
     }
 
     /// Go back to following the Omarchy theme (or Gruvbox dark when absent).
-    /// Driven by `:theme system` (PN-102 increment 4).
-    #[allow(dead_code)]
+    /// Driven by `:theme system`.
     pub fn set_system(&mut self) {
         *self = Self::from_setting("system");
     }

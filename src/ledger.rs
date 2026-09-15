@@ -479,8 +479,14 @@ impl LedgerRing {
             .collect()
     }
 
+    /// The oldest id still retained, or `None` when the ring is empty.
+    #[must_use]
+    pub fn oldest_id(&self) -> Option<u64> {
+        let buf = self.buf.lock().unwrap_or_else(|p| p.into_inner());
+        buf.front().map(|r| r.id)
+    }
+
     /// The most recent id handed out, or `0` when nothing has been recorded.
-    #[allow(dead_code)]
     #[must_use]
     pub fn last_id(&self) -> u64 {
         self.next_id.load(Ordering::SeqCst).saturating_sub(1)
