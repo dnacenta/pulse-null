@@ -21,30 +21,10 @@ pub fn create_provider(
     config: &Config,
     entity_root: &Path,
 ) -> Result<Box<dyn LmProvider>, ProviderError> {
-    match config.llm.provider.as_str() {
-        "claude" => {
-            let api_key = config.resolve_api_key().ok_or_else(|| {
-                ProviderError::MissingApiKey(
-                    "No API key found. Set it in pulse-null.toml or ANTHROPIC_API_KEY env var."
-                        .into(),
-                )
-            })?;
-            Ok(Box::new(ClaudeProvider::new(
-                api_key,
-                config.llm.model.clone(),
-            )))
-        }
-        "ollama" => Ok(Box::new(OllamaProvider::new(
-            config.llm.model.clone(),
-            config.llm.base_url.clone(),
-        ))),
-        "claude-code" => Ok(Box::new(ClaudeCodeProvider::new(
-            config.llm.model.clone(),
-            config.llm.claude_bin.clone(),
-            entity_root.to_path_buf(),
-        ))),
-        other => Err(ProviderError::Unknown(other.to_string())),
-    }
+    // One construction site: every provider streams, and a streaming
+    // provider is an `LmProvider` (trait upcasting).
+    let provider: Box<dyn StreamingProvider> = create_streaming_provider(config, entity_root)?;
+    Ok(provider)
 }
 
 /// Create a streaming-capable provider based on config.

@@ -114,6 +114,15 @@ impl AlertQueue {
         self.alerts.is_empty()
     }
 
+    /// The pending alerts, oldest first, without consuming them.
+    ///
+    /// The ledger backfill reads the queue; draining it there would steal the
+    /// alerts from the consumer that is supposed to deliver them.
+    #[must_use]
+    pub fn snapshot(&self) -> &[Alert] {
+        &self.alerts
+    }
+
     /// Persist the queue to disk (atomic write).
     fn save(&self) -> Result<(), Box<dyn std::error::Error>> {
         let file = AlertFile {

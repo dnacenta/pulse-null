@@ -6,9 +6,10 @@ use axum::Json;
 
 use crate::provider_status::ProviderState;
 use crate::server::AppState;
+use crate::wire::HealthResponse;
 
 /// Health check — returns provider status with entity name.
-pub async fn health(State(state): State<Arc<AppState>>) -> (StatusCode, Json<serde_json::Value>) {
+pub async fn health(State(state): State<Arc<AppState>>) -> (StatusCode, Json<HealthResponse>) {
     let status = state.provider_status.read().await;
 
     let (http_status, state_str) = match status.state {
@@ -19,27 +20,25 @@ pub async fn health(State(state): State<Arc<AppState>>) -> (StatusCode, Json<ser
 
     let isolated = crate::server::isolation::is_active(&state.root_dir);
     let leading = state.leadership.load(std::sync::atomic::Ordering::Relaxed);
-    let mut body = serde_json::json!({
-        "status": state_str,
-        "entity": state.config.entity.name,
-        "isolation": isolated,
+    let mut body = HealthResponse {
+        status: state_str.to_string(),
+        entity: state.config.entity.name.clone(),
+        isolation: isolated,
         // Observed state only — the marker is reported separately as
         // `isolation`; claiming "shed" from the marker alone would lie
         // whenever the coordinator is wedged and its tasks still run.
-        "control_plane": if leading { "leading" } else { "not-leading" },
-    });
+        control_plane: if leading { "leading" } else { "not-leading" }.to_string(),
+        last_error: None,
+        error_kind: None,
+        last_error_at: None,
+        consecutive_failures: None,
+    };
 
     if status.state != ProviderState::Healthy {
-        if let Some(ref error) = status.last_error {
-            body["last_error"] = serde_json::json!(error);
-        }
-        if let Some(ref kind) = status.error_kind {
-            body["error_kind"] = serde_json::json!(kind.to_string());
-        }
-        if let Some(ref at) = status.last_error_at {
-            body["last_error_at"] = serde_json::json!(at.to_rfc3339());
-        }
-        body["consecutive_failures"] = serde_json::json!(status.consecutive_failures);
+        body.last_error = status.last_error.clone();
+        body.error_kind = status.error_kind.as_ref().map(ToString::to_string);
+        body.last_error_at = status.last_error_at.as_ref().map(|at| at.to_rfc3339());
+        body.consecutive_failures = Some(status.consecutive_failures);
     }
 
     (http_status, Json(body))

@@ -35,6 +35,10 @@ fn subprocess_timeout() -> Duration {
 /// Timeout for the one-off `--system-prompt-file` support probe.
 const PROBE_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// How much of the CLI's stderr the streaming path keeps for the log when a
+/// turn fails. The pipe is drained in full so the child never blocks on it.
+const STDERR_TAIL_BYTES: usize = 4096;
+
 /// What a CLI without the flag prints when it parses `--system-prompt-file`.
 const UNKNOWN_OPTION_MARKER: &str = "unknown option";
 
@@ -161,8 +165,14 @@ fn stream_invoke_args(
 pub(crate) enum StreamLine {
     /// Incremental text as the model produces it.
     Delta(String),
-    /// The terminal record, carrying the assembled reply.
-    Result { text: String, is_error: bool },
+    /// The terminal record, carrying the assembled reply and, when the CLI
+    /// reports it, the turn's token usage.
+    Result {
+        text: String,
+        is_error: bool,
+        input_tokens: Option<u32>,
+        output_tokens: Option<u32>,
+    },
     /// Structure we do not consume (tool events, init, usage records).
     Other,
 }
@@ -198,6 +208,8 @@ pub(crate) fn parse_stream_line(line: &str) -> StreamLine {
         Some("result") => StreamLine::Result {
             text: value["result"].as_str().unwrap_or("").trim().to_string(),
             is_error: value["is_error"].as_bool().unwrap_or(false),
+            input_tokens: value["usage"]["input_tokens"].as_u64().map(|v| v as u32),
+            output_tokens: value["usage"]["output_tokens"].as_u64().map(|v| v as u32),
         },
         _ => StreamLine::Other,
     }
@@ -528,6 +540,9 @@ impl StreamingProvider for ClaudeCodeProvider {
             cmd.args(stream_invoke_args(&model, system_prompt_file.path(), restricted))
                 .stdin(Stdio::piped())
                 .stdout(Stdio::piped())
+                // Drained by a task below (a piped-but-undrained stderr would
+                // block the child once it fills); its tail reaches the log
+                // when the turn fails.
                 .stderr(Stdio::piped());
             // The caller hanging up must not leave a model running.
             cmd.kill_on_drop(true);
@@ -540,11 +555,28 @@ impl StreamingProvider for ClaudeCodeProvider {
                 }
             };
 
+            let stderr_tail = child.stderr.take().map(|err| tokio::spawn(drain_stderr(err)));
+
+            // The idle bound: no single wait on the child — the prompt write,
+            // each output line, the exit — may exceed it. A model that is
+            // still talking is never cut off; one that has gone silent does
+            // not hold the turn (and the session lock behind it) forever.
+            let idle = subprocess_timeout();
+            let timed_out = || StreamEvent::Error(format!("claude timed out after {}s", idle.as_secs()));
+
             if let Some(mut stdin) = child.stdin.take() {
                 use tokio::io::AsyncWriteExt;
-                if let Err(e) = stdin.write_all(prompt.as_bytes()).await {
-                    yield StreamEvent::Error(format!("failed to write to claude stdin: {e}"));
-                    return;
+                match tokio::time::timeout(idle, stdin.write_all(prompt.as_bytes())).await {
+                    Ok(Ok(())) => {}
+                    Ok(Err(e)) => {
+                        yield StreamEvent::Error(format!("failed to write to claude stdin: {e}"));
+                        return;
+                    }
+                    Err(_) => {
+                        let _ = child.start_kill();
+                        yield timed_out();
+                        return;
+                    }
                 }
                 // Dropped here: closing stdin is what tells the CLI to start.
             }
@@ -558,35 +590,59 @@ impl StreamingProvider for ClaudeCodeProvider {
             let mut lines = BufReader::new(stdout).lines();
             let mut assembled = String::new();
             let mut terminal: Option<(String, bool)> = None;
+            let mut usage: (Option<u32>, Option<u32>) = (None, None);
 
+            let mut failure: Option<StreamEvent> = None;
             loop {
-                match lines.next_line().await {
-                    Ok(Some(line)) => match parse_stream_line(&line) {
+                match tokio::time::timeout(idle, lines.next_line()).await {
+                    Err(_) => {
+                        let _ = child.start_kill();
+                        failure = Some(timed_out());
+                        break;
+                    }
+                    Ok(Ok(Some(line))) => match parse_stream_line(&line) {
                         StreamLine::Delta(text) => {
                             assembled.push_str(&text);
                             yield StreamEvent::TextDelta(text);
                         }
-                        StreamLine::Result { text, is_error } => {
+                        StreamLine::Result { text, is_error, input_tokens, output_tokens } => {
                             terminal = Some((text, is_error));
+                            usage = (input_tokens, output_tokens);
                         }
                         StreamLine::Other => {}
                     },
-                    Ok(None) => break,
-                    Err(e) => {
-                        yield StreamEvent::Error(format!("reading claude output: {e}"));
+                    Ok(Ok(None)) => break,
+                    Ok(Err(e)) => {
+                        failure = Some(StreamEvent::Error(format!("reading claude output: {e}")));
                         break;
                     }
                 }
             }
 
-            let _ = child.wait().await;
+            let _ = tokio::time::timeout(idle, child.wait()).await;
+
+            // Diagnostics for the log, only when the turn did not succeed.
+            let failed = failure.is_some() || !matches!(terminal, Some((_, false)));
+            if failed {
+                if let Some(handle) = stderr_tail {
+                    if let Ok(Ok(tail)) = tokio::time::timeout(Duration::from_secs(2), handle).await {
+                        if !tail.trim().is_empty() {
+                            warn!("claude stderr (tail): {}", tail.trim());
+                        }
+                    }
+                }
+            }
+            if let Some(event) = failure {
+                yield event;
+                return;
+            }
 
             match terminal {
                 // The CLI reports failures in the terminal record rather than
                 // by exiting non-zero mid-stream; quota exhaustion and policy
                 // refusals both arrive this way.
                 Some((text, true)) => {
-                    yield StreamEvent::Error(text);
+                    yield classify_stream_failure(&model, text);
                 }
                 Some((text, false)) => {
                     // Prefer the assembled deltas; fall back to the terminal
@@ -599,10 +655,8 @@ impl StreamingProvider for ClaudeCodeProvider {
                             content: vec![ContentBlock::Text { text: final_text }],
                             stop_reason: StopReason::EndTurn,
                             model: model.clone(),
-                            // The streaming CLI reports usage in records we do
-                            // not consume; token counts stay with /chat.
-                            input_tokens: None,
-                            output_tokens: None,
+                            input_tokens: usage.0,
+                            output_tokens: usage.1,
                         });
                     }
                 }
@@ -611,8 +665,8 @@ impl StreamingProvider for ClaudeCodeProvider {
                         content: vec![ContentBlock::Text { text: assembled }],
                         stop_reason: StopReason::EndTurn,
                         model: model.clone(),
-                        input_tokens: None,
-                        output_tokens: None,
+                        input_tokens: usage.0,
+                        output_tokens: usage.1,
                     });
                 }
                 None => {
@@ -621,6 +675,28 @@ impl StreamingProvider for ClaudeCodeProvider {
             }
         })
     }
+}
+
+/// Read a child's stderr to the end, keeping only the last
+/// [`STDERR_TAIL_BYTES`]. Reading everything is the point: a pipe nobody
+/// drains blocks the child once it fills.
+async fn drain_stderr(mut err: tokio::process::ChildStderr) -> String {
+    use tokio::io::AsyncReadExt;
+    let mut tail: Vec<u8> = Vec::new();
+    let mut buf = [0u8; 4096];
+    loop {
+        match err.read(&mut buf).await {
+            Ok(0) | Err(_) => break,
+            Ok(n) => {
+                tail.extend_from_slice(&buf[..n]);
+                if tail.len() > STDERR_TAIL_BYTES {
+                    let cut = tail.len() - STDERR_TAIL_BYTES;
+                    tail.drain(..cut);
+                }
+            }
+        }
+    }
+    String::from_utf8_lossy(&tail).into_owned()
 }
 
 /// Serialize a message history into a single prompt string.
@@ -692,6 +768,34 @@ enum RefusalCheck {
     NotRefusal,
 }
 
+/// Map a streamed terminal record with `is_error == true` to the stream event
+/// the chat handler expects: a typed [`StreamEvent::Refused`] for AUP
+/// refusals (so PN-88's fallback fires for streamed turns too), a plain
+/// [`StreamEvent::Error`] for everything else (quota, timeout, empty).
+fn classify_stream_failure(model: &str, text: String) -> StreamEvent {
+    if is_aup_refusal(&text) {
+        StreamEvent::Refused {
+            model: model.to_string(),
+            detail: truncate(&text, 500).to_string(),
+        }
+    } else {
+        // Same drift alarm as the buffered path: an error-flagged result that
+        // does not carry the signature is worth a WARN, not silence.
+        warn!(
+            model = %model,
+            "claude stream ended with is_error=true but did not match the AUP \
+             Usage-Policy signature — refusal detection may have drifted"
+        );
+        StreamEvent::Error(text)
+    }
+}
+
+/// The one place the AUP refusal signature lives. Both the buffered and the
+/// streamed classifier call this, so the signature cannot drift between them.
+fn is_aup_refusal(body: &str) -> bool {
+    body.to_lowercase().contains("usage policy")
+}
+
 /// Classify a non-zero-exit stdout body as an AUP refusal or a plain error.
 ///
 /// A refusal is valid JSON with `is_error == true` **and** a `result` body
@@ -705,7 +809,7 @@ fn classify_nonzero_exit(stdout: &str) -> RefusalCheck {
         return RefusalCheck::NotRefusal;
     }
     let result = parsed["result"].as_str().unwrap_or("");
-    if result.to_lowercase().contains("usage policy") {
+    if is_aup_refusal(result) {
         RefusalCheck::Refusal(result.to_string())
     } else {
         RefusalCheck::ErrorFlagButNoPolicyMatch
@@ -818,20 +922,53 @@ mod tests {
     }
 
     #[test]
+    fn stream_result_carries_usage_when_present() {
+        let line = r#"{"type":"result","subtype":"success","is_error":false,"result":"hi","usage":{"input_tokens":120,"output_tokens":7}}"#;
+        match parse_stream_line(line) {
+            StreamLine::Result {
+                input_tokens,
+                output_tokens,
+                ..
+            } => {
+                assert_eq!(input_tokens, Some(120));
+                assert_eq!(output_tokens, Some(7));
+            }
+            other => panic!("expected result, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn stream_failure_with_policy_text_is_a_typed_refusal() {
+        match classify_stream_failure("m", "This request violates our Usage Policy.".into()) {
+            StreamEvent::Refused { model, detail } => {
+                assert_eq!(model, "m");
+                assert!(detail.contains("Usage Policy"));
+            }
+            other => panic!("expected Refused, got {other:?}"),
+        }
+        assert!(matches!(
+            classify_stream_failure("m", "You're out of extra usage".into()),
+            StreamEvent::Error(_)
+        ));
+    }
+
+    #[test]
     fn stream_result_carries_text_and_error_flag() {
         let ok = r#"{"type":"result","subtype":"success","result":"  done  ","is_error":false}"#;
         assert_eq!(
             parse_stream_line(ok),
             StreamLine::Result {
                 text: "done".to_string(),
-                is_error: false
+                is_error: false,
+                input_tokens: None,
+                output_tokens: None,
             }
         );
 
         // How quota exhaustion actually arrives — observed live 2026-08-13.
         let quota = r#"{"type":"result","subtype":"success","is_error":true,"result":"You're out of extra usage \u00b7 resets Aug 19, 6am (UTC)"}"#;
         match parse_stream_line(quota) {
-            StreamLine::Result { text, is_error } => {
+            StreamLine::Result { text, is_error, .. } => {
                 assert!(is_error, "an is_error body must not be spoken as a reply");
                 assert!(text.contains("out of extra usage"));
             }

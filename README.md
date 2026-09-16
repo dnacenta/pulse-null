@@ -307,10 +307,11 @@ Entities under one unix user share that user's rights: each runs `claude` with p
 
 ```
 pulse-null init [--dir <path>]       Create a new entity
-pulse-null up                        Start the entity server
+pulse-null up                        Start the entity: daemon + terminal UI
+pulse-null up --headless             Daemon only (systemd, servers)
 pulse-null down                      Stop the entity
 pulse-null status                    Show entity status
-pulse-null chat                      Interactive REPL
+pulse-null chat                      Terminal UI, straight into the conversation
 
 pulse-null schedule list             List scheduled tasks
 pulse-null schedule add              Add a scheduled task
@@ -336,6 +337,25 @@ pulse-null vigil reflection          Cognitive quality signals
 pulse-null vigil outcomes            Effectiveness signals
 ```
 
+## Terminal UI
+
+`pulse-null up` (without `--headless`) and `pulse-null chat` open the terminal UI. It is a client of the running daemon: if one is up it attaches over HTTP, otherwise it starts one in-process and stops it cleanly on quit. It never owns a provider or writes session files itself.
+
+The window model follows Hyprland: panes with a one-cell gap, one accent border on the focused pane, `Ctrl+h/j/k/l` to move focus, `f` for fullscreen. A one-line bar shows the entity, model, page, cognitive status (it says *no signal yet* until there is data), alert count and clock.
+
+**Talk** is the conversation page. Your message appears the instant you press Enter; the reply streams token by token as the provider produces it; typing works during a reply and Enter queues one message; `Ctrl+c` cancels a reply (the daemon rolls the turn back); scrolling up during a reply holds your place and shows `↓ new`, `G` glides back to the tail. Further pages (Watch, Remember, Setup) arrive in later releases; `:` lists them.
+
+`:` opens the command line (`Tab` completes): `:theme <name|system>`, `:motion <full|reduced|off>`, `:quit`, `:help`. `?` shows the keys for the focused pane.
+
+```toml
+[tui]
+theme = "gruvbox"     # gruvbox (default), tokyo-night, catppuccin, everforest, rose-pine, nord, or "system"
+motion = "full"       # full | reduced | off — drops to reduced by itself on a slow link
+nerd_font = "auto"    # auto | on | off
+```
+
+The look is Gruvbox dark by default. With `theme = "system"` on an [Omarchy](https://omarchy.org) desktop the palette is read from `~/.config/omarchy/current/theme/colors.toml` and crossfades when you switch themes. Logs go to `logs/tui.log` in the entity directory while the UI is up.
+
 ## HTTP API
 
 All endpoints except `/health` require `X-Echo-Secret` header when `security.secret` is configured. Rate limited to 10 burst / 2 per second.
@@ -344,7 +364,16 @@ All endpoints except `/health` require `X-Echo-Secret` header when `security.sec
 |--------|------|-------------|
 | GET | `/health` | Health check (no auth) |
 | GET | `/api/status` | Entity status |
-| POST | `/chat` | Send a message |
+| GET | `/api/dashboard` | Pipeline and cognitive health |
+| POST | `/chat` | Send a message, get the whole reply |
+| POST | `/api/chat/stream` | Same turn as `/chat`, streamed as server-sent events: `status`, `delta`, then `done` or `error`. Closing the connection cancels the turn. |
+| GET | `/api/session/{channel}` | The conversation on a channel as the TUI shows it |
+| GET | `/api/events` | Live ledger of what the entity does (SSE, `Last-Event-ID` replay) |
+| GET | `/api/ledger` | Ledger backfill from disk (`since`, `kind`, `limit`) |
+| GET | `/api/schedule` | Scheduled tasks with cadence, last run, next fire |
+| POST | `/api/schedule/{id}/enable`, `…/disable` | Toggle a task (same path as the CLI) |
+| GET | `/api/schedule/{id}/last` | Stored output of a task's last run |
+| GET | `/api/alerts/peek`, POST `/api/alerts/drain` | Task alerts |
 
 ### POST /chat
 

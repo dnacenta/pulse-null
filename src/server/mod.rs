@@ -28,14 +28,16 @@ use crate::provider_status::SharedProviderStatus;
 use crate::scheduler::intent::IntentQueue;
 use crate::scheduler::Schedule;
 use crate::session_store::SessionStore;
+use crate::streaming::StreamingProvider;
 use crate::tools::ToolRegistry;
-use pulse_system_types::llm::LmProvider;
 use pulse_system_types::monitoring::{CognitiveMonitor, OutcomeTracker, PipelineMonitor};
 
 /// Shared application state
 pub struct AppState {
     pub config: Config,
-    pub provider: Box<dyn LmProvider>,
+    /// The entity's model. Streaming-capable so `/api/chat/stream` can forward
+    /// deltas; every non-streaming call site upcasts to `&dyn LmProvider`.
+    pub provider: Box<dyn StreamingProvider>,
     pub session_store: SessionStore,
     pub system_prompt: RwLock<String>,
     pub tools: ToolRegistry,
@@ -56,6 +58,28 @@ pub struct AppState {
     /// Written by the coordinator, read by /health — the data plane never
     /// depends on it.
     pub leadership: std::sync::atomic::AtomicBool,
+    /// Live ledger rows for `/api/events` replay.
+    pub ledger: Arc<crate::ledger::LedgerRing>,
+    /// Cap on open `/api/events` streams (one per attached client, held for
+    /// its lifetime).
+    pub event_permits: Arc<tokio::sync::Semaphore>,
+    /// Cap on in-flight `/api/chat/stream` turns. Separate from the event
+    /// pool so idle watchers can never refuse a message.
+    pub chat_permits: Arc<tokio::sync::Semaphore>,
+}
+
+/// Concurrent `/api/events` connections before a 503.
+pub const MAX_EVENT_STREAMS: usize = 4;
+/// Concurrent `/api/chat/stream` turns before a 503.
+pub const MAX_CHAT_STREAMS: usize = 4;
+
+/// The two stream pools, sized by the constants above.
+#[must_use]
+pub fn stream_pools() -> (Arc<tokio::sync::Semaphore>, Arc<tokio::sync::Semaphore>) {
+    (
+        Arc::new(tokio::sync::Semaphore::new(MAX_EVENT_STREAMS)),
+        Arc::new(tokio::sync::Semaphore::new(MAX_CHAT_STREAMS)),
+    )
 }
 
 /// Rebuild AWARENESS.md from the current plugin and tool state.
@@ -120,9 +144,29 @@ pub async fn awareness_listener(
 }
 
 pub async fn start(config: Config) -> Result<(), Box<dyn std::error::Error>> {
+    start_with_shutdown(config, None).await
+}
+
+/// Like [`start`], plus an optional external stop: when `stop` flips to
+/// `true` the daemon shuts down exactly as it does on SIGTERM. The TUI uses
+/// this for a daemon it started in-process, so leaving the shell never has
+/// to signal its own process.
+pub async fn start_with_shutdown(
+    config: Config,
+    stop: Option<tokio::sync::watch::Receiver<bool>>,
+) -> Result<(), Box<dyn std::error::Error>> {
     let root_dir = config.root_dir()?;
 
-    let provider = crate::providers::create_provider(&config, &root_dir)?;
+    // The provider runs from inside the entity (PN-104).
+    let provider = crate::providers::create_streaming_provider(&config, &root_dir)?;
+
+    if !boot::has_usable_secret(&config) {
+        tracing::warn!(
+            "[security] secret is not set: every request on {}:{} is admitted as the owner",
+            config.server.host,
+            config.server.port
+        );
+    }
 
     // Ensure required directories and files exist
     ensure_infrastructure(&root_dir);
@@ -198,6 +242,12 @@ pub async fn start(config: Config) -> Result<(), Box<dyn std::error::Error>> {
     // Create event bus
     let event_bus = Arc::new(EventBus::new(64));
 
+    // Ledger ring: projects bus events into rows for /api/events replay.
+    let ledger = Arc::new(crate::ledger::LedgerRing::new(
+        crate::ledger::DEFAULT_RING_CAPACITY,
+    ));
+    crate::ledger::spawn_projector(event_bus.subscribe(), Arc::clone(&ledger));
+
     // Create the persist coordinator (tracks fire-and-forget writes for graceful shutdown)
     let persist_coordinator = Arc::new(PersistCoordinator::new());
 
@@ -268,6 +318,9 @@ pub async fn start(config: Config) -> Result<(), Box<dyn std::error::Error>> {
         alert_queue: tokio::sync::Mutex::new(alert_queue),
         provider_status: crate::provider_status::new_shared(),
         leadership: std::sync::atomic::AtomicBool::new(false),
+        event_permits: crate::server::stream_pools().0,
+        chat_permits: crate::server::stream_pools().1,
+        ledger,
     });
 
     // Startup pipeline health check
@@ -335,14 +388,24 @@ pub async fn start(config: Config) -> Result<(), Box<dyn std::error::Error>> {
     let mut shutdown_rx_axum = shutdown_tx.subscribe();
     let mut shutdown_rx_main = shutdown_tx.subscribe();
 
-    // Signal handler: fires once on SIGTERM or SIGINT
+    // Signal handler: fires once on SIGTERM, SIGINT, or the external stop.
     tokio::spawn(async move {
         let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
             .expect("failed to install SIGTERM handler");
         let sigint = tokio::signal::ctrl_c();
+        let external = async {
+            match stop {
+                Some(mut rx) => {
+                    // A closed sender counts as a stop: the owner is gone.
+                    while rx.changed().await.is_ok() && !*rx.borrow() {}
+                }
+                None => std::future::pending().await,
+            }
+        };
         tokio::select! {
             _ = sigterm.recv() => tracing::info!("Received SIGTERM"),
             _ = sigint => tracing::info!("Received SIGINT"),
+            () = external => tracing::info!("Stop requested by the owning process"),
         }
         let _ = shutdown_tx.send(true);
     });
@@ -476,6 +539,20 @@ pub fn build_router(state: Arc<AppState>, plugin_routes: Router<()>) -> Router {
         .route("/api/status", get(handlers::status::status))
         .route("/api/dashboard", get(handlers::dashboard::dashboard))
         .route("/chat", post(handlers::chat::chat))
+        .route("/api/chat/stream", post(handlers::chat::chat_stream))
+        .route("/api/events", get(handlers::events::events))
+        .route("/api/ledger", get(handlers::events::ledger))
+        .route("/api/schedule", get(handlers::schedule::list))
+        .route(
+            "/api/schedule/{id}/enable",
+            post(handlers::schedule::enable),
+        )
+        .route(
+            "/api/schedule/{id}/disable",
+            post(handlers::schedule::disable),
+        )
+        .route("/api/schedule/{id}/last", get(handlers::schedule::last))
+        .route("/api/session/{channel}", get(handlers::sessions::history))
         .route(
             "/api/sessions/reset",
             post(handlers::sessions::reset_session),
