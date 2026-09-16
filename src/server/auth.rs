@@ -102,9 +102,9 @@ pub async fn require_auth(
     }
 
     // Fall back to global secret check
-    let secret = match &state.config.security.secret {
-        Some(s) => s,
-        None => {
+    let secret = match state.config.security.secret.as_deref() {
+        Some(s) if !s.trim().is_empty() => s,
+        _ => {
             req.extensions_mut().insert(AuthIdentity::Owner);
             return Ok(next.run(req).await);
         }

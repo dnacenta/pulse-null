@@ -155,17 +155,18 @@ pub async fn start_with_shutdown(
     config: Config,
     stop: Option<tokio::sync::watch::Receiver<bool>>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let provider = crate::providers::create_streaming_provider(&config)?;
+    let root_dir = config.root_dir()?;
 
-    if config.security.secret.is_none() {
+    // The provider runs from inside the entity (PN-104).
+    let provider = crate::providers::create_streaming_provider(&config, &root_dir)?;
+
+    if !boot::has_usable_secret(&config) {
         tracing::warn!(
             "[security] secret is not set: every request on {}:{} is admitted as the owner",
             config.server.host,
             config.server.port
         );
     }
-
-    let root_dir = config.root_dir()?;
 
     // Ensure required directories and files exist
     ensure_infrastructure(&root_dir);
@@ -196,24 +197,21 @@ pub async fn start_with_shutdown(
         crate::graph_context::cache_graph_stats(&root_dir).await;
     }
 
-    // Verify Claude Code integration if applicable
+    // Verify this entity's Claude Code integration if applicable
     if config.llm.provider == "claude-code" {
-        if let Ok(home) = std::env::var("HOME") {
-            let home_dir = std::path::PathBuf::from(home);
-            let items = crate::init::claude_code_bootstrap::verify(&root_dir, &home_dir);
-            for item in &items {
-                match &item.status {
-                    crate::init::claude_code_bootstrap::ItemStatus::Missing => {
-                        tracing::warn!(
-                            "Claude Code: {} missing — run 'pulse-null repair' to fix",
-                            item.path.display()
-                        );
-                    }
-                    crate::init::claude_code_bootstrap::ItemStatus::Wrong(reason) => {
-                        tracing::warn!("Claude Code: {} — {}", item.path.display(), reason);
-                    }
-                    _ => {}
+        let items = crate::init::claude_code_bootstrap::verify(&root_dir);
+        for item in &items {
+            match &item.status {
+                crate::init::claude_code_bootstrap::ItemStatus::Missing => {
+                    tracing::warn!(
+                        "Claude Code: {} missing — run 'pulse-null repair' to fix",
+                        item.path.display()
+                    );
                 }
+                crate::init::claude_code_bootstrap::ItemStatus::Wrong(reason) => {
+                    tracing::warn!("Claude Code: {} — {}", item.path.display(), reason);
+                }
+                _ => {}
             }
         }
     }
@@ -367,7 +365,13 @@ pub async fn start_with_shutdown(
 
     let app = build_router(Arc::clone(&state), plugin_routes);
 
-    let addr = format!("{}:{}", config.server.host, config.server.port);
+    // Same rule as multi-entity boot: an entity with no usable secret stays
+    // on loopback whatever its config says (PN-104 audit SEC-001).
+    let (host, host_note) = boot::bind_host(&config.server.host, boot::has_usable_secret(&config));
+    if let Some(note) = host_note {
+        tracing::warn!("{}", note);
+    }
+    let addr = format!("{}:{}", host, config.server.port);
     let listener = tokio::net::TcpListener::bind(&addr).await?;
 
     // Write PID file so `pulse-null down` can find us

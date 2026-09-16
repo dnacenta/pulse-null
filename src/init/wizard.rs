@@ -14,6 +14,7 @@ pub async fn run(target_dir: &Path) -> Result<(), Box<dyn std::error::Error>> {
     // Entity name
     let entity_name: String = Input::new()
         .with_prompt("  What should your entity be called?")
+        .validate_with(|s: &String| crate::discovery::validate_entity_name(s).map(|_| ()))
         .interact_text()?;
 
     // Owner name
@@ -117,7 +118,7 @@ pub async fn run(target_dir: &Path) -> Result<(), Box<dyn std::error::Error>> {
     // Server port
     let port: u16 = Input::new()
         .with_prompt("  Server port")
-        .default(3100)
+        .default(crate::discovery::suggest_port(target_dir))
         .interact_text()?;
 
     println!();
@@ -201,7 +202,8 @@ pub async fn run(target_dir: &Path) -> Result<(), Box<dyn std::error::Error>> {
     );
 
     // Create directory structure
-    let entity_dir = target_dir.join(entity_name.to_lowercase());
+    let dir_name = crate::discovery::validate_entity_name(&entity_name)?;
+    let entity_dir = target_dir.join(dir_name);
 
     // Guard against overwriting an existing entity
     if entity_dir.join("pulse-null.toml").exists() {
@@ -302,19 +304,18 @@ pub async fn run(target_dir: &Path) -> Result<(), Box<dyn std::error::Error>> {
         );
     }
 
-    // Wire up Claude Code integration if provider is claude-code
+    // Wire up Claude Code integration if provider is claude-code. Everything
+    // lands inside the entity directory — nothing in $HOME/.claude — so any
+    // number of entities can share one unix user (PN-104).
     if config.provider == "claude-code" {
-        if let Ok(home) = std::env::var("HOME") {
-            let home_dir = std::path::PathBuf::from(home);
-            println!();
-            println!(
-                "  {}",
-                style("Setting up Claude Code integration...").bold()
-            );
-            let results = super::claude_code_bootstrap::ensure(&entity_dir, &home_dir);
-            for item in &results {
-                println!("  {item}");
-            }
+        println!();
+        println!(
+            "  {}",
+            style("Setting up Claude Code integration...").bold()
+        );
+        let results = super::claude_code_bootstrap::ensure(&entity_dir);
+        for item in &results {
+            println!("  {item}");
         }
     }
 
@@ -324,14 +325,21 @@ pub async fn run(target_dir: &Path) -> Result<(), Box<dyn std::error::Error>> {
         style(&entity_name).cyan().bold()
     );
 
-    // Show the correct startup command based on context
-    let run_hint = if let Some(project_root) = target_dir.parent() {
-        // target_dir is entities/ — user should run from its parent
-        format!("cd {} && pulse-null up", project_root.display())
+    // Show the correct startup commands: the entity on its own, or all of
+    // them from the entity home (legacy `entities/` trees run from the parent).
+    let entity_home = if target_dir.file_name().is_some_and(|n| n == "entities") {
+        target_dir.parent().unwrap_or(target_dir)
     } else {
-        "pulse-null up".to_string()
+        target_dir
     };
-    println!("  Run {} to start.", style(&run_hint).green());
+    println!(
+        "  Run {} to start it on its own.",
+        style(format!("cd {} && pulse-null up", entity_dir.display())).green()
+    );
+    println!(
+        "  Run {} to start every entity here.",
+        style(format!("cd {} && pulse-null up", entity_home.display())).green()
+    );
     println!(
         "  Manage plugins with: {}",
         style("pulse-null plugin add|remove <name>").green()
