@@ -35,6 +35,10 @@ fn subprocess_timeout() -> Duration {
 /// Timeout for the one-off `--system-prompt-file` support probe.
 const PROBE_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// How much of the CLI's stderr the streaming path keeps for the log when a
+/// turn fails. The pipe is drained in full so the child never blocks on it.
+const STDERR_TAIL_BYTES: usize = 4096;
+
 /// What a CLI without the flag prints when it parses `--system-prompt-file`.
 const UNKNOWN_OPTION_MARKER: &str = "unknown option";
 
@@ -522,9 +526,10 @@ impl StreamingProvider for ClaudeCodeProvider {
                 .env_remove("CLAUDECODE")
                 .stdin(Stdio::piped())
                 .stdout(Stdio::piped())
-                // Nothing reads stderr on this path; a piped-but-undrained stderr
-                // would block the child once it fills.
-                .stderr(Stdio::null());
+                // Drained by a task below (a piped-but-undrained stderr would
+                // block the child once it fills); its tail reaches the log
+                // when the turn fails.
+                .stderr(Stdio::piped());
             // The caller hanging up must not leave a model running.
             cmd.kill_on_drop(true);
 
@@ -536,11 +541,28 @@ impl StreamingProvider for ClaudeCodeProvider {
                 }
             };
 
+            let stderr_tail = child.stderr.take().map(|err| tokio::spawn(drain_stderr(err)));
+
+            // The idle bound: no single wait on the child — the prompt write,
+            // each output line, the exit — may exceed it. A model that is
+            // still talking is never cut off; one that has gone silent does
+            // not hold the turn (and the session lock behind it) forever.
+            let idle = subprocess_timeout();
+            let timed_out = || StreamEvent::Error(format!("claude timed out after {}s", idle.as_secs()));
+
             if let Some(mut stdin) = child.stdin.take() {
                 use tokio::io::AsyncWriteExt;
-                if let Err(e) = stdin.write_all(prompt.as_bytes()).await {
-                    yield StreamEvent::Error(format!("failed to write to claude stdin: {e}"));
-                    return;
+                match tokio::time::timeout(idle, stdin.write_all(prompt.as_bytes())).await {
+                    Ok(Ok(())) => {}
+                    Ok(Err(e)) => {
+                        yield StreamEvent::Error(format!("failed to write to claude stdin: {e}"));
+                        return;
+                    }
+                    Err(_) => {
+                        let _ = child.start_kill();
+                        yield timed_out();
+                        return;
+                    }
                 }
                 // Dropped here: closing stdin is what tells the CLI to start.
             }
@@ -556,17 +578,13 @@ impl StreamingProvider for ClaudeCodeProvider {
             let mut terminal: Option<(String, bool)> = None;
             let mut usage: (Option<u32>, Option<u32>) = (None, None);
 
-            // Same bound as the buffered path: a model that stops talking must
-            // not hold the turn (and the session lock behind it) forever.
-            let deadline = tokio::time::Instant::now() + subprocess_timeout();
+            let mut failure: Option<StreamEvent> = None;
             loop {
-                match tokio::time::timeout_at(deadline, lines.next_line()).await {
+                match tokio::time::timeout(idle, lines.next_line()).await {
                     Err(_) => {
-                        yield StreamEvent::Error(format!(
-                            "claude timed out after {}s",
-                            subprocess_timeout().as_secs()
-                        ));
-                        return;
+                        let _ = child.start_kill();
+                        failure = Some(timed_out());
+                        break;
                     }
                     Ok(Ok(Some(line))) => match parse_stream_line(&line) {
                         StreamLine::Delta(text) => {
@@ -581,13 +599,29 @@ impl StreamingProvider for ClaudeCodeProvider {
                     },
                     Ok(Ok(None)) => break,
                     Ok(Err(e)) => {
-                        yield StreamEvent::Error(format!("reading claude output: {e}"));
+                        failure = Some(StreamEvent::Error(format!("reading claude output: {e}")));
                         break;
                     }
                 }
             }
 
-            let _ = tokio::time::timeout_at(deadline, child.wait()).await;
+            let _ = tokio::time::timeout(idle, child.wait()).await;
+
+            // Diagnostics for the log, only when the turn did not succeed.
+            let failed = failure.is_some() || !matches!(terminal, Some((_, false)));
+            if failed {
+                if let Some(handle) = stderr_tail {
+                    if let Ok(Ok(tail)) = tokio::time::timeout(Duration::from_secs(2), handle).await {
+                        if !tail.trim().is_empty() {
+                            warn!("claude stderr (tail): {}", tail.trim());
+                        }
+                    }
+                }
+            }
+            if let Some(event) = failure {
+                yield event;
+                return;
+            }
 
             match terminal {
                 // The CLI reports failures in the terminal record rather than
@@ -627,6 +661,28 @@ impl StreamingProvider for ClaudeCodeProvider {
             }
         })
     }
+}
+
+/// Read a child's stderr to the end, keeping only the last
+/// [`STDERR_TAIL_BYTES`]. Reading everything is the point: a pipe nobody
+/// drains blocks the child once it fills.
+async fn drain_stderr(mut err: tokio::process::ChildStderr) -> String {
+    use tokio::io::AsyncReadExt;
+    let mut tail: Vec<u8> = Vec::new();
+    let mut buf = [0u8; 4096];
+    loop {
+        match err.read(&mut buf).await {
+            Ok(0) | Err(_) => break,
+            Ok(n) => {
+                tail.extend_from_slice(&buf[..n]);
+                if tail.len() > STDERR_TAIL_BYTES {
+                    let cut = tail.len() - STDERR_TAIL_BYTES;
+                    tail.drain(..cut);
+                }
+            }
+        }
+    }
+    String::from_utf8_lossy(&tail).into_owned()
 }
 
 /// Serialize a message history into a single prompt string.

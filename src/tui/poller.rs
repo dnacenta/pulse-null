@@ -3,8 +3,9 @@
 //! The render loop never awaits the network. This task owns connectivity:
 //! it probes until the daemon answers, keeps the ledger event stream open,
 //! refreshes the bar on a cadence (three GETs joined into one round trip),
-//! fetches history after every attach, and reports everything over a
-//! channel. When the daemon goes away it backs off 0.5→8 s and says so.
+//! fetches history after every attach (in its own task, since a turn can
+//! hold the session for minutes), and reports everything over a channel.
+//! When the daemon goes away it backs off 0.5→8 s and says so.
 
 use std::time::{Duration, Instant};
 
@@ -24,6 +25,11 @@ pub enum Bg {
     Bar(BarUpdate),
     /// The `tui` channel's conversation, after an attach.
     History(Vec<HistoryMessage>),
+    /// History could not be read yet: a turn holds the session. Sent once
+    /// per attach; `History` follows when the turn ends.
+    HistoryBusy,
+    /// History gave up (an error, or the session never freed).
+    HistoryUnavailable(String),
     /// A live ledger row arrived (the row itself lands with the Watch page).
     Row,
 }
@@ -46,6 +52,9 @@ pub enum Ctl {
 
 /// Probe cadence while a daemon we started ourselves is coming up.
 const FAST_PROBE: Duration = Duration::from_millis(250);
+/// How long fast probing lasts before a daemon that never came up is
+/// treated like one that went away (backoff, `Unreachable` reports).
+const FAST_PROBE_FOR: Duration = Duration::from_secs(10);
 /// Reconnect backoff bounds after a daemon we had goes away.
 pub const BACKOFF_MIN: Duration = Duration::from_millis(500);
 pub const BACKOFF_MAX: Duration = Duration::from_secs(8);
@@ -53,9 +62,11 @@ pub const BACKOFF_MAX: Duration = Duration::from_secs(8);
 const BAR_EVERY: Duration = Duration::from_secs(5);
 /// A ledger row asks for a refresh at most this often.
 const ROW_REFRESH_DEBOUNCE: Duration = Duration::from_secs(1);
-/// History fetch: the daemon answers 503 while a turn holds the session.
-const HISTORY_ATTEMPTS: usize = 6;
+/// History fetch: the daemon answers 503 while a turn holds the session,
+/// which a streamed reply can do for as long as the provider's idle bound
+/// (15 min by default). Retry that long, then say so.
 const HISTORY_RETRY: Duration = Duration::from_secs(2);
+const HISTORY_MAX_WAIT: Duration = Duration::from_secs(15 * 60);
 
 /// The delay after `previous` failed: doubled, capped.
 #[must_use]
@@ -80,15 +91,24 @@ pub fn spawn(
 
 async fn run(
     client: Client,
-    mut attached: bool,
+    attached_at_start: bool,
     mut ctl: mpsc::Receiver<Ctl>,
     tx: mpsc::Sender<Bg>,
 ) {
     // Fast probing until the first attach (a daemon we spawned is booting);
-    // exponential backoff after a daemon we had goes away.
-    let mut fast = !attached;
-    let mut backoff = FAST_PROBE;
+    // exponential backoff after a daemon we had goes away. A daemon that
+    // already answered goes through the same attach path (probe now, bar,
+    // history) so `pulse-null chat` loads the conversation like a relaunch.
+    let mut attached = false;
+    let mut fast = !attached_at_start;
+    let fast_since = Instant::now();
+    let mut backoff = if attached_at_start {
+        Duration::ZERO
+    } else {
+        FAST_PROBE
+    };
     let mut last_id: Option<u64> = None;
+    let mut history_task: Option<tokio::task::JoinHandle<()>> = None;
 
     loop {
         if !attached {
@@ -103,11 +123,21 @@ async fn run(
                 if let Some(update) = refresh(&client).await {
                     let _ = tx.send(Bg::Bar(update)).await;
                 }
-                if let Some(h) = fetch_history(&client).await {
-                    let _ = tx.send(Bg::History(h)).await;
+                // Its own task: the session may be busy for minutes, and the
+                // ledger stream and the bar must not wait behind it.
+                abort(&mut history_task);
+                history_task = Some(tokio::spawn(history(client.clone(), tx.clone())));
+            } else {
+                if fast && fast_since.elapsed() < FAST_PROBE_FOR {
+                    continue;
                 }
-            } else if !fast {
-                backoff = next_backoff(backoff.max(BACKOFF_MIN));
+                fast = false;
+                // First report is BACKOFF_MIN itself, then doubling to the cap.
+                backoff = if backoff < BACKOFF_MIN {
+                    BACKOFF_MIN
+                } else {
+                    next_backoff(backoff)
+                };
                 if tx
                     .send(Bg::Unreachable { retry_in: backoff })
                     .await
@@ -133,6 +163,7 @@ async fn run(
             Err(e) => {
                 tracing::warn!("ledger stream unavailable: {e}");
                 attached = false;
+                abort(&mut history_task);
                 backoff = BACKOFF_MIN;
                 let _ = tx.send(Bg::Unreachable { retry_in: backoff }).await;
                 continue;
@@ -197,6 +228,7 @@ async fn run(
 
         // Anything that broke the inner loop means the daemon is gone.
         attached = false;
+        abort(&mut history_task);
         backoff = BACKOFF_MIN;
         if tx
             .send(Bg::Unreachable { retry_in: backoff })
@@ -235,22 +267,48 @@ async fn refresh(client: &Client) -> Option<BarUpdate> {
     })
 }
 
-/// The `tui` conversation, retried while the daemon reports the session busy.
-async fn fetch_history(client: &Client) -> Option<Vec<HistoryMessage>> {
-    for attempt in 1..=HISTORY_ATTEMPTS {
+fn abort(task: &mut Option<tokio::task::JoinHandle<()>>) {
+    if let Some(t) = task.take() {
+        t.abort();
+    }
+}
+
+/// The `tui` conversation, retried while the daemon reports the session
+/// busy. Says so once, then delivers the history when the turn ends, or
+/// gives up after [`HISTORY_MAX_WAIT`].
+async fn history(client: Client, tx: mpsc::Sender<Bg>) {
+    let started = Instant::now();
+    let mut said_busy = false;
+    loop {
         match client.history("tui").await {
-            Ok(h) => return Some(h),
+            Ok(h) => {
+                let _ = tx.send(Bg::History(h)).await;
+                return;
+            }
             Err(super::client::ClientError::Status { status: 503, .. }) => {
-                tracing::debug!("history busy (attempt {attempt}); retrying");
+                if !said_busy {
+                    said_busy = true;
+                    if tx.send(Bg::HistoryBusy).await.is_err() {
+                        return;
+                    }
+                }
+                if started.elapsed() >= HISTORY_MAX_WAIT {
+                    let _ = tx
+                        .send(Bg::HistoryUnavailable(
+                            "the session stayed busy; relaunch to load it".to_string(),
+                        ))
+                        .await;
+                    return;
+                }
                 tokio::time::sleep(HISTORY_RETRY).await;
             }
             Err(e) => {
                 tracing::warn!("history unavailable: {e}");
-                return None;
+                let _ = tx.send(Bg::HistoryUnavailable(e.to_string())).await;
+                return;
             }
         }
     }
-    None
 }
 
 #[cfg(test)]

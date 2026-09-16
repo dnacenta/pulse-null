@@ -257,6 +257,12 @@ async fn event_loop(
                             .collect();
                         app.talk.load_history(items);
                     }
+                    Some(Bg::HistoryBusy) => app
+                        .talk
+                        .notice("history: a turn holds the session — loading when it ends"),
+                    Some(Bg::HistoryUnavailable(why)) => {
+                        app.talk.notice(&format!("history unavailable: {why}"));
+                    }
                     // Rows feed the Watch page in the next plan; the poller
                     // already refreshed the bar for this one.
                     Some(Bg::Row) => {}
