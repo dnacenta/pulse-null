@@ -1,3 +1,6 @@
+// Peer-to-peer plumbing. Its only consumer, the old Comms tab, was deleted in
+// PN-102; `/api/peers` and `/api/comms` (phase 4) pick it up again.
+#![allow(dead_code)]
 use std::collections::HashMap;
 use std::path::Path;
 use std::time::{Duration, Instant};

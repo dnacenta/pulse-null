@@ -11,35 +11,10 @@ use crate::streaming::StreamingProvider;
 
 /// Create a boxed provider based on config.
 pub fn create_provider(config: &Config) -> Result<Box<dyn LmProvider>, ProviderError> {
-    match config.llm.provider.as_str() {
-        "claude" => {
-            let api_key = config.resolve_api_key().ok_or_else(|| {
-                ProviderError::MissingApiKey(
-                    "No API key found. Set it in pulse-null.toml or ANTHROPIC_API_KEY env var."
-                        .into(),
-                )
-            })?;
-            Ok(Box::new(ClaudeProvider::new(
-                api_key,
-                config.llm.model.clone(),
-            )))
-        }
-        "ollama" => Ok(Box::new(OllamaProvider::new(
-            config.llm.model.clone(),
-            config.llm.base_url.clone(),
-        ))),
-        "claude-code" => {
-            let mut provider =
-                ClaudeCodeProvider::new(config.llm.model.clone(), config.llm.claude_bin.clone());
-            // Isolation awareness (spec Stage 2): the CLI subprocess brings
-            // its own tools, so the marker must reach the spawn itself.
-            if let Ok(root) = config.root_dir() {
-                provider = provider.with_isolation_root(root);
-            }
-            Ok(Box::new(provider))
-        }
-        other => Err(ProviderError::Unknown(other.to_string())),
-    }
+    // One construction site: every provider streams, and a streaming
+    // provider is an `LmProvider` (trait upcasting).
+    let provider: Box<dyn StreamingProvider> = create_streaming_provider(config)?;
+    Ok(provider)
 }
 
 /// Create a streaming-capable provider based on config.

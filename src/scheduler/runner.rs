@@ -263,8 +263,12 @@ async fn run_builtin_handler(
     match task.id.as_str() {
         "trajectory-mining" => {
             tracing::info!("Running built-in trajectory mining handler");
-            let docs_dir = resolve_docs_dir(root_dir);
-            let summary = crate::caliber::runtime::mine_and_update(&docs_dir);
+            // The entity ROOT, not the journal: outcomes are recorded with
+            // `record_outcome(root_dir, ..)` and CALIBER.md is read from the
+            // root by the prompt builder and vigil. Mining `<root>/journal`
+            // read an outcomes file nothing writes and wrote a CALIBER.md
+            // nothing reads.
+            let summary = crate::caliber::runtime::mine_and_update(root_dir);
             tracing::info!("Trajectory mining complete: {}", summary);
 
             // Record outcome for caliber-echo itself

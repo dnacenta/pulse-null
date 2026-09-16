@@ -5,6 +5,7 @@ pub mod dynamic;
 pub mod evaluator;
 pub mod executor;
 pub mod health;
+pub mod humanize;
 pub mod intent;
 pub mod liveness;
 pub mod output;

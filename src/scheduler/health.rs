@@ -307,6 +307,14 @@ impl TaskHealthStore {
         self.file.tasks.get(task_id)
     }
 
+    /// Every known task as `(task_id, health)`, in task-id order.
+    pub fn tasks(&self) -> impl Iterator<Item = (&str, &TaskHealth)> {
+        self.file
+            .tasks
+            .iter()
+            .map(|(id, health)| (id.as_str(), health))
+    }
+
     /// Most recent success across every known task.
     #[must_use]
     pub fn last_success_any(&self) -> Option<DateTime<Utc>> {

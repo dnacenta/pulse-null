@@ -30,9 +30,16 @@ pub fn outcomes_file(docs_dir: &Path) -> PathBuf {
     caliber_dir(docs_dir).join("outcomes.json")
 }
 
-/// Path to CALIBER.md
-pub fn caliber_md(docs_dir: &Path) -> PathBuf {
-    docs_dir.join("CALIBER.md")
+/// Path to CALIBER.md: `{root_dir}/CALIBER.md`.
+///
+/// The argument is the **entity root**, not a docs/journal directory. The
+/// capability map is written next to `schedule.json` and `task_health.json`
+/// because that is where the outcomes it is mined from already live
+/// (`record_outcome` is always called with the root). Resolving it against
+/// `<root>/journal` instead — as the trajectory miner once did — produced a
+/// second CALIBER.md that nothing ever read.
+pub fn caliber_md(root_dir: &Path) -> PathBuf {
+    root_dir.join("CALIBER.md")
 }
 
 // ---------------------------------------------------------------------------
@@ -203,6 +210,16 @@ mod tests {
         let plugin = CaliberEchoPlugin::new();
         let health = plugin.health().await;
         assert!(matches!(health, PluginHealth::Down(_)));
+    }
+
+    /// The single rule every CALIBER.md reader and writer now follows: the
+    /// file sits directly in the entity root. Three call sites used to
+    /// disagree (the miner resolved `<root>/journal`), so one of them was
+    /// always looking at a file the others never touched.
+    #[test]
+    fn caliber_md_lives_in_the_entity_root() {
+        let root = Path::new("/home/pulse/entity");
+        assert_eq!(caliber_md(root), root.join("CALIBER.md"));
     }
 
     #[test]
