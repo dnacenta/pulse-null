@@ -412,7 +412,7 @@ impl Talk {
         focus: PaneId,
         t: Tokens,
         owner: &str,
-        entity: &str,
+        pulse: &str,
         motion: &mut Motion,
         palette: Palette,
     ) {
@@ -429,7 +429,7 @@ impl Talk {
                         width: inner.width.saturating_sub(1),
                         ..inner
                     };
-                    let mut lay = self.transcript.layout(text_area, t, owner, entity, status);
+                    let mut lay = self.transcript.layout(text_area, t, owner, pulse, status);
                     // `lay.lines` is exactly the visible window; nothing to scroll.
                     let para = Paragraph::new(std::mem::take(&mut lay.lines))
                         .style(Style::default().bg(t.ground));

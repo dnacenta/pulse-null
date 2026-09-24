@@ -359,11 +359,7 @@ impl SessionData {
 /// Archives the current conversation (via end_session), clears the session,
 /// and inserts a handoff summary as the first message of the new session.
 /// Returns the archive path if archiving succeeded.
-pub fn reset_session(
-    data: &mut SessionData,
-    root_dir: &Path,
-    entity_name: &str,
-) -> Option<PathBuf> {
+pub fn reset_session(data: &mut SessionData, root_dir: &Path, pulse_name: &str) -> Option<PathBuf> {
     if data.messages.is_empty() && data.quarantine.is_empty() {
         return None;
     }
@@ -382,13 +378,13 @@ pub fn reset_session(
     // context across the session boundary.
     let archive_path = crate::session::end_session(
         root_dir,
-        entity_name,
+        pulse_name,
         &data.messages,
         &data.channel,
         "session-reset",
         Some(&data.key),
     );
-    crate::session::archive_quarantine(root_dir, entity_name, &data.key, &data.quarantine);
+    crate::session::archive_quarantine(root_dir, pulse_name, &data.key, &data.quarantine);
 
     tracing::info!(
         "[session-reset] key={} msgs={} compactions={} hallucinations={} → fresh session",
@@ -549,7 +545,7 @@ pub struct SessionStore {
     sessions: RwLock<HashMap<String, std::sync::Arc<RwLock<Session>>>>,
     sessions_dir: PathBuf,
     root_dir: PathBuf,
-    entity_name: String,
+    pulse_name: String,
     ttl_seconds: u64,
     max_sessions: usize,
     coordinator: Option<Arc<PersistCoordinator>>,
@@ -569,12 +565,12 @@ impl SessionStore {
     pub async fn new(
         root_dir: &Path,
         config: &crate::config::SessionConfig,
-        entity_name: &str,
+        pulse_name: &str,
     ) -> Self {
         Self::with_identity(
             root_dir,
             config,
-            entity_name,
+            pulse_name,
             &OwnerConfig::default(),
             &HashMap::new(),
         )
@@ -589,7 +585,7 @@ impl SessionStore {
     pub async fn with_identity(
         root_dir: &Path,
         config: &crate::config::SessionConfig,
-        entity_name: &str,
+        pulse_name: &str,
         owner: &OwnerConfig,
         peers: &HashMap<String, crate::config::PeerConfig>,
     ) -> Self {
@@ -602,7 +598,7 @@ impl SessionStore {
             sessions: RwLock::new(HashMap::new()),
             sessions_dir: sessions_dir.clone(),
             root_dir: root_dir.to_path_buf(),
-            entity_name: entity_name.to_string(),
+            pulse_name: pulse_name.to_string(),
             ttl_seconds: config.ttl_seconds,
             max_sessions: config.max_sessions,
             coordinator: None,
@@ -682,7 +678,7 @@ impl SessionStore {
                             if !data.messages.is_empty() {
                                 crate::session::end_session(
                                     &self.root_dir,
-                                    &self.entity_name,
+                                    &self.pulse_name,
                                     &data.messages,
                                     &data.channel,
                                     "session-expired-on-load",
@@ -985,7 +981,7 @@ impl SessionStore {
 
     /// Clean up expired sessions, archiving them first.
     /// Returns the paths of any archived conversations (for graph ingestion).
-    pub async fn cleanup_expired(&self, root_dir: &Path, entity_name: &str) -> Vec<PathBuf> {
+    pub async fn cleanup_expired(&self, root_dir: &Path, pulse_name: &str) -> Vec<PathBuf> {
         let mut expired_keys = Vec::new();
 
         {
@@ -1011,7 +1007,7 @@ impl SessionStore {
                     // Full session end: archive + EPHEMERAL + LOGBOOK
                     if let Some(path) = crate::session::end_session(
                         root_dir,
-                        entity_name,
+                        pulse_name,
                         &session.data.messages,
                         &session.data.channel,
                         "session-expired",
@@ -1035,7 +1031,7 @@ impl SessionStore {
 
     /// Archive all sessions (for shutdown).
     /// Returns the paths of archived conversations (for graph ingestion).
-    pub async fn archive_all(&self, root_dir: &Path, entity_name: &str) -> Vec<PathBuf> {
+    pub async fn archive_all(&self, root_dir: &Path, pulse_name: &str) -> Vec<PathBuf> {
         let sessions = self.sessions.read().await;
         let mut archived_paths = Vec::new();
 
@@ -1051,7 +1047,7 @@ impl SessionStore {
             // (SEC-003) so it never reaches EPHEMERAL or the graph.
             if let Some(path) = crate::session::end_session(
                 root_dir,
-                entity_name,
+                pulse_name,
                 &session.data.messages,
                 &session.data.channel,
                 "server-shutdown",
@@ -1060,12 +1056,7 @@ impl SessionStore {
                 tracing::info!("Archived session {} to {}", key, path.display());
                 archived_paths.push(path);
             }
-            crate::session::archive_quarantine(
-                root_dir,
-                entity_name,
-                key,
-                &session.data.quarantine,
-            );
+            crate::session::archive_quarantine(root_dir, pulse_name, key, &session.data.quarantine);
         }
 
         // Persist all to disk so they can be restored on restart
@@ -1565,7 +1556,7 @@ mod tests {
         session.data.quarantine.push(user_msg("spicy"));
         session.data.quarantine.push(asst_msg("opus reply"));
 
-        let archive = reset_session(&mut session.data, tmp.path(), "TestEntity");
+        let archive = reset_session(&mut session.data, tmp.path(), "TestPulse");
 
         assert!(
             archive.is_some(),
@@ -1601,7 +1592,7 @@ mod tests {
             .quarantine
             .push(asst_msg("opus reply to the spicy question"));
 
-        reset_session(&mut session.data, tmp.path(), "TestEntity");
+        reset_session(&mut session.data, tmp.path(), "TestPulse");
 
         // EPHEMERAL must contain the clean trunk topic and NOT the quarantined
         // content (SEC-003) — EPHEMERAL auto-loads into the default model.

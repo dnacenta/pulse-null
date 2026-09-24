@@ -9,7 +9,9 @@ const CONFIG_FILENAME: &str = "pulse-null.toml";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
-    pub entity: EntityConfig,
+    /// The pulse's identity. `[entity]` is the pre-rename spelling (PN-115).
+    #[serde(alias = "entity")]
+    pub pulse: PulseConfig,
     pub server: ServerConfig,
     pub llm: LlmConfig,
     pub security: SecurityConfig,
@@ -28,7 +30,7 @@ pub struct Config {
     #[serde(default)]
     pub autonomy: AutonomyConfig,
     #[serde(default)]
-    pub pulse: PulseConfig,
+    pub caliber: CaliberConfig,
     /// Terminal UI look and motion (PN-102).
     #[serde(default)]
     pub tui: TuiConfig,
@@ -57,7 +59,7 @@ pub struct Config {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct EntityConfig {
+pub struct PulseConfig {
     pub name: String,
     pub owner_name: String,
     pub owner_alias: String,
@@ -297,7 +299,7 @@ impl Config {
     pub fn load() -> Result<Self, crate::errors::ConfigError> {
         let path = Self::find_config()?;
         let content = std::fs::read_to_string(&path)?;
-        let config: Config = toml::from_str(&content)?;
+        let config = Self::from_toml_str(&content)?;
         validate::validate(&config)?;
         Ok(config)
     }
@@ -306,9 +308,26 @@ impl Config {
     pub fn load_from(dir: &std::path::Path) -> Result<Self, crate::errors::ConfigError> {
         let path = dir.join(CONFIG_FILENAME);
         let content = std::fs::read_to_string(&path)?;
-        let config: Config = toml::from_str(&content)?;
+        let config = Self::from_toml_str(&content)?;
         validate::validate(&config)?;
         Ok(config)
+    }
+
+    /// Parse a `pulse-null.toml` body (unvalidated), accepting the
+    /// pre-PN-115 layout: `[entity]` is read as `[pulse]`, and the
+    /// caliber-echo `[pulse]` table it used to sit beside as `[caliber]`.
+    pub fn from_toml_str(content: &str) -> Result<Self, crate::errors::ConfigError> {
+        let mut doc: toml::Table = toml::from_str(content)?;
+        if !doc.contains_key(LEGACY_IDENTITY_SECTION) {
+            // Parse the text itself so errors keep their line numbers.
+            return Ok(toml::from_str(content)?);
+        }
+        migrate_legacy_sections(&mut doc).map_err(crate::errors::ConfigError::Validation)?;
+        tracing::warn!(
+            "pulse-null.toml uses the pre-PN-115 [{LEGACY_IDENTITY_SECTION}] section — \
+             still accepted; rename it to [pulse]"
+        );
+        Ok(toml::Value::Table(doc).try_into()?)
     }
 
     /// Find pulse-null.toml by walking up from current directory
@@ -328,7 +347,7 @@ impl Config {
         }
     }
 
-    /// Get the entity root directory (where pulse-null.toml lives)
+    /// Get the pulse root directory (where pulse-null.toml lives)
     pub fn root_dir(&self) -> Result<PathBuf, crate::errors::ConfigError> {
         let path = Self::find_config()?;
         Ok(path
@@ -709,7 +728,7 @@ pub struct TensionConfig {
     /// Beyond this, forced triage, NOT silent eviction.
     ///
     /// The store admits the thread and raises a [`crate::tension::TriageDemand`]
-    /// the entity has to answer. Dropping at the cap is the defect in the
+    /// the pulse has to answer. Dropping at the cap is the defect in the
     /// intent queue's `push()` and in the `predictions.json` prune; this is
     /// the third store and it does not reproduce it.
     pub max_live_threads: usize,
@@ -842,7 +861,7 @@ pub struct SessionConfig {
     /// Owner session time limit in seconds (default: 8h).
     #[serde(default = "default_owner_time_cap")]
     pub owner_time_cap_seconds: u64,
-    /// Session limits for peer entities.
+    /// Session limits for peer pulses.
     #[serde(default = "default_peer_message_cap")]
     pub peer_message_cap: usize,
     /// Peer session time limit in seconds (default: 1h).
@@ -987,7 +1006,7 @@ impl Default for PlatformConfig {
     }
 }
 
-/// Configuration for a remote peer entity
+/// Configuration for a remote peer pulse
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PeerConfig {
     pub host: String,
@@ -1120,17 +1139,56 @@ impl Default for TuiConfig {
     }
 }
 
-/// Configuration for caliber-echo outcome tracking
+/// The section that held the pulse's identity before PN-115 (now `[pulse]`).
+const LEGACY_IDENTITY_SECTION: &str = "entity";
+
+/// Keys of the `[pulse]` identity table. Before PN-115 a `[pulse]` table
+/// held caliber-echo settings instead (now `[caliber]`); one carrying none of
+/// these keys next to an `[entity]` table is that legacy section.
+const PULSE_IDENTITY_KEYS: [&str; 4] = ["name", "owner_name", "owner_alias", "rules_dir"];
+
+/// Rewrite the pre-PN-115 layout in place: `[entity]` becomes `[pulse]`, and
+/// the legacy caliber `[pulse]` it would collide with becomes `[caliber]`.
+/// Ambiguous mixes of old and new names are refused, never guessed at.
+fn migrate_legacy_sections(doc: &mut toml::Table) -> Result<(), String> {
+    let Some(identity) = doc.remove(LEGACY_IDENTITY_SECTION) else {
+        return Ok(());
+    };
+    if let Some(existing) = doc.remove("pulse") {
+        let Some(table) = existing.as_table() else {
+            return Err("[pulse] must be a table".into());
+        };
+        if PULSE_IDENTITY_KEYS.iter().any(|k| table.contains_key(*k)) {
+            return Err(
+                "both [entity] and [pulse] name the pulse — keep [pulse] and remove [entity]"
+                    .into(),
+            );
+        }
+        if doc.contains_key("caliber") {
+            return Err(
+                "both [pulse] (the pre-PN-115 caliber settings) and [caliber] are \
+                 present — merge them into [caliber]"
+                    .into(),
+            );
+        }
+        doc.insert("caliber".into(), existing);
+    }
+    doc.insert("pulse".into(), identity);
+    Ok(())
+}
+
+/// Configuration for caliber-echo outcome tracking (`[caliber]`; `[pulse]`
+/// before PN-115).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
-pub struct PulseConfig {
+pub struct CaliberConfig {
     /// Enable outcome recording after task/intent execution
     pub enabled: bool,
     /// Maximum outcomes to keep (rolling window)
     pub max_outcomes: usize,
 }
 
-impl Default for PulseConfig {
+impl Default for CaliberConfig {
     fn default() -> Self {
         Self {
             enabled: true,
@@ -1147,7 +1205,7 @@ pub mod test_support {
     /// its default — the starting point for tests that need to vary one knob.
     pub fn minimal_config() -> Config {
         Config {
-            entity: EntityConfig {
+            pulse: PulseConfig {
                 name: "Test".into(),
                 owner_name: "Owner".into(),
                 owner_alias: "O".into(),
@@ -1176,7 +1234,7 @@ pub mod test_support {
             pipeline: PipelineConfig::default(),
             monitoring: MonitoringConfig::default(),
             autonomy: AutonomyConfig::default(),
-            pulse: PulseConfig::default(),
+            caliber: CaliberConfig::default(),
             graph: GraphConfig::default(),
             prediction: PredictionConfig::default(),
             tension: TensionConfig::default(),
@@ -1305,5 +1363,89 @@ mod fallback_tests {
         assert!(cfg.fallback_on_refusal);
         assert_eq!(cfg.fallback_model, None);
         assert_eq!(cfg.fallback_target(), None);
+    }
+}
+
+/// PN-115: the `[entity]` → `[pulse]` rename keeps pre-rename configs booting.
+#[cfg(test)]
+mod pulse_rename_tests {
+    use super::*;
+
+    const REST: &str = "[server]\nport = 3200\n[llm]\nprovider = \"claude-code\"\n\
+                        [security]\n";
+
+    fn identity(section: &str) -> String {
+        format!("[{section}]\nname = \"Echo\"\nowner_name = \"D\"\nowner_alias = \"D\"\n")
+    }
+
+    #[test]
+    fn pulse_section_parses() {
+        let cfg = Config::from_toml_str(&format!("{}{REST}", identity("pulse"))).unwrap();
+        assert_eq!(cfg.pulse.name, "Echo");
+        assert!(cfg.caliber.enabled);
+    }
+
+    #[test]
+    fn legacy_entity_section_still_parses() {
+        let text = format!("{}{REST}", identity("entity"));
+        let cfg = Config::from_toml_str(&text).unwrap();
+        assert_eq!(cfg.pulse.name, "Echo");
+        assert_eq!(cfg.pulse.owner_alias, "D");
+        // The serde alias alone also accepts it, for direct deserialisers.
+        let direct: Config = toml::from_str(&text).unwrap();
+        assert_eq!(direct.pulse.name, "Echo");
+    }
+
+    #[test]
+    fn legacy_caliber_pulse_section_moves_to_caliber() {
+        let text = format!(
+            "{}[pulse]\nenabled = false\nmax_outcomes = 7\n{REST}",
+            identity("entity")
+        );
+        let cfg = Config::from_toml_str(&text).unwrap();
+        assert_eq!(cfg.pulse.name, "Echo");
+        assert!(!cfg.caliber.enabled);
+        assert_eq!(cfg.caliber.max_outcomes, 7);
+    }
+
+    #[test]
+    fn new_caliber_section_parses() {
+        let text = format!("{}[caliber]\nenabled = false\n{REST}", identity("pulse"));
+        let cfg = Config::from_toml_str(&text).unwrap();
+        assert!(!cfg.caliber.enabled);
+        assert_eq!(cfg.caliber.max_outcomes, 200);
+    }
+
+    #[test]
+    fn ambiguous_mixes_are_refused() {
+        let both = format!("{}{}{REST}", identity("entity"), identity("pulse"));
+        assert!(Config::from_toml_str(&both).is_err());
+        let two_calibers = format!(
+            "{}[pulse]\nenabled = false\n[caliber]\nenabled = true\n{REST}",
+            identity("entity")
+        );
+        assert!(Config::from_toml_str(&two_calibers).is_err());
+    }
+
+    #[test]
+    fn context_buffer_entity_filter_is_an_alias() {
+        for key in ["entity_filter", "pulse_filter"] {
+            let text = format!(
+                "{}[context_buffer]\n{key} = false\n{REST}",
+                identity("pulse")
+            );
+            let cfg = Config::from_toml_str(&text).unwrap();
+            assert!(!cfg.context_buffer.pulse_filter, "{key}");
+        }
+    }
+
+    #[test]
+    fn serialises_the_new_names() {
+        let cfg = Config::from_toml_str(&format!("{}{REST}", identity("entity"))).unwrap();
+        let text = toml::to_string(&cfg).unwrap();
+        assert!(text.contains("[pulse]"), "{text}");
+        assert!(text.contains("[caliber]"), "{text}");
+        assert!(!text.contains("[entity]"), "{text}");
+        assert!(text.contains("pulse_filter"), "{text}");
     }
 }

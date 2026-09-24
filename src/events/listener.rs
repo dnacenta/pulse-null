@@ -5,7 +5,7 @@ use std::sync::Arc;
 use chrono::{DateTime, Duration, Utc};
 use tokio::sync::RwLock;
 
-use super::{ConversationTrust, EntityEvent, InteractionSource, SalienceKind};
+use super::{ConversationTrust, InteractionSource, PulseEvent, SalienceKind};
 use crate::config::{Config, EventsConfig};
 use crate::outreach::{self, Decision, OutreachCandidate};
 use crate::scheduler::evaluator::{
@@ -22,7 +22,7 @@ const MAX_CONSECUTIVE_FIRES: u32 = 3;
 
 /// Listen for events and translate them into queued intents.
 pub async fn event_listener(
-    mut rx: tokio::sync::broadcast::Receiver<EntityEvent>,
+    mut rx: tokio::sync::broadcast::Receiver<PulseEvent>,
     intent_queue: Arc<RwLock<IntentQueue>>,
     config: Arc<Config>,
     root_dir: PathBuf,
@@ -46,7 +46,7 @@ pub async fn event_listener(
 
                 // Check cooldown — PostInteraction is exempt from consecutive
                 // fire limits since each interaction is a unique trigger
-                let is_post_conversation = matches!(event, EntityEvent::PostInteraction { .. });
+                let is_post_conversation = matches!(event, PulseEvent::PostInteraction { .. });
 
                 // Salience carries its own admission control: the quality
                 // gate, quiet hours and per-kind daily caps (PN-94 §2.2–2.5).
@@ -54,7 +54,7 @@ pub async fn event_listener(
                 // throttle `Blocking`, which the spec requires to be uncapped,
                 // and the circuit breaker would retire the channel after three
                 // messages. The caps are the control; this is not.
-                let self_governed = matches!(event, EntityEvent::Salience { .. });
+                let self_governed = matches!(event, PulseEvent::Salience { .. });
 
                 if let Some((last_queued, fires)) =
                     cooldowns.get(&event_type).filter(|_| !self_governed)
@@ -90,17 +90,17 @@ pub async fn event_listener(
                 // Each event type has a trait-based evaluator that performs mechanical
                 // checks (timestamps, token counts, signal deltas) without LLM calls.
                 let evaluator: Option<Box<dyn Evaluator>> = match &event {
-                    EntityEvent::PipelineFrozen { .. } => Some(Box::new(PipelineDocEval::new(
+                    PulseEvent::PipelineFrozen { .. } => Some(Box::new(PipelineDocEval::new(
                         "pipeline_frozen",
                         docs_dir.clone(),
                     ))),
-                    EntityEvent::PipelineConversionLow { .. } => Some(Box::new(
+                    PulseEvent::PipelineConversionLow { .. } => Some(Box::new(
                         PipelineDocEval::new("pipeline_conversion_low", docs_dir.clone()),
                     )),
-                    EntityEvent::CognitiveHealthChanged { .. } => Some(Box::new(
+                    PulseEvent::CognitiveHealthChanged { .. } => Some(Box::new(
                         CognitiveEval::new(root_dir.clone(), docs_dir.clone()),
                     )),
-                    EntityEvent::PostInteraction {
+                    PulseEvent::PostInteraction {
                         input_tokens,
                         output_tokens,
                         ..
@@ -217,7 +217,7 @@ pub async fn event_listener(
 /// Any pending cap-tightening notice is delivered here, before the decision
 /// is acted on, and is marked announced only once delivery succeeds — a
 /// notice lost to a failing webhook must be retried, not assumed seen.
-async fn admit_salience(event: &EntityEvent, config: &Arc<Config>, root_dir: &Path) -> bool {
+async fn admit_salience(event: &PulseEvent, config: &Arc<Config>, root_dir: &Path) -> bool {
     let Some(candidate) = OutreachCandidate::from_event(event) else {
         return false;
     };
@@ -290,9 +290,9 @@ async fn announce_tightening(
 
 /// Translate an event into an intent, respecting config toggles.
 /// Returns None if the event type is disabled.
-fn translate_event(event: &EntityEvent, config: &EventsConfig) -> Option<Intent> {
+fn translate_event(event: &PulseEvent, config: &EventsConfig) -> Option<Intent> {
     match event {
-        EntityEvent::PostInteraction {
+        PulseEvent::PostInteraction {
             source,
             trust,
             summary,
@@ -386,7 +386,7 @@ fn translate_event(event: &EntityEvent, config: &EventsConfig) -> Option<Intent>
             })
         }
 
-        EntityEvent::PipelineAlert {
+        PulseEvent::PipelineAlert {
             document,
             count,
             hard_limit,
@@ -418,7 +418,7 @@ fn translate_event(event: &EntityEvent, config: &EventsConfig) -> Option<Intent>
             })
         }
 
-        EntityEvent::PipelineFrozen {
+        PulseEvent::PipelineFrozen {
             sessions_without_movement,
         } => {
             if !config.pipeline_frozen {
@@ -448,7 +448,7 @@ fn translate_event(event: &EntityEvent, config: &EventsConfig) -> Option<Intent>
             })
         }
 
-        EntityEvent::PipelineConversionLow {
+        PulseEvent::PipelineConversionLow {
             conversations_7d,
             pipeline_updates_7d,
         } => {
@@ -489,9 +489,9 @@ fn translate_event(event: &EntityEvent, config: &EventsConfig) -> Option<Intent>
 
         // PluginStateChanged triggers AWARENESS.md rebuild — handled externally,
         // no intent needed from the event listener.
-        EntityEvent::PluginStateChanged { .. } => None,
+        PulseEvent::PluginStateChanged { .. } => None,
 
-        EntityEvent::CognitiveHealthChanged {
+        PulseEvent::CognitiveHealthChanged {
             previous,
             current,
             suggestions,
@@ -539,18 +539,18 @@ fn translate_event(event: &EntityEvent, config: &EventsConfig) -> Option<Intent>
         // ProviderError notifications are handled directly via output::route_error()
         // in the scheduler — not through the intent system, because the provider
         // is likely down when this fires.
-        EntityEvent::ProviderError { .. } => None,
+        PulseEvent::ProviderError { .. } => None,
 
         // Prediction pressure is observed and routed by the runner via
         // reflection-window prompt augmentation, not via an autonomous LLM
         // intent. The event exists for vigil-pulse and future listeners.
-        EntityEvent::PredictionPressure { .. } => None,
+        PulseEvent::PredictionPressure { .. } => None,
 
         // Salience has already cleared the outreach admission by the time it
         // gets here (see `admit_salience`), so this only shapes the message.
         // Routing is `Share`: `Call` stays manual until the Discord channel
         // has a track record (spec §2.5, `allow_call_routing = false`).
-        EntityEvent::Salience {
+        PulseEvent::Salience {
             kind,
             thread_id,
             headline,
@@ -658,7 +658,7 @@ mod tests {
             post_conversation: true,
             ..EventsConfig::default()
         };
-        let event = EntityEvent::PostInteraction {
+        let event = PulseEvent::PostInteraction {
             source: InteractionSource::Chat {
                 channel: "discord".to_string(),
             },
@@ -682,7 +682,7 @@ mod tests {
             post_conversation: true,
             ..EventsConfig::default()
         };
-        let event = EntityEvent::PostInteraction {
+        let event = PulseEvent::PostInteraction {
             source: InteractionSource::Comms {
                 peer: "Synth".to_string(),
             },
@@ -702,7 +702,7 @@ mod tests {
             post_conversation: false,
             ..EventsConfig::default()
         };
-        let event = EntityEvent::PostInteraction {
+        let event = PulseEvent::PostInteraction {
             source: InteractionSource::Chat {
                 channel: "chat".to_string(),
             },
@@ -720,7 +720,7 @@ mod tests {
             pipeline_alert: true,
             ..EventsConfig::default()
         };
-        let event = EntityEvent::PipelineAlert {
+        let event = PulseEvent::PipelineAlert {
             document: "LEARNING".to_string(),
             count: 8,
             hard_limit: 8,
@@ -736,7 +736,7 @@ mod tests {
             pipeline_frozen: true,
             ..EventsConfig::default()
         };
-        let event = EntityEvent::PipelineFrozen {
+        let event = PulseEvent::PipelineFrozen {
             sessions_without_movement: 5,
         };
         let intent = translate_event(&event, &config).unwrap();
@@ -751,7 +751,7 @@ mod tests {
         };
 
         // Declining: HEALTHY → WATCH should queue
-        let event = EntityEvent::CognitiveHealthChanged {
+        let event = PulseEvent::CognitiveHealthChanged {
             previous: "HEALTHY".to_string(),
             current: "WATCH".to_string(),
             suggestions: vec!["Try new domain.".to_string()],
@@ -759,7 +759,7 @@ mod tests {
         assert!(translate_event(&event, &config).is_some());
 
         // Improving: WATCH → HEALTHY should NOT queue
-        let event = EntityEvent::CognitiveHealthChanged {
+        let event = PulseEvent::CognitiveHealthChanged {
             previous: "WATCH".to_string(),
             current: "HEALTHY".to_string(),
             suggestions: vec![],
@@ -767,7 +767,7 @@ mod tests {
         assert!(translate_event(&event, &config).is_none());
 
         // Same: HEALTHY → HEALTHY should NOT queue
-        let event = EntityEvent::CognitiveHealthChanged {
+        let event = PulseEvent::CognitiveHealthChanged {
             previous: "HEALTHY".to_string(),
             current: "HEALTHY".to_string(),
             suggestions: vec![],
@@ -781,7 +781,7 @@ mod tests {
             pipeline_conversion_low: true,
             ..EventsConfig::default()
         };
-        let event = EntityEvent::PipelineConversionLow {
+        let event = PulseEvent::PipelineConversionLow {
             conversations_7d: 5,
             pipeline_updates_7d: 0,
         };
@@ -805,7 +805,7 @@ mod tests {
             post_conversation: true,
             ..EventsConfig::default()
         };
-        let event = EntityEvent::PostInteraction {
+        let event = PulseEvent::PostInteraction {
             source: InteractionSource::ScheduledTask {
                 task_name: "reflection".to_string(),
             },
@@ -825,7 +825,7 @@ mod tests {
             post_conversation: true,
             ..EventsConfig::default()
         };
-        let event = EntityEvent::PostInteraction {
+        let event = PulseEvent::PostInteraction {
             source: InteractionSource::Research {
                 topic: "emergence".to_string(),
             },
@@ -845,7 +845,7 @@ mod tests {
             post_conversation: true,
             ..EventsConfig::default()
         };
-        let event = EntityEvent::PostInteraction {
+        let event = PulseEvent::PostInteraction {
             source: InteractionSource::Comms {
                 peer: "Nova".to_string(),
             },
@@ -859,8 +859,8 @@ mod tests {
         assert!(intent.prompt.contains("remote peer"));
     }
 
-    fn salience(kind: SalienceKind) -> EntityEvent {
-        EntityEvent::Salience {
+    fn salience(kind: SalienceKind) -> PulseEvent {
+        PulseEvent::Salience {
             kind,
             thread_id: None,
             headline: "The gate rejects self-authored evidence".to_string(),
@@ -923,7 +923,7 @@ mod tests {
             .prompt
             .contains("continues thread"));
 
-        if let EntityEvent::Salience {
+        if let PulseEvent::Salience {
             ref mut thread_id, ..
         } = event
         {
@@ -941,7 +941,7 @@ mod tests {
             post_conversation: true,
             ..EventsConfig::default()
         };
-        let event = EntityEvent::PostInteraction {
+        let event = PulseEvent::PostInteraction {
             source: InteractionSource::Comms {
                 peer: "unknown".to_string(),
             },

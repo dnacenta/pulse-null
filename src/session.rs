@@ -11,7 +11,7 @@ use regex::Regex;
 pub struct ArchiveMeta {
     pub trigger: String,
     pub channel: String,
-    pub entity_name: String,
+    pub pulse_name: String,
     pub session_key: Option<String>,
 }
 
@@ -164,10 +164,10 @@ pub fn archive_conversation(
     };
 
     let content = format!(
-        "---\nlog: {next_num}\ndate: \"{date_full}\"\ntrigger: {trigger}\nchannel: {channel}\nentity: \"{entity}\"\n{session_key_line}message_count: {message_count}\n---\n\n# Conversation {next_num:03}\n\n{conversation_md}",
+        "---\nlog: {next_num}\ndate: \"{date_full}\"\ntrigger: {trigger}\nchannel: {channel}\npulse: \"{pulse}\"\n{session_key_line}message_count: {message_count}\n---\n\n# Conversation {next_num:03}\n\n{conversation_md}",
         trigger = meta.trigger,
         channel = meta.channel,
-        entity = meta.entity_name,
+        pulse = meta.pulse_name,
     );
 
     if let Err(e) = file.write_all(content.as_bytes()) {
@@ -228,7 +228,7 @@ fn append_index(
 /// Returns the archive path on success (for graph ingestion).
 pub fn end_session(
     root_dir: &Path,
-    entity_name: &str,
+    pulse_name: &str,
     conversation: &[Message],
     channel: &str,
     trigger: &str,
@@ -242,7 +242,7 @@ pub fn end_session(
     let meta = ArchiveMeta {
         trigger: trigger.to_string(),
         channel: channel.to_string(),
-        entity_name: entity_name.to_string(),
+        pulse_name: pulse_name.to_string(),
         session_key: session_key.map(|s| s.to_string()),
     };
 
@@ -258,7 +258,7 @@ pub fn end_session(
     };
 
     // Path 2: Write lightweight EPHEMERAL summary
-    write_ephemeral_summary(root_dir, entity_name, conversation);
+    write_ephemeral_summary(root_dir, pulse_name, conversation);
 
     // Path 3: Automatic LOGBOOK entry
     crate::logbook::log_session_end(
@@ -286,7 +286,7 @@ pub fn end_session(
 /// (best-effort: a quarantine archive failure must not abort a session reset).
 pub fn archive_quarantine(
     root_dir: &Path,
-    entity_name: &str,
+    pulse_name: &str,
     session_key: &str,
     quarantine: &[Message],
 ) -> Option<PathBuf> {
@@ -323,9 +323,9 @@ pub fn archive_quarantine(
 
     let body = conversation_to_markdown(quarantine);
     let content = format!(
-        "---\ndate: \"{date}\"\nentity: \"{entity}\"\nsession_key: \"{key}\"\nlane: quarantine\nmessage_count: {count}\n---\n\n# Quarantine {key} ({n:03})\n\n{body}",
+        "---\ndate: \"{date}\"\npulse: \"{pulse}\"\nsession_key: \"{key}\"\nlane: quarantine\nmessage_count: {count}\n---\n\n# Quarantine {key} ({n:03})\n\n{body}",
         date = now.format("%Y-%m-%dT%H:%M:%SZ"),
-        entity = entity_name,
+        pulse = pulse_name,
         key = session_key,
         count = quarantine.len(),
     );
@@ -346,14 +346,14 @@ pub fn archive_quarantine(
 }
 
 /// Archive a comms (peer-to-peer) conversation transcript.
-/// Takes (entity_name, text) pairs and writes to the shared conversation archive.
+/// Takes (speaker, text) pairs and writes to the shared conversation archive.
 /// Consumed again by `/api/comms` in PN-102 phase 4.
 #[allow(dead_code)]
 pub fn archive_comms_conversation(
     root_dir: &Path,
     messages: &[(String, String)],
-    local_entity: &str,
-    peer_entity: &str,
+    local_pulse: &str,
+    peer_pulse: &str,
 ) -> Result<PathBuf, String> {
     if messages.is_empty() {
         return Err("Nothing to archive (empty comms transcript)".to_string());
@@ -371,15 +371,15 @@ pub fn archive_comms_conversation(
 
     // Build markdown with speaker names as headers
     let mut md = String::new();
-    for (i, (entity, text)) in messages.iter().enumerate() {
+    for (i, (speaker, text)) in messages.iter().enumerate() {
         if i > 0 {
             md.push_str("\n---\n\n");
         }
-        md.push_str(&format!("### {}\n\n{}\n", entity, text));
+        md.push_str(&format!("### {speaker}\n\n{text}\n"));
     }
 
     let content = format!(
-        "---\nlog: {next_num}\ndate: \"{date_full}\"\ntrigger: comms-end\nchannel: comms\nentity: \"{local_entity}\"\npeer: \"{peer_entity}\"\nmessage_count: {message_count}\n---\n\n# Conversation {next_num:03}\n\n{md}",
+        "---\nlog: {next_num}\ndate: \"{date_full}\"\ntrigger: comms-end\nchannel: comms\npulse: \"{local_pulse}\"\npeer: \"{peer_pulse}\"\nmessage_count: {message_count}\n---\n\n# Conversation {next_num:03}\n\n{md}",
     );
 
     let log_path = conv_dir.join(format!("conversation-{next_num:03}.md"));
@@ -582,7 +582,7 @@ pub async fn graph_sync_vigil(root_dir: &Path) {
 }
 
 /// Write a lightweight session summary to memory/EPHEMERAL.md.
-fn write_ephemeral_summary(root_dir: &Path, entity_name: &str, conversation: &[Message]) {
+fn write_ephemeral_summary(root_dir: &Path, pulse_name: &str, conversation: &[Message]) {
     if conversation.is_empty() {
         return;
     }
@@ -616,7 +616,7 @@ fn write_ephemeral_summary(root_dir: &Path, entity_name: &str, conversation: &[M
     let mut content = format!("## Chat Session — {}\n\n", now);
     content.push_str(&format!(
         "Conversation with {} ({} messages)\n\n",
-        entity_name,
+        pulse_name,
         conversation.len()
     ));
     content.push_str("### Topics discussed\n\n");
@@ -919,7 +919,7 @@ mod tests {
         let meta = ArchiveMeta {
             trigger: "test".into(),
             channel: "chat".into(),
-            entity_name: "echo".into(),
+            pulse_name: "echo".into(),
             session_key: None,
         };
 
@@ -938,6 +938,29 @@ mod tests {
             std::fs::read_to_string(conv_dir.join("conversation-002.md")).unwrap(),
             "claimed by other"
         );
+    }
+
+    /// PN-115: the frontmatter names the pulse under `pulse:`; the pre-rename
+    /// `entity:` key is no longer written (recall-echo 4.6.0 reads both).
+    #[test]
+    fn archive_frontmatter_names_the_pulse() {
+        let dir = tempfile::tempdir().unwrap();
+        let conversation = vec![Message {
+            role: Role::User,
+            content: MessageContent::Text("hello".into()),
+            source: None,
+        }];
+        let meta = ArchiveMeta {
+            trigger: "test".into(),
+            channel: "chat".into(),
+            pulse_name: "echo".into(),
+            session_key: None,
+        };
+        let path = archive_conversation(dir.path(), &conversation, &meta).unwrap();
+        let text = std::fs::read_to_string(path).unwrap();
+        let frontmatter = text.split("\n---\n").next().unwrap();
+        assert!(frontmatter.contains("\npulse: \"echo\"\n"), "{frontmatter}");
+        assert!(!frontmatter.contains("entity:"), "{frontmatter}");
     }
 
     #[test]
@@ -1038,7 +1061,7 @@ mod tests {
         let meta = ArchiveMeta {
             trigger: "session-end".into(),
             channel: "repl".into(),
-            entity_name: "TestEntity".into(),
+            pulse_name: "TestPulse".into(),
             session_key: None,
         };
 
@@ -1078,7 +1101,7 @@ mod tests {
         let meta = ArchiveMeta {
             trigger: "session-end".into(),
             channel: "repl".into(),
-            entity_name: "Test".into(),
+            pulse_name: "Test".into(),
             session_key: None,
         };
 
@@ -1095,7 +1118,7 @@ mod tests {
             &ArchiveMeta {
                 trigger: "session-end".into(),
                 channel: "repl".into(),
-                entity_name: "Test".into(),
+                pulse_name: "Test".into(),
                 session_key: None,
             },
         );

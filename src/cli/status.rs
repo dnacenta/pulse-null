@@ -10,10 +10,10 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let config = Config::load()?;
     let root_dir = config.root_dir()?;
 
-    println!("Pulse: {}", config.entity.name);
+    println!("Pulse: {}", config.pulse.name);
     println!(
         "Owner: {} ({})",
-        config.entity.owner_name, config.entity.owner_alias
+        config.pulse.owner_name, config.pulse.owner_alias
     );
     println!("LLM: {}", config.llm.provider);
     println!("Server: {}:{}", config.server.host, config.server.port);

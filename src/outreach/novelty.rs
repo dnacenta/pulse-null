@@ -226,7 +226,7 @@ Body text that is not a heading.
     }
 
     #[test]
-    fn corpus_on_a_fresh_entity_is_empty() {
+    fn corpus_on_a_fresh_pulse_is_empty() {
         let tmp = TempDir::new().unwrap();
         assert!(build_corpus(tmp.path(), &OutreachStore::default()).is_empty());
     }

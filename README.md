@@ -259,9 +259,9 @@ pulse-null up --headless         # single-pulse mode: this pulse only
 
 Running each pulse from its own directory is what production wants: one systemd unit per pulse, each with its own `WorkingDirectory`, its own environment file for provider credentials, and independent restarts. Every `pulse-null` subcommand is scoped to the pulse whose directory you run it from.
 
-For a quick look at all of them at once, `pulse-null up` from the install root boots every pulse in one process and opens the multi-pulse TUI. Each pulse binds the host and port from its own `pulse-null.toml`; if that port is already taken, it falls back to the next free port from 3200 upward and says so in the log. The older `entities/` subdirectory layout is still recognized.
+For a quick look at all of them at once, `pulse-null up` from the install root boots every pulse in one process and opens the multi-pulse TUI. Each pulse binds the host and port from its own `pulse-null.toml`; if that port is already taken, it falls back to the next free port from 3200 upward and says so in the log. Pulses kept in a `pulses/` subdirectory (or the older `entities/`) are recognized too.
 
-When the provider is `claude-code`, the pulse runs `claude` from inside its own directory with `RECALL_ECHO_HOME` pointing at it, so Claude Code picks up the pulse's `CLAUDE.md`, hooks and rules, and recall-echo reads and writes that pulse's memory. `pulse-null repair` re-creates any of those files and retires leftover `~/.claude` symlinks from older installs.
+When the provider is `claude-code`, the pulse runs `claude` from inside its own directory with `RECALL_ECHO_HOME` pointing at it, so Claude Code picks up the pulse's `CLAUDE.md`, hooks and rules, and recall-echo reads and writes that pulse's memory. `pulse-null repair` re-creates any of those files, rewrites recall-echo hooks written by older versions (`--entity-root` becomes `--pulse-root`; recall-echo 4.6.0 or later is required), and retires leftover `~/.claude` symlinks from older installs.
 
 Pulses under one unix user share that user's rights: each runs `claude` with permission prompts disabled and can read and write its siblings' directories. They do not collide, but they are not isolated from each other. Where isolation matters, give each pulse its own unix user.
 
@@ -273,9 +273,9 @@ Pulses under one unix user share that user's rights: each runs `claude` with per
 
 | Section | Key | Default | Description |
 |---------|-----|---------|-------------|
-| `entity` | `name` | — | Pulse name |
-| `entity` | `owner_name` | — | Your name |
-| `entity` | `owner_alias` | — | How the pulse addresses you |
+| `pulse` | `name` | — | Pulse name |
+| `pulse` | `owner_name` | — | Your name |
+| `pulse` | `owner_alias` | — | How the pulse addresses you |
 | `server` | `host` | `127.0.0.1` | Bind address |
 | `server` | `port` | `3100` | Bind port |
 | `llm` | `provider` | set at init | LLM backend (`claude`, `claude-code`, `ollama`) — chosen in the wizard; a config missing the key falls back to `claude` |
@@ -294,6 +294,11 @@ Pulses under one unix user share that user's rights: each runs `claude` with per
 | `scheduler` | `enabled` | `true` | Enable scheduled tasks |
 | `scheduler` | `timezone` | `UTC` | Timezone for cron expressions |
 | `vigil` | `enabled` | `true` | Metacognitive monitoring (vigil-pulse) |
+| `caliber` | `enabled` | `true` | Record task and intent outcomes (caliber-echo) |
+| `caliber` | `max_outcomes` | `200` | Rolling window of recorded outcomes |
+| `context_buffer` | `pulse_filter` | `true` | On shared channels, drop other pulses' messages from the injected context |
+
+Configs written before the rename still load: `[entity]` is read as `[pulse]` (a caliber `[pulse]` table beside it is read as `[caliber]`), and `entity_filter` as `pulse_filter`.
 
 ### Environment Variables
 

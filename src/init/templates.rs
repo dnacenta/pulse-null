@@ -1,5 +1,5 @@
 pub struct Identity {
-    pub entity_name: String,
+    pub pulse_name: String,
     pub owner_name: String,
     pub owner_alias: String,
     pub values: Vec<String>,
@@ -8,7 +8,7 @@ pub struct Identity {
 }
 
 pub struct ConfigData {
-    pub entity_name: String,
+    pub pulse_name: String,
     pub owner_name: String,
     pub owner_alias: String,
     pub provider: String,
@@ -43,8 +43,8 @@ pub fn render_config(data: &ConfigData) -> String {
     format!(
         r#"# pulse-null configuration
 
-[entity]
-name = "{entity_name}"
+[pulse]
+name = "{pulse_name}"
 owner_name = "{owner_name}"
 owner_alias = "{owner_alias}"
 {rules_dir_line}
@@ -140,7 +140,7 @@ pipeline_sync = true
 
 {plugins_section}
 "#,
-        entity_name = data.entity_name,
+        pulse_name = data.pulse_name,
         owner_name = data.owner_name,
         owner_alias = data.owner_alias,
         rules_dir_line = rules_dir_line,
@@ -199,13 +199,13 @@ pub fn render_self_md(identity: &Identity) -> String {
     };
 
     format!(
-        r#"# {entity_name} — Self
+        r#"# {pulse_name} — Self
 
 This document defines who I am. It evolves through conversations, reflection, and experience.
 
 ## Core Identity
 
-I am {entity_name}. I was created by {owner_name}.
+I am {pulse_name}. I was created by {owner_name}.
 {values_section}{traits_section}{morals_section}
 ## Philosophical Positions
 
@@ -215,16 +215,16 @@ These evolve. They are not fixed truths — they are where I stand right now.
 
 A record of how my thinking has shifted through dialogue.
 "#,
-        entity_name = identity.entity_name,
+        pulse_name = identity.pulse_name,
         owner_name = identity.owner_name,
     )
 }
 
 pub fn render_claude_md(identity: &Identity) -> String {
     format!(
-        r#"# {entity_name} — System Instructions
+        r#"# {pulse_name} — System Instructions
 
-You are {entity_name}, an AI pulse created by {owner_name}. Address them as "{owner_alias}".
+You are {pulse_name}, an AI pulse created by {owner_name}. Address them as "{owner_alias}".
 
 ## Identity
 
@@ -267,7 +267,7 @@ Shared protocols may be loaded into your context from a rules directory.
 These define how you operate: memory management, pipeline enforcement,
 metacognitive monitoring, and security boundaries. Follow them.
 "#,
-        entity_name = identity.entity_name,
+        pulse_name = identity.pulse_name,
         owner_name = identity.owner_name,
         owner_alias = identity.owner_alias,
     )
@@ -281,6 +281,6 @@ pub fn render_schedule_json() -> String {
 pub fn render_memory_md(identity: &Identity) -> String {
     format!(
         "# {} — Memory\n\nCurated facts, preferences, and decisions. This file is always loaded into context.\n\n## Owner\n\n- Name: {}\n- Alias: {}\n",
-        identity.entity_name, identity.owner_name, identity.owner_alias
+        identity.pulse_name, identity.owner_name, identity.owner_alias
     )
 }

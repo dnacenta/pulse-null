@@ -205,7 +205,7 @@ pub struct CompactionParams<'a> {
     /// Root directory for archiving compacted messages.
     pub root_dir: &'a Path,
     /// Pulse name for archive metadata.
-    pub entity_name: &'a str,
+    pub pulse_name: &'a str,
     /// Channel name for archive metadata.
     pub channel: &'a str,
     /// Session key for archive metadata.
@@ -234,7 +234,7 @@ pub async fn compact_if_needed(
     context_budget: usize,
     max_tokens: u32,
     root_dir: &Path,
-    entity_name: &str,
+    pulse_name: &str,
     channel: &str,
     session_key: Option<&str>,
     compaction_failures: u32,
@@ -248,7 +248,7 @@ pub async fn compact_if_needed(
             context_budget,
             max_tokens,
             root_dir,
-            entity_name,
+            pulse_name,
             channel,
             session_key,
             compaction_failures,
@@ -344,7 +344,7 @@ async fn compact_with_params(
     let meta = crate::session::ArchiveMeta {
         trigger: "compaction".to_string(),
         channel: params.channel.to_string(),
-        entity_name: params.entity_name.to_string(),
+        pulse_name: params.pulse_name.to_string(),
         session_key: params.session_key.map(|s| s.to_string()),
     };
     if let Err(e) = crate::session::archive_conversation(params.root_dir, old_messages, &meta) {

@@ -14,7 +14,7 @@ use crate::session_store::SessionStore;
 use super::AppState;
 
 /// Result of booting a pulse's server.
-pub struct BootedEntity {
+pub struct BootedPulse {
     pub server_handle: JoinHandle<()>,
     pub coordinator: crate::coordinator::control::Coordinator,
     pub event_bus: Arc<EventBus>,
@@ -26,11 +26,11 @@ pub struct BootedEntity {
 ///
 /// Unlike `server::start()`, this does NOT block. It spawns the server
 /// as a tokio task and returns handles for lifecycle management.
-pub async fn boot_entity(
+pub async fn boot_pulse(
     config: Config,
     root_dir: PathBuf,
     fallback_port: u16,
-) -> Result<BootedEntity, Box<dyn std::error::Error>> {
+) -> Result<BootedPulse, Box<dyn std::error::Error>> {
     super::ensure_infrastructure(&root_dir);
 
     // Create LLM provider
@@ -68,7 +68,7 @@ pub async fn boot_entity(
     let mut session_store = SessionStore::with_identity(
         &root_dir,
         &config.sessions,
-        &config.entity.name,
+        &config.pulse.name,
         &config.owner,
         &config.peers,
     )
@@ -144,31 +144,31 @@ pub async fn boot_entity(
 
     // The pulse's own host:port when the port is free; the registry's
     // fallback otherwise, said out loud (PN-104).
-    let entity_name = config.entity.name.clone();
+    let pulse_name = config.pulse.name.clone();
     let (host, host_note) = bind_host(&config.server.host, has_usable_secret(&config));
     if let Some(note) = host_note {
-        tracing::warn!("Pulse \"{}\": {}", entity_name, note);
+        tracing::warn!("Pulse \"{}\": {}", pulse_name, note);
     }
     let (port, fallback_note) = choose_port(config.server.port, fallback_port, |p| {
         crate::registry::port_available_on(&host, p)
     });
     if let Some(note) = fallback_note {
-        tracing::warn!("Pulse \"{}\": {}", entity_name, note);
+        tracing::warn!("Pulse \"{}\": {}", pulse_name, note);
     }
     let addr = format!("{host}:{port}");
     let listener = tokio::net::TcpListener::bind(&addr).await?;
     let actual_port = listener.local_addr()?.port();
 
-    tracing::info!("Pulse \"{}\" listening on :{}", entity_name, actual_port);
+    tracing::info!("Pulse \"{}\" listening on :{}", pulse_name, actual_port);
 
     // Spawn server as background task (non-blocking)
     let server_handle = tokio::spawn(async move {
         if let Err(e) = axum::serve(listener, app).await {
-            tracing::error!("Pulse \"{}\" server error: {}", entity_name, e);
+            tracing::error!("Pulse \"{}\" server error: {}", pulse_name, e);
         }
     });
 
-    Ok(BootedEntity {
+    Ok(BootedPulse {
         server_handle,
         coordinator,
         event_bus,

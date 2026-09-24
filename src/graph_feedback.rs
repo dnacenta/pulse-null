@@ -37,7 +37,7 @@ pub struct RetrievalLogEntry {
 /// File I/O runs on a `spawn_blocking` worker so the async runtime is not
 /// blocked by syscalls (small but unbounded under fsync pressure / NFS).
 pub async fn emit_manifest(
-    entity_root: PathBuf,
+    pulse_root: PathBuf,
     correlation_id: Option<String>,
     retrieved_entity_ids: Vec<String>,
 ) {
@@ -47,7 +47,7 @@ pub async fn emit_manifest(
     // Best-effort: ignore JoinError if the runtime is shutting down.
     let _ = tokio::task::spawn_blocking(move || {
         emit_manifest_blocking(
-            &entity_root,
+            &pulse_root,
             correlation_id.as_deref(),
             &retrieved_entity_ids,
         );
@@ -58,7 +58,7 @@ pub async fn emit_manifest(
 /// Synchronous core of `emit_manifest`. Called inside `spawn_blocking` from
 /// async paths; called directly from tests so they don't need a runtime.
 fn emit_manifest_blocking(
-    entity_root: &Path,
+    pulse_root: &Path,
     correlation_id: Option<&str>,
     retrieved_entity_ids: &[String],
 ) {
@@ -74,7 +74,7 @@ fn emit_manifest_blocking(
             "retrieval manifest: no correlation_id — manifest entry will be unattributable"
         );
     }
-    let learning_dir = entity_root.join(LEARNING_DIR);
+    let learning_dir = pulse_root.join(LEARNING_DIR);
     if let Err(e) = std::fs::create_dir_all(&learning_dir) {
         tracing::warn!("retrieval manifest: create_dir_all failed: {e}");
         return;
@@ -115,8 +115,8 @@ pub fn classify_used(retrieved_ids: &[String], _response_text: &str) -> Vec<Stri
 /// Read the union of retrieved entity IDs across manifest entries whose
 /// `correlation_id` matches. Reads today's and yesterday's files (covers
 /// midnight rollover). Best-effort — returns empty on any error.
-pub fn read_retrieval_set(entity_root: &Path, correlation_id: &str) -> Vec<String> {
-    let learning_dir = entity_root.join(LEARNING_DIR);
+pub fn read_retrieval_set(pulse_root: &Path, correlation_id: &str) -> Vec<String> {
+    let learning_dir = pulse_root.join(LEARNING_DIR);
     if !learning_dir.exists() {
         return Vec::new();
     }
@@ -188,7 +188,7 @@ fn outcome_kind_for(outcome: &str) -> Option<recall_echo::graph::utility::Outcom
 /// See PR #67 audit, PERF-002. Sub-Hz call frequency means this is a
 /// scaling concern, not a correctness one.
 pub async fn bridge_feedback(
-    entity_root: &Path,
+    pulse_root: &Path,
     correlation_id: &str,
     outcome: &str,
     response_text: &str,
@@ -196,12 +196,12 @@ pub async fn bridge_feedback(
     let Some(kind) = outcome_kind_for(outcome) else {
         return; // Surprising or unrecognized — see Decision 2
     };
-    let retrieved = read_retrieval_set(entity_root, correlation_id);
+    let retrieved = read_retrieval_set(pulse_root, correlation_id);
     if retrieved.is_empty() {
         return;
     }
     let used = classify_used(&retrieved, response_text);
-    let graph_dir = entity_root.join("memory").join("graph");
+    let graph_dir = pulse_root.join("memory").join("graph");
     let gm = match recall_echo::graph::GraphMemory::open(&graph_dir).await {
         Ok(gm) => gm,
         Err(e) => {
@@ -349,7 +349,7 @@ mod tests {
     #[tokio::test]
     async fn bridge_skips_when_outcome_is_unrecognized() {
         // Surprising and unknown strings return early before any I/O.
-        // We assert by giving an entity_root that does not exist — if the
+        // We assert by giving a pulse_root that does not exist — if the
         // function tried to read the manifest or open the graph, it would
         // log warnings (and we'd see test output noise). Either way, no
         // panic and no graph open is verifiable by absence of a learning

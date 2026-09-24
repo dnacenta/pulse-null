@@ -275,7 +275,7 @@ fn view(entry: &ScheduleEntry, health: &TaskHealthStore, timezone: &str) -> Sche
 fn creator_label(creator: &TaskCreator) -> &'static str {
     match creator {
         TaskCreator::System => "system",
-        TaskCreator::Entity => "entity",
+        TaskCreator::Entity => "pulse",
         TaskCreator::User => "user",
     }
 }
@@ -480,7 +480,7 @@ mod tests {
             assert_eq!(view.cron, entry.task.cron);
             assert_eq!(view.cadence, humanize(&entry.task.cron));
             assert_eq!(view.channel, entry.task.channel);
-            assert!(matches!(view.created_by, "system" | "entity" | "user"));
+            assert!(matches!(view.created_by, "system" | "pulse" | "user"));
             // A fresh root has no task_health.json.
             assert!(view.last_run.is_none());
             assert_eq!(view.consecutive_failures, 0);
@@ -586,7 +586,7 @@ mod tests {
 
         let listed = list_tasks(dir.path(), TZ).unwrap();
         assert!(find(&listed, "external").enabled);
-        assert_eq!(find(&listed, "external").created_by, "entity");
+        assert_eq!(find(&listed, "external").created_by, "pulse");
         assert!(!find(&listed, &ids[0]).enabled);
     }
 

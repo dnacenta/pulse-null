@@ -58,40 +58,40 @@ pub struct ClaudeCodeProvider {
     /// marker: while isolated, the spawned CLI is restricted to read-only
     /// tools, because the in-process tool registry swap cannot reach a
     /// subprocess that brings its own tools.
-    entity_root: PathBuf,
+    pulse_root: PathBuf,
 }
 
 /// Environment variable recall-echo reads to locate the pulse root when a
-/// hook or MCP invocation carries no explicit `--entity-root`.
+/// hook or MCP invocation carries no explicit `--pulse-root`.
 pub const RECALL_ECHO_HOME: &str = "RECALL_ECHO_HOME";
 
 impl ClaudeCodeProvider {
-    pub fn new(model: String, claude_bin: Option<String>, entity_root: PathBuf) -> Self {
+    pub fn new(model: String, claude_bin: Option<String>, pulse_root: PathBuf) -> Self {
         let claude_bin = claude_bin
             .or_else(|| std::env::var("CLAUDE_BIN").ok())
             .unwrap_or_else(|| "claude".into());
         Self {
             model,
             claude_bin,
-            entity_root,
+            pulse_root,
         }
     }
 
     /// The pulse root every subprocess is anchored to.
     #[cfg(test)]
-    pub fn entity_root(&self) -> &Path {
-        &self.entity_root
+    pub fn pulse_root(&self) -> &Path {
+        &self.pulse_root
     }
 }
 
-/// A `claude` command anchored to `entity_root`: cwd and `RECALL_ECHO_HOME`
+/// A `claude` command anchored to `pulse_root`: cwd and `RECALL_ECHO_HOME`
 /// point at the pulse root, and the `CLAUDECODE` marker of any enclosing
 /// Claude Code session is stripped so the child does not think it is nested.
 /// Free function so the spawn shape can be tested without spawning.
-fn entity_command(claude_bin: &str, entity_root: &Path) -> tokio::process::Command {
+fn pulse_command(claude_bin: &str, pulse_root: &Path) -> tokio::process::Command {
     let mut cmd = tokio::process::Command::new(claude_bin);
-    cmd.current_dir(entity_root)
-        .env(RECALL_ECHO_HOME, entity_root)
+    cmd.current_dir(pulse_root)
+        .env(RECALL_ECHO_HOME, pulse_root)
         .env_remove("CLAUDECODE");
     cmd
 }
@@ -379,8 +379,8 @@ impl LmProvider for ClaudeCodeProvider {
         let messages = messages.to_vec();
         let model = self.model.clone();
         let claude_bin = self.claude_bin.clone();
-        let entity_root = self.entity_root.clone();
-        let restricted = crate::server::isolation::is_active(&self.entity_root);
+        let pulse_root = self.pulse_root.clone();
+        let restricted = crate::server::isolation::is_active(&self.pulse_root);
 
         Box::pin(async move {
             let prompt = serialize_messages(&messages);
@@ -390,7 +390,7 @@ impl LmProvider for ClaudeCodeProvider {
             // and cancellation — which unlinks the staged prompt.
             let system_prompt_file = SystemPromptFile::create(&system_prompt)?;
 
-            let mut cmd = entity_command(&claude_bin, &entity_root);
+            let mut cmd = pulse_command(&claude_bin, &pulse_root);
             cmd.args(invoke_args(&model, system_prompt_file.path(), restricted))
                 .stdin(Stdio::piped())
                 .stdout(Stdio::piped())
@@ -516,8 +516,8 @@ impl StreamingProvider for ClaudeCodeProvider {
         let messages = messages.to_vec();
         let model = self.model.clone();
         let claude_bin = self.claude_bin.clone();
-        let entity_root = self.entity_root.clone();
-        let restricted = crate::server::isolation::is_active(&self.entity_root);
+        let pulse_root = self.pulse_root.clone();
+        let restricted = crate::server::isolation::is_active(&self.pulse_root);
 
         Box::pin(async_stream::stream! {
             let prompt = serialize_messages(&messages);
@@ -536,7 +536,7 @@ impl StreamingProvider for ClaudeCodeProvider {
                 }
             };
 
-            let mut cmd = entity_command(&claude_bin, &entity_root);
+            let mut cmd = pulse_command(&claude_bin, &pulse_root);
             cmd.args(stream_invoke_args(&model, system_prompt_file.path(), restricted))
                 .stdin(Stdio::piped())
                 .stdout(Stdio::piped())
@@ -1491,7 +1491,7 @@ mod tests {
             Some("/usr/bin/true".into()),
             root.path().to_path_buf(),
         );
-        let cmd = entity_command("/usr/bin/true", provider.entity_root());
+        let cmd = pulse_command("/usr/bin/true", provider.pulse_root());
         let std_cmd = cmd.as_std();
 
         assert_eq!(std_cmd.get_current_dir(), Some(root.path()));
@@ -1507,7 +1507,7 @@ mod tests {
             Some(&None),
             "an enclosing Claude Code session marker must be stripped"
         );
-        assert_eq!(provider.entity_root(), root.path());
+        assert_eq!(provider.pulse_root(), root.path());
     }
 
     #[test]

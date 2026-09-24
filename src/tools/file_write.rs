@@ -4,12 +4,12 @@ use super::{resolve_sandboxed_path, Tool, ToolError, ToolResult};
 
 /// Write content to a file in the pulse's data directory.
 pub struct FileWriteTool {
-    entity_root: PathBuf,
+    pulse_root: PathBuf,
 }
 
 impl FileWriteTool {
-    pub fn new(entity_root: PathBuf) -> Self {
-        Self { entity_root }
+    pub fn new(pulse_root: PathBuf) -> Self {
+        Self { pulse_root }
     }
 }
 
@@ -40,7 +40,7 @@ impl Tool for FileWriteTool {
     }
 
     fn execute(&self, input: serde_json::Value) -> ToolResult<'_> {
-        let entity_root = self.entity_root.clone();
+        let pulse_root = self.pulse_root.clone();
         Box::pin(async move {
             let path = input["path"].as_str().ok_or_else(|| {
                 ToolError::ExecutionFailed("Missing 'path' parameter".to_string())
@@ -50,7 +50,7 @@ impl Tool for FileWriteTool {
                 ToolError::ExecutionFailed("Missing 'content' parameter".to_string())
             })?;
 
-            let resolved = resolve_sandboxed_path(&entity_root, path)?;
+            let resolved = resolve_sandboxed_path(&pulse_root, path)?;
 
             // Create parent directories if they don't exist
             if let Some(parent) = resolved.parent() {

@@ -114,7 +114,7 @@ impl std::fmt::Display for SalienceKind {
 /// Internal pulse events that can trigger autonomous actions.
 #[derive(Debug, Clone)]
 #[allow(dead_code)]
-pub enum EntityEvent {
+pub enum PulseEvent {
     /// Emitted after any meaningful interaction completes.
     PostInteraction {
         source: InteractionSource,
@@ -192,11 +192,11 @@ pub enum EntityEvent {
     },
 }
 
-impl EntityEvent {
+impl PulseEvent {
     /// String key for cooldown/circuit breaker tracking.
     pub fn event_type(&self) -> String {
         match self {
-            EntityEvent::PostInteraction { source, .. } => match source {
+            PulseEvent::PostInteraction { source, .. } => match source {
                 InteractionSource::Chat { .. } => "post_conversation".into(),
                 InteractionSource::Comms { peer } => format!("post_comms_{}", peer),
                 InteractionSource::ScheduledTask { task_name } => {
@@ -204,23 +204,23 @@ impl EntityEvent {
                 }
                 InteractionSource::Research { topic } => format!("post_research_{}", topic),
             },
-            EntityEvent::PipelineAlert { document, .. } => format!("pipeline_alert_{}", document),
-            EntityEvent::PipelineFrozen { .. } => "pipeline_frozen".into(),
-            EntityEvent::CognitiveHealthChanged { .. } => "cognitive_decline".into(),
-            EntityEvent::PipelineConversionLow { .. } => "pipeline_conversion_low".into(),
-            EntityEvent::PluginStateChanged { plugin_name, .. } => {
+            PulseEvent::PipelineAlert { document, .. } => format!("pipeline_alert_{}", document),
+            PulseEvent::PipelineFrozen { .. } => "pipeline_frozen".into(),
+            PulseEvent::CognitiveHealthChanged { .. } => "cognitive_decline".into(),
+            PulseEvent::PipelineConversionLow { .. } => "pipeline_conversion_low".into(),
+            PulseEvent::PluginStateChanged { plugin_name, .. } => {
                 format!("plugin_state_{}", plugin_name)
             }
-            EntityEvent::ProviderError { .. } => "provider_error".into(),
-            EntityEvent::PredictionPressure { .. } => "prediction_pressure".into(),
-            EntityEvent::Salience { kind, .. } => format!("salience_{kind}"),
+            PulseEvent::ProviderError { .. } => "provider_error".into(),
+            PulseEvent::PredictionPressure { .. } => "prediction_pressure".into(),
+            PulseEvent::Salience { kind, .. } => format!("salience_{kind}"),
         }
     }
 }
 
 /// Lightweight event bus backed by a tokio broadcast channel.
 pub struct EventBus {
-    sender: broadcast::Sender<EntityEvent>,
+    sender: broadcast::Sender<PulseEvent>,
 }
 
 impl EventBus {
@@ -231,12 +231,12 @@ impl EventBus {
 
     /// Emit an event. Returns number of receivers that got it.
     /// Returns 0 if no listeners — that's fine, events are fire-and-forget.
-    pub fn emit(&self, event: EntityEvent) -> usize {
+    pub fn emit(&self, event: PulseEvent) -> usize {
         self.sender.send(event).unwrap_or_default()
     }
 
     /// Subscribe to events.
-    pub fn subscribe(&self) -> broadcast::Receiver<EntityEvent> {
+    pub fn subscribe(&self) -> broadcast::Receiver<PulseEvent> {
         self.sender.subscribe()
     }
 }
@@ -248,7 +248,7 @@ mod tests {
     #[tokio::test]
     async fn test_emit_without_receivers() {
         let bus = EventBus::new(16);
-        let count = bus.emit(EntityEvent::PipelineFrozen {
+        let count = bus.emit(PulseEvent::PipelineFrozen {
             sessions_without_movement: 5,
         });
         assert_eq!(count, 0);
@@ -259,7 +259,7 @@ mod tests {
         let bus = EventBus::new(16);
         let mut rx = bus.subscribe();
 
-        bus.emit(EntityEvent::PostInteraction {
+        bus.emit(PulseEvent::PostInteraction {
             source: InteractionSource::Chat {
                 channel: "discord".to_string(),
             },
@@ -271,7 +271,7 @@ mod tests {
 
         let event = rx.recv().await.unwrap();
         match event {
-            EntityEvent::PostInteraction { source, .. } => {
+            PulseEvent::PostInteraction { source, .. } => {
                 assert!(matches!(source, InteractionSource::Chat { .. }));
             }
             _ => panic!("Wrong event type"),
@@ -283,10 +283,10 @@ mod tests {
         let bus = EventBus::new(16);
         let mut rx = bus.subscribe();
 
-        bus.emit(EntityEvent::PipelineFrozen {
+        bus.emit(PulseEvent::PipelineFrozen {
             sessions_without_movement: 3,
         });
-        bus.emit(EntityEvent::PipelineFrozen {
+        bus.emit(PulseEvent::PipelineFrozen {
             sessions_without_movement: 4,
         });
 
@@ -294,13 +294,13 @@ mod tests {
         let e2 = rx.recv().await.unwrap();
 
         match e1 {
-            EntityEvent::PipelineFrozen {
+            PulseEvent::PipelineFrozen {
                 sessions_without_movement,
             } => assert_eq!(sessions_without_movement, 3),
             _ => panic!("Wrong event"),
         }
         match e2 {
-            EntityEvent::PipelineFrozen {
+            PulseEvent::PipelineFrozen {
                 sessions_without_movement,
             } => assert_eq!(sessions_without_movement, 4),
             _ => panic!("Wrong event"),
@@ -309,7 +309,7 @@ mod tests {
 
     #[test]
     fn test_event_type_scheduled_task() {
-        let event = EntityEvent::PostInteraction {
+        let event = PulseEvent::PostInteraction {
             source: InteractionSource::ScheduledTask {
                 task_name: "reflection".to_string(),
             },
@@ -325,7 +325,7 @@ mod tests {
     fn salience_event_type_is_per_kind() {
         // The cooldown/telemetry key separates kinds, because their budgets
         // are separate — one noisy Finding must not mask a Blocking.
-        let event = EntityEvent::Salience {
+        let event = PulseEvent::Salience {
             kind: SalienceKind::Blocking,
             thread_id: None,
             headline: "h".to_string(),
@@ -365,7 +365,7 @@ mod tests {
 
     #[test]
     fn test_event_type_research() {
-        let event = EntityEvent::PostInteraction {
+        let event = PulseEvent::PostInteraction {
             source: InteractionSource::Research {
                 topic: "emergence".to_string(),
             },

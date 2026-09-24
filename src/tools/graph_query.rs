@@ -5,16 +5,16 @@ use std::path::PathBuf;
 use super::{Tool, ToolError, ToolResult};
 
 pub struct GraphQueryTool {
-    entity_root: PathBuf,
+    pulse_root: PathBuf,
 }
 
 impl GraphQueryTool {
-    pub fn new(entity_root: PathBuf) -> Self {
-        Self { entity_root }
+    pub fn new(pulse_root: PathBuf) -> Self {
+        Self { pulse_root }
     }
 
     fn graph_dir(&self) -> PathBuf {
-        self.entity_root.join("memory").join("graph")
+        self.pulse_root.join("memory").join("graph")
     }
 }
 
@@ -53,7 +53,7 @@ impl Tool for GraphQueryTool {
     }
 
     fn execute(&self, input: serde_json::Value) -> ToolResult<'_> {
-        let entity_root = self.entity_root.clone();
+        let pulse_root = self.pulse_root.clone();
         let graph_dir = self.graph_dir();
         // Capture correlation_id from task-local before crossing the
         // spawn_blocking boundary — task-locals are bound to the current
@@ -111,9 +111,9 @@ impl Tool for GraphQueryTool {
                     // stalls the async runtime.
                     // Shed while isolated: the retrieval manifest is a write
                     // into archives/ — and the graph is a likely suspect.
-                    if !crate::server::isolation::is_active(&entity_root) {
+                    if !crate::server::isolation::is_active(&pulse_root) {
                         crate::graph_feedback::emit_manifest(
-                            entity_root,
+                            pulse_root,
                             correlation_id,
                             retrieved_ids,
                         )

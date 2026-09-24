@@ -111,12 +111,12 @@ async fn rebuild_awareness(state: &Arc<AppState>) {
 /// Listens for PluginStateChanged events on the event bus and triggers a
 /// manifest rebuild so the pulse's capability inventory stays in sync.
 pub async fn awareness_listener(
-    mut rx: tokio::sync::broadcast::Receiver<crate::events::EntityEvent>,
+    mut rx: tokio::sync::broadcast::Receiver<crate::events::PulseEvent>,
     state: Arc<AppState>,
 ) {
     loop {
         match rx.recv().await {
-            Ok(crate::events::EntityEvent::PluginStateChanged {
+            Ok(crate::events::PulseEvent::PluginStateChanged {
                 ref plugin_name,
                 ref new_state,
             }) => {
@@ -186,7 +186,7 @@ pub async fn start_with_shutdown(
         }
 
         if let Err(e) =
-            crate::surrealdb_manager::provision_entity(&data_dir, &config.entity.name, &root_dir)
+            crate::surrealdb_manager::provision_pulse(&data_dir, &config.pulse.name, &root_dir)
                 .await
         {
             tracing::error!("SurrealDB provisioning failed: {e}");
@@ -255,7 +255,7 @@ pub async fn start_with_shutdown(
     let mut session_store = SessionStore::with_identity(
         &root_dir,
         &config.sessions,
-        &config.entity.name,
+        &config.pulse.name,
         &config.owner,
         &config.peers,
     )
@@ -344,7 +344,7 @@ pub async fn start_with_shutdown(
             wal,
             &state.session_store,
             &state.root_dir,
-            &config.entity.name,
+            &config.pulse.name,
         )
         .await;
     }
@@ -459,7 +459,7 @@ pub async fn start_with_shutdown(
     } else {
         state
             .session_store
-            .archive_all(&root_dir, &config.entity.name)
+            .archive_all(&root_dir, &config.pulse.name)
             .await
     };
 

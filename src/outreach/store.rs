@@ -1,4 +1,4 @@
-//! `{entity}/outreach.json` — the sent log, D's responses, and the rejection
+//! `{pulse}/outreach.json` — the sent log, D's responses, and the rejection
 //! log (PN-94, spec §4).
 //!
 //! ## Persistence discipline

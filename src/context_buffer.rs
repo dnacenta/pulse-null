@@ -29,7 +29,9 @@ pub struct ContextBufferConfig {
     pub max_inject_chars: usize,
     /// When true, filter out messages from other pulses on shared channels.
     /// Only the human sender and the current pulse's messages are kept.
-    pub entity_filter: bool,
+    /// `entity_filter` is the pre-PN-115 key.
+    #[serde(alias = "entity_filter")]
+    pub pulse_filter: bool,
 }
 
 impl Default for ContextBufferConfig {
@@ -40,7 +42,7 @@ impl Default for ContextBufferConfig {
             max_age_minutes: 10,
             max_entries: 3,
             max_inject_chars: 1000,
-            entity_filter: true,
+            pulse_filter: true,
         }
     }
 }
@@ -191,14 +193,14 @@ impl ContextBufferStore {
     /// deduplication against session history, and token/entry caps.
     ///
     /// - `channel`: which channel buffer to read
-    /// - `entity_name`: the current pulse's name (for pulse-aware filtering)
+    /// - `pulse_name`: the current pulse's name (for pulse-aware filtering)
     /// - `human_senders`: senders that are known humans (owner, trusted users)
     /// - `session_texts`: recent session message texts for deduplication
     /// - `config`: the context buffer config with caps and filter settings
     pub async fn get_context_filtered(
         &self,
         channel: &str,
-        entity_name: &str,
+        pulse_name: &str,
         human_senders: &[&str],
         session_texts: &[String],
         config: &ContextBufferConfig,
@@ -225,11 +227,11 @@ impl ContextBufferStore {
 
             // Pulse-aware filtering: on shared channels, only keep messages
             // from known human senders or the current pulse
-            if config.entity_filter {
+            if config.pulse_filter {
                 let is_human = human_senders
                     .iter()
                     .any(|s| s.eq_ignore_ascii_case(&entry.sender));
-                let is_self = entry.sender.eq_ignore_ascii_case(entity_name);
+                let is_self = entry.sender.eq_ignore_ascii_case(pulse_name);
                 if !is_human && !is_self {
                     continue;
                 }
@@ -534,10 +536,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn filtered_entity_filter_removes_other_entities() {
+    async fn filtered_pulse_filter_removes_other_pulses() {
         let tmp = tempfile::tempdir().unwrap();
         let config = ContextBufferConfig {
-            entity_filter: true,
+            pulse_filter: true,
             ..Default::default()
         };
         let store = ContextBufferStore::new(tmp.path(), &config).await;

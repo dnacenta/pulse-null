@@ -155,7 +155,7 @@ pub enum EvidenceRejection {
     /// The marker named no artifact at all.
     NoEvidence,
     /// The path escaped the pulse root or was absolute.
-    PathOutsideEntity(String),
+    PathOutsidePulse(String),
     /// The path names journal text, which is what the artifact requirement
     /// exists to exclude.
     PathInJournal(String),
@@ -177,7 +177,7 @@ impl std::fmt::Display for EvidenceRejection {
                 "no artifact named — discharge needs a file changed outside the journal, \
                  a resolved prediction id, or a tool that ran"
             ),
-            Self::PathOutsideEntity(p) => write!(f, "path '{p}' is not inside the pulse root"),
+            Self::PathOutsidePulse(p) => write!(f, "path '{p}' is not inside the pulse root"),
             Self::PathInJournal(p) => write!(
                 f,
                 "path '{p}' is journal text; writing about a thread is not working it"
@@ -259,9 +259,9 @@ impl<'a> WorkEvidence<'a> {
 
     fn verify_file(&self, raw: &str) -> Result<WorkArtifact, EvidenceRejection> {
         let cleaned = sanitize_field(raw, 512);
-        let relative = match entity_relative_path(&cleaned) {
+        let relative = match pulse_relative_path(&cleaned) {
             Some(p) => p,
-            None => return Err(EvidenceRejection::PathOutsideEntity(cleaned)),
+            None => return Err(EvidenceRejection::PathOutsidePulse(cleaned)),
         };
         if is_journal_path(&relative) {
             return Err(EvidenceRejection::PathInJournal(cleaned));
@@ -831,7 +831,7 @@ fn truncate_chars(s: &str, max_len: usize) -> String {
 
 /// Normalize a claimed path to a pulse-relative one, refusing anything
 /// absolute or containing a parent-directory hop.
-fn entity_relative_path(raw: &str) -> Option<PathBuf> {
+fn pulse_relative_path(raw: &str) -> Option<PathBuf> {
     let path = Path::new(raw.trim());
     if raw.trim().is_empty() {
         return None;
@@ -1229,11 +1229,11 @@ mod tests {
         ));
         assert!(matches!(
             ev.verify(&claim("../../etc/passwd")).unwrap_err(),
-            EvidenceRejection::PathOutsideEntity(_)
+            EvidenceRejection::PathOutsidePulse(_)
         ));
         assert!(matches!(
             ev.verify(&claim("/etc/passwd")).unwrap_err(),
-            EvidenceRejection::PathOutsideEntity(_)
+            EvidenceRejection::PathOutsidePulse(_)
         ));
     }
 

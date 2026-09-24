@@ -32,8 +32,8 @@ pub type PluginResult<'a> =
 /// Context passed to plugins during initialization
 #[allow(dead_code)]
 pub struct PluginContext {
-    pub entity_root: PathBuf,
-    pub entity_name: String,
+    pub pulse_root: PathBuf,
+    pub pulse_name: String,
     pub provider: Arc<Box<dyn LmProvider>>,
 }
 

@@ -243,13 +243,13 @@ impl Plugin for PraxisEchoPlugin {
                 .and_then(|t| t.get("claude_dir"))
                 .and_then(|v| v.as_str())
                 .map(std::path::PathBuf::from)
-                .unwrap_or_else(|| ctx.entity_root.join("monitoring"));
+                .unwrap_or_else(|| ctx.pulse_root.join("monitoring"));
 
             let docs_dir = table
                 .and_then(|t| t.get("docs_dir"))
                 .and_then(|v| v.as_str())
                 .map(std::path::PathBuf::from)
-                .unwrap_or_else(|| ctx.entity_root.clone());
+                .unwrap_or_else(|| ctx.pulse_root.clone());
 
             tracing::info!(
                 "praxis-echo: claude_dir = {}, docs_dir = {}",

@@ -72,7 +72,7 @@ impl Boot {
         // Three drifting sine waves in the accent family.
         let phase = tick as f64 * 0.08;
         let w = f64::from(aurora.width.max(1));
-        let colors = [t.intent, t.accent, t.entity];
+        let colors = [t.intent, t.accent, t.pulse];
         let canvas = Canvas::default()
             .marker(Marker::Braille)
             .x_bounds([0.0, w])

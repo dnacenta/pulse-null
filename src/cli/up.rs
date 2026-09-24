@@ -7,22 +7,22 @@ use crate::config::Config;
 use crate::server;
 
 pub async fn run(headless: bool) -> Result<(), Box<dyn std::error::Error>> {
-    // Detect mode: single pulse (CWD has config) or multi-pulse (entities/ dir)
-    match crate::discovery::find_entity_home() {
-        None => run_single_entity(headless).await,
-        Some(entity_home) => run_multi_entity(headless, entity_home).await,
+    // Detect mode: single pulse (CWD has config) or multi-pulse (a pulse home)
+    match crate::discovery::find_pulse_home() {
+        None => run_single_pulse(headless).await,
+        Some(pulse_home) => run_multi_pulse(headless, pulse_home).await,
     }
 }
 
 /// Single-pulse mode. Headless runs the daemon in the foreground; otherwise
 /// the TUI attaches to a running daemon or starts one in-process (PN-102).
-async fn run_single_entity(headless: bool) -> Result<(), Box<dyn std::error::Error>> {
+async fn run_single_pulse(headless: bool) -> Result<(), Box<dyn std::error::Error>> {
     let config = Config::load()?;
 
     if headless {
         tracing::info!(
             "Starting pulse \"{}\" on {}:{} (headless)",
-            config.entity.name,
+            config.pulse.name,
             config.server.host,
             config.server.port
         );
@@ -35,53 +35,49 @@ async fn run_single_entity(headless: bool) -> Result<(), Box<dyn std::error::Err
 /// Multi-pulse mode: discover and boot every pulse. Headless only — the
 /// multi-pulse TUI was removed in PN-102; run `pulse-null up` inside one
 /// pulse directory for the interactive shell.
-async fn run_multi_entity(
+async fn run_multi_pulse(
     headless: bool,
-    entity_home: PathBuf,
+    pulse_home: PathBuf,
 ) -> Result<(), Box<dyn std::error::Error>> {
     if !headless {
         return Err(format!(
             "{} holds several pulses. Run `pulse-null up --headless` here, or `pulse-null up` inside one pulse directory for the TUI.",
-            entity_home.display()
+            pulse_home.display()
         )
         .into());
     }
 
-    let discovered = crate::discovery::discover_entities(&entity_home);
+    let discovered = crate::discovery::discover_pulses(&pulse_home);
 
     tracing::info!(
         "Multi-pulse mode: found {} pulse(s) in {}",
         discovered.len(),
-        entity_home.display()
+        pulse_home.display()
     );
 
     // Registry hands out fallback ports from 3200 upward; each pulse first
     // tries the port in its own pulse-null.toml (PN-104).
-    let registry = Arc::new(RwLock::new(crate::registry::EntityRegistry::new(3200)));
+    let registry = Arc::new(RwLock::new(crate::registry::PulseRegistry::new(3200)));
 
     // Boot all discovered pulses
-    for entity in discovered {
+    for pulse in discovered {
         let fallback_port = registry.write().await.next_port();
-        match crate::server::boot::boot_entity(
-            entity.config.clone(),
-            entity.dir.clone(),
+        match crate::server::boot::boot_pulse(
+            pulse.config.clone(),
+            pulse.dir.clone(),
             fallback_port,
         )
         .await
         {
             Ok(booted) => {
-                tracing::info!(
-                    "Booted pulse \"{}\" on :{}",
-                    entity.name,
-                    booted.actual_port
-                );
+                tracing::info!("Booted pulse \"{}\" on :{}", pulse.name, booted.actual_port);
                 registry
                     .write()
                     .await
-                    .register(crate::registry::RunningEntity {
-                        name: entity.name.clone(),
-                        dir: entity.dir,
-                        config: entity.config,
+                    .register(crate::registry::RunningPulse {
+                        name: pulse.name.clone(),
+                        dir: pulse.dir,
+                        config: pulse.config,
                         port: booted.actual_port,
                         server_handle: booted.server_handle,
                         coordinator: booted.coordinator,
@@ -90,7 +86,7 @@ async fn run_multi_entity(
                     });
             }
             Err(e) => {
-                tracing::error!("Failed to boot pulse \"{}\": {}", entity.name, e);
+                tracing::error!("Failed to boot pulse \"{}\": {}", pulse.name, e);
             }
         }
     }

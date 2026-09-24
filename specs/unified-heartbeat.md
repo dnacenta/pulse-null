@@ -6,8 +6,8 @@ The header heartbeat only reflects the pulse's activity during chat. When the pu
 
 Current behavior in `main_screen.rs:141-147`:
 ```rust
-let comms_state = self.comms.active_entity_state();
-let header_state = if self.active_tab == Tab::Comms && comms_state != EntityState::Idle {
+let comms_state = self.comms.active_pulse_state();
+let header_state = if self.active_tab == Tab::Comms && comms_state != PulseState::Idle {
     &comms_state
 } else {
     &self.chat.state
@@ -25,13 +25,13 @@ The header heartbeat reflects the pulse's activity from any source. If the pulse
 
 ## Design
 
-### Shared Entity State
+### Shared Pulse State
 
-Introduce a top-level `EntityPulse` that aggregates activity from all sources:
+Introduce a top-level `PulseHeartbeat` that aggregates activity from all sources:
 
 ```rust
-pub struct EntityPulse {
-    state: EntityState,
+pub struct PulseHeartbeat {
+    state: PulseState,
     source: PulseSource,
     pulse_data: VecDeque<f64>,
     pulse_color: PulseColorTransition,
@@ -60,32 +60,32 @@ If a higher-priority source goes idle, fall through to the next active source.
 
 ### Update Points
 
-1. **Chat tab** — already sets `self.chat.state`. Also writes to `EntityPulse`.
-2. **Comms tab** — `LocalActivity` events write to `EntityPulse` with `PulseSource::Comms`.
-3. **Scheduler runner** — emit state changes to `EntityPulse` via `AppContext` or EventBus event.
+1. **Chat tab** — already sets `self.chat.state`. Also writes to `PulseHeartbeat`.
+2. **Comms tab** — `LocalActivity` events write to `PulseHeartbeat` with `PulseSource::Comms`.
+3. **Scheduler runner** — emit state changes to `PulseHeartbeat` via `AppContext` or EventBus event.
 4. **Intent executor** — same as scheduler.
 
-For scheduler and intents (which run outside the TUI in server mode), we need an `EntityState` channel on the EventBus:
+For scheduler and intents (which run outside the TUI in server mode), we need an `PulseState` channel on the EventBus:
 
 ```rust
-EntityEvent::StateChange {
-    state: EntityState,
+PulseEvent::StateChange {
+    state: PulseState,
     source: PulseSource,
 }
 ```
 
-The TUI's event listener picks these up and updates `EntityPulse`.
+The TUI's event listener picks these up and updates `PulseHeartbeat`.
 
 ### Header Rendering
 
 Replace the current conditional logic with:
 
 ```rust
-let pulse = &ctx.entity_pulse;
+let pulse = &ctx.pulse_heartbeat;
 header::draw(
     frame,
     chunks[0],
-    ctx.entity_name.as_deref(),
+    ctx.pulse_name.as_deref(),
     Some("HEALTHY"),
     ctx.model_name.as_deref(),
     &pulse.pulse_data,
@@ -96,7 +96,7 @@ header::draw(
 
 ### State Label
 
-The header state label (currently just the EntityState name) should include the source:
+The header state label (currently just the PulseState name) should include the source:
 
 - Idle: `idle`
 - Chat thinking: `thinking`
@@ -111,24 +111,24 @@ The header state label (currently just the EntityState name) should include the 
 - Use comms pulse data/color when comms state is active
 - Minimal change, immediate fix
 
-### Phase 2 — EntityPulse Abstraction
-- Create `EntityPulse` struct in `AppContext`
+### Phase 2 — PulseHeartbeat Abstraction
+- Create `PulseHeartbeat` struct in `AppContext`
 - All sources write to it with priority resolution
-- Header reads from `EntityPulse` only
+- Header reads from `PulseHeartbeat` only
 
 ### Phase 3 — Background Activity
-- Add `EntityEvent::StateChange` to EventBus
+- Add `PulseEvent::StateChange` to EventBus
 - Scheduler and intent executor emit state changes
-- TUI event listener updates `EntityPulse`
+- TUI event listener updates `PulseHeartbeat`
 - Source label in header
 
 ## Files Affected
 
 - `src/tui/screens/main_screen.rs` — header state resolution
-- `src/tui/app.rs` — EntityPulse in AppContext
+- `src/tui/app.rs` — PulseHeartbeat in AppContext
 - `src/tui/widgets/header.rs` — source label rendering
-- `src/tui/tabs/comms.rs` — write to EntityPulse
-- `src/tui/tabs/chat.rs` — write to EntityPulse
+- `src/tui/tabs/comms.rs` — write to PulseHeartbeat
+- `src/tui/tabs/chat.rs` — write to PulseHeartbeat
 - `src/events/mod.rs` — StateChange event (Phase 3)
 - `src/scheduler/runner.rs` — emit StateChange (Phase 3)
 - `src/scheduler/intent.rs` — emit StateChange (Phase 3)

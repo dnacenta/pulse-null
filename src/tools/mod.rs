@@ -99,7 +99,7 @@ impl ToolRegistry {
 /// Resolve a relative path within the pulse data directory.
 /// Returns an error if the path tries to escape the sandbox.
 pub fn resolve_sandboxed_path(
-    entity_root: &Path,
+    pulse_root: &Path,
     relative_path: &str,
 ) -> Result<PathBuf, ToolError> {
     // Reject absolute paths
@@ -116,11 +116,11 @@ pub fn resolve_sandboxed_path(
         ));
     }
 
-    let resolved = entity_root.join(relative_path);
+    let resolved = pulse_root.join(relative_path);
 
-    // Extra safety: ensure the canonical path is still under entity_root.
+    // Extra safety: ensure the canonical path is still under pulse_root.
     // We check the resolved path's prefix rather than canonicalizing (the file may not exist yet).
-    if !resolved.starts_with(entity_root) {
+    if !resolved.starts_with(pulse_root) {
         return Err(ToolError::PermissionDenied(
             "Path escapes pulse data directory".to_string(),
         ));

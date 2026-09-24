@@ -20,7 +20,7 @@ pub enum DaemonState {
 /// and `/api/alerts/peek`; missing values render as an honest dash.
 #[derive(Debug, Clone)]
 pub struct BarState {
-    pub entity: String,
+    pub pulse: String,
     pub model: String,
     pub daemon: DaemonState,
     /// Cognitive status from `/api/dashboard`, when it has enough data.
@@ -31,9 +31,9 @@ pub struct BarState {
 
 impl BarState {
     #[must_use]
-    pub fn new(entity: &str, model: &str) -> Self {
+    pub fn new(pulse: &str, model: &str) -> Self {
         Self {
-            entity: entity.to_string(),
+            pulse: pulse.to_string(),
             model: model.to_string(),
             daemon: DaemonState::Starting,
             health: None,
@@ -92,8 +92,8 @@ pub fn draw_top(
     // Left: pulse · model
     let mut left = vec![
         Span::styled(
-            format!(" {}", state.entity),
-            Style::default().fg(t.entity).add_modifier(Modifier::BOLD),
+            format!(" {}", state.pulse),
+            Style::default().fg(t.pulse).add_modifier(Modifier::BOLD),
         ),
         sep.clone(),
         Span::styled(state.model.clone(), Style::default().fg(t.ink)),

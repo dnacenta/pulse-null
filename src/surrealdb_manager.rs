@@ -120,23 +120,23 @@ pub async fn ensure_running(
 /// Provision a database and user for a pulse.
 ///
 /// Connects as root, creates namespace/database/user if not exists,
-/// writes the pulse password to `{entity_dir}/secrets/graph-password`,
+/// writes the pulse password to `{pulse_dir}/secrets/graph-password`,
 /// and updates the pulse's `.recall-echo.toml` with [graph] settings.
-pub async fn provision_entity(
+pub async fn provision_pulse(
     data_dir: &Path,
-    entity_name: &str,
-    entity_dir: &Path,
+    pulse_name: &str,
+    pulse_dir: &Path,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let secrets_dir = entity_dir.join("secrets");
+    let secrets_dir = pulse_dir.join("secrets");
     let password_path = secrets_dir.join("graph-password");
 
     // If password file exists, the pulse is already provisioned
     if password_path.exists() {
-        info!("Pulse '{entity_name}' already provisioned (password file exists)");
+        info!("Pulse '{pulse_name}' already provisioned (password file exists)");
         return Ok(());
     }
 
-    info!("Provisioning SurrealDB database for pulse '{entity_name}'");
+    info!("Provisioning SurrealDB database for pulse '{pulse_name}'");
 
     let root_password = read_root_password(data_dir)?;
     let url = format!("{SURREAL_BIND}:{SURREAL_PORT}");
@@ -150,17 +150,17 @@ pub async fn provision_entity(
     .await?;
 
     // Generate pulse password
-    let entity_password = generate_password();
+    let pulse_password = generate_password();
 
     // Create namespace, database, and user
     let provision_sql = format!(
         r#"
         DEFINE NAMESPACE IF NOT EXISTS {NAMESPACE};
         USE NS {NAMESPACE};
-        DEFINE DATABASE IF NOT EXISTS {entity_name};
-        USE DB {entity_name};
-        DEFINE USER IF NOT EXISTS {entity_name} ON DATABASE
-            PASSWORD '{entity_password}' ROLES OWNER;
+        DEFINE DATABASE IF NOT EXISTS {pulse_name};
+        USE DB {pulse_name};
+        DEFINE USER IF NOT EXISTS {pulse_name} ON DATABASE
+            PASSWORD '{pulse_password}' ROLES OWNER;
         "#
     );
 
@@ -168,7 +168,7 @@ pub async fn provision_entity(
 
     // Write password file
     std::fs::create_dir_all(&secrets_dir)?;
-    std::fs::write(&password_path, &entity_password)?;
+    std::fs::write(&password_path, &pulse_password)?;
 
     // Set file permissions to 0600 (owner read/write only)
     #[cfg(unix)]
@@ -178,11 +178,11 @@ pub async fn provision_entity(
     }
 
     // Update pulse's .recall-echo.toml with [graph] section
-    let memory_dir = entity_dir.join("memory");
+    let memory_dir = pulse_dir.join("memory");
     let config_path = memory_dir.join(".recall-echo.toml");
-    update_recall_echo_config(&config_path, entity_name, "secrets/graph-password")?;
+    update_recall_echo_config(&config_path, pulse_name, "secrets/graph-password")?;
 
-    info!("Pulse '{entity_name}' provisioned successfully");
+    info!("Pulse '{pulse_name}' provisioned successfully");
     Ok(())
 }
 
@@ -301,7 +301,7 @@ fn generate_password() -> String {
 
 fn update_recall_echo_config(
     config_path: &Path,
-    entity_name: &str,
+    pulse_name: &str,
     password_file: &str,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let mut content = if config_path.exists() {
@@ -326,8 +326,8 @@ fn update_recall_echo_config(
 mode = "server"
 url = "{SURREAL_BIND}:{SURREAL_PORT}"
 namespace = "{NAMESPACE}"
-database = "{entity_name}"
-username = "{entity_name}"
+database = "{pulse_name}"
+username = "{pulse_name}"
 password_file = "{password_file}"
 "#
     );

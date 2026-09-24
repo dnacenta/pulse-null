@@ -68,7 +68,7 @@ pub struct App {
 impl App {
     #[must_use]
     pub fn new(
-        entity: &str,
+        pulse: &str,
         model: &str,
         owner: &str,
         theme: ThemeWatcher,
@@ -79,7 +79,7 @@ impl App {
             screen: Screen::Boot,
             focus: PaneId::Prompt,
             fullscreen: false,
-            bar: BarState::new(entity, model),
+            bar: BarState::new(pulse, model),
             glyphs,
             theme,
             motion: Motion::new(motion_level),
@@ -496,7 +496,7 @@ impl App {
             }
             Screen::Talk => {
                 let palette = self.palette();
-                let entity = self.bar.entity.clone();
+                let pulse = self.bar.pulse.clone();
                 let owner = self.owner.clone();
                 if self.fullscreen {
                     self.talk.render(
@@ -505,7 +505,7 @@ impl App {
                         self.focus,
                         t,
                         &owner,
-                        &entity,
+                        &pulse,
                         &mut self.motion,
                         palette,
                     );
@@ -523,7 +523,7 @@ impl App {
                         self.focus,
                         t,
                         &owner,
-                        &entity,
+                        &pulse,
                         &mut self.motion,
                         palette,
                     );

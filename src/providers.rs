@@ -12,25 +12,25 @@ use crate::streaming::StreamingProvider;
 
 /// Create a boxed provider based on config.
 ///
-/// `entity_root` is the pulse the provider speaks for. The claude-code
+/// `pulse_root` is the pulse the provider speaks for. The claude-code
 /// backend runs every subprocess from inside it (PN-104); the HTTP backends
 /// ignore it. Callers pass the root they already hold rather than letting the
 /// factory re-derive one from the process cwd, which is wrong whenever one
 /// process serves several pulses.
 pub fn create_provider(
     config: &Config,
-    entity_root: &Path,
+    pulse_root: &Path,
 ) -> Result<Box<dyn LmProvider>, ProviderError> {
     // One construction site: every provider streams, and a streaming
     // provider is an `LmProvider` (trait upcasting).
-    let provider: Box<dyn StreamingProvider> = create_streaming_provider(config, entity_root)?;
+    let provider: Box<dyn StreamingProvider> = create_streaming_provider(config, pulse_root)?;
     Ok(provider)
 }
 
 /// Create a streaming-capable provider based on config.
 pub fn create_streaming_provider(
     config: &Config,
-    entity_root: &Path,
+    pulse_root: &Path,
 ) -> Result<Box<dyn StreamingProvider>, ProviderError> {
     match config.llm.provider.as_str() {
         "claude" => {
@@ -52,7 +52,7 @@ pub fn create_streaming_provider(
         "claude-code" => Ok(Box::new(ClaudeCodeProvider::new(
             config.llm.model.clone(),
             config.llm.claude_bin.clone(),
-            entity_root.to_path_buf(),
+            pulse_root.to_path_buf(),
         ))),
         other => Err(ProviderError::Unknown(other.to_string())),
     }
@@ -61,9 +61,9 @@ pub fn create_streaming_provider(
 /// Create an Arc-wrapped provider (for server/plugin usage where shared ownership is needed).
 pub fn create_provider_arc(
     config: &Config,
-    entity_root: &Path,
+    pulse_root: &Path,
 ) -> Result<Arc<Box<dyn LmProvider>>, ProviderError> {
-    Ok(Arc::new(create_provider(config, entity_root)?))
+    Ok(Arc::new(create_provider(config, pulse_root)?))
 }
 
 /// Create a provider that talks to `model` instead of `[llm] model`.
@@ -75,10 +75,10 @@ pub fn create_provider_arc(
 /// minutes apart, so it is built per execution rather than cached.
 pub fn create_provider_with_model(
     config: &Config,
-    entity_root: &Path,
+    pulse_root: &Path,
     model: &str,
 ) -> Result<Box<dyn LmProvider>, ProviderError> {
-    create_provider(&with_model(config, model), entity_root)
+    create_provider(&with_model(config, model), pulse_root)
 }
 
 /// The same configuration, pointed at a different model.

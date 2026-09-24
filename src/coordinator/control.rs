@@ -205,8 +205,8 @@ async fn wait_or_shutdown(shutdown_rx: &mut watch::Receiver<bool>, dur: Duration
 
 /// Lease holder id: pulse name (sanitized to the lease id charset) + pid,
 /// so concurrent processes are distinguishable in the lease WAL.
-pub(crate) fn holder_id(entity_name: &str) -> String {
-    format!("{}-{}", lease_safe(entity_name), std::process::id())
+pub(crate) fn holder_id(pulse_name: &str) -> String {
+    format!("{}-{}", lease_safe(pulse_name), std::process::id())
 }
 
 async fn leadership_loop(
@@ -217,7 +217,7 @@ async fn leadership_loop(
     scheduler_handles: SharedHandles,
 ) {
     let dir = state.root_dir.join("coordinator");
-    let holder_base = holder_id(&state.config.entity.name);
+    let holder_base = holder_id(&state.config.pulse.name);
     // Tenure-scoped holder ids: without the suffix, a predecessor tenure's
     // leftover claim would be indistinguishable from ours, and neither the
     // stale-claim sweep nor fenced completion could tell them apart.

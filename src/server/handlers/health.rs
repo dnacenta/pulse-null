@@ -22,7 +22,7 @@ pub async fn health(State(state): State<Arc<AppState>>) -> (StatusCode, Json<Hea
     let leading = state.leadership.load(std::sync::atomic::Ordering::Relaxed);
     let mut body = HealthResponse {
         status: state_str.to_string(),
-        entity: state.config.entity.name.clone(),
+        pulse: state.config.pulse.name.clone(),
         isolation: isolated,
         // Observed state only — the marker is reported separately as
         // `isolation`; claiming "shed" from the marker alone would lie

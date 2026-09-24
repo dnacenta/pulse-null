@@ -3,7 +3,7 @@
 //! PN-94, `interest-triggered-outreach-spec.md`. Every unprompted message the
 //! pulse could previously generate was, structurally, a status report: every
 //! event in the bus was about the health of the machinery, never about the
-//! thinking. [`crate::events::EntityEvent::Salience`] is the content event;
+//! thinking. [`crate::events::PulseEvent::Salience`] is the content event;
 //! this module is what stands between raising one and D's phone buzzing.
 //!
 //! ## What this module is for
@@ -38,7 +38,7 @@ use regex::Regex;
 use serde::{Deserialize, Serialize};
 
 use crate::config::{Config, OutreachConfig};
-use crate::events::{EntityEvent, SalienceKind};
+use crate::events::{PulseEvent, SalienceKind};
 use store::{OutreachStore, RejectedCandidate, SentMessage};
 
 // ---------------------------------------------------------------------------
@@ -61,9 +61,9 @@ impl OutreachCandidate {
     /// Read a candidate off a `Salience` event. Returns `None` for any other
     /// event, so callers can filter without a second match.
     #[must_use]
-    pub fn from_event(event: &EntityEvent) -> Option<Self> {
+    pub fn from_event(event: &PulseEvent) -> Option<Self> {
         match event {
-            EntityEvent::Salience {
+            PulseEvent::Salience {
                 kind,
                 thread_id,
                 headline,
@@ -901,7 +901,7 @@ mod tests {
     }
 
     #[test]
-    fn development_gets_no_referent_from_the_entitys_own_journal() {
+    fn development_gets_no_referent_from_the_pulses_own_journal() {
         // Spec §6.1: gate 2 must be stricter for Development, never softer.
         // Quoting your own THOUGHTS.md with a line number is still prose you
         // wrote.

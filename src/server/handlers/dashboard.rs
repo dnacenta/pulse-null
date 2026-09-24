@@ -15,9 +15,9 @@ pub async fn dashboard(State(state): State<Arc<AppState>>) -> Json<serde_json::V
 
     // Pulse metadata
     let plugins: Vec<String> = config.plugins.keys().cloned().collect();
-    let entity = serde_json::json!({
-        "name": config.entity.name,
-        "user": config.entity.owner_alias,
+    let pulse = serde_json::json!({
+        "name": config.pulse.name,
+        "user": config.pulse.owner_alias,
         "model": config.llm.model,
         "version": version,
         "plugins": plugins,
@@ -74,7 +74,7 @@ pub async fn dashboard(State(state): State<Arc<AppState>>) -> Json<serde_json::V
     };
 
     Json(serde_json::json!({
-        "entity": entity,
+        "pulse": pulse,
         "pipeline": pipeline_data,
         "cognitive_health": cognitive_data,
     }))

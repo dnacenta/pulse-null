@@ -17,7 +17,7 @@ Tab index 5 (after Comms). Label: `recall`.
 ```rust
 pub enum Tab {
     Chat,       // 0
-    Entity,     // 1
+    Pulse,      // 1
     Evolution,  // 2
     Files,      // 3
     Comms,      // 4

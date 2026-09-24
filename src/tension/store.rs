@@ -1,4 +1,4 @@
-//! Tension store persistence — `{entity}/tension.json`.
+//! Tension store persistence — `{pulse}/tension.json`.
 //!
 //! Same discipline as `predictions.json` (PN-86), for the same reasons:
 //! atomic rename so an interrupted write cannot tear the file, a locked

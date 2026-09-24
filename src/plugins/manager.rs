@@ -6,7 +6,7 @@ use axum::Router;
 use super::registry;
 use super::{Plugin, PluginContext, PluginHealth, PluginMeta};
 use crate::config::Config;
-use crate::events::{EntityEvent, EventBus, PluginStateChange};
+use crate::events::{EventBus, PluginStateChange, PulseEvent};
 use crate::scheduler::ScheduledTask;
 use pulse_system_types::llm::LmProvider;
 
@@ -82,12 +82,12 @@ impl PluginManager {
     pub async fn init_all(
         &mut self,
         config: &Config,
-        entity_root: &Path,
+        pulse_root: &Path,
         provider: Arc<Box<dyn LmProvider>>,
     ) -> Result<(), crate::errors::PluginError> {
         let ctx = PluginContext {
-            entity_root: entity_root.to_path_buf(),
-            entity_name: config.entity.name.clone(),
+            pulse_root: pulse_root.to_path_buf(),
+            pulse_name: config.pulse.name.clone(),
             provider,
         };
 
@@ -169,7 +169,7 @@ impl PluginManager {
                     entry.state = PluginState::Failed;
                     changed = true;
                     if let Some(ref bus) = self.event_bus {
-                        bus.emit(EntityEvent::PluginStateChanged {
+                        bus.emit(PulseEvent::PluginStateChanged {
                             plugin_name: meta.name.clone(),
                             new_state: PluginStateChange::Failed,
                         });
@@ -182,7 +182,7 @@ impl PluginManager {
                     entry.state = PluginState::Running;
                     changed = true;
                     if let Some(ref bus) = self.event_bus {
-                        bus.emit(EntityEvent::PluginStateChanged {
+                        bus.emit(PulseEvent::PluginStateChanged {
                             plugin_name: meta.name.clone(),
                             new_state: PluginStateChange::Recovered,
                         });
@@ -315,14 +315,14 @@ impl PluginManager {
 mod tests {
     use super::*;
     use crate::config::{
-        AutonomyConfig, Config, EntityConfig, GraphConfig, LlmConfig, MemoryConfig,
+        AutonomyConfig, CaliberConfig, Config, GraphConfig, LlmConfig, MemoryConfig,
         MonitoringConfig, OutreachConfig, PipelineConfig, PlatformConfig, PredictionConfig,
         PulseConfig, SchedulerConfig, SecurityConfig, ServerConfig, SessionConfig, TrustConfig,
     };
 
     fn test_config() -> Config {
         Config {
-            entity: EntityConfig {
+            pulse: PulseConfig {
                 name: "Test".into(),
                 owner_name: "Owner".into(),
                 owner_alias: "O".into(),
@@ -354,7 +354,7 @@ mod tests {
             pipeline: PipelineConfig::default(),
             monitoring: MonitoringConfig::default(),
             autonomy: AutonomyConfig::default(),
-            pulse: PulseConfig::default(),
+            caliber: CaliberConfig::default(),
             graph: GraphConfig::default(),
             prediction: PredictionConfig::default(),
             tension: Default::default(),

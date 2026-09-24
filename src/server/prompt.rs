@@ -190,7 +190,7 @@ pub fn build_system_prompt_budgeted(
     }
 
     // --- Tier 0 (Essential): Rule/protocol files ---
-    if let Some(ref rules_dir) = config.entity.rules_dir {
+    if let Some(ref rules_dir) = config.pulse.rules_dir {
         match load_rule_files(rules_dir) {
             Ok(rules) => {
                 let mut rules_text = String::new();
@@ -451,7 +451,7 @@ pub fn build_system_prompt_budgeted(
     }
 
     // --- Tier 2 (Low): Caliber ---
-    if config.pulse.enabled {
+    if config.caliber.enabled {
         if let Some(caliber_text) = crate::caliber::runtime::render_for_prompt(root_dir) {
             let wrapped = format!("<caliber>\n{}\n</caliber>", caliber_text);
             let capped = if budget_enabled && budget_cfg.caliber_cap > 0 {
@@ -805,7 +805,7 @@ pub fn build_task_system_prompt_budgeted(
     }
 
     // --- Tier 0 (Essential): Shared rule/protocol files ---
-    if let Some(ref rules_dir) = config.entity.rules_dir {
+    if let Some(ref rules_dir) = config.pulse.rules_dir {
         match load_rule_files(rules_dir) {
             Ok(rules) => {
                 let mut rules_text = String::new();
@@ -1284,13 +1284,13 @@ fn build_capabilities(config: &Config) -> Vec<Capability> {
     }
 
     // Outcome tracking (caliber)
-    if config.pulse.enabled {
+    if config.caliber.enabled {
         capabilities.push(Capability {
             name: "Outcome Tracking (caliber)".into(),
             what: "Operational self-model that records outcomes of tasks and intents — success, failure, partial, skipped.".into(),
             why: "Learn from your own performance. Calibrate confidence in your abilities over time.".into(),
             how: "Outcomes are recorded automatically after task execution. Review your caliber data to understand patterns in what works and what doesn't.".into(),
-            constraints: Some(format!("Rolling window of {} outcomes.", config.pulse.max_outcomes)),
+            constraints: Some(format!("Rolling window of {} outcomes.", config.caliber.max_outcomes)),
         });
     }
 
@@ -1377,11 +1377,11 @@ fn build_channels_section(config: &Config, plugin_descriptions: &[(String, Strin
 }
 
 /// Build the pulse header that opens the manifest.
-fn build_entity_header(config: &Config) -> String {
+fn build_pulse_header(config: &Config) -> String {
     format!(
         "# {} — Platform Awareness\n\nYou are **{}**, running on **pulse-null** v{}.\nProvider: {} (model: {})",
-        config.entity.name,
-        config.entity.name,
+        config.pulse.name,
+        config.pulse.name,
         env!("CARGO_PKG_VERSION"),
         config.llm.provider,
         config.llm.model,
@@ -1402,7 +1402,7 @@ pub fn rebuild_platform_manifest(
     let mut sections = Vec::new();
 
     // Pulse header (always first)
-    sections.push(build_entity_header(config));
+    sections.push(build_pulse_header(config));
 
     // Core capabilities from config
     let capabilities = build_capabilities(config);
@@ -1578,8 +1578,8 @@ mod tests {
 
     fn minimal_config() -> Config {
         Config {
-            entity: EntityConfig {
-                name: "TestEntity".into(),
+            pulse: PulseConfig {
+                name: "TestPulse".into(),
                 owner_name: "Tester".into(),
                 owner_alias: "T".into(),
                 rules_dir: None,
@@ -1607,7 +1607,7 @@ mod tests {
             pipeline: PipelineConfig::default(),
             monitoring: MonitoringConfig::default(),
             autonomy: AutonomyConfig::default(),
-            pulse: PulseConfig::default(),
+            caliber: CaliberConfig::default(),
             graph: GraphConfig::default(),
             prediction: PredictionConfig::default(),
             tension: TensionConfig::default(),
@@ -1624,10 +1624,10 @@ mod tests {
     }
 
     #[test]
-    fn manifest_includes_entity_name() {
+    fn manifest_includes_pulse_name() {
         let config = minimal_config();
         let manifest = rebuild_platform_manifest(&config, &[], &[]);
-        assert!(manifest.contains("TestEntity"));
+        assert!(manifest.contains("TestPulse"));
         assert!(manifest.contains("pulse-null"));
         assert!(manifest.contains("ollama"));
         assert!(manifest.contains("llama3"));
@@ -1735,7 +1735,7 @@ mod tests {
         config.pipeline.enabled = false;
         config.monitoring.enabled = false;
         config.autonomy.enabled = false;
-        config.pulse.enabled = false;
+        config.caliber.enabled = false;
         config.sessions.persist = false;
         config.context_buffer.enabled = false;
         config.graph.enabled = false;
@@ -1773,13 +1773,13 @@ mod tests {
         config.pipeline.enabled = false;
         config.monitoring.enabled = false;
         config.autonomy.enabled = false;
-        config.pulse.enabled = false;
+        config.caliber.enabled = false;
         config.sessions.persist = false;
         config.context_buffer.enabled = false;
         config.graph.enabled = false;
         let manifest = rebuild_platform_manifest(&config, &[], &[]);
         // Should still have header, memory capability, and channels
-        assert!(manifest.contains("TestEntity"));
+        assert!(manifest.contains("TestPulse"));
         assert!(manifest.contains("Memory System"));
         assert!(manifest.contains("Communication Channels"));
         // Should NOT have tools or plugins sections
@@ -1793,7 +1793,7 @@ mod tests {
         config.pipeline.enabled = false;
         config.monitoring.enabled = false;
         config.autonomy.enabled = false;
-        config.pulse.enabled = false;
+        config.caliber.enabled = false;
         config.sessions.persist = false;
         config.context_buffer.enabled = false;
         config.graph.enabled = false;
@@ -1813,10 +1813,10 @@ mod tests {
     }
 
     #[test]
-    fn entity_header_always_first_in_manifest() {
+    fn pulse_header_always_first_in_manifest() {
         let config = minimal_config();
         let manifest = rebuild_platform_manifest(&config, &[], &[]);
-        assert!(manifest.starts_with("# TestEntity — Platform Awareness"));
+        assert!(manifest.starts_with("# TestPulse — Platform Awareness"));
     }
 
     // --- Phase 6: System Prompt Budget tests ---
@@ -1853,13 +1853,13 @@ mod tests {
         // Write a CLAUDE.md
         std::fs::write(
             dir.path().join("CLAUDE.md"),
-            "# Test Entity\nYou are a test.",
+            "# Test Pulse\nYou are a test.",
         )
         .unwrap();
 
         let result = build_system_prompt_budgeted(dir.path(), &config, None, None).unwrap();
 
-        assert!(result.prompt.contains("# Test Entity"));
+        assert!(result.prompt.contains("# Test Pulse"));
         assert!(result.estimated_tokens > 0);
         assert!(!result.was_trimmed);
         assert!(result.dropped_components.is_empty());
@@ -1915,7 +1915,7 @@ mod tests {
         config.system_prompt_budget.findings_cap = 5000;
 
         // Write essential and low-priority files
-        std::fs::write(dir.path().join("CLAUDE.md"), "# Entity\nCore identity.").unwrap();
+        std::fs::write(dir.path().join("CLAUDE.md"), "# Pulse\nCore identity.").unwrap();
         std::fs::create_dir_all(dir.path().join("memory")).unwrap();
         std::fs::write(
             dir.path().join("memory/EPHEMERAL.md"),
@@ -1933,7 +1933,7 @@ mod tests {
         // Should have trimmed something
         assert!(result.was_trimmed);
         // Essential content should still be present
-        assert!(result.prompt.contains("# Entity"));
+        assert!(result.prompt.contains("# Pulse"));
         assert!(result.prompt.contains("memory-curation"));
     }
 
@@ -1942,7 +1942,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mut config = minimal_config();
         config.system_prompt_budget.enabled = true;
-        config.pulse.enabled = true;
+        config.caliber.enabled = true;
         // Very tight budget — should force drops
         config.system_prompt_budget.token_budget = 100;
         config.system_prompt_budget.ephemeral_cap = 5000;
@@ -2067,7 +2067,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let config = minimal_config();
 
-        std::fs::write(dir.path().join("CLAUDE.md"), "# Entity").unwrap();
+        std::fs::write(dir.path().join("CLAUDE.md"), "# Pulse").unwrap();
         write_giant_line(&dir.path().join("THOUGHT_STACK.md"), 200_000);
 
         let result = build_system_prompt_budgeted(dir.path(), &config, None, None).unwrap();
@@ -2122,7 +2122,7 @@ mod tests {
         let mut config = minimal_config();
         config.system_prompt_budget.enabled = false;
 
-        std::fs::write(dir.path().join("CLAUDE.md"), "# Entity").unwrap();
+        std::fs::write(dir.path().join("CLAUDE.md"), "# Pulse").unwrap();
         write_giant_line(&dir.path().join("THOUGHT_STACK.md"), 500_000);
         write_giant_line(&dir.path().join("AWARENESS.md"), 500_000);
         std::fs::create_dir_all(dir.path().join("memory")).unwrap();
@@ -2152,7 +2152,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let config = minimal_config();
 
-        std::fs::write(dir.path().join("CLAUDE.md"), "# Entity").unwrap();
+        std::fs::write(dir.path().join("CLAUDE.md"), "# Pulse").unwrap();
         let line = "t".repeat(4096);
         let stack: String = std::iter::repeat_n(line.as_str(), 2560)
             .collect::<Vec<_>>()
@@ -2196,7 +2196,7 @@ mod tests {
         config.system_prompt_budget.token_budget = 800;
         config.system_prompt_budget.self_md_cap = 0;
 
-        std::fs::write(dir.path().join("CLAUDE.md"), "# Entity").unwrap();
+        std::fs::write(dir.path().join("CLAUDE.md"), "# Pulse").unwrap();
         std::fs::write(dir.path().join("SELF.md"), "s".repeat(40_000)).unwrap();
 
         let result = build_system_prompt_budgeted(dir.path(), &config, None, None).unwrap();
@@ -2209,7 +2209,7 @@ mod tests {
             result.estimated_tokens
         );
         // Essential survives untouched.
-        assert!(result.prompt.contains("# Entity"));
+        assert!(result.prompt.contains("# Pulse"));
         assert!(result.prompt.contains("memory-curation"));
     }
 
@@ -2220,13 +2220,13 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let config = minimal_config();
 
-        std::fs::write(dir.path().join("CLAUDE.md"), "# Entity\nBehave.").unwrap();
+        std::fs::write(dir.path().join("CLAUDE.md"), "# Pulse\nBehave.").unwrap();
         std::fs::write(dir.path().join("SELF.md"), "I am a test.").unwrap();
         std::fs::write(dir.path().join("THOUGHT_STACK.md"), "- thinking").unwrap();
 
         let prompt = build_task_system_prompt(dir.path(), &config).unwrap();
 
-        let claude = prompt.find("# Entity").unwrap();
+        let claude = prompt.find("# Pulse").unwrap();
         let identity = prompt.find("<identity>").unwrap();
         let stack = prompt.find("<thought-stack>").unwrap();
         let task = prompt.find("<task-context>").unwrap();
@@ -2243,7 +2243,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let config = minimal_config();
 
-        std::fs::write(dir.path().join("CLAUDE.md"), "# Entity").unwrap();
+        std::fs::write(dir.path().join("CLAUDE.md"), "# Pulse").unwrap();
 
         let result = build_task_system_prompt_budgeted(dir.path(), &config).unwrap();
 

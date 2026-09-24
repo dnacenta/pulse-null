@@ -18,7 +18,7 @@ use super::theme::Tokens;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Who {
     Owner,
-    Entity,
+    Pulse,
     /// A dim system notice (errors, interruptions).
     Notice,
 }
@@ -262,7 +262,7 @@ impl Transcript {
     /// Open the pulse's reply; deltas append to it.
     pub fn open_reply(&mut self) {
         self.entries
-            .push(Entry::new(Who::Entity, "", EntryState::Streaming));
+            .push(Entry::new(Who::Pulse, "", EntryState::Streaming));
         self.deltas = 0;
         self.reveal_pending = false;
         self.pending.clear();
@@ -416,14 +416,14 @@ impl Transcript {
     /// work once), then build `Line`s only for the rows inside the viewport.
     /// Per-frame cost is O(entries + viewport), not O(total rows).
     ///
-    /// `owner` and `entity` are the labels; `status` is a live line shown
+    /// `owner` and `pulse` are the labels; `status` is a live line shown
     /// under a streaming reply (thinking, tool).
     pub fn layout(
         &mut self,
         inner: Rect,
         t: Tokens,
         owner: &str,
-        entity: &str,
+        pulse: &str,
         status: Option<Line<'static>>,
     ) -> Layout {
         self.drain_pending();
@@ -484,12 +484,12 @@ impl Transcript {
         // Pass 2: lines for the visible rows only.
         let label_style = |who: &Who| match who {
             Who::Owner => Style::default().fg(t.accent).add_modifier(Modifier::BOLD),
-            Who::Entity => Style::default().fg(t.entity).add_modifier(Modifier::BOLD),
+            Who::Pulse => Style::default().fg(t.pulse).add_modifier(Modifier::BOLD),
             Who::Notice => Style::default().fg(t.dim).add_modifier(Modifier::ITALIC),
         };
         let body_style = |who: &Who| match who {
             Who::Notice => Style::default().fg(t.dim).add_modifier(Modifier::ITALIC),
-            Who::Owner | Who::Entity => Style::default().fg(t.ink),
+            Who::Owner | Who::Pulse => Style::default().fg(t.ink),
         };
         let visible = |row: usize| row >= offset && row < end;
         let mut lines: Vec<Line<'static>> = Vec::with_capacity(self.viewport);
@@ -512,7 +512,7 @@ impl Transcript {
                 if visible(r) {
                     let label = match e.who {
                         Who::Owner => owner.to_string(),
-                        Who::Entity => entity.to_string(),
+                        Who::Pulse => pulse.to_string(),
                         Who::Notice => String::new(),
                     };
                     lines.push(Line::from(vec![
@@ -841,7 +841,7 @@ mod tests {
         let mut t = Transcript::new();
         t.load(vec![
             (Who::Owner, "hi".into(), vec![]),
-            (Who::Entity, "hello".into(), vec!["file_read".into()]),
+            (Who::Pulse, "hello".into(), vec!["file_read".into()]),
         ]);
         let l = lay(&mut t, 10);
         assert!(l.new_rows.is_empty());

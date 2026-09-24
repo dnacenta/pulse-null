@@ -102,9 +102,9 @@ async fn run_with(config: Config, skip_boot: bool) -> Result<(), Box<dyn std::er
     let _ = execute!(std::io::stdout(), crossterm::event::EnableMouseCapture);
 
     let mut app = App::new(
-        &config.entity.name,
+        &config.pulse.name,
         &config.llm.model,
-        &config.entity.owner_alias,
+        &config.pulse.owner_alias,
         ThemeWatcher::from_setting(&config.tui.theme),
         MotionLevel::parse(&config.tui.motion),
         Glyphs::from_setting(&config.tui.nerd_font),
@@ -268,7 +268,7 @@ async fn event_loop(
                                 let who = if m.role == "user" {
                                     transcript::Who::Owner
                                 } else {
-                                    transcript::Who::Entity
+                                    transcript::Who::Pulse
                                 };
                                 (who, m.text, m.tools)
                             })

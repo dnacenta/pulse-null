@@ -122,7 +122,7 @@ impl Plugin for CaliberEchoPlugin {
                 .and_then(|t| t.get("docs_dir"))
                 .and_then(|v| v.as_str())
                 .map(PathBuf::from)
-                .unwrap_or_else(|| ctx.entity_root.clone());
+                .unwrap_or_else(|| ctx.pulse_root.clone());
 
             tracing::info!("caliber-echo: docs_dir = {}", docs_dir.display());
             self.inner = Some(CaliberEcho::new(docs_dir));
@@ -217,19 +217,19 @@ mod tests {
     /// disagree (the miner resolved `<root>/journal`), so one of them was
     /// always looking at a file the others never touched.
     #[test]
-    fn caliber_md_lives_in_the_entity_root() {
-        let root = Path::new("/home/pulse/entity");
+    fn caliber_md_lives_in_the_pulse_root() {
+        let root = Path::new("/home/pulse/pulse-null/echo");
         assert_eq!(caliber_md(root), root.join("CALIBER.md"));
     }
 
     #[test]
     fn path_helpers() {
-        let docs = Path::new("/tmp/entity");
-        assert_eq!(caliber_dir(docs), Path::new("/tmp/entity/caliber"));
+        let docs = Path::new("/tmp/pulse");
+        assert_eq!(caliber_dir(docs), Path::new("/tmp/pulse/caliber"));
         assert_eq!(
             outcomes_file(docs),
-            Path::new("/tmp/entity/caliber/outcomes.json")
+            Path::new("/tmp/pulse/caliber/outcomes.json")
         );
-        assert_eq!(caliber_md(docs), Path::new("/tmp/entity/CALIBER.md"));
+        assert_eq!(caliber_md(docs), Path::new("/tmp/pulse/CALIBER.md"));
     }
 }

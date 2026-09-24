@@ -6,7 +6,7 @@
 #     --no-session-persistence --dangerously-skip-permissions [--disallowedTools T]
 # and probes capability at startup with: -p --system-prompt-file <absent-path>.
 #
-# Grok Build 1.0.0 differences bridged here (fixtures: entity/notes/grok-fixtures-phase1):
+# Grok Build 1.0.0 differences bridged here (fixtures: ~/pulse-null/echo/notes/grok-fixtures-phase1):
 #   - no --system-prompt-file        -> --system-prompt-override <contents> (argv)
 #   - `-p -` does not read stdin     -> spool stdin to a temp file, --prompt-file
 #   - no --no-session-persistence    -> dropped; transcripts land in ~/.grok/sessions
