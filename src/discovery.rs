@@ -24,7 +24,7 @@ pub fn find_entity_home() -> Option<PathBuf> {
 }
 
 /// The pure resolution, separated from process state so it can be tested.
-fn resolve_entity_home(cwd: &Path, home: Option<&Path>) -> Option<PathBuf> {
+pub fn resolve_entity_home(cwd: &Path, home: Option<&Path>) -> Option<PathBuf> {
     // Single entity mode: CWD is inside an entity (any ancestor holds
     // pulse-null.toml) — the same walk `Config::load()` does, so `up` agrees
     // with every other subcommand about which entity a directory belongs to.
@@ -68,6 +68,22 @@ pub fn has_entity_children(dir: &Path) -> bool {
     std::fs::read_dir(dir)
         .map(|entries| entries.flatten().any(|e| is_entity_child(&e)))
         .unwrap_or(false)
+}
+
+/// Every entity directory under `entity_home` this user owns, whether or
+/// not its config loads. Home lists broken ones dim; `discover_entities`
+/// skips them.
+#[must_use]
+pub fn entity_dirs(entity_home: &Path) -> Vec<PathBuf> {
+    std::fs::read_dir(entity_home)
+        .map(|entries| {
+            entries
+                .flatten()
+                .filter(|e| is_entity_child(e) && owned_by_us(e))
+                .map(|e| e.path())
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 /// A real subdirectory (not a symlink — a link can point at a tree someone

@@ -156,7 +156,16 @@ pub async fn start_with_shutdown(
     stop: Option<tokio::sync::watch::Receiver<bool>>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let root_dir = config.root_dir()?;
+    start_in(config, root_dir, stop).await
+}
 
+/// [`start_with_shutdown`] for an entity that is not the current directory:
+/// the TUI's Home page starts daemons for any entity the user picks.
+pub async fn start_in(
+    config: Config,
+    root_dir: PathBuf,
+    stop: Option<tokio::sync::watch::Receiver<bool>>,
+) -> Result<(), Box<dyn std::error::Error>> {
     // The provider runs from inside the entity (PN-104).
     let provider = crate::providers::create_streaming_provider(&config, &root_dir)?;
 

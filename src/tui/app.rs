@@ -14,6 +14,7 @@ use tachyonfx::Motion as Sweep;
 use super::bar::{self, BarState, DaemonState, Glyphs};
 use super::boot::Boot;
 use super::floats::{CmdLine, Command, Confirm, FloatAction, Help};
+use super::home::{Home, HomeAction};
 use super::keymap::{self, Context};
 use super::motion::{Key, Moment, Motion, MotionLevel, Palette};
 use super::pages::talk::{Talk, TalkAction};
@@ -27,6 +28,9 @@ pub const MIN_ROWS: u16 = 20;
 /// Which top-level screen is showing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Screen {
+    /// The entity menu under the logo.
+    Home,
+    /// Waiting for a daemon (`pulse-null chat` with none up).
     Boot,
     Talk,
 }
@@ -35,6 +39,10 @@ pub enum Screen {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Action {
     None,
+    /// Open Talk for `home.rows[i]`.
+    Open(usize),
+    /// Run the entity wizard.
+    Create,
     Quit,
 }
 
@@ -54,6 +62,7 @@ pub struct App {
     pub theme: ThemeWatcher,
     pub motion: Motion,
     pub boot: Boot,
+    pub home: Home,
     pub talk: Talk,
     pub owner: String,
     tick: u64,
@@ -84,6 +93,7 @@ impl App {
             theme,
             motion: Motion::new(motion_level),
             boot: Boot::new("connecting to the daemon"),
+            home: Home::new(Vec::new()),
             talk: Talk::new(),
             owner: owner.to_string(),
             tick: 0,
@@ -104,9 +114,31 @@ impl App {
         }
     }
 
+    /// Home is the start screen: the menu, with `rows` from `Home::scan`.
+    pub fn start_home(&mut self, rows: Vec<super::home::EntityRow>) {
+        self.home = Home::new(rows);
+        self.screen = Screen::Home;
+        self.pending = None;
+    }
+
+    /// The user picked an entity: Talk speaks for it from now on, with that
+    /// entity's `[tui]` settings.
+    pub fn enter_entity(&mut self, config: &crate::config::Config) {
+        self.bar = BarState::new(&config.entity.name, &config.llm.model);
+        self.owner = config.entity.owner_alias.clone();
+        self.talk = Talk::new();
+        self.focus = PaneId::Prompt;
+        self.fullscreen = false;
+        self.float = None;
+        self.theme = ThemeWatcher::from_setting(&config.tui.theme);
+        self.motion
+            .set_level(MotionLevel::parse(&config.tui.motion));
+        self.glyphs = Glyphs::from_setting(&config.tui.nerd_font);
+    }
+
     /// The daemon answered: dissolve the boot screen, then show Talk.
     pub fn attached(&mut self) {
-        if self.screen == Screen::Boot && self.pending.is_none() {
+        if matches!(self.screen, Screen::Boot | Screen::Home) && self.pending.is_none() {
             self.bar.daemon = DaemonState::Connected;
             self.motion
                 .add(Key::Boot, Moment::BootOut, self.last_area, self.palette());
@@ -121,6 +153,10 @@ impl App {
     /// The mouse wheel always moves the conversation, whatever has focus:
     /// negative is up. Floats and the boot screen ignore it.
     pub fn on_wheel(&mut self, rows: i32) {
+        if self.screen == Screen::Home && self.float.is_none() {
+            self.home.on_wheel(rows);
+            return;
+        }
         if self.screen != Screen::Talk || self.float.is_some() {
             return;
         }
@@ -178,18 +214,19 @@ impl App {
 
     /// Start the boot coalesce once the first frame has a real area.
     pub fn boot_started(&mut self, area: Rect) {
-        self.motion.add(
-            Key::Boot,
-            Moment::BootIn,
-            Boot::logo_area(area),
-            self.palette(),
-        );
+        let logo = if self.screen == Screen::Home {
+            self.home.logo_area(area)
+        } else {
+            Boot::logo_area(area)
+        };
+        self.motion
+            .add(Key::Boot, Moment::BootIn, logo, self.palette());
     }
 
     /// Periodic tick from the loop (spinner, aurora).
     pub fn tick(&mut self) {
         self.tick = self.tick.wrapping_add(1);
-        if self.screen == Screen::Boot {
+        if matches!(self.screen, Screen::Boot | Screen::Home) {
             self.boot.tick();
         }
     }
@@ -208,6 +245,14 @@ impl App {
     }
 
     pub fn on_key(&mut self, key: KeyEvent) -> Action {
+        if self.screen == Screen::Home && self.float.is_none() {
+            return match self.home.on_key(key) {
+                HomeAction::None => Action::None,
+                HomeAction::Open(i) => Action::Open(i),
+                HomeAction::Create => Action::Create,
+                HomeAction::Exit => Action::Quit,
+            };
+        }
         if key.kind != KeyEventKind::Press {
             return Action::None;
         }
@@ -282,6 +327,7 @@ impl App {
     fn open_help(&mut self) {
         let (ctx, title) = match (self.screen, self.focus) {
             (Screen::Boot, _) => (Context::Boot, "boot"),
+            (Screen::Home, _) => (Context::Home, "home"),
             (Screen::Talk, PaneId::Prompt) => (
                 Context::Prompt {
                     turn_active: self.talk.turn_active(),
@@ -442,6 +488,7 @@ impl App {
             (_, _, Some(Float::Confirm(_))) => Context::Confirm,
             (_, _, Some(Float::Help(_))) => Context::Help,
             (Screen::Boot, _, None) => Context::Boot,
+            (Screen::Home, _, None) => Context::Home,
             (Screen::Talk, PaneId::Prompt, None) => Context::Prompt {
                 turn_active: self.talk.turn_active(),
             },
@@ -482,6 +529,19 @@ impl App {
         }
 
         match self.screen {
+            Screen::Home => {
+                if first_frame {
+                    self.boot_started(area);
+                }
+                if self.pending.is_some() && !self.motion.has(&Key::Boot) {
+                    self.switch_pending();
+                    self.render(frame);
+                    return;
+                }
+                let glyphs = self.glyphs;
+                self.home
+                    .render(frame, area, t, self.tick, &mut self.boot, &glyphs);
+            }
             Screen::Boot => {
                 if first_frame {
                     self.boot_started(area);

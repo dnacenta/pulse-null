@@ -23,6 +23,17 @@ pub enum ClientError {
     Json(#[from] serde_json::Error),
 }
 
+/// The outcome of a health probe, coarse enough for a menu row.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Probe {
+    /// `/health` answered OK.
+    Up,
+    /// Nothing listens (connection refused): a daemon can be started.
+    Refused,
+    /// Something answered, but not a healthy daemon (timeout, bad status).
+    Other,
+}
+
 /// A connection to one entity daemon.
 #[derive(Clone)]
 pub struct Client {
@@ -89,6 +100,21 @@ impl Client {
     }
 
     /// True when `/health` answers 200 within a second.
+    /// What listens on the daemon's port, for Home's entity rows.
+    pub async fn probe_detail(&self) -> Probe {
+        match self
+            .get("/health")
+            .timeout(std::time::Duration::from_secs(1))
+            .send()
+            .await
+        {
+            Ok(r) if r.status().is_success() => Probe::Up,
+            Ok(_) => Probe::Other,
+            Err(e) if e.is_connect() => Probe::Refused,
+            Err(_) => Probe::Other,
+        }
+    }
+
     pub async fn probe(&self) -> bool {
         matches!(
             self.get("/health")

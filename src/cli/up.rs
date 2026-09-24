@@ -29,7 +29,8 @@ async fn run_single_entity(headless: bool) -> Result<(), Box<dyn std::error::Err
         return server::start(config).await;
     }
 
-    crate::tui::run(config).await
+    // Home lists this entity with the user's others (PN-113).
+    crate::tui::run_home().await
 }
 
 /// Multi-entity mode: discover and boot every entity. Headless only — the
@@ -40,11 +41,8 @@ async fn run_multi_entity(
     entity_home: PathBuf,
 ) -> Result<(), Box<dyn std::error::Error>> {
     if !headless {
-        return Err(format!(
-            "{} holds several entities. Run `pulse-null up --headless` here, or `pulse-null up` inside one entity directory for the TUI.",
-            entity_home.display()
-        )
-        .into());
+        // Home lists every entity found here; nothing starts until chosen.
+        return crate::tui::run_home().await;
     }
 
     let discovered = crate::discovery::discover_entities(&entity_home);
