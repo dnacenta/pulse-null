@@ -118,6 +118,20 @@ impl App {
         }
     }
 
+    /// The mouse wheel always moves the conversation, whatever has focus:
+    /// negative is up. Floats and the boot screen ignore it.
+    pub fn on_wheel(&mut self, rows: i32) {
+        if self.screen != Screen::Talk || self.float.is_some() {
+            return;
+        }
+        let n = rows.unsigned_abs() as usize;
+        if rows < 0 {
+            self.talk.transcript.scroll_up(n);
+        } else {
+            self.talk.transcript.scroll_down(n);
+        }
+    }
+
     /// `pulse-null chat` with a daemon already up: no boot screen at all.
     pub fn skip_boot(&mut self) {
         self.bar.daemon = DaemonState::Connected;
@@ -662,6 +676,39 @@ mod tests {
             .filter(|e| e.who == super::super::transcript::Who::Notice)
             .count();
         assert_eq!(notices, 3, "theme, motion and the not-yet page each notice");
+    }
+
+    #[test]
+    fn wheel_scrolls_the_transcript_from_the_prompt_and_never_the_history() {
+        let mut a = app();
+        for i in 0..40 {
+            a.talk.transcript.push_owner(&format!("line {i}"));
+        }
+        let area = ratatui::layout::Rect::new(0, 0, 80, 10);
+        let _ = a
+            .talk
+            .transcript
+            .layout(area, a.theme.tokens(), "D", "echo", None);
+        type_text(&mut a, "draft");
+        a.on_wheel(-3);
+        assert!(
+            !a.talk.transcript.is_following(),
+            "wheel up leaves the tail"
+        );
+        assert_eq!(a.talk.prompt.text(), "draft", "the draft is untouched");
+        a.on_wheel(3);
+        a.on_wheel(300);
+        assert!(
+            a.talk.transcript.is_following(),
+            "wheel down past the end re-follows"
+        );
+        // A float owns the keyboard and the wheel alike (`:` is a character
+        // while a draft is typed, so open it from the transcript).
+        a.set_focus(PaneId::Transcript);
+        a.on_key(key(KeyCode::Char(':')));
+        assert!(a.float.is_some());
+        a.on_wheel(-3);
+        assert!(a.talk.transcript.is_following());
     }
 
     #[test]
