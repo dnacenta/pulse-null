@@ -340,6 +340,19 @@ async fn event_loop(
                                 }
                                 session = Some(s);
                             }
+                            Action::Home => {
+                                // The poller and any turn go with the session; the
+                                // daemon this process started stays for Exit.
+                                drop(session.take());
+                                if let Some(task) = turn_task.take() {
+                                    task.abort();
+                                }
+                                turn_rx = None;
+                                attached = false;
+                                let cwd = std::env::current_dir().unwrap_or_default();
+                                let home_dir = std::env::var_os("HOME").map(std::path::PathBuf::from);
+                                app.start_home(home::Home::scan(&cwd, home_dir.as_deref()));
+                            }
                             Action::Create => {
                                 app.home.notice = Some(
                                     "create: not yet — run `pulse-null init` in a terminal".to_string(),

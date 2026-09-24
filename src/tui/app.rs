@@ -39,6 +39,8 @@ pub enum Screen {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Action {
     None,
+    /// Back to the entity menu (the loop drops the session, keeps daemons).
+    Home,
     /// Open Talk for `home.rows[i]`.
     Open(usize),
     /// Run the entity wizard.
@@ -119,6 +121,11 @@ impl App {
         self.home = Home::new(rows);
         self.screen = Screen::Home;
         self.pending = None;
+        self.float = None;
+        // Coming back from Talk: the logo coalesces again.
+        if self.last_area != Rect::default() {
+            self.boot_started(self.last_area);
+        }
     }
 
     /// The user picked an entity: Talk speaks for it from now on, with that
@@ -317,10 +324,25 @@ impl App {
             self.open_float(Float::Confirm(Confirm {
                 question: "A reply is still streaming. Quit anyway?".to_string(),
                 yes: "quit",
+                then: Command::Quit,
             }));
             Action::None
         } else {
             Action::Quit
+        }
+    }
+
+    /// Back to Home now, or ask first when a reply is still streaming.
+    fn request_home(&mut self) -> Action {
+        if self.talk.turn_active() {
+            self.open_float(Float::Confirm(Confirm {
+                question: "A reply is still streaming. Leave it and go Home?".to_string(),
+                yes: "home",
+                then: Command::Home,
+            }));
+            Action::None
+        } else {
+            Action::Home
         }
     }
 
@@ -371,7 +393,7 @@ impl App {
     fn float_key(&mut self, key: KeyEvent) -> Action {
         let action = match self.float.as_mut() {
             Some(Float::CmdLine(c)) => c.on_key(key),
-            Some(Float::Confirm(_)) => Confirm::on_key(key),
+            Some(Float::Confirm(c)) => c.on_key(key),
             Some(Float::Help(_)) => Help::on_key(key),
             None => FloatAction::Close,
         };
@@ -406,6 +428,13 @@ impl App {
             Command::Help => {
                 self.open_help();
                 Action::None
+            }
+            Command::Home => {
+                if confirmed {
+                    Action::Home
+                } else {
+                    self.request_home()
+                }
             }
             Command::Theme(name) => {
                 let before = self.theme.tokens();
@@ -736,6 +765,85 @@ mod tests {
             .filter(|e| e.who == super::super::transcript::Who::Notice)
             .count();
         assert_eq!(notices, 3, "theme, motion and the not-yet page each notice");
+    }
+
+    fn entity_row(name: &str, port: u16) -> super::super::home::EntityRow {
+        let mut c = crate::config::test_support::minimal_config();
+        c.entity.name = name.to_string();
+        c.entity.owner_alias = "Dee".to_string();
+        c.llm.model = "m2".to_string();
+        c.server.port = port;
+        c.tui.motion = "off".to_string();
+        super::super::home::EntityRow {
+            name: name.to_string(),
+            dir: std::path::PathBuf::from(format!("/x/{name}")),
+            config: Some(c),
+            error: None,
+            state: super::super::home::EntityState::Unknown,
+        }
+    }
+
+    #[test]
+    fn home_enter_on_an_entity_row_asks_to_open_it() {
+        let mut a = app();
+        a.start_home(vec![entity_row("echo", 3200), entity_row("synth", 3201)]);
+        assert_eq!(a.screen, Screen::Home);
+        a.on_key(key(KeyCode::Char('j')));
+        assert_eq!(a.on_key(key(KeyCode::Enter)), Action::Open(1));
+        a.on_key(key(KeyCode::Char('3')));
+        assert_eq!(a.on_key(key(KeyCode::Enter)), Action::Create);
+        assert_eq!(a.on_key(key(KeyCode::Char('q'))), Action::Quit);
+        // Global chords and floats do not apply on Home.
+        assert_eq!(a.on_key(key(KeyCode::Char(':'))), Action::None);
+        assert!(a.float.is_none());
+    }
+
+    #[test]
+    fn enter_entity_resets_bar_owner_and_talk() {
+        let mut a = app();
+        type_text(&mut a, "draft");
+        let row = entity_row("synth", 3201);
+        a.enter_entity(row.config.as_ref().unwrap());
+        assert_eq!(a.bar.entity, "synth");
+        assert_eq!(a.bar.model, "m2");
+        assert_eq!(a.owner, "Dee");
+        assert!(a.talk.prompt.is_empty(), "a fresh Talk");
+        assert_eq!(
+            a.motion.level(),
+            MotionLevel::Off,
+            "the entity's [tui] applies"
+        );
+    }
+
+    #[test]
+    fn home_command_confirms_mid_turn_and_returns_when_idle() {
+        let mut a = app();
+        a.on_key(key(KeyCode::Char(':')));
+        type_text(&mut a, "home");
+        assert_eq!(
+            a.on_key(key(KeyCode::Enter)),
+            Action::Home,
+            "idle: straight back"
+        );
+
+        let mut a = app();
+        type_text(&mut a, "hello");
+        a.on_key(key(KeyCode::Enter));
+        assert!(a.talk.turn_active());
+        a.set_focus(PaneId::Transcript);
+        a.on_key(key(KeyCode::Char(':')));
+        type_text(&mut a, "home");
+        assert_eq!(a.on_key(key(KeyCode::Enter)), Action::None);
+        assert!(matches!(a.float, Some(Float::Confirm(_))), "asks first");
+        assert_eq!(a.on_key(key(KeyCode::Esc)), Action::None, "Esc stays");
+        a.on_key(key(KeyCode::Char(':')));
+        type_text(&mut a, "home");
+        a.on_key(key(KeyCode::Enter));
+        assert_eq!(
+            a.on_key(key(KeyCode::Enter)),
+            Action::Home,
+            "Enter confirms"
+        );
     }
 
     #[test]
