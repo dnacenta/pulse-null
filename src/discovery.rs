@@ -70,6 +70,42 @@ pub fn has_entity_children(dir: &Path) -> bool {
         .unwrap_or(false)
 }
 
+/// Why a directory is not trusted as this user's entity.
+///
+/// Booting an entity runs the binaries and hooks its files name with our
+/// rights, so a directory qualifies only when it is a real directory (not
+/// a symlink into someone else's tree), owned by the running user, and its
+/// `pulse-null.toml` is a real file owned by the same user.
+pub fn untrusted_reason(dir: &Path) -> Option<String> {
+    use std::os::unix::fs::MetadataExt;
+    // SAFETY: geteuid has no preconditions and cannot fail.
+    let me = unsafe { libc::geteuid() };
+    let meta = match std::fs::symlink_metadata(dir) {
+        Ok(m) => m,
+        Err(e) => return Some(format!("cannot read: {e}")),
+    };
+    if meta.file_type().is_symlink() {
+        return Some("is a symlink".to_string());
+    }
+    if !meta.is_dir() {
+        return Some("not a directory".to_string());
+    }
+    if meta.uid() != me {
+        return Some("not owned by you".to_string());
+    }
+    let toml = match std::fs::symlink_metadata(dir.join("pulse-null.toml")) {
+        Ok(m) => m,
+        Err(e) => return Some(format!("pulse-null.toml: {e}")),
+    };
+    if toml.file_type().is_symlink() {
+        return Some("pulse-null.toml is a symlink".to_string());
+    }
+    if toml.uid() != me {
+        return Some("pulse-null.toml not owned by you".to_string());
+    }
+    None
+}
+
 /// Every entity directory under `entity_home` this user owns, whether or
 /// not its config loads. Home lists broken ones dim; `discover_entities`
 /// skips them.

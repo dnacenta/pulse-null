@@ -401,7 +401,16 @@ pub async fn start_in(
     tokio::spawn(async move {
         let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
             .expect("failed to install SIGTERM handler");
-        let sigint = tokio::signal::ctrl_c();
+        // An owned daemon (Home started it) stops on its owner's flag, not
+        // on a Ctrl+c the terminal delivers to the whole process group.
+        let owned = stop.is_some();
+        let sigint = async {
+            if owned {
+                std::future::pending::<()>().await;
+            } else {
+                let _ = tokio::signal::ctrl_c().await;
+            }
+        };
         let external = async {
             match stop {
                 Some(mut rx) => {
@@ -413,7 +422,7 @@ pub async fn start_in(
         };
         tokio::select! {
             _ = sigterm.recv() => tracing::info!("Received SIGTERM"),
-            _ = sigint => tracing::info!("Received SIGINT"),
+            () = sigint => tracing::info!("Received SIGINT"),
             () = external => tracing::info!("Stop requested by the owning process"),
         }
         let _ = shutdown_tx.send(true);

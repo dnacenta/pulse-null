@@ -252,6 +252,9 @@ impl App {
     }
 
     pub fn on_key(&mut self, key: KeyEvent) -> Action {
+        if key.kind != KeyEventKind::Press {
+            return Action::None;
+        }
         if self.screen == Screen::Home && self.float.is_none() {
             if key.code == KeyCode::Char('?') {
                 self.open_help();
@@ -263,9 +266,6 @@ impl App {
                 HomeAction::Create => Action::Create,
                 HomeAction::Exit => Action::Quit,
             };
-        }
-        if key.kind != KeyEventKind::Press {
-            return Action::None;
         }
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
 
@@ -778,13 +778,10 @@ mod tests {
         c.llm.model = "m2".to_string();
         c.server.port = port;
         c.tui.motion = "off".to_string();
-        super::super::home::EntityRow {
-            name: name.to_string(),
-            dir: std::path::PathBuf::from(format!("/x/{name}")),
-            config: Some(c),
-            error: None,
-            state: super::super::home::EntityState::Unknown,
-        }
+        super::super::home::EntityRow::from_load(
+            std::path::PathBuf::from(format!("/x/{name}")),
+            Ok(c),
+        )
     }
 
     #[test]
@@ -807,7 +804,7 @@ mod tests {
         let mut a = app();
         type_text(&mut a, "draft");
         let row = entity_row("synth", 3201);
-        a.enter_entity(row.config.as_ref().unwrap());
+        a.enter_entity(row.config().unwrap());
         assert_eq!(a.bar.entity, "synth");
         assert_eq!(a.bar.model, "m2");
         assert_eq!(a.owner, "Dee");

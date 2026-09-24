@@ -6,6 +6,9 @@ use crate::config::Config;
 pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
     match Config::load() {
         Ok(config) => crate::tui::run_chat(config).await,
-        Err(_) => crate::tui::run_home().await,
+        // No entity here: the menu. A broken config inside an entity is
+        // still an error worth reading.
+        Err(crate::errors::ConfigError::NotFound(_)) => crate::tui::run_home().await,
+        Err(e) => Err(e.into()),
     }
 }
