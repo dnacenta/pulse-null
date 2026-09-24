@@ -253,6 +253,10 @@ impl App {
 
     pub fn on_key(&mut self, key: KeyEvent) -> Action {
         if self.screen == Screen::Home && self.float.is_none() {
+            if key.code == KeyCode::Char('?') {
+                self.open_help();
+                return Action::None;
+            }
             return match self.home.on_key(key) {
                 HomeAction::None => Action::None,
                 HomeAction::Open(i) => Action::Open(i),

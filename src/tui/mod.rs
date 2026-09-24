@@ -110,14 +110,21 @@ async fn run_app_with(
     session: Option<Session>,
     mut started: Vec<Daemon>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let (mut terminal, keyboard_enhanced) = enter_terminal();
-    let result = event_loop(&mut terminal, &mut app, session, &mut started).await;
-    leave_terminal(keyboard_enhanced);
+    let mut term = enter_terminal();
+    let result = event_loop(&mut term, &mut app, session, &mut started).await;
+    leave_terminal(&term);
     stop_daemons(started).await;
     result
 }
 
-fn enter_terminal() -> (ratatui::DefaultTerminal, bool) {
+/// The terminal in TUI mode: alternate screen, raw mode, the flags we
+/// pushed and must pop again.
+struct Term {
+    terminal: ratatui::DefaultTerminal,
+    keyboard_enhanced: bool,
+}
+
+fn enter_terminal() -> Term {
     let terminal = ratatui::init();
     let keyboard_enhanced = crossterm::terminal::supports_keyboard_enhancement().unwrap_or(false);
     if keyboard_enhanced {
@@ -133,11 +140,14 @@ fn enter_terminal() -> (ratatui::DefaultTerminal, bool) {
     // emulates the wheel as ↑/↓ keys, which the prompt reads as history.
     // Text selection is Shift+drag while the TUI runs, as in any TUI.
     let _ = execute!(std::io::stdout(), crossterm::event::EnableMouseCapture);
-    (terminal, keyboard_enhanced)
+    Term {
+        terminal,
+        keyboard_enhanced,
+    }
 }
 
-fn leave_terminal(keyboard_enhanced: bool) {
-    if keyboard_enhanced {
+fn leave_terminal(term: &Term) {
+    if term.keyboard_enhanced {
         let _ = execute!(
             std::io::stdout(),
             crossterm::event::PopKeyboardEnhancementFlags
@@ -247,8 +257,60 @@ fn on_turn_item(app: &mut App, item: Option<Result<ChatEvent, ClientError>>) -> 
     }
 }
 
+/// Leave TUI mode, run `f` with the terminal cooked (the init wizard
+/// prompts through it), then come back. The event stream is recreated by
+/// the caller so nothing reads stdin while `f` does.
+async fn suspend_for<F: std::future::Future>(term: &mut Term, f: F) -> F::Output {
+    leave_terminal(term);
+    let out = f.await;
+    *term = enter_terminal();
+    let _ = term.terminal.clear();
+    out
+}
+
+/// `pulse-null init --dir <target>` as a child on the cooked terminal. A
+/// child, not the in-process wizard: the prompt library answers Ctrl+c by
+/// raising SIGINT at its own process, which would take the TUI (and any
+/// daemon it started) down with it; in a child it ends only the wizard.
+async fn run_wizard(target: &std::path::Path) -> Result<(), String> {
+    std::fs::create_dir_all(target).map_err(|e| e.to_string())?;
+    let exe = std::env::current_exe().map_err(|e| e.to_string())?;
+    let status = tokio::process::Command::new(exe)
+        .arg("init")
+        .arg("--dir")
+        .arg(target)
+        .status()
+        .await
+        .map_err(|e| format!("could not start the wizard: {e}"))?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(match status.code() {
+            Some(code) => format!("exit {code}"),
+            None => "cancelled".to_string(),
+        })
+    }
+}
+
+/// Where `Create a new entity` puts it: the discovered entity home, else
+/// `~/pulse-null`.
+fn create_target() -> std::path::PathBuf {
+    crate::discovery::find_entity_home().unwrap_or_else(|| {
+        std::env::var_os("HOME")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| std::path::PathBuf::from("."))
+            .join("pulse-null")
+    })
+}
+
+fn rescan_home() -> Vec<home::EntityRow> {
+    let cwd = std::env::current_dir().unwrap_or_default();
+    let home_dir = std::env::var_os("HOME").map(std::path::PathBuf::from);
+    home::Home::scan(&cwd, home_dir.as_deref())
+}
+
 async fn event_loop(
-    terminal: &mut ratatui::DefaultTerminal,
+    term: &mut Term,
     app: &mut App,
     mut session: Option<Session>,
     started: &mut Vec<Daemon>,
@@ -284,6 +346,9 @@ async fn event_loop(
 
     let mut dirty = true;
     let mut last_draw = Instant::now() - FRAME;
+    // Set by the Create row; handled after the select so the event stream
+    // can be dropped and rebuilt around the wizard.
+    let mut create = false;
 
     if attached {
         app.attached();
@@ -299,7 +364,7 @@ async fn event_loop(
                 std::io::stdout(),
                 crossterm::terminal::BeginSynchronizedUpdate
             );
-            terminal.draw(|f| app.render(f))?;
+            term.terminal.draw(|f| app.render(f))?;
             let _ = execute!(
                 std::io::stdout(),
                 crossterm::terminal::EndSynchronizedUpdate
@@ -349,15 +414,9 @@ async fn event_loop(
                                 }
                                 turn_rx = None;
                                 attached = false;
-                                let cwd = std::env::current_dir().unwrap_or_default();
-                                let home_dir = std::env::var_os("HOME").map(std::path::PathBuf::from);
-                                app.start_home(home::Home::scan(&cwd, home_dir.as_deref()));
+                                app.start_home(rescan_home());
                             }
-                            Action::Create => {
-                                app.home.notice = Some(
-                                    "create: not yet — run `pulse-null init` in a terminal".to_string(),
-                                );
-                            }
+                            Action::Create => create = true,
                             Action::None => {}
                         }
                         dirty = true;
@@ -507,6 +566,22 @@ async fn event_loop(
             }
             // Something is dirty but the pacer said "not yet": wake for it.
             _ = tokio::time::sleep_until((last_draw + FRAME).into()), if dirty => {}
+        }
+
+        if create {
+            create = false;
+            // dialoguer reads the cooked terminal; our reader must be gone.
+            drop(events);
+            let target = create_target();
+            let result = suspend_for(term, run_wizard(&target)).await;
+            events = EventStream::new();
+            app.start_home(rescan_home());
+            app.home.notice = Some(match result {
+                Ok(()) => "pulse created — pick it to start".to_string(),
+                Err(e) => format!("the wizard did not finish: {e}"),
+            });
+            dirty = true;
+            continue;
         }
 
         // The page asked for a send or a cancel; the loop owns the sockets.

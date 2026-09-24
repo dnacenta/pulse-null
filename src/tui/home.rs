@@ -1,5 +1,6 @@
-//! Home: the splash with a menu under it. One "Talk to <entity>" row per
-//! entity this user owns, then "Create a new entity", then "Exit". The logo
+//! Home: the splash with a menu under it. One "Talk to <pulse>" row per
+//! pulse (entity directory) this user owns, then "Create a new pulse", then
+//! "Exit". "Pulse" is the product word for an entity on screen. The logo
 //! and its coalesce moment come from `boot`; this page only adds the list.
 //!
 //! Nothing here touches the network. States are probed by the loop and
@@ -368,7 +369,7 @@ impl Home {
             lines.insert(
                 0,
                 Line::from(Span::styled(
-                    "  no entity yet — create one to start",
+                    "  no pulse yet — create one to start",
                     Style::default().fg(t.dim).add_modifier(Modifier::ITALIC),
                 )),
             );
@@ -402,7 +403,7 @@ impl Home {
                     None => format!("Talk to {}", r.name),
                 }
             }
-            Item::Create => "Create a new entity".to_string(),
+            Item::Create => "Create a new pulse".to_string(),
             Item::Exit => "Exit".to_string(),
         }
     }
@@ -640,7 +641,7 @@ mod tests {
         })
         .unwrap();
         let text = format!("{:?}", term.backend().buffer());
-        assert!(text.contains("no entity yet"), "{text}");
-        assert!(text.contains("Create a new entity"));
+        assert!(text.contains("no pulse yet"), "{text}");
+        assert!(text.contains("Create a new pulse"));
     }
 }
