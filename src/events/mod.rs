@@ -7,7 +7,7 @@ use tokio::sync::broadcast;
 pub enum InteractionSource {
     /// Direct conversation with the owner (chat, voice, discord).
     Chat { channel: String },
-    /// Peer-to-peer conversation between entities (comms).
+    /// Peer-to-peer conversation between pulses (comms).
     Comms { peer: String },
     /// Autonomous scheduled task execution.
     ScheduledTask { task_name: String },
@@ -24,7 +24,7 @@ pub enum ConversationTrust {
     LocalPeer,
     /// Configured remote peer — moderate trust.
     RemotePeer,
-    /// Unknown entity — no trust.
+    /// Unknown sender — no trust.
     Public,
 }
 
@@ -111,7 +111,7 @@ impl std::fmt::Display for SalienceKind {
     }
 }
 
-/// Internal entity events that can trigger autonomous actions.
+/// Internal pulse events that can trigger autonomous actions.
 #[derive(Debug, Clone)]
 #[allow(dead_code)]
 pub enum EntityEvent {
@@ -148,7 +148,7 @@ pub enum EntityEvent {
     },
 
     /// Emitted when a plugin's state changes (failure or recovery).
-    /// Triggers an AWARENESS.md rebuild so the entity's capability inventory
+    /// Triggers an AWARENESS.md rebuild so the pulse's capability inventory
     /// stays in sync with reality.
     PluginStateChanged {
         plugin_name: String,
@@ -165,7 +165,7 @@ pub enum EntityEvent {
     /// Emitted when accumulated prediction-error importance crosses
     /// `PredictionConfig::importance_threshold`. Carries enough context for
     /// downstream listeners (vigil-pulse feed, reflection-window prompt
-    /// augmentation) to point the entity at the specific prediction that
+    /// augmentation) to point the pulse at the specific prediction that
     /// most needs graduation.
     PredictionPressure {
         accumulated_importance: f64,
@@ -173,7 +173,7 @@ pub enum EntityEvent {
         triggering_surprise: f64,
     },
 
-    /// Emitted when the entity's own cognition produces something it judges
+    /// Emitted when the pulse's own cognition produces something it judges
     /// worth telling the owner about, unprompted (PN-94, spec §2.1).
     ///
     /// This is the only event in the bus that is about *content* rather than

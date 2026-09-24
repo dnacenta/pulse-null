@@ -2,21 +2,21 @@ use std::path::{Path, PathBuf};
 
 use crate::config::Config;
 
-/// A discovered entity directory with its loaded config.
+/// A discovered pulse directory with its loaded config.
 pub struct DiscoveredEntity {
     pub name: String,
     pub dir: PathBuf,
     pub config: Config,
 }
 
-/// Determine the entity home directory.
+/// Determine the pulse home directory.
 ///
-/// Returns `None` if CWD contains `pulse-null.toml` (single-entity mode).
-/// Otherwise the entity home is the first of: CWD itself when it already
-/// holds entities as direct children (the flat `~/pulse-null/<name>` layout,
-/// PN-104), the legacy `CWD/entities/`, `~/pulse-null/` with entity
+/// Returns `None` if CWD contains `pulse-null.toml` (single-pulse mode).
+/// Otherwise the pulse home is the first of: CWD itself when it already
+/// holds pulses as direct children (the flat `~/pulse-null/<name>` layout,
+/// PN-104), the legacy `CWD/entities/`, `~/pulse-null/` with pulse
 /// children, the legacy `~/pulse-null/entities/`; failing all of those, CWD
-/// is the place new entities will be created.
+/// is the place new pulses will be created.
 pub fn find_entity_home() -> Option<PathBuf> {
     let cwd = std::env::current_dir().ok()?;
     let home = std::env::var_os("HOME").map(PathBuf::from);
@@ -25,9 +25,9 @@ pub fn find_entity_home() -> Option<PathBuf> {
 
 /// The pure resolution, separated from process state so it can be tested.
 fn resolve_entity_home(cwd: &Path, home: Option<&Path>) -> Option<PathBuf> {
-    // Single entity mode: CWD is inside an entity (any ancestor holds
+    // Single pulse mode: CWD is inside a pulse (any ancestor holds
     // pulse-null.toml) — the same walk `Config::load()` does, so `up` agrees
-    // with every other subcommand about which entity a directory belongs to.
+    // with every other subcommand about which pulse a directory belongs to.
     if cwd
         .ancestors()
         .any(|dir| dir.join("pulse-null.toml").exists())
@@ -35,7 +35,7 @@ fn resolve_entity_home(cwd: &Path, home: Option<&Path>) -> Option<PathBuf> {
         return None;
     }
 
-    // Flat layout: entities are direct children of CWD
+    // Flat layout: pulses are direct children of CWD
     if has_entity_children(cwd) {
         return Some(cwd.to_path_buf());
     }
@@ -59,11 +59,11 @@ fn resolve_entity_home(cwd: &Path, home: Option<&Path>) -> Option<PathBuf> {
         }
     }
 
-    // Nothing yet — new entities go straight into CWD (flat layout).
+    // Nothing yet — new pulses go straight into CWD (flat layout).
     Some(cwd.to_path_buf())
 }
 
-/// Does `dir` hold at least one entity as a direct child?
+/// Does `dir` hold at least one pulse as a direct child?
 pub fn has_entity_children(dir: &Path) -> bool {
     std::fs::read_dir(dir)
         .map(|entries| entries.flatten().any(|e| is_entity_child(&e)))
@@ -76,7 +76,7 @@ fn is_entity_child(entry: &std::fs::DirEntry) -> bool {
     entry.file_type().is_ok_and(|t| t.is_dir()) && entry.path().join("pulse-null.toml").exists()
 }
 
-/// Booting an entity runs its configured binaries with our rights; only
+/// Booting a pulse runs its configured binaries with our rights; only
 /// directories we own qualify. `DirEntry::metadata` does not follow
 /// symlinks, so it describes the same thing `is_entity_child` judged.
 fn owned_by_us(entry: &std::fs::DirEntry) -> bool {
@@ -86,8 +86,8 @@ fn owned_by_us(entry: &std::fs::DirEntry) -> bool {
     entry.metadata().is_ok_and(|m| m.uid() == me)
 }
 
-/// A port for a new entity in `entity_home`: the first from 3200 upward
-/// that no sibling's `pulse-null.toml` already claims. Every entity binding
+/// A port for a new pulse in `entity_home`: the first from 3200 upward
+/// that no sibling's `pulse-null.toml` already claims. Every pulse binding
 /// its own configured port is what makes those ports stable.
 pub fn suggest_port(entity_home: &Path) -> u16 {
     let taken: std::collections::BTreeSet<u16> = std::fs::read_dir(entity_home)
@@ -113,7 +113,7 @@ fn configured_port(config_path: &Path) -> Option<u16> {
     u16::try_from(port).ok()
 }
 
-/// Entity names become directory names under the entity home, so they are
+/// Pulse names become directory names under the pulse home, so they are
 /// kept to a safe shape: lowercase ASCII letters, digits, `-` and `_`, 1–32
 /// characters, starting with a letter or digit.
 pub fn validate_entity_name(name: &str) -> Result<String, String> {
@@ -137,8 +137,8 @@ pub fn validate_entity_name(name: &str) -> Result<String, String> {
     }
 }
 
-/// Scan the entity home directory for valid entity directories. Two
-/// directories claiming the same entity name would silently shadow each
+/// Scan the pulse home directory for valid pulse directories. Two
+/// directories claiming the same pulse name would silently shadow each
 /// other in the registry, so only the first (by path) is kept and the
 /// duplicate is reported.
 pub fn discover_entities(entity_home: &Path) -> Vec<DiscoveredEntity> {
@@ -156,7 +156,7 @@ pub fn discover_entities(entity_home: &Path) -> Vec<DiscoveredEntity> {
         }
         if !owned_by_us(&entry) {
             tracing::warn!(
-                "Skipping {}: not owned by the running user — an entity is booted with this user's rights",
+                "Skipping {}: not owned by the running user — a pulse is booted with this user's rights",
                 path.display()
             );
             continue;
@@ -182,7 +182,7 @@ pub fn discover_entities(entity_home: &Path) -> Vec<DiscoveredEntity> {
             true
         } else {
             tracing::warn!(
-                "Skipping {}: another entity directory already uses the name \"{}\"",
+                "Skipping {}: another pulse directory already uses the name \"{}\"",
                 e.dir.display(),
                 e.name
             );

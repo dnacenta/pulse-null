@@ -28,7 +28,7 @@ const PIPELINE_DOCS: &[&str] = &[
 const SAFETY_NET_HOURS: i64 = 48;
 
 /// Extended cooldown multiplier when last response had no tool calls.
-/// If the entity did nothing useful, wait longer before trying again.
+/// If the pulse did nothing useful, wait longer before trying again.
 const NO_TOOLS_COOLDOWN_MULTIPLIER: i64 = 2;
 
 /// Per-event tracking state.
@@ -342,9 +342,9 @@ fn count_signal_frames(root_dir: &Path) -> usize {
 }
 
 /// Get the docs_dir for pipeline documents from root_dir.
-/// Pipeline documents live in the entity's journal directory.
+/// Pipeline documents live in the pulse's journal directory.
 pub fn resolve_docs_dir(root_dir: &Path) -> PathBuf {
-    // Check if journal/ subdir exists (entity structure)
+    // Check if journal/ subdir exists (pulse structure)
     let journal = root_dir.join("journal");
     if journal.exists() {
         return journal;
@@ -709,7 +709,7 @@ pub fn resolve_task_evaluator(
 
 /// Accumulated-importance descriptor returned when prediction-error pressure
 /// crosses the configured threshold. Drives reflection-window graduation:
-/// the entity should promote the LEARNING items associated with the
+/// the pulse should promote the LEARNING items associated with the
 /// `triggering_error`'s prediction onto THOUGHTS during the next reflection.
 ///
 /// This is the consumer side of spec 2c — without this gate the

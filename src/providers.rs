@@ -12,11 +12,11 @@ use crate::streaming::StreamingProvider;
 
 /// Create a boxed provider based on config.
 ///
-/// `entity_root` is the entity the provider speaks for. The claude-code
+/// `entity_root` is the pulse the provider speaks for. The claude-code
 /// backend runs every subprocess from inside it (PN-104); the HTTP backends
 /// ignore it. Callers pass the root they already hold rather than letting the
 /// factory re-derive one from the process cwd, which is wrong whenever one
-/// process serves several entities.
+/// process serves several pulses.
 pub fn create_provider(
     config: &Config,
     entity_root: &Path,

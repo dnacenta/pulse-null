@@ -203,7 +203,7 @@ async fn wait_or_shutdown(shutdown_rx: &mut watch::Receiver<bool>, dur: Duration
     }
 }
 
-/// Lease holder id: entity name (sanitized to the lease id charset) + pid,
+/// Lease holder id: pulse name (sanitized to the lease id charset) + pid,
 /// so concurrent processes are distinguishable in the lease WAL.
 pub(crate) fn holder_id(entity_name: &str) -> String {
     format!("{}-{}", lease_safe(entity_name), std::process::id())

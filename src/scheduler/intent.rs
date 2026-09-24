@@ -46,7 +46,7 @@ pub struct Intent {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum IntentSource {
-    /// Created by the entity via [INTENT:] marker
+    /// Created by the pulse via [INTENT:] marker
     #[default]
     EntityMarker,
     /// Created by an internal event trigger
@@ -312,7 +312,7 @@ pub fn create_intent_from_marker(
 
 /// Parse a `[SALIENCE: {...}]` JSON marker into a `Salience` event (PN-94).
 ///
-/// This is Phase 1's trigger, and knowingly the weak version: the entity
+/// This is Phase 1's trigger, and knowingly the weak version: the pulse
 /// decides when it is interesting, which is unaudited. It ships first anyway
 /// because it makes the behaviour observable, and observable behaviour is
 /// what makes Phase 2 falsifiable (spec §3).
@@ -1619,7 +1619,7 @@ mod tests {
         assert_eq!(
             crate::outreach::stated_cost(&evidence),
             Some(crate::outreach::Cost::Nothing),
-            "the inline line is the one the entity wrote in context"
+            "the inline line is the one the pulse wrote in context"
         );
     }
 

@@ -39,7 +39,7 @@ pub struct ChatResponse {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub output_tokens: Option<u32>,
     /// Sticky isolation-mode indicator — present (true) on every response
-    /// while the entity is isolated, so any consumer arriving mid-session
+    /// while the pulse is isolated, so any consumer arriving mid-session
     /// sees the posture.
     #[serde(skip_serializing_if = "std::ops::Not::not", default)]
     pub isolation: bool,
@@ -826,7 +826,7 @@ pub(crate) async fn run_turn(
         maybe_checkpoint(&state, &session_key, &mut session.data, &channel).await;
     }
 
-    // Record entity response to context buffer (shed in isolation)
+    // Record pulse response to context buffer (shed in isolation)
     if !isolated {
         if let Some(ref cb) = state.context_buffer {
             cb.record(&channel, &state.config.entity.name, "assistant", &text)
@@ -1366,8 +1366,8 @@ fn build_identity_system_prompt(base: &str, resolved_key: &str, sender: &str) ->
         format!(
             "{}\n\n<peer-conversation-context>\n\
              You are having a direct conversation with {}.\n\
-             {} is a trusted peer entity — a sibling in the same pulse-null network, \
-             managed by the same owner. This is an internal conversation between entities, \
+             {} is a trusted peer pulse — a sibling in the same pulse-null network, \
+             managed by the same owner. This is an internal conversation between pulses, \
              not a user-facing interaction.\n\n\
              Speak freely and collaboratively. Share knowledge, insights, and observations openly.\n\
              If you have graph memory available, use it to recall past interactions with {}.\n\n\

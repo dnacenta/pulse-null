@@ -96,7 +96,7 @@ impl ToolRegistry {
     }
 }
 
-/// Resolve a relative path within the entity data directory.
+/// Resolve a relative path within the pulse data directory.
 /// Returns an error if the path tries to escape the sandbox.
 pub fn resolve_sandboxed_path(
     entity_root: &Path,
@@ -122,7 +122,7 @@ pub fn resolve_sandboxed_path(
     // We check the resolved path's prefix rather than canonicalizing (the file may not exist yet).
     if !resolved.starts_with(entity_root) {
         return Err(ToolError::PermissionDenied(
-            "Path escapes entity data directory".to_string(),
+            "Path escapes pulse data directory".to_string(),
         ));
     }
 

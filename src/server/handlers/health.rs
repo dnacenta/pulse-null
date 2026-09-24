@@ -8,7 +8,7 @@ use crate::provider_status::ProviderState;
 use crate::server::AppState;
 use crate::wire::HealthResponse;
 
-/// Health check — returns provider status with entity name.
+/// Health check — returns provider status with pulse name.
 pub async fn health(State(state): State<Arc<AppState>>) -> (StatusCode, Json<HealthResponse>) {
     let status = state.provider_status.read().await;
 

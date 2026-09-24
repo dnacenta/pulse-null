@@ -1,7 +1,7 @@
 //! SurrealDB server process manager.
 //!
-//! Manages the SurrealDB server lifecycle: startup, health check, entity
-//! provisioning, and graceful shutdown. The first entity to boot spawns the
+//! Manages the SurrealDB server lifecycle: startup, health check, pulse
+//! provisioning, and graceful shutdown. The first pulse to boot spawns the
 //! server; the last to shut down stops it.
 
 use std::path::{Path, PathBuf};
@@ -58,7 +58,7 @@ pub async fn ensure_running(
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped());
 
-    // Detach the process so it survives if this entity shuts down
+    // Detach the process so it survives if this pulse shuts down
     unsafe {
         cmd.pre_exec(|| {
             libc::setsid();
@@ -117,11 +117,11 @@ pub async fn ensure_running(
     }
 }
 
-/// Provision a database and user for an entity.
+/// Provision a database and user for a pulse.
 ///
 /// Connects as root, creates namespace/database/user if not exists,
-/// writes the entity password to `{entity_dir}/secrets/graph-password`,
-/// and updates the entity's `.recall-echo.toml` with [graph] settings.
+/// writes the pulse password to `{entity_dir}/secrets/graph-password`,
+/// and updates the pulse's `.recall-echo.toml` with [graph] settings.
 pub async fn provision_entity(
     data_dir: &Path,
     entity_name: &str,
@@ -130,13 +130,13 @@ pub async fn provision_entity(
     let secrets_dir = entity_dir.join("secrets");
     let password_path = secrets_dir.join("graph-password");
 
-    // If password file exists, entity is already provisioned
+    // If password file exists, the pulse is already provisioned
     if password_path.exists() {
-        info!("Entity '{entity_name}' already provisioned (password file exists)");
+        info!("Pulse '{entity_name}' already provisioned (password file exists)");
         return Ok(());
     }
 
-    info!("Provisioning SurrealDB database for entity '{entity_name}'");
+    info!("Provisioning SurrealDB database for pulse '{entity_name}'");
 
     let root_password = read_root_password(data_dir)?;
     let url = format!("{SURREAL_BIND}:{SURREAL_PORT}");
@@ -149,7 +149,7 @@ pub async fn provision_entity(
     })
     .await?;
 
-    // Generate entity password
+    // Generate pulse password
     let entity_password = generate_password();
 
     // Create namespace, database, and user
@@ -177,12 +177,12 @@ pub async fn provision_entity(
         std::fs::set_permissions(&password_path, std::fs::Permissions::from_mode(0o600))?;
     }
 
-    // Update entity's .recall-echo.toml with [graph] section
+    // Update pulse's .recall-echo.toml with [graph] section
     let memory_dir = entity_dir.join("memory");
     let config_path = memory_dir.join(".recall-echo.toml");
     update_recall_echo_config(&config_path, entity_name, "secrets/graph-password")?;
 
-    info!("Entity '{entity_name}' provisioned successfully");
+    info!("Pulse '{entity_name}' provisioned successfully");
     Ok(())
 }
 

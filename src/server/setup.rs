@@ -1,7 +1,7 @@
 //! Shared setup helpers used by both `server::start()` and `boot::boot_entity()`.
 //!
 //! Eliminates duplication of monitor creation, tool registration, and plugin
-//! initialization between the standalone server and multi-entity boot paths.
+//! initialization between the standalone server and multi-pulse boot paths.
 
 use std::path::Path;
 use std::sync::Arc;
@@ -45,7 +45,7 @@ pub fn create_monitors(config: &Config) -> Monitors {
     }
 }
 
-/// Register all built-in tools for the entity.
+/// Register all built-in tools for the pulse.
 pub fn register_builtin_tools(root_dir: &Path, config: &Config) -> ToolRegistry {
     let mut tools = ToolRegistry::new();
     tools.register(Box::new(crate::tools::file_read::FileReadTool::new(
@@ -71,7 +71,7 @@ pub fn register_builtin_tools(root_dir: &Path, config: &Config) -> ToolRegistry 
 
 /// The read-only introspection tool set for Isolation Mode (coordinator
 /// spec, Stage 2): journal/ and memory/ are readable, nothing is writable,
-/// and nothing reaches outside the entity root. No plugin tools.
+/// and nothing reaches outside the pulse root. No plugin tools.
 pub fn register_readonly_tools(root_dir: &Path, config: &Config) -> ToolRegistry {
     let mut tools = ToolRegistry::new();
     tools.register(Box::new(crate::tools::file_read::FileReadTool::new(

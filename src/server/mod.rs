@@ -35,7 +35,7 @@ use pulse_system_types::monitoring::{CognitiveMonitor, OutcomeTracker, PipelineM
 /// Shared application state
 pub struct AppState {
     pub config: Config,
-    /// The entity's model. Streaming-capable so `/api/chat/stream` can forward
+    /// The pulse's model. Streaming-capable so `/api/chat/stream` can forward
     /// deltas; every non-streaming call site upcasts to `&dyn LmProvider`.
     pub provider: Box<dyn StreamingProvider>,
     pub session_store: SessionStore,
@@ -109,7 +109,7 @@ async fn rebuild_awareness(state: &Arc<AppState>) {
 /// Background listener that rebuilds AWARENESS.md when plugin state changes.
 ///
 /// Listens for PluginStateChanged events on the event bus and triggers a
-/// manifest rebuild so the entity's capability inventory stays in sync.
+/// manifest rebuild so the pulse's capability inventory stays in sync.
 pub async fn awareness_listener(
     mut rx: tokio::sync::broadcast::Receiver<crate::events::EntityEvent>,
     state: Arc<AppState>,
@@ -157,7 +157,7 @@ pub async fn start_with_shutdown(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let root_dir = config.root_dir()?;
 
-    // The provider runs from inside the entity (PN-104).
+    // The provider runs from inside the pulse (PN-104).
     let provider = crate::providers::create_streaming_provider(&config, &root_dir)?;
 
     if !boot::has_usable_secret(&config) {
@@ -171,7 +171,7 @@ pub async fn start_with_shutdown(
     // Ensure required directories and files exist
     ensure_infrastructure(&root_dir);
 
-    // Start SurrealDB server and provision entity database (if graph enabled in server mode)
+    // Start SurrealDB server and provision the pulse database (if graph enabled in server mode)
     if config.graph.enabled && config.graph.mode == "server" {
         let data_dir = config
             .graph
@@ -197,7 +197,7 @@ pub async fn start_with_shutdown(
         crate::graph_context::cache_graph_stats(&root_dir).await;
     }
 
-    // Verify this entity's Claude Code integration if applicable
+    // Verify this pulse's Claude Code integration if applicable
     if config.llm.provider == "claude-code" {
         let items = crate::init::claude_code_bootstrap::verify(&root_dir);
         for item in &items {
@@ -365,7 +365,7 @@ pub async fn start_with_shutdown(
 
     let app = build_router(Arc::clone(&state), plugin_routes);
 
-    // Same rule as multi-entity boot: an entity with no usable secret stays
+    // Same rule as multi-pulse boot: a pulse with no usable secret stays
     // on loopback whatever its config says (PN-104 audit SEC-001).
     let (host, host_note) = boot::bind_host(&config.server.host, boot::has_usable_secret(&config));
     if let Some(note) = host_note {
@@ -573,7 +573,7 @@ pub fn build_router(state: Arc<AppState>, plugin_routes: Router<()>) -> Router {
 
 /// Ensure all required directories and seed files exist.
 ///
-/// Called on every startup so that entities created before certain features
+/// Called on every startup so that pulses created before certain features
 /// were added (or set up manually) get the infrastructure they need.
 pub fn ensure_infrastructure(root_dir: &std::path::Path) {
     let dirs = [

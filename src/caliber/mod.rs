@@ -1,6 +1,6 @@
 //! caliber-echo — Operational self-model and capability mapping
 //!
-//! Manages CALIBER.md and outcome tracking for AI entities.
+//! Manages CALIBER.md and outcome tracking for pulses.
 //! Records what was attempted, what happened, and how predictions
 //! compared to reality.
 
@@ -32,7 +32,7 @@ pub fn outcomes_file(docs_dir: &Path) -> PathBuf {
 
 /// Path to CALIBER.md: `{root_dir}/CALIBER.md`.
 ///
-/// The argument is the **entity root**, not a docs/journal directory. The
+/// The argument is the **pulse root**, not a docs/journal directory. The
 /// capability map is written next to `schedule.json` and `task_health.json`
 /// because that is where the outcomes it is mined from already live
 /// (`record_outcome` is always called with the root). Resolving it against
@@ -46,7 +46,7 @@ pub fn caliber_md(root_dir: &Path) -> PathBuf {
 // Core struct
 // ---------------------------------------------------------------------------
 
-/// Main caliber-echo struct. Holds the path to the entity's documents.
+/// Main caliber-echo struct. Holds the path to the pulse's documents.
 pub struct CaliberEcho {
     docs_dir: PathBuf,
 }
@@ -80,7 +80,7 @@ impl CaliberEcho {
     fn get_setup_prompts() -> Vec<SetupPrompt> {
         vec![SetupPrompt {
             key: "docs_dir".into(),
-            question: "Entity documents directory (where CALIBER.md lives):".into(),
+            question: "Pulse documents directory (where CALIBER.md lives):".into(),
             required: true,
             secret: false,
             default: Some("./".into()),
@@ -213,7 +213,7 @@ mod tests {
     }
 
     /// The single rule every CALIBER.md reader and writer now follows: the
-    /// file sits directly in the entity root. Three call sites used to
+    /// file sits directly in the pulse root. Three call sites used to
     /// disagree (the miner resolved `<root>/journal`), so one of them was
     /// always looking at a file the others never touched.
     #[test]

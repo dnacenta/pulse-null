@@ -39,7 +39,7 @@ use serde::{Deserialize, Serialize};
 use crate::config::{LivenessConfig, MAX_FLAP_WINDOW_SIZE};
 use crate::errors::SchedulerError;
 
-/// Persisted health store, in the entity root alongside `predictions.json`.
+/// Persisted health store, in the pulse root alongside `predictions.json`.
 const TASK_HEALTH_FILE: &str = "task_health.json";
 
 /// Temporary file used for the atomic write.
@@ -176,7 +176,7 @@ impl TaskHealthStore {
     /// Load the store from `root_dir`, or start an empty one.
     ///
     /// A missing or corrupt file never fails the scheduler: liveness
-    /// bookkeeping must not be able to take the entity down.
+    /// bookkeeping must not be able to take the pulse down.
     #[must_use]
     pub fn load(root_dir: &Path) -> Self {
         let path = root_dir.join(TASK_HEALTH_FILE);

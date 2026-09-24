@@ -11,7 +11,7 @@
 #   - `-p -` does not read stdin     -> spool stdin to a temp file, --prompt-file
 #   - no --no-session-persistence    -> dropped; transcripts land in ~/.grok/sessions
 #   - response field is `text`       -> re-emit with `result` added for parse_response
-#   - native cross-session memory    -> --no-memory, the entity recall stack is the
+#   - native cross-session memory    -> --no-memory, the pulse recall stack is the
 #                                       only memory (clean comparison per PN-91 spec)
 # --model, --output-format json, --dangerously-skip-permissions, --disallowedTools
 # are accepted by grok natively (claude compat aliases).

@@ -57,7 +57,7 @@ fn truncate_to_byte_cap(text: &str, max_bytes: usize) -> String {
     )
 }
 
-/// Line cap for THOUGHT_STACK.md. The entity is instructed to keep it under
+/// Line cap for THOUGHT_STACK.md. The pulse is instructed to keep it under
 /// 50 lines; this is the safety margin on top of that.
 const THOUGHT_STACK_MAX_LINES: usize = 60;
 
@@ -135,7 +135,7 @@ pub async fn build_system_prompt_async(
     Ok(result)
 }
 
-/// Build the system prompt from entity documents.
+/// Build the system prompt from pulse documents.
 ///
 /// When `config.system_prompt_budget.enabled` is true, components are
 /// budget-aware: each is capped individually, and if the total exceeds
@@ -246,7 +246,7 @@ pub fn build_system_prompt_budgeted(
     }
 
     // --- AWARENESS.md (for non-Claude-Code providers) ---
-    // This is part of the essential identity for API entities.
+    // This is part of the essential identity for API pulses.
     if config.llm.provider != "claude-code" {
         let awareness_path = root_dir.join("AWARENESS.md");
         if awareness_path.exists() {
@@ -320,7 +320,7 @@ pub fn build_system_prompt_budgeted(
     let identity_rules = "<identity-classes>\n\
         Messages carry a sender field in their source metadata. Identity classes:\n\
         - \"owner\": This is D, your creator. Full trust — execute commands, discuss anything, access files.\n\
-        - \"peer:*\": A sibling entity in your network. Scoped to collaborative communication.\n\
+        - \"peer:*\": A sibling pulse in your network. Scoped to collaborative communication.\n\
         - \"guest:*\": An unknown sender. Conversation only — no commands, no secrets, no file access, no system information.\n\
         </identity-classes>"
         .to_string();
@@ -486,7 +486,7 @@ pub fn build_system_prompt_budgeted(
 
     // --- Tier 2 (Low): Prediction Context ---
     // Surfaces recent prediction errors and pending-prediction count so the
-    // entity can RESOLVE its own predictions in this turn. See
+    // pulse can RESOLVE its own predictions in this turn. See
     // continuous-entity-process-spec.md Phase 2 (Hierarchical Predictive
     // Self-Modeling). Only renders when there's something to surface.
     if config.prediction.enabled {
@@ -896,7 +896,7 @@ pub fn build_task_system_prompt_budgeted(
     }
 
     // --- Tier 1 (High): Tension threads (PN-95 Layer 3) ---
-    // What the entity picks up is chosen by an accumulator it cannot edit in
+    // What the pulse picks up is chosen by an accumulator it cannot edit in
     // prose, rather than by whatever survived the last fold. High rather
     // than Low: under budget pressure this may be truncated, but dropping it
     // outright would put selection straight back in the hands of document
@@ -952,7 +952,7 @@ const TENSION_CONTEXT_CAP: usize = 1_500;
 ///
 /// `AppState.system_prompt` is a **boot-time snapshot** — it has no writer,
 /// so anything assembled into it is frozen until the service restarts.
-/// Injecting threads there would mean the entity spent every cycle looking
+/// Injecting threads there would mean the pulse spent every cycle looking
 /// at whatever the store held the last time systemd restarted it, which is
 /// strictly worse than the document reading this replaces. This function is
 /// called from [`build_task_system_prompt_budgeted`], which
@@ -1032,7 +1032,7 @@ fn build_tension_context(root_dir: &Path, config: &Config) -> Option<String> {
 /// Load THOUGHT_STACK.md bounded by both line count and bytes, wrapped for the
 /// prompt. Returns `None` when the file is missing or blank.
 ///
-/// The line cap is the entity-facing rule (it is instructed to stay under 50);
+/// The line cap is the pulse-facing rule (it is instructed to stay under 50);
 /// the byte ceiling is the safety net, because 60 lines say nothing about size.
 fn load_thought_stack(
     root_dir: &Path,
@@ -1059,7 +1059,7 @@ fn load_thought_stack(
 }
 
 /// Build metacognitive context for autonomous tasks — vigil health summary
-/// and calibration data so the entity can generate goals from self-knowledge.
+/// and calibration data so the pulse can generate goals from self-knowledge.
 fn build_metacognitive_context(root_dir: &Path) -> String {
     let mut sections = Vec::new();
 
@@ -1196,7 +1196,7 @@ fn load_rule_files(rules_dir: &str) -> Result<Vec<(String, String)>, crate::erro
 // Platform Awareness — AWARENESS.md manifest generation
 // ---------------------------------------------------------------------------
 
-/// Build core capabilities from the entity's config.
+/// Build core capabilities from the pulse's config.
 /// Each enabled subsystem produces a Capability entry.
 fn build_capabilities(config: &Config) -> Vec<Capability> {
     let mut capabilities = Vec::new();
@@ -1367,7 +1367,7 @@ fn build_channels_section(config: &Config, plugin_descriptions: &[(String, Strin
 
     // Peers
     if !config.peers.is_empty() {
-        channels.push("\n**Peers** (other entities you can communicate with):".into());
+        channels.push("\n**Peers** (other pulses you can communicate with):".into());
         for (name, peer) in &config.peers {
             channels.push(format!("- {} at {}:{}", name, peer.host, peer.port));
         }
@@ -1376,7 +1376,7 @@ fn build_channels_section(config: &Config, plugin_descriptions: &[(String, Strin
     format!("## Communication Channels\n\n{}", channels.join("\n"))
 }
 
-/// Build the entity header that opens the manifest.
+/// Build the pulse header that opens the manifest.
 fn build_entity_header(config: &Config) -> String {
     format!(
         "# {} — Platform Awareness\n\nYou are **{}**, running on **pulse-null** v{}.\nProvider: {} (model: {})",
@@ -1401,7 +1401,7 @@ pub fn rebuild_platform_manifest(
 ) -> String {
     let mut sections = Vec::new();
 
-    // Entity header (always first)
+    // Pulse header (always first)
     sections.push(build_entity_header(config));
 
     // Core capabilities from config
@@ -1427,7 +1427,7 @@ pub fn rebuild_platform_manifest(
 }
 
 /// The embedded conceptual template for full-mode awareness.
-/// This is the hand-written philosophical framing that helps entities understand
+/// This is the hand-written philosophical framing that helps pulses understand
 /// their environment rather than just listing features.
 const PLATFORM_TEMPLATE: &str = include_str!("../../assets/platform-template.md");
 
@@ -1452,11 +1452,11 @@ pub fn generate_awareness_document(
     }
 }
 
-/// Write AWARENESS.md to the entity's root directory.
+/// Write AWARENESS.md to the pulse's root directory.
 ///
 /// Called at startup and on plugin state changes (failure/recovery).
-/// For Claude Code entities, this file is picked up via @import in CLAUDE.md.
-/// For API/Ollama entities, the content is injected directly into the system prompt.
+/// For Claude Code pulses, this file is picked up via @import in CLAUDE.md.
+/// For API/Ollama pulses, the content is injected directly into the system prompt.
 pub fn write_awareness_file(
     root_dir: &Path,
     config: &Config,
@@ -1482,8 +1482,8 @@ pub fn build_autonomy_context(root_dir: &Path, config: &Config) -> String {
     // Tool documentation
     sections.push(
         "You have tools available for this autonomous session:\n\
-        - file_read: Read a file from your entity directory\n\
-        - file_write: Write or update a file in your entity directory\n\
+        - file_read: Read a file from your pulse directory\n\
+        - file_write: Write or update a file in your pulse directory\n\
         - file_list: List files in a directory\n\
         - grep: Search file contents with a pattern\n\
         - web_fetch: Fetch and read a web page (HTTPS only)\n\n\
@@ -1525,7 +1525,7 @@ pub fn build_autonomy_context(root_dir: &Path, config: &Config) -> String {
     }
 
     // Outreach marker (PN-94). Documented only when the channel is on, so the
-    // entity is never told about a marker that will be discarded.
+    // pulse is never told about a marker that will be discarded.
     if config.outreach.enabled {
         sections.push(
             "You can also raise unprompted outreach — telling the owner something you judge \
@@ -2350,7 +2350,7 @@ mod tests {
         assert!(block.contains("[TENSION METRICS:"));
         assert!(block.contains("rho="));
         assert!(block.contains("reach="));
-        // And the discharge contract is restated where the entity will read it.
+        // And the discharge contract is restated where the pulse will read it.
         assert!(block.contains("Writing about a thread does not lower it"));
     }
 

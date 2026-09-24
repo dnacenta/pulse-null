@@ -44,7 +44,7 @@ pub trait Plugin: Send + Sync {
     /// Plugin identity
     fn meta(&self) -> PluginMeta;
 
-    /// Initialize the plugin with its config and entity context
+    /// Initialize the plugin with its config and pulse context
     fn init<'a>(&'a mut self, config: &'a toml::Value, ctx: &'a PluginContext) -> PluginResult<'a>;
 
     /// Start the plugin (called after init)
@@ -71,14 +71,14 @@ pub trait Plugin: Send + Sync {
         Vec::new()
     }
 
-    /// Optional: contribute tools to the entity's tool registry.
+    /// Optional: contribute tools to the pulse's tool registry.
     /// Called after init(), tools are registered before AppState is constructed.
     fn tools(&self) -> Vec<Box<dyn crate::tools::Tool>> {
         Vec::new()
     }
 
-    /// Optional: describe this plugin for the entity's platform awareness.
-    /// Returns a structured description that tells the entity what this plugin
+    /// Optional: describe this plugin for the pulse's platform awareness.
+    /// Returns a structured description that tells the pulse what this plugin
     /// provides, why it exists, how to use it, and key constraints.
     /// Called during manifest generation — only loaded plugins contribute.
     fn platform_description(&self) -> Option<String> {

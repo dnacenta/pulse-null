@@ -1,6 +1,6 @@
-//! Prediction resolution — parsing structured markers from entity task output.
+//! Prediction resolution — parsing structured markers from pulse task output.
 //!
-//! The entity writes JSON-in-marker structures in its cognitive cycle output:
+//! The pulse writes JSON-in-marker structures in its cognitive cycle output:
 //! - `[PREDICT:{"content":"...","confidence":0.7}]` — a new prediction
 //! - `[RESOLVE:{"id":"...","outcome":"...","surprise":0.4,"direction":"misdirected","insight":"..."}]` —
 //!   resolution of an existing prediction
@@ -22,9 +22,9 @@ use super::{ErrorDirection, PredictionResolution, PredictionStack, Timescale};
 /// A prediction parsed from a `[PREDICT:{...}]` marker.
 #[derive(Debug, Clone)]
 pub struct ParsedPrediction {
-    /// What the entity predicts will happen.
+    /// What the pulse predicts will happen.
     pub content: String,
-    /// How confident the entity is (0.0 to 1.0).
+    /// How confident the pulse is (0.0 to 1.0).
     pub confidence: f64,
     /// The timescale for this prediction.
     pub timescale: Timescale,
@@ -69,7 +69,7 @@ pub struct ProcessSummary {
     /// Ids of predictions that actually transitioned to resolved in this
     /// pass. This is a *state transition in another store*, which is why the
     /// tension substrate (PN-95) accepts it as non-text evidence that a
-    /// thread was worked — the entity cannot produce one by writing about a
+    /// thread was worked — the pulse cannot produce one by writing about a
     /// thread, only by resolving a prediction that was genuinely pending.
     pub resolved_prediction_ids: Vec<String>,
 }
@@ -151,7 +151,7 @@ fn sanitize_marker_id(s: &str) -> String {
         .collect()
 }
 
-/// Parse `[PREDICT:{...}]` markers from entity task output.
+/// Parse `[PREDICT:{...}]` markers from pulse task output.
 ///
 /// Each match is `serde_json::from_str`'d into `PredictionMarker`; malformed
 /// JSON, missing fields, or empty content cause the marker to be skipped
@@ -209,7 +209,7 @@ pub fn parse_predictions(text: &str, default_timescale: Timescale) -> Vec<Parsed
     predictions
 }
 
-/// Parse `[RESOLVE:{...}]` markers from entity task output.
+/// Parse `[RESOLVE:{...}]` markers from pulse task output.
 ///
 /// Each match is `serde_json::from_str`'d into `ResolutionMarker`; malformed
 /// JSON, unknown `direction`, or empty `id`/`outcome` cause the marker to be
@@ -331,7 +331,7 @@ pub fn parse_resolutions(text: &str) -> (Vec<ParsedResolution>, Vec<SkippedResol
 ///
 /// * `stack` - The prediction stack to update. Surprise threshold is read
 ///   from `stack.config.surprise_threshold`.
-/// * `task_output` - The raw text output from the entity's cognitive cycle.
+/// * `task_output` - The raw text output from the pulse's cognitive cycle.
 /// * `task_id` - Identifier for the task (used for logging).
 /// * `default_timescale` - The timescale to assign to new predictions from
 ///   this task.
@@ -377,7 +377,7 @@ pub fn process_task_output(
         } = parsed;
         // "well-calibrated" claims the prediction held; surprise above the
         // error threshold claims it failed. A self-contradictory resolution
-        // would reach the entity's next prompt as `[well-calibrated]
+        // would reach the pulse's next prompt as `[well-calibrated]
         // surprise 0.9` — reject it loudly and leave the prediction pending
         // so it can be re-resolved coherently (SEC-011).
         if direction == ErrorDirection::WellCalibrated && surprise > stack.config.surprise_threshold

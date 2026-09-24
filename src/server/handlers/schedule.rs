@@ -6,7 +6,7 @@
 //!
 //! * **Disk is the truth.** Every request re-reads `schedule.json` and
 //!   `task_health.json` rather than serving the process's in-memory copy —
-//!   the CLI, the entity's own `[SCHEDULE:]` markers and this API all write
+//!   the CLI, the pulse's own `[SCHEDULE:]` markers and this API all write
 //!   the same file, so a cached view is a stale view.
 //! * **Writes go through [`Schedule::save_delta`]**, exactly as the CLI does.
 //!   The daemon rewrites `schedule.json` wholesale, so a read-modify-write
@@ -142,7 +142,7 @@ pub fn list_tasks(root: &Path, timezone: &str) -> Result<Vec<ScheduleTaskView>, 
 ///
 /// `Ok(None)` means no task carries that id — an absent task is a 404, not an
 /// error. The mutation runs inside [`Schedule::save_delta`], so it merges with
-/// whatever the CLI or the entity wrote in the meantime.
+/// whatever the CLI or the pulse wrote in the meantime.
 pub fn set_enabled(
     root: &Path,
     timezone: &str,

@@ -224,7 +224,7 @@ pub fn render_claude_md(identity: &Identity) -> String {
     format!(
         r#"# {entity_name} — System Instructions
 
-You are {entity_name}, an AI entity created by {owner_name}. Address them as "{owner_alias}".
+You are {entity_name}, an AI pulse created by {owner_name}. Address them as "{owner_alias}".
 
 ## Identity
 

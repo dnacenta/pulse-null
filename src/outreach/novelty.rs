@@ -1,6 +1,6 @@
 //! Gate 1's oracle — novelty against the record (PN-94, spec §2.3.1).
 //!
-//! The dominant failure of a self-triggered channel is restating: the entity
+//! The dominant failure of a self-triggered channel is restating: the pulse
 //! rediscovers something it already wrote down and sends it as news. So a
 //! headline is compared against what is already on the record, and "already
 //! on the record" means two things — every prior outreach message, and every
@@ -233,7 +233,7 @@ Body text that is not a heading.
 
     #[test]
     fn an_empty_corpus_is_maximal_novelty_without_loading_a_model() {
-        // Must not touch the ONNX runtime: the first message an entity ever
+        // Must not touch the ONNX runtime: the first message a pulse ever
         // sends cannot be a restatement of nothing.
         let tmp = TempDir::new().unwrap();
         let novelty = EmbeddingNovelty::new(tmp.path());

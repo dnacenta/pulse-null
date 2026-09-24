@@ -27,8 +27,8 @@ pub struct ContextBufferConfig {
     pub max_entries: usize,
     /// Maximum total characters to inject per turn (~4 chars ≈ 1 token).
     pub max_inject_chars: usize,
-    /// When true, filter out messages from other entities on shared channels.
-    /// Only the human sender and the current entity's messages are kept.
+    /// When true, filter out messages from other pulses on shared channels.
+    /// Only the human sender and the current pulse's messages are kept.
     pub entity_filter: bool,
 }
 
@@ -87,12 +87,12 @@ impl ContextBufferStore {
         self.coordinator = Some(coordinator);
     }
 
-    /// Load existing context-buffer-*.json files from the entity root.
+    /// Load existing context-buffer-*.json files from the pulse root.
     async fn load_from_disk(&self) {
         let entries = match std::fs::read_dir(&self.root_dir) {
             Ok(entries) => entries,
             Err(e) => {
-                tracing::warn!("Failed to read entity root for context buffers: {}", e);
+                tracing::warn!("Failed to read pulse root for context buffers: {}", e);
                 return;
             }
         };
@@ -187,11 +187,11 @@ impl ContextBufferStore {
         Some(lines.join("\n"))
     }
 
-    /// Get context with Phase 4 filtering: time decay, entity filtering,
+    /// Get context with Phase 4 filtering: time decay, pulse filtering,
     /// deduplication against session history, and token/entry caps.
     ///
     /// - `channel`: which channel buffer to read
-    /// - `entity_name`: the current entity's name (for entity-aware filtering)
+    /// - `entity_name`: the current pulse's name (for pulse-aware filtering)
     /// - `human_senders`: senders that are known humans (owner, trusted users)
     /// - `session_texts`: recent session message texts for deduplication
     /// - `config`: the context buffer config with caps and filter settings
@@ -223,8 +223,8 @@ impl ContextBufferStore {
                 continue;
             }
 
-            // Entity-aware filtering: on shared channels, only keep messages
-            // from known human senders or the current entity
+            // Pulse-aware filtering: on shared channels, only keep messages
+            // from known human senders or the current pulse
             if config.entity_filter {
                 let is_human = human_senders
                     .iter()
@@ -553,7 +553,7 @@ mod tests {
             .record("shared", "Synth", "assistant", "synth response")
             .await;
 
-        // Nova is the entity, Dani is the human — Echo and Synth should be filtered out
+        // Nova is the pulse, Dani is the human — Echo and Synth should be filtered out
         let ctx = store
             .get_context_filtered("shared", "Nova", &["Dani"], &[], &config)
             .await
@@ -651,7 +651,7 @@ mod tests {
         let config = ContextBufferConfig::default();
         let store = ContextBufferStore::new(tmp.path(), &config).await;
 
-        // Only other entity's messages on a shared channel
+        // Only other pulse's messages on a shared channel
         store
             .record("shared", "Echo", "assistant", "echo msg")
             .await;

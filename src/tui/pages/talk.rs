@@ -471,7 +471,7 @@ impl Talk {
 
                     // Motion: new rows fade in (staggered on the reveal path),
                     // the streaming cursor glows, the pane breathes while
-                    // the entity thinks.
+                    // the pulse thinks.
                     for (i, row) in lay.new_rows.iter().enumerate() {
                         let key = FxKey::Line((u64::from(row.rect.y) << 16) | i as u64);
                         motion.add(

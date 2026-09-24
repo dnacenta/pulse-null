@@ -120,8 +120,8 @@ pub struct CompactionMetrics {
     pub system_prompt_tokens: usize,
     /// Currently active plan or task description.
     /// Survives compaction — re-injected into post-compaction context.
-    /// Set when the entity commits to a multi-step task; cleared on
-    /// session reset or when the entity completes/abandons the plan.
+    /// Set when the pulse commits to a multi-step task; cleared on
+    /// session reset or when the pulse completes/abandons the plan.
     #[serde(default)]
     pub active_plan: Option<String>,
     /// Context quality score: ratio of high-quality tokens (recent window +
@@ -240,7 +240,7 @@ impl SessionData {
     /// Set the active plan for this session.
     ///
     /// The plan survives compaction and is re-injected into post-compaction
-    /// context so the entity always knows what it's working on.
+    /// context so the pulse always knows what it's working on.
     #[allow(dead_code)]
     pub fn set_active_plan(&mut self, plan: &str) {
         self.compaction.active_plan = Some(plan.to_string());
@@ -430,8 +430,8 @@ pub fn reset_session(
 /// limits. The channel is treated as metadata, not as a session boundary.
 ///
 /// Returns one of:
-/// - `"owner"` — the entity's creator/owner
-/// - `"peer:{name}"` — a known sibling entity in the network
+/// - `"owner"` — the pulse's creator/owner
+/// - `"peer:{name}"` — a known sibling pulse in the network
 /// - `"guest:{sender}"` — an unknown or unrecognized sender
 pub fn resolve_sender(
     channel: &str,
@@ -463,7 +463,7 @@ pub fn resolve_sender(
         }
     }
 
-    // Known peer entities
+    // Known peer pulses
     if channel == "comms" && peers.contains_key(sender) {
         return format!("peer:{}", sender);
     }

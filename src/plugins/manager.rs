@@ -112,7 +112,7 @@ impl PluginManager {
     }
 
     /// Start all plugins. Individual plugin failures are logged but do not
-    /// abort the startup — the entity continues with reduced capabilities.
+    /// abort the startup — the pulse continues with reduced capabilities.
     /// Failed plugins are tracked and excluded from platform awareness.
     pub async fn start_all(&mut self) -> Result<(), crate::errors::PluginError> {
         for entry in &mut self.entries {
@@ -258,7 +258,7 @@ impl PluginManager {
     }
 
     /// Collect platform awareness descriptions from running plugins only.
-    /// Failed plugins are excluded — the entity should not think it has
+    /// Failed plugins are excluded — the pulse should not think it has
     /// capabilities that aren't actually available.
     pub fn collect_platform_descriptions(&self) -> Vec<(String, String)> {
         let mut descriptions = Vec::new();

@@ -23,7 +23,7 @@ pub enum ClientError {
     Json(#[from] serde_json::Error),
 }
 
-/// A connection to one entity daemon.
+/// A connection to one pulse daemon.
 #[derive(Clone)]
 pub struct Client {
     base: String,

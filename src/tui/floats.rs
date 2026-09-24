@@ -81,7 +81,7 @@ const SPECS: &[Spec] = &[
     Spec {
         name: "open",
         args: "<file>",
-        what: "read an entity document",
+        what: "read a pulse document",
         later: Some("the Remember page (phase 3)"),
     },
     Spec {

@@ -60,7 +60,7 @@ pub struct InteractionRecord {
     pub started_at: DateTime<Utc>,
     /// When the interaction ended (None if still in progress).
     pub ended_at: Option<DateTime<Utc>>,
-    /// Name of the entity that participated.
+    /// Name of the local pulse that participated.
     pub entity_name: String,
     /// Brief summary of the interaction (first ~300 chars of last response).
     pub summary: String,
@@ -477,9 +477,9 @@ mod tests {
         ));
         assert!(matches!(record.trust, ConversationTrust::LocalPeer));
         assert_eq!(record.messages.len(), 2);
-        // Nova's message should be Role::User (not local entity)
+        // Nova's message should be Role::User (not local pulse)
         assert!(matches!(record.messages[0].role, Role::User));
-        // Echo's message should be Role::Assistant (local entity)
+        // Echo's message should be Role::Assistant (local pulse)
         assert!(matches!(record.messages[1].role, Role::Assistant));
     }
 

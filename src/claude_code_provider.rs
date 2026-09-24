@@ -13,7 +13,7 @@ use tracing::warn;
 /// Default timeout for a Claude Code subprocess.
 ///
 /// This is not an API call — it is an agent that reads files, runs tools and
-/// writes for as long as the task needs. Measured on the live entity, a
+/// writes for as long as the task needs. Measured on the live pulse, a
 /// thinking-loop cycle takes 3.8-4.4 minutes and grows with the size of the
 /// memory it reasons over; at the old 300s ceiling roughly half of them were
 /// killed mid-thought. Fifteen minutes leaves headroom for that growth while
@@ -49,10 +49,10 @@ use crate::streaming::{StreamEvent, StreamResult, StreamingProvider};
 pub struct ClaudeCodeProvider {
     model: String,
     claude_bin: String,
-    /// The entity this provider speaks for. Every `claude` subprocess runs
+    /// The pulse this provider speaks for. Every `claude` subprocess runs
     /// with this as its working directory and as `RECALL_ECHO_HOME`, so the
-    /// CLI picks up the entity's own `CLAUDE.md`, `.claude/settings.json`
-    /// hooks and `.claude/rules/`, and recall-echo resolves the entity's
+    /// CLI picks up the pulse's own `CLAUDE.md`, `.claude/settings.json`
+    /// hooks and `.claude/rules/`, and recall-echo resolves the pulse's
     /// memory — independent of the daemon's cwd and of `$HOME/.claude`
     /// (PN-104). It is also consulted per-invocation for the isolation
     /// marker: while isolated, the spawned CLI is restricted to read-only
@@ -61,7 +61,7 @@ pub struct ClaudeCodeProvider {
     entity_root: PathBuf,
 }
 
-/// Environment variable recall-echo reads to locate the entity root when a
+/// Environment variable recall-echo reads to locate the pulse root when a
 /// hook or MCP invocation carries no explicit `--entity-root`.
 pub const RECALL_ECHO_HOME: &str = "RECALL_ECHO_HOME";
 
@@ -77,7 +77,7 @@ impl ClaudeCodeProvider {
         }
     }
 
-    /// The entity root every subprocess is anchored to.
+    /// The pulse root every subprocess is anchored to.
     #[cfg(test)]
     pub fn entity_root(&self) -> &Path {
         &self.entity_root
@@ -85,7 +85,7 @@ impl ClaudeCodeProvider {
 }
 
 /// A `claude` command anchored to `entity_root`: cwd and `RECALL_ECHO_HOME`
-/// point at the entity root, and the `CLAUDECODE` marker of any enclosing
+/// point at the pulse root, and the `CLAUDECODE` marker of any enclosing
 /// Claude Code session is stripped so the child does not think it is nested.
 /// Free function so the spawn shape can be tested without spawning.
 fn entity_command(claude_bin: &str, entity_root: &Path) -> tokio::process::Command {
@@ -1335,7 +1335,7 @@ mod tests {
     async fn system_prompt_goes_to_a_file_not_argv() {
         let mock = MockCli::succeeding();
         let provider = mock.provider("opus");
-        let system_prompt = "# Identity\nYou are a test entity.";
+        let system_prompt = "# Identity\nYou are a test pulse.";
 
         let response = provider
             .invoke(system_prompt, &user_message("hello"), 1024, None)
@@ -1353,7 +1353,7 @@ mod tests {
             "system prompt must never ride argv, got {argv:?}"
         );
         assert!(
-            !argv.iter().any(|a| a.contains("You are a test entity")),
+            !argv.iter().any(|a| a.contains("You are a test pulse")),
             "prompt content leaked into argv: {argv:?}"
         );
         assert_eq!(mock.captured_prompt(), system_prompt);
@@ -1481,7 +1481,7 @@ mod tests {
         assert!(!path.exists(), "guard must unlink the file when dropped");
     }
 
-    // --- PN-104: every subprocess is anchored to the entity ---
+    // --- PN-104: every subprocess is anchored to the pulse ---
 
     #[test]
     fn base_command_sets_cwd_and_env() {
@@ -1500,7 +1500,7 @@ mod tests {
         assert_eq!(
             envs.get(std::ffi::OsStr::new(RECALL_ECHO_HOME)),
             Some(&Some(root.path().as_os_str())),
-            "RECALL_ECHO_HOME must name the entity root"
+            "RECALL_ECHO_HOME must name the pulse root"
         );
         assert_eq!(
             envs.get(std::ffi::OsStr::new("CLAUDECODE")),

@@ -48,7 +48,7 @@ mod wire;
 
 #[derive(Parser)]
 #[command(name = "pulse-null")]
-#[command(about = "One binary. One command. Your own AI entity.")]
+#[command(about = "One binary. One command. Your own AI pulse.")]
 #[command(version)]
 struct Cli {
     #[command(subcommand)]
@@ -57,23 +57,23 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
-    /// Initialize a new entity
+    /// Initialize a new pulse
     Init {
-        /// Directory to create the entity in (defaults to current directory)
+        /// Directory to create the pulse in (defaults to current directory)
         #[arg(short, long)]
         dir: Option<String>,
     },
-    /// Start the entity
+    /// Start the pulse
     Up {
         /// Run in headless mode (HTTP server only, no TUI). Use for systemd services.
         #[arg(long)]
         headless: bool,
     },
-    /// Talk to your entity in the terminal
+    /// Talk to your pulse in the terminal
     Chat,
-    /// Stop the entity
+    /// Stop the pulse
     Down,
-    /// Show entity status
+    /// Show pulse status
     Status,
     /// Manage scheduled tasks
     Schedule {
@@ -325,7 +325,7 @@ enum ArchiveAction {
 
 /// Where the TUI sends its logs: stdout belongs to the screen while the TUI
 /// runs, so `pulse-null up` (without `--headless`) and `pulse-null chat` log
-/// to `logs/tui.log` under the entity root (where `pulse-null.toml` lives;
+/// to `logs/tui.log` under the pulse root (where `pulse-null.toml` lives;
 /// the current directory when none is found). The file is owner-only and a
 /// symlink in its place is refused, since the log can carry request details.
 fn open_tui_log() -> Result<std::fs::File, String> {

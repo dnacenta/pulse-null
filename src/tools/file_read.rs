@@ -2,7 +2,7 @@ use std::path::PathBuf;
 
 use super::{resolve_sandboxed_path, Tool, ToolError, ToolResult};
 
-/// Read a file from the entity's data directory.
+/// Read a file from the pulse's data directory.
 pub struct FileReadTool {
     entity_root: PathBuf,
 }
@@ -19,7 +19,7 @@ impl Tool for FileReadTool {
     }
 
     fn description(&self) -> &str {
-        "Read a file from the entity's data directory"
+        "Read a file from the pulse's data directory"
     }
 
     fn input_schema(&self) -> serde_json::Value {
@@ -28,7 +28,7 @@ impl Tool for FileReadTool {
             "properties": {
                 "path": {
                     "type": "string",
-                    "description": "Path relative to the entity's data directory"
+                    "description": "Path relative to the pulse's data directory"
                 }
             },
             "required": ["path"]

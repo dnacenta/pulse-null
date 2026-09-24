@@ -89,7 +89,7 @@ pub fn draw_top(
     let dim = Style::default().fg(t.dim);
     let sep = Span::styled(format!(" {} ", g.sep), dim);
 
-    // Left: entity · model
+    // Left: pulse · model
     let mut left = vec![
         Span::styled(
             format!(" {}", state.entity),

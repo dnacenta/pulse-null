@@ -12,7 +12,7 @@ const MAX_MATCHES: usize = 200;
 /// Maximum file size to search (1 MB). Larger files are skipped.
 const MAX_FILE_SIZE: u64 = 1_024 * 1_024;
 
-/// Search file contents for a pattern within the entity's data directory.
+/// Search file contents for a pattern within the pulse's data directory.
 pub struct GrepTool {
     entity_root: PathBuf,
 }
@@ -29,7 +29,7 @@ impl Tool for GrepTool {
     }
 
     fn description(&self) -> &str {
-        "Search file contents for a regex pattern within the entity's data directory. \
+        "Search file contents for a regex pattern within the pulse's data directory. \
          Returns matching lines with file paths and line numbers."
     }
 
@@ -43,7 +43,7 @@ impl Tool for GrepTool {
                 },
                 "path": {
                     "type": "string",
-                    "description": "Directory or file path relative to entity root. Defaults to root."
+                    "description": "Directory or file path relative to pulse root. Defaults to root."
                 },
                 "glob": {
                     "type": "string",

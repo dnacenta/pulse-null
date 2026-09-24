@@ -1,4 +1,4 @@
-//! Graph query tool — gives entities the ability to search their knowledge graph.
+//! Graph query tool — gives pulses the ability to search their knowledge graph.
 
 use std::path::PathBuf;
 

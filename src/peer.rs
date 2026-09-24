@@ -58,7 +58,7 @@ impl std::fmt::Display for PeerError {
 pub struct PeerClient {
     http: reqwest::Client,
     peers: HashMap<String, PeerConfig>,
-    /// This entity's name, sent as X-Peer-Name for peer authentication.
+    /// This pulse's name, sent as X-Peer-Name for peer authentication.
     entity_name: String,
 }
 

@@ -264,7 +264,7 @@ async fn build_state_boxed_with_config(
         config,
         provider,
         session_store,
-        system_prompt: RwLock::new("You are a test entity.".to_string()),
+        system_prompt: RwLock::new("You are a test pulse.".to_string()),
         tools,
         event_bus: Arc::new(EventBus::new(16)),
         root_dir,

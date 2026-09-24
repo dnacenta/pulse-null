@@ -198,7 +198,7 @@ pub struct Transcript {
     viewport: usize,
 }
 
-/// Owner and entity labels, and the indent every body row gets.
+/// Owner and pulse labels, and the indent every body row gets.
 const INDENT: usize = 2;
 
 impl Default for Transcript {
@@ -259,7 +259,7 @@ impl Transcript {
         self.mark_new();
     }
 
-    /// Open the entity's reply; deltas append to it.
+    /// Open the pulse's reply; deltas append to it.
     pub fn open_reply(&mut self) {
         self.entries
             .push(Entry::new(Who::Entity, "", EntryState::Streaming));
@@ -800,7 +800,7 @@ mod tests {
         for i in 0..1000 {
             t.push_owner(&format!("owner message number {i} with a few words in it"));
             t.open_reply();
-            t.push_delta(&format!("entity reply number {i} — also a few words"));
+            t.push_delta(&format!("pulse reply number {i} — also a few words"));
             t.finish_reply("", false);
         }
         t.open_reply();

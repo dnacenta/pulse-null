@@ -1,15 +1,15 @@
-//! Claude Code integration, scoped to one entity.
+//! Claude Code integration, scoped to one pulse.
 //!
-//! Everything Claude Code needs to run *as* an entity lives inside that
-//! entity's directory: `.claude/settings.json` (recall-echo hooks that carry
-//! the entity root explicitly), `.claude/rules/recall-echo.md` (the memory
-//! protocol, entity-relative), and `memory/.recall-echo.toml` (where
-//! recall-echo reads its config). The provider runs `claude` with the entity
+//! Everything Claude Code needs to run *as* a pulse lives inside that
+//! pulse's directory: `.claude/settings.json` (recall-echo hooks that carry
+//! the pulse root explicitly), `.claude/rules/recall-echo.md` (the memory
+//! protocol, pulse-relative), and `memory/.recall-echo.toml` (where
+//! recall-echo reads its config). The provider runs `claude` with the pulse
 //! as cwd, so Claude Code picks these up as project-scope configuration.
 //!
 //! Nothing here writes to `$HOME/.claude`. The previous design symlinked the
-//! user's `~/.claude/{ARCHIVE.md,EPHEMERAL.md,memories}` into one entity,
-//! which made a second entity under the same unix user impossible (PN-104).
+//! user's `~/.claude/{ARCHIVE.md,EPHEMERAL.md,memories}` into one pulse,
+//! which made a second pulse under the same unix user impossible (PN-104).
 //! [`verify`] still *looks* at `$HOME/.claude`, but only to report leftovers
 //! from that design so `pulse-null repair` can retire them.
 
@@ -315,7 +315,7 @@ fn write_regular_file(path: &Path, content: &str, within: &Path) -> Result<(), S
         .map_err(|e| format!("parent directory: {e}"))?;
     if !parent_real.starts_with(within) {
         return Err(format!(
-            "parent {} resolves outside the entity ({})",
+            "parent {} resolves outside the pulse ({})",
             parent.display(),
             parent_real.display()
         ));
@@ -452,7 +452,7 @@ fn ensure_config(path: &Path, content: &str, within: &Path) -> BootstrapItem {
 }
 
 /// `memory/conversations -> ../archives/conversations`, relative so the
-/// entity tree survives being moved. An absolute link to the same place is
+/// pulse tree survives being moved. An absolute link to the same place is
 /// rewritten; anything else is left alone and reported.
 fn ensure_conversations_link(entity_root: &Path) -> BootstrapItem {
     let link = entity_root.join("memory/conversations");
@@ -528,12 +528,12 @@ auto_sync = true
 }
 
 /// Generate the recall-echo.md rules file. Every path is relative to the
-/// entity root, which is the cwd Claude Code runs in for this entity.
+/// pulse root, which is the cwd Claude Code runs in for this pulse.
 fn render_rules_md() -> &'static str {
     r#"# recall-echo — Memory Protocol
 
 You have a persistent four-layer memory system. Use it to maintain continuity across sessions.
-All paths below are relative to your entity directory, which is the working directory you run in.
+All paths below are relative to your pulse directory, which is the working directory you run in.
 
 ## Memory Layers
 
@@ -604,7 +604,7 @@ current conversation.
 "#
 }
 
-/// Create all Claude Code integration files for one entity.
+/// Create all Claude Code integration files for one pulse.
 /// Safe to run multiple times — skips anything already correct. A parent
 /// that is not a real directory (a symlink, say) stops everything under it:
 /// nothing is created through a component we did not verify.
@@ -618,7 +618,7 @@ pub fn ensure(entity_root: &Path) -> Vec<BootstrapItem> {
         return vec![BootstrapItem {
             path: entity_root,
             kind: ItemKind::Directory,
-            status: ItemStatus::Skipped("entity root is not valid UTF-8".into()),
+            status: ItemStatus::Skipped("pulse root is not valid UTF-8".into()),
         }];
     }
     let claude_dir = entity_root.join(".claude");
@@ -662,7 +662,7 @@ pub fn ensure(entity_root: &Path) -> Vec<BootstrapItem> {
 }
 
 /// Verify Claude Code integration without creating anything. Also reports
-/// leftovers of the pre-PN-104 user-level layout that point at this entity.
+/// leftovers of the pre-PN-104 user-level layout that point at this pulse.
 pub fn verify(entity_root: &Path) -> Vec<BootstrapItem> {
     let entity_root = entity_root
         .canonicalize()
@@ -736,7 +736,7 @@ pub fn verify(entity_root: &Path) -> Vec<BootstrapItem> {
                 path: link,
                 kind: ItemKind::Symlink,
                 status: ItemStatus::Wrong(
-                    "legacy user-level link into this entity — run 'pulse-null repair'".into(),
+                    "legacy user-level link into this pulse — run 'pulse-null repair'".into(),
                 ),
             });
         }
@@ -746,7 +746,7 @@ pub fn verify(entity_root: &Path) -> Vec<BootstrapItem> {
 }
 
 /// Symlinks in `$HOME/.claude` left by the pre-PN-104 bootstrap that resolve
-/// into `entity_root`. Links into *other* entities are not ours to touch.
+/// into `entity_root`. Links into *other* pulses are not ours to touch.
 pub fn legacy_home_links(entity_root: &Path, home: &Path) -> Vec<PathBuf> {
     let root = entity_root
         .canonicalize()
@@ -764,7 +764,7 @@ pub fn legacy_home_links(entity_root: &Path, home: &Path) -> Vec<PathBuf> {
             } else {
                 link.parent().unwrap_or(Path::new("/")).join(target)
             };
-            // A dangling link cannot be shown to resolve inside the entity
+            // A dangling link cannot be shown to resolve inside the pulse
             // (`..` is not normalised lexically), so it is not ours to remove.
             let Ok(target) = target.canonicalize() else {
                 return false;
@@ -775,8 +775,8 @@ pub fn legacy_home_links(entity_root: &Path, home: &Path) -> Vec<PathBuf> {
 }
 
 /// recall-echo hook commands in the *user-level* `$HOME/.claude/settings.json`
-/// that carry no entity root. Under one entity per user they worked by
-/// accident of cwd; with several they fire for every entity and resolve to
+/// that carry no pulse root. Under one pulse per user they worked by
+/// accident of cwd; with several they fire for every pulse and resolve to
 /// the wrong one. Reported for the operator to remove — never edited here.
 pub fn user_hooks_missing_root(home: &Path) -> Vec<String> {
     let path = home.join(".claude/settings.json");
@@ -1016,7 +1016,7 @@ mod tests {
         assert_eq!(for_other.len(), 1);
         assert!(for_other[0].ends_with("EPHEMERAL.md"));
 
-        // A dangling link cannot be shown to point inside the entity — even
+        // A dangling link cannot be shown to point inside the pulse — even
         // one whose lexical target escapes through `..` — so it is left alone.
         std::fs::remove_file(claude.join("ARCHIVE.md")).unwrap();
         std::os::unix::fs::symlink(root.join("../../etc/passwd"), claude.join("ARCHIVE.md"))
@@ -1177,9 +1177,9 @@ mod tests {
             .next()
             .is_none());
 
-        // A direct write whose parent resolves outside the entity is refused.
+        // A direct write whose parent resolves outside the pulse is refused.
         let err = write_regular_file(&elsewhere.path().join("x.json"), "{}", &root).unwrap_err();
-        assert!(err.contains("outside the entity"), "{err}");
+        assert!(err.contains("outside the pulse"), "{err}");
 
         // Temp files are O_EXCL: a planted name cannot be written through.
         std::fs::remove_file(root.join(".claude")).unwrap();

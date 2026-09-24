@@ -45,7 +45,7 @@ pub struct ScheduleEntry {
     /// Model this task runs on, overriding `[llm] model` for this task only.
     ///
     /// Exists because a safety layer can refuse a whole *class* of task while
-    /// leaving chat untouched: pinning the entity globally to work around one
+    /// leaving chat untouched: pinning the pulse globally to work around one
     /// refusing task costs every other caller the model they wanted.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
@@ -85,7 +85,7 @@ pub struct Schedule {
 }
 
 impl Schedule {
-    /// Load schedule from schedule.json in the entity root. Pure read: a
+    /// Load schedule from schedule.json in the pulse root. Pure read: a
     /// missing file is an error. Only `load_or_init` (boot) may create the
     /// defaults — this load runs from task loops and save_delta, where a
     /// transiently absent file (unlink+rename edit, restore, mount blip)
@@ -105,7 +105,7 @@ impl Schedule {
     }
 
     /// Boot-time load: creates and persists the default schedule if the file
-    /// does not exist yet (fresh entity).
+    /// does not exist yet (fresh pulse).
     pub fn load_or_init(root_dir: &Path) -> Result<Self, crate::errors::SchedulerError> {
         if !root_dir.join("schedule.json").exists() {
             let schedule = Self::with_defaults();
@@ -148,7 +148,7 @@ impl Schedule {
     ///
     /// A replacement that carries no model override inherits the one it
     /// replaces. The override is operator policy about *how* a task runs;
-    /// the definition is content, and the entity rewrites its own content
+    /// the definition is content, and the pulse rewrites its own content
     /// via `[SCHEDULE:]`. Dropping the override on rewrite would silently
     /// move a task back onto the model it was moved off.
     pub fn add_task(&mut self, task: impl Into<ScheduleEntry>) {
@@ -316,11 +316,11 @@ pub async fn start(
     Ok(handles)
 }
 
-/// The per-tick tension update — the arithmetic layer the entity has never
+/// The per-tick tension update — the arithmetic layer the pulse has never
 /// had (spec §1.2).
 ///
 /// Between the end of one cognitive cycle and the start of the next, the
-/// entity's state currently changes only if an LLM call changes it, so every
+/// pulse's state currently changes only if an LLM call changes it, so every
 /// inter-cycle transition has to be paid for in tokens and in practice none
 /// happen. This loop is that missing primitive: it wakes every
 /// [`crate::tension::TICK_INTERVAL_MINUTES`], adds accrual to every live
@@ -593,7 +593,7 @@ mod tests {
         assert_eq!(schedule.find_task("t").unwrap().model_override(), Some("m"));
     }
 
-    /// The entity rewrites its own tasks via `[SCHEDULE:]`. Losing the
+    /// The pulse rewrites its own tasks via `[SCHEDULE:]`. Losing the
     /// override there would silently move a task back onto the model it was
     /// deliberately moved off.
     #[test]

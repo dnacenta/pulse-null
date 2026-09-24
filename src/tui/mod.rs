@@ -50,7 +50,7 @@ const TURN_TICK: Duration = Duration::from_millis(100);
 /// Omarchy theme file poll cadence.
 const THEME_TICK: Duration = Duration::from_secs(2);
 
-/// Run the TUI for the entity described by `config`, starting with the boot
+/// Run the TUI for the pulse described by `config`, starting with the boot
 /// screen (`pulse-null up`).
 pub async fn run(config: Config) -> Result<(), Box<dyn std::error::Error>> {
     run_with(config, false).await

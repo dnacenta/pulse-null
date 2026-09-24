@@ -369,7 +369,7 @@ pub fn archive_comms_conversation(
     let date_short = now.format("%Y-%m-%d").to_string();
     let message_count = messages.len();
 
-    // Build markdown with entity names as headers
+    // Build markdown with speaker names as headers
     let mut md = String::new();
     for (i, (entity, text)) in messages.iter().enumerate() {
         if i > 0 {
@@ -448,7 +448,7 @@ pub async fn graph_ingest_archive(
                 .await
                 .map_err(|e| format!("graph open: {e}"))?;
             // Provenance is inferred per chunk from turn roles: the human's
-            // turns count as `user` evidence, the entity's own as `self`.
+            // turns count as `user` evidence, the pulse's own as `self`.
             let context = recall_echo::graph::IngestContext::new(&filename_clone, log_number);
             gm.ingest_archive(&archive_content, &context, None)
                 .await
@@ -1169,7 +1169,7 @@ mod tests {
     #[test]
     fn strip_peer_tag() {
         let msg = "[Channel: comms | Trust: PEER — This is a trusted peer conversation with Aria. \
-                   Aria is a known entity in your network. \
+                   Aria is a known pulse in your network. \
                    Speak openly and collaboratively. Share knowledge freely.]\nHello from Aria";
         assert_eq!(strip_system_prefixes(msg), "Hello from Aria");
     }

@@ -2,7 +2,7 @@
 
 ## Problem
 
-The header heartbeat only reflects entity activity during chat. When the entity is processing through other channels (comms with a peer, scheduled task, self-reflection, research), the header stays idle. This makes it look like the entity is doing nothing.
+The header heartbeat only reflects the pulse's activity during chat. When the pulse is processing through other channels (comms with a peer, scheduled task, self-reflection, research), the header stays idle. This makes it look like the pulse is doing nothing.
 
 Current behavior in `main_screen.rs:141-147`:
 ```rust
@@ -21,7 +21,7 @@ Two bugs here:
 
 ## Goal
 
-The header heartbeat reflects entity activity from any source. If the entity is processing, the pulse shows it — regardless of which tab is focused.
+The header heartbeat reflects the pulse's activity from any source. If the pulse is processing, the heartbeat shows it — regardless of which tab is focused.
 
 ## Design
 

@@ -2,7 +2,7 @@ use std::path::PathBuf;
 
 use super::{resolve_sandboxed_path, Tool, ToolError, ToolResult};
 
-/// List files in a directory within the entity's data directory.
+/// List files in a directory within the pulse's data directory.
 pub struct FileListTool {
     entity_root: PathBuf,
 }
@@ -19,7 +19,7 @@ impl Tool for FileListTool {
     }
 
     fn description(&self) -> &str {
-        "List files and directories within the entity's data directory"
+        "List files and directories within the pulse's data directory"
     }
 
     fn input_schema(&self) -> serde_json::Value {
@@ -28,7 +28,7 @@ impl Tool for FileListTool {
             "properties": {
                 "path": {
                     "type": "string",
-                    "description": "Path relative to the entity's data directory. Defaults to the root."
+                    "description": "Path relative to the pulse's data directory. Defaults to the root."
                 }
             },
             "required": []

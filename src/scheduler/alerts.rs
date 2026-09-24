@@ -33,7 +33,7 @@ pub struct Alert {
 
 /// File-backed alert queue.
 ///
-/// Alerts are persisted to `alerts.json` in the entity root so they
+/// Alerts are persisted to `alerts.json` in the pulse root so they
 /// survive restarts. The queue is append-only until drained.
 #[derive(Debug)]
 pub struct AlertQueue {
@@ -295,7 +295,7 @@ pub fn alert_from_tension_triage(source: &str, demand: &crate::tension::TriageDe
 
 /// Create an alert reporting refused tension markers (PN-95).
 ///
-/// A discharge claim that is silently ignored reads to the entity exactly
+/// A discharge claim that is silently ignored reads to the pulse exactly
 /// like a granted one, which is how a store quietly stops meaning anything.
 pub fn alert_from_tension_rejections(
     source: &str,

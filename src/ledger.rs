@@ -1,4 +1,4 @@
-//! The entity's ledger: one chronological row per thing the entity did.
+//! The pulse's ledger: one chronological row per thing the pulse did.
 //!
 //! Rows are projected from [`EntityEvent`]s as they happen (live) and
 //! reconstructed from on-disk records on demand (backfill). The daemon keeps
@@ -498,7 +498,7 @@ impl LedgerRing {
     }
 }
 
-/// Bridge the entity event bus into the ring for the life of the process.
+/// Bridge the pulse event bus into the ring for the life of the process.
 ///
 /// Returns the task handle; the task ends when the bus closes.
 pub fn spawn_projector(

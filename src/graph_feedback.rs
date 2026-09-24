@@ -19,7 +19,7 @@
 
 use std::path::{Path, PathBuf};
 
-/// Subdirectory under each entity's root holding learning artifacts.
+/// Subdirectory under each pulse's root holding learning artifacts.
 const LEARNING_DIR: &str = "learning";
 
 #[derive(serde::Serialize, serde::Deserialize, Debug, Clone)]

@@ -283,7 +283,7 @@ pub fn load(root_dir: &Path) -> OutreachStore {
 
 /// Fail-closed load for read-modify-write callers.
 ///
-/// A missing file is a fresh entity and starts empty. An existing file that
+/// A missing file is a fresh pulse and starts empty. An existing file that
 /// cannot be read or parsed is an error and the delta is aborted — writing
 /// back an empty store would reset every daily cap and the entire response
 /// window in one stroke. A corrupt file is quarantined to
@@ -378,7 +378,7 @@ pub fn save(
 /// Ids of predictions that have actually resolved.
 ///
 /// Gate 2 accepts a prediction id as an external referent only if it names a
-/// prediction that resolved — an unresolved id is a pointer to the entity's
+/// prediction that resolved — an unresolved id is a pointer to the pulse's
 /// own expectation, which is exactly the self-authored evidence the gate
 /// exists to reject.
 #[must_use]

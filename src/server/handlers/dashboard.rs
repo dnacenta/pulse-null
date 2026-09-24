@@ -13,7 +13,7 @@ pub async fn dashboard(State(state): State<Arc<AppState>>) -> Json<serde_json::V
     let config = &state.config;
     let version = env!("CARGO_PKG_VERSION");
 
-    // Entity metadata
+    // Pulse metadata
     let plugins: Vec<String> = config.plugins.keys().cloned().collect();
     let entity = serde_json::json!({
         "name": config.entity.name,

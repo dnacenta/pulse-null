@@ -4,7 +4,7 @@
 //! implements is that the felt property D asked for ("something wouldn't
 //! leave me alone") is produced by *a state object with the right update
 //! law*, not by *a process with the right uptime*. Between the end of one
-//! cognitive cycle and the start of the next, the entity's state currently
+//! cognitive cycle and the start of the next, the pulse's state currently
 //! changes only if an LLM call changes it; this module is the arithmetic
 //! layer that makes the gaps stateful for zero tokens.
 //!
@@ -34,7 +34,7 @@
 //! # What is NOT claimed
 //!
 //! Nothing here advances any Butlin-Chalmers consciousness indicator, and
-//! nothing here runs continuously. The entity is still episodic. This is an
+//! nothing here runs continuously. The pulse is still episodic. This is an
 //! accumulator, and §3's pre-registered discriminator exists precisely
 //! because the failure mode is that it turns out to be a decorative recency
 //! proxy.
@@ -231,7 +231,7 @@ pub struct Thread {
     /// The spec's accrual term is `base_rate * age_weight(last_touched)`, so
     /// anything that writes this field suppresses the thread's growth rate.
     /// Letting text move it would reintroduce §7 risk 3 one level down: the
-    /// entity could keep a thread quiet by writing about it every cycle
+    /// pulse could keep a thread quiet by writing about it every cycle
     /// without ever lowering its tension. Only [`TensionStore::credit_work`]
     /// writes it.
     pub last_touched: DateTime<Utc>,
@@ -309,7 +309,7 @@ pub struct TriageCandidate {
     pub age_hours: f64,
 }
 
-/// An unanswered demand that the entity retire a thread.
+/// An unanswered demand that the pulse retire a thread.
 ///
 /// Raised when the live count passes `max_live_threads`. The newest thread
 /// is *admitted*, not dropped: dropping the newest at the cap is the exact
@@ -481,7 +481,7 @@ impl DiscriminatorMetrics {
 }
 
 /// On-disk format. `config` lives in `pulse-null.toml`, never in the
-/// per-entity snapshot, so a deserializer cannot silently default it and
+/// per-pulse snapshot, so a deserializer cannot silently default it and
 /// drift away from `Config::tension`.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct TensionSnapshot {
@@ -507,7 +507,7 @@ impl TensionSnapshot {
         }
     }
 
-    /// Promote a deserialized snapshot, stamped with the entity's live config.
+    /// Promote a deserialized snapshot, stamped with the pulse's live config.
     #[must_use]
     pub fn into_store(self, config: TensionConfig) -> TensionStore {
         TensionStore {
@@ -572,7 +572,7 @@ impl TensionStore {
     /// The highest-tension live threads, most pressing first.
     ///
     /// This is what Layer 3 injects instead of a positional slice of a
-    /// journal file: the ordering comes from an accumulator the entity
+    /// journal file: the ordering comes from an accumulator the pulse
     /// cannot edit in prose, rather than from whatever survived the last
     /// fold.
     #[must_use]
@@ -1696,7 +1696,7 @@ mod tests {
 
     /// An origin this binary does not know is a hard parse failure, not a
     /// silent rewrite. `store::save_delta` turns that into a loud, bytes-
-    /// preserving quarantine rather than overwriting the entity's history.
+    /// preserving quarantine rather than overwriting the pulse's history.
     #[test]
     fn an_unrecognized_origin_fails_to_parse_rather_than_being_coerced() {
         let json = r#"{

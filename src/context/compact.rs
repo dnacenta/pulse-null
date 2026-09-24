@@ -38,12 +38,12 @@ pub struct CompactionResult {
 /// that preserves task state, decisions, open threads, and explicitly tracks what
 /// context was lost during compaction.
 const STRUCTURED_SUMMARY_SYSTEM_PROMPT: &str = "\
-You are summarizing a conversation for context continuity. The entity will continue \
+You are summarizing a conversation for context continuity. The pulse will continue \
 this conversation with ONLY your summary as history. Anything you don't include is gone.
 
 Produce a structured summary with these sections:
 
-1. CURRENT TASK: What is the entity currently working on? What did the user last ask for?
+1. CURRENT TASK: What is the pulse currently working on? What did the user last ask for?
 2. KEY DECISIONS: What was agreed, decided, or established? Include any code context, \
    file paths, or technical specifics that were settled.
 3. OPEN THREADS: What questions are pending? What was promised but not yet delivered?
@@ -52,7 +52,7 @@ Produce a structured summary with these sections:
 5. RELATIONAL CONTEXT: Note any emotional tone, relationship dynamics, or conversation \
    style that should carry forward.
 
-Be concise but never sacrifice task state for brevity. The entity MUST know what \
+Be concise but never sacrifice task state for brevity. The pulse MUST know what \
 it's supposed to be doing right now.";
 
 /// Build the structured summarization prompt from messages being compacted.
@@ -204,7 +204,7 @@ pub struct CompactionParams<'a> {
     pub max_tokens: u32,
     /// Root directory for archiving compacted messages.
     pub root_dir: &'a Path,
-    /// Entity name for archive metadata.
+    /// Pulse name for archive metadata.
     pub entity_name: &'a str,
     /// Channel name for archive metadata.
     pub channel: &'a str,
@@ -413,7 +413,7 @@ async fn compact_with_params(
     );
 
     // Re-inject active plan after the summary (before files and recent window).
-    // The plan is the highest-priority re-injection — the entity must know what
+    // The plan is the highest-priority re-injection — the pulse must know what
     // it's supposed to be doing after compaction.
     if let Some(plan) = params.active_plan {
         let plan_msg = format!(

@@ -59,7 +59,7 @@ pub struct CycleOutcome<'a> {
 /// Record that a cognitive cycle is starting, and emit the §3 metrics.
 ///
 /// The pre-registered discriminator ships **inline in the routine per-cycle
-/// payload** (spec §3): here in the cycle log and, for the entity itself, in
+/// payload** (spec §3): here in the cycle log and, for the pulse itself, in
 /// the `<tension-context>` block of the prompt just built. A coverage
 /// denominator that ships as a separate quality report does not get read.
 pub async fn open_cycle(state: &Arc<AppState>, root_dir: &Path) -> Option<DiscriminatorMetrics> {

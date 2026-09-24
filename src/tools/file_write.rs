@@ -2,7 +2,7 @@ use std::path::PathBuf;
 
 use super::{resolve_sandboxed_path, Tool, ToolError, ToolResult};
 
-/// Write content to a file in the entity's data directory.
+/// Write content to a file in the pulse's data directory.
 pub struct FileWriteTool {
     entity_root: PathBuf,
 }
@@ -19,7 +19,7 @@ impl Tool for FileWriteTool {
     }
 
     fn description(&self) -> &str {
-        "Write content to a file in the entity's data directory. Creates parent directories if needed."
+        "Write content to a file in the pulse's data directory. Creates parent directories if needed."
     }
 
     fn input_schema(&self) -> serde_json::Value {
@@ -28,7 +28,7 @@ impl Tool for FileWriteTool {
             "properties": {
                 "path": {
                     "type": "string",
-                    "description": "Path relative to the entity's data directory"
+                    "description": "Path relative to the pulse's data directory"
                 },
                 "content": {
                     "type": "string",

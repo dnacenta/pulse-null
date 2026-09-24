@@ -263,7 +263,7 @@ async fn run_builtin_handler(
     match task.id.as_str() {
         "trajectory-mining" => {
             tracing::info!("Running built-in trajectory mining handler");
-            // The entity ROOT, not the journal: outcomes are recorded with
+            // The pulse ROOT, not the journal: outcomes are recorded with
             // `record_outcome(root_dir, ..)` and CALIBER.md is read from the
             // root by the prompt builder and vigil. Mining `<root>/journal`
             // read an outcomes file nothing writes and wrote a CALIBER.md
@@ -922,7 +922,7 @@ async fn route_output_markers(
         match super::dynamic::create_task_from_marker(schedule_json) {
             Ok(new_task) => {
                 tracing::info!(
-                    "Entity self-scheduled task: '{}' ({})",
+                    "Pulse self-scheduled task: '{}' ({})",
                     new_task.name,
                     new_task.cron
                 );

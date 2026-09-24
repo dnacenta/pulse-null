@@ -38,7 +38,7 @@ pub async fn list() -> Result<(), Box<dyn std::error::Error>> {
 
         let creator = match task.created_by {
             TaskCreator::System => "system",
-            TaskCreator::Entity => "entity",
+            TaskCreator::Entity => "pulse",
             TaskCreator::User => "user",
         };
 
@@ -155,7 +155,7 @@ pub async fn disable(id: String) -> Result<(), Box<dyn std::error::Error>> {
 
 /// Pin one task to a model, or clear the pin so it follows `[llm] model`.
 ///
-/// Editing schedule.json by hand does not work while the entity is running —
+/// Editing schedule.json by hand does not work while the pulse is running —
 /// the process rewrites the file — so the override needs a command of its own,
 /// exactly like `enable` / `disable`.
 pub async fn set_model(

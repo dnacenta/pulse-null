@@ -8,7 +8,7 @@
 //!   nobody can read cannot tell anyone whether the gate is calibrated
 //!   (spec §7.2, §8).
 //! * `respond` records D's reaction, which is the only scoring signal in the
-//!   system that the entity did not author (spec §2.4). Without a way to
+//!   system that the pulse did not author (spec §2.4). Without a way to
 //!   record it every cap tightens to half and stays there.
 
 use chrono::Utc;
