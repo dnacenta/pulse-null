@@ -25,7 +25,7 @@ pub mod transcript;
 use std::io::Write as _;
 use std::time::{Duration, Instant};
 
-use crossterm::event::{Event, EventStream, KeyboardEnhancementFlags};
+use crossterm::event::{Event, EventStream, KeyboardEnhancementFlags, MouseEventKind};
 use crossterm::execute;
 use tokio::time::MissedTickBehavior;
 use tokio_stream::StreamExt as _;
@@ -41,6 +41,8 @@ use theme::ThemeWatcher;
 
 /// How long the boot screen waits for a daemon we started before it says so.
 const ATTACH_TIMEOUT: Duration = Duration::from_secs(10);
+/// Transcript rows per wheel notch.
+const WHEEL_ROWS: i32 = 3;
 /// Shortest interval between two frames (62.5 fps ceiling).
 const FRAME: Duration = Duration::from_millis(16);
 /// Spinner / aurora cadence on the boot screen.
@@ -94,6 +96,10 @@ async fn run_with(config: Config, skip_boot: bool) -> Result<(), Box<dyn std::er
         );
     }
     let _ = execute!(std::io::stdout(), crossterm::event::EnableBracketedPaste);
+    // Mouse capture is what makes the wheel ours: without it the terminal
+    // emulates the wheel as ↑/↓ keys, which the prompt reads as history.
+    // Text selection is Shift+drag while the TUI runs, as in any TUI.
+    let _ = execute!(std::io::stdout(), crossterm::event::EnableMouseCapture);
 
     let mut app = App::new(
         &config.entity.name,
@@ -119,6 +125,7 @@ async fn run_with(config: Config, skip_boot: bool) -> Result<(), Box<dyn std::er
             crossterm::event::PopKeyboardEnhancementFlags
         );
     }
+    let _ = execute!(std::io::stdout(), crossterm::event::DisableMouseCapture);
     let _ = execute!(std::io::stdout(), crossterm::event::DisableBracketedPaste);
     ratatui::restore();
 
@@ -224,6 +231,17 @@ async fn event_loop(
                         dirty = true;
                     }
                     Some(Ok(Event::Resize(_, _))) => dirty = true,
+                    Some(Ok(Event::Mouse(m))) => {
+                        let rows = match m.kind {
+                            MouseEventKind::ScrollUp => -WHEEL_ROWS,
+                            MouseEventKind::ScrollDown => WHEEL_ROWS,
+                            _ => 0,
+                        };
+                        if rows != 0 {
+                            app.on_wheel(rows);
+                            dirty = true;
+                        }
+                    }
                     Some(Ok(_)) => {}
                     Some(Err(e)) => return Err(e.into()),
                     None => return Ok(()),
