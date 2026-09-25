@@ -32,11 +32,18 @@ use crate::cli_provider::adapter::{
 };
 use crate::init::agent_bootstrap::{ensure_config, BootstrapItem, ItemKind, ItemStatus};
 
-/// Tools an isolated pulse must not reach, as grok's own comma-separated
-/// `--disallowed-tools <TOOLS>` list. (`--disallowed-tools` is grok's compat
-/// alias for a single `--deny <RULE>`, so a list handed to it matched
-/// nothing — the shim had that bug in production.)
-const RESTRICTED_TOOLS: &str = "Write,Edit,MultiEdit,NotebookEdit,Bash,WebFetch,WebSearch,Task";
+/// The tools an isolated pulse keeps: grok's read-only built-ins, by grok's
+/// own identifiers. Measured on grok 1.0.0 (2026-09-25): `--disallowed-tools`
+/// takes grok's names, not Claude's (`Bash`, `Write` match nothing), and it
+/// cannot remove `run_terminal_command` at all — the shell stayed and ran.
+/// An allowlist through `--tools` is what removes the terminal and the file
+/// writers; the two marketplace tools survive an allowlist and go through
+/// `--disallowed-tools`, and `--disable-web-search` covers the web pair.
+/// With all three, the session's tool list is exactly this.
+const ISOLATED_TOOLS: &str = "read_file,list_dir,grep,todo_write";
+
+/// Tools that survive a `--tools` allowlist and must be removed by name.
+const ISOLATED_REMOVE: &str = "search_tool,use_tool,workflow";
 
 /// Hidden thinking is billed and unbounded: `high` measured at ~20s per chat
 /// turn against ~5s for `low` on the same prompt, with no visible quality gain
@@ -146,8 +153,11 @@ impl CliAdapter for Grok {
         args.push("--trust".into());
 
         if inv.restricted {
+            args.push("--tools".into());
+            args.push(ISOLATED_TOOLS.into());
             args.push("--disallowed-tools".into());
-            args.push(RESTRICTED_TOOLS.into());
+            args.push(ISOLATED_REMOVE.into());
+            args.push("--disable-web-search".into());
         }
         if inv.streaming {
             // Adds `stream_event` lines with text deltas; without it the
@@ -432,17 +442,29 @@ mod tests {
         let root = PathBuf::from("/home/pulse/pulse-null/echo");
 
         let plain = strings(&Grok.invoke_args(&invocation(&prompt, &root)));
+        assert!(!plain.iter().any(|arg| arg == "--tools"));
         assert!(!plain.iter().any(|arg| arg == "--disallowed-tools"));
+        assert!(!plain.iter().any(|arg| arg == "--disable-web-search"));
         assert!(!plain.iter().any(|arg| arg == "--include-partial-messages"));
 
         let mut inv = invocation(&prompt, &root);
         inv.restricted = true;
         inv.streaming = true;
         let guarded = strings(&Grok.invoke_args(&inv));
+        // Isolation is an allowlist of grok's read-only tools (its names),
+        // plus the two removals an allowlist does not cover and the web pair.
+        assert_eq!(value_of(&guarded, "--tools"), Some(ISOLATED_TOOLS));
         assert_eq!(
             value_of(&guarded, "--disallowed-tools"),
-            Some(RESTRICTED_TOOLS)
+            Some(ISOLATED_REMOVE)
         );
+        assert!(guarded.iter().any(|arg| arg == "--disable-web-search"));
+        for shell_or_write in ["run_terminal_command", "write", "search_replace"] {
+            assert!(
+                !ISOLATED_TOOLS.split(',').any(|t| t == shell_or_write),
+                "{shell_or_write} must not be allowed in isolation"
+            );
+        }
         assert!(guarded
             .iter()
             .any(|arg| arg == "--include-partial-messages"));
