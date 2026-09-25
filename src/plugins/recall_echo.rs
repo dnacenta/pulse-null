@@ -36,7 +36,7 @@ impl Plugin for RecallEchoPlugin {
                 .and_then(|t| t.get("base_dir"))
                 .and_then(|v| v.as_str())
                 .map(std::path::PathBuf::from)
-                .unwrap_or_else(|| ctx.pulse_root.join("memory"));
+                .unwrap_or_else(|| default_base_dir(&ctx.pulse_root));
 
             tracing::info!("recall-echo: base_dir = {}", base_dir.display());
             self.inner = Some(recall_echo::RecallEcho::new(base_dir));
@@ -82,6 +82,15 @@ impl Plugin for RecallEchoPlugin {
     }
 }
 
+/// The directory handed to `RecallEcho::new` when the config names none.
+///
+/// `RecallEcho::new` takes the pulse root and appends `memory/` itself.
+/// Passing `<root>/memory` made every health check look for
+/// `<root>/memory/memory` and mark the plugin failed a minute after start.
+fn default_base_dir(pulse_root: &std::path::Path) -> std::path::PathBuf {
+    pulse_root.to_path_buf()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -105,5 +114,21 @@ mod tests {
         let plugin = RecallEchoPlugin::new();
         let health = plugin.health().await;
         assert!(matches!(health, PluginHealth::Down(_)));
+    }
+
+    #[tokio::test]
+    async fn default_base_dir_is_healthy_on_a_pulse_layout() {
+        use pulse_system_types::plugin::Plugin as _;
+        let dir = tempfile::TempDir::new().unwrap();
+        let memory = dir.path().join("memory");
+        std::fs::create_dir_all(memory.join("conversations")).unwrap();
+        std::fs::write(memory.join("MEMORY.md"), "# Memory\n").unwrap();
+
+        let good = recall_echo::RecallEcho::new(default_base_dir(dir.path()));
+        assert!(matches!(good.health().await, PluginHealth::Healthy));
+
+        // The old default: one `memory/` too deep.
+        let old = recall_echo::RecallEcho::new(memory);
+        assert!(matches!(old.health().await, PluginHealth::Down(_)));
     }
 }
