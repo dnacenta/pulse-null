@@ -399,6 +399,42 @@ mod tests {
     use super::*;
     use tempfile::TempDir;
 
+    /// PN-115: a schedule.json written before the rename says
+    /// `"created_by": "entity"`. It must load as `TaskCreator::Pulse` (a
+    /// parse failure would stop every task loop) and be rewritten as "pulse".
+    #[test]
+    fn pre_rename_created_by_entity_loads_as_pulse() {
+        let dir = TempDir::new().unwrap();
+        let legacy = serde_json::json!({
+            "tasks": [{
+                "id": "follow-up",
+                "name": "Follow up",
+                "cron": "0 0 14 * * *",
+                "channel": "system",
+                "prompt": "p",
+                "output_routing": "silent",
+                "enabled": false,
+                "created_by": "entity",
+                "model": "claude-opus-5"
+            }]
+        });
+        std::fs::write(dir.path().join("schedule.json"), legacy.to_string()).unwrap();
+
+        let schedule = Schedule::load(dir.path()).unwrap();
+        let entry = &schedule.tasks[0];
+        assert_eq!(entry.task.created_by, TaskCreator::Pulse);
+        assert_eq!(entry.model.as_deref(), Some("claude-opus-5"));
+
+        schedule.save(dir.path()).unwrap();
+        let written = std::fs::read_to_string(dir.path().join("schedule.json")).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&written).unwrap();
+        assert_eq!(value["tasks"][0]["created_by"], "pulse");
+        assert_eq!(
+            Schedule::load(dir.path()).unwrap().tasks[0].task.created_by,
+            TaskCreator::Pulse
+        );
+    }
+
     /// MEDIUM-3 regression: concurrent save_delta callers must not lose
     /// updates (load-apply-save is serialized by the static mutex + flock).
     #[test]
@@ -419,7 +455,7 @@ mod tests {
                         prompt: "p".into(),
                         output_routing: OutputRouting::Silent,
                         enabled: true,
-                        created_by: TaskCreator::Entity,
+                        created_by: TaskCreator::Pulse,
                         evaluator: None,
                     });
                     Schedule::save_delta(&root, |s| s.add_task(entry)).unwrap();
@@ -484,7 +520,7 @@ mod tests {
             prompt: "do the thing".into(),
             output_routing: OutputRouting::Silent,
             enabled: true,
-            created_by: TaskCreator::Entity,
+            created_by: TaskCreator::Pulse,
             evaluator: None,
         });
         in_memory = Schedule::save_delta(root, |s| s.add_task(new_task)).unwrap();

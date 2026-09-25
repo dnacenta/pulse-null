@@ -275,7 +275,7 @@ fn view(entry: &ScheduleEntry, health: &TaskHealthStore, timezone: &str) -> Sche
 fn creator_label(creator: &TaskCreator) -> &'static str {
     match creator {
         TaskCreator::System => "system",
-        TaskCreator::Entity => "pulse",
+        TaskCreator::Pulse => "pulse",
         TaskCreator::User => "user",
     }
 }
@@ -574,7 +574,7 @@ mod tests {
                 prompt: "p".to_string(),
                 output_routing: OutputRouting::Silent,
                 enabled: true,
-                created_by: TaskCreator::Entity,
+                created_by: TaskCreator::Pulse,
                 evaluator: None,
             });
         })

@@ -77,11 +77,10 @@ chrono = { version = "0.4", features = ["serde"] }
 libc = "0.2"
 
 # Shared types
-pulse-system-types = "0.6.3"
+pulse-system-types = "0.7"
 
 # Core dependencies (always included — these define a pulse)
 recall-echo = { git = "https://github.com/dnacenta/recall-echo.git", branch = "main", default-features = false, features = ["pulse-null", "server"] }
-vigil-pulse = "0.1"
 
 # SurrealDB (for server provisioning — per-pulse DB/user creation)
 surrealdb = { version = "3", default-features = false, features = ["protocol-ws"] }
@@ -89,7 +88,7 @@ which = "7"
 
 # Plugins (optional — different interfaces to speak through)
 voice-echo = { version = "0.8", optional = true }
-discord-echo = { version = "0.1.2", optional = true }
+discord-echo = { version = "0.1.3", optional = true }
 
 [features]
 default = []

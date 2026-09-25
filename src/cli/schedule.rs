@@ -38,7 +38,7 @@ pub async fn list() -> Result<(), Box<dyn std::error::Error>> {
 
         let creator = match task.created_by {
             TaskCreator::System => "system",
-            TaskCreator::Entity => "pulse",
+            TaskCreator::Pulse => "pulse",
             TaskCreator::User => "user",
         };
 
