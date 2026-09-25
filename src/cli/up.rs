@@ -7,15 +7,18 @@ use crate::config::Config;
 use crate::server;
 
 pub async fn run(headless: bool) -> Result<(), Box<dyn std::error::Error>> {
-    // Detect mode: single pulse (CWD has config) or multi-pulse (a pulse home)
+    // The TUI opens Home wherever it runs; only headless cares which mode.
+    if !headless {
+        return crate::tui::run_home().await;
+    }
+    // Detect mode: single pulse (CWD has config) or multi-pulse (pulses/ dir)
     match crate::discovery::find_pulse_home() {
         None => run_single_pulse(headless).await,
         Some(pulse_home) => run_multi_pulse(headless, pulse_home).await,
     }
 }
 
-/// Single-pulse mode. Headless runs the daemon in the foreground; otherwise
-/// the TUI attaches to a running daemon or starts one in-process (PN-102).
+/// Single-pulse mode, headless: the daemon in the foreground.
 async fn run_single_pulse(headless: bool) -> Result<(), Box<dyn std::error::Error>> {
     let config = Config::load()?;
 
@@ -29,22 +32,17 @@ async fn run_single_pulse(headless: bool) -> Result<(), Box<dyn std::error::Erro
         return server::start(config).await;
     }
 
-    crate::tui::run(config).await
+    crate::tui::run_home().await
 }
 
-/// Multi-pulse mode: discover and boot every pulse. Headless only — the
-/// multi-pulse TUI was removed in PN-102; run `pulse-null up` inside one
-/// pulse directory for the interactive shell.
+/// Multi-pulse mode, headless: discover and boot every pulse in one
+/// process. The interactive shell is Home (`run` above).
 async fn run_multi_pulse(
     headless: bool,
     pulse_home: PathBuf,
 ) -> Result<(), Box<dyn std::error::Error>> {
     if !headless {
-        return Err(format!(
-            "{} holds several pulses. Run `pulse-null up --headless` here, or `pulse-null up` inside one pulse directory for the TUI.",
-            pulse_home.display()
-        )
-        .into());
+        return crate::tui::run_home().await;
     }
 
     let discovered = crate::discovery::discover_pulses(&pulse_home);

@@ -259,7 +259,7 @@ pulse-null up --headless         # single-pulse mode: this pulse only
 
 Running each pulse from its own directory is what production wants: one systemd unit per pulse, each with its own `WorkingDirectory`, its own environment file for provider credentials, and independent restarts. Every `pulse-null` subcommand is scoped to the pulse whose directory you run it from.
 
-For a quick look at all of them at once, `pulse-null up` from the install root boots every pulse in one process and opens the multi-pulse TUI. Each pulse binds the host and port from its own `pulse-null.toml`; if that port is already taken, it falls back to the next free port from 3200 upward and says so in the log. Pulses kept in a `pulses/` subdirectory (or the older `entities/`) are recognized too.
+`pulse-null up` from anywhere opens the terminal UI's Home page, which lists every pulse you own with its state and starts one only when you pick it. `pulse-null up --headless` from the install root boots every pulse in one process; each binds the host and port from its own `pulse-null.toml`, and if that port is already taken it falls back to the next free port from 3200 upward and says so in the log. Pulses kept in a `pulses/` subdirectory (or the older `entities/`) are recognized too.
 
 When the provider is `claude-code`, the pulse runs `claude` from inside its own directory with `RECALL_ECHO_HOME` pointing at it, so Claude Code picks up the pulse's `CLAUDE.md`, hooks and rules, and recall-echo reads and writes that pulse's memory. `pulse-null repair` re-creates any of those files, rewrites recall-echo hooks written by older versions (`--entity-root` becomes `--pulse-root`; recall-echo 4.6.0 or later is required), and retires leftover `~/.claude` symlinks from older installs.
 
@@ -312,11 +312,11 @@ Configs written before the rename still load: `[entity]` is read as `[pulse]` (a
 
 ```
 pulse-null init [--dir <path>]       Create a new pulse
-pulse-null up                        Start the pulse: daemon + terminal UI
+pulse-null up                        Terminal UI: Home lists your pulses, pick one to start or attach
 pulse-null up --headless             Daemon only (systemd, servers)
 pulse-null down                      Stop the pulse
 pulse-null status                    Show pulse status
-pulse-null chat                      Terminal UI, straight into the conversation
+pulse-null chat                      Terminal UI, straight into this pulse's conversation (Home elsewhere)
 
 pulse-null schedule list             List scheduled tasks
 pulse-null schedule add              Add a scheduled task
@@ -344,13 +344,15 @@ pulse-null vigil outcomes            Effectiveness signals
 
 ## Terminal UI
 
-`pulse-null up` (without `--headless`) and `pulse-null chat` open the terminal UI. It is a client of the running daemon: if one is up it attaches over HTTP, otherwise it starts one in-process and stops it cleanly on quit. It never owns a provider or writes session files itself.
+`pulse-null up` (without `--headless`) and `pulse-null chat` open the terminal UI. It is a client of the running daemon: if one is up it attaches over HTTP, otherwise it starts one in-process and stops it cleanly on exit. It never owns a provider or writes session files itself.
+
+**Home** is the first screen under the logo: one *Talk to <pulse>* row per pulse you own (found in `~/pulse-null/<name>`, the directory you are in, and the legacy `~/entity`), each showing `up`, `stopped` or `unreachable`, probed every two seconds; then *Create a new pulse*, which runs the setup wizard and lists the result; then *Exit*. `Enter` on a stopped pulse starts its daemon in this process and opens Talk; on a running one it attaches. `:home` goes back to the menu without stopping anything; Exit stops the daemons Home started. `pulse-null chat` inside a pulse directory skips Home.
 
 The window model follows Hyprland: panes with a one-cell gap, one accent border on the focused pane, `Ctrl+h/j/k/l` to move focus, `f` for fullscreen. A one-line bar shows the pulse, model, page, cognitive status (it says *no signal yet* until there is data), alert count and clock.
 
 **Talk** is the conversation page. Your message appears the instant you press Enter; the reply streams token by token as the provider produces it; typing works during a reply and Enter queues one message; `Ctrl+c` cancels a reply (the daemon rolls the turn back); scrolling up during a reply holds your place and shows `↓ new`, `G` glides back to the tail. Further pages (Watch, Remember, Setup) arrive in later releases; `:` lists them.
 
-`:` opens the command line (`Tab` completes): `:theme <name|system>`, `:motion <full|reduced|off>`, `:quit`, `:help`. `?` shows the keys for the focused pane.
+`:` opens the command line (`Tab` completes): `:home`, `:theme <name|system>`, `:motion <full|reduced|off>`, `:quit`, `:help`. `?` shows the keys for the focused pane.
 
 ```toml
 [tui]

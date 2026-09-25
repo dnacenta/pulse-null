@@ -36,6 +36,8 @@ pub enum Command {
     Motion(MotionLevel),
     Quit,
     Help,
+    /// Back to the pulse menu; the daemon stays up.
+    Home,
 }
 
 /// Every command name, its argument hint, and where it lives.
@@ -52,6 +54,12 @@ const SPECS: &[Spec] = &[
         name: "talk",
         args: "",
         what: "the conversation",
+        later: None,
+    },
+    Spec {
+        name: "home",
+        args: "",
+        what: "back to the pulse menu",
         later: None,
     },
     Spec {
@@ -163,6 +171,7 @@ pub fn run_command(line: &str) -> FloatAction {
     }
     match name {
         "talk" => FloatAction::Close,
+        "home" => FloatAction::Run(Command::Home),
         "quit" => FloatAction::Run(Command::Quit),
         "help" => FloatAction::Run(Command::Help),
         "theme" => {
@@ -368,12 +377,14 @@ fn common_prefix(cands: &[String]) -> String {
 pub struct Confirm {
     pub question: String,
     pub yes: &'static str,
+    /// What Enter runs.
+    pub then: Command,
 }
 
 impl Confirm {
-    pub fn on_key(key: KeyEvent) -> FloatAction {
+    pub fn on_key(&self, key: KeyEvent) -> FloatAction {
         match key.code {
-            KeyCode::Enter | KeyCode::Char('y') => FloatAction::Run(Command::Quit),
+            KeyCode::Enter | KeyCode::Char('y') => FloatAction::Run(self.then.clone()),
             _ => FloatAction::Close,
         }
     }
@@ -556,6 +567,7 @@ mod tests {
     #[test]
     fn real_commands_run() {
         assert_eq!(run_command("quit"), FloatAction::Run(Command::Quit));
+        assert_eq!(run_command("home"), FloatAction::Run(Command::Home));
         assert_eq!(run_command("help"), FloatAction::Run(Command::Help));
         assert_eq!(
             run_command("theme system"),

@@ -25,7 +25,7 @@ pub fn find_pulse_home() -> Option<PathBuf> {
 }
 
 /// The pure resolution, separated from process state so it can be tested.
-fn resolve_pulse_home(cwd: &Path, home: Option<&Path>) -> Option<PathBuf> {
+pub fn resolve_pulse_home(cwd: &Path, home: Option<&Path>) -> Option<PathBuf> {
     // Single pulse mode: CWD is inside a pulse (any ancestor holds
     // pulse-null.toml) — the same walk `Config::load()` does, so `up` agrees
     // with every other subcommand about which pulse a directory belongs to.
@@ -85,6 +85,58 @@ pub fn has_pulse_children(dir: &Path) -> bool {
     std::fs::read_dir(dir)
         .map(|entries| entries.flatten().any(|e| is_pulse_child(&e)))
         .unwrap_or(false)
+}
+
+/// Why a directory is not trusted as this user's pulse.
+///
+/// Booting a pulse runs the binaries and hooks its files name with our
+/// rights, so a directory qualifies only when it is a real directory (not
+/// a symlink into someone else's tree), owned by the running user, and its
+/// `pulse-null.toml` is a real file owned by the same user.
+pub fn untrusted_reason(dir: &Path) -> Option<String> {
+    use std::os::unix::fs::MetadataExt;
+    // SAFETY: geteuid has no preconditions and cannot fail.
+    let me = unsafe { libc::geteuid() };
+    let meta = match std::fs::symlink_metadata(dir) {
+        Ok(m) => m,
+        Err(e) => return Some(format!("cannot read: {e}")),
+    };
+    if meta.file_type().is_symlink() {
+        return Some("is a symlink".to_string());
+    }
+    if !meta.is_dir() {
+        return Some("not a directory".to_string());
+    }
+    if meta.uid() != me {
+        return Some("not owned by you".to_string());
+    }
+    let toml = match std::fs::symlink_metadata(dir.join("pulse-null.toml")) {
+        Ok(m) => m,
+        Err(e) => return Some(format!("pulse-null.toml: {e}")),
+    };
+    if toml.file_type().is_symlink() {
+        return Some("pulse-null.toml is a symlink".to_string());
+    }
+    if toml.uid() != me {
+        return Some("pulse-null.toml not owned by you".to_string());
+    }
+    None
+}
+
+/// Every pulse directory under `pulse_home` this user owns, whether or
+/// not its config loads. Home lists broken ones dim; `discover_pulses`
+/// skips them.
+#[must_use]
+pub fn pulse_dirs(pulse_home: &Path) -> Vec<PathBuf> {
+    std::fs::read_dir(pulse_home)
+        .map(|entries| {
+            entries
+                .flatten()
+                .filter(|e| is_pulse_child(e) && owned_by_us(e))
+                .map(|e| e.path())
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 /// A real subdirectory (not a symlink — a link can point at a tree someone

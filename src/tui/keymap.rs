@@ -16,6 +16,8 @@ const fn b(keys: &'static str, what: &'static str) -> Binding {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Context {
     Boot,
+    /// The pulse menu.
+    Home,
     /// Talk, prompt focused.
     Prompt {
         turn_active: bool,
@@ -39,6 +41,12 @@ pub const GLOBAL: &[Binding] = &[
 pub fn bindings(ctx: Context) -> Vec<Binding> {
     match ctx {
         Context::Boot => vec![b("q", "quit")],
+        Context::Home => vec![
+            b("j / k", "move"),
+            b("1-9", "jump"),
+            b("Enter", "open"),
+            b("q", "exit"),
+        ],
         Context::Prompt { turn_active } => vec![
             b("Enter", "send (or queue one while a reply streams)"),
             b("Shift+Enter / Alt+Enter", "newline"),
@@ -115,6 +123,7 @@ mod tests {
     fn hints_are_a_prefix_of_the_bindings() {
         for ctx in [
             Context::Boot,
+            Context::Home,
             Context::Prompt { turn_active: false },
             Context::Prompt { turn_active: true },
             Context::Transcript,

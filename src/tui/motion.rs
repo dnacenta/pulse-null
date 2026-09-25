@@ -135,7 +135,6 @@ impl Motion {
         }
     }
 
-    #[cfg(test)]
     #[must_use]
     pub fn level(&self) -> MotionLevel {
         self.level

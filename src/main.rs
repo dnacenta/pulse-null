@@ -330,11 +330,21 @@ enum ArchiveAction {
 /// symlink in its place is refused, since the log can carry request details.
 fn open_tui_log() -> Result<std::fs::File, String> {
     use std::os::unix::fs::OpenOptionsExt as _;
-    let root = config::Config::find_config()
+    // Inside a pulse: its logs/. Elsewhere (Home): the user's state dir,
+    // never the current directory.
+    let dir = match config::Config::find_config()
         .ok()
         .and_then(|p| p.parent().map(std::path::Path::to_path_buf))
-        .unwrap_or_else(|| std::path::PathBuf::from("."));
-    let dir = root.join("logs");
+    {
+        Some(root) => root.join("logs"),
+        None => std::env::var_os("XDG_STATE_HOME")
+            .map(std::path::PathBuf::from)
+            .or_else(|| {
+                std::env::var_os("HOME").map(|h| std::path::PathBuf::from(h).join(".local/state"))
+            })
+            .ok_or_else(|| "no HOME to log under".to_string())?
+            .join("pulse-null"),
+    };
     std::fs::create_dir_all(&dir).map_err(|e| format!("{}: {e}", dir.display()))?;
     let path = dir.join("tui.log");
     std::fs::OpenOptions::new()
@@ -397,6 +407,10 @@ async fn main() {
             }
         }
         Commands::Chat => {
+            if let Err(e) = cli::root_guard::refuse_root("chat") {
+                eprintln!("{e}");
+                std::process::exit(1);
+            }
             if let Err(e) = cli::chat::run().await {
                 eprintln!("Error: {e}");
                 std::process::exit(1);

@@ -14,6 +14,7 @@ use tachyonfx::Motion as Sweep;
 use super::bar::{self, BarState, DaemonState, Glyphs};
 use super::boot::Boot;
 use super::floats::{CmdLine, Command, Confirm, FloatAction, Help};
+use super::home::{Home, HomeAction};
 use super::keymap::{self, Context};
 use super::motion::{Key, Moment, Motion, MotionLevel, Palette};
 use super::pages::talk::{Talk, TalkAction};
@@ -27,6 +28,9 @@ pub const MIN_ROWS: u16 = 20;
 /// Which top-level screen is showing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Screen {
+    /// The pulse menu under the logo.
+    Home,
+    /// Waiting for a daemon (`pulse-null chat` with none up).
     Boot,
     Talk,
 }
@@ -35,6 +39,12 @@ pub enum Screen {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Action {
     None,
+    /// Back to the pulse menu (the loop drops the session, keeps daemons).
+    Home,
+    /// Open Talk for `home.rows[i]`.
+    Open(usize),
+    /// Run the pulse wizard.
+    Create,
     Quit,
 }
 
@@ -54,6 +64,7 @@ pub struct App {
     pub theme: ThemeWatcher,
     pub motion: Motion,
     pub boot: Boot,
+    pub home: Home,
     pub talk: Talk,
     pub owner: String,
     tick: u64,
@@ -84,6 +95,7 @@ impl App {
             theme,
             motion: Motion::new(motion_level),
             boot: Boot::new("connecting to the daemon"),
+            home: Home::new(Vec::new()),
             talk: Talk::new(),
             owner: owner.to_string(),
             tick: 0,
@@ -104,9 +116,36 @@ impl App {
         }
     }
 
+    /// Home is the start screen: the menu, with `rows` from `Home::scan`.
+    pub fn start_home(&mut self, rows: Vec<super::home::PulseRow>) {
+        self.home = Home::new(rows);
+        self.screen = Screen::Home;
+        self.pending = None;
+        self.float = None;
+        // Coming back from Talk: the logo coalesces again.
+        if self.last_area != Rect::default() {
+            self.boot_started(self.last_area);
+        }
+    }
+
+    /// The user picked a pulse: Talk speaks for it from now on, with that
+    /// pulse's `[tui]` settings.
+    pub fn enter_pulse(&mut self, config: &crate::config::Config) {
+        self.bar = BarState::new(&config.pulse.name, &config.llm.model);
+        self.owner = config.pulse.owner_alias.clone();
+        self.talk = Talk::new();
+        self.focus = PaneId::Prompt;
+        self.fullscreen = false;
+        self.float = None;
+        self.theme = ThemeWatcher::from_setting(&config.tui.theme);
+        self.motion
+            .set_level(MotionLevel::parse(&config.tui.motion));
+        self.glyphs = Glyphs::from_setting(&config.tui.nerd_font);
+    }
+
     /// The daemon answered: dissolve the boot screen, then show Talk.
     pub fn attached(&mut self) {
-        if self.screen == Screen::Boot && self.pending.is_none() {
+        if matches!(self.screen, Screen::Boot | Screen::Home) && self.pending.is_none() {
             self.bar.daemon = DaemonState::Connected;
             self.motion
                 .add(Key::Boot, Moment::BootOut, self.last_area, self.palette());
@@ -121,6 +160,10 @@ impl App {
     /// The mouse wheel always moves the conversation, whatever has focus:
     /// negative is up. Floats and the boot screen ignore it.
     pub fn on_wheel(&mut self, rows: i32) {
+        if self.screen == Screen::Home && self.float.is_none() {
+            self.home.on_wheel(rows);
+            return;
+        }
         if self.screen != Screen::Talk || self.float.is_some() {
             return;
         }
@@ -178,18 +221,19 @@ impl App {
 
     /// Start the boot coalesce once the first frame has a real area.
     pub fn boot_started(&mut self, area: Rect) {
-        self.motion.add(
-            Key::Boot,
-            Moment::BootIn,
-            Boot::logo_area(area),
-            self.palette(),
-        );
+        let logo = if self.screen == Screen::Home {
+            self.home.logo_area(area)
+        } else {
+            Boot::logo_area(area)
+        };
+        self.motion
+            .add(Key::Boot, Moment::BootIn, logo, self.palette());
     }
 
     /// Periodic tick from the loop (spinner, aurora).
     pub fn tick(&mut self) {
         self.tick = self.tick.wrapping_add(1);
-        if self.screen == Screen::Boot {
+        if matches!(self.screen, Screen::Boot | Screen::Home) {
             self.boot.tick();
         }
     }
@@ -210,6 +254,18 @@ impl App {
     pub fn on_key(&mut self, key: KeyEvent) -> Action {
         if key.kind != KeyEventKind::Press {
             return Action::None;
+        }
+        if self.screen == Screen::Home && self.float.is_none() {
+            if key.code == KeyCode::Char('?') {
+                self.open_help();
+                return Action::None;
+            }
+            return match self.home.on_key(key) {
+                HomeAction::None => Action::None,
+                HomeAction::Open(i) => Action::Open(i),
+                HomeAction::Create => Action::Create,
+                HomeAction::Exit => Action::Quit,
+            };
         }
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
 
@@ -272,6 +328,7 @@ impl App {
             self.open_float(Float::Confirm(Confirm {
                 question: "A reply is still streaming. Quit anyway?".to_string(),
                 yes: "quit",
+                then: Command::Quit,
             }));
             Action::None
         } else {
@@ -279,9 +336,24 @@ impl App {
         }
     }
 
+    /// Back to Home now, or ask first when a reply is still streaming.
+    fn request_home(&mut self) -> Action {
+        if self.talk.turn_active() {
+            self.open_float(Float::Confirm(Confirm {
+                question: "A reply is still streaming. Leave it and go Home?".to_string(),
+                yes: "home",
+                then: Command::Home,
+            }));
+            Action::None
+        } else {
+            Action::Home
+        }
+    }
+
     fn open_help(&mut self) {
         let (ctx, title) = match (self.screen, self.focus) {
             (Screen::Boot, _) => (Context::Boot, "boot"),
+            (Screen::Home, _) => (Context::Home, "home"),
             (Screen::Talk, PaneId::Prompt) => (
                 Context::Prompt {
                     turn_active: self.talk.turn_active(),
@@ -325,7 +397,7 @@ impl App {
     fn float_key(&mut self, key: KeyEvent) -> Action {
         let action = match self.float.as_mut() {
             Some(Float::CmdLine(c)) => c.on_key(key),
-            Some(Float::Confirm(_)) => Confirm::on_key(key),
+            Some(Float::Confirm(c)) => c.on_key(key),
             Some(Float::Help(_)) => Help::on_key(key),
             None => FloatAction::Close,
         };
@@ -360,6 +432,13 @@ impl App {
             Command::Help => {
                 self.open_help();
                 Action::None
+            }
+            Command::Home => {
+                if confirmed {
+                    Action::Home
+                } else {
+                    self.request_home()
+                }
             }
             Command::Theme(name) => {
                 let before = self.theme.tokens();
@@ -442,6 +521,7 @@ impl App {
             (_, _, Some(Float::Confirm(_))) => Context::Confirm,
             (_, _, Some(Float::Help(_))) => Context::Help,
             (Screen::Boot, _, None) => Context::Boot,
+            (Screen::Home, _, None) => Context::Home,
             (Screen::Talk, PaneId::Prompt, None) => Context::Prompt {
                 turn_active: self.talk.turn_active(),
             },
@@ -482,6 +562,19 @@ impl App {
         }
 
         match self.screen {
+            Screen::Home => {
+                if first_frame {
+                    self.boot_started(area);
+                }
+                if self.pending.is_some() && !self.motion.has(&Key::Boot) {
+                    self.switch_pending();
+                    self.render(frame);
+                    return;
+                }
+                let glyphs = self.glyphs;
+                self.home
+                    .render(frame, area, t, self.tick, &mut self.boot, &glyphs);
+            }
             Screen::Boot => {
                 if first_frame {
                     self.boot_started(area);
@@ -676,6 +769,82 @@ mod tests {
             .filter(|e| e.who == super::super::transcript::Who::Notice)
             .count();
         assert_eq!(notices, 3, "theme, motion and the not-yet page each notice");
+    }
+
+    fn pulse_row(name: &str, port: u16) -> super::super::home::PulseRow {
+        let mut c = crate::config::test_support::minimal_config();
+        c.pulse.name = name.to_string();
+        c.pulse.owner_alias = "Dee".to_string();
+        c.llm.model = "m2".to_string();
+        c.server.port = port;
+        c.tui.motion = "off".to_string();
+        super::super::home::PulseRow::from_load(
+            std::path::PathBuf::from(format!("/x/{name}")),
+            Ok(c),
+        )
+    }
+
+    #[test]
+    fn home_enter_on_an_pulse_row_asks_to_open_it() {
+        let mut a = app();
+        a.start_home(vec![pulse_row("echo", 3200), pulse_row("synth", 3201)]);
+        assert_eq!(a.screen, Screen::Home);
+        a.on_key(key(KeyCode::Char('j')));
+        assert_eq!(a.on_key(key(KeyCode::Enter)), Action::Open(1));
+        a.on_key(key(KeyCode::Char('3')));
+        assert_eq!(a.on_key(key(KeyCode::Enter)), Action::Create);
+        assert_eq!(a.on_key(key(KeyCode::Char('q'))), Action::Quit);
+        // Global chords and floats do not apply on Home.
+        assert_eq!(a.on_key(key(KeyCode::Char(':'))), Action::None);
+        assert!(a.float.is_none());
+    }
+
+    #[test]
+    fn enter_pulse_resets_bar_owner_and_talk() {
+        let mut a = app();
+        type_text(&mut a, "draft");
+        let row = pulse_row("synth", 3201);
+        a.enter_pulse(row.config().unwrap());
+        assert_eq!(a.bar.pulse, "synth");
+        assert_eq!(a.bar.model, "m2");
+        assert_eq!(a.owner, "Dee");
+        assert!(a.talk.prompt.is_empty(), "a fresh Talk");
+        assert_eq!(
+            a.motion.level(),
+            MotionLevel::Off,
+            "the pulse's [tui] applies"
+        );
+    }
+
+    #[test]
+    fn home_command_confirms_mid_turn_and_returns_when_idle() {
+        let mut a = app();
+        a.on_key(key(KeyCode::Char(':')));
+        type_text(&mut a, "home");
+        assert_eq!(
+            a.on_key(key(KeyCode::Enter)),
+            Action::Home,
+            "idle: straight back"
+        );
+
+        let mut a = app();
+        type_text(&mut a, "hello");
+        a.on_key(key(KeyCode::Enter));
+        assert!(a.talk.turn_active());
+        a.set_focus(PaneId::Transcript);
+        a.on_key(key(KeyCode::Char(':')));
+        type_text(&mut a, "home");
+        assert_eq!(a.on_key(key(KeyCode::Enter)), Action::None);
+        assert!(matches!(a.float, Some(Float::Confirm(_))), "asks first");
+        assert_eq!(a.on_key(key(KeyCode::Esc)), Action::None, "Esc stays");
+        a.on_key(key(KeyCode::Char(':')));
+        type_text(&mut a, "home");
+        a.on_key(key(KeyCode::Enter));
+        assert_eq!(
+            a.on_key(key(KeyCode::Enter)),
+            Action::Home,
+            "Enter confirms"
+        );
     }
 
     #[test]

@@ -156,7 +156,16 @@ pub async fn start_with_shutdown(
     stop: Option<tokio::sync::watch::Receiver<bool>>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let root_dir = config.root_dir()?;
+    start_in(config, root_dir, stop).await
+}
 
+/// [`start_with_shutdown`] for a pulse that is not the current directory:
+/// the TUI's Home page starts daemons for any pulse the user picks.
+pub async fn start_in(
+    config: Config,
+    root_dir: PathBuf,
+    stop: Option<tokio::sync::watch::Receiver<bool>>,
+) -> Result<(), Box<dyn std::error::Error>> {
     // The provider runs from inside the pulse (PN-104).
     let provider = crate::providers::create_streaming_provider(&config, &root_dir)?;
 
@@ -392,7 +401,16 @@ pub async fn start_with_shutdown(
     tokio::spawn(async move {
         let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
             .expect("failed to install SIGTERM handler");
-        let sigint = tokio::signal::ctrl_c();
+        // An owned daemon (Home started it) stops on its owner's flag, not
+        // on a Ctrl+c the terminal delivers to the whole process group.
+        let owned = stop.is_some();
+        let sigint = async {
+            if owned {
+                std::future::pending::<()>().await;
+            } else {
+                let _ = tokio::signal::ctrl_c().await;
+            }
+        };
         let external = async {
             match stop {
                 Some(mut rx) => {
@@ -404,7 +422,7 @@ pub async fn start_with_shutdown(
         };
         tokio::select! {
             _ = sigterm.recv() => tracing::info!("Received SIGTERM"),
-            _ = sigint => tracing::info!("Received SIGINT"),
+            () = sigint => tracing::info!("Received SIGINT"),
             () = external => tracing::info!("Stop requested by the owning process"),
         }
         let _ = shutdown_tx.send(true);

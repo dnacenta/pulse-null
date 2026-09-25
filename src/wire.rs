@@ -171,6 +171,15 @@ mod tests {
     }
 
     #[test]
+    fn health_reads_the_pulse_field() {
+        let h: HealthResponse = serde_json::from_str(
+            r#"{"status":"healthy","pulse":"Echo","isolation":false,"control_plane":"leading"}"#,
+        )
+        .unwrap();
+        assert_eq!(h.pulse, "Echo");
+    }
+
+    #[test]
     fn health_and_cognitive_health_round_trip() {
         let h = HealthResponse {
             status: "degraded".into(),
