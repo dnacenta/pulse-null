@@ -9,6 +9,8 @@
 //! exactly that archive here.
 //!
 //! ```text
+//! boot catch-up (log > watermark) ─────────┐
+//!                                          ▼
 //! graph_ingest_archive ──enqueue(log)──▶ queue ──▶ one worker ──▶ recall-echo
 //!                                         (≤64)     │               extract_archive
 //!                                                   ├─ isolated?        skip
@@ -29,6 +31,13 @@
 //!   UTC day, so a broken provider costs three attempts, not one per archive.
 //! - **Bounded spend.** A per-day token cap, recorded on disk so a restart
 //!   does not reset it.
+//! - **Nothing archived is missed.** In practice a pulse archives almost
+//!   only at shutdown, where extraction would be killed mid-archive, so it
+//!   is skipped there. A watermark in the same ledger — the highest archive
+//!   ever queued — lets each boot queue what arrived since (the archives
+//!   the store still has pending, oldest first). Queueing raises it, so a
+//!   crash never pays for an archive twice. The first boot only sets it: the
+//!   historical backlog is a backfill decision, not a side effect of a deploy.
 //! - **The pulse's own CLI environment.** The extraction CLI is spawned with
 //!   the same allowlisted environment a chat turn gets (its login included,
 //!   nothing else), from a neutral working directory so it never loads the
@@ -57,7 +66,8 @@ const MAX_CONSECUTIVE_FAILURES: u32 = 3;
 /// Longest one archive may take before it counts as a failure. The largest
 /// archive measured on a live pulse took 11 minutes.
 const ARCHIVE_TIMEOUT: Duration = Duration::from_secs(30 * 60);
-/// Spend ledger, in the pulse root beside the other runtime state.
+/// Spend and watermark ledger, in the pulse root beside the other runtime
+/// state.
 const LEDGER_FILE: &str = "graph_extraction.json";
 /// Where the extraction CLI runs: nowhere an agent CLI finds project
 /// instructions, hooks or rules to load.
@@ -72,6 +82,9 @@ pub type ExtractResult = Result<ExtractOutcome, ExtractArchiveError>;
 /// can be tested without a store or a model.
 pub trait ExtractBackend: Send + Sync {
     fn extract(&self, log_number: u32) -> Pin<Box<dyn Future<Output = ExtractResult> + Send + '_>>;
+
+    /// Log numbers the store still has awaiting extraction.
+    fn pending(&self) -> Pin<Box<dyn Future<Output = Result<Vec<u32>, String>> + Send + '_>>;
 }
 
 /// The real backend: recall-echo, on this pulse's memory.
@@ -87,6 +100,22 @@ impl ExtractBackend for RecallBackend {
             log_number,
             &self.overrides,
         ))
+    }
+
+    fn pending(&self) -> Pin<Box<dyn Future<Output = Result<Vec<u32>, String>> + Send + '_>> {
+        Box::pin(async move {
+            let graph = recall_echo::graph::GraphMemory::open(&self.memory_dir.join("graph"))
+                .await
+                .map_err(|e| format!("graph open: {e}"))?;
+            let logs = graph
+                .unextracted_log_numbers()
+                .await
+                .map_err(|e| format!("pending scan: {e}"))?;
+            Ok(logs
+                .into_iter()
+                .filter_map(|log| u32::try_from(log).ok())
+                .collect())
+        })
     }
 }
 
@@ -122,57 +151,127 @@ fn cli_overrides(config: &Config, root_dir: &Path, memory_dir: &Path) -> CliOver
     }
 }
 
-// ── Budget ───────────────────────────────────────────────────────────────
+// ── Ledger ───────────────────────────────────────────────────────────────
 
-/// One UTC day's spend, as persisted.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-struct DaySpend {
-    day: NaiveDate,
+/// What `graph_extraction.json` holds. Every field is optional on read, so
+/// a ledger written before the watermark existed (`{day, tokens}`) still
+/// loads.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+struct LedgerState {
+    /// The UTC day `tokens` was spent on.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    day: Option<NaiveDate>,
+    #[serde(default)]
     tokens: u64,
+    /// The highest archive log number ever queued for extraction. Archives
+    /// above it are what the next boot's catch-up looks for. `None` until
+    /// the first boot sets it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    watermark: Option<u32>,
 }
 
-/// A per-day token cap, recorded on disk so a restart cannot reset it.
+/// The on-disk ledger: one small JSON file, read-modify-written under a lock
+/// and replaced atomically, so a crash leaves the old state or the new one.
+struct Ledger {
+    path: PathBuf,
+    write: Mutex<()>,
+}
+
+impl Ledger {
+    fn new(path: PathBuf) -> Self {
+        Self {
+            path,
+            write: Mutex::new(()),
+        }
+    }
+
+    /// The current state. Missing reads as empty; unreadable reads as empty
+    /// and says so — the next write replaces it.
+    fn read(&self) -> LedgerState {
+        let Ok(text) = std::fs::read_to_string(&self.path) else {
+            return LedgerState::default();
+        };
+        serde_json::from_str(&text).unwrap_or_else(|e| {
+            tracing::warn!(
+                "graph: extraction ledger {} is unreadable ({e}) — treating it as empty",
+                self.path.display()
+            );
+            LedgerState::default()
+        })
+    }
+
+    /// Apply `change` to the stored state and persist it. Returns the new state.
+    fn update(&self, change: impl FnOnce(&mut LedgerState)) -> LedgerState {
+        let _held = self
+            .write
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut state = self.read();
+        change(&mut state);
+        if let Err(e) = write_atomically(&self.path, &state) {
+            tracing::warn!(
+                "graph: cannot write extraction ledger {}: {e}",
+                self.path.display()
+            );
+        }
+        state
+    }
+
+    fn watermark(&self) -> Option<u32> {
+        self.read().watermark
+    }
+
+    /// Raise the watermark to `log_number`; never lowers it.
+    fn raise_watermark(&self, log_number: u32) {
+        if self.watermark().is_some_and(|w| w >= log_number) {
+            return;
+        }
+        self.update(|state| {
+            state.watermark = Some(state.watermark.map_or(log_number, |w| w.max(log_number)));
+        });
+    }
+}
+
+fn write_atomically(path: &Path, state: &LedgerState) -> std::io::Result<()> {
+    let tmp = path.with_extension("json.tmp");
+    std::fs::write(&tmp, serde_json::to_vec(state)?)?;
+    std::fs::rename(&tmp, path)
+}
+
+// ── Budget ───────────────────────────────────────────────────────────────
+
+/// A per-day token cap, recorded in the ledger so a restart cannot reset it.
 struct DailyBudget {
     limit: u64,
-    path: PathBuf,
 }
 
 impl DailyBudget {
-    /// Tokens spent on `day`. A missing file, a stale day or an unreadable
-    /// ledger all read as nothing spent; an unreadable one says so.
-    fn spent(&self, day: NaiveDate) -> u64 {
-        let Ok(text) = std::fs::read_to_string(&self.path) else {
-            return 0;
-        };
-        match serde_json::from_str::<DaySpend>(&text) {
-            Ok(spend) if spend.day == day => spend.tokens,
-            Ok(_) => 0,
-            Err(e) => {
-                tracing::warn!(
-                    "graph: extraction ledger {} is unreadable ({e}) — counting today from zero",
-                    self.path.display()
-                );
-                0
-            }
+    /// Tokens spent on `day`; a stale day reads as nothing spent.
+    fn spent(&self, ledger: &Ledger, day: NaiveDate) -> u64 {
+        let state = ledger.read();
+        if state.day == Some(day) {
+            state.tokens
+        } else {
+            0
         }
     }
 
     /// True when `day` has no budget left.
-    fn exhausted(&self, day: NaiveDate) -> bool {
-        self.limit > 0 && self.spent(day) >= self.limit
+    fn exhausted(&self, ledger: &Ledger, day: NaiveDate) -> bool {
+        self.limit > 0 && self.spent(ledger, day) >= self.limit
     }
 
     /// Add `tokens` to `day` and return the day's new total.
-    fn charge(&self, day: NaiveDate, tokens: u64) -> u64 {
-        let total = self.spent(day).saturating_add(tokens);
-        let spend = DaySpend { day, tokens: total };
-        if let Err(e) = write_atomically(&self.path, &spend) {
-            tracing::warn!(
-                "graph: cannot record extraction spend in {}: {e}",
-                self.path.display()
-            );
-        }
-        total
+    fn charge(&self, ledger: &Ledger, day: NaiveDate, tokens: u64) -> u64 {
+        ledger
+            .update(|state| {
+                if state.day != Some(day) {
+                    state.day = Some(day);
+                    state.tokens = 0;
+                }
+                state.tokens = state.tokens.saturating_add(tokens);
+            })
+            .tokens
     }
 
     fn describe(&self, spent: u64) -> String {
@@ -184,10 +283,26 @@ impl DailyBudget {
     }
 }
 
-fn write_atomically(path: &Path, spend: &DaySpend) -> std::io::Result<()> {
-    let tmp = path.with_extension("json.tmp");
-    std::fs::write(&tmp, serde_json::to_vec(spend)?)?;
-    std::fs::rename(&tmp, path)
+// ── Catch-up ─────────────────────────────────────────────────────────────
+
+/// Log numbers of the archives in `dir` (`conversation-<N>.md`), ascending.
+fn archive_logs(dir: &Path) -> Vec<u32> {
+    let mut logs: Vec<u32> = std::fs::read_dir(dir)
+        .into_iter()
+        .flatten()
+        .filter_map(Result::ok)
+        .filter_map(|entry| {
+            entry
+                .file_name()
+                .to_str()?
+                .strip_prefix("conversation-")?
+                .strip_suffix(".md")?
+                .parse()
+                .ok()
+        })
+        .collect();
+    logs.sort_unstable();
+    logs
 }
 
 // ── Scheduling state ─────────────────────────────────────────────────────
@@ -195,8 +310,13 @@ fn write_atomically(path: &Path, spend: &DaySpend) -> std::io::Result<()> {
 #[derive(Debug, Default)]
 struct Queue {
     pending: VecDeque<u32>,
+    /// Catch-up archives that did not fit in `pending`; moved in, oldest
+    /// first, as slots free up.
+    backlog: VecDeque<u32>,
     /// A worker is draining the queue.
     running: bool,
+    /// The boot catch-up has not finished queueing yet.
+    catching_up: bool,
     consecutive_failures: u32,
     /// Extraction is paused for the rest of this day.
     paused_on: Option<NaiveDate>,
@@ -217,6 +337,7 @@ type Today = Arc<dyn Fn() -> NaiveDate + Send + Sync>;
 
 struct Inner {
     root_dir: PathBuf,
+    ledger: Ledger,
     budget: DailyBudget,
     backend: Arc<dyn ExtractBackend>,
     runtime: tokio::runtime::Handle,
@@ -255,12 +376,14 @@ impl GraphExtractor {
                 format!("{} tokens per UTC day", graph.extract_daily_token_budget)
             }
         );
-        Some(Self::new(
+        let extractor = Self::new(
             root_dir,
             graph.extract_daily_token_budget,
             Arc::new(backend),
             tokio::runtime::Handle::current(),
-        ))
+        );
+        extractor.start_catch_up(&crate::session::conversations_dir(root_dir));
+        Some(extractor)
     }
 
     fn new(
@@ -272,9 +395,9 @@ impl GraphExtractor {
         Self {
             inner: Arc::new(Inner {
                 root_dir: root_dir.to_path_buf(),
+                ledger: Ledger::new(root_dir.join(LEDGER_FILE)),
                 budget: DailyBudget {
                     limit: daily_token_budget,
-                    path: root_dir.join(LEDGER_FILE),
                 },
                 backend,
                 runtime,
@@ -287,6 +410,7 @@ impl GraphExtractor {
 
     /// Queue archive `log_number` for extraction. Returns at once; the
     /// archive is extracted in the background, after any already queued.
+    /// Queueing it raises the watermark, so no later boot queues it again.
     pub fn enqueue(&self, log_number: u32) {
         let start_worker = {
             let mut queue = self.inner.lock_queue();
@@ -303,10 +427,41 @@ impl GraphExtractor {
             queue.pending.push_back(log_number);
             !std::mem::replace(&mut queue.running, true)
         };
+        self.inner.ledger.raise_watermark(log_number);
         if start_worker {
-            let inner = Arc::clone(&self.inner);
-            self.inner.runtime.spawn(drain(inner));
+            self.inner.spawn_worker();
         }
+    }
+
+    /// Queue what this pulse archived since extraction last looked — in
+    /// practice the archives written at the previous shutdown, which are
+    /// ingested on the way out but never extracted there.
+    ///
+    /// The watermark is read now, before anything can be enqueued; the scan
+    /// and the store query run in the background, so startup never waits.
+    /// With no watermark yet, it is set to the newest archive on disk and
+    /// nothing is queued: the historical backlog is a backfill decision, not
+    /// something a deploy should start spending on.
+    fn start_catch_up(&self, conversations_dir: &Path) {
+        let highest = archive_logs(conversations_dir).last().copied().unwrap_or(0);
+        let Some(watermark) = self.inner.ledger.watermark() else {
+            self.inner.ledger.raise_watermark(highest);
+            tracing::info!(
+                "graph: catch-up — first run, watermark set to log {highest}; earlier archives \
+                 are left to a backfill"
+            );
+            return;
+        };
+        if highest <= watermark {
+            tracing::info!("graph: catch-up — 0 archive(s) since log {watermark} queued");
+            return;
+        }
+        self.inner.lock_queue().catching_up = true;
+        let inner = Arc::clone(&self.inner);
+        let dir = conversations_dir.to_path_buf();
+        self.inner
+            .runtime
+            .spawn(async move { inner.catch_up(&dir, watermark).await });
     }
 }
 
@@ -318,14 +473,73 @@ impl Inner {
     }
 
     /// The next archive, or `None` — in which case the worker has been
-    /// marked stopped, under the same lock an enqueue takes.
+    /// marked stopped, under the same lock an enqueue takes. Tops the queue
+    /// up from the catch-up backlog as slots free.
     fn next_job(&self) -> Option<u32> {
-        let mut queue = self.lock_queue();
-        let next = queue.pending.pop_front();
-        if next.is_none() {
-            queue.running = false;
+        let (next, raised) = {
+            let mut queue = self.lock_queue();
+            let raised = refill(&mut queue);
+            let next = queue.pending.pop_front();
+            if next.is_none() {
+                queue.running = false;
+            }
+            (next, raised)
+        };
+        if let Some(log_number) = raised {
+            self.ledger.raise_watermark(log_number);
         }
         next
+    }
+
+    fn spawn_worker(self: &Arc<Self>) {
+        self.runtime.spawn(drain(Arc::clone(self)));
+    }
+
+    /// Queue every archive above `watermark` that the store still has
+    /// pending, oldest first. Whatever does not fit in the queue waits in
+    /// the backlog.
+    async fn catch_up(self: Arc<Self>, dir: &Path, watermark: u32) {
+        let candidates: Vec<u32> = archive_logs(dir)
+            .into_iter()
+            .filter(|log| *log > watermark)
+            .collect();
+        let found = match self.backend.pending().await {
+            Ok(pending) => {
+                let pending: std::collections::HashSet<u32> = pending.into_iter().collect();
+                candidates
+                    .into_iter()
+                    .filter(|log| pending.contains(log))
+                    .collect()
+            }
+            Err(e) => {
+                // Extraction itself skips what has nothing pending, for free.
+                tracing::info!(
+                    "graph: catch-up cannot list pending archives ({e}) — queueing every \
+                     archive since log {watermark}"
+                );
+                candidates
+            }
+        };
+        let count = found.len();
+        let (raised, start_worker) = {
+            let mut queue = self.lock_queue();
+            queue.catching_up = false;
+            for log_number in found {
+                if !queue.pending.contains(&log_number) && !queue.backlog.contains(&log_number) {
+                    queue.backlog.push_back(log_number);
+                }
+            }
+            let raised = refill(&mut queue);
+            let start = !queue.pending.is_empty() && !std::mem::replace(&mut queue.running, true);
+            (raised, start)
+        };
+        if let Some(log_number) = raised {
+            self.ledger.raise_watermark(log_number);
+        }
+        tracing::info!("graph: catch-up — {count} archive(s) since log {watermark} queued");
+        if start_worker {
+            self.spawn_worker();
+        }
     }
 
     /// Why `log_number` must not be extracted right now, if it must not.
@@ -338,7 +552,7 @@ impl Inner {
             // Said once, when the pause began.
             return Some(Refusal::Quiet);
         }
-        if !self.budget.exhausted(today) {
+        if !self.budget.exhausted(&self.ledger, today) {
             return None;
         }
         if queue.budget_noted_on == Some(today) {
@@ -347,7 +561,7 @@ impl Inner {
         queue.budget_noted_on = Some(today);
         Some(Refusal::Say(format!(
             "daily token budget spent ({}); further archives today are left pending quietly",
-            self.budget.describe(self.budget.spent(today))
+            self.budget.describe(self.budget.spent(&self.ledger, today))
         )))
     }
 
@@ -387,9 +601,9 @@ impl Inner {
             Err(err) => err.tokens_spent(),
         };
         let spent_today = if spent > 0 {
-            self.budget.charge(today, spent)
+            self.budget.charge(&self.ledger, today, spent)
         } else {
-            self.budget.spent(today)
+            self.budget.spent(&self.ledger, today)
         };
         self.report(log_number, today, result, spent_today);
     }
@@ -449,6 +663,22 @@ fn log_extracted(log_number: u32, extraction: &ArchiveExtraction, budget: &str) 
     }
 }
 
+/// Move backlog into free queue slots, oldest first. Returns the highest log
+/// number moved, for the watermark.
+fn refill(queue: &mut Queue) -> Option<u32> {
+    let mut raised = None;
+    while queue.pending.len() < MAX_QUEUED {
+        let Some(log_number) = queue.backlog.pop_front() else {
+            break;
+        };
+        if !queue.pending.contains(&log_number) {
+            queue.pending.push_back(log_number);
+            raised = Some(raised.map_or(log_number, |r: u32| r.max(log_number)));
+        }
+    }
+    raised
+}
+
 /// Drain the queue, one archive at a time, until it is empty.
 async fn drain(inner: Arc<Inner>) {
     let _unwedge = UnwedgeOnPanic(Arc::clone(&inner));
@@ -480,6 +710,9 @@ mod tests {
     /// many run at once.
     struct Scripted {
         answers: Mutex<VecDeque<ExtractResult>>,
+        /// What `pending()` answers; empty means "everything is pending".
+        pending: Mutex<Option<Result<Vec<u32>, String>>>,
+        seen: Mutex<Vec<u32>>,
         calls: AtomicUsize,
         in_flight: AtomicUsize,
         max_in_flight: AtomicUsize,
@@ -490,6 +723,8 @@ mod tests {
         fn new(answers: Vec<ExtractResult>, delay: Duration) -> Arc<Self> {
             Arc::new(Self {
                 answers: Mutex::new(answers.into()),
+                pending: Mutex::new(None),
+                seen: Mutex::new(Vec::new()),
                 calls: AtomicUsize::new(0),
                 in_flight: AtomicUsize::new(0),
                 max_in_flight: AtomicUsize::new(0),
@@ -497,14 +732,34 @@ mod tests {
             })
         }
 
+        fn with_pending(self: Arc<Self>, pending: Result<Vec<u32>, String>) -> Arc<Self> {
+            *self.pending.lock().unwrap() = Some(pending);
+            self
+        }
+
         fn calls(&self) -> usize {
             self.calls.load(Ordering::SeqCst)
+        }
+
+        fn seen(&self) -> Vec<u32> {
+            self.seen.lock().unwrap().clone()
         }
     }
 
     impl ExtractBackend for Scripted {
-        fn extract(&self, _log: u32) -> Pin<Box<dyn Future<Output = ExtractResult> + Send + '_>> {
+        fn pending(&self) -> Pin<Box<dyn Future<Output = Result<Vec<u32>, String>> + Send + '_>> {
             Box::pin(async move {
+                self.pending
+                    .lock()
+                    .unwrap()
+                    .clone()
+                    .unwrap_or_else(|| Ok((0..10_000).collect()))
+            })
+        }
+
+        fn extract(&self, log: u32) -> Pin<Box<dyn Future<Output = ExtractResult> + Send + '_>> {
+            Box::pin(async move {
+                self.seen.lock().unwrap().push(log);
                 self.calls.fetch_add(1, Ordering::SeqCst);
                 let now = self.in_flight.fetch_add(1, Ordering::SeqCst) + 1;
                 self.max_in_flight.fetch_max(now, Ordering::SeqCst);
@@ -553,11 +808,35 @@ mod tests {
         extractor
     }
 
-    /// Wait until the worker has drained the queue and stopped.
+    fn spent(extractor: &GraphExtractor, on: NaiveDate) -> u64 {
+        extractor.inner.budget.spent(&extractor.inner.ledger, on)
+    }
+
+    fn watermark(extractor: &GraphExtractor) -> Option<u32> {
+        extractor.inner.ledger.watermark()
+    }
+
+    /// `archives/conversations` under `root`, holding `conversation-<N>.md`
+    /// for every `N` in `logs`.
+    fn archives(root: &Path, logs: impl IntoIterator<Item = u32>) -> PathBuf {
+        let dir = root.join("archives").join("conversations");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("INDEX.md"), "# index\n").unwrap();
+        for log in logs {
+            std::fs::write(dir.join(format!("conversation-{log:03}.md")), "x").unwrap();
+        }
+        dir
+    }
+
+    /// Wait until the catch-up has queued and the worker has drained the
+    /// queue and stopped.
     async fn settle(extractor: &GraphExtractor) {
         for _ in 0..500 {
-            if !extractor.inner.lock_queue().running {
-                return;
+            {
+                let queue = extractor.inner.lock_queue();
+                if !queue.running && !queue.catching_up {
+                    return;
+                }
             }
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
@@ -613,7 +892,7 @@ mod tests {
 
         // 600, then 1200 (the overrun of one archive), then refused.
         assert_eq!(backend.calls(), 2);
-        assert_eq!(extractor.inner.budget.spent(day(25)), 1_200);
+        assert_eq!(spent(&extractor, day(25)), 1_200);
     }
 
     #[tokio::test]
@@ -636,7 +915,7 @@ mod tests {
         restarted.enqueue(3);
         settle(&restarted).await;
         assert_eq!(backend.calls(), 1);
-        assert_eq!(restarted.inner.budget.spent(day(26)), 10);
+        assert_eq!(spent(&restarted, day(26)), 10);
     }
 
     #[tokio::test]
@@ -671,11 +950,7 @@ mod tests {
         }
         settle(&extractor).await;
         assert_eq!(backend.calls(), 3);
-        assert_eq!(
-            extractor.inner.budget.spent(day(25)),
-            30,
-            "failed calls are charged"
-        );
+        assert_eq!(spent(&extractor, day(25)), 30, "failed calls are charged");
 
         *today.lock().unwrap() = day(26);
         extractor.enqueue(7);
@@ -712,7 +987,7 @@ mod tests {
         settle(&extractor).await;
 
         assert_eq!(backend.calls(), 5, "never paused");
-        assert_eq!(extractor.inner.budget.spent(day(25)), 5);
+        assert_eq!(spent(&extractor, day(25)), 5);
         assert_eq!(extractor.inner.lock_queue().paused_on, None);
     }
 
@@ -768,17 +1043,211 @@ mod tests {
     #[test]
     fn an_unreadable_ledger_counts_from_zero() {
         let tmp = tempfile::tempdir().unwrap();
-        let budget = DailyBudget {
-            limit: 10,
-            path: tmp.path().join(LEDGER_FILE),
-        };
-        std::fs::write(&budget.path, "not json").unwrap();
-        assert_eq!(budget.spent(day(25)), 0);
-        assert_eq!(budget.charge(day(25), 4), 4);
-        assert_eq!(budget.spent(day(25)), 4);
-        assert!(!budget.exhausted(day(25)));
-        budget.charge(day(25), 6);
-        assert!(budget.exhausted(day(25)));
+        let ledger = Ledger::new(tmp.path().join(LEDGER_FILE));
+        let budget = DailyBudget { limit: 10 };
+        std::fs::write(&ledger.path, "not json").unwrap();
+        assert_eq!(budget.spent(&ledger, day(25)), 0);
+        assert_eq!(budget.charge(&ledger, day(25), 4), 4);
+        assert_eq!(budget.spent(&ledger, day(25)), 4);
+        assert!(!budget.exhausted(&ledger, day(25)));
+        budget.charge(&ledger, day(25), 6);
+        assert!(budget.exhausted(&ledger, day(25)));
+    }
+
+    /// A ledger written before the watermark existed still carries today's
+    /// spend, and has no watermark.
+    #[test]
+    fn a_pre_watermark_ledger_still_loads() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ledger = Ledger::new(tmp.path().join(LEDGER_FILE));
+        std::fs::write(&ledger.path, r#"{"day":"2026-09-25","tokens":1234}"#).unwrap();
+        assert_eq!(DailyBudget { limit: 0 }.spent(&ledger, day(25)), 1_234);
+        assert_eq!(ledger.watermark(), None);
+
+        ledger.raise_watermark(7);
+        ledger.raise_watermark(5);
+        let state = ledger.read();
+        assert_eq!(state.watermark, Some(7), "the watermark never goes down");
+        assert_eq!(state.tokens, 1_234, "raising it keeps the spend");
+    }
+
+    #[test]
+    fn archive_logs_reads_only_conversation_files_in_order() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = archives(tmp.path(), [10, 2, 1000]);
+        std::fs::write(dir.join("conversation-x.md"), "").unwrap();
+        std::fs::write(dir.join("notes.md"), "").unwrap();
+        assert_eq!(archive_logs(&dir), vec![2, 10, 1000]);
+        assert_eq!(archive_logs(&tmp.path().join("absent")), Vec::<u32>::new());
+    }
+
+    /// First boot: the historical backlog is not pulled in.
+    #[tokio::test]
+    async fn a_first_run_sets_the_watermark_to_the_newest_archive_and_queues_nothing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = archives(tmp.path(), 1..=40);
+        let backend = Scripted::new(Vec::new(), Duration::ZERO);
+        let today = Arc::new(Mutex::new(day(25)));
+        let extractor = extractor(tmp.path(), 0, Arc::clone(&backend), today);
+
+        extractor.start_catch_up(&dir);
+        settle(&extractor).await;
+
+        assert_eq!(watermark(&extractor), Some(40));
+        assert_eq!(backend.calls(), 0);
+    }
+
+    #[tokio::test]
+    async fn a_first_run_with_no_archives_starts_at_zero() {
+        let tmp = tempfile::tempdir().unwrap();
+        let backend = Scripted::new(vec![extracted(1)], Duration::ZERO);
+        let today = Arc::new(Mutex::new(day(25)));
+        let extractor = extractor(tmp.path(), 0, Arc::clone(&backend), today);
+
+        extractor.start_catch_up(&tmp.path().join("archives/conversations"));
+        assert_eq!(watermark(&extractor), Some(0));
+
+        // The pulse's very first archive is then above the watermark.
+        let dir = archives(tmp.path(), [1]);
+        let restarted = self::extractor(
+            tmp.path(),
+            0,
+            Arc::clone(&backend),
+            Arc::new(Mutex::new(day(25))),
+        );
+        restarted.start_catch_up(&dir);
+        settle(&restarted).await;
+        assert_eq!(backend.seen(), vec![1]);
+    }
+
+    /// Boot: only archives above the watermark that the store still has
+    /// pending, oldest first — an extracted one, or one that was never
+    /// ingested (comms archives are not), costs nothing.
+    #[tokio::test]
+    async fn catch_up_queues_only_pending_archives_above_the_watermark_oldest_first() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = archives(tmp.path(), 1..=8);
+        Ledger::new(tmp.path().join(LEDGER_FILE)).raise_watermark(3);
+        let backend = Scripted::new(Vec::new(), Duration::ZERO).with_pending(Ok(vec![8, 2, 5, 7]));
+        let today = Arc::new(Mutex::new(day(25)));
+        let extractor = extractor(tmp.path(), 0, Arc::clone(&backend), today);
+
+        extractor.start_catch_up(&dir);
+        settle(&extractor).await;
+
+        assert_eq!(backend.seen(), vec![5, 7, 8]);
+        assert_eq!(watermark(&extractor), Some(8));
+    }
+
+    /// The watermark is on disk: a restart re-spends nothing, and still
+    /// finds what arrived since.
+    #[tokio::test]
+    async fn the_watermark_survives_a_restart() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = archives(tmp.path(), 1..=5);
+        Ledger::new(tmp.path().join(LEDGER_FILE)).raise_watermark(2);
+        let backend = Scripted::new(Vec::new(), Duration::ZERO);
+        let first = extractor(
+            tmp.path(),
+            0,
+            Arc::clone(&backend),
+            Arc::new(Mutex::new(day(25))),
+        );
+        first.start_catch_up(&dir);
+        settle(&first).await;
+        assert_eq!(backend.seen(), vec![3, 4, 5]);
+
+        // Restart with nothing new: nothing queued.
+        let restarted = extractor(
+            tmp.path(),
+            0,
+            Arc::clone(&backend),
+            Arc::new(Mutex::new(day(25))),
+        );
+        restarted.start_catch_up(&dir);
+        settle(&restarted).await;
+        assert_eq!(backend.calls(), 3);
+
+        // Archives written at the last shutdown are the next boot's work.
+        archives(tmp.path(), [6, 7]);
+        let again = extractor(
+            tmp.path(),
+            0,
+            Arc::clone(&backend),
+            Arc::new(Mutex::new(day(26))),
+        );
+        again.start_catch_up(&dir);
+        settle(&again).await;
+        assert_eq!(backend.seen(), vec![3, 4, 5, 6, 7]);
+    }
+
+    /// Queueing raises the watermark at once — before the extraction runs —
+    /// so a crash mid-archive cannot make the next boot pay for it again.
+    #[tokio::test]
+    async fn queueing_raises_the_watermark_before_extracting() {
+        let tmp = tempfile::tempdir().unwrap();
+        let backend = Scripted::new(vec![extracted(1)], Duration::from_secs(5));
+        let today = Arc::new(Mutex::new(day(25)));
+        let extractor = extractor(tmp.path(), 0, Arc::clone(&backend), today);
+
+        extractor.enqueue(12);
+        assert_eq!(watermark(&extractor), Some(12));
+        extractor.enqueue(9);
+        assert_eq!(watermark(&extractor), Some(12));
+    }
+
+    /// More than the queue holds: the rest waits in the backlog and is
+    /// drained behind it, still one at a time, still in order.
+    #[tokio::test]
+    async fn a_catch_up_larger_than_the_queue_is_drained_in_order() {
+        let tmp = tempfile::tempdir().unwrap();
+        let total = MAX_QUEUED as u32 * 2 + 5;
+        let dir = archives(tmp.path(), 1..=total);
+        Ledger::new(tmp.path().join(LEDGER_FILE)).raise_watermark(0);
+        let backend = Scripted::new(Vec::new(), Duration::ZERO);
+        let today = Arc::new(Mutex::new(day(25)));
+        let extractor = extractor(tmp.path(), 0, Arc::clone(&backend), today);
+
+        extractor.start_catch_up(&dir);
+        settle(&extractor).await;
+
+        assert_eq!(backend.seen(), (1..=total).collect::<Vec<_>>());
+        assert_eq!(backend.max_in_flight.load(Ordering::SeqCst), 1);
+        assert_eq!(watermark(&extractor), Some(total));
+    }
+
+    /// Catch-up spends under the same cap as everything else.
+    #[tokio::test]
+    async fn catch_up_respects_the_daily_budget() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = archives(tmp.path(), 1..=5);
+        Ledger::new(tmp.path().join(LEDGER_FILE)).raise_watermark(0);
+        let backend = Scripted::new((0..5).map(|_| extracted(600)).collect(), Duration::ZERO);
+        let today = Arc::new(Mutex::new(day(25)));
+        let extractor = extractor(tmp.path(), 1_000, Arc::clone(&backend), today);
+
+        extractor.start_catch_up(&dir);
+        settle(&extractor).await;
+
+        assert_eq!(backend.calls(), 2);
+    }
+
+    /// A store that cannot be asked is not a reason to skip the catch-up:
+    /// extraction itself costs nothing on an archive with nothing pending.
+    #[tokio::test]
+    async fn an_unreachable_store_queues_every_archive_above_the_watermark() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = archives(tmp.path(), 1..=4);
+        Ledger::new(tmp.path().join(LEDGER_FILE)).raise_watermark(2);
+        let backend = Scripted::new(Vec::new(), Duration::ZERO)
+            .with_pending(Err("graph open: connection refused".into()));
+        let today = Arc::new(Mutex::new(day(25)));
+        let extractor = extractor(tmp.path(), 0, Arc::clone(&backend), today);
+
+        extractor.start_catch_up(&dir);
+        settle(&extractor).await;
+
+        assert_eq!(backend.seen(), vec![3, 4]);
     }
 
     /// The extraction CLI sees the pulse's allowlisted environment, runs

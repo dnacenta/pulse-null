@@ -86,7 +86,7 @@ pub fn conversation_to_markdown(conversation: &[Message]) -> String {
 }
 
 /// Archives directory for conversations.
-fn conversations_dir(root_dir: &Path) -> PathBuf {
+pub(crate) fn conversations_dir(root_dir: &Path) -> PathBuf {
     root_dir.join("archives").join("conversations")
 }
 
