@@ -23,6 +23,32 @@ pub enum ClientError {
     Json(#[from] serde_json::Error),
 }
 
+/// The outcome of a health probe, coarse enough for a menu row.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Probe {
+    /// `/health` answered OK and named the entity we expected.
+    Up,
+    /// `/health` answered OK but for another entity: the port is theirs.
+    Foreign(String),
+    /// Nothing listens (connection refused): a daemon can be started.
+    Refused,
+    /// Something answered, but not a healthy daemon (timeout, bad status).
+    Other,
+}
+
+/// One connection pool for every client in the process: building a
+/// reqwest client is not free, and Home makes one per entity row.
+fn shared_http() -> reqwest::Client {
+    static HTTP: std::sync::LazyLock<reqwest::Client> = std::sync::LazyLock::new(|| {
+        reqwest::Client::builder()
+            .connect_timeout(std::time::Duration::from_secs(2))
+            .no_proxy()
+            .build()
+            .expect("reqwest client")
+    });
+    HTTP.clone()
+}
+
 /// A connection to one entity daemon.
 #[derive(Clone)]
 pub struct Client {
@@ -67,10 +93,7 @@ impl Client {
         Self {
             base: format!("http://{host}:{port}"),
             secret,
-            http: reqwest::Client::builder()
-                .connect_timeout(std::time::Duration::from_secs(2))
-                .build()
-                .expect("reqwest client"),
+            http: shared_http(),
         }
     }
 
@@ -88,10 +111,36 @@ impl Client {
         r
     }
 
-    /// True when `/health` answers 200 within a second.
+    /// What listens on the daemon's port, for Home's entity rows. `/health`
+    /// needs no credential, so none is sent: a probe goes to whatever holds
+    /// the port. The daemon's answer names its entity; a mismatch is
+    /// `Foreign`, never `Up`.
+    pub async fn probe_detail(&self, expect_entity: &str) -> Probe {
+        let resp = self
+            .http
+            .get(format!("{}/health", self.base))
+            .timeout(std::time::Duration::from_secs(1))
+            .send()
+            .await;
+        match resp {
+            Ok(r) if r.status().is_success() => {
+                match r.json::<crate::wire::HealthResponse>().await {
+                    Ok(h) if h.entity == expect_entity => Probe::Up,
+                    Ok(h) => Probe::Foreign(h.entity),
+                    Err(_) => Probe::Other,
+                }
+            }
+            Ok(_) => Probe::Other,
+            Err(e) if e.is_connect() => Probe::Refused,
+            Err(_) => Probe::Other,
+        }
+    }
+
+    /// True when `/health` answers 200 within a second (any entity).
     pub async fn probe(&self) -> bool {
         matches!(
-            self.get("/health")
+            self.http
+                .get(format!("{}/health", self.base))
                 .timeout(std::time::Duration::from_secs(1))
                 .send()
                 .await,

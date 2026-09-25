@@ -134,6 +134,9 @@ pub struct CognitiveSignals {
 pub struct HealthResponse {
     /// `healthy`, `degraded` or `offline`.
     pub status: String,
+    /// The entity's name. Also accepted as `pulse`, the product word a
+    /// daemon may use for it on the wire.
+    #[serde(alias = "pulse")]
     pub entity: String,
     #[serde(default)]
     pub isolation: bool,
@@ -152,6 +155,15 @@ pub struct HealthResponse {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn health_accepts_pulse_as_the_entity_field() {
+        let h: HealthResponse = serde_json::from_str(
+            r#"{"status":"healthy","pulse":"Echo","isolation":false,"control_plane":"leading"}"#,
+        )
+        .unwrap();
+        assert_eq!(h.entity, "Echo");
+    }
 
     #[test]
     fn health_and_cognitive_health_round_trip() {

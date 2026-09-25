@@ -7,6 +7,10 @@ use crate::config::Config;
 use crate::server;
 
 pub async fn run(headless: bool) -> Result<(), Box<dyn std::error::Error>> {
+    // The TUI opens Home wherever it runs; only headless cares which mode.
+    if !headless {
+        return crate::tui::run_home().await;
+    }
     // Detect mode: single entity (CWD has config) or multi-entity (entities/ dir)
     match crate::discovery::find_entity_home() {
         None => run_single_entity(headless).await,
@@ -14,8 +18,7 @@ pub async fn run(headless: bool) -> Result<(), Box<dyn std::error::Error>> {
     }
 }
 
-/// Single-entity mode. Headless runs the daemon in the foreground; otherwise
-/// the TUI attaches to a running daemon or starts one in-process (PN-102).
+/// Single-entity mode, headless: the daemon in the foreground.
 async fn run_single_entity(headless: bool) -> Result<(), Box<dyn std::error::Error>> {
     let config = Config::load()?;
 
@@ -29,22 +32,17 @@ async fn run_single_entity(headless: bool) -> Result<(), Box<dyn std::error::Err
         return server::start(config).await;
     }
 
-    crate::tui::run(config).await
+    crate::tui::run_home().await
 }
 
-/// Multi-entity mode: discover and boot every entity. Headless only — the
-/// multi-entity TUI was removed in PN-102; run `pulse-null up` inside one
-/// entity directory for the interactive shell.
+/// Multi-entity mode, headless: discover and boot every entity in one
+/// process. The interactive shell is Home (`run` above).
 async fn run_multi_entity(
     headless: bool,
     entity_home: PathBuf,
 ) -> Result<(), Box<dyn std::error::Error>> {
     if !headless {
-        return Err(format!(
-            "{} holds several entities. Run `pulse-null up --headless` here, or `pulse-null up` inside one entity directory for the TUI.",
-            entity_home.display()
-        )
-        .into());
+        return crate::tui::run_home().await;
     }
 
     let discovered = crate::discovery::discover_entities(&entity_home);

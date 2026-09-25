@@ -108,7 +108,9 @@ async fn run(
         FAST_PROBE
     };
     let mut last_id: Option<u64> = None;
-    let mut history_task: Option<tokio::task::JoinHandle<()>> = None;
+    // Aborted with the poller: a `Session` drop aborts this task, and the
+    // guard takes the history fetch down with it.
+    let mut history_task = AbortOnDrop(None);
 
     loop {
         if !attached {
@@ -125,8 +127,7 @@ async fn run(
                 }
                 // Its own task: the session may be busy for minutes, and the
                 // ledger stream and the bar must not wait behind it.
-                abort(&mut history_task);
-                history_task = Some(tokio::spawn(history(client.clone(), tx.clone())));
+                history_task.replace(tokio::spawn(history(client.clone(), tx.clone())));
             } else {
                 if fast && fast_since.elapsed() < FAST_PROBE_FOR {
                     continue;
@@ -163,7 +164,7 @@ async fn run(
             Err(e) => {
                 tracing::warn!("ledger stream unavailable: {e}");
                 attached = false;
-                abort(&mut history_task);
+                history_task.replace_none();
                 backoff = BACKOFF_MIN;
                 let _ = tx.send(Bg::Unreachable { retry_in: backoff }).await;
                 continue;
@@ -228,7 +229,7 @@ async fn run(
 
         // Anything that broke the inner loop means the daemon is gone.
         attached = false;
-        abort(&mut history_task);
+        history_task.replace_none();
         backoff = BACKOFF_MIN;
         if tx
             .send(Bg::Unreachable { retry_in: backoff })
@@ -267,9 +268,25 @@ async fn refresh(client: &Client) -> Option<BarUpdate> {
     })
 }
 
-fn abort(task: &mut Option<tokio::task::JoinHandle<()>>) {
-    if let Some(t) = task.take() {
-        t.abort();
+/// A task handle that aborts its task when dropped or replaced.
+struct AbortOnDrop(Option<tokio::task::JoinHandle<()>>);
+
+impl AbortOnDrop {
+    fn replace(&mut self, task: tokio::task::JoinHandle<()>) {
+        self.replace_none();
+        self.0 = Some(task);
+    }
+
+    fn replace_none(&mut self) {
+        if let Some(t) = self.0.take() {
+            t.abort();
+        }
+    }
+}
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        self.replace_none();
     }
 }
 

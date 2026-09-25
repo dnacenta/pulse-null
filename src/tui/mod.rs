@@ -1,7 +1,7 @@
 //! The terminal UI (v2, PN-102): a client of the running daemon.
 //!
-//! `run` attaches to the daemon named in the config, or starts one in this
-//! process when none answers, then drives an event-driven render loop: it
+//! `run_home` opens the entity menu; picking a row attaches to that daemon,
+//! or starts one in this process when none answers, then drives an event-driven render loop: it
 //! draws only when a key, a daemon message, a theme change or a running
 //! effect says something changed, and never faster than one frame per
 //! 16 ms. The loop itself never touches the network: `poller` does, and
@@ -12,6 +12,7 @@ pub mod bar;
 pub mod boot;
 pub mod client;
 pub mod floats;
+pub mod home;
 pub mod keymap;
 pub mod motion;
 pub mod pages;
@@ -51,41 +52,96 @@ const BOOT_TICK: Duration = Duration::from_millis(80);
 const TURN_TICK: Duration = Duration::from_millis(100);
 /// Omarchy theme file poll cadence.
 const THEME_TICK: Duration = Duration::from_secs(2);
+/// Entity state probe cadence while Home shows.
+const HOME_TICK: Duration = Duration::from_secs(2);
 
-/// Run the TUI for the entity described by `config`, starting with the boot
-/// screen (`pulse-null up`).
-pub async fn run(config: Config) -> Result<(), Box<dyn std::error::Error>> {
-    run_with(config, false).await
+/// `pulse-null up`: Home — the logo and the entity menu. Nothing is
+/// started until a row is chosen.
+pub async fn run_home() -> Result<(), Box<dyn std::error::Error>> {
+    let rows = rescan_home();
+    let tui = crate::config::TuiConfig::default();
+    let mut app = App::new(
+        "pulse-null",
+        "",
+        "",
+        ThemeWatcher::from_setting(&tui.theme),
+        MotionLevel::parse(&tui.motion),
+        Glyphs::from_setting(&tui.nerd_font),
+    );
+    app.start_home(rows);
+    run_app(app, None).await
 }
 
-/// `pulse-null chat`: when a daemon is already up, open straight into Talk.
+/// `pulse-null chat`: the TUI for the entity in `config`, straight into
+/// Talk when a daemon is already up.
 pub async fn run_chat(config: Config) -> Result<(), Box<dyn std::error::Error>> {
-    run_with(config, true).await
-}
-
-async fn run_with(config: Config, skip_boot: bool) -> Result<(), Box<dyn std::error::Error>> {
+    let root = config.root_dir()?;
+    let mut started = Vec::new();
     let client = Client::new(
         &config.server.host,
         config.server.port,
         config.security.secret.clone(),
     );
-
-    // Attach or spawn. The daemon owns the provider, tools and sessions;
-    // this process only ever talks to it over HTTP.
-    let mut daemon_task = None;
-    let (daemon_stop, stop_rx) = tokio::sync::watch::channel(false);
-    let attached_at_start = client.probe().await;
-    if !attached_at_start {
-        tracing::info!("no daemon at {}; starting one in-process", client.base());
-        let cfg = config.clone();
-        daemon_task = Some(tokio::spawn(async move {
-            if let Err(e) = crate::server::start_with_shutdown(cfg, Some(stop_rx)).await {
-                tracing::error!("daemon exited with error: {e}");
-            }
-        }));
+    let state = home::EntityState::from(client.probe_detail(&config.entity.name).await);
+    let session = Session::open(&config, root, state, &mut started)
+        .map_err(|why| format!("cannot open {}: {why}", config.entity.name))?;
+    let mut app = App::new(
+        "",
+        "",
+        "",
+        ThemeWatcher::from_setting(&config.tui.theme),
+        MotionLevel::parse(&config.tui.motion),
+        Glyphs::from_setting(&config.tui.nerd_font),
+    );
+    app.enter_entity(&config);
+    if session.attached {
+        app.skip_boot();
+    } else {
+        app.screen = app::Screen::Boot;
+        app.boot.status = "starting the daemon".to_string();
     }
+    run_app_with(app, Some(session), started).await
+}
 
-    let mut terminal = ratatui::init();
+async fn run_app(app: App, session: Option<Session>) -> Result<(), Box<dyn std::error::Error>> {
+    run_app_with(app, session, Vec::new()).await
+}
+
+/// Terminal setup, the loop, terminal teardown, then stop every daemon this
+/// process started (the stop flag feeds the same graceful-shutdown path as
+/// SIGTERM, so sessions archive and pidfiles are removed).
+async fn run_app_with(
+    mut app: App,
+    session: Option<Session>,
+    mut started: Vec<Daemon>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    // Between wizard prompts the terminal is cooked, so a Ctrl+c there
+    // reaches this process as SIGINT. Swallow it: the child wizard dies
+    // (it gets the default disposition on exec), the TUI carries on.
+    let _sigint = tokio::spawn(async {
+        loop {
+            let _ = tokio::signal::ctrl_c().await;
+        }
+    });
+    let mut term = enter_terminal();
+    let result = event_loop(&mut term, &mut app, session, &mut started).await;
+    leave_terminal(&term);
+    if !started.is_empty() {
+        eprintln!("stopping {} pulse(s) this shell started…", started.len());
+    }
+    stop_daemons(started).await;
+    result
+}
+
+/// The terminal in TUI mode: alternate screen, raw mode, the flags we
+/// pushed and must pop again.
+struct Term {
+    terminal: ratatui::DefaultTerminal,
+    keyboard_enhanced: bool,
+}
+
+fn enter_terminal() -> Term {
+    let terminal = ratatui::init();
     let keyboard_enhanced = crossterm::terminal::supports_keyboard_enhancement().unwrap_or(false);
     if keyboard_enhanced {
         let _ = execute!(
@@ -100,26 +156,14 @@ async fn run_with(config: Config, skip_boot: bool) -> Result<(), Box<dyn std::er
     // emulates the wheel as ↑/↓ keys, which the prompt reads as history.
     // Text selection is Shift+drag while the TUI runs, as in any TUI.
     let _ = execute!(std::io::stdout(), crossterm::event::EnableMouseCapture);
-
-    let mut app = App::new(
-        &config.entity.name,
-        &config.llm.model,
-        &config.entity.owner_alias,
-        ThemeWatcher::from_setting(&config.tui.theme),
-        MotionLevel::parse(&config.tui.motion),
-        Glyphs::from_setting(&config.tui.nerd_font),
-    );
-    if !attached_at_start {
-        app.boot.status = "starting the daemon".to_string();
-    } else if skip_boot {
-        app.skip_boot();
+    Term {
+        terminal,
+        keyboard_enhanced,
     }
+}
 
-    let (ctl, bg, poller_task) = poller::spawn(client.clone(), attached_at_start);
-    let result = event_loop(&mut terminal, &mut app, &client, ctl, bg, attached_at_start).await;
-    poller_task.abort();
-
-    if keyboard_enhanced {
+fn leave_terminal(term: &Term) {
+    if term.keyboard_enhanced {
         let _ = execute!(
             std::io::stdout(),
             crossterm::event::PopKeyboardEnhancementFlags
@@ -128,19 +172,127 @@ async fn run_with(config: Config, skip_boot: bool) -> Result<(), Box<dyn std::er
     let _ = execute!(std::io::stdout(), crossterm::event::DisableMouseCapture);
     let _ = execute!(std::io::stdout(), crossterm::event::DisableBracketedPaste);
     ratatui::restore();
+}
 
-    // We started the daemon: stop it the way systemd would, so sessions
-    // archive and the pidfile is removed. The stop flag feeds the same
-    // graceful-shutdown path as SIGTERM.
-    if let Some(task) = daemon_task {
-        let _ = daemon_stop.send(true);
-        match tokio::time::timeout(Duration::from_secs(40), task).await {
-            Ok(_) => tracing::info!("in-process daemon stopped"),
-            Err(_) => tracing::warn!("in-process daemon did not stop within 40 s"),
+/// A daemon this process started for an entity directory.
+struct Daemon {
+    dir: std::path::PathBuf,
+    stop: tokio::sync::watch::Sender<bool>,
+    /// Ends with the daemon: `Err` is why it did not run.
+    task: tokio::task::JoinHandle<Result<(), String>>,
+}
+
+/// Daemons whose task has ended, with why, removed from `started`.
+async fn reap_daemons(started: &mut Vec<Daemon>) -> Vec<(std::path::PathBuf, String)> {
+    let mut ended = Vec::new();
+    let mut i = 0;
+    while i < started.len() {
+        if started[i].task.is_finished() {
+            let d = started.remove(i);
+            let why = match d.task.await {
+                Ok(Ok(())) => "it exited".to_string(),
+                Ok(Err(e)) => e,
+                Err(e) => format!("it panicked: {e}"),
+            };
+            ended.push((d.dir, why));
+        } else {
+            i += 1;
         }
     }
+    ended
+}
 
-    result
+/// Stop every started daemon, joined, each bounded to 40 s.
+async fn stop_daemons(started: Vec<Daemon>) {
+    let mut set = tokio::task::JoinSet::new();
+    for d in started {
+        set.spawn(async move {
+            let _ = d.stop.send(true);
+            match tokio::time::timeout(Duration::from_secs(40), d.task).await {
+                Ok(_) => tracing::info!("in-process daemon for {} stopped", d.dir.display()),
+                Err(_) => tracing::warn!(
+                    "in-process daemon for {} did not stop within 40 s",
+                    d.dir.display()
+                ),
+            }
+        });
+    }
+    while set.join_next().await.is_some() {}
+}
+
+/// Everything the loop needs to talk to one entity: the HTTP client and
+/// the poller task that owns connectivity. Created when a row is chosen.
+struct Session {
+    client: Client,
+    ctl: tokio::sync::mpsc::Sender<Ctl>,
+    bg: tokio::sync::mpsc::Receiver<Bg>,
+    poller: tokio::task::JoinHandle<()>,
+    /// Whether `/health` answered when the session opened.
+    attached: bool,
+}
+
+impl Session {
+    /// Attach to the entity's daemon (`state` is `Up`), or start one in this
+    /// process for `root` when nothing listens (`Stopped`; once per
+    /// directory — a second pick of the same entity reuses the daemon
+    /// already booting). Nothing is awaited: the probe already happened,
+    /// and the poller confirms the attach. A port that answers for another
+    /// entity or not as a daemon is refused here as well as in the menu.
+    fn open(
+        config: &Config,
+        root: std::path::PathBuf,
+        state: home::EntityState,
+        started: &mut Vec<Daemon>,
+    ) -> Result<Self, String> {
+        if let Some(why) = crate::discovery::untrusted_reason(&root) {
+            return Err(why);
+        }
+        let attached = match state {
+            home::EntityState::Up => true,
+            home::EntityState::Stopped
+            | home::EntityState::Starting
+            | home::EntityState::Unknown => false,
+            home::EntityState::Foreign(who) => return Err(format!("port held by {who}")),
+            home::EntityState::Unreachable => {
+                return Err("port answers, but not as a daemon".into())
+            }
+        };
+        let client = Client::new(
+            &config.server.host,
+            config.server.port,
+            config.security.secret.clone(),
+        );
+        if !attached && !started.iter().any(|d| d.dir == root) {
+            tracing::info!("no daemon at {}; starting one in-process", client.base());
+            let (stop, stop_rx) = tokio::sync::watch::channel(false);
+            let cfg = config.clone();
+            let dir = root.clone();
+            let task = tokio::spawn(async move {
+                crate::server::start_in(cfg, dir, Some(stop_rx))
+                    .await
+                    .map_err(|e| e.to_string())
+            });
+            started.push(Daemon {
+                dir: root,
+                stop,
+                task,
+            });
+        }
+        let (ctl, bg, poller) = poller::spawn(client.clone(), attached);
+        Ok(Self {
+            client,
+            ctl,
+            bg,
+            poller,
+            attached,
+        })
+    }
+}
+
+impl Drop for Session {
+    fn drop(&mut self) {
+        self.poller.abort();
+    }
 }
 
 /// One item from the chat stream. Returns true when the stream is over.
@@ -162,24 +314,105 @@ fn on_turn_item(app: &mut App, item: Option<Result<ChatEvent, ClientError>>) -> 
     }
 }
 
+/// Leave TUI mode, run `f` with the terminal cooked (the init wizard
+/// prompts through it), then come back. The event stream is recreated by
+/// the caller so nothing reads stdin while `f` does.
+async fn suspend_for<F: std::future::Future>(term: &mut Term, f: F) -> F::Output {
+    leave_terminal(term);
+    let out = f.await;
+    *term = enter_terminal();
+    let _ = term.terminal.clear();
+    out
+}
+
+/// `pulse-null init --dir <target>` as a child on the cooked terminal. A
+/// child, not the in-process wizard: the prompt library answers Ctrl+c by
+/// raising SIGINT at its own process, which would take the TUI (and any
+/// daemon it started) down with it; in a child it ends only the wizard.
+async fn run_wizard(target: &std::path::Path) -> Result<(), String> {
+    std::fs::create_dir_all(target).map_err(|e| e.to_string())?;
+    // /proc/self/exe keeps working after the binary was replaced in place
+    // (a deploy); `current_exe()` would then end in " (deleted)".
+    let exe = std::path::Path::new("/proc/self/exe");
+    let exe = if exe.exists() {
+        exe.to_path_buf()
+    } else {
+        std::env::current_exe().map_err(|e| e.to_string())?
+    };
+    let mut dir_arg = std::ffi::OsString::from("--dir=");
+    dir_arg.push(target);
+    let status = tokio::process::Command::new(exe)
+        .arg("init")
+        .arg(dir_arg)
+        .status()
+        .await
+        .map_err(|e| format!("could not start the wizard: {e}"))?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(match status.code() {
+            Some(code) => format!("exit {code}"),
+            None => "cancelled".to_string(),
+        })
+    }
+}
+
+/// Where `Create a new entity` puts it: the discovered entity home, else
+/// `~/pulse-null`.
+/// `(cwd, $HOME)` as the scan and the create target see them.
+fn where_we_are() -> (std::path::PathBuf, Option<std::path::PathBuf>) {
+    (
+        std::env::current_dir().unwrap_or_default(),
+        std::env::var_os("HOME").map(std::path::PathBuf::from),
+    )
+}
+
+/// Where `Create a new pulse` puts it: a directory that already holds this
+/// user's entities (the resolved entity home when it has entity children),
+/// else `~/pulse-null` — never a bare cwd, which the scan would not find
+/// again from anywhere else.
+fn create_target(cwd: &std::path::Path, home: Option<&std::path::Path>) -> std::path::PathBuf {
+    if let Some(entity_home) = crate::discovery::resolve_entity_home(cwd, home) {
+        if crate::discovery::has_entity_children(&entity_home) {
+            return entity_home;
+        }
+    }
+    home.map_or_else(|| cwd.to_path_buf(), |h| h.join("pulse-null"))
+}
+
+fn rescan_home() -> Vec<home::EntityRow> {
+    let (cwd, home_dir) = where_we_are();
+    home::Home::scan(&cwd, home_dir.as_deref())
+}
+
 async fn event_loop(
-    terminal: &mut ratatui::DefaultTerminal,
+    term: &mut Term,
     app: &mut App,
-    client: &Client,
-    ctl: tokio::sync::mpsc::Sender<Ctl>,
-    mut bg: tokio::sync::mpsc::Receiver<Bg>,
-    mut attached: bool,
+    mut session: Option<Session>,
+    started: &mut Vec<Daemon>,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    let mut attached = session.as_ref().is_some_and(|s| s.attached);
     let mut events = EventStream::new();
     let mut boot_tick = tokio::time::interval(BOOT_TICK);
     let mut turn_tick = tokio::time::interval(TURN_TICK);
     let mut theme_tick = tokio::time::interval(THEME_TICK);
+    let mut home_tick = tokio::time::interval(HOME_TICK);
+    // Probe results for Home's rows, from a task per tick.
+    let (states_tx, mut states_rx) =
+        tokio::sync::mpsc::channel::<Vec<(std::path::PathBuf, home::EntityState)>>(4);
     // A ticker that is gated off for a while must not burst when it comes
     // back; skip the missed periods.
-    for t in [&mut boot_tick, &mut turn_tick, &mut theme_tick] {
+    for t in [
+        &mut boot_tick,
+        &mut turn_tick,
+        &mut theme_tick,
+        &mut home_tick,
+    ] {
         t.set_missed_tick_behavior(MissedTickBehavior::Delay);
     }
-    let attach_deadline = Instant::now() + ATTACH_TIMEOUT;
+    let mut attach_deadline = Instant::now() + ATTACH_TIMEOUT;
+    // The daemon address, for the boot status; set when a session opens.
+    let mut daemon_base: Option<String> = session.as_ref().map(|s| s.client.base().to_string());
 
     // The in-flight chat turn, if any: its event receiver and the task that
     // pumps the SSE stream into it. Dropping the task drops the response body,
@@ -189,6 +422,9 @@ async fn event_loop(
 
     let mut dirty = true;
     let mut last_draw = Instant::now() - FRAME;
+    // Set by the Create row; handled after the select so the event stream
+    // can be dropped and rebuilt around the wizard.
+    let mut create = false;
 
     if attached {
         app.attached();
@@ -204,7 +440,7 @@ async fn event_loop(
                 std::io::stdout(),
                 crossterm::terminal::BeginSynchronizedUpdate
             );
-            terminal.draw(|f| app.render(f))?;
+            term.terminal.draw(|f| app.render(f))?;
             let _ = execute!(
                 std::io::stdout(),
                 crossterm::terminal::EndSynchronizedUpdate
@@ -221,8 +457,50 @@ async fn event_loop(
             ev = events.next() => {
                 match ev {
                     Some(Ok(Event::Key(key))) => {
-                        if app.on_key(key) == Action::Quit {
-                            return Ok(());
+                        match app.on_key(key) {
+                            Action::Quit => return Ok(()),
+                            Action::Open(i) => {
+                                let Some(config) = app.home.rows[i].config().cloned() else {
+                                    continue;
+                                };
+                                let root = app.home.rows[i].dir.clone();
+                                let state = app.home.rows[i].state.clone();
+                                // A previous pick's poller and turn go; its daemon stays.
+                                drop(session.take());
+                                if let Some(task) = turn_task.take() {
+                                    task.abort();
+                                }
+                                turn_rx = None;
+                                match Session::open(&config, root.clone(), state, started) {
+                                    Ok(s) => {
+                                        attached = s.attached;
+                                        attach_deadline = Instant::now() + ATTACH_TIMEOUT;
+                                        daemon_base = Some(s.client.base().to_string());
+                                        app.enter_entity(&config);
+                                        app.screen = app::Screen::Home;
+                                        if attached {
+                                            app.attached();
+                                        }
+                                        session = Some(s);
+                                    }
+                                    Err(why) => {
+                                        app.home.daemon_ended(&root, &why);
+                                    }
+                                }
+                            }
+                            Action::Home => {
+                                // The poller and any turn go with the session; the
+                                // daemon this process started stays for Exit.
+                                drop(session.take());
+                                if let Some(task) = turn_task.take() {
+                                    task.abort();
+                                }
+                                turn_rx = None;
+                                attached = false;
+                                app.start_home(rescan_home());
+                            }
+                            Action::Create => create = true,
+                            Action::None => {}
                         }
                         dirty = true;
                     }
@@ -247,7 +525,12 @@ async fn event_loop(
                     None => return Ok(()),
                 }
             }
-            msg = bg.recv() => {
+            msg = async {
+                match session.as_mut() {
+                    Some(s) => s.bg.recv().await,
+                    None => std::future::pending().await,
+                }
+            } => {
                 match msg {
                     Some(Bg::Attached) => {
                         attached = true;
@@ -256,8 +539,15 @@ async fn event_loop(
                     }
                     Some(Bg::Unreachable { retry_in }) => {
                         attached = false;
-                        if app.screen != app::Screen::Boot {
-                            app.daemon_lost(retry_in);
+                        match app.screen {
+                            app::Screen::Talk => app.daemon_lost(retry_in),
+                            app::Screen::Home => {
+                                app.home.notice = Some(format!(
+                                    "no daemon answered at {} — retrying",
+                                    daemon_base.as_deref().unwrap_or("?")
+                                ));
+                            }
+                            app::Screen::Boot => {}
                         }
                     }
                     Some(Bg::Bar(update)) => app.apply_bar(&update),
@@ -316,15 +606,53 @@ async fn event_loop(
                 app.talk.tick();
                 dirty = true;
             }
-            _ = boot_tick.tick(), if app.screen == app::Screen::Boot => {
+            _ = boot_tick.tick(), if app.screen == app::Screen::Boot
+                || (app.screen == app::Screen::Home
+                    && (app.motion.level() != MotionLevel::Off
+                        || app.home.rows.iter().any(|r| r.state == home::EntityState::Starting))) => {
                 app.tick();
-                if !attached && Instant::now() > attach_deadline {
+                if app.screen == app::Screen::Boot && !attached && Instant::now() > attach_deadline {
                     app.boot.status = format!(
                         "no daemon at {} — still trying (q to quit)",
-                        client.base()
+                        daemon_base.as_deref().unwrap_or("?")
                     );
                 }
                 dirty = true;
+            }
+            _ = home_tick.tick(), if app.screen == app::Screen::Home => {
+                // A daemon we started that already died: say so on its row.
+                for (dir, why) in reap_daemons(started).await {
+                    tracing::warn!("daemon for {} ended: {why}", dir.display());
+                    app.home.daemon_ended(&dir, &why);
+                    dirty = true;
+                }
+                // One task probes every row; the loop never awaits the network.
+                let targets: Vec<(std::path::PathBuf, String, Client)> = app
+                    .home
+                    .rows
+                    .iter()
+                    .filter_map(|r| r.client().map(|c| (r.dir.clone(), r.name.clone(), c)))
+                    .collect();
+                let tx = states_tx.clone();
+                tokio::spawn(async move {
+                    let mut set = tokio::task::JoinSet::new();
+                    for (dir, name, c) in targets {
+                        set.spawn(async move {
+                            (dir, home::EntityState::from(c.probe_detail(&name).await))
+                        });
+                    }
+                    let mut states = Vec::new();
+                    while let Some(r) = set.join_next().await {
+                        if let Ok(s) = r {
+                            states.push(s);
+                        }
+                    }
+                    let _ = tx.try_send(states);
+                });
+            }
+            Some(states) = states_rx.recv() => {
+                app.home.apply_states(&states);
+                dirty |= app.screen == app::Screen::Home;
             }
             _ = theme_tick.tick() => {
                 if let Some(previous) = app.theme.poll() {
@@ -334,6 +662,23 @@ async fn event_loop(
             }
             // Something is dirty but the pacer said "not yet": wake for it.
             _ = tokio::time::sleep_until((last_draw + FRAME).into()), if dirty => {}
+        }
+
+        if create {
+            create = false;
+            // dialoguer reads the cooked terminal; our reader must be gone.
+            drop(events);
+            let (cwd, home_dir) = where_we_are();
+            let target = create_target(&cwd, home_dir.as_deref());
+            let result = suspend_for(term, run_wizard(&target)).await;
+            events = EventStream::new();
+            app.start_home(rescan_home());
+            app.home.notice = Some(match result {
+                Ok(()) => "pulse created — pick it to start".to_string(),
+                Err(e) => format!("the wizard did not finish: {e}"),
+            });
+            dirty = true;
+            continue;
         }
 
         // The page asked for a send or a cancel; the loop owns the sockets.
@@ -346,11 +691,14 @@ async fn event_loop(
             dirty = true;
         }
         if let Some(text) = app.talk.take_outbox() {
+            let Some(s) = session.as_ref() else {
+                continue;
+            };
             if let Some(task) = turn_task.take() {
                 task.abort();
             }
             let (tx, rx) = tokio::sync::mpsc::channel(256);
-            let c = client.clone();
+            let c = s.client.clone();
             turn_task = Some(tokio::spawn(async move {
                 match c.chat_stream("tui", &text).await {
                     Ok(stream) => {
@@ -369,8 +717,48 @@ async fn event_loop(
             turn_rx = Some(rx);
             // A finished turn is a ledger row; ask for fresh bar facts once
             // the poller sees it (debounced there).
-            let _ = ctl.try_send(Ctl::Refresh);
+            let _ = s.ctl.try_send(Ctl::Refresh);
             dirty = true;
         }
+    }
+}
+
+#[cfg(test)]
+mod create_target_tests {
+    use super::create_target;
+
+    fn entity_at(dir: &std::path::Path, name: &str) {
+        let d = dir.join(name);
+        std::fs::create_dir_all(&d).unwrap();
+        std::fs::write(d.join("pulse-null.toml"), "").unwrap();
+    }
+
+    #[test]
+    fn create_goes_where_entities_already_live_else_home_pulse_null() {
+        let home = tempfile::tempdir().unwrap();
+        let cwd = tempfile::tempdir().unwrap();
+        // Nothing anywhere: ~/pulse-null, not the cwd.
+        assert_eq!(
+            create_target(cwd.path(), Some(home.path())),
+            home.path().join("pulse-null")
+        );
+        // Entities under ~/pulse-null: there.
+        entity_at(&home.path().join("pulse-null"), "echo");
+        assert_eq!(
+            create_target(cwd.path(), Some(home.path())),
+            home.path().join("pulse-null")
+        );
+        // Entities as children of the cwd: the cwd is the entity home.
+        let flat = tempfile::tempdir().unwrap();
+        entity_at(flat.path(), "nova");
+        assert_eq!(
+            create_target(flat.path(), Some(home.path())),
+            flat.path().to_path_buf()
+        );
+        // Inside an entity: still ~/pulse-null, never inside the entity.
+        assert_eq!(
+            create_target(&flat.path().join("nova/memory"), Some(home.path())),
+            home.path().join("pulse-null")
+        );
     }
 }

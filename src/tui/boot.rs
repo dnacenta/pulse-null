@@ -41,25 +41,24 @@ impl Boot {
         Self::split(area)[1]
     }
 
-    fn split(area: Rect) -> [Rect; 5] {
-        Layout::vertical([
-            Constraint::Fill(1),
-            Constraint::Length(4),
-            Constraint::Length(3),
-            Constraint::Length(2),
-            Constraint::Fill(1),
-        ])
-        .areas(area)
+    /// The logo's rectangle inside a header drawn by `render_header`.
+    #[must_use]
+    pub fn logo_area_in(header: Rect) -> Rect {
+        Self::split_header(header)[0]
     }
 
-    pub fn render(&mut self, frame: &mut Frame, area: Rect, t: Tokens, tick: u64) {
-        let [_, logo, aurora, status, _] = Self::split(area);
+    fn split_header(header: Rect) -> [Rect; 2] {
+        Layout::vertical([Constraint::Length(4), Constraint::Length(3)]).areas(header)
+    }
 
-        frame.render_widget(
-            Paragraph::new("").style(Style::default().bg(t.ground)),
-            area,
-        );
+    /// Logo and aurora only (Home draws its own lines under them).
+    pub fn render_header(&self, frame: &mut Frame, header: Rect, t: Tokens, tick: u64) {
+        let [logo, aurora] = Self::split_header(header);
+        Self::draw_logo(frame, logo, t);
+        Self::draw_aurora(frame, aurora, t, tick);
+    }
 
+    fn draw_logo(frame: &mut Frame, logo: Rect, t: Tokens) {
         // "PULSE NULL" in quadrant pixels: 10 glyphs × 4 cells = 40 cols, 4 rows.
         let big = BigText::builder()
             .pixel_size(PixelSize::Quadrant)
@@ -68,7 +67,9 @@ impl Boot {
             .centered()
             .build();
         frame.render_widget(big, logo);
+    }
 
+    fn draw_aurora(frame: &mut Frame, aurora: Rect, t: Tokens, tick: u64) {
         // Three drifting sine waves in the accent family.
         let phase = tick as f64 * 0.08;
         let w = f64::from(aurora.width.max(1));
@@ -99,6 +100,29 @@ impl Boot {
                 }
             });
         frame.render_widget(canvas, aurora);
+    }
+
+    fn split(area: Rect) -> [Rect; 5] {
+        Layout::vertical([
+            Constraint::Fill(1),
+            Constraint::Length(4),
+            Constraint::Length(3),
+            Constraint::Length(2),
+            Constraint::Fill(1),
+        ])
+        .areas(area)
+    }
+
+    pub fn render(&mut self, frame: &mut Frame, area: Rect, t: Tokens, tick: u64) {
+        let [_, logo, aurora, status, _] = Self::split(area);
+
+        frame.render_widget(
+            Paragraph::new("").style(Style::default().bg(t.ground)),
+            area,
+        );
+
+        Self::draw_logo(frame, logo, t);
+        Self::draw_aurora(frame, aurora, t, tick);
 
         // Status line with spinner, centered.
         let throbber = Throbber::default()
