@@ -26,9 +26,9 @@ pub enum ClientError {
 /// The outcome of a health probe, coarse enough for a menu row.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Probe {
-    /// `/health` answered OK and named the entity we expected.
+    /// `/health` answered OK and named the pulse we expected.
     Up,
-    /// `/health` answered OK but for another entity: the port is theirs.
+    /// `/health` answered OK but for another pulse: the port is theirs.
     Foreign(String),
     /// Nothing listens (connection refused): a daemon can be started.
     Refused,
@@ -37,7 +37,7 @@ pub enum Probe {
 }
 
 /// One connection pool for every client in the process: building a
-/// reqwest client is not free, and Home makes one per entity row.
+/// reqwest client is not free, and Home makes one per pulse row.
 fn shared_http() -> reqwest::Client {
     static HTTP: std::sync::LazyLock<reqwest::Client> = std::sync::LazyLock::new(|| {
         reqwest::Client::builder()
@@ -49,7 +49,7 @@ fn shared_http() -> reqwest::Client {
     HTTP.clone()
 }
 
-/// A connection to one entity daemon.
+/// A connection to one pulse daemon.
 #[derive(Clone)]
 pub struct Client {
     base: String,
@@ -111,11 +111,11 @@ impl Client {
         r
     }
 
-    /// What listens on the daemon's port, for Home's entity rows. `/health`
+    /// What listens on the daemon's port, for Home's pulse rows. `/health`
     /// needs no credential, so none is sent: a probe goes to whatever holds
-    /// the port. The daemon's answer names its entity; a mismatch is
+    /// the port. The daemon's answer names its pulse; a mismatch is
     /// `Foreign`, never `Up`.
-    pub async fn probe_detail(&self, expect_entity: &str) -> Probe {
+    pub async fn probe_detail(&self, expect_pulse: &str) -> Probe {
         let resp = self
             .http
             .get(format!("{}/health", self.base))
@@ -125,8 +125,8 @@ impl Client {
         match resp {
             Ok(r) if r.status().is_success() => {
                 match r.json::<crate::wire::HealthResponse>().await {
-                    Ok(h) if h.entity == expect_entity => Probe::Up,
-                    Ok(h) => Probe::Foreign(h.entity),
+                    Ok(h) if h.pulse == expect_pulse => Probe::Up,
+                    Ok(h) => Probe::Foreign(h.pulse),
                     Err(_) => Probe::Other,
                 }
             }
@@ -136,7 +136,7 @@ impl Client {
         }
     }
 
-    /// True when `/health` answers 200 within a second (any entity).
+    /// True when `/health` answers 200 within a second (any pulse).
     pub async fn probe(&self) -> bool {
         matches!(
             self.http

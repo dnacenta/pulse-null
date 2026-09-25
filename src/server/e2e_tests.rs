@@ -13,7 +13,7 @@ use tokio::sync::RwLock;
 use tower::ServiceExt;
 
 use crate::config::{
-    AutonomyConfig, Config, EntityConfig, GraphConfig, LlmConfig, MemoryConfig, MonitoringConfig,
+    AutonomyConfig, CaliberConfig, Config, GraphConfig, LlmConfig, MemoryConfig, MonitoringConfig,
     OutreachConfig, PipelineConfig, PredictionConfig, PulseConfig, SchedulerConfig, SecurityConfig,
     ServerConfig, SessionConfig, TrustConfig,
 };
@@ -164,8 +164,8 @@ impl LmProvider for RefusingProvider {
 
 fn test_config() -> Config {
     Config {
-        entity: EntityConfig {
-            name: "TestEntity".to_string(),
+        pulse: PulseConfig {
+            name: "TestPulse".to_string(),
             owner_name: "Tester".to_string(),
             owner_alias: "T".to_string(),
             rules_dir: None,
@@ -193,7 +193,7 @@ fn test_config() -> Config {
         pipeline: PipelineConfig::default(),
         monitoring: MonitoringConfig::default(),
         autonomy: AutonomyConfig::default(),
-        pulse: PulseConfig::default(),
+        caliber: CaliberConfig::default(),
         graph: GraphConfig::default(),
         prediction: PredictionConfig::default(),
         tension: Default::default(),
@@ -256,7 +256,7 @@ async fn build_state_boxed_with_config(
     let wal =
         crate::wal::WalWriter::new(&root_dir.join("sessions"), crate::wal::WalFsync::None).ok();
     let session_store =
-        crate::session_store::SessionStore::new(&root_dir, &config.sessions, &config.entity.name)
+        crate::session_store::SessionStore::new(&root_dir, &config.sessions, &config.pulse.name)
             .await;
     let plugin_manager = crate::plugins::manager::PluginManager::new(&config);
     let alert_queue = crate::scheduler::alerts::AlertQueue::load(&root_dir);
@@ -264,7 +264,7 @@ async fn build_state_boxed_with_config(
         config,
         provider,
         session_store,
-        system_prompt: RwLock::new("You are a test entity.".to_string()),
+        system_prompt: RwLock::new("You are a test pulse.".to_string()),
         tools,
         event_bus: Arc::new(EventBus::new(16)),
         root_dir,

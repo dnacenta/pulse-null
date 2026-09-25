@@ -134,10 +134,9 @@ pub struct CognitiveSignals {
 pub struct HealthResponse {
     /// `healthy`, `degraded` or `offline`.
     pub status: String,
-    /// The entity's name. Also accepted as `pulse`, the product word a
-    /// daemon may use for it on the wire.
-    #[serde(alias = "pulse")]
-    pub entity: String,
+    /// The pulse's name. Daemons before PN-115 sent it as `entity`.
+    #[serde(alias = "entity")]
+    pub pulse: String,
     #[serde(default)]
     pub isolation: bool,
     /// `leading` or `not-leading` — observed, not inferred from the marker.
@@ -156,20 +155,35 @@ pub struct HealthResponse {
 mod tests {
     use super::*;
 
+    /// PN-115: a daemon from before the rename names the pulse `entity`.
     #[test]
-    fn health_accepts_pulse_as_the_entity_field() {
+    fn pre_rename_health_body_deserializes() {
+        let old = serde_json::json!({
+            "status": "healthy",
+            "entity": "Echo",
+            "control_plane": "leading",
+        });
+        let h: HealthResponse = serde_json::from_value(old).unwrap();
+        assert_eq!(h.pulse, "Echo");
+        let v = serde_json::to_value(&h).unwrap();
+        assert_eq!(v["pulse"], "Echo");
+        assert!(v.get("entity").is_none());
+    }
+
+    #[test]
+    fn health_reads_the_pulse_field() {
         let h: HealthResponse = serde_json::from_str(
             r#"{"status":"healthy","pulse":"Echo","isolation":false,"control_plane":"leading"}"#,
         )
         .unwrap();
-        assert_eq!(h.entity, "Echo");
+        assert_eq!(h.pulse, "Echo");
     }
 
     #[test]
     fn health_and_cognitive_health_round_trip() {
         let h = HealthResponse {
             status: "degraded".into(),
-            entity: "echo".into(),
+            pulse: "echo".into(),
             isolation: true,
             control_plane: "leading".into(),
             last_error: Some("x".into()),

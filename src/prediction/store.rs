@@ -1,6 +1,6 @@
 //! Prediction stack persistence — atomic JSON file storage.
 //!
-//! Predictions are stored as `predictions.json` in the entity root directory.
+//! Predictions are stored as `predictions.json` in the pulse root directory.
 //! Writes use an atomic rename pattern (write to `.tmp`, then rename) to prevent
 //! data corruption from interrupted writes.
 //!
@@ -31,7 +31,7 @@ const PREDICTIONS_TMP: &str = "predictions.json.tmp";
 
 /// Load the prediction stack from disk and apply the given config.
 ///
-/// `predictions.json` carries only the per-entity predictions and errors —
+/// `predictions.json` carries only the per-pulse predictions and errors —
 /// calibration knobs (`PredictionConfig`) live in `pulse-null.toml` and are
 /// always rehydrated from the caller's `Config`, never from the snapshot.
 /// Returns an empty stack with `config` if the file is missing, unreadable,
@@ -80,7 +80,7 @@ pub fn load(root_dir: &Path, config: PredictionConfig) -> PredictionStack {
 /// the prediction engine always boots. That is the wrong contract inside
 /// [`save_delta`], where the loaded stack is written straight back — a
 /// transient read/parse failure would silently wipe the store. Here a
-/// missing file is still an empty stack (fresh entity), but an existing
+/// missing file is still an empty stack (fresh pulse), but an existing
 /// file that cannot be read or parsed is an error and the delta is aborted.
 ///
 /// A corrupt file is additionally **quarantined** (renamed to
@@ -447,7 +447,7 @@ mod tests {
         assert_eq!(loaded.predictions[0].content, "after-quarantine");
     }
 
-    /// PN-86: missing file is a fresh entity, not an error — save_delta
+    /// PN-86: missing file is a fresh pulse, not an error — save_delta
     /// starts from an empty stack and creates the file.
     #[test]
     fn save_delta_missing_file_starts_empty() {

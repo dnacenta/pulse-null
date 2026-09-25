@@ -67,7 +67,7 @@ pub enum Moment {
     PageSweep(Dir),
     /// A pane gained focus (border goes dim → accent).
     Focus,
-    /// The entity is thinking: the pane border breathes until cancelled.
+    /// The pulse is thinking: the pane border breathes until cancelled.
     Breathe,
     /// A new transcript line fades in from dim.
     LineIn,

@@ -4,7 +4,7 @@
 //! flags degraded sessions when thresholds are exceeded, and exposes metrics
 //! via the health endpoint.
 //!
-//! Confirmed systemic issue: all three entities (Echo, Nova, Synth) exhibited
+//! Confirmed systemic issue: all three pulses (Echo, Nova, Synth) exhibited
 //! hallucinated turn generation. This module makes that visible and actionable.
 
 use chrono::Utc;

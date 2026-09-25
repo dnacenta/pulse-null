@@ -142,7 +142,7 @@ fn row_event(row: &LedgerRow) -> Option<Event> {
 
 /// SSE stream of ledger rows. Honours `Last-Event-ID` for replay from the ring.
 ///
-/// Owner only (rows describe the owner's entity), and capped by
+/// Owner only (rows describe the owner's pulse), and capped by
 /// [`crate::server::MAX_EVENT_STREAMS`] concurrent connections — a 503 beyond that.
 pub async fn events(
     State(state): State<Arc<AppState>>,

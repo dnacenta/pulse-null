@@ -16,15 +16,13 @@ fn validate_threshold(name: &str, soft: usize, hard: usize) -> Result<(), Config
 }
 
 pub fn validate(config: &Config) -> Result<(), ConfigError> {
-    if config.entity.name.is_empty() {
-        return Err(ConfigError::Validation(
-            "Entity name cannot be empty".into(),
-        ));
+    if config.pulse.name.is_empty() {
+        return Err(ConfigError::Validation("Pulse name cannot be empty".into()));
     }
-    if config.entity.owner_name.is_empty() {
+    if config.pulse.owner_name.is_empty() {
         return Err(ConfigError::Validation("Owner name cannot be empty".into()));
     }
-    if let Some(ref rules_dir) = config.entity.rules_dir {
+    if let Some(ref rules_dir) = config.pulse.rules_dir {
         let path = std::path::Path::new(rules_dir);
         if !path.exists() {
             return Err(ConfigError::Validation(format!(

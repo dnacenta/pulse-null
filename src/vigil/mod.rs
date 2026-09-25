@@ -44,7 +44,12 @@ pub fn docs_dir() -> Result<PathBuf, String> {
         return Ok(PathBuf::from(p));
     }
     std::env::var("HOME")
-        .map(|h| PathBuf::from(h).join("entity").join("journal"))
+        .map(|h| {
+            PathBuf::from(h)
+                .join("pulse-null")
+                .join("echo")
+                .join("journal")
+        })
         .map_err(|_| "Could not determine home directory".to_string())
 }
 
@@ -186,7 +191,7 @@ impl VigilEcho {
                 question: "Identity documents directory:".into(),
                 required: true,
                 secret: false,
-                default: Some("~/entity/journal".into()),
+                default: Some("~/pulse-null/echo/journal".into()),
             },
         ]
     }
@@ -228,13 +233,13 @@ impl Plugin for VigilEchoPlugin {
                 .and_then(|t| t.get("claude_dir"))
                 .and_then(|v| v.as_str())
                 .map(std::path::PathBuf::from)
-                .unwrap_or_else(|| ctx.entity_root.join("monitoring"));
+                .unwrap_or_else(|| ctx.pulse_root.join("monitoring"));
 
             let docs_dir = table
                 .and_then(|t| t.get("docs_dir"))
                 .and_then(|v| v.as_str())
                 .map(std::path::PathBuf::from)
-                .unwrap_or_else(|| ctx.entity_root.join("journal"));
+                .unwrap_or_else(|| ctx.pulse_root.join("journal"));
 
             tracing::info!(
                 "vigil-echo: claude_dir = {}, docs_dir = {}",

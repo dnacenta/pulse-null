@@ -82,7 +82,7 @@ pub struct CompactionHealth {
     pub circuit_breaker_count: usize,
     /// Total compaction events in the window.
     pub event_count: usize,
-    /// Suggestion for the entity/operator (if any).
+    /// Suggestion for the running pulse or its operator (if any).
     pub suggestion: Option<String>,
 }
 

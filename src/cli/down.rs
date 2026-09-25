@@ -8,18 +8,18 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let pid = match pidfile::read(&root_dir) {
         Some(pid) => pid,
         None => {
-            eprintln!("No running entity found (no PID file).");
+            eprintln!("No running pulse found (no PID file).");
             return Ok(());
         }
     };
 
     if !pidfile::is_alive(pid) {
-        eprintln!("Entity is not running (stale PID file, pid {}).", pid);
+        eprintln!("Pulse is not running (stale PID file, pid {}).", pid);
         pidfile::remove(&root_dir);
         return Ok(());
     }
 
-    println!("Stopping entity (pid {})...", pid);
+    println!("Stopping pulse (pid {})...", pid);
 
     if !pidfile::kill(pid) {
         return Err(format!("Failed to send SIGTERM to pid {}", pid).into());
@@ -29,12 +29,12 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
     for _ in 0..100 {
         if !pidfile::is_alive(pid) {
             pidfile::remove(&root_dir);
-            println!("Entity stopped.");
+            println!("Pulse stopped.");
             return Ok(());
         }
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     }
 
-    eprintln!("Entity did not stop within 10 seconds (pid {}).", pid);
+    eprintln!("Pulse did not stop within 10 seconds (pid {}).", pid);
     Ok(())
 }

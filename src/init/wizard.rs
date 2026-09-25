@@ -8,13 +8,13 @@ use super::templates;
 pub async fn run(target_dir: &Path) -> Result<(), Box<dyn std::error::Error>> {
     println!();
     println!("  {}", style("Welcome to pulse-null.").bold());
-    println!("  Let's create your entity.");
+    println!("  Let's create your pulse.");
     println!();
 
-    // Entity name
-    let entity_name: String = Input::new()
-        .with_prompt("  What should your entity be called?")
-        .validate_with(|s: &String| crate::discovery::validate_entity_name(s).map(|_| ()))
+    // Pulse name
+    let pulse_name: String = Input::new()
+        .with_prompt("  What should your pulse be called?")
+        .validate_with(|s: &String| crate::discovery::validate_pulse_name(s).map(|_| ()))
         .interact_text()?;
 
     // Owner name
@@ -24,21 +24,21 @@ pub async fn run(target_dir: &Path) -> Result<(), Box<dyn std::error::Error>> {
 
     // Owner alias
     let owner_alias: String = Input::new()
-        .with_prompt("  How should the entity address you?")
+        .with_prompt("  How should the pulse address you?")
         .default(owner_name.clone())
         .interact_text()?;
 
     println!();
-    println!("  {}", style("Let's set up your entity's identity.").bold());
+    println!("  {}", style("Let's set up your pulse's identity.").bold());
     println!();
 
     // Core values
-    println!("  Core values — what principles should guide your entity?");
+    println!("  Core values — what principles should guide your pulse?");
     println!("  (Enter one per line, empty line to finish)");
     let values = read_multiline("  > ")?;
 
     // Personality traits
-    println!("  Personality traits — how should your entity communicate?");
+    println!("  Personality traits — how should your pulse communicate?");
     println!("  (Enter one per line, empty line to finish)");
     let traits = read_multiline("  > ")?;
 
@@ -197,33 +197,33 @@ pub async fn run(target_dir: &Path) -> Result<(), Box<dyn std::error::Error>> {
 
     println!();
     println!(
-        "  Creating entity \"{}\"...",
-        style(&entity_name).cyan().bold()
+        "  Creating pulse \"{}\"...",
+        style(&pulse_name).cyan().bold()
     );
 
     // Create directory structure
-    let dir_name = crate::discovery::validate_entity_name(&entity_name)?;
-    let entity_dir = target_dir.join(dir_name);
+    let dir_name = crate::discovery::validate_pulse_name(&pulse_name)?;
+    let pulse_dir = target_dir.join(dir_name);
 
-    // Guard against overwriting an existing entity
-    if entity_dir.join("pulse-null.toml").exists() {
+    // Guard against overwriting an existing pulse
+    if pulse_dir.join("pulse-null.toml").exists() {
         println!();
         println!(
-            "  {} Entity \"{}\" already exists at {}",
+            "  {} Pulse \"{}\" already exists at {}",
             style("⚠").yellow(),
-            entity_name,
-            entity_dir.display()
+            pulse_name,
+            pulse_dir.display()
         );
-        println!("  Choose a different name or delete the existing entity first.");
+        println!("  Choose a different name or delete the existing pulse first.");
         println!();
         return Ok(());
     }
 
-    create_directory_structure(&entity_dir)?;
+    create_directory_structure(&pulse_dir)?;
 
     // Generate files
     let identity = templates::Identity {
-        entity_name: entity_name.clone(),
+        pulse_name: pulse_name.clone(),
         owner_name: owner_name.clone(),
         owner_alias: owner_alias.clone(),
         values: values.clone(),
@@ -232,7 +232,7 @@ pub async fn run(target_dir: &Path) -> Result<(), Box<dyn std::error::Error>> {
     };
 
     let config = templates::ConfigData {
-        entity_name: entity_name.clone(),
+        pulse_name: pulse_name.clone(),
         owner_name: owner_name.clone(),
         owner_alias: owner_alias.clone(),
         provider: provider_name,
@@ -257,27 +257,27 @@ pub async fn run(target_dir: &Path) -> Result<(), Box<dyn std::error::Error>> {
         ("memory/ARCHIVE.md", "# Archive Index\n".to_string()),
         (
             "journal/LEARNING.md",
-            format!("# {} — Learning\n\nResearch journal. Raw notes from reading, papers, concepts encountered.\n", entity_name),
+            format!("# {} — Learning\n\nResearch journal. Raw notes from reading, papers, concepts encountered.\n", pulse_name),
         ),
         (
             "journal/THOUGHTS.md",
-            format!("# {} — Thoughts\n\nIncubation space. Half-formed ideas that need multiple passes.\n", entity_name),
+            format!("# {} — Thoughts\n\nIncubation space. Half-formed ideas that need multiple passes.\n", pulse_name),
         ),
         (
             "journal/REFLECTIONS.md",
-            format!("# {} — Reflections\n\nCrystallized observations, patterns, and lessons learned.\n", entity_name),
+            format!("# {} — Reflections\n\nCrystallized observations, patterns, and lessons learned.\n", pulse_name),
         ),
         (
             "journal/CURIOSITY.md",
-            format!("# {} — Curiosity\n\n## Open Questions\n\n## Themes\n\n## Explored\n", entity_name),
+            format!("# {} — Curiosity\n\n## Open Questions\n\n## Themes\n\n## Explored\n", pulse_name),
         ),
         (
             "journal/PRAXIS.md",
-            format!("# {} — Praxis\n\nActive behavioral policies derived from reflection.\n", entity_name),
+            format!("# {} — Praxis\n\nActive behavioral policies derived from reflection.\n", pulse_name),
         ),
         (
             "journal/LOGBOOK.md",
-            format!("# {} — Logbook\n\nSession tracking and daily records.\n", entity_name),
+            format!("# {} — Logbook\n\nSession tracking and daily records.\n", pulse_name),
         ),
         (
             "schedule.json",
@@ -294,7 +294,7 @@ pub async fn run(target_dir: &Path) -> Result<(), Box<dyn std::error::Error>> {
     ];
 
     for (path, content) in &files {
-        let full_path = entity_dir.join(path);
+        let full_path = pulse_dir.join(path);
         std::fs::write(&full_path, content)?;
         let display_path = path.rsplit('/').next().unwrap_or(path);
         println!(
@@ -305,40 +305,38 @@ pub async fn run(target_dir: &Path) -> Result<(), Box<dyn std::error::Error>> {
     }
 
     // Wire up Claude Code integration if provider is claude-code. Everything
-    // lands inside the entity directory — nothing in $HOME/.claude — so any
-    // number of entities can share one unix user (PN-104).
+    // lands inside the pulse directory — nothing in $HOME/.claude — so any
+    // number of pulses can share one unix user (PN-104).
     if config.provider == "claude-code" {
         println!();
         println!(
             "  {}",
             style("Setting up Claude Code integration...").bold()
         );
-        let results = super::claude_code_bootstrap::ensure(&entity_dir);
+        let results = super::claude_code_bootstrap::ensure(&pulse_dir);
         for item in &results {
             println!("  {item}");
         }
     }
 
     println!();
-    println!(
-        "  Entity \"{}\" is ready.",
-        style(&entity_name).cyan().bold()
-    );
+    println!("  Pulse \"{}\" is ready.", style(&pulse_name).cyan().bold());
 
-    // Show the correct startup commands: the entity on its own, or all of
-    // them from the entity home (legacy `entities/` trees run from the parent).
-    let entity_home = if target_dir.file_name().is_some_and(|n| n == "entities") {
+    // Show the correct startup commands: the pulse on its own, or all of
+    // them from the pulse home (`pulses/` / legacy `entities/` container
+    // trees run from the parent).
+    let pulse_home = if crate::discovery::is_pulse_container(target_dir) {
         target_dir.parent().unwrap_or(target_dir)
     } else {
         target_dir
     };
     println!(
         "  Run {} to start it on its own.",
-        style(format!("cd {} && pulse-null up", entity_dir.display())).green()
+        style(format!("cd {} && pulse-null up", pulse_dir.display())).green()
     );
     println!(
-        "  Run {} to start every entity here.",
-        style(format!("cd {} && pulse-null up", entity_home.display())).green()
+        "  Run {} to start every pulse here.",
+        style(format!("cd {} && pulse-null up", pulse_home.display())).green()
     );
     println!(
         "  Manage plugins with: {}",

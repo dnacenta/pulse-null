@@ -16,7 +16,7 @@ const fn b(keys: &'static str, what: &'static str) -> Binding {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Context {
     Boot,
-    /// The entity menu.
+    /// The pulse menu.
     Home,
     /// Talk, prompt focused.
     Prompt {

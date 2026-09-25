@@ -12,14 +12,14 @@ const MAX_MATCHES: usize = 200;
 /// Maximum file size to search (1 MB). Larger files are skipped.
 const MAX_FILE_SIZE: u64 = 1_024 * 1_024;
 
-/// Search file contents for a pattern within the entity's data directory.
+/// Search file contents for a pattern within the pulse's data directory.
 pub struct GrepTool {
-    entity_root: PathBuf,
+    pulse_root: PathBuf,
 }
 
 impl GrepTool {
-    pub fn new(entity_root: PathBuf) -> Self {
-        Self { entity_root }
+    pub fn new(pulse_root: PathBuf) -> Self {
+        Self { pulse_root }
     }
 }
 
@@ -29,7 +29,7 @@ impl Tool for GrepTool {
     }
 
     fn description(&self) -> &str {
-        "Search file contents for a regex pattern within the entity's data directory. \
+        "Search file contents for a regex pattern within the pulse's data directory. \
          Returns matching lines with file paths and line numbers."
     }
 
@@ -43,7 +43,7 @@ impl Tool for GrepTool {
                 },
                 "path": {
                     "type": "string",
-                    "description": "Directory or file path relative to entity root. Defaults to root."
+                    "description": "Directory or file path relative to pulse root. Defaults to root."
                 },
                 "glob": {
                     "type": "string",
@@ -55,7 +55,7 @@ impl Tool for GrepTool {
     }
 
     fn execute(&self, input: serde_json::Value) -> ToolResult<'_> {
-        let entity_root = self.entity_root.clone();
+        let pulse_root = self.pulse_root.clone();
         Box::pin(async move {
             let pattern_str = input["pattern"].as_str().ok_or_else(|| {
                 ToolError::ExecutionFailed("Missing 'pattern' parameter".to_string())
@@ -65,7 +65,7 @@ impl Tool for GrepTool {
                 .map_err(|e| ToolError::ExecutionFailed(format!("Invalid regex pattern: {}", e)))?;
 
             let path = input["path"].as_str().unwrap_or(".");
-            let resolved = resolve_sandboxed_path(&entity_root, path)?;
+            let resolved = resolve_sandboxed_path(&pulse_root, path)?;
 
             if !resolved.exists() {
                 return Err(ToolError::NotFound(format!("Path not found: {}", path)));
@@ -84,17 +84,17 @@ impl Tool for GrepTool {
             // Collect files to search — run the blocking walk on a thread pool
             let files = tokio::task::spawn_blocking({
                 let resolved = resolved.clone();
-                let entity_root = entity_root.clone();
+                let pulse_root = pulse_root.clone();
                 let glob_matcher = glob_matcher.clone();
-                move || collect_files(&resolved, &entity_root, glob_matcher.as_ref())
+                move || collect_files(&resolved, &pulse_root, glob_matcher.as_ref())
             })
             .await
             .map_err(|e| ToolError::ExecutionFailed(format!("Task join error: {}", e)))?;
 
             // Search each file — also blocking I/O
             let matches = tokio::task::spawn_blocking({
-                let entity_root = entity_root.clone();
-                move || search_files(&files, &re, &entity_root)
+                let pulse_root = pulse_root.clone();
+                move || search_files(&files, &re, &pulse_root)
             })
             .await
             .map_err(|e| ToolError::ExecutionFailed(format!("Task join error: {}", e)))?;
@@ -122,13 +122,13 @@ impl Tool for GrepTool {
 /// Walk the directory tree and collect files to search.
 fn collect_files(
     start: &PathBuf,
-    entity_root: &PathBuf,
+    pulse_root: &PathBuf,
     glob_matcher: Option<&GlobMatcher>,
 ) -> Vec<PathBuf> {
     let mut files = Vec::new();
 
     if start.is_file() {
-        if should_search_file(start, entity_root, glob_matcher) {
+        if should_search_file(start, pulse_root, glob_matcher) {
             files.push(start.clone());
         }
         return files;
@@ -140,7 +140,7 @@ fn collect_files(
         .filter_map(|e| e.ok())
     {
         let path = entry.path();
-        if path.is_file() && should_search_file(&path.to_path_buf(), entity_root, glob_matcher) {
+        if path.is_file() && should_search_file(&path.to_path_buf(), pulse_root, glob_matcher) {
             files.push(path.to_path_buf());
         }
     }
@@ -152,7 +152,7 @@ fn collect_files(
 /// Check whether a file should be searched.
 fn should_search_file(
     path: &PathBuf,
-    entity_root: &PathBuf,
+    pulse_root: &PathBuf,
     glob_matcher: Option<&GlobMatcher>,
 ) -> bool {
     // Skip files over the size limit
@@ -164,7 +164,7 @@ fn should_search_file(
 
     // Apply glob filter against the relative path
     if let Some(matcher) = glob_matcher {
-        if let Ok(relative) = path.strip_prefix(entity_root) {
+        if let Ok(relative) = path.strip_prefix(pulse_root) {
             if !matcher.is_match(relative) {
                 return false;
             }
@@ -189,7 +189,7 @@ fn should_search_file(
 }
 
 /// Search files for the regex pattern and return formatted match lines.
-fn search_files(files: &[PathBuf], re: &Regex, entity_root: &PathBuf) -> Vec<String> {
+fn search_files(files: &[PathBuf], re: &Regex, pulse_root: &PathBuf) -> Vec<String> {
     let mut matches = Vec::new();
 
     for file_path in files {
@@ -199,7 +199,7 @@ fn search_files(files: &[PathBuf], re: &Regex, entity_root: &PathBuf) -> Vec<Str
         };
 
         let relative = file_path
-            .strip_prefix(entity_root)
+            .strip_prefix(pulse_root)
             .unwrap_or(file_path)
             .to_string_lossy();
 

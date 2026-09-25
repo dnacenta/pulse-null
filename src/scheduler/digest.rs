@@ -15,13 +15,13 @@ use chrono::Utc;
 /// Reads the archive INDEX.md to find entries with task/research triggers
 /// from today, then reads each archive to extract summaries. Writes a single
 /// "Task Digest" entry to EPHEMERAL.md.
-pub fn write_task_digest(root_dir: &Path, entity_name: &str) {
+pub fn write_task_digest(root_dir: &Path, pulse_name: &str) {
     let today = Utc::now().format("%Y-%m-%d").to_string();
-    write_task_digest_for_date(root_dir, entity_name, &today);
+    write_task_digest_for_date(root_dir, pulse_name, &today);
 }
 
 /// Write a task digest for a specific date (for testing and backfill).
-pub fn write_task_digest_for_date(root_dir: &Path, entity_name: &str, date: &str) {
+pub fn write_task_digest_for_date(root_dir: &Path, pulse_name: &str, date: &str) {
     let index_path = root_dir
         .join("archives")
         .join("conversations")
@@ -81,7 +81,7 @@ pub fn write_task_digest_for_date(root_dir: &Path, entity_name: &str, date: &str
     let mut content = format!("## Task Digest — {}\n\n", now);
     content.push_str(&format!(
         "{} completed {} task(s)\n\n",
-        entity_name,
+        pulse_name,
         summaries.len()
     ));
     content.push_str("### Key outputs\n\n");

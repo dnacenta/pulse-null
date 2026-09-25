@@ -1,7 +1,7 @@
 //! Home: the splash with a menu under it. One "Talk to <pulse>" row per
-//! pulse (entity directory) this user owns, then "Create a new pulse", then
-//! "Exit". "Pulse" is the product word for an entity on screen. The logo
-//! and its coalesce moment come from `boot`; this page only adds the list.
+//! pulse directory this user owns, then "Create a new pulse", then "Exit".
+//! The logo and its coalesce moment come from `boot`; this page only adds
+//! the list.
 //!
 //! Nothing here touches the network. States are probed by the loop and
 //! handed in through `apply_states`; opening a row is an `Action` the loop
@@ -24,24 +24,24 @@ use super::client::{Client, Probe};
 use super::keymap;
 use super::theme::Tokens;
 
-/// What the probe found on an entity's port.
+/// What the probe found on a pulse's port.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum EntityState {
+pub enum PulseState {
     /// Not probed yet.
     Unknown,
-    /// `/health` answered for this entity.
+    /// `/health` answered for this pulse.
     Up,
     /// Nothing listens: Enter starts a daemon in this process.
     Stopped,
     /// Something listens but it is not a healthy daemon.
     Unreachable,
-    /// A healthy daemon, but another entity's: the port is theirs.
+    /// A healthy daemon, but another pulse's: the port is theirs.
     Foreign(String),
     /// Enter was pressed; waiting for the daemon to answer.
     Starting,
 }
 
-impl From<Probe> for EntityState {
+impl From<Probe> for PulseState {
     fn from(p: Probe) -> Self {
         match p {
             Probe::Up => Self::Up,
@@ -52,20 +52,20 @@ impl From<Probe> for EntityState {
     }
 }
 
-/// One entity directory, whether or not it can be used.
+/// One pulse directory, whether or not it can be used.
 #[derive(Clone)]
-pub struct EntityRow {
+pub struct PulseRow {
     pub name: String,
     pub dir: PathBuf,
     /// The loaded config, or why this row cannot be opened (untrusted
     /// directory, config error). Never logged: the config holds secrets.
     pub load: Result<Config, String>,
-    pub state: EntityState,
+    pub state: PulseState,
     /// Another listed row has the same name; the label shows the directory.
     pub ambiguous: bool,
 }
 
-impl EntityRow {
+impl PulseRow {
     /// A row for `dir`: refused when the directory is not this user's, else
     /// whatever the config load says.
     #[must_use]
@@ -80,7 +80,7 @@ impl EntityRow {
     #[must_use]
     pub fn from_load(dir: PathBuf, load: Result<Config, String>) -> Self {
         let name = match &load {
-            Ok(c) => c.entity.name.clone(),
+            Ok(c) => c.pulse.name.clone(),
             Err(_) => dir
                 .file_name()
                 .map(|n| n.to_string_lossy().into_owned())
@@ -90,7 +90,7 @@ impl EntityRow {
             name,
             dir,
             load,
-            state: EntityState::Unknown,
+            state: PulseState::Unknown,
             ambiguous: false,
         }
     }
@@ -119,7 +119,7 @@ impl EntityRow {
 /// A menu line, in display order.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Item {
-    Entity(usize),
+    Pulse(usize),
     Create,
     Exit,
 }
@@ -136,7 +136,7 @@ pub enum HomeAction {
 
 /// Home state.
 pub struct Home {
-    pub rows: Vec<EntityRow>,
+    pub rows: Vec<PulseRow>,
     /// Index into the menu (`item(i)`).
     pub selected: usize,
     /// One dim line under the menu (wizard result, port clash, ...).
@@ -148,7 +148,7 @@ const HEADER_ROWS: u16 = 7;
 
 impl Home {
     #[must_use]
-    pub fn new(mut rows: Vec<EntityRow>) -> Self {
+    pub fn new(mut rows: Vec<PulseRow>) -> Self {
         // Same name twice: say which directory each one is.
         for i in 0..rows.len() {
             let dup = rows
@@ -166,24 +166,24 @@ impl Home {
         h
     }
 
-    /// Every entity directory from every place the CLI looks: the entity
-    /// `cwd` is inside, the discovered entity home, the flat
+    /// Every pulse directory from every place the CLI looks: the pulse
+    /// `cwd` is inside, the discovered pulse home, the flat
     /// `~/pulse-null/<name>` layout, and the legacy `~/entity`. Each is
     /// trusted or refused by `discovery::untrusted_reason`; nothing is
     /// hidden, a refused directory is a dim row with the reason.
     #[must_use]
-    pub fn scan(cwd: &Path, home: Option<&Path>) -> Vec<EntityRow> {
+    pub fn scan(cwd: &Path, home: Option<&Path>) -> Vec<PulseRow> {
         let mut dirs: Vec<PathBuf> = Vec::new();
 
-        // The entity cwd is inside, if any (the walk `Config::load` does).
+        // The pulse cwd is inside, if any (the walk `Config::load` does).
         if let Some(inside) = cwd.ancestors().find(|d| d.join("pulse-null.toml").exists()) {
             dirs.push(inside.to_path_buf());
         }
-        if let Some(entity_home) = crate::discovery::resolve_entity_home(cwd, home) {
-            dirs.extend(crate::discovery::entity_dirs(&entity_home));
+        if let Some(pulse_home) = crate::discovery::resolve_pulse_home(cwd, home) {
+            dirs.extend(crate::discovery::pulse_dirs(&pulse_home));
         }
         if let Some(home) = home {
-            dirs.extend(crate::discovery::entity_dirs(&home.join("pulse-null")));
+            dirs.extend(crate::discovery::pulse_dirs(&home.join("pulse-null")));
             let legacy = home.join("entity");
             if legacy.join("pulse-null.toml").exists() {
                 dirs.push(legacy);
@@ -192,13 +192,13 @@ impl Home {
 
         // One row per directory (canonical path), whatever route found it.
         let mut seen = std::collections::HashSet::new();
-        let mut rows: Vec<EntityRow> = dirs
+        let mut rows: Vec<PulseRow> = dirs
             .into_iter()
             .filter(|dir| {
                 let key = std::fs::canonicalize(dir).unwrap_or_else(|_| dir.clone());
                 seen.insert(key)
             })
-            .map(EntityRow::from_dir)
+            .map(PulseRow::from_dir)
             .collect();
         rows.sort_by(|a, b| a.name.cmp(&b.name).then_with(|| a.dir.cmp(&b.dir)));
         rows
@@ -213,7 +213,7 @@ impl Home {
     #[must_use]
     pub fn item(&self, i: usize) -> Item {
         if i < self.rows.len() {
-            Item::Entity(i)
+            Item::Pulse(i)
         } else if i == self.rows.len() {
             Item::Create
         } else {
@@ -236,7 +236,7 @@ impl Home {
 
     fn is_selectable(&self, item: Item) -> bool {
         match item {
-            Item::Entity(i) => self.rows[i].selectable(),
+            Item::Pulse(i) => self.rows[i].selectable(),
             Item::Create | Item::Exit => true,
         }
     }
@@ -261,10 +261,10 @@ impl Home {
 
     /// Replace probe results by directory. A row we are starting keeps
     /// saying so until its daemon answers; `daemon_ended` clears that.
-    pub fn apply_states(&mut self, states: &[(PathBuf, EntityState)]) {
+    pub fn apply_states(&mut self, states: &[(PathBuf, PulseState)]) {
         for (dir, state) in states {
             if let Some(row) = self.rows.iter_mut().find(|r| &r.dir == dir) {
-                if row.state != EntityState::Starting || *state == EntityState::Up {
+                if row.state != PulseState::Starting || *state == PulseState::Up {
                     row.state = state.clone();
                 }
             }
@@ -275,7 +275,7 @@ impl Home {
     /// back to being probed and the notice says why.
     pub fn daemon_ended(&mut self, dir: &Path, why: &str) {
         if let Some(row) = self.rows.iter_mut().find(|r| r.dir == dir) {
-            row.state = EntityState::Unknown;
+            row.state = PulseState::Unknown;
             self.notice = Some(format!("{} did not start: {why}", row.name));
         }
     }
@@ -312,8 +312,8 @@ impl Home {
 
     fn activate(&mut self) -> HomeAction {
         match self.item(self.selected) {
-            Item::Entity(i) if self.rows[i].selectable() => match &self.rows[i].state {
-                EntityState::Foreign(who) => {
+            Item::Pulse(i) if self.rows[i].selectable() => match &self.rows[i].state {
+                PulseState::Foreign(who) => {
                     self.notice = Some(format!(
                         "port :{} is held by {who} — not {}",
                         self.rows[i].port().unwrap_or(0),
@@ -321,22 +321,22 @@ impl Home {
                     ));
                     HomeAction::None
                 }
-                EntityState::Unreachable => {
+                PulseState::Unreachable => {
                     self.notice = Some(format!(
                         "port :{} answers, but not as a daemon — nothing to attach to",
                         self.rows[i].port().unwrap_or(0)
                     ));
                     HomeAction::None
                 }
-                EntityState::Starting => HomeAction::None,
-                EntityState::Unknown | EntityState::Up | EntityState::Stopped => {
-                    if self.rows[i].state == EntityState::Stopped {
-                        self.rows[i].state = EntityState::Starting;
+                PulseState::Starting => HomeAction::None,
+                PulseState::Unknown | PulseState::Up | PulseState::Stopped => {
+                    if self.rows[i].state == PulseState::Stopped {
+                        self.rows[i].state = PulseState::Starting;
                     }
                     HomeAction::Open(i)
                 }
             },
-            Item::Entity(_) => HomeAction::None,
+            Item::Pulse(_) => HomeAction::None,
             Item::Create => HomeAction::Create,
             Item::Exit => HomeAction::Exit,
         }
@@ -420,7 +420,7 @@ impl Home {
                 Span::styled(format!("{} ", n + 1), Style::default().fg(t.dim)),
                 Span::styled(format!("{label}{pad}"), base),
             ];
-            if let Item::Entity(i) = item {
+            if let Item::Pulse(i) = item {
                 spans.push(Span::raw("  "));
                 spans.extend(state_spans(&self.rows[i], t, g, tick));
             }
@@ -452,7 +452,7 @@ impl Home {
 
     fn label(&self, item: Item) -> String {
         match item {
-            Item::Entity(i) => {
+            Item::Pulse(i) => {
                 let r = &self.rows[i];
                 let mut s = match &r.load {
                     Ok(_) => format!("Talk to {}", r.name),
@@ -469,7 +469,7 @@ impl Home {
     }
 }
 
-fn state_spans(r: &EntityRow, t: Tokens, g: &Glyphs, tick: u64) -> Vec<Span<'static>> {
+fn state_spans(r: &PulseRow, t: Tokens, g: &Glyphs, tick: u64) -> Vec<Span<'static>> {
     if let Err(why) = &r.load {
         return vec![Span::styled(
             super::text::truncate(why, 40, "…"),
@@ -478,12 +478,12 @@ fn state_spans(r: &EntityRow, t: Tokens, g: &Glyphs, tick: u64) -> Vec<Span<'sta
     }
     let port = r.port().map(|p| format!(" · :{p}")).unwrap_or_default();
     let (dot, color, word) = match &r.state {
-        EntityState::Unknown => ("·", t.dim, String::new()),
-        EntityState::Up => (g.dot, t.good, format!("up{port}")),
-        EntityState::Stopped => ("○", t.dim, "stopped".to_string()),
-        EntityState::Unreachable => (g.dot, t.warn, format!("unreachable{port}")),
-        EntityState::Foreign(who) => (g.dot, t.warn, format!("port held by {who}{port}")),
-        EntityState::Starting => {
+        PulseState::Unknown => ("·", t.dim, String::new()),
+        PulseState::Up => (g.dot, t.good, format!("up{port}")),
+        PulseState::Stopped => ("○", t.dim, "stopped".to_string()),
+        PulseState::Unreachable => (g.dot, t.warn, format!("unreachable{port}")),
+        PulseState::Foreign(who) => (g.dot, t.warn, format!("port held by {who}{port}")),
+        PulseState::Starting => {
             const FRAMES: [&str; 6] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴"];
             (
                 FRAMES[(tick as usize) % FRAMES.len()],
@@ -506,13 +506,13 @@ mod tests {
         KeyEvent::new(code, KeyModifiers::NONE)
     }
 
-    pub(crate) fn entity_at(dir: &Path, name: &str, port: u16) -> PathBuf {
+    pub(crate) fn pulse_at(dir: &Path, name: &str, port: u16) -> PathBuf {
         let d = dir.join(name);
         std::fs::create_dir_all(&d).unwrap();
         std::fs::write(
             d.join("pulse-null.toml"),
             format!(
-                "[entity]\nname = \"{name}\"\nowner_name = \"D\"\nowner_alias = \"D\"\n[llm]\nprovider = \"claude-code\"\nmodel = \"m\"\n[server]\nhost = \"127.0.0.1\"\nport = {port}\n[security]\n"
+                "[pulse]\nname = \"{name}\"\nowner_name = \"D\"\nowner_alias = \"D\"\n[llm]\nprovider = \"claude-code\"\nmodel = \"m\"\n[server]\nhost = \"127.0.0.1\"\nport = {port}\n[security]\n"
             ),
         )
         .unwrap();
@@ -520,28 +520,26 @@ mod tests {
     }
 
     /// Rows that cannot be opened (no config), for menu-shape tests.
-    fn broken_rows(names: &[&str]) -> Vec<EntityRow> {
+    fn broken_rows(names: &[&str]) -> Vec<PulseRow> {
         names
             .iter()
-            .map(|n| {
-                EntityRow::from_load(PathBuf::from(format!("/x/{n}")), Err("no config".into()))
-            })
+            .map(|n| PulseRow::from_load(PathBuf::from(format!("/x/{n}")), Err("no config".into())))
             .collect()
     }
 
     /// Loadable rows backed by real directories; the tempdir is returned so
     /// it lives as long as the rows.
-    fn selectable_rows(names: &[&str]) -> (tempfile::TempDir, Vec<EntityRow>) {
+    fn selectable_rows(names: &[&str]) -> (tempfile::TempDir, Vec<PulseRow>) {
         let tmp = tempfile::tempdir().unwrap();
         let rows = names
             .iter()
             .enumerate()
-            .map(|(i, n)| EntityRow::from_dir(entity_at(tmp.path(), n, 3200 + i as u16)))
+            .map(|(i, n)| PulseRow::from_dir(pulse_at(tmp.path(), n, 3200 + i as u16)))
             .collect();
         (tmp, rows)
     }
 
-    impl std::fmt::Debug for EntityRow {
+    impl std::fmt::Debug for PulseRow {
         fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
             write!(
                 f,
@@ -554,12 +552,12 @@ mod tests {
     }
 
     #[test]
-    fn scan_finds_flat_legacy_home_and_cwd_entity() {
+    fn scan_finds_flat_legacy_home_and_cwd_pulse() {
         let home = tempfile::tempdir().unwrap();
         let cwd = tempfile::tempdir().unwrap();
-        entity_at(&home.path().join("pulse-null"), "synth", 3201);
-        entity_at(home.path(), "entity", 3200); // legacy ~/entity
-        let inside = entity_at(cwd.path(), "nova", 3202);
+        pulse_at(&home.path().join("pulse-null"), "synth", 3201);
+        pulse_at(home.path(), "entity", 3200); // legacy ~/entity
+        let inside = pulse_at(cwd.path(), "nova", 3202);
         let found = Home::scan(&inside.join("memory"), Some(home.path()));
         let names: Vec<&str> = found.iter().map(|r| r.name.as_str()).collect();
         assert_eq!(names, vec!["entity", "nova", "synth"]);
@@ -570,8 +568,8 @@ mod tests {
     fn scan_lists_both_dirs_with_one_name_and_says_where() {
         let home = tempfile::tempdir().unwrap();
         let cwd = tempfile::tempdir().unwrap();
-        entity_at(&home.path().join("pulse-null"), "a-echo", 3200);
-        entity_at(&home.path().join("pulse-null"), "b-echo", 3201);
+        pulse_at(&home.path().join("pulse-null"), "a-echo", 3200);
+        pulse_at(&home.path().join("pulse-null"), "b-echo", 3201);
         for d in ["a-echo", "b-echo"] {
             let p = home
                 .path()
@@ -584,15 +582,15 @@ mod tests {
         let h = Home::new(Home::scan(cwd.path(), Some(home.path())));
         assert_eq!(h.rows.len(), 2, "nothing is hidden");
         assert!(h.rows.iter().all(|r| r.ambiguous));
-        assert!(h.label(Item::Entity(0)).contains("a-echo"));
-        assert!(h.label(Item::Entity(1)).contains("b-echo"));
+        assert!(h.label(Item::Pulse(0)).contains("a-echo"));
+        assert!(h.label(Item::Pulse(1)).contains("b-echo"));
     }
 
     #[test]
     fn scan_lists_a_broken_config_as_a_dim_row() {
         let home = tempfile::tempdir().unwrap();
         let cwd = tempfile::tempdir().unwrap();
-        entity_at(&home.path().join("pulse-null"), "good", 3200);
+        pulse_at(&home.path().join("pulse-null"), "good", 3200);
         let bad = home.path().join("pulse-null/bad");
         std::fs::create_dir_all(&bad).unwrap();
         std::fs::write(bad.join("pulse-null.toml"), "this is = not [toml").unwrap();
@@ -603,16 +601,16 @@ mod tests {
         let h = Home::new(found);
         assert_eq!(
             h.item(h.selected),
-            Item::Entity(1),
+            Item::Pulse(1),
             "selection skips the broken row"
         );
     }
 
     #[test]
-    fn a_symlinked_entity_dir_is_refused() {
+    fn a_symlinked_pulse_dir_is_refused() {
         let home = tempfile::tempdir().unwrap();
         let cwd = tempfile::tempdir().unwrap();
-        let real = entity_at(&home.path().join("elsewhere"), "planted", 3200);
+        let real = pulse_at(&home.path().join("elsewhere"), "planted", 3200);
         std::fs::create_dir_all(home.path().join("pulse-null")).unwrap();
         std::os::unix::fs::symlink(&real, home.path().join("pulse-null/planted")).unwrap();
         // ~/entity as a symlink too: the legacy source has no other filter.
@@ -641,9 +639,9 @@ mod tests {
         assert_eq!(h.item(h.selected), Item::Exit, "clamped at the end");
         assert_eq!(h.on_key(key(KeyCode::Enter)), HomeAction::Exit);
         h.on_key(key(KeyCode::Char('1')));
-        h.rows[0].state = EntityState::Stopped;
+        h.rows[0].state = PulseState::Stopped;
         assert_eq!(h.on_key(key(KeyCode::Enter)), HomeAction::Open(0));
-        assert_eq!(h.rows[0].state, EntityState::Starting);
+        assert_eq!(h.rows[0].state, PulseState::Starting);
         h.on_key(key(KeyCode::Char('3')));
         assert_eq!(h.on_key(key(KeyCode::Enter)), HomeAction::Create);
         assert_eq!(h.on_key(key(KeyCode::Char('q'))), HomeAction::Exit);
@@ -657,18 +655,14 @@ mod tests {
     fn a_foreign_or_unreachable_row_does_not_open() {
         let (_tmp, rows) = selectable_rows(&["echo"]);
         let mut h = Home::new(rows);
-        h.rows[0].state = EntityState::Foreign("synth".into());
+        h.rows[0].state = PulseState::Foreign("synth".into());
         assert_eq!(h.on_key(key(KeyCode::Enter)), HomeAction::None);
         assert!(h.notice.as_deref().unwrap().contains("held by synth"));
-        h.rows[0].state = EntityState::Unreachable;
+        h.rows[0].state = PulseState::Unreachable;
         assert_eq!(h.on_key(key(KeyCode::Enter)), HomeAction::None);
-        h.rows[0].state = EntityState::Up;
+        h.rows[0].state = PulseState::Up;
         assert_eq!(h.on_key(key(KeyCode::Enter)), HomeAction::Open(0));
-        assert_eq!(
-            h.rows[0].state,
-            EntityState::Up,
-            "attaching is not starting"
-        );
+        assert_eq!(h.rows[0].state, PulseState::Up, "attaching is not starting");
     }
 
     #[test]
@@ -688,17 +682,17 @@ mod tests {
     fn states_apply_by_dir_starting_sticks_until_up_or_the_daemon_ends() {
         let mut h = Home::new(broken_rows(&["echo"]));
         let dir = h.rows[0].dir.clone();
-        h.apply_states(&[(dir.clone(), EntityState::Stopped)]);
-        assert_eq!(h.rows[0].state, EntityState::Stopped);
-        h.rows[0].state = EntityState::Starting;
-        h.apply_states(&[(dir.clone(), EntityState::Stopped)]);
-        assert_eq!(h.rows[0].state, EntityState::Starting);
+        h.apply_states(&[(dir.clone(), PulseState::Stopped)]);
+        assert_eq!(h.rows[0].state, PulseState::Stopped);
+        h.rows[0].state = PulseState::Starting;
+        h.apply_states(&[(dir.clone(), PulseState::Stopped)]);
+        assert_eq!(h.rows[0].state, PulseState::Starting);
         h.daemon_ended(&dir, "port in use");
-        assert_eq!(h.rows[0].state, EntityState::Unknown);
+        assert_eq!(h.rows[0].state, PulseState::Unknown);
         assert!(h.notice.as_deref().unwrap().contains("port in use"));
-        h.rows[0].state = EntityState::Starting;
-        h.apply_states(&[(dir, EntityState::Up)]);
-        assert_eq!(h.rows[0].state, EntityState::Up);
+        h.rows[0].state = PulseState::Starting;
+        h.apply_states(&[(dir, PulseState::Up)]);
+        assert_eq!(h.rows[0].state, PulseState::Up);
     }
 
     /// One HTTP answer on a fresh port, then the listener goes away.
@@ -729,33 +723,34 @@ mod tests {
         drop(free);
         let c = Client::new("127.0.0.1", port, None);
         assert_eq!(
-            EntityState::from(c.probe_detail("echo").await),
-            EntityState::Stopped
+            PulseState::from(c.probe_detail("echo").await),
+            PulseState::Stopped
         );
 
         let port = serve_once("", "500 nope").await;
         let c = Client::new("127.0.0.1", port, None);
         assert_eq!(
-            EntityState::from(c.probe_detail("echo").await),
-            EntityState::Unreachable
+            PulseState::from(c.probe_detail("echo").await),
+            PulseState::Unreachable
         );
 
         let synth =
-            r#"{"status":"healthy","entity":"synth","isolation":false,"control_plane":"leading"}"#;
+            r#"{"status":"healthy","pulse":"synth","isolation":false,"control_plane":"leading"}"#;
         let port = serve_once(synth, "200 OK").await;
         let c = Client::new("127.0.0.1", port, None);
         assert_eq!(
-            EntityState::from(c.probe_detail("echo").await),
-            EntityState::Foreign("synth".into())
+            PulseState::from(c.probe_detail("echo").await),
+            PulseState::Foreign("synth".into())
         );
 
+        // A daemon from before PN-115 names itself under `entity`.
         let echo =
             r#"{"status":"healthy","entity":"echo","isolation":false,"control_plane":"leading"}"#;
         let port = serve_once(echo, "200 OK").await;
         let c = Client::new("127.0.0.1", port, None);
         assert_eq!(
-            EntityState::from(c.probe_detail("echo").await),
-            EntityState::Up
+            PulseState::from(c.probe_detail("echo").await),
+            PulseState::Up
         );
     }
 

@@ -28,7 +28,7 @@ pub const MIN_ROWS: u16 = 20;
 /// Which top-level screen is showing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Screen {
-    /// The entity menu under the logo.
+    /// The pulse menu under the logo.
     Home,
     /// Waiting for a daemon (`pulse-null chat` with none up).
     Boot,
@@ -39,11 +39,11 @@ pub enum Screen {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Action {
     None,
-    /// Back to the entity menu (the loop drops the session, keeps daemons).
+    /// Back to the pulse menu (the loop drops the session, keeps daemons).
     Home,
     /// Open Talk for `home.rows[i]`.
     Open(usize),
-    /// Run the entity wizard.
+    /// Run the pulse wizard.
     Create,
     Quit,
 }
@@ -79,7 +79,7 @@ pub struct App {
 impl App {
     #[must_use]
     pub fn new(
-        entity: &str,
+        pulse: &str,
         model: &str,
         owner: &str,
         theme: ThemeWatcher,
@@ -90,7 +90,7 @@ impl App {
             screen: Screen::Boot,
             focus: PaneId::Prompt,
             fullscreen: false,
-            bar: BarState::new(entity, model),
+            bar: BarState::new(pulse, model),
             glyphs,
             theme,
             motion: Motion::new(motion_level),
@@ -117,7 +117,7 @@ impl App {
     }
 
     /// Home is the start screen: the menu, with `rows` from `Home::scan`.
-    pub fn start_home(&mut self, rows: Vec<super::home::EntityRow>) {
+    pub fn start_home(&mut self, rows: Vec<super::home::PulseRow>) {
         self.home = Home::new(rows);
         self.screen = Screen::Home;
         self.pending = None;
@@ -128,11 +128,11 @@ impl App {
         }
     }
 
-    /// The user picked an entity: Talk speaks for it from now on, with that
-    /// entity's `[tui]` settings.
-    pub fn enter_entity(&mut self, config: &crate::config::Config) {
-        self.bar = BarState::new(&config.entity.name, &config.llm.model);
-        self.owner = config.entity.owner_alias.clone();
+    /// The user picked a pulse: Talk speaks for it from now on, with that
+    /// pulse's `[tui]` settings.
+    pub fn enter_pulse(&mut self, config: &crate::config::Config) {
+        self.bar = BarState::new(&config.pulse.name, &config.llm.model);
+        self.owner = config.pulse.owner_alias.clone();
         self.talk = Talk::new();
         self.focus = PaneId::Prompt;
         self.fullscreen = false;
@@ -589,7 +589,7 @@ impl App {
             }
             Screen::Talk => {
                 let palette = self.palette();
-                let entity = self.bar.entity.clone();
+                let pulse = self.bar.pulse.clone();
                 let owner = self.owner.clone();
                 if self.fullscreen {
                     self.talk.render(
@@ -598,7 +598,7 @@ impl App {
                         self.focus,
                         t,
                         &owner,
-                        &entity,
+                        &pulse,
                         &mut self.motion,
                         palette,
                     );
@@ -616,7 +616,7 @@ impl App {
                         self.focus,
                         t,
                         &owner,
-                        &entity,
+                        &pulse,
                         &mut self.motion,
                         palette,
                     );
@@ -771,23 +771,23 @@ mod tests {
         assert_eq!(notices, 3, "theme, motion and the not-yet page each notice");
     }
 
-    fn entity_row(name: &str, port: u16) -> super::super::home::EntityRow {
+    fn pulse_row(name: &str, port: u16) -> super::super::home::PulseRow {
         let mut c = crate::config::test_support::minimal_config();
-        c.entity.name = name.to_string();
-        c.entity.owner_alias = "Dee".to_string();
+        c.pulse.name = name.to_string();
+        c.pulse.owner_alias = "Dee".to_string();
         c.llm.model = "m2".to_string();
         c.server.port = port;
         c.tui.motion = "off".to_string();
-        super::super::home::EntityRow::from_load(
+        super::super::home::PulseRow::from_load(
             std::path::PathBuf::from(format!("/x/{name}")),
             Ok(c),
         )
     }
 
     #[test]
-    fn home_enter_on_an_entity_row_asks_to_open_it() {
+    fn home_enter_on_an_pulse_row_asks_to_open_it() {
         let mut a = app();
-        a.start_home(vec![entity_row("echo", 3200), entity_row("synth", 3201)]);
+        a.start_home(vec![pulse_row("echo", 3200), pulse_row("synth", 3201)]);
         assert_eq!(a.screen, Screen::Home);
         a.on_key(key(KeyCode::Char('j')));
         assert_eq!(a.on_key(key(KeyCode::Enter)), Action::Open(1));
@@ -800,19 +800,19 @@ mod tests {
     }
 
     #[test]
-    fn enter_entity_resets_bar_owner_and_talk() {
+    fn enter_pulse_resets_bar_owner_and_talk() {
         let mut a = app();
         type_text(&mut a, "draft");
-        let row = entity_row("synth", 3201);
-        a.enter_entity(row.config().unwrap());
-        assert_eq!(a.bar.entity, "synth");
+        let row = pulse_row("synth", 3201);
+        a.enter_pulse(row.config().unwrap());
+        assert_eq!(a.bar.pulse, "synth");
         assert_eq!(a.bar.model, "m2");
         assert_eq!(a.owner, "Dee");
         assert!(a.talk.prompt.is_empty(), "a fresh Talk");
         assert_eq!(
             a.motion.level(),
             MotionLevel::Off,
-            "the entity's [tui] applies"
+            "the pulse's [tui] applies"
         );
     }
 

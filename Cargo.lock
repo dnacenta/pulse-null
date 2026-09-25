@@ -1377,13 +1377,13 @@ dependencies = [
 
 [[package]]
 name = "discord-echo"
-version = "0.1.2"
+version = "0.1.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1122486ba79b5358d691dd23a48e92b9897d317cac16563dd6220f0f0b1f17b5"
+checksum = "66838d2a38a7eb4abcbb71a79a8972e6dffcd66ced85d902dac1ff3f402c5e54"
 dependencies = [
  "chrono",
  "futures-util",
- "pulse-system-types 0.6.3",
+ "pulse-system-types 0.7.0",
  "reqwest",
  "serde",
  "serde_json",
@@ -4206,7 +4206,7 @@ dependencies = [
  "libc",
  "owo-colors",
  "proptest",
- "pulse-system-types 0.6.3",
+ "pulse-system-types 0.7.0",
  "ratatui",
  "recall-echo",
  "regex",
@@ -4229,7 +4229,6 @@ dependencies = [
  "unicode-segmentation",
  "unicode-width",
  "uuid",
- "vigil-pulse",
  "voice-echo",
  "walkdir",
  "which",
@@ -4247,9 +4246,9 @@ dependencies = [
 
 [[package]]
 name = "pulse-system-types"
-version = "0.6.3"
+version = "0.7.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "497484670f2bb673be80340ac2ead8f0107e19f029d1f68dcdf33643788389d0"
+checksum = "6d19dae6f34122ab0f7b7b03dc343346ff1a48811d60bf49e0e0cded609c2eae"
 dependencies = [
  "serde",
  "serde_json",
@@ -4626,8 +4625,8 @@ checksum = "bbc4a4ea2a66a41a1152c4b3d86e8954dc087bdf33af35446e6e176db4e73c8c"
 
 [[package]]
 name = "recall-echo"
-version = "4.1.0"
-source = "git+https://github.com/dnacenta/recall-echo.git?branch=main#97f5a97f0080a48e42b59eb10b38cdf517a489d6"
+version = "4.6.0"
+source = "git+https://github.com/dnacenta/recall-echo.git?branch=main#69b917e3ad52ac1e271396cdbc18593a853a7138"
 dependencies = [
  "async-trait",
  "chrono",
@@ -4635,7 +4634,8 @@ dependencies = [
  "dirs",
  "fastembed",
  "futures",
- "pulse-system-types 0.6.3",
+ "libc",
+ "pulse-system-types 0.7.0",
  "regex",
  "serde",
  "serde_json",
@@ -6705,19 +6705,6 @@ name = "version_check"
 version = "0.9.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
-
-[[package]]
-name = "vigil-pulse"
-version = "0.1.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "924c54aa7e44e562dd4b99c3d5ce34b9a949250ded224759d2aae03dd3fd0b05"
-dependencies = [
- "chrono",
- "owo-colors",
- "pulse-system-types 0.5.0",
- "serde",
- "serde_json",
-]
 
 [[package]]
 name = "voice-echo"

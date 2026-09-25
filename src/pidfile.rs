@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 
 const PID_FILENAME: &str = ".pulse-null.pid";
 
-/// Get the PID file path for an entity root directory.
+/// Get the PID file path for a pulse root directory.
 pub fn path(root_dir: &Path) -> PathBuf {
     root_dir.join(PID_FILENAME)
 }

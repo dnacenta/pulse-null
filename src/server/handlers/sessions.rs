@@ -75,7 +75,7 @@ pub async fn reset_session(
     let archive_path = crate::session_store::reset_session(
         &mut session.data,
         &state.root_dir,
-        &state.config.entity.name,
+        &state.config.pulse.name,
     );
 
     session.mark_dirty();

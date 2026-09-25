@@ -2,14 +2,14 @@ use std::path::PathBuf;
 
 use super::{resolve_sandboxed_path, Tool, ToolError, ToolResult};
 
-/// List files in a directory within the entity's data directory.
+/// List files in a directory within the pulse's data directory.
 pub struct FileListTool {
-    entity_root: PathBuf,
+    pulse_root: PathBuf,
 }
 
 impl FileListTool {
-    pub fn new(entity_root: PathBuf) -> Self {
-        Self { entity_root }
+    pub fn new(pulse_root: PathBuf) -> Self {
+        Self { pulse_root }
     }
 }
 
@@ -19,7 +19,7 @@ impl Tool for FileListTool {
     }
 
     fn description(&self) -> &str {
-        "List files and directories within the entity's data directory"
+        "List files and directories within the pulse's data directory"
     }
 
     fn input_schema(&self) -> serde_json::Value {
@@ -28,7 +28,7 @@ impl Tool for FileListTool {
             "properties": {
                 "path": {
                     "type": "string",
-                    "description": "Path relative to the entity's data directory. Defaults to the root."
+                    "description": "Path relative to the pulse's data directory. Defaults to the root."
                 }
             },
             "required": []
@@ -36,11 +36,11 @@ impl Tool for FileListTool {
     }
 
     fn execute(&self, input: serde_json::Value) -> ToolResult<'_> {
-        let entity_root = self.entity_root.clone();
+        let pulse_root = self.pulse_root.clone();
         Box::pin(async move {
             let path = input["path"].as_str().unwrap_or(".");
 
-            let resolved = resolve_sandboxed_path(&entity_root, path)?;
+            let resolved = resolve_sandboxed_path(&pulse_root, path)?;
 
             if !resolved.exists() {
                 return Err(ToolError::NotFound(format!(

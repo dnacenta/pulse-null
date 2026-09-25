@@ -36,7 +36,7 @@ pub enum Command {
     Motion(MotionLevel),
     Quit,
     Help,
-    /// Back to the entity menu; the daemon stays up.
+    /// Back to the pulse menu; the daemon stays up.
     Home,
 }
 
@@ -59,7 +59,7 @@ const SPECS: &[Spec] = &[
     Spec {
         name: "home",
         args: "",
-        what: "back to the entity menu",
+        what: "back to the pulse menu",
         later: None,
     },
     Spec {
@@ -89,7 +89,7 @@ const SPECS: &[Spec] = &[
     Spec {
         name: "open",
         args: "<file>",
-        what: "read an entity document",
+        what: "read a pulse document",
         later: Some("the Remember page (phase 3)"),
     },
     Spec {

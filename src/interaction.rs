@@ -12,7 +12,7 @@ use chrono::{DateTime, Utc};
 use pulse_system_types::llm::{Message, MessageContent, Role};
 use serde::{Deserialize, Serialize};
 
-use crate::events::{ConversationTrust, EntityEvent, InteractionSource};
+use crate::events::{ConversationTrust, InteractionSource, PulseEvent};
 use crate::session::{archive_conversation, end_session, ArchiveMeta};
 use crate::session_store::SessionData;
 use crate::utils;
@@ -60,8 +60,10 @@ pub struct InteractionRecord {
     pub started_at: DateTime<Utc>,
     /// When the interaction ended (None if still in progress).
     pub ended_at: Option<DateTime<Utc>>,
-    /// Name of the entity that participated.
-    pub entity_name: String,
+    /// Name of the local pulse that participated. Pre-PN-115 records call
+    /// it `entity_name`.
+    #[serde(alias = "entity_name")]
+    pub pulse_name: String,
     /// Brief summary of the interaction (first ~300 chars of last response).
     pub summary: String,
     /// Full message transcript.
@@ -78,7 +80,7 @@ impl InteractionRecord {
     /// Trust is determined by the caller based on the request context.
     pub fn from_session(
         session: &SessionData,
-        entity_name: &str,
+        pulse_name: &str,
         trust: ConversationTrust,
         input_tokens: u32,
         output_tokens: u32,
@@ -94,7 +96,7 @@ impl InteractionRecord {
             trust,
             started_at: session.created_at,
             ended_at: Some(Utc::now()),
-            entity_name: entity_name.to_string(),
+            pulse_name: pulse_name.to_string(),
             summary,
             messages: session.messages.clone(),
             metadata: InteractionMetadata {
@@ -112,18 +114,18 @@ impl InteractionRecord {
 
     /// Build an InteractionRecord from a peer-to-peer comms conversation.
     ///
-    /// Comms messages are stored as (entity_name, text) pairs rather than
+    /// Comms messages are stored as (pulse_name, text) pairs rather than
     /// full Message objects. This constructor converts them.
     pub fn from_comms(
         messages: &[(String, String)],
-        local_entity: &str,
-        peer_entity: &str,
+        local_pulse: &str,
+        peer_pulse: &str,
         trust: ConversationTrust,
     ) -> Self {
         let converted: Vec<Message> = messages
             .iter()
-            .map(|(entity, text)| {
-                let role = if entity == local_entity {
+            .map(|(speaker, text)| {
+                let role = if speaker == local_pulse {
                     Role::Assistant
                 } else {
                     Role::User
@@ -141,12 +143,12 @@ impl InteractionRecord {
         Self {
             id: uuid::Uuid::new_v4().to_string(),
             source: InteractionSource::Comms {
-                peer: peer_entity.to_string(),
+                peer: peer_pulse.to_string(),
             },
             trust,
             started_at: Utc::now(),
             ended_at: Some(Utc::now()),
-            entity_name: local_entity.to_string(),
+            pulse_name: local_pulse.to_string(),
             summary,
             messages: converted,
             metadata: InteractionMetadata::default(),
@@ -156,7 +158,7 @@ impl InteractionRecord {
     /// Build an InteractionRecord from a scheduled task execution.
     pub fn from_task(
         task_name: &str,
-        entity_name: &str,
+        pulse_name: &str,
         messages: Vec<Message>,
         started_at: DateTime<Utc>,
         metadata: InteractionMetadata,
@@ -171,7 +173,7 @@ impl InteractionRecord {
             trust: ConversationTrust::Owner,
             started_at,
             ended_at: Some(Utc::now()),
-            entity_name: entity_name.to_string(),
+            pulse_name: pulse_name.to_string(),
             summary,
             messages,
             metadata,
@@ -181,7 +183,7 @@ impl InteractionRecord {
     /// Build an InteractionRecord from a research intent execution.
     pub fn from_research(
         topic: &str,
-        entity_name: &str,
+        pulse_name: &str,
         messages: Vec<Message>,
         started_at: DateTime<Utc>,
         metadata: InteractionMetadata,
@@ -196,7 +198,7 @@ impl InteractionRecord {
             trust: ConversationTrust::Owner,
             started_at,
             ended_at: Some(Utc::now()),
-            entity_name: entity_name.to_string(),
+            pulse_name: pulse_name.to_string(),
             summary,
             messages,
             metadata,
@@ -206,8 +208,8 @@ impl InteractionRecord {
     /// Produce a PostInteraction event from this record.
     ///
     /// Used to emit onto the event bus after an interaction completes.
-    pub fn to_event(&self) -> EntityEvent {
-        EntityEvent::PostInteraction {
+    pub fn to_event(&self) -> PulseEvent {
+        PulseEvent::PostInteraction {
             source: self.source.clone(),
             trust: self.trust.clone(),
             summary: self.summary.clone(),
@@ -239,7 +241,7 @@ impl InteractionRecord {
         ArchiveMeta {
             trigger,
             channel,
-            entity_name: self.entity_name.clone(),
+            pulse_name: self.pulse_name.clone(),
             session_key: self.metadata.session_key.clone(),
         }
     }
@@ -255,7 +257,7 @@ impl InteractionRecord {
 
         end_session(
             root_dir,
-            &self.entity_name,
+            &self.pulse_name,
             &self.messages,
             &self.to_archive_meta().channel,
             &self.to_archive_meta().trigger,
@@ -416,6 +418,25 @@ mod tests {
         msgs
     }
 
+    /// PN-115: records written before the rename carry `entity_name`.
+    #[test]
+    fn pre_rename_record_deserializes() {
+        let record = InteractionRecord::from_task(
+            "t",
+            "Echo",
+            make_messages(2),
+            Utc::now(),
+            InteractionMetadata::default(),
+        );
+        let mut value = serde_json::to_value(&record).unwrap();
+        assert_eq!(value["pulse_name"], "Echo");
+        let obj = value.as_object_mut().unwrap();
+        let name = obj.remove("pulse_name").unwrap();
+        obj.insert("entity_name".into(), name);
+        let old: InteractionRecord = serde_json::from_value(value).unwrap();
+        assert_eq!(old.pulse_name, "Echo");
+    }
+
     #[test]
     fn from_task_produces_correct_source() {
         let meta = InteractionMetadata {
@@ -438,7 +459,7 @@ mod tests {
         assert!(matches!(record.trust, ConversationTrust::Owner));
         assert_eq!(record.metadata.input_tokens, 100);
         assert_eq!(record.metadata.output_tokens, 200);
-        assert_eq!(record.entity_name, "Echo");
+        assert_eq!(record.pulse_name, "Echo");
     }
 
     #[test]
@@ -477,9 +498,9 @@ mod tests {
         ));
         assert!(matches!(record.trust, ConversationTrust::LocalPeer));
         assert_eq!(record.messages.len(), 2);
-        // Nova's message should be Role::User (not local entity)
+        // Nova's message should be Role::User (not local pulse)
         assert!(matches!(record.messages[0].role, Role::User));
-        // Echo's message should be Role::Assistant (local entity)
+        // Echo's message should be Role::Assistant (local pulse)
         assert!(matches!(record.messages[1].role, Role::Assistant));
     }
 
@@ -500,7 +521,7 @@ mod tests {
 
         let event = record.to_event();
         match event {
-            EntityEvent::PostInteraction {
+            PulseEvent::PostInteraction {
                 source,
                 trust,
                 input_tokens,
@@ -528,7 +549,7 @@ mod tests {
             trust: ConversationTrust::Owner,
             started_at: Utc::now(),
             ended_at: None,
-            entity_name: "Echo".into(),
+            pulse_name: "Echo".into(),
             summary: String::new(),
             messages: vec![],
             metadata: InteractionMetadata::default(),
@@ -569,7 +590,7 @@ mod tests {
             trust: ConversationTrust::Owner,
             started_at: Utc::now(),
             ended_at: None,
-            entity_name: "Echo".into(),
+            pulse_name: "Echo".into(),
             summary: String::new(),
             messages: vec![Message {
                 role: Role::Assistant,
@@ -606,7 +627,7 @@ mod tests {
             trust: ConversationTrust::Owner,
             started_at: Utc::now(),
             ended_at: None,
-            entity_name: "Echo".into(),
+            pulse_name: "Echo".into(),
             summary: String::new(),
             messages: vec![],
             metadata: InteractionMetadata::default(),
@@ -624,7 +645,7 @@ mod tests {
             trust: ConversationTrust::Owner,
             started_at: Utc::now(),
             ended_at: None,
-            entity_name: "Echo".into(),
+            pulse_name: "Echo".into(),
             summary: String::new(),
             messages: vec![],
             metadata: InteractionMetadata::default(),
@@ -696,7 +717,7 @@ mod tests {
             trust: ConversationTrust::Owner,
             started_at: Utc::now(),
             ended_at: None,
-            entity_name: "Echo".into(),
+            pulse_name: "Echo".into(),
             summary: String::new(),
             messages: vec![],
             metadata: InteractionMetadata::default(),
@@ -715,7 +736,7 @@ mod tests {
             trust: ConversationTrust::Owner,
             started_at: Utc::now(),
             ended_at: None,
-            entity_name: "Echo".into(),
+            pulse_name: "Echo".into(),
             summary: String::new(),
             messages: vec![],
             metadata: InteractionMetadata {

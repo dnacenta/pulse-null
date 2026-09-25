@@ -2,7 +2,7 @@
 
 ## Problem
 
-The memory graph is a core system with no visibility in the TUI. You can't see whether it's working, how populated it is, or when the entity accesses it. The only way to inspect it is through the GraphQueryTool (which requires the entity to query itself) or raw database inspection.
+The memory graph is a core system with no visibility in the TUI. You can't see whether it's working, how populated it is, or when the pulse accesses it. The only way to inspect it is through the GraphQueryTool (which requires the pulse to query itself) or raw database inspection.
 
 ## Goal
 
@@ -17,7 +17,7 @@ Tab index 5 (after Comms). Label: `recall`.
 ```rust
 pub enum Tab {
     Chat,       // 0
-    Entity,     // 1
+    Pulse,      // 1
     Evolution,  // 2
     Files,      // 3
     Comms,      // 4
@@ -80,7 +80,7 @@ Renders:
 
 ### Section 3: Retrieval Log
 
-Real-time scrollable log of graph operations. This is the core observability piece — you can watch the entity think through its memory.
+Real-time scrollable log of graph operations. This is the core observability piece — you can watch the pulse think through its memory.
 
 Each entry: `timestamp  operation  query/target  →  result summary  (latency)`
 

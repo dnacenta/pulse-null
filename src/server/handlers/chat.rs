@@ -39,7 +39,7 @@ pub struct ChatResponse {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub output_tokens: Option<u32>,
     /// Sticky isolation-mode indicator — present (true) on every response
-    /// while the entity is isolated, so any consumer arriving mid-session
+    /// while the pulse is isolated, so any consumer arriving mid-session
     /// sees the posture.
     #[serde(skip_serializing_if = "std::ops::Not::not", default)]
     pub isolation: bool,
@@ -219,7 +219,7 @@ pub(crate) async fn run_turn(
     }
 
     // Inject channel context buffer (recent activity on this channel)
-    // Phase 4: use filtered retrieval — time decay, entity filtering,
+    // Phase 4: use filtered retrieval — time decay, pulse filtering,
     // deduplication against session history, entry/token caps.
     if let Some(ref cb) = state.context_buffer {
         // Extract recent session message texts for deduplication.
@@ -237,10 +237,10 @@ pub(crate) async fn run_turn(
         };
 
         // Human senders: the owner alias and the current sender
-        let mut human_senders: Vec<&str> = vec![&state.config.entity.owner_alias];
+        let mut human_senders: Vec<&str> = vec![&state.config.pulse.owner_alias];
         if let Some(ref s) = req.sender {
             // If sender differs from owner_alias, include both
-            if !s.eq_ignore_ascii_case(&state.config.entity.owner_alias) {
+            if !s.eq_ignore_ascii_case(&state.config.pulse.owner_alias) {
                 human_senders.push(s.as_str());
             }
         }
@@ -248,7 +248,7 @@ pub(crate) async fn run_turn(
         if let Some(channel_context) = cb
             .get_context_filtered(
                 &req.channel,
-                &state.config.entity.name,
+                &state.config.pulse.name,
                 &human_senders,
                 &session_texts,
                 &state.config.context_buffer,
@@ -339,7 +339,7 @@ pub(crate) async fn run_turn(
         crate::session_store::reset_session(
             &mut session.data,
             &state.root_dir,
-            &state.config.entity.name,
+            &state.config.pulse.name,
         );
     }
 
@@ -398,7 +398,7 @@ pub(crate) async fn run_turn(
             state.config.llm.context_budget,
             state.config.llm.max_tokens,
             &state.root_dir,
-            &state.config.entity.name,
+            &state.config.pulse.name,
             &req.channel,
             Some(&session_key),
             current_compaction_failures,
@@ -807,7 +807,7 @@ pub(crate) async fn run_turn(
         if let Err(e) = crate::caliber::runtime::record_outcome(
             &state.root_dir,
             conv_outcome,
-            state.config.pulse.max_outcomes,
+            state.config.caliber.max_outcomes,
         ) {
             tracing::warn!("Failed to record conversation outcome: {}", e);
         }
@@ -826,10 +826,10 @@ pub(crate) async fn run_turn(
         maybe_checkpoint(&state, &session_key, &mut session.data, &channel).await;
     }
 
-    // Record entity response to context buffer (shed in isolation)
+    // Record pulse response to context buffer (shed in isolation)
     if !isolated {
         if let Some(ref cb) = state.context_buffer {
-            cb.record(&channel, &state.config.entity.name, "assistant", &text)
+            cb.record(&channel, &state.config.pulse.name, "assistant", &text)
                 .await;
         }
     }
@@ -839,7 +839,7 @@ pub(crate) async fn run_turn(
     let conversation_trust = conversation_trust_from_identity(&resolved_key);
     let interaction = InteractionRecord::from_session(
         &session.data,
-        &state.config.entity.name,
+        &state.config.pulse.name,
         conversation_trust,
         result.input_tokens,
         result.output_tokens,
@@ -1366,8 +1366,8 @@ fn build_identity_system_prompt(base: &str, resolved_key: &str, sender: &str) ->
         format!(
             "{}\n\n<peer-conversation-context>\n\
              You are having a direct conversation with {}.\n\
-             {} is a trusted peer entity — a sibling in the same pulse-null network, \
-             managed by the same owner. This is an internal conversation between entities, \
+             {} is a trusted peer pulse — a sibling in the same pulse-null network, \
+             managed by the same owner. This is an internal conversation between pulses, \
              not a user-facing interaction.\n\n\
              Speak freely and collaboratively. Share knowledge, insights, and observations openly.\n\
              If you have graph memory available, use it to recall past interactions with {}.\n\n\
@@ -1443,7 +1443,7 @@ async fn maybe_checkpoint(
     let meta = crate::session::ArchiveMeta {
         trigger: "checkpoint".to_string(),
         channel: channel.to_string(),
-        entity_name: state.config.entity.name.clone(),
+        pulse_name: state.config.pulse.name.clone(),
         session_key: Some(session_key.to_string()),
     };
 

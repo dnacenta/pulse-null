@@ -1,19 +1,19 @@
 //! Interest-triggered outreach — unprompted contact with content behind it.
 //!
 //! PN-94, `interest-triggered-outreach-spec.md`. Every unprompted message the
-//! entity could previously generate was, structurally, a status report: every
+//! pulse could previously generate was, structurally, a status report: every
 //! event in the bus was about the health of the machinery, never about the
-//! thinking. [`crate::events::EntityEvent::Salience`] is the content event;
+//! thinking. [`crate::events::PulseEvent::Salience`] is the content event;
 //! this module is what stands between raising one and D's phone buzzing.
 //!
 //! ## What this module is for
 //!
 //! A self-triggered channel converges to noise, and it converges *silently*,
-//! because the entity's own estimate of message quality is exactly the
+//! because the pulse's own estimate of message quality is exactly the
 //! faculty that would have to notice the drift. So nothing here asks the
-//! entity whether a message is worth sending. Three mechanical checks decide
+//! pulse whether a message is worth sending. Three mechanical checks decide
 //! (§2.3), a clock and a counter decide when (§2.2, §2.5), and D's response
-//! behaviour — the only signal the entity cannot author — decides whether the
+//! behaviour — the only signal the pulse cannot author — decides whether the
 //! checks were any good (§2.4, see [`feedback`]).
 //!
 //! ## Fail-closed everywhere
@@ -38,7 +38,7 @@ use regex::Regex;
 use serde::{Deserialize, Serialize};
 
 use crate::config::{Config, OutreachConfig};
-use crate::events::{EntityEvent, SalienceKind};
+use crate::events::{PulseEvent, SalienceKind};
 use store::{OutreachStore, RejectedCandidate, SentMessage};
 
 // ---------------------------------------------------------------------------
@@ -61,9 +61,9 @@ impl OutreachCandidate {
     /// Read a candidate off a `Salience` event. Returns `None` for any other
     /// event, so callers can filter without a second match.
     #[must_use]
-    pub fn from_event(event: &EntityEvent) -> Option<Self> {
+    pub fn from_event(event: &PulseEvent) -> Option<Self> {
         match event {
-            EntityEvent::Salience {
+            PulseEvent::Salience {
                 kind,
                 thread_id,
                 headline,
@@ -164,11 +164,11 @@ pub fn with_cost_line(evidence: &str, cost: Cost) -> String {
 // Gate 2 — external referent
 // ---------------------------------------------------------------------------
 
-/// An anchor in `evidence` that the entity did not author (spec §2.3.2).
+/// An anchor in `evidence` that the pulse did not author (spec §2.3.2).
 ///
 /// This is the load-bearing gate. "I've been thinking about this" is exactly
 /// the message an LLM can generate infinitely and convincingly with nothing
-/// behind it; the fraction of the content that can correct the entity is the
+/// behind it; the fraction of the content that can correct the pulse is the
 /// fraction it did not write.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ExternalReferent {
@@ -234,7 +234,7 @@ fn find_tool_measurement(evidence: &str) -> Option<String> {
     })
 }
 
-/// Documents the entity writes itself.
+/// Documents the pulse writes itself.
 ///
 /// A file reference into one of these is self-authored prose wearing a file
 /// path. It still counts for most kinds — quoting your own journal with a
@@ -255,7 +255,7 @@ const SELF_AUTHORED_DOCS: &[&str] = &[
     "THOUGHT_STACK.md",
 ];
 
-/// Whether `path` names one of the entity's own journal documents.
+/// Whether `path` names one of the pulse's own journal documents.
 fn is_self_authored(path: &str) -> bool {
     let file = path.rsplit('/').next().unwrap_or(path);
     let file = file.split(':').next().unwrap_or(file);
@@ -267,7 +267,7 @@ fn is_self_authored(path: &str) -> bool {
 /// Find the strongest external referent in `evidence`, if any.
 ///
 /// `resolved_predictions` gates the prediction-id form: an id that has not
-/// resolved points at the entity's own expectation, which is not evidence of
+/// resolved points at the pulse's own expectation, which is not evidence of
 /// anything yet.
 #[must_use]
 pub fn find_referent(
@@ -332,7 +332,7 @@ pub enum RejectionReason {
     Disabled,
     /// The candidate is not well-formed enough to judge.
     Malformed { detail: String },
-    /// Gate 2: nothing in the evidence that the entity did not author.
+    /// Gate 2: nothing in the evidence that the pulse did not author.
     NoExternalReferent,
     /// Gate 3: the message never says what it is asking for.
     NoCostStated,
@@ -901,7 +901,7 @@ mod tests {
     }
 
     #[test]
-    fn development_gets_no_referent_from_the_entitys_own_journal() {
+    fn development_gets_no_referent_from_the_pulses_own_journal() {
         // Spec §6.1: gate 2 must be stricter for Development, never softer.
         // Quoting your own THOUGHTS.md with a line number is still prose you
         // wrote.

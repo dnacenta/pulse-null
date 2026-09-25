@@ -1,7 +1,7 @@
-//! Shared setup helpers used by both `server::start()` and `boot::boot_entity()`.
+//! Shared setup helpers used by both `server::start()` and `boot::boot_pulse()`.
 //!
 //! Eliminates duplication of monitor creation, tool registration, and plugin
-//! initialization between the standalone server and multi-entity boot paths.
+//! initialization between the standalone server and multi-pulse boot paths.
 
 use std::path::Path;
 use std::sync::Arc;
@@ -32,7 +32,7 @@ pub fn create_monitors(config: &Config) -> Monitors {
         None
     };
 
-    let outcome = if config.pulse.enabled {
+    let outcome = if config.caliber.enabled {
         Some(Arc::new(crate::caliber::runtime::CaliberTracker::new()) as Arc<dyn OutcomeTracker>)
     } else {
         None
@@ -45,7 +45,7 @@ pub fn create_monitors(config: &Config) -> Monitors {
     }
 }
 
-/// Register all built-in tools for the entity.
+/// Register all built-in tools for the pulse.
 pub fn register_builtin_tools(root_dir: &Path, config: &Config) -> ToolRegistry {
     let mut tools = ToolRegistry::new();
     tools.register(Box::new(crate::tools::file_read::FileReadTool::new(
@@ -71,7 +71,7 @@ pub fn register_builtin_tools(root_dir: &Path, config: &Config) -> ToolRegistry 
 
 /// The read-only introspection tool set for Isolation Mode (coordinator
 /// spec, Stage 2): journal/ and memory/ are readable, nothing is writable,
-/// and nothing reaches outside the entity root. No plugin tools.
+/// and nothing reaches outside the pulse root. No plugin tools.
 pub fn register_readonly_tools(root_dir: &Path, config: &Config) -> ToolRegistry {
     let mut tools = ToolRegistry::new();
     tools.register(Box::new(crate::tools::file_read::FileReadTool::new(
@@ -146,11 +146,7 @@ pub fn startup_pipeline_check(
         let health = monitor.calculate(root_dir, &thresholds);
         let archived = monitor.check_and_archive(root_dir, &thresholds, &health);
         for doc in &archived {
-            tracing::info!(
-                "{}: auto-archived overflow from {}",
-                config.entity.name,
-                doc
-            );
+            tracing::info!("{}: auto-archived overflow from {}", config.pulse.name, doc);
         }
     }
 }
@@ -234,7 +230,7 @@ pub fn spawn_session_cleanup(config: &Config, state: &Arc<super::AppState>) {
                 }
                 let archived_paths = cleanup_state
                     .session_store
-                    .cleanup_expired(&cleanup_state.root_dir, &cleanup_state.config.entity.name)
+                    .cleanup_expired(&cleanup_state.root_dir, &cleanup_state.config.pulse.name)
                     .await;
                 cleanup_state.session_store.persist_all().await;
 

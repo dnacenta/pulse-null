@@ -412,7 +412,7 @@ impl Talk {
         focus: PaneId,
         t: Tokens,
         owner: &str,
-        entity: &str,
+        pulse: &str,
         motion: &mut Motion,
         palette: Palette,
     ) {
@@ -429,7 +429,7 @@ impl Talk {
                         width: inner.width.saturating_sub(1),
                         ..inner
                     };
-                    let mut lay = self.transcript.layout(text_area, t, owner, entity, status);
+                    let mut lay = self.transcript.layout(text_area, t, owner, pulse, status);
                     // `lay.lines` is exactly the visible window; nothing to scroll.
                     let para = Paragraph::new(std::mem::take(&mut lay.lines))
                         .style(Style::default().bg(t.ground));
@@ -471,7 +471,7 @@ impl Talk {
 
                     // Motion: new rows fade in (staggered on the reveal path),
                     // the streaming cursor glows, the pane breathes while
-                    // the entity thinks.
+                    // the pulse thinks.
                     for (i, row) in lay.new_rows.iter().enumerate() {
                         let key = FxKey::Line((u64::from(row.rect.y) << 16) | i as u64);
                         motion.add(

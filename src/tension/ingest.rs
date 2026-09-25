@@ -16,7 +16,7 @@
 //! # The discharge firewall (spec §7 risk 3)
 //!
 //! The spec's most likely failure is that `work_credit` becomes reachable
-//! from output text, at which point the entity discharges tension by writing
+//! from output text, at which point the pulse discharges tension by writing
 //! about a thread — the exact defect FINDINGS c890 recorded, where a report
 //! discharged the debt by listing it.
 //!
@@ -32,7 +32,7 @@
 //! A claim that checks out mints a [`WorkArtifact`], and only a
 //! [`WorkArtifact`] can reach [`TensionStore::credit_work`]. A claim that
 //! does not check out is *rejected and reported* — never silently dropped,
-//! because a silently ignored discharge claim reads to the entity exactly
+//! because a silently ignored discharge claim reads to the pulse exactly
 //! like a granted one.
 
 use std::path::{Component, Path, PathBuf};
@@ -61,11 +61,11 @@ const MAX_ID_LEN: usize = 64;
 /// Maximum length of an abandonment or dissolution reason.
 const MAX_REASON_LEN: usize = 300;
 
-/// The entity's own journal. A file diff here is text about the work, not
+/// The pulse's own journal. A file diff here is text about the work, not
 /// the work, so it cannot mint a [`WorkArtifact`].
 const JOURNAL_DIR: &str = "journal";
 
-/// Journal documents that live at the entity root rather than under
+/// Journal documents that live at the pulse root rather than under
 /// `journal/`. Same rule applies to them.
 const JOURNAL_FILES: &[&str] = &[
     "LEARNING.md",
@@ -130,7 +130,7 @@ struct ResolveMarker {
 /// reference to something this module can go and check.
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct EvidenceClaim {
-    /// Entity-relative path to a file changed this cycle, outside the journal.
+    /// Pulse-relative path to a file changed this cycle, outside the journal.
     #[serde(default)]
     pub file: Option<String>,
     /// Id of a prediction resolved this cycle.
@@ -154,8 +154,8 @@ impl EvidenceClaim {
 pub enum EvidenceRejection {
     /// The marker named no artifact at all.
     NoEvidence,
-    /// The path escaped the entity root or was absolute.
-    PathOutsideEntity(String),
+    /// The path escaped the pulse root or was absolute.
+    PathOutsidePulse(String),
     /// The path names journal text, which is what the artifact requirement
     /// exists to exclude.
     PathInJournal(String),
@@ -177,7 +177,7 @@ impl std::fmt::Display for EvidenceRejection {
                 "no artifact named — discharge needs a file changed outside the journal, \
                  a resolved prediction id, or a tool that ran"
             ),
-            Self::PathOutsideEntity(p) => write!(f, "path '{p}' is not inside the entity root"),
+            Self::PathOutsidePulse(p) => write!(f, "path '{p}' is not inside the pulse root"),
             Self::PathInJournal(p) => write!(
                 f,
                 "path '{p}' is journal text; writing about a thread is not working it"
@@ -259,9 +259,9 @@ impl<'a> WorkEvidence<'a> {
 
     fn verify_file(&self, raw: &str) -> Result<WorkArtifact, EvidenceRejection> {
         let cleaned = sanitize_field(raw, 512);
-        let relative = match entity_relative_path(&cleaned) {
+        let relative = match pulse_relative_path(&cleaned) {
             Some(p) => p,
-            None => return Err(EvidenceRejection::PathOutsideEntity(cleaned)),
+            None => return Err(EvidenceRejection::PathOutsidePulse(cleaned)),
         };
         if is_journal_path(&relative) {
             return Err(EvidenceRejection::PathInJournal(cleaned));
@@ -658,7 +658,7 @@ struct ParsedResolution {
 /// `origin` may name `open_question`, `callback`, `adverse` or
 /// `user_raised` and defaults to `user_raised`. It deliberately may **not**
 /// name `prediction_error`: that origin is minted mechanically from
-/// `predictions.json`, and letting text claim it would let the entity forge
+/// `predictions.json`, and letting text claim it would let the pulse forge
 /// the provenance of its own pressure.
 fn parse_threads(text: &str) -> Vec<ThreadDraft> {
     let mut drafts = Vec::new();
@@ -829,9 +829,9 @@ fn truncate_chars(s: &str, max_len: usize) -> String {
     sanitize_field(s, max_len)
 }
 
-/// Normalize a claimed path to an entity-relative one, refusing anything
+/// Normalize a claimed path to a pulse-relative one, refusing anything
 /// absolute or containing a parent-directory hop.
-fn entity_relative_path(raw: &str) -> Option<PathBuf> {
+fn pulse_relative_path(raw: &str) -> Option<PathBuf> {
     let path = Path::new(raw.trim());
     if raw.trim().is_empty() {
         return None;
@@ -847,7 +847,7 @@ fn entity_relative_path(raw: &str) -> Option<PathBuf> {
     (!normalized.as_os_str().is_empty()).then_some(normalized)
 }
 
-/// Whether an entity-relative path names journal text.
+/// Whether a pulse-relative path names journal text.
 fn is_journal_path(relative: &Path) -> bool {
     if relative
         .components()
@@ -1229,11 +1229,11 @@ mod tests {
         ));
         assert!(matches!(
             ev.verify(&claim("../../etc/passwd")).unwrap_err(),
-            EvidenceRejection::PathOutsideEntity(_)
+            EvidenceRejection::PathOutsidePulse(_)
         ));
         assert!(matches!(
             ev.verify(&claim("/etc/passwd")).unwrap_err(),
-            EvidenceRejection::PathOutsideEntity(_)
+            EvidenceRejection::PathOutsidePulse(_)
         ));
     }
 

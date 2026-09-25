@@ -14,10 +14,10 @@ pub async fn run(dir: Option<String>) -> Result<(), Box<dyn std::error::Error>> 
     if base_dir.join("pulse-null.toml").exists() {
         println!();
         println!(
-            "  {} This directory already contains a pulse-null.toml (single-entity mode).",
+            "  {} This directory already contains a pulse-null.toml (single-pulse mode).",
             style("⚠").yellow()
         );
-        println!("  To create entities in multi-entity mode, run from a parent directory.");
+        println!("  To create pulses in multi-pulse mode, run from a parent directory.");
         println!(
             "  Or use {} to target a different location.",
             style("pulse-null init --dir /path/to/project").cyan()
@@ -26,15 +26,10 @@ pub async fn run(dir: Option<String>) -> Result<(), Box<dyn std::error::Error>> 
         return Ok(());
     }
 
-    // Flat layout (PN-104): the entity is created directly under base_dir,
-    // e.g. ~/pulse-null/<name>. A pre-existing `entities/` subdirectory is
-    // honoured so older trees keep their shape.
-    let entities_dir = base_dir.join("entities");
-    let target = if entities_dir.is_dir() {
-        entities_dir
-    } else {
-        base_dir
-    };
+    // Flat layout (PN-104): the pulse is created directly under base_dir,
+    // e.g. ~/pulse-null/<name>. A pre-existing `pulses/` (or pre-PN-115
+    // `entities/`) container is honoured so older trees keep their shape.
+    let target = crate::discovery::pulse_container(&base_dir).unwrap_or(base_dir);
     std::fs::create_dir_all(&target)?;
 
     wizard::run(&target).await

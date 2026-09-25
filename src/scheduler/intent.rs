@@ -10,7 +10,7 @@ use super::executor::{self, ExecutionConfig};
 use super::output;
 use super::Schedule;
 use crate::config::AutonomyConfig;
-use crate::events::EntityEvent;
+use crate::events::PulseEvent;
 use crate::interaction::{InteractionMetadata, InteractionRecord};
 use crate::server::prompt;
 use crate::server::AppState;
@@ -46,9 +46,10 @@ pub struct Intent {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum IntentSource {
-    /// Created by the entity via [INTENT:] marker
+    /// Created by the pulse via [INTENT:] marker
     #[default]
-    EntityMarker,
+    #[serde(alias = "entity_marker")]
+    PulseMarker,
     /// Created by an internal event trigger
     Event(String),
     /// Created by a scheduled task's [INTENT:] marker
@@ -312,7 +313,7 @@ pub fn create_intent_from_marker(
 
 /// Parse a `[SALIENCE: {...}]` JSON marker into a `Salience` event (PN-94).
 ///
-/// This is Phase 1's trigger, and knowingly the weak version: the entity
+/// This is Phase 1's trigger, and knowingly the weak version: the pulse
 /// decides when it is interesting, which is unaudited. It ships first anyway
 /// because it makes the behaviour observable, and observable behaviour is
 /// what makes Phase 2 falsifiable (spec §3).
@@ -331,7 +332,7 @@ pub fn create_intent_from_marker(
 /// uncapped, quiet-hours-overriding budget.
 pub fn create_salience_from_marker(
     json_str: &str,
-) -> Result<EntityEvent, crate::errors::PulseError> {
+) -> Result<PulseEvent, crate::errors::PulseError> {
     let value: serde_json::Value = serde_json::from_str(json_str)?;
 
     let kind_label = value["kind"]
@@ -370,7 +371,7 @@ pub fn create_salience_from_marker(
         .filter(|t| !t.is_empty())
         .map(str::to_string);
 
-    Ok(EntityEvent::Salience {
+    Ok(PulseEvent::Salience {
         kind,
         thread_id,
         headline,
@@ -1012,14 +1013,14 @@ async fn execute_intent(
         let interaction = match &intent.source {
             IntentSource::ScheduledTask(name) => InteractionRecord::from_task(
                 name,
-                &state.config.entity.name,
+                &state.config.pulse.name,
                 result.messages.clone(),
                 started_at,
                 meta,
             ),
             _ => InteractionRecord::from_research(
                 &intent.description,
-                &state.config.entity.name,
+                &state.config.pulse.name,
                 result.messages.clone(),
                 started_at,
                 meta,
@@ -1142,7 +1143,8 @@ async fn execute_intent(
             result.total_output_tokens,
         );
         let outcome_kind = outcome.outcome.clone();
-        if let Err(e) = tracker.record_outcome(&root_dir, outcome, state.config.pulse.max_outcomes)
+        if let Err(e) =
+            tracker.record_outcome(&root_dir, outcome, state.config.caliber.max_outcomes)
         {
             tracing::error!("Failed to record outcome for intent '{}': {}", intent.id, e);
         }
@@ -1171,7 +1173,7 @@ async fn execute_intent(
 
         let health_after = monitor.assess(&root_dir, window, min_samples);
         if health_after.sufficient_data && health_after.status != health_before.status {
-            state.event_bus.emit(EntityEvent::CognitiveHealthChanged {
+            state.event_bus.emit(PulseEvent::CognitiveHealthChanged {
                 previous: previous_status,
                 current: health_after.status.to_string(),
                 suggestions: health_after.suggestions,
@@ -1209,7 +1211,7 @@ async fn execute_intent(
         ];
         for (name, doc_health) in &docs {
             if doc_health.status == pulse_system_types::monitoring::ThresholdStatus::Red {
-                state.event_bus.emit(EntityEvent::PipelineAlert {
+                state.event_bus.emit(PulseEvent::PipelineAlert {
                     document: name.to_string(),
                     count: doc_health.count,
                     hard_limit: doc_health.hard,
@@ -1219,7 +1221,7 @@ async fn execute_intent(
 
         // Emit PipelineFrozen if pipeline is stuck
         if pipeline_state.sessions_without_movement >= state.config.pipeline.freeze_threshold {
-            state.event_bus.emit(EntityEvent::PipelineFrozen {
+            state.event_bus.emit(PulseEvent::PipelineFrozen {
                 sessions_without_movement: pipeline_state.sessions_without_movement,
             });
         }
@@ -1268,6 +1270,28 @@ mod tests {
             output_routing: IntentOutput::Silent,
             depth: 0,
         }
+    }
+
+    /// PN-115: a queue written before the rename tags marker-born intents
+    /// `entity_marker`. It must load (a parse failure empties the queue) and
+    /// be written back under the new name.
+    #[test]
+    fn pre_rename_intents_json_loads() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut intent = make_intent("old-1", IntentPriority::Normal);
+        intent.source = IntentSource::PulseMarker;
+        let mut value = serde_json::json!({ "intents": [intent] });
+        assert_eq!(value["intents"][0]["source"], "pulse_marker");
+        value["intents"][0]["source"] = "entity_marker".into();
+        std::fs::write(dir.path().join(INTENTS_FILE), value.to_string()).unwrap();
+
+        let queue = IntentQueue::load(dir.path());
+        assert_eq!(queue.intents.len(), 1);
+        assert_eq!(queue.intents[0].source, IntentSource::PulseMarker);
+        queue.save().unwrap();
+        let text = std::fs::read_to_string(dir.path().join(INTENTS_FILE)).unwrap();
+        assert!(text.contains("\"pulse_marker\""), "{text}");
+        assert!(!text.contains("entity_marker"), "{text}");
     }
 
     fn shared_leases(dir: &Path) -> crate::coordinator::control::SharedLeases {
@@ -1536,7 +1560,7 @@ mod tests {
     #[test]
     fn create_intent_from_valid_marker() {
         let json = r#"{"description": "Research memory", "prompt": "Deep dive into episodic memory.", "priority": "high"}"#;
-        let intent = create_intent_from_marker(json, IntentSource::EntityMarker).unwrap();
+        let intent = create_intent_from_marker(json, IntentSource::PulseMarker).unwrap();
         assert_eq!(intent.description, "Research memory");
         assert_eq!(intent.priority, IntentPriority::High);
         assert!(intent.id.starts_with("intent-"));
@@ -1545,17 +1569,17 @@ mod tests {
     #[test]
     fn create_intent_rejects_missing_fields() {
         let json = r#"{"description": "No prompt"}"#;
-        assert!(create_intent_from_marker(json, IntentSource::EntityMarker).is_err());
+        assert!(create_intent_from_marker(json, IntentSource::PulseMarker).is_err());
 
         let json = r#"{"prompt": "No description"}"#;
-        assert!(create_intent_from_marker(json, IntentSource::EntityMarker).is_err());
+        assert!(create_intent_from_marker(json, IntentSource::PulseMarker).is_err());
     }
 
     // --- [SALIENCE:] marker (PN-94) --------------------------------------
 
-    fn salience_parts(event: &EntityEvent) -> (crate::events::SalienceKind, String, String, f64) {
+    fn salience_parts(event: &PulseEvent) -> (crate::events::SalienceKind, String, String, f64) {
         match event {
-            EntityEvent::Salience {
+            PulseEvent::Salience {
                 kind,
                 headline,
                 evidence,
@@ -1619,7 +1643,7 @@ mod tests {
         assert_eq!(
             crate::outreach::stated_cost(&evidence),
             Some(crate::outreach::Cost::Nothing),
-            "the inline line is the one the entity wrote in context"
+            "the inline line is the one the pulse wrote in context"
         );
     }
 

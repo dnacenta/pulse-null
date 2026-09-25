@@ -36,7 +36,7 @@ impl Plugin for RecallEchoPlugin {
                 .and_then(|t| t.get("base_dir"))
                 .and_then(|v| v.as_str())
                 .map(std::path::PathBuf::from)
-                .unwrap_or_else(|| ctx.entity_root.join("memory"));
+                .unwrap_or_else(|| ctx.pulse_root.join("memory"));
 
             tracing::info!("recall-echo: base_dir = {}", base_dir.display());
             self.inner = Some(recall_echo::RecallEcho::new(base_dir));

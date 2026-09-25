@@ -17,7 +17,7 @@ pub struct Tokens {
     pub ink: Color,
     pub dim: Color,
     pub accent: Color,
-    pub entity: Color,
+    pub pulse: Color,
     pub good: Color,
     pub warn: Color,
     pub bad: Color,
@@ -48,7 +48,7 @@ pub const GRUVBOX_DARK: Tokens = Tokens {
     ink: rgb(0xebdbb2),
     dim: rgb(0x928374),
     accent: rgb(0x83a598),
-    entity: rgb(0x8ec07c),
+    pulse: rgb(0x8ec07c),
     good: rgb(0xb8bb26),
     warn: rgb(0xfabd2f),
     bad: rgb(0xfb4934),
@@ -61,7 +61,7 @@ pub const TOKYO_NIGHT: Tokens = Tokens {
     ink: rgb(0xc0caf5),
     dim: rgb(0x565f89),
     accent: rgb(0x7aa2f7),
-    entity: rgb(0x7dcfff),
+    pulse: rgb(0x7dcfff),
     good: rgb(0x9ece6a),
     warn: rgb(0xe0af68),
     bad: rgb(0xf7768e),
@@ -78,7 +78,7 @@ pub fn builtin(name: &str) -> Option<Tokens> {
             ink: rgb(0xcdd6f4),
             dim: rgb(0x6c7086),
             accent: rgb(0x89b4fa),
-            entity: rgb(0x94e2d5),
+            pulse: rgb(0x94e2d5),
             good: rgb(0xa6e3a1),
             warn: rgb(0xf9e2af),
             bad: rgb(0xf38ba8),
@@ -90,7 +90,7 @@ pub fn builtin(name: &str) -> Option<Tokens> {
             ink: rgb(0xd3c6aa),
             dim: rgb(0x859289),
             accent: rgb(0x7fbbb3),
-            entity: rgb(0x83c092),
+            pulse: rgb(0x83c092),
             good: rgb(0xa7c080),
             warn: rgb(0xdbbc7f),
             bad: rgb(0xe67e80),
@@ -101,7 +101,7 @@ pub fn builtin(name: &str) -> Option<Tokens> {
             ink: rgb(0xe0def4),
             dim: rgb(0x6e6a86),
             accent: rgb(0xc4a7e7),
-            entity: rgb(0x9ccfd8),
+            pulse: rgb(0x9ccfd8),
             good: rgb(0x31748f),
             warn: rgb(0xf6c177),
             bad: rgb(0xeb6f92),
@@ -112,7 +112,7 @@ pub fn builtin(name: &str) -> Option<Tokens> {
             ink: rgb(0xd8dee9),
             dim: rgb(0x4c566a),
             accent: rgb(0x88c0d0),
-            entity: rgb(0x8fbcbb),
+            pulse: rgb(0x8fbcbb),
             good: rgb(0xa3be8c),
             warn: rgb(0xebcb8b),
             bad: rgb(0xbf616a),
@@ -145,7 +145,7 @@ fn parse_hex(s: &str) -> Option<Color> {
 /// Verified layout (2026-09-02): top-level keys `background`, `foreground`,
 /// `accent`, `cursor`, `selection_*`, `color0`..`color15`. Mapping:
 /// ground←background, ink←foreground, accent←accent (else color4),
-/// dim←color8, entity←color6, good←color2, warn←color3, bad←color1,
+/// dim←color8, pulse←color6, good←color2, warn←color3, bad←color1,
 /// intent←color5. Any missing or malformed key falls back to Gruvbox dark for
 /// that token only; an unreadable or unparsable file is an error, and the
 /// caller falls back wholesale.
@@ -165,7 +165,7 @@ fn tokens_from_omarchy_value(value: &toml::Value) -> Tokens {
         accent: get("accent")
             .or_else(|| get("color4"))
             .unwrap_or(base.accent),
-        entity: get("color6").unwrap_or(base.entity),
+        pulse: get("color6").unwrap_or(base.pulse),
         good: get("color2").unwrap_or(base.good),
         warn: get("color3").unwrap_or(base.warn),
         bad: get("color1").unwrap_or(base.bad),
@@ -344,7 +344,7 @@ color8 = "#444b6a"
         assert_eq!(t.ink, rgb(0xa9b1d6));
         assert_eq!(t.accent, rgb(0x7aa2f7));
         assert_eq!(t.dim, rgb(0x444b6a));
-        assert_eq!(t.entity, rgb(0x449dab));
+        assert_eq!(t.pulse, rgb(0x449dab));
         assert_eq!(t.good, rgb(0x9ece6a));
         assert_eq!(t.warn, rgb(0xe0af68));
         assert_eq!(t.bad, rgb(0xf7768e));

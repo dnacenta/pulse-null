@@ -1,6 +1,6 @@
-//! The entity's ledger: one chronological row per thing the entity did.
+//! The pulse's ledger: one chronological row per thing the pulse did.
 //!
-//! Rows are projected from [`EntityEvent`]s as they happen (live) and
+//! Rows are projected from [`PulseEvent`]s as they happen (live) and
 //! reconstructed from on-disk records on demand (backfill). The daemon keeps
 //! the last [`LedgerRing::capacity`] live rows in memory so a client that
 //! drops its `/api/events` stream can replay what it missed by `id`.
@@ -15,7 +15,7 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::broadcast;
 
 use crate::caliber::outcome::{Outcome, OutcomeRecord, TaskType};
-use crate::events::{ConversationTrust, EntityEvent, InteractionSource};
+use crate::events::{ConversationTrust, InteractionSource, PulseEvent};
 
 /// Rows the daemon keeps for `/api/events` replay.
 pub const DEFAULT_RING_CAPACITY: usize = 500;
@@ -167,15 +167,15 @@ fn alert_row(id: u64, at: DateTime<Utc>, name: &str) -> LedgerRow {
     }
 }
 
-/// Project an [`EntityEvent`] into a ledger row, if it is ledger-worthy.
+/// Project an [`PulseEvent`] into a ledger row, if it is ledger-worthy.
 ///
 /// `id` is assigned by the caller (the ring) so projection stays pure.
-pub fn project(event: &EntityEvent, id: u64, at: DateTime<Utc>) -> Option<LedgerRow> {
+pub fn project(event: &PulseEvent, id: u64, at: DateTime<Utc>) -> Option<LedgerRow> {
     match event {
         // The summary is LLM-written, unbounded and frequently multi-paragraph.
         // The ledger is a one-line-per-thing index: detail is fetched through
         // `detail_ref`, never carried inline.
-        EntityEvent::PostInteraction {
+        PulseEvent::PostInteraction {
             source,
             trust,
             summary: _,
@@ -208,7 +208,7 @@ pub fn project(event: &EntityEvent, id: u64, at: DateTime<Utc>) -> Option<Ledger
             })
         }
 
-        EntityEvent::PipelineAlert {
+        PulseEvent::PipelineAlert {
             document,
             count,
             hard_limit,
@@ -218,7 +218,7 @@ pub fn project(event: &EntityEvent, id: u64, at: DateTime<Utc>) -> Option<Ledger
             &format!("{document} at hard limit {count}/{hard_limit}"),
         )),
 
-        EntityEvent::PipelineFrozen {
+        PulseEvent::PipelineFrozen {
             sessions_without_movement,
         } => Some(alert_row(
             id,
@@ -226,7 +226,7 @@ pub fn project(event: &EntityEvent, id: u64, at: DateTime<Utc>) -> Option<Ledger
             &format!("pipeline frozen for {sessions_without_movement} sessions"),
         )),
 
-        EntityEvent::CognitiveHealthChanged {
+        PulseEvent::CognitiveHealthChanged {
             previous, current, ..
         } => Some(alert_row(
             id,
@@ -234,7 +234,7 @@ pub fn project(event: &EntityEvent, id: u64, at: DateTime<Utc>) -> Option<Ledger
             &format!("cognitive {previous} → {current}"),
         )),
 
-        EntityEvent::PipelineConversionLow {
+        PulseEvent::PipelineConversionLow {
             conversations_7d,
             pipeline_updates_7d,
         } => Some(alert_row(
@@ -246,7 +246,7 @@ pub fn project(event: &EntityEvent, id: u64, at: DateTime<Utc>) -> Option<Ledger
             ),
         )),
 
-        EntityEvent::PluginStateChanged {
+        PulseEvent::PluginStateChanged {
             plugin_name,
             new_state,
         } => Some(alert_row(
@@ -255,7 +255,7 @@ pub fn project(event: &EntityEvent, id: u64, at: DateTime<Utc>) -> Option<Ledger
             &format!("plugin {plugin_name} {new_state}"),
         )),
 
-        EntityEvent::ProviderError {
+        PulseEvent::ProviderError {
             error,
             error_kind,
             task_id,
@@ -277,7 +277,7 @@ pub fn project(event: &EntityEvent, id: u64, at: DateTime<Utc>) -> Option<Ledger
             detail_ref: None,
         }),
 
-        EntityEvent::PredictionPressure {
+        PulseEvent::PredictionPressure {
             accumulated_importance,
             triggering_prediction_id,
             ..
@@ -289,7 +289,7 @@ pub fn project(event: &EntityEvent, id: u64, at: DateTime<Utc>) -> Option<Ledger
             ),
         )),
 
-        EntityEvent::Salience { kind, headline, .. } => {
+        PulseEvent::Salience { kind, headline, .. } => {
             Some(alert_row(id, at, &format!("{kind}: {headline}")))
         }
     }
@@ -462,7 +462,7 @@ impl LedgerRing {
 
     /// Project an event, assign it an id, and push it. Returns the row if the
     /// event was ledger-worthy.
-    pub fn record(&self, event: &EntityEvent) -> Option<LedgerRow> {
+    pub fn record(&self, event: &PulseEvent) -> Option<LedgerRow> {
         let id = self.next_id();
         let row = project(event, id, Utc::now())?;
         self.push(row.clone());
@@ -498,11 +498,11 @@ impl LedgerRing {
     }
 }
 
-/// Bridge the entity event bus into the ring for the life of the process.
+/// Bridge the pulse event bus into the ring for the life of the process.
 ///
 /// Returns the task handle; the task ends when the bus closes.
 pub fn spawn_projector(
-    mut rx: broadcast::Receiver<EntityEvent>,
+    mut rx: broadcast::Receiver<PulseEvent>,
     ring: std::sync::Arc<LedgerRing>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
@@ -581,8 +581,8 @@ mod tests {
     // project()
     // -----------------------------------------------------------------
 
-    fn interaction(source: InteractionSource, trust: ConversationTrust) -> EntityEvent {
-        EntityEvent::PostInteraction {
+    fn interaction(source: InteractionSource, trust: ConversationTrust) -> PulseEvent {
+        PulseEvent::PostInteraction {
             source,
             trust,
             summary: "a long multi-line summary\nsecond line".to_string(),
@@ -665,7 +665,7 @@ mod tests {
 
     #[test]
     fn project_provider_error_is_a_failed_provider_row() {
-        let event = EntityEvent::ProviderError {
+        let event = PulseEvent::ProviderError {
             error: "x".repeat(500),
             error_kind: "rate_limit".to_string(),
             task_id: "thinking-loop".to_string(),
@@ -683,7 +683,7 @@ mod tests {
 
     #[test]
     fn project_pipeline_alert_states_the_limit() {
-        let event = EntityEvent::PipelineAlert {
+        let event = PulseEvent::PipelineAlert {
             document: "LEARNING.md".to_string(),
             count: 42,
             hard_limit: 40,
@@ -697,7 +697,7 @@ mod tests {
 
     #[test]
     fn project_salience_prefixes_the_kind() {
-        let event = EntityEvent::Salience {
+        let event = PulseEvent::Salience {
             kind: crate::events::SalienceKind::Blocking,
             thread_id: None,
             headline: "needs a decision".to_string(),

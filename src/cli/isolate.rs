@@ -24,7 +24,7 @@ pub async fn on(reason: Option<String>) -> Result<(), Box<dyn std::error::Error>
         );
     } else {
         println!(
-            "  {} entered. Minimal core only — the running entity sheds the \
+            "  {} entered. Minimal core only — the running pulse sheds the \
              coordinator, scheduler, and all state writes at its next turn.",
             style("ISOLATION").red().bold()
         );

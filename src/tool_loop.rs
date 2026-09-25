@@ -509,17 +509,17 @@ fn append_feedback_nudges(
 
     // AE-1: Within-session expectation-violation feedback.
     // When tool results contain errors or empty results, inject a
-    // metacognitive nudge so the entity adjusts its approach in
+    // metacognitive nudge so the pulse adjusts its approach in
     // real-time rather than continuing with a broken assumption.
     if had_failure && had_success {
         // Mixed results — some tools worked, some didn't.
-        // The entity should notice and adapt.
+        // The pulse should notice and adapt.
         results.push(ContentBlock::Text {
             text: EXPECTATION_VIOLATION_MIXED.to_string(),
         });
     } else if had_failure && !rs.tool_degraded {
         // All tools failed but we haven't hit degraded state yet.
-        // Nudge the entity to reconsider its approach.
+        // Nudge the pulse to reconsider its approach.
         results.push(ContentBlock::Text {
             text: EXPECTATION_VIOLATION_FAILED.to_string(),
         });

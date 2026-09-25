@@ -278,7 +278,7 @@ fn find_section_end(lines: &[&str], section_start: usize, next_section: Option<u
 /// - Appends prediction errors to Calibration Record
 /// - Appends changes to Evolution Log
 ///
-/// `root_dir` is the entity root — the same directory the outcomes behind
+/// `root_dir` is the pulse root — the same directory the outcomes behind
 /// `report` were recorded in, and the one [`super::caliber_md`] resolves
 /// against.
 ///

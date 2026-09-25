@@ -343,7 +343,7 @@ pub async fn recover_orphans(
     wal: &WalWriter,
     session_store: &crate::session_store::SessionStore,
     root_dir: &std::path::Path,
-    entity_name: &str,
+    pulse_name: &str,
 ) {
     let wal_keys = match wal.list_active() {
         Ok(keys) => keys,
@@ -402,7 +402,7 @@ pub async fn recover_orphans(
         let meta = crate::session::ArchiveMeta {
             trigger: "crash-recovery".to_string(),
             channel: channel.clone(),
-            entity_name: entity_name.to_string(),
+            pulse_name: pulse_name.to_string(),
             session_key: Some(key.clone()),
         };
 
@@ -418,7 +418,7 @@ pub async fn recover_orphans(
                 // Write EPHEMERAL summary (same as clean exit)
                 crate::session::end_session(
                     root_dir,
-                    entity_name,
+                    pulse_name,
                     &messages,
                     &channel,
                     "crash-recovery",

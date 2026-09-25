@@ -6,7 +6,7 @@
 //!
 //! * **Disk is the truth.** Every request re-reads `schedule.json` and
 //!   `task_health.json` rather than serving the process's in-memory copy —
-//!   the CLI, the entity's own `[SCHEDULE:]` markers and this API all write
+//!   the CLI, the pulse's own `[SCHEDULE:]` markers and this API all write
 //!   the same file, so a cached view is a stale view.
 //! * **Writes go through [`Schedule::save_delta`]**, exactly as the CLI does.
 //!   The daemon rewrites `schedule.json` wholesale, so a read-modify-write
@@ -142,7 +142,7 @@ pub fn list_tasks(root: &Path, timezone: &str) -> Result<Vec<ScheduleTaskView>, 
 ///
 /// `Ok(None)` means no task carries that id — an absent task is a 404, not an
 /// error. The mutation runs inside [`Schedule::save_delta`], so it merges with
-/// whatever the CLI or the entity wrote in the meantime.
+/// whatever the CLI or the pulse wrote in the meantime.
 pub fn set_enabled(
     root: &Path,
     timezone: &str,
@@ -275,7 +275,7 @@ fn view(entry: &ScheduleEntry, health: &TaskHealthStore, timezone: &str) -> Sche
 fn creator_label(creator: &TaskCreator) -> &'static str {
     match creator {
         TaskCreator::System => "system",
-        TaskCreator::Entity => "entity",
+        TaskCreator::Pulse => "pulse",
         TaskCreator::User => "user",
     }
 }
@@ -480,7 +480,7 @@ mod tests {
             assert_eq!(view.cron, entry.task.cron);
             assert_eq!(view.cadence, humanize(&entry.task.cron));
             assert_eq!(view.channel, entry.task.channel);
-            assert!(matches!(view.created_by, "system" | "entity" | "user"));
+            assert!(matches!(view.created_by, "system" | "pulse" | "user"));
             // A fresh root has no task_health.json.
             assert!(view.last_run.is_none());
             assert_eq!(view.consecutive_failures, 0);
@@ -574,7 +574,7 @@ mod tests {
                 prompt: "p".to_string(),
                 output_routing: OutputRouting::Silent,
                 enabled: true,
-                created_by: TaskCreator::Entity,
+                created_by: TaskCreator::Pulse,
                 evaluator: None,
             });
         })
@@ -586,7 +586,7 @@ mod tests {
 
         let listed = list_tasks(dir.path(), TZ).unwrap();
         assert!(find(&listed, "external").enabled);
-        assert_eq!(find(&listed, "external").created_by, "entity");
+        assert_eq!(find(&listed, "external").created_by, "pulse");
         assert!(!find(&listed, &ids[0]).enabled);
     }
 

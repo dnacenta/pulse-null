@@ -43,8 +43,8 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     // Leftovers of the pre-PN-104 layout: `$HOME/.claude` symlinks into this
-    // entity are removed (they are ours), user-level recall-echo hooks that
-    // carry no entity root are only reported (that file is the user's).
+    // pulse are removed (they are ours), user-level recall-echo hooks that
+    // carry no pulse root are only reported (that file is the user's).
     let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
     if let Some(home) = home {
         let legacy = claude_code_bootstrap::legacy_home_links(&root_dir, &home);
@@ -52,7 +52,7 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
             println!();
             println!(
                 "  {}",
-                style("Retiring legacy user-level links into this entity:").bold()
+                style("Retiring legacy user-level links into this pulse:").bold()
             );
             for link in &legacy {
                 match std::fs::remove_file(link) {
@@ -81,12 +81,12 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
             let settings = home.join(".claude/settings.json");
             println!();
             println!(
-                "  {} {} has recall-echo hooks without an entity root.",
+                "  {} {} has recall-echo hooks without a pulse root.",
                 style("⚠").yellow(),
                 settings.display()
             );
-            println!("    They fire for every entity this user runs and resolve to the wrong one.");
-            println!("    The entity now carries its own hooks in .claude/settings.json — remove these by hand:");
+            println!("    They fire for every pulse this user runs and resolve to the wrong one.");
+            println!("    The pulse now carries its own hooks in .claude/settings.json — remove these by hand:");
             for command in &stale {
                 println!("      {}", printable(command));
             }

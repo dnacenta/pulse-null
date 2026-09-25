@@ -1,6 +1,6 @@
 //! The terminal UI (v2, PN-102): a client of the running daemon.
 //!
-//! `run_home` opens the entity menu; picking a row attaches to that daemon,
+//! `run_home` opens the pulse menu; picking a row attaches to that daemon,
 //! or starts one in this process when none answers, then drives an event-driven render loop: it
 //! draws only when a key, a daemon message, a theme change or a running
 //! effect says something changed, and never faster than one frame per
@@ -52,10 +52,10 @@ const BOOT_TICK: Duration = Duration::from_millis(80);
 const TURN_TICK: Duration = Duration::from_millis(100);
 /// Omarchy theme file poll cadence.
 const THEME_TICK: Duration = Duration::from_secs(2);
-/// Entity state probe cadence while Home shows.
+/// Pulse state probe cadence while Home shows.
 const HOME_TICK: Duration = Duration::from_secs(2);
 
-/// `pulse-null up`: Home — the logo and the entity menu. Nothing is
+/// `pulse-null up`: Home — the logo and the pulse menu. Nothing is
 /// started until a row is chosen.
 pub async fn run_home() -> Result<(), Box<dyn std::error::Error>> {
     let rows = rescan_home();
@@ -72,7 +72,7 @@ pub async fn run_home() -> Result<(), Box<dyn std::error::Error>> {
     run_app(app, None).await
 }
 
-/// `pulse-null chat`: the TUI for the entity in `config`, straight into
+/// `pulse-null chat`: the TUI for the pulse in `config`, straight into
 /// Talk when a daemon is already up.
 pub async fn run_chat(config: Config) -> Result<(), Box<dyn std::error::Error>> {
     let root = config.root_dir()?;
@@ -82,9 +82,9 @@ pub async fn run_chat(config: Config) -> Result<(), Box<dyn std::error::Error>> 
         config.server.port,
         config.security.secret.clone(),
     );
-    let state = home::EntityState::from(client.probe_detail(&config.entity.name).await);
+    let state = home::PulseState::from(client.probe_detail(&config.pulse.name).await);
     let session = Session::open(&config, root, state, &mut started)
-        .map_err(|why| format!("cannot open {}: {why}", config.entity.name))?;
+        .map_err(|why| format!("cannot open {}: {why}", config.pulse.name))?;
     let mut app = App::new(
         "",
         "",
@@ -93,7 +93,7 @@ pub async fn run_chat(config: Config) -> Result<(), Box<dyn std::error::Error>> 
         MotionLevel::parse(&config.tui.motion),
         Glyphs::from_setting(&config.tui.nerd_font),
     );
-    app.enter_entity(&config);
+    app.enter_pulse(&config);
     if session.attached {
         app.skip_boot();
     } else {
@@ -174,7 +174,7 @@ fn leave_terminal(term: &Term) {
     ratatui::restore();
 }
 
-/// A daemon this process started for an entity directory.
+/// A daemon this process started for a pulse directory.
 struct Daemon {
     dir: std::path::PathBuf,
     stop: tokio::sync::watch::Sender<bool>,
@@ -220,7 +220,7 @@ async fn stop_daemons(started: Vec<Daemon>) {
     while set.join_next().await.is_some() {}
 }
 
-/// Everything the loop needs to talk to one entity: the HTTP client and
+/// Everything the loop needs to talk to one pulse: the HTTP client and
 /// the poller task that owns connectivity. Created when a row is chosen.
 struct Session {
     client: Client,
@@ -232,30 +232,28 @@ struct Session {
 }
 
 impl Session {
-    /// Attach to the entity's daemon (`state` is `Up`), or start one in this
+    /// Attach to the pulse's daemon (`state` is `Up`), or start one in this
     /// process for `root` when nothing listens (`Stopped`; once per
-    /// directory — a second pick of the same entity reuses the daemon
+    /// directory — a second pick of the same pulse reuses the daemon
     /// already booting). Nothing is awaited: the probe already happened,
     /// and the poller confirms the attach. A port that answers for another
-    /// entity or not as a daemon is refused here as well as in the menu.
+    /// pulse or not as a daemon is refused here as well as in the menu.
     fn open(
         config: &Config,
         root: std::path::PathBuf,
-        state: home::EntityState,
+        state: home::PulseState,
         started: &mut Vec<Daemon>,
     ) -> Result<Self, String> {
         if let Some(why) = crate::discovery::untrusted_reason(&root) {
             return Err(why);
         }
         let attached = match state {
-            home::EntityState::Up => true,
-            home::EntityState::Stopped
-            | home::EntityState::Starting
-            | home::EntityState::Unknown => false,
-            home::EntityState::Foreign(who) => return Err(format!("port held by {who}")),
-            home::EntityState::Unreachable => {
-                return Err("port answers, but not as a daemon".into())
+            home::PulseState::Up => true,
+            home::PulseState::Stopped | home::PulseState::Starting | home::PulseState::Unknown => {
+                false
             }
+            home::PulseState::Foreign(who) => return Err(format!("port held by {who}")),
+            home::PulseState::Unreachable => return Err("port answers, but not as a daemon".into()),
         };
         let client = Client::new(
             &config.server.host,
@@ -357,7 +355,7 @@ async fn run_wizard(target: &std::path::Path) -> Result<(), String> {
     }
 }
 
-/// Where `Create a new entity` puts it: the discovered entity home, else
+/// Where `Create a new pulse` puts it: the discovered pulse home, else
 /// `~/pulse-null`.
 /// `(cwd, $HOME)` as the scan and the create target see them.
 fn where_we_are() -> (std::path::PathBuf, Option<std::path::PathBuf>) {
@@ -368,19 +366,19 @@ fn where_we_are() -> (std::path::PathBuf, Option<std::path::PathBuf>) {
 }
 
 /// Where `Create a new pulse` puts it: a directory that already holds this
-/// user's entities (the resolved entity home when it has entity children),
+/// user's pulses (the resolved pulse home when it has pulse children),
 /// else `~/pulse-null` — never a bare cwd, which the scan would not find
 /// again from anywhere else.
 fn create_target(cwd: &std::path::Path, home: Option<&std::path::Path>) -> std::path::PathBuf {
-    if let Some(entity_home) = crate::discovery::resolve_entity_home(cwd, home) {
-        if crate::discovery::has_entity_children(&entity_home) {
-            return entity_home;
+    if let Some(pulse_home) = crate::discovery::resolve_pulse_home(cwd, home) {
+        if crate::discovery::has_pulse_children(&pulse_home) {
+            return pulse_home;
         }
     }
     home.map_or_else(|| cwd.to_path_buf(), |h| h.join("pulse-null"))
 }
 
-fn rescan_home() -> Vec<home::EntityRow> {
+fn rescan_home() -> Vec<home::PulseRow> {
     let (cwd, home_dir) = where_we_are();
     home::Home::scan(&cwd, home_dir.as_deref())
 }
@@ -399,7 +397,7 @@ async fn event_loop(
     let mut home_tick = tokio::time::interval(HOME_TICK);
     // Probe results for Home's rows, from a task per tick.
     let (states_tx, mut states_rx) =
-        tokio::sync::mpsc::channel::<Vec<(std::path::PathBuf, home::EntityState)>>(4);
+        tokio::sync::mpsc::channel::<Vec<(std::path::PathBuf, home::PulseState)>>(4);
     // A ticker that is gated off for a while must not burst when it comes
     // back; skip the missed periods.
     for t in [
@@ -476,7 +474,7 @@ async fn event_loop(
                                         attached = s.attached;
                                         attach_deadline = Instant::now() + ATTACH_TIMEOUT;
                                         daemon_base = Some(s.client.base().to_string());
-                                        app.enter_entity(&config);
+                                        app.enter_pulse(&config);
                                         app.screen = app::Screen::Home;
                                         if attached {
                                             app.attached();
@@ -558,7 +556,7 @@ async fn event_loop(
                                 let who = if m.role == "user" {
                                     transcript::Who::Owner
                                 } else {
-                                    transcript::Who::Entity
+                                    transcript::Who::Pulse
                                 };
                                 (who, m.text, m.tools)
                             })
@@ -609,7 +607,7 @@ async fn event_loop(
             _ = boot_tick.tick(), if app.screen == app::Screen::Boot
                 || (app.screen == app::Screen::Home
                     && (app.motion.level() != MotionLevel::Off
-                        || app.home.rows.iter().any(|r| r.state == home::EntityState::Starting))) => {
+                        || app.home.rows.iter().any(|r| r.state == home::PulseState::Starting))) => {
                 app.tick();
                 if app.screen == app::Screen::Boot && !attached && Instant::now() > attach_deadline {
                     app.boot.status = format!(
@@ -638,7 +636,7 @@ async fn event_loop(
                     let mut set = tokio::task::JoinSet::new();
                     for (dir, name, c) in targets {
                         set.spawn(async move {
-                            (dir, home::EntityState::from(c.probe_detail(&name).await))
+                            (dir, home::PulseState::from(c.probe_detail(&name).await))
                         });
                     }
                     let mut states = Vec::new();
@@ -727,14 +725,14 @@ async fn event_loop(
 mod create_target_tests {
     use super::create_target;
 
-    fn entity_at(dir: &std::path::Path, name: &str) {
+    fn pulse_at(dir: &std::path::Path, name: &str) {
         let d = dir.join(name);
         std::fs::create_dir_all(&d).unwrap();
         std::fs::write(d.join("pulse-null.toml"), "").unwrap();
     }
 
     #[test]
-    fn create_goes_where_entities_already_live_else_home_pulse_null() {
+    fn create_goes_where_pulses_already_live_else_home_pulse_null() {
         let home = tempfile::tempdir().unwrap();
         let cwd = tempfile::tempdir().unwrap();
         // Nothing anywhere: ~/pulse-null, not the cwd.
@@ -742,20 +740,20 @@ mod create_target_tests {
             create_target(cwd.path(), Some(home.path())),
             home.path().join("pulse-null")
         );
-        // Entities under ~/pulse-null: there.
-        entity_at(&home.path().join("pulse-null"), "echo");
+        // Pulses under ~/pulse-null: there.
+        pulse_at(&home.path().join("pulse-null"), "echo");
         assert_eq!(
             create_target(cwd.path(), Some(home.path())),
             home.path().join("pulse-null")
         );
-        // Entities as children of the cwd: the cwd is the entity home.
+        // Pulses as children of the cwd: the cwd is the pulse home.
         let flat = tempfile::tempdir().unwrap();
-        entity_at(flat.path(), "nova");
+        pulse_at(flat.path(), "nova");
         assert_eq!(
             create_target(flat.path(), Some(home.path())),
             flat.path().to_path_buf()
         );
-        // Inside an entity: still ~/pulse-null, never inside the entity.
+        // Inside a pulse: still ~/pulse-null, never inside the pulse.
         assert_eq!(
             create_target(&flat.path().join("nova/memory"), Some(home.path())),
             home.path().join("pulse-null")
