@@ -64,9 +64,9 @@ fn serialize_marks_scheduled_tasks() {
 // --- command anchoring ---
 
 #[test]
-fn entity_command_sets_cwd_env_and_scrubs() {
+fn pulse_command_sets_cwd_env_and_scrubs() {
     let root = tempfile::tempdir().unwrap();
-    let cmd = entity_command("/usr/bin/true", root.path(), &Claude);
+    let cmd = pulse_command("/usr/bin/true", root.path(), &Claude);
     let std_cmd = cmd.as_std();
     assert_eq!(std_cmd.get_current_dir(), Some(root.path()));
     let envs: std::collections::HashMap<_, _> = std_cmd.get_envs().collect();
@@ -94,7 +94,7 @@ fn provider_resolves_bin_from_override_then_default() {
         root.path().into(),
     );
     assert_eq!(p.bin(), "/x/claude");
-    assert_eq!(p.entity_root(), root.path());
+    assert_eq!(p.pulse_root(), root.path());
     assert_eq!(p.adapter_name(), "claude");
     assert_eq!(p.name(), "cli");
     assert!(!p.supports_tools());
@@ -456,10 +456,33 @@ async fn refusal_is_a_typed_error() {
 #[test]
 fn env_set_reaches_the_child() {
     let root = tempfile::tempdir().unwrap();
-    let cmd = entity_command("/usr/bin/true", root.path(), &Grok);
+    let cmd = pulse_command("/usr/bin/true", root.path(), &Grok);
     let envs: std::collections::HashMap<_, _> = cmd.as_std().get_envs().collect();
     assert_eq!(
         envs.get(std::ffi::OsStr::new("RUST_LOG")),
         Some(&Some(std::ffi::OsStr::new("warn")))
     );
+}
+
+/// A streamed terminal record flagged as an error becomes a typed refusal
+/// when it carries the adapter's refusal signature, and a plain error
+/// otherwise — the same classifier the buffered path uses, so the fallback
+/// fires for streamed turns too.
+#[test]
+fn stream_failure_with_policy_text_is_a_typed_refusal() {
+    match classify_stream_failure(
+        &Claude,
+        "m",
+        "This request violates our Usage Policy.".into(),
+    ) {
+        StreamEvent::Refused { model, detail } => {
+            assert_eq!(model, "m");
+            assert!(detail.contains("Usage Policy"));
+        }
+        other => panic!("expected Refused, got {other:?}"),
+    }
+    assert!(matches!(
+        classify_stream_failure(&Claude, "m", "You're out of extra usage".into()),
+        StreamEvent::Error(_)
+    ));
 }

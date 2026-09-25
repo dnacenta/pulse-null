@@ -1,16 +1,16 @@
-//! Entity-local wiring that every agent CLI shares, and the file mechanics
+//! Pulse-local wiring that every agent CLI shares, and the file mechanics
 //! the per-CLI integrations build on.
 //!
-//! Everything an agent CLI needs to run *as* an entity lives inside that
-//! entity's directory. This module owns the CLI-independent part — the
-//! memory directory, `memory/.recall-echo.toml` carrying the entity's own
+//! Everything an agent CLI needs to run *as* a pulse lives inside that
+//! pulse's directory. This module owns the CLI-independent part — the
+//! memory directory, `memory/.recall-echo.toml` carrying the pulse's own
 //! provider, the conversations link — plus the symlink-safe, contained
 //! read/write helpers. Which instruction file, hooks or rules a given CLI
 //! reads is that CLI's adapter's business (`cli_provider::adapters`).
 //!
 //! Nothing here writes to the user's home. The pre-PN-104 design symlinked
-//! `~/.claude/{ARCHIVE.md,EPHEMERAL.md,memories}` into one entity, which made
-//! a second entity under the same unix user impossible.
+//! `~/.claude/{ARCHIVE.md,EPHEMERAL.md,memories}` into one pulse, which made
+//! a second pulse under the same unix user impossible.
 
 use std::fmt;
 use std::path::{Path, PathBuf};
@@ -172,7 +172,7 @@ pub(crate) fn write_regular_file(path: &Path, content: &str, within: &Path) -> R
         .map_err(|e| format!("parent directory: {e}"))?;
     if !parent_real.starts_with(within) {
         return Err(format!(
-            "parent {} resolves outside the entity ({})",
+            "parent {} resolves outside the pulse ({})",
             parent.display(),
             parent_real.display()
         ));
@@ -257,11 +257,11 @@ pub(crate) fn ensure_config(path: &Path, content: &str, within: &Path) -> Bootst
 }
 
 /// `memory/conversations -> ../archives/conversations`, relative so the
-/// entity tree survives being moved. An absolute link to the same place is
+/// pulse tree survives being moved. An absolute link to the same place is
 /// rewritten; anything else is left alone and reported.
-fn ensure_conversations_link(entity_root: &Path) -> BootstrapItem {
-    let link = entity_root.join("memory/conversations");
-    let target = entity_root.join("archives/conversations");
+fn ensure_conversations_link(pulse_root: &Path) -> BootstrapItem {
+    let link = pulse_root.join("memory/conversations");
+    let target = pulse_root.join("archives/conversations");
     let relative = PathBuf::from("../archives/conversations");
     let item = |status| BootstrapItem {
         path: link.clone(),
@@ -312,13 +312,13 @@ fn ensure_conversations_link(entity_root: &Path) -> BootstrapItem {
 }
 
 /// Generate the recall-echo.toml config content. `recall_provider` is the
-/// value recall-echo's `[llm] provider` takes for the entity's agent CLI —
-/// the same CLI does the entity's thinking and recall-echo's extraction, and
+/// value recall-echo's `[llm] provider` takes for the pulse's agent CLI —
+/// the same CLI does the pulse's thinking and recall-echo's extraction, and
 /// its sessions are what recall-echo's capture sweep should look for.
-pub(crate) fn render_recall_echo_toml(entity_root: &Path, recall_provider: &str) -> String {
+pub(crate) fn render_recall_echo_toml(pulse_root: &Path, recall_provider: &str) -> String {
     // TOML string literals, escaped by the toml crate — a quote or newline
     // in the path must not be able to open a new table.
-    let docs_dir = toml::Value::String(format!("{}/journal", entity_root.display())).to_string();
+    let docs_dir = toml::Value::String(format!("{}/journal", pulse_root.display())).to_string();
     let provider = toml::Value::String(recall_provider.to_string()).to_string();
     format!(
         r#"[ephemeral]
@@ -339,68 +339,68 @@ auto_sync = true
     )
 }
 
-/// The agent-CLI-independent part of an entity's wiring: the memory
-/// directory, recall-echo's config with the entity's provider, and the
+/// The agent-CLI-independent part of a pulse's wiring: the memory
+/// directory, recall-echo's config with the pulse's provider, and the
 /// conversations link. Safe to run repeatedly. A root that is not valid
 /// UTF-8 is refused: a lossy path would be persisted into config.
-pub fn ensure_common(entity_root: &Path, recall_provider: &str) -> Vec<BootstrapItem> {
-    let entity_root = entity_root
+pub fn ensure_common(pulse_root: &Path, recall_provider: &str) -> Vec<BootstrapItem> {
+    let pulse_root = pulse_root
         .canonicalize()
-        .unwrap_or_else(|_| entity_root.to_path_buf());
-    if entity_root.to_str().is_none() {
+        .unwrap_or_else(|_| pulse_root.to_path_buf());
+    if pulse_root.to_str().is_none() {
         return vec![BootstrapItem {
-            path: entity_root,
+            path: pulse_root,
             kind: ItemKind::Directory,
-            status: ItemStatus::Skipped("entity root is not valid UTF-8".into()),
+            status: ItemStatus::Skipped("pulse root is not valid UTF-8".into()),
         }];
     }
-    let memory_dir = entity_root.join("memory");
+    let memory_dir = pulse_root.join("memory");
     let mut items = Vec::new();
-    items.extend(migrate_legacy_instructions(&entity_root));
+    items.extend(migrate_legacy_instructions(&pulse_root));
     let memory = ensure_dir(&memory_dir);
     let memory_ok = matches!(memory.status, ItemStatus::Created | ItemStatus::Exists);
     items.push(memory);
     if memory_ok {
         items.push(ensure_config(
             &memory_dir.join(".recall-echo.toml"),
-            &render_recall_echo_toml(&entity_root, recall_provider),
-            &entity_root,
+            &render_recall_echo_toml(&pulse_root, recall_provider),
+            &pulse_root,
         ));
-        items.push(ensure_conversations_link(&entity_root));
+        items.push(ensure_conversations_link(&pulse_root));
     }
     items
 }
 
-/// Entities created before PN-106 keep their instructions in the file one
+/// Pulses created before PN-106 keep their instructions in the file one
 /// vendor's CLI reads. Copy it to the generic `INSTRUCTIONS.md` once, so the
 /// prompt builder and every adapter's pointer file have something to point
 /// at. Nothing is copied when INSTRUCTIONS.md exists or the legacy file is
 /// itself only a pointer.
-fn migrate_legacy_instructions(entity_root: &Path) -> Vec<BootstrapItem> {
-    let generic = entity_root.join("INSTRUCTIONS.md");
+fn migrate_legacy_instructions(pulse_root: &Path) -> Vec<BootstrapItem> {
+    let generic = pulse_root.join("INSTRUCTIONS.md");
     if generic.exists() {
         return Vec::new();
     }
-    let legacy = entity_root.join("CLAUDE.md"); // vendor-ok: pre-PN-106 instruction file
+    let legacy = pulse_root.join("CLAUDE.md"); // vendor-ok: pre-PN-106 instruction file
     let Ok(Some(text)) = read_small_file(&legacy) else {
         return Vec::new();
     };
     if text.trim().is_empty() || text.contains("@INSTRUCTIONS.md") {
         return Vec::new();
     }
-    vec![ensure_config(&generic, &text, entity_root)]
+    vec![ensure_config(&generic, &text, pulse_root)]
 }
 
 /// Report the state of the agent-CLI-independent wiring without changing
 /// anything.
-pub fn verify_common(entity_root: &Path, recall_provider: &str) -> Vec<BootstrapItem> {
-    let entity_root = entity_root
+pub fn verify_common(pulse_root: &Path, recall_provider: &str) -> Vec<BootstrapItem> {
+    let pulse_root = pulse_root
         .canonicalize()
-        .unwrap_or_else(|_| entity_root.to_path_buf());
+        .unwrap_or_else(|_| pulse_root.to_path_buf());
     let mut items = Vec::new();
-    let toml_path = entity_root.join("memory/.recall-echo.toml");
-    // Present, and naming the entity's own provider: `ensure_config` never
-    // rewrites the file, so an entity whose adapter changed would otherwise
+    let toml_path = pulse_root.join("memory/.recall-echo.toml");
+    // Present, and naming the pulse's own provider: `ensure_config` never
+    // rewrites the file, so a pulse whose adapter changed would otherwise
     // keep recall-echo extracting with the previous CLI.
     let status = match read_small_file(&toml_path) {
         Ok(Some(text)) => match toml::from_str::<toml::Value>(&text) {
@@ -413,7 +413,7 @@ pub fn verify_common(entity_root: &Path, recall_provider: &str) -> Vec<Bootstrap
                     ItemStatus::Exists
                 } else {
                     ItemStatus::Wrong(format!(
-                        "[llm] provider is {} but this entity's agent is {recall_provider}",
+                        "[llm] provider is {} but this pulse's agent is {recall_provider}",
                         configured.unwrap_or("unset")
                     ))
                 }
@@ -428,7 +428,7 @@ pub fn verify_common(entity_root: &Path, recall_provider: &str) -> Vec<Bootstrap
         path: toml_path,
         kind: ItemKind::ConfigFile,
     });
-    let link = entity_root.join("memory/conversations");
+    let link = pulse_root.join("memory/conversations");
     items.push(BootstrapItem {
         status: if link.is_symlink() {
             ItemStatus::Exists
@@ -452,7 +452,7 @@ pub fn verify_common(entity_root: &Path, recall_provider: &str) -> Vec<Bootstrap
 mod tests {
     use super::*;
 
-    fn entity() -> tempfile::TempDir {
+    fn pulse() -> tempfile::TempDir {
         let dir = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(dir.path().join("archives/conversations")).unwrap();
         std::fs::create_dir_all(dir.path().join("memory")).unwrap();
@@ -461,7 +461,7 @@ mod tests {
 
     #[test]
     fn existing_recall_toml_untouched() {
-        let dir = entity();
+        let dir = pulse();
         let toml = dir.path().join("memory/.recall-echo.toml");
         std::fs::write(&toml, "[graph]\nmode = \"server\"\n").unwrap();
         ensure_common(dir.path(), "claude-code");
@@ -473,7 +473,7 @@ mod tests {
 
     #[test]
     fn conversations_link_is_relative() {
-        let dir = entity();
+        let dir = pulse();
         let root = dir.path().canonicalize().unwrap();
         // An absolute link to the right place gets rewritten as relative.
         std::os::unix::fs::symlink(

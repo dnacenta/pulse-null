@@ -339,7 +339,7 @@ pub fn render_outcome_line(outcome: &OutcomeRecord) -> String {
 /// Render a concise caliber summary for system prompt injection (~50 lines max).
 ///
 /// Combines CALIBER.md capability map with outcome statistics to give the
-/// entity self-knowledge about its operational strengths and weaknesses.
+/// the pulse's self-knowledge about its operational strengths and weaknesses.
 /// This is the Phase 5 prompt injection entry point.
 pub fn render_for_prompt(docs_dir: &Path) -> Option<String> {
     let mut lines = Vec::new();

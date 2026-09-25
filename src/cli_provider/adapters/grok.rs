@@ -1,4 +1,4 @@
-//! Grok Build CLI, driven headlessly as an entity's brain.
+//! Grok Build CLI, driven headlessly as a pulse's brain.
 //!
 //! Grok advertises Claude-compat aliases for most of the flags pulse-null
 //! needs, but three differences are load-bearing and were verified against
@@ -32,7 +32,7 @@ use crate::cli_provider::adapter::{
 };
 use crate::init::agent_bootstrap::{ensure_config, BootstrapItem, ItemKind, ItemStatus};
 
-/// Tools an isolated entity must not reach, as grok's own comma-separated
+/// Tools an isolated pulse must not reach, as grok's own comma-separated
 /// `--disallowed-tools <TOOLS>` list. (`--disallowed-tools` is grok's compat
 /// alias for a single `--deny <RULE>`, so a list handed to it matched
 /// nothing — the shim had that bug in production.)
@@ -44,7 +44,7 @@ const RESTRICTED_TOOLS: &str = "Write,Edit,MultiEdit,NotebookEdit,Bash,WebFetch,
 const DEFAULT_REASONING_EFFORT: &str = "low";
 
 /// Environment variable that overrides [`DEFAULT_REASONING_EFFORT`], read at
-/// invoke time so an operator can retune a running entity without a rebuild.
+/// invoke time so an operator can retune a running pulse without a rebuild.
 const REASONING_EFFORT_ENV: &str = "GROK_REASONING_EFFORT";
 
 /// Grok Build CLI.
@@ -54,7 +54,7 @@ impl Grok {
     /// The effort level for this invocation: `[llm] reasoning_effort` first,
     /// then the `GROK_REASONING_EFFORT` environment override, then `low` —
     /// measured 2026-09-02: `high` cost ~20s of hidden thinking per chat
-    /// turn on the live entity, `low` 4.6s, same one-word answer.
+    /// turn on the live pulse, `low` 4.6s, same one-word answer.
     fn reasoning_effort(configured: Option<&str>) -> String {
         configured
             .map(str::trim)
@@ -101,10 +101,10 @@ impl CliAdapter for Grok {
     }
 
     /// Inline on argv. Linux caps a single argument at 128 KiB; the runner
-    /// refuses anything larger rather than silently truncating the entity's
+    /// refuses anything larger rather than silently truncating the pulse's
     /// identity.
     /// Grok has no file channel for the system prompt, so it rides on argv
-    /// (`--system-prompt-override`). That makes the entity's identity and
+    /// (`--system-prompt-override`). That makes the pulse's identity and
     /// memory readable in `/proc/<pid>/cmdline` by any local account while
     /// a turn runs — an accepted trade-off of this CLI, to be compensated at
     /// the host (`ProtectProc=invisible`, `hidepid`), not something another
@@ -135,14 +135,14 @@ impl CliAdapter for Grok {
             args.push(prompt_file.as_os_str().to_os_string());
         }
 
-        // The entity's recall stack is its only memory; grok's own
+        // The pulse's recall stack is its only memory; grok's own
         // cross-session memory would be a second, unmanaged store.
         args.push("--no-memory".into());
         args.push("--reasoning-effort".into());
         args.push(Self::reasoning_effort(inv.reasoning_effort).into());
         args.push("--dangerously-skip-permissions".into());
         // Grok refuses to run project hooks in an untrusted directory, and the
-        // entity directory is never in its trust store on a fresh host.
+        // pulse directory is never in its trust store on a fresh host.
         args.push("--trust".into());
 
         if inv.restricted {
@@ -214,20 +214,20 @@ impl AgentIntegration for Grok {
         "AGENTS.md"
     }
 
-    fn ensure(&self, entity_root: &Path, _recall_bin: &str) -> Vec<BootstrapItem> {
-        let entity_root = &entity_root
+    fn ensure(&self, pulse_root: &Path, _recall_bin: &str) -> Vec<BootstrapItem> {
+        let pulse_root = &pulse_root
             .canonicalize()
-            .unwrap_or_else(|_| entity_root.to_path_buf());
-        let path = entity_root.join(self.instruction_file());
+            .unwrap_or_else(|_| pulse_root.to_path_buf());
+        let path = pulse_root.join(self.instruction_file());
         vec![ensure_config(
             &path,
-            &instruction_pointer(entity_root),
-            entity_root,
+            &instruction_pointer(pulse_root),
+            pulse_root,
         )]
     }
 
-    fn verify(&self, entity_root: &Path) -> Vec<BootstrapItem> {
-        let path = entity_root.join(self.instruction_file());
+    fn verify(&self, pulse_root: &Path) -> Vec<BootstrapItem> {
+        let path = pulse_root.join(self.instruction_file());
         let status = if path.is_file() {
             ItemStatus::Exists
         } else {
@@ -241,7 +241,7 @@ impl AgentIntegration for Grok {
         // Grok auto-loads other harnesses' config — rules, hooks, MCPs from
         // the user's home — unless `[compat.*]` is off in ~/.grok/config.toml.
         // With it on, a hook in the user's home runs on every turn of every
-        // entity. Report drift; the file is the user's, never edited here.
+        // pulse. Report drift; the file is the user's, never edited here.
         if let Some(home) = std::env::var_os("HOME").map(std::path::PathBuf::from) {
             let config = home.join(".grok/config.toml");
             if !compat_disabled(&config) {
@@ -249,7 +249,7 @@ impl AgentIntegration for Grok {
                     path: config,
                     kind: ItemKind::ConfigFile,
                     status: ItemStatus::Wrong(
-                        "set every key under [compat.claude], [compat.cursor] and [compat.codex] to false so foreign harness hooks and rules stay out of entity turns".into(),
+                        "set every key under [compat.claude], [compat.cursor] and [compat.codex] to false so foreign harness hooks and rules stay out of pulse turns".into(),
                     ),
                 });
             }
@@ -273,15 +273,15 @@ impl AgentIntegration for Grok {
 }
 
 /// `AGENTS.md` is a pointer, not a second source of truth: this CLI does not
-/// resolve `@`-imports, so the file says in prose what the entity's real
+/// resolve `@`-imports, so the file says in prose what the pulse's real
 /// instructions are and where they live.
-fn instruction_pointer(entity_root: &Path) -> String {
-    let entity = entity_root
+fn instruction_pointer(pulse_root: &Path) -> String {
+    let pulse = pulse_root
         .file_name()
         .and_then(|name| name.to_str())
-        .unwrap_or("entity");
+        .unwrap_or("pulse");
     format!(
-        "# {entity} — Agent instructions\n\n\
+        "# {pulse} — Agent instructions\n\n\
          Read `INSTRUCTIONS.md` in this directory before acting; it is the \
          source of truth. This file exists because this CLI looks for \
          AGENTS.md.\n"
@@ -360,7 +360,7 @@ mod tests {
             prompt_file: Some(prompt_file),
             restricted: false,
             streaming: false,
-            entity_root: root,
+            pulse_root: root,
             reasoning_effort: None,
         }
     }

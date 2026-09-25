@@ -214,8 +214,8 @@ pub fn run(config: &PraxisConfig) -> Result<(), String> {
     // Pre-flight check
     if !claude.exists() {
         return Err(
-            "Config directory not found. Ensure the entity root is properly configured.\n  \
-             Check your entity configuration, then run this again."
+            "Config directory not found. Ensure the pulse root is properly configured.\n  \
+             Check your pulse configuration, then run this again."
                 .to_string(),
         );
     }

@@ -12,7 +12,7 @@ use super::intent::{self, IntentQueue, IntentSource};
 use super::liveness::{self, SharedTaskHealth, TaskOutcome};
 use super::output;
 use super::{Schedule, ScheduleEntry, ScheduledTask};
-use crate::events::EntityEvent;
+use crate::events::PulseEvent;
 use crate::interaction::{InteractionMetadata, InteractionRecord};
 use crate::provider_status;
 use crate::server::prompt;
@@ -263,8 +263,12 @@ async fn run_builtin_handler(
     match task.id.as_str() {
         "trajectory-mining" => {
             tracing::info!("Running built-in trajectory mining handler");
-            let docs_dir = resolve_docs_dir(root_dir);
-            let summary = crate::caliber::runtime::mine_and_update(&docs_dir);
+            // The pulse ROOT, not the journal: outcomes are recorded with
+            // `record_outcome(root_dir, ..)` and CALIBER.md is read from the
+            // root by the prompt builder and vigil. Mining `<root>/journal`
+            // read an outcomes file nothing writes and wrote a CALIBER.md
+            // nothing reads.
+            let summary = crate::caliber::runtime::mine_and_update(root_dir);
             tracing::info!("Trajectory mining complete: {}", summary);
 
             // Record outcome for caliber-echo itself
@@ -274,7 +278,7 @@ async fn run_builtin_handler(
                     0, 0,
                 );
                 if let Err(e) =
-                    tracker.record_outcome(root_dir, outcome, state.config.pulse.max_outcomes)
+                    tracker.record_outcome(root_dir, outcome, state.config.caliber.max_outcomes)
                 {
                     tracing::error!("Failed to record trajectory-mining outcome: {}", e);
                 }
@@ -575,7 +579,7 @@ async fn execute_task(
     let duration = (Utc::now() - started_at).num_seconds().max(0) as f64;
     let interaction = InteractionRecord::from_task(
         &task.id,
-        &state.config.entity.name,
+        &state.config.pulse.name,
         transcript,
         started_at,
         InteractionMetadata {
@@ -694,7 +698,8 @@ async fn execute_task(
             output_tokens,
         );
         let outcome_kind = outcome.outcome.clone();
-        if let Err(e) = tracker.record_outcome(&root_dir, outcome, state.config.pulse.max_outcomes)
+        if let Err(e) =
+            tracker.record_outcome(&root_dir, outcome, state.config.caliber.max_outcomes)
         {
             tracing::error!("Failed to record outcome for task '{}': {}", task.id, e);
         }
@@ -755,7 +760,7 @@ async fn execute_task(
         // Assess health AFTER recording new signals
         let health_after = monitor.assess(&root_dir, window, min_samples);
         if health_after.sufficient_data && health_after.status != health_before.status {
-            state.event_bus.emit(EntityEvent::CognitiveHealthChanged {
+            state.event_bus.emit(PulseEvent::CognitiveHealthChanged {
                 previous: previous_status,
                 current: health_after.status.to_string(),
                 suggestions: health_after.suggestions,
@@ -794,7 +799,7 @@ async fn execute_task(
         ];
         for (name, doc_health) in &docs {
             if doc_health.status == pulse_system_types::monitoring::ThresholdStatus::Red {
-                state.event_bus.emit(EntityEvent::PipelineAlert {
+                state.event_bus.emit(PulseEvent::PipelineAlert {
                     document: name.to_string(),
                     count: doc_health.count,
                     hard_limit: doc_health.hard,
@@ -804,7 +809,7 @@ async fn execute_task(
 
         // Emit PipelineFrozen if no movement for >= freeze_threshold sessions
         if pipeline_state.sessions_without_movement >= state.config.pipeline.freeze_threshold {
-            state.event_bus.emit(EntityEvent::PipelineFrozen {
+            state.event_bus.emit(PulseEvent::PipelineFrozen {
                 sessions_without_movement: pipeline_state.sessions_without_movement,
             });
         }
@@ -819,7 +824,7 @@ async fn execute_task(
             let conversations_7d = crate::session::count_recent_conversations(&root_dir, 7);
             let pipeline_updates_7d = crate::session::count_pipeline_updates(&root_dir, 7);
             if conversations_7d >= 3 && pipeline_updates_7d < 2 {
-                state.event_bus.emit(EntityEvent::PipelineConversionLow {
+                state.event_bus.emit(PulseEvent::PipelineConversionLow {
                     conversations_7d,
                     pipeline_updates_7d,
                 });
@@ -830,7 +835,7 @@ async fn execute_task(
     // Daily task digest: consolidate today's task outputs into a single EPHEMERAL entry.
     // Idempotent — needs_digest() returns false if today's digest already exists.
     if super::digest::needs_digest(&root_dir) {
-        super::digest::write_task_digest(&root_dir, &state.config.entity.name);
+        super::digest::write_task_digest(&root_dir, &state.config.pulse.name);
     }
 
     // Graph pipeline sync (if enabled)
@@ -892,7 +897,7 @@ async fn handle_provider_error(state: &Arc<AppState>, task_id: &str, error_msg: 
     }
 
     // Emit event
-    state.event_bus.emit(EntityEvent::ProviderError {
+    state.event_bus.emit(PulseEvent::ProviderError {
         error: error_msg.to_string(),
         error_kind: kind_str,
         task_id: task_id.to_string(),
@@ -918,7 +923,7 @@ async fn route_output_markers(
         match super::dynamic::create_task_from_marker(schedule_json) {
             Ok(new_task) => {
                 tracing::info!(
-                    "Entity self-scheduled task: '{}' ({})",
+                    "Pulse self-scheduled task: '{}' ({})",
                     new_task.name,
                     new_task.cron
                 );
@@ -1108,7 +1113,7 @@ fn inject_reflection_pressure_directive(
     );
     state
         .event_bus
-        .emit(crate::events::EntityEvent::PredictionPressure {
+        .emit(crate::events::PulseEvent::PredictionPressure {
             accumulated_importance: pressure.accumulated_importance,
             triggering_prediction_id: pressure.triggering_prediction_id,
             triggering_surprise: pressure.triggering_surprise,

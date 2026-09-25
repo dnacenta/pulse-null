@@ -33,7 +33,7 @@ pub struct Alert {
 
 /// File-backed alert queue.
 ///
-/// Alerts are persisted to `alerts.json` in the entity root so they
+/// Alerts are persisted to `alerts.json` in the pulse root so they
 /// survive restarts. The queue is append-only until drained.
 #[derive(Debug)]
 pub struct AlertQueue {
@@ -112,6 +112,15 @@ impl AlertQueue {
     #[allow(dead_code)]
     pub fn is_empty(&self) -> bool {
         self.alerts.is_empty()
+    }
+
+    /// The pending alerts, oldest first, without consuming them.
+    ///
+    /// The ledger backfill reads the queue; draining it there would steal the
+    /// alerts from the consumer that is supposed to deliver them.
+    #[must_use]
+    pub fn snapshot(&self) -> &[Alert] {
+        &self.alerts
     }
 
     /// Persist the queue to disk (atomic write).
@@ -286,7 +295,7 @@ pub fn alert_from_tension_triage(source: &str, demand: &crate::tension::TriageDe
 
 /// Create an alert reporting refused tension markers (PN-95).
 ///
-/// A discharge claim that is silently ignored reads to the entity exactly
+/// A discharge claim that is silently ignored reads to the pulse exactly
 /// like a granted one, which is how a store quietly stops meaning anything.
 pub fn alert_from_tension_rejections(
     source: &str,

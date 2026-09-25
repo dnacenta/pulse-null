@@ -1,4 +1,4 @@
-//! Tension store persistence — `{entity}/tension.json`.
+//! Tension store persistence — `{pulse}/tension.json`.
 //!
 //! Same discipline as `predictions.json` (PN-86), for the same reasons:
 //! atomic rename so an interrupted write cannot tear the file, a locked
@@ -12,7 +12,7 @@
 //!   prompt build that cannot read tension should still produce a prompt.
 //! * [`load_strict`] fail-closes — a corrupt file aborts the delta and is
 //!   quarantined, because the alternative is writing an empty store over
-//!   the entity's entire accumulated pressure.
+//!   the pulse's entire accumulated pressure.
 //!
 //! ## Sync vs. async
 //!
@@ -74,7 +74,7 @@ pub fn load(root_dir: &Path, config: TensionConfig) -> TensionStore {
 
 /// Fail-closed load for read-modify-write callers.
 ///
-/// A missing file is an empty store (fresh entity); an existing file that
+/// A missing file is an empty store (fresh pulse); an existing file that
 /// cannot be read or parsed is an error and the delta is aborted. A corrupt
 /// file is quarantined to `tension.json.corrupt.<ts>` so the failure costs
 /// one loud cycle rather than wedging every future write forever.
@@ -311,7 +311,7 @@ mod tests {
     }
 
     /// Fail-closed: a corrupt existing file aborts the delta rather than
-    /// wiping the entity's accumulated pressure, and is quarantined so the
+    /// wiping the pulse's accumulated pressure, and is quarantined so the
     /// next write self-heals.
     #[test]
     fn save_delta_aborts_and_quarantines_corrupt_file() {

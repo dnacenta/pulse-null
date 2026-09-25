@@ -51,7 +51,7 @@ pub fn create_task_from_marker(
         prompt,
         output_routing,
         enabled: true,
-        created_by: TaskCreator::Entity,
+        created_by: TaskCreator::Pulse,
         evaluator: None,
     })
 }
@@ -67,7 +67,7 @@ mod tests {
         assert_eq!(task.name, "follow-up-foucault");
         assert_eq!(task.cron, "0 0 14 * * *");
         assert!(task.prompt.contains("Foucault"));
-        assert_eq!(task.created_by, TaskCreator::Entity);
+        assert_eq!(task.created_by, TaskCreator::Pulse);
         assert!(task.enabled);
     }
 

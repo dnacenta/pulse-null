@@ -1,6 +1,6 @@
 //! caliber-echo — Operational self-model and capability mapping
 //!
-//! Manages CALIBER.md and outcome tracking for AI entities.
+//! Manages CALIBER.md and outcome tracking for pulses.
 //! Records what was attempted, what happened, and how predictions
 //! compared to reality.
 
@@ -30,16 +30,23 @@ pub fn outcomes_file(docs_dir: &Path) -> PathBuf {
     caliber_dir(docs_dir).join("outcomes.json")
 }
 
-/// Path to CALIBER.md
-pub fn caliber_md(docs_dir: &Path) -> PathBuf {
-    docs_dir.join("CALIBER.md")
+/// Path to CALIBER.md: `{root_dir}/CALIBER.md`.
+///
+/// The argument is the **pulse root**, not a docs/journal directory. The
+/// capability map is written next to `schedule.json` and `task_health.json`
+/// because that is where the outcomes it is mined from already live
+/// (`record_outcome` is always called with the root). Resolving it against
+/// `<root>/journal` instead — as the trajectory miner once did — produced a
+/// second CALIBER.md that nothing ever read.
+pub fn caliber_md(root_dir: &Path) -> PathBuf {
+    root_dir.join("CALIBER.md")
 }
 
 // ---------------------------------------------------------------------------
 // Core struct
 // ---------------------------------------------------------------------------
 
-/// Main caliber-echo struct. Holds the path to the entity's documents.
+/// Main caliber-echo struct. Holds the path to the pulse's documents.
 pub struct CaliberEcho {
     docs_dir: PathBuf,
 }
@@ -73,7 +80,7 @@ impl CaliberEcho {
     fn get_setup_prompts() -> Vec<SetupPrompt> {
         vec![SetupPrompt {
             key: "docs_dir".into(),
-            question: "Entity documents directory (where CALIBER.md lives):".into(),
+            question: "Pulse documents directory (where CALIBER.md lives):".into(),
             required: true,
             secret: false,
             default: Some("./".into()),
@@ -115,7 +122,7 @@ impl Plugin for CaliberEchoPlugin {
                 .and_then(|t| t.get("docs_dir"))
                 .and_then(|v| v.as_str())
                 .map(PathBuf::from)
-                .unwrap_or_else(|| ctx.entity_root.clone());
+                .unwrap_or_else(|| ctx.pulse_root.clone());
 
             tracing::info!("caliber-echo: docs_dir = {}", docs_dir.display());
             self.inner = Some(CaliberEcho::new(docs_dir));
@@ -205,14 +212,24 @@ mod tests {
         assert!(matches!(health, PluginHealth::Down(_)));
     }
 
+    /// The single rule every CALIBER.md reader and writer now follows: the
+    /// file sits directly in the pulse root. Three call sites used to
+    /// disagree (the miner resolved `<root>/journal`), so one of them was
+    /// always looking at a file the others never touched.
+    #[test]
+    fn caliber_md_lives_in_the_pulse_root() {
+        let root = Path::new("/home/pulse/pulse-null/echo");
+        assert_eq!(caliber_md(root), root.join("CALIBER.md"));
+    }
+
     #[test]
     fn path_helpers() {
-        let docs = Path::new("/tmp/entity");
-        assert_eq!(caliber_dir(docs), Path::new("/tmp/entity/caliber"));
+        let docs = Path::new("/tmp/pulse");
+        assert_eq!(caliber_dir(docs), Path::new("/tmp/pulse/caliber"));
         assert_eq!(
             outcomes_file(docs),
-            Path::new("/tmp/entity/caliber/outcomes.json")
+            Path::new("/tmp/pulse/caliber/outcomes.json")
         );
-        assert_eq!(caliber_md(docs), Path::new("/tmp/entity/CALIBER.md"));
+        assert_eq!(caliber_md(docs), Path::new("/tmp/pulse/CALIBER.md"));
     }
 }

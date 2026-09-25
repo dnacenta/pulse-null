@@ -1,3 +1,6 @@
+// Peer-to-peer plumbing. Its only consumer, the old Comms tab, was deleted in
+// PN-102; `/api/peers` and `/api/comms` (phase 4) pick it up again.
+#![allow(dead_code)]
 use std::collections::HashMap;
 use std::path::Path;
 use std::time::{Duration, Instant};
@@ -55,19 +58,19 @@ impl std::fmt::Display for PeerError {
 pub struct PeerClient {
     http: reqwest::Client,
     peers: HashMap<String, PeerConfig>,
-    /// This entity's name, sent as X-Peer-Name for peer authentication.
-    entity_name: String,
+    /// This pulse's name, sent as X-Peer-Name for peer authentication.
+    pulse_name: String,
 }
 
 impl PeerClient {
-    pub fn new(peers: HashMap<String, PeerConfig>, entity_name: String) -> Self {
+    pub fn new(peers: HashMap<String, PeerConfig>, pulse_name: String) -> Self {
         Self {
             http: reqwest::Client::builder()
                 .timeout(Duration::from_secs(120))
                 .build()
                 .expect("failed to build HTTP client"),
             peers,
-            entity_name,
+            pulse_name,
         }
     }
 
@@ -121,7 +124,7 @@ impl PeerClient {
         }));
 
         // Identify ourselves for peer authentication
-        req = req.header("X-Peer-Name", &self.entity_name);
+        req = req.header("X-Peer-Name", &self.pulse_name);
 
         if let Some(secret) = &peer.secret {
             req = req.header("X-Echo-Secret", secret);

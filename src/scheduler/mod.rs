@@ -5,6 +5,7 @@ pub mod dynamic;
 pub mod evaluator;
 pub mod executor;
 pub mod health;
+pub mod humanize;
 pub mod intent;
 pub mod liveness;
 pub mod output;
@@ -44,7 +45,7 @@ pub struct ScheduleEntry {
     /// Model this task runs on, overriding `[llm] model` for this task only.
     ///
     /// Exists because a safety layer can refuse a whole *class* of task while
-    /// leaving chat untouched: pinning the entity globally to work around one
+    /// leaving chat untouched: pinning the pulse globally to work around one
     /// refusing task costs every other caller the model they wanted.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
@@ -84,7 +85,7 @@ pub struct Schedule {
 }
 
 impl Schedule {
-    /// Load schedule from schedule.json in the entity root. Pure read: a
+    /// Load schedule from schedule.json in the pulse root. Pure read: a
     /// missing file is an error. Only `load_or_init` (boot) may create the
     /// defaults — this load runs from task loops and save_delta, where a
     /// transiently absent file (unlink+rename edit, restore, mount blip)
@@ -104,7 +105,7 @@ impl Schedule {
     }
 
     /// Boot-time load: creates and persists the default schedule if the file
-    /// does not exist yet (fresh entity).
+    /// does not exist yet (fresh pulse).
     pub fn load_or_init(root_dir: &Path) -> Result<Self, crate::errors::SchedulerError> {
         if !root_dir.join("schedule.json").exists() {
             let schedule = Self::with_defaults();
@@ -147,7 +148,7 @@ impl Schedule {
     ///
     /// A replacement that carries no model override inherits the one it
     /// replaces. The override is operator policy about *how* a task runs;
-    /// the definition is content, and the entity rewrites its own content
+    /// the definition is content, and the pulse rewrites its own content
     /// via `[SCHEDULE:]`. Dropping the override on rewrite would silently
     /// move a task back onto the model it was moved off.
     pub fn add_task(&mut self, task: impl Into<ScheduleEntry>) {
@@ -315,11 +316,11 @@ pub async fn start(
     Ok(handles)
 }
 
-/// The per-tick tension update — the arithmetic layer the entity has never
+/// The per-tick tension update — the arithmetic layer the pulse has never
 /// had (spec §1.2).
 ///
 /// Between the end of one cognitive cycle and the start of the next, the
-/// entity's state currently changes only if an LLM call changes it, so every
+/// pulse's state currently changes only if an LLM call changes it, so every
 /// inter-cycle transition has to be paid for in tokens and in practice none
 /// happen. This loop is that missing primitive: it wakes every
 /// [`crate::tension::TICK_INTERVAL_MINUTES`], adds accrual to every live
@@ -398,6 +399,42 @@ mod tests {
     use super::*;
     use tempfile::TempDir;
 
+    /// PN-115: a schedule.json written before the rename says
+    /// `"created_by": "entity"`. It must load as `TaskCreator::Pulse` (a
+    /// parse failure would stop every task loop) and be rewritten as "pulse".
+    #[test]
+    fn pre_rename_created_by_entity_loads_as_pulse() {
+        let dir = TempDir::new().unwrap();
+        let legacy = serde_json::json!({
+            "tasks": [{
+                "id": "follow-up",
+                "name": "Follow up",
+                "cron": "0 0 14 * * *",
+                "channel": "system",
+                "prompt": "p",
+                "output_routing": "silent",
+                "enabled": false,
+                "created_by": "entity",
+                "model": "claude-opus-5"
+            }]
+        });
+        std::fs::write(dir.path().join("schedule.json"), legacy.to_string()).unwrap();
+
+        let schedule = Schedule::load(dir.path()).unwrap();
+        let entry = &schedule.tasks[0];
+        assert_eq!(entry.task.created_by, TaskCreator::Pulse);
+        assert_eq!(entry.model.as_deref(), Some("claude-opus-5"));
+
+        schedule.save(dir.path()).unwrap();
+        let written = std::fs::read_to_string(dir.path().join("schedule.json")).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&written).unwrap();
+        assert_eq!(value["tasks"][0]["created_by"], "pulse");
+        assert_eq!(
+            Schedule::load(dir.path()).unwrap().tasks[0].task.created_by,
+            TaskCreator::Pulse
+        );
+    }
+
     /// MEDIUM-3 regression: concurrent save_delta callers must not lose
     /// updates (load-apply-save is serialized by the static mutex + flock).
     #[test]
@@ -418,7 +455,7 @@ mod tests {
                         prompt: "p".into(),
                         output_routing: OutputRouting::Silent,
                         enabled: true,
-                        created_by: TaskCreator::Entity,
+                        created_by: TaskCreator::Pulse,
                         evaluator: None,
                     });
                     Schedule::save_delta(&root, |s| s.add_task(entry)).unwrap();
@@ -483,7 +520,7 @@ mod tests {
             prompt: "do the thing".into(),
             output_routing: OutputRouting::Silent,
             enabled: true,
-            created_by: TaskCreator::Entity,
+            created_by: TaskCreator::Pulse,
             evaluator: None,
         });
         in_memory = Schedule::save_delta(root, |s| s.add_task(new_task)).unwrap();
@@ -592,7 +629,7 @@ mod tests {
         assert_eq!(schedule.find_task("t").unwrap().model_override(), Some("m"));
     }
 
-    /// The entity rewrites its own tasks via `[SCHEDULE:]`. Losing the
+    /// The pulse rewrites its own tasks via `[SCHEDULE:]`. Losing the
     /// override there would silently move a task back onto the model it was
     /// deliberately moved off.
     #[test]

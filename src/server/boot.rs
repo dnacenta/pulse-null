@@ -13,8 +13,8 @@ use crate::session_store::SessionStore;
 
 use super::AppState;
 
-/// Result of booting an entity's server.
-pub struct BootedEntity {
+/// Result of booting a pulse's server.
+pub struct BootedPulse {
     pub server_handle: JoinHandle<()>,
     pub coordinator: crate::coordinator::control::Coordinator,
     pub event_bus: Arc<EventBus>,
@@ -22,19 +22,19 @@ pub struct BootedEntity {
     pub persist_coordinator: Arc<PersistCoordinator>,
 }
 
-/// Boot an entity's HTTP server and scheduler as background tasks.
+/// Boot a pulse's HTTP server and scheduler as background tasks.
 ///
 /// Unlike `server::start()`, this does NOT block. It spawns the server
 /// as a tokio task and returns handles for lifecycle management.
-pub async fn boot_entity(
+pub async fn boot_pulse(
     config: Config,
     root_dir: PathBuf,
     fallback_port: u16,
-) -> Result<BootedEntity, Box<dyn std::error::Error>> {
+) -> Result<BootedPulse, Box<dyn std::error::Error>> {
     super::ensure_infrastructure(&root_dir);
 
     // Create LLM provider
-    let provider = crate::providers::create_provider(&config, &root_dir)?;
+    let provider = crate::providers::create_streaming_provider(&config, &root_dir)?;
 
     // Monitoring
     let monitors = super::setup::create_monitors(&config);
@@ -68,7 +68,7 @@ pub async fn boot_entity(
     let mut session_store = SessionStore::with_identity(
         &root_dir,
         &config.sessions,
-        &config.entity.name,
+        &config.pulse.name,
         &config.owner,
         &config.peers,
     )
@@ -105,12 +105,17 @@ pub async fn boot_entity(
         alert_queue: tokio::sync::Mutex::new(alert_queue),
         provider_status: crate::provider_status::new_shared(),
         leadership: std::sync::atomic::AtomicBool::new(false),
+        event_permits: crate::server::stream_pools().0,
+        chat_permits: crate::server::stream_pools().1,
+        ledger: Arc::new(crate::ledger::LedgerRing::new(
+            crate::ledger::DEFAULT_RING_CAPACITY,
+        )),
     });
 
     // Pipeline health check
     super::setup::startup_pipeline_check(&root_dir, &config, &state.pipeline_monitor);
 
-    // Scheduler — gated on control-plane leadership (fail-open: the entity's
+    // Scheduler — gated on control-plane leadership (fail-open: the pulse's
     // interactive surfaces never wait on the coordinator).
     let schedule = Schedule::load_or_init(&root_dir)?;
     let schedule = Arc::new(RwLock::new(schedule));
@@ -137,33 +142,33 @@ pub async fn boot_entity(
     // Build router (plugin_routes collected before AppState construction)
     let app = super::build_router(Arc::clone(&state), plugin_routes);
 
-    // The entity's own host:port when the port is free; the registry's
+    // The pulse's own host:port when the port is free; the registry's
     // fallback otherwise, said out loud (PN-104).
-    let entity_name = config.entity.name.clone();
+    let pulse_name = config.pulse.name.clone();
     let (host, host_note) = bind_host(&config.server.host, has_usable_secret(&config));
     if let Some(note) = host_note {
-        tracing::warn!("Entity \"{}\": {}", entity_name, note);
+        tracing::warn!("Pulse \"{}\": {}", pulse_name, note);
     }
     let (port, fallback_note) = choose_port(config.server.port, fallback_port, |p| {
         crate::registry::port_available_on(&host, p)
     });
     if let Some(note) = fallback_note {
-        tracing::warn!("Entity \"{}\": {}", entity_name, note);
+        tracing::warn!("Pulse \"{}\": {}", pulse_name, note);
     }
     let addr = format!("{host}:{port}");
     let listener = tokio::net::TcpListener::bind(&addr).await?;
     let actual_port = listener.local_addr()?.port();
 
-    tracing::info!("Entity \"{}\" listening on :{}", entity_name, actual_port);
+    tracing::info!("Pulse \"{}\" listening on :{}", pulse_name, actual_port);
 
     // Spawn server as background task (non-blocking)
     let server_handle = tokio::spawn(async move {
         if let Err(e) = axum::serve(listener, app).await {
-            tracing::error!("Entity \"{}\" server error: {}", entity_name, e);
+            tracing::error!("Pulse \"{}\" server error: {}", pulse_name, e);
         }
     });
 
-    Ok(BootedEntity {
+    Ok(BootedPulse {
         server_handle,
         coordinator,
         event_bus,
@@ -181,9 +186,9 @@ pub(crate) fn has_usable_secret(config: &Config) -> bool {
         .is_some_and(|s| !s.trim().is_empty())
 }
 
-/// The host an entity binds in multi-entity mode. Its configured host, unless
-/// that would expose an entity with no `security.secret` beyond loopback —
-/// then loopback, with a note. `pulse-null.toml` is entity-writable data, so
+/// The host a pulse binds in multi-pulse mode. Its configured host, unless
+/// that would expose a pulse with no `security.secret` beyond loopback —
+/// then loopback, with a note. `pulse-null.toml` is pulse-writable data, so
 /// the socket must not be the only thing standing between it and the network.
 pub(crate) fn bind_host(configured: &str, has_secret: bool) -> (String, Option<String>) {
     let loopback = configured == "localhost"
@@ -201,7 +206,7 @@ pub(crate) fn bind_host(configured: &str, has_secret: bool) -> (String, Option<S
     )
 }
 
-/// Pick the port an entity binds in multi-entity mode: its configured port
+/// Pick the port a pulse binds in multi-pulse mode: its configured port
 /// when `available`, else `fallback` with a note naming both.
 fn choose_port(
     configured: u16,

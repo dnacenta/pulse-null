@@ -6,10 +6,18 @@ use axum::Json;
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
 
+use std::convert::Infallible;
+
+use axum::response::sse::{Event, KeepAlive, Sse};
+use futures_core::Stream;
+use tokio::sync::mpsc;
+
 use crate::interaction::InteractionRecord;
+use crate::server::auth::AuthIdentity;
 use crate::server::{injection, AppState};
-use crate::session_store::resolve_sender;
-use crate::tool_loop;
+use crate::session_store::{resolve_sender, Session};
+use crate::streaming::StreamingProvider;
+use crate::tool_loop::{self, TurnEvent, TurnSink, TurnStatus};
 use pulse_system_types::llm::{Message, MessageContent, MessageSource, Role};
 
 #[derive(Deserialize)]
@@ -31,10 +39,15 @@ pub struct ChatResponse {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub output_tokens: Option<u32>,
     /// Sticky isolation-mode indicator — present (true) on every response
-    /// while the entity is isolated, so any consumer arriving mid-session
+    /// while the pulse is isolated, so any consumer arriving mid-session
     /// sees the posture.
     #[serde(skip_serializing_if = "std::ops::Not::not", default)]
     pub isolation: bool,
+    /// True when the hallucination guard cut the reply short. A streaming
+    /// client uses it to know the `done` text is authoritative over the
+    /// deltas it already showed.
+    #[serde(skip_serializing_if = "std::ops::Not::not", default)]
+    pub truncated: bool,
 }
 
 fn default_channel() -> String {
@@ -42,7 +55,7 @@ fn default_channel() -> String {
 }
 
 /// Maximum number of tool-use round trips before we force a text response.
-const MAX_TOOL_ROUNDS: u32 = 25;
+const MAX_TOOL_ROUNDS: u32 = tool_loop::DEFAULT_MAX_TOOL_ROUNDS;
 
 /// Maximum number of refusal-fallback invocations per session (SEC-002).
 /// Once reached, further refusals take the ordinary rollback + error path
@@ -102,20 +115,73 @@ fn validate_request(req: &ChatRequest) -> Result<(), (StatusCode, String)> {
 
 pub async fn chat(
     State(state): State<Arc<AppState>>,
+    axum::Extension(who): axum::Extension<AuthIdentity>,
     Json(req): Json<ChatRequest>,
 ) -> Result<Json<ChatResponse>, (StatusCode, String)> {
+    run_turn(state, req, who, None).await.map(Json)
+}
+
+/// Channels whose session is the owner's by construction.
+fn is_owner_channel(channel: &str) -> bool {
+    matches!(channel, "tui" | "system" | "reflection")
+}
+
+/// A peer credential never reaches an owner channel — 403 before anything
+/// else (the stream endpoint checks this before it opens the stream, so the
+/// refusal is an HTTP status, not an event inside a 200).
+fn refuse_peer_on_owner_channel(
+    who: &AuthIdentity,
+    channel: &str,
+) -> Result<(), (StatusCode, String)> {
+    if let AuthIdentity::Peer(name) = who {
+        if is_owner_channel(channel) {
+            tracing::warn!("peer {name} posted to the owner channel {channel:?}");
+            return Err((
+                StatusCode::FORBIDDEN,
+                "this channel is reserved for the owner".to_string(),
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Run one conversation turn end to end: identity, isolation, context buffer,
+/// session limits, compaction, the provider call (with refusal fallback),
+/// guards, persistence, and the post-interaction event.
+///
+/// `/chat` calls this with no sink and returns the response as JSON.
+/// `/api/chat/stream` passes a [`TurnSink`] and forwards every
+/// [`TurnEvent`] to the client as it happens; the turn itself is identical.
+///
+/// Cancellation: if this future is dropped mid-turn (a streaming client went
+/// away) the user message is rolled back exactly as a failed turn is, so the
+/// trunk never carries a dangling user turn. Nothing is persisted.
+pub(crate) async fn run_turn(
+    state: Arc<AppState>,
+    req: ChatRequest,
+    who: AuthIdentity,
+    sink: Option<TurnSink>,
+) -> Result<ChatResponse, (StatusCode, String)> {
     validate_request(&req)?;
 
-    // Auth is enforced by middleware (server/auth.rs)
-
-    // Resolve sender identity (Phase 1: Unified Session)
+    // Authentication happened in the middleware (server/auth.rs); the
+    // identity it established is what the turn runs as. A peer credential
+    // can never become the owner through the body: the owner channels are
+    // refused, and the session key comes from the credential, not from
+    // `sender` or `channel`.
     let sender_label = req.sender.as_deref().unwrap_or("unknown");
-    let resolved_key = resolve_sender(
-        &req.channel,
-        req.sender.as_deref(),
-        &state.config.owner,
-        &state.config.peers,
-    );
+    let resolved_key = match &who {
+        AuthIdentity::Owner => resolve_sender(
+            &req.channel,
+            req.sender.as_deref(),
+            &state.config.owner,
+            &state.config.peers,
+        ),
+        AuthIdentity::Peer(name) => {
+            refuse_peer_on_owner_channel(&who, &req.channel)?;
+            format!("peer:{name}")
+        }
+    };
 
     // Isolation commands are handled before ANYTHING else touches the turn —
     // including the provider, which may itself be the suspect. Owned by the
@@ -127,13 +193,14 @@ pub async fn chat(
         sender_label,
     ) {
         crate::server::isolation::Intercept::Handled { response, isolated } => {
-            return Ok(Json(ChatResponse {
+            return Ok(ChatResponse {
                 response,
                 model: "isolation-control".to_string(),
                 input_tokens: None,
                 output_tokens: None,
                 isolation: isolated,
-            }));
+                truncated: false,
+            });
         }
         crate::server::isolation::Intercept::None => {}
     }
@@ -152,7 +219,7 @@ pub async fn chat(
     }
 
     // Inject channel context buffer (recent activity on this channel)
-    // Phase 4: use filtered retrieval — time decay, entity filtering,
+    // Phase 4: use filtered retrieval — time decay, pulse filtering,
     // deduplication against session history, entry/token caps.
     if let Some(ref cb) = state.context_buffer {
         // Extract recent session message texts for deduplication.
@@ -170,10 +237,10 @@ pub async fn chat(
         };
 
         // Human senders: the owner alias and the current sender
-        let mut human_senders: Vec<&str> = vec![&state.config.entity.owner_alias];
+        let mut human_senders: Vec<&str> = vec![&state.config.pulse.owner_alias];
         if let Some(ref s) = req.sender {
             // If sender differs from owner_alias, include both
-            if !s.eq_ignore_ascii_case(&state.config.entity.owner_alias) {
+            if !s.eq_ignore_ascii_case(&state.config.pulse.owner_alias) {
                 human_senders.push(s.as_str());
             }
         }
@@ -181,7 +248,7 @@ pub async fn chat(
         if let Some(channel_context) = cb
             .get_context_filtered(
                 &req.channel,
-                &state.config.entity.name,
+                &state.config.pulse.name,
                 &human_senders,
                 &session_texts,
                 &state.config.context_buffer,
@@ -212,8 +279,10 @@ pub async fn chat(
         .get_or_create_by_key(&resolved_key, &req.channel, sender_label)
         .await;
 
-    // Lock the session for this request
-    let mut session = session_arc.write().await;
+    // Lock the session for this request. The guard also owns the rollback:
+    // if this future is dropped after the user message is pushed and before
+    // the turn succeeds, the guard truncates while it still holds the lock.
+    let mut session = TurnGuard::new(session_arc.write().await);
     session.touch();
 
     // Ephemeral isolation tail (spec Stage 2: "nothing that writes"): while
@@ -270,7 +339,7 @@ pub async fn chat(
         crate::session_store::reset_session(
             &mut session.data,
             &state.root_dir,
-            &state.config.entity.name,
+            &state.config.pulse.name,
         );
     }
 
@@ -283,6 +352,7 @@ pub async fn chat(
     // this point so it can never poison later turns — the 2026-08-09
     // session-poisoning bug, where a refused turn left a half-appended user
     // message that made fable re-trip on every subsequent benign turn.
+    let trunk_len_before_push = session.data.messages.len();
     session.data.messages.push(Message {
         role: Role::User,
         content: user_content.clone(),
@@ -291,6 +361,10 @@ pub async fn chat(
             sender: resolved_key.clone(),
         }),
     });
+    // PN-102: a dropped future (streaming client disconnected) rolls the user
+    // message back the same way a failed turn does. Disarmed the moment the
+    // provider call succeeds.
+    session.arm(trunk_len_before_push);
 
     // A real human message just arrived — reset the autonomous round counter
     // now, pre-turn, so that even a turn that later refuses or errors still
@@ -310,6 +384,8 @@ pub async fn chat(
 
     // Tier-2 compaction is shed in isolation: it calls the provider and
     // writes archives — both belong to the subsystems under suspicion.
+    // It can rewrite the trunk under the rollback watermark, so the guard is
+    // re-anchored right after it (see `TurnGuard::rearm_at_last_user`).
     if !isolated {
         // Compact conversation if approaching context budget (Tier 2 — Structured AutoCompact)
         // Extract values before the call to avoid borrow conflicts with &mut messages
@@ -322,7 +398,7 @@ pub async fn chat(
             state.config.llm.context_budget,
             state.config.llm.max_tokens,
             &state.root_dir,
-            &state.config.entity.name,
+            &state.config.pulse.name,
             &req.channel,
             Some(&session_key),
             current_compaction_failures,
@@ -396,6 +472,7 @@ pub async fn chat(
             }
         }
     }
+    session.rearm_at_last_user();
 
     // Invoke LLM with tool loop
     let channel = req.channel.clone();
@@ -479,6 +556,7 @@ pub async fn chat(
         &system_prompt,
         state.config.llm.max_tokens,
         &correlation_id,
+        sink.as_ref(),
     )
     .await
     .map_err(|e| {
@@ -509,16 +587,27 @@ pub async fn chat(
         }
         // Keep the banner sticky even on the failure path — while isolated
         // the provider is precisely the suspect.
-        let msg = if crate::server::isolation::is_active(&state.root_dir) {
-            format!("{} {}", crate::server::isolation::BANNER, e)
+        // SEC-007 applies to every provider failure, not only the fallback
+        // path: the detail is in the log above; the client gets a generic
+        // body (and the isolation banner when relevant).
+        let public = if e.downcast_ref::<crate::errors::RefusalError>().is_some() {
+            "the model declined this request"
         } else {
-            e.to_string()
+            "upstream model error"
+        };
+        let msg = if crate::server::isolation::is_active(&state.root_dir) {
+            format!("{} {}", crate::server::isolation::BANNER, public)
+        } else {
+            public.to_string()
         };
         (StatusCode::INTERNAL_SERVER_ERROR, msg)
     })?;
 
     let committed_to_quarantine = turn.quarantined;
     let result = turn.result;
+    // The turn succeeded: from here on the messages are committed and a
+    // dropped future must not undo them.
+    session.disarm();
 
     // Re-sample: a turn admitted just before the marker appeared must not
     // write after it. OR of the two samples drives every gate below.
@@ -718,7 +807,7 @@ pub async fn chat(
         if let Err(e) = crate::caliber::runtime::record_outcome(
             &state.root_dir,
             conv_outcome,
-            state.config.pulse.max_outcomes,
+            state.config.caliber.max_outcomes,
         ) {
             tracing::warn!("Failed to record conversation outcome: {}", e);
         }
@@ -737,10 +826,10 @@ pub async fn chat(
         maybe_checkpoint(&state, &session_key, &mut session.data, &channel).await;
     }
 
-    // Record entity response to context buffer (shed in isolation)
+    // Record pulse response to context buffer (shed in isolation)
     if !isolated {
         if let Some(ref cb) = state.context_buffer {
-            cb.record(&channel, &state.config.entity.name, "assistant", &text)
+            cb.record(&channel, &state.config.pulse.name, "assistant", &text)
                 .await;
         }
     }
@@ -750,7 +839,7 @@ pub async fn chat(
     let conversation_trust = conversation_trust_from_identity(&resolved_key);
     let interaction = InteractionRecord::from_session(
         &session.data,
-        &state.config.entity.name,
+        &state.config.pulse.name,
         conversation_trust,
         result.input_tokens,
         result.output_tokens,
@@ -821,7 +910,7 @@ pub async fn chat(
     // Sticky banner for trusted consumers; concealed from guests (the
     // operating posture is not their business).
     let reveal = isolated && !resolved_key.starts_with("guest:");
-    Ok(Json(ChatResponse {
+    Ok(ChatResponse {
         response: if reveal {
             crate::server::isolation::banner_wrap(text)
         } else {
@@ -831,7 +920,208 @@ pub async fn chat(
         input_tokens: Some(result.input_tokens),
         output_tokens: Some(result.output_tokens),
         isolation: reveal,
-    }))
+        truncated: result.was_truncated,
+    })
+}
+
+/// The session write guard for one turn, plus the rollback watermark.
+///
+/// Rolling back has to happen while this guard still owns the lock. A
+/// deferred rollback that re-acquires the lock is a race: tokio's `RwLock`
+/// is FIFO, so a turn already queued on the same session runs first, and the
+/// late truncate then deletes *that* turn's committed messages. Here the
+/// guard itself truncates in `Drop`, synchronously, before the lock is
+/// released — a dropped future (streaming client gone) rolls back exactly
+/// the messages this turn pushed and nothing else.
+struct TurnGuard<'a> {
+    inner: tokio::sync::RwLockWriteGuard<'a, Session>,
+    /// Trunk length before this turn's user message; `Some` while armed.
+    watermark: Option<usize>,
+}
+
+impl<'a> TurnGuard<'a> {
+    fn new(inner: tokio::sync::RwLockWriteGuard<'a, Session>) -> Self {
+        Self {
+            inner,
+            watermark: None,
+        }
+    }
+
+    /// Roll back to `len` messages if this guard is dropped before `disarm`.
+    fn arm(&mut self, len: usize) {
+        self.watermark = Some(len);
+    }
+
+    /// The turn committed: keep everything.
+    fn disarm(&mut self) {
+        self.watermark = None;
+    }
+
+    /// Compaction may have replaced older messages with a summary, leaving
+    /// the trunk shorter than the armed watermark; a rollback would then be
+    /// a no-op and the uncommitted user message would survive. Re-anchor at
+    /// the user message we pushed, which compaction keeps as the last entry.
+    fn rearm_at_last_user(&mut self) {
+        let Some(armed) = self.watermark else {
+            return;
+        };
+        let n = self.inner.data.messages.len();
+        let last_is_user = self.inner.data.messages.last().is_some_and(|m| {
+            matches!(m.role, Role::User) && matches!(m.source, Some(MessageSource::Human { .. }))
+        });
+        self.watermark = Some(if last_is_user { n - 1 } else { armed.min(n) });
+    }
+}
+
+impl std::ops::Deref for TurnGuard<'_> {
+    type Target = Session;
+    fn deref(&self) -> &Session {
+        &self.inner
+    }
+}
+
+impl std::ops::DerefMut for TurnGuard<'_> {
+    fn deref_mut(&mut self) -> &mut Session {
+        &mut self.inner
+    }
+}
+
+impl Drop for TurnGuard<'_> {
+    fn drop(&mut self) {
+        let Some(len) = self.watermark.take() else {
+            return;
+        };
+        let now = self.inner.data.messages.len();
+        if now > len {
+            self.inner.data.messages.truncate(len);
+            self.inner.data.compaction.estimated_tokens =
+                crate::context::estimate_conversation_tokens(&self.inner.data.messages);
+            tracing::info!(
+                "[chat] turn cancelled — rolled back {} uncommitted message(s)",
+                now - len
+            );
+        }
+    }
+}
+
+/// Aborts the turn task when the SSE response body is dropped, which is how a
+/// client disconnect reaches us.
+struct AbortOnDrop(tokio::task::AbortHandle);
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
+/// Capacity of the progress channel between the turn and its SSE stream.
+/// Full means the client is slower than the model; the event is then dropped
+/// (`try_send`), never awaited — `done.text` is authoritative.
+const STREAM_CHANNEL_CAPACITY: usize = 256;
+
+fn sse_event(ev: &crate::wire::ChatStreamEvent) -> Event {
+    let (name, data) = ev.to_sse_parts();
+    // A serde_json::Value always serializes; the Err arm is unreachable.
+    Event::default()
+        .event(name.clone())
+        .json_data(data)
+        .unwrap_or_else(|_| Event::default().event(name).data("{}"))
+}
+
+/// Encode one turn event for the wire.
+fn turn_event_to_sse(event: TurnEvent) -> Event {
+    use crate::wire::{ChatStreamEvent, TurnPhase};
+    let ev = match event {
+        TurnEvent::Status(TurnStatus::Thinking) => ChatStreamEvent::Status {
+            status: TurnPhase::Thinking,
+            name: None,
+        },
+        TurnEvent::Status(TurnStatus::Responding) => ChatStreamEvent::Status {
+            status: TurnPhase::Responding,
+            name: None,
+        },
+        TurnEvent::Status(TurnStatus::Tool(name)) => ChatStreamEvent::Status {
+            status: TurnPhase::Tool,
+            name: Some(name),
+        },
+        TurnEvent::Delta(text) => ChatStreamEvent::Delta { text },
+    };
+    sse_event(&ev)
+}
+
+fn done_to_sse(resp: ChatResponse) -> Event {
+    sse_event(&crate::wire::ChatStreamEvent::Done {
+        text: resp.response,
+        model: resp.model,
+        tokens_in: resp.input_tokens,
+        tokens_out: resp.output_tokens,
+        isolation: resp.isolation,
+        truncated: resp.truncated,
+    })
+}
+
+fn error_to_sse(status: StatusCode, message: String) -> Event {
+    sse_event(&crate::wire::ChatStreamEvent::Error {
+        status: status.as_u16(),
+        message,
+    })
+}
+
+/// `POST /api/chat/stream` — the same turn as [`chat`], delivered as SSE.
+///
+/// Events: `status {status: thinking|responding|tool, name?}`, `delta {text}`
+/// (as the provider yields them; the client coalesces), then exactly one of
+/// `done {text, model, tokens_in, tokens_out, isolation, truncated}` or
+/// `error {status, message}`. Dropping the connection aborts the turn: the
+/// provider child is killed and the user message is rolled back.
+///
+/// Client contract: deltas are best-effort and unvalidated. A consumer that
+/// stops reading loses deltas rather than stalling the turn, and a reply the
+/// hallucination guard cut short is streamed raw first. `done.text` is the
+/// validated, complete reply and must replace whatever was shown; `truncated`
+/// says the guard fired.
+pub async fn chat_stream(
+    State(state): State<Arc<AppState>>,
+    axum::Extension(who): axum::Extension<AuthIdentity>,
+    Json(req): Json<ChatRequest>,
+) -> Result<Sse<impl Stream<Item = Result<Event, Infallible>>>, (StatusCode, String)> {
+    validate_request(&req)?;
+    refuse_peer_on_owner_channel(&who, &req.channel)?;
+    let permit = Arc::clone(&state.chat_permits)
+        .try_acquire_owned()
+        .map_err(|_| {
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "too many open streams; try again shortly".to_string(),
+            )
+        })?;
+
+    let (tx, rx) = mpsc::channel::<TurnEvent>(STREAM_CHANNEL_CAPACITY);
+    let (done_tx, done_rx) = tokio::sync::oneshot::channel();
+    let task = tokio::spawn(async move {
+        let outcome = run_turn(state, req, who, Some(tx)).await;
+        let _ = done_tx.send(outcome);
+    });
+    let guard = AbortOnDrop(task.abort_handle());
+
+    let stream = async_stream::stream! {
+        let _guard = guard;
+        let _permit = permit;
+        let mut rx = rx;
+        while let Some(event) = rx.recv().await {
+            yield Ok(turn_event_to_sse(event));
+        }
+        match done_rx.await {
+            Ok(Ok(resp)) => yield Ok(done_to_sse(resp)),
+            Ok(Err((status, message))) => yield Ok(error_to_sse(status, message)),
+            Err(_) => yield Ok(error_to_sse(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "turn ended without a result".to_string(),
+            )),
+        }
+    };
+
+    Ok(Sse::new(stream).keep_alive(KeepAlive::new().interval(std::time::Duration::from_secs(15))))
 }
 
 /// Outcome of one interactive turn after the refusal-fallback dance.
@@ -897,14 +1187,16 @@ fn shed_isolation_quarantine(data: &mut crate::session_store::SessionData) -> us
 /// caller performed before invoking the helper is not reverted.
 ///
 /// Precondition: the current user message is the last element of `data.messages`.
+#[allow(clippy::too_many_arguments)]
 async fn invoke_turn_with_refusal_fallback<F>(
     data: &mut crate::session_store::SessionData,
-    default_provider: &dyn pulse_system_types::llm::LmProvider,
+    default_provider: &dyn StreamingProvider,
     build_fallback: Option<F>,
     tools: &crate::tools::ToolRegistry,
     system_prompt: &str,
     max_tokens: u32,
     correlation_id: &str,
+    sink: Option<&TurnSink>,
 ) -> Result<TurnResult, Box<dyn std::error::Error + Send + Sync>>
 where
     F: FnOnce()
@@ -919,18 +1211,37 @@ where
         None => return Err("invoke_turn_with_refusal_fallback called with an empty trunk".into()),
     };
 
-    let default_outcome = crate::task_context::scope(
-        Some(correlation_id.to_string()),
-        tool_loop::invoke_with_tool_loop(
-            default_provider,
-            tools,
-            system_prompt,
-            &mut data.messages,
-            max_tokens,
-            MAX_TOOL_ROUNDS,
-        ),
-    )
-    .await;
+    let default_outcome = match sink {
+        Some(sink) => {
+            crate::task_context::scope(
+                Some(correlation_id.to_string()),
+                tool_loop::invoke_with_tool_loop_streaming(
+                    default_provider,
+                    tools,
+                    system_prompt,
+                    &mut data.messages,
+                    max_tokens,
+                    MAX_TOOL_ROUNDS,
+                    sink,
+                ),
+            )
+            .await
+        }
+        None => {
+            crate::task_context::scope(
+                Some(correlation_id.to_string()),
+                tool_loop::invoke_with_tool_loop(
+                    default_provider,
+                    tools,
+                    system_prompt,
+                    &mut data.messages,
+                    max_tokens,
+                    MAX_TOOL_ROUNDS,
+                ),
+            )
+            .await
+        }
+    };
 
     let refusal = match default_outcome {
         Ok(result) => {
@@ -980,6 +1291,11 @@ where
     fallback_ctx.extend(data.quarantine.iter().cloned());
     fallback_ctx.push(user_msg.clone());
 
+    // The fallback provider is buffered; a streaming client learns it is
+    // thinking again and then gets the whole reply as one delta.
+    if let Some(sink) = sink {
+        let _ = sink.try_send(TurnEvent::Status(TurnStatus::Thinking));
+    }
     let fallback_outcome = crate::task_context::scope(
         Some(correlation_id.to_string()),
         tool_loop::invoke_with_tool_loop(
@@ -995,6 +1311,10 @@ where
 
     match fallback_outcome {
         Ok(result) => {
+            if let Some(sink) = sink {
+                let _ = sink.try_send(TurnEvent::Status(TurnStatus::Responding));
+                let _ = sink.try_send(TurnEvent::Delta(result.text.clone()));
+            }
             // Quarantine the exchange: the trunk stays clean so the default
             // model does not re-trip on later benign turns.
             data.quarantine.push(user_msg);
@@ -1046,8 +1366,8 @@ fn build_identity_system_prompt(base: &str, resolved_key: &str, sender: &str) ->
         format!(
             "{}\n\n<peer-conversation-context>\n\
              You are having a direct conversation with {}.\n\
-             {} is a trusted peer entity — a sibling in the same pulse-null network, \
-             managed by the same owner. This is an internal conversation between entities, \
+             {} is a trusted peer pulse — a sibling in the same pulse-null network, \
+             managed by the same owner. This is an internal conversation between pulses, \
              not a user-facing interaction.\n\n\
              Speak freely and collaboratively. Share knowledge, insights, and observations openly.\n\
              If you have graph memory available, use it to recall past interactions with {}.\n\n\
@@ -1123,7 +1443,7 @@ async fn maybe_checkpoint(
     let meta = crate::session::ArchiveMeta {
         trigger: "checkpoint".to_string(),
         channel: channel.to_string(),
-        entity_name: state.config.entity.name.clone(),
+        pulse_name: state.config.pulse.name.clone(),
         session_key: Some(session_key.to_string()),
     };
 
@@ -1266,6 +1586,7 @@ mod tests {
         seen: Arc<Mutex<Vec<String>>>,
     }
 
+    impl crate::streaming::StreamingProvider for RecordingProvider {}
     impl LmProvider for RecordingProvider {
         fn invoke(
             &self,
@@ -1304,6 +1625,7 @@ mod tests {
 
     /// Always issues an AUP refusal.
     struct RefusingMock;
+    impl crate::streaming::StreamingProvider for RefusingMock {}
     impl LmProvider for RefusingMock {
         fn invoke(
             &self,
@@ -1330,6 +1652,7 @@ mod tests {
 
     /// Always fails with a generic (non-refusal) error.
     struct FailingMock;
+    impl crate::streaming::StreamingProvider for FailingMock {}
     impl LmProvider for FailingMock {
         fn invoke(
             &self,
@@ -1357,6 +1680,42 @@ mod tests {
                 sender: "owner".into(),
             }),
         }
+    }
+
+    /// S2-5: compaction shrinks the trunk under the armed watermark; the
+    /// guard re-anchors at the user message so a cancel still removes it.
+    #[tokio::test]
+    async fn rollback_survives_compaction_under_the_watermark() {
+        let lock =
+            tokio::sync::RwLock::new(Session::new("owner".into(), "tui".into(), "owner".into()));
+        {
+            let mut guard = TurnGuard::new(lock.write().await);
+            for t in ["a", "b", "c", "d"] {
+                guard.data.messages.push(user(t));
+            }
+            let before = guard.data.messages.len();
+            guard.data.messages.push(user("current"));
+            guard.arm(before);
+
+            // Compaction: everything before the current turn folds into one summary.
+            let current = guard.data.messages.pop().unwrap();
+            guard.data.messages.clear();
+            guard.data.messages.push(user("[summary of a..d]"));
+            guard.data.messages.push(current);
+            guard.rearm_at_last_user();
+            // Dropped without disarm: the client went away.
+        }
+        let session = lock.read().await;
+        let texts: Vec<String> = session
+            .data
+            .messages
+            .iter()
+            .map(|m| match &m.content {
+                MessageContent::Text(t) => t.clone(),
+                MessageContent::Blocks(_) => String::new(),
+            })
+            .collect();
+        assert_eq!(texts, vec!["[summary of a..d]".to_string()]);
     }
 
     /// A session whose trunk holds `trunk` then the current user turn `turn`.
@@ -1396,6 +1755,7 @@ mod tests {
             "sys",
             1024,
             "corr",
+            None,
         )
         .await
         .unwrap();
@@ -1428,6 +1788,7 @@ mod tests {
             "sys",
             1024,
             "corr",
+            None,
         )
         .await
         .unwrap();
@@ -1447,6 +1808,7 @@ mod tests {
             "sys",
             1024,
             "corr",
+            None,
         )
         .await
         .unwrap();
@@ -1479,6 +1841,7 @@ mod tests {
             "sys",
             1024,
             "corr",
+            None,
         )
         .await
         .unwrap();
@@ -1499,6 +1862,7 @@ mod tests {
             "sys",
             1024,
             "corr",
+            None,
         )
         .await
         .unwrap();
@@ -1528,6 +1892,7 @@ mod tests {
             "sys",
             1024,
             "corr",
+            None,
         )
         .await
         .unwrap_err();
@@ -1560,6 +1925,7 @@ mod tests {
             "sys",
             1024,
             "corr",
+            None,
         )
         .await
         .unwrap_err();
@@ -1654,6 +2020,7 @@ mod tests {
             "sys",
             1024,
             "corr",
+            None,
         )
         .await
         .unwrap_err();
@@ -1696,6 +2063,7 @@ mod tests {
             "sys",
             1024,
             "corr",
+            None,
         )
         .await
         .unwrap_err();
@@ -1735,6 +2103,7 @@ mod tests {
             "sys",
             1024,
             "corr",
+            None,
         )
         .await
         .unwrap_err();
@@ -1764,6 +2133,7 @@ mod tests {
             "sys",
             1024,
             "corr",
+            None,
         )
         .await
         .unwrap_err();

@@ -30,7 +30,10 @@ pub struct DrainResponse {
 /// Consumers should poll this endpoint periodically.
 pub async fn drain_alerts(
     State(state): State<Arc<AppState>>,
+    axum::Extension(who): axum::Extension<crate::server::auth::AuthIdentity>,
 ) -> Result<Json<DrainResponse>, (StatusCode, String)> {
+    who.require_owner()
+        .map_err(|s| (s, "owner only".to_string()))?;
     let mut queue = state.alert_queue.lock().await;
     let alerts = queue.drain();
     let count = alerts.len();

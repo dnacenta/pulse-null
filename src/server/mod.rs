@@ -28,14 +28,16 @@ use crate::provider_status::SharedProviderStatus;
 use crate::scheduler::intent::IntentQueue;
 use crate::scheduler::Schedule;
 use crate::session_store::SessionStore;
+use crate::streaming::StreamingProvider;
 use crate::tools::ToolRegistry;
-use pulse_system_types::llm::LmProvider;
 use pulse_system_types::monitoring::{CognitiveMonitor, OutcomeTracker, PipelineMonitor};
 
 /// Shared application state
 pub struct AppState {
     pub config: Config,
-    pub provider: Box<dyn LmProvider>,
+    /// The pulse's model. Streaming-capable so `/api/chat/stream` can forward
+    /// deltas; every non-streaming call site upcasts to `&dyn LmProvider`.
+    pub provider: Box<dyn StreamingProvider>,
     pub session_store: SessionStore,
     pub system_prompt: RwLock<String>,
     pub tools: ToolRegistry,
@@ -56,6 +58,28 @@ pub struct AppState {
     /// Written by the coordinator, read by /health — the data plane never
     /// depends on it.
     pub leadership: std::sync::atomic::AtomicBool,
+    /// Live ledger rows for `/api/events` replay.
+    pub ledger: Arc<crate::ledger::LedgerRing>,
+    /// Cap on open `/api/events` streams (one per attached client, held for
+    /// its lifetime).
+    pub event_permits: Arc<tokio::sync::Semaphore>,
+    /// Cap on in-flight `/api/chat/stream` turns. Separate from the event
+    /// pool so idle watchers can never refuse a message.
+    pub chat_permits: Arc<tokio::sync::Semaphore>,
+}
+
+/// Concurrent `/api/events` connections before a 503.
+pub const MAX_EVENT_STREAMS: usize = 4;
+/// Concurrent `/api/chat/stream` turns before a 503.
+pub const MAX_CHAT_STREAMS: usize = 4;
+
+/// The two stream pools, sized by the constants above.
+#[must_use]
+pub fn stream_pools() -> (Arc<tokio::sync::Semaphore>, Arc<tokio::sync::Semaphore>) {
+    (
+        Arc::new(tokio::sync::Semaphore::new(MAX_EVENT_STREAMS)),
+        Arc::new(tokio::sync::Semaphore::new(MAX_CHAT_STREAMS)),
+    )
 }
 
 /// Rebuild AWARENESS.md from the current plugin and tool state.
@@ -85,14 +109,14 @@ async fn rebuild_awareness(state: &Arc<AppState>) {
 /// Background listener that rebuilds AWARENESS.md when plugin state changes.
 ///
 /// Listens for PluginStateChanged events on the event bus and triggers a
-/// manifest rebuild so the entity's capability inventory stays in sync.
+/// manifest rebuild so the pulse's capability inventory stays in sync.
 pub async fn awareness_listener(
-    mut rx: tokio::sync::broadcast::Receiver<crate::events::EntityEvent>,
+    mut rx: tokio::sync::broadcast::Receiver<crate::events::PulseEvent>,
     state: Arc<AppState>,
 ) {
     loop {
         match rx.recv().await {
-            Ok(crate::events::EntityEvent::PluginStateChanged {
+            Ok(crate::events::PulseEvent::PluginStateChanged {
                 ref plugin_name,
                 ref new_state,
             }) => {
@@ -120,14 +144,43 @@ pub async fn awareness_listener(
 }
 
 pub async fn start(config: Config) -> Result<(), Box<dyn std::error::Error>> {
-    let root_dir = config.root_dir()?;
+    start_with_shutdown(config, None).await
+}
 
-    let provider = crate::providers::create_provider(&config, &root_dir)?;
+/// Like [`start`], plus an optional external stop: when `stop` flips to
+/// `true` the daemon shuts down exactly as it does on SIGTERM. The TUI uses
+/// this for a daemon it started in-process, so leaving the shell never has
+/// to signal its own process.
+pub async fn start_with_shutdown(
+    config: Config,
+    stop: Option<tokio::sync::watch::Receiver<bool>>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let root_dir = config.root_dir()?;
+    start_in(config, root_dir, stop).await
+}
+
+/// [`start_with_shutdown`] for a pulse that is not the current directory:
+/// the TUI's Home page starts daemons for any pulse the user picks.
+pub async fn start_in(
+    config: Config,
+    root_dir: PathBuf,
+    stop: Option<tokio::sync::watch::Receiver<bool>>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    // The provider runs from inside the pulse (PN-104).
+    let provider = crate::providers::create_streaming_provider(&config, &root_dir)?;
+
+    if !boot::has_usable_secret(&config) {
+        tracing::warn!(
+            "[security] secret is not set: every request on {}:{} is admitted as the owner",
+            config.server.host,
+            config.server.port
+        );
+    }
 
     // Ensure required directories and files exist
     ensure_infrastructure(&root_dir);
 
-    // Start SurrealDB server and provision entity database (if graph enabled in server mode)
+    // Start SurrealDB server and provision the pulse database (if graph enabled in server mode)
     if config.graph.enabled && config.graph.mode == "server" {
         let data_dir = config
             .graph
@@ -142,7 +195,7 @@ pub async fn start(config: Config) -> Result<(), Box<dyn std::error::Error>> {
         }
 
         if let Err(e) =
-            crate::surrealdb_manager::provision_entity(&data_dir, &config.entity.name, &root_dir)
+            crate::surrealdb_manager::provision_pulse(&data_dir, &config.pulse.name, &root_dir)
                 .await
         {
             tracing::error!("SurrealDB provisioning failed: {e}");
@@ -153,7 +206,7 @@ pub async fn start(config: Config) -> Result<(), Box<dyn std::error::Error>> {
         crate::graph_context::cache_graph_stats(&root_dir).await;
     }
 
-    // Verify this entity's agent-CLI integration if applicable
+    // Verify this pulse's agent-CLI integration if applicable
     if let Some(adapter) = config
         .llm
         .cli_adapter()
@@ -206,6 +259,12 @@ pub async fn start(config: Config) -> Result<(), Box<dyn std::error::Error>> {
     // Create event bus
     let event_bus = Arc::new(EventBus::new(64));
 
+    // Ledger ring: projects bus events into rows for /api/events replay.
+    let ledger = Arc::new(crate::ledger::LedgerRing::new(
+        crate::ledger::DEFAULT_RING_CAPACITY,
+    ));
+    crate::ledger::spawn_projector(event_bus.subscribe(), Arc::clone(&ledger));
+
     // Create the persist coordinator (tracks fire-and-forget writes for graceful shutdown)
     let persist_coordinator = Arc::new(PersistCoordinator::new());
 
@@ -213,7 +272,7 @@ pub async fn start(config: Config) -> Result<(), Box<dyn std::error::Error>> {
     let mut session_store = SessionStore::with_identity(
         &root_dir,
         &config.sessions,
-        &config.entity.name,
+        &config.pulse.name,
         &config.owner,
         &config.peers,
     )
@@ -276,6 +335,9 @@ pub async fn start(config: Config) -> Result<(), Box<dyn std::error::Error>> {
         alert_queue: tokio::sync::Mutex::new(alert_queue),
         provider_status: crate::provider_status::new_shared(),
         leadership: std::sync::atomic::AtomicBool::new(false),
+        event_permits: crate::server::stream_pools().0,
+        chat_permits: crate::server::stream_pools().1,
+        ledger,
     });
 
     // Startup pipeline health check
@@ -299,7 +361,7 @@ pub async fn start(config: Config) -> Result<(), Box<dyn std::error::Error>> {
             wal,
             &state.session_store,
             &state.root_dir,
-            &config.entity.name,
+            &config.pulse.name,
         )
         .await;
     }
@@ -320,7 +382,7 @@ pub async fn start(config: Config) -> Result<(), Box<dyn std::error::Error>> {
 
     let app = build_router(Arc::clone(&state), plugin_routes);
 
-    // Same rule as multi-entity boot: an entity with no usable secret stays
+    // Same rule as multi-pulse boot: a pulse with no usable secret stays
     // on loopback whatever its config says (PN-104 audit SEC-001).
     let (host, host_note) = boot::bind_host(&config.server.host, boot::has_usable_secret(&config));
     if let Some(note) = host_note {
@@ -343,14 +405,33 @@ pub async fn start(config: Config) -> Result<(), Box<dyn std::error::Error>> {
     let mut shutdown_rx_axum = shutdown_tx.subscribe();
     let mut shutdown_rx_main = shutdown_tx.subscribe();
 
-    // Signal handler: fires once on SIGTERM or SIGINT
+    // Signal handler: fires once on SIGTERM, SIGINT, or the external stop.
     tokio::spawn(async move {
         let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
             .expect("failed to install SIGTERM handler");
-        let sigint = tokio::signal::ctrl_c();
+        // An owned daemon (Home started it) stops on its owner's flag, not
+        // on a Ctrl+c the terminal delivers to the whole process group.
+        let owned = stop.is_some();
+        let sigint = async {
+            if owned {
+                std::future::pending::<()>().await;
+            } else {
+                let _ = tokio::signal::ctrl_c().await;
+            }
+        };
+        let external = async {
+            match stop {
+                Some(mut rx) => {
+                    // A closed sender counts as a stop: the owner is gone.
+                    while rx.changed().await.is_ok() && !*rx.borrow() {}
+                }
+                None => std::future::pending().await,
+            }
+        };
         tokio::select! {
             _ = sigterm.recv() => tracing::info!("Received SIGTERM"),
-            _ = sigint => tracing::info!("Received SIGINT"),
+            () = sigint => tracing::info!("Received SIGINT"),
+            () = external => tracing::info!("Stop requested by the owning process"),
         }
         let _ = shutdown_tx.send(true);
     });
@@ -404,7 +485,7 @@ pub async fn start(config: Config) -> Result<(), Box<dyn std::error::Error>> {
     } else {
         state
             .session_store
-            .archive_all(&root_dir, &config.entity.name)
+            .archive_all(&root_dir, &config.pulse.name)
             .await
     };
 
@@ -484,6 +565,20 @@ pub fn build_router(state: Arc<AppState>, plugin_routes: Router<()>) -> Router {
         .route("/api/status", get(handlers::status::status))
         .route("/api/dashboard", get(handlers::dashboard::dashboard))
         .route("/chat", post(handlers::chat::chat))
+        .route("/api/chat/stream", post(handlers::chat::chat_stream))
+        .route("/api/events", get(handlers::events::events))
+        .route("/api/ledger", get(handlers::events::ledger))
+        .route("/api/schedule", get(handlers::schedule::list))
+        .route(
+            "/api/schedule/{id}/enable",
+            post(handlers::schedule::enable),
+        )
+        .route(
+            "/api/schedule/{id}/disable",
+            post(handlers::schedule::disable),
+        )
+        .route("/api/schedule/{id}/last", get(handlers::schedule::last))
+        .route("/api/session/{channel}", get(handlers::sessions::history))
         .route(
             "/api/sessions/reset",
             post(handlers::sessions::reset_session),
@@ -504,7 +599,7 @@ pub fn build_router(state: Arc<AppState>, plugin_routes: Router<()>) -> Router {
 
 /// Ensure all required directories and seed files exist.
 ///
-/// Called on every startup so that entities created before certain features
+/// Called on every startup so that pulses created before certain features
 /// were added (or set up manually) get the infrastructure they need.
 pub fn ensure_infrastructure(root_dir: &std::path::Path) {
     let dirs = [

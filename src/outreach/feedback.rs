@@ -1,9 +1,9 @@
 //! The feedback loop — the part that actually matters (PN-94, spec §2.4).
 //!
 //! An outreach channel with no feedback converges to noise, and it converges
-//! *silently*: the entity's own estimate of message quality is exactly the
+//! *silently*: the pulse's own estimate of message quality is exactly the
 //! faculty that would have to detect the drift. D's response is the only
-//! independent signal, because it is the only one the entity cannot author.
+//! independent signal, because it is the only one the pulse cannot author.
 //!
 //! Two properties here are deliberate and neither is an accident of
 //! implementation:
@@ -21,7 +21,7 @@
 //! accepted anyway, because the alternative is a self-assessed quality score,
 //! which is strictly worse: it correlates with the very error it is meant to
 //! detect. The weakness is handled by the window size, not by substituting a
-//! judgement the entity makes about itself.
+//! judgement the pulse makes about itself.
 
 use std::path::Path;
 

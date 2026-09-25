@@ -2,7 +2,6 @@ use clap::{Parser, Subcommand};
 
 mod anthropic_provider;
 mod caliber;
-mod chat;
 mod cli;
 mod cli_provider;
 mod config;
@@ -17,6 +16,7 @@ mod graph_feedback;
 mod init;
 mod intake_audit;
 mod interaction;
+mod ledger;
 mod logbook;
 mod ollama_provider;
 mod outreach;
@@ -44,10 +44,11 @@ mod tui;
 mod utils;
 mod vigil;
 mod wal;
+mod wire;
 
 #[derive(Parser)]
 #[command(name = "pulse-null")]
-#[command(about = "One binary. One command. Your own AI entity.")]
+#[command(about = "One binary. One command. Your own AI pulse.")]
 #[command(version)]
 struct Cli {
     #[command(subcommand)]
@@ -56,23 +57,23 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
-    /// Initialize a new entity
+    /// Initialize a new pulse
     Init {
-        /// Directory to create the entity in (defaults to current directory)
+        /// Directory to create the pulse in (defaults to current directory)
         #[arg(short, long)]
         dir: Option<String>,
     },
-    /// Start the entity
+    /// Start the pulse
     Up {
         /// Run in headless mode (HTTP server only, no TUI). Use for systemd services.
         #[arg(long)]
         headless: bool,
     },
-    /// Talk to your entity in the terminal
+    /// Talk to your pulse in the terminal
     Chat,
-    /// Stop the entity
+    /// Stop the pulse
     Down,
-    /// Show entity status
+    /// Show pulse status
     Status,
     /// Manage scheduled tasks
     Schedule {
@@ -322,16 +323,67 @@ enum ArchiveAction {
     },
 }
 
+/// Where the TUI sends its logs: stdout belongs to the screen while the TUI
+/// runs, so `pulse-null up` (without `--headless`) and `pulse-null chat` log
+/// to `logs/tui.log` under the pulse root (where `pulse-null.toml` lives;
+/// the current directory when none is found). The file is owner-only and a
+/// symlink in its place is refused, since the log can carry request details.
+fn open_tui_log() -> Result<std::fs::File, String> {
+    use std::os::unix::fs::OpenOptionsExt as _;
+    // Inside a pulse: its logs/. Elsewhere (Home): the user's state dir,
+    // never the current directory.
+    let dir = match config::Config::find_config()
+        .ok()
+        .and_then(|p| p.parent().map(std::path::Path::to_path_buf))
+    {
+        Some(root) => root.join("logs"),
+        None => std::env::var_os("XDG_STATE_HOME")
+            .map(std::path::PathBuf::from)
+            .or_else(|| {
+                std::env::var_os("HOME").map(|h| std::path::PathBuf::from(h).join(".local/state"))
+            })
+            .ok_or_else(|| "no HOME to log under".to_string())?
+            .join("pulse-null"),
+    };
+    std::fs::create_dir_all(&dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+    let path = dir.join("tui.log");
+    std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(&path)
+        .map_err(|e| format!("{}: {e}", path.display()))
+}
+
 #[tokio::main]
 async fn main() {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "pulse_null=info".into()),
-        )
-        .init();
-
     let cli = Cli::parse();
+
+    let filter = tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| "pulse_null=info".into());
+    let tui_mode = matches!(
+        cli.command,
+        Commands::Up { headless: false } | Commands::Chat
+    );
+    if tui_mode {
+        match open_tui_log() {
+            Ok(file) => tracing_subscriber::fmt()
+                .with_env_filter(filter)
+                .with_ansi(false)
+                .with_writer(std::sync::Arc::new(file))
+                .init(),
+            Err(e) => {
+                eprintln!("pulse-null: cannot open the TUI log ({e}); logging is off for this run");
+                tracing_subscriber::fmt()
+                    .with_env_filter(filter)
+                    .with_writer(std::io::sink)
+                    .init();
+            }
+        }
+    } else {
+        tracing_subscriber::fmt().with_env_filter(filter).init();
+    }
 
     match cli.command {
         Commands::Init { dir } => {
@@ -355,6 +407,10 @@ async fn main() {
             }
         }
         Commands::Chat => {
+            if let Err(e) = cli::root_guard::refuse_root("chat") {
+                eprintln!("{e}");
+                std::process::exit(1);
+            }
             if let Err(e) = cli::chat::run().await {
                 eprintln!("Error: {e}");
                 std::process::exit(1);

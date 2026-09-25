@@ -278,12 +278,16 @@ fn find_section_end(lines: &[&str], section_start: usize, next_section: Option<u
 /// - Appends prediction errors to Calibration Record
 /// - Appends changes to Evolution Log
 ///
+/// `root_dir` is the pulse root — the same directory the outcomes behind
+/// `report` were recorded in, and the one [`super::caliber_md`] resolves
+/// against.
+///
 /// Returns true if any changes were made.
 pub fn update_caliber_md(
-    docs_dir: &Path,
+    root_dir: &Path,
     report: &TrajectoryReport,
 ) -> Result<bool, Box<dyn std::error::Error>> {
-    let caliber_path = super::caliber_md(docs_dir);
+    let caliber_path = super::caliber_md(root_dir);
     let content = std::fs::read_to_string(&caliber_path).unwrap_or_default();
 
     if content.is_empty() {
@@ -720,6 +724,35 @@ mod tests {
         assert!(content.contains("research"));
         assert!(content.contains("0.67"));
         assert!(content.contains("auto-created"));
+    }
+
+    /// A `journal/` subdir used to divert the miner's write to
+    /// `<root>/journal/CALIBER.md`, which no reader ever opened. The write
+    /// target is the argument, always.
+    #[test]
+    fn update_writes_to_the_root_even_when_a_journal_dir_exists() {
+        let dir = TempDir::new().unwrap();
+        std::fs::create_dir_all(dir.path().join("journal")).unwrap();
+        std::fs::create_dir_all(dir.path().join("caliber")).unwrap();
+
+        let report = TrajectoryReport {
+            date: Utc::now().date_naive(),
+            total_outcomes: 3,
+            domain_reports: vec![DomainReport {
+                domain: "research".to_string(),
+                sample_size: 3,
+                success_rate: 1.0,
+                avg_tokens: 400,
+                valence_distribution: ValenceDistribution::default(),
+                confidence_delta: Some(1.0),
+            }],
+            prediction_errors: vec![],
+            notable_patterns: vec![],
+        };
+
+        assert!(update_caliber_md(dir.path(), &report).unwrap());
+        assert!(dir.path().join("CALIBER.md").exists());
+        assert!(!dir.path().join("journal/CALIBER.md").exists());
     }
 
     #[test]

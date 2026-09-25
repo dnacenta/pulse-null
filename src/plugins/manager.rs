@@ -6,7 +6,7 @@ use axum::Router;
 use super::registry;
 use super::{Plugin, PluginContext, PluginHealth, PluginMeta};
 use crate::config::Config;
-use crate::events::{EntityEvent, EventBus, PluginStateChange};
+use crate::events::{EventBus, PluginStateChange, PulseEvent};
 use crate::scheduler::ScheduledTask;
 use pulse_system_types::llm::LmProvider;
 
@@ -82,12 +82,12 @@ impl PluginManager {
     pub async fn init_all(
         &mut self,
         config: &Config,
-        entity_root: &Path,
+        pulse_root: &Path,
         provider: Arc<Box<dyn LmProvider>>,
     ) -> Result<(), crate::errors::PluginError> {
         let ctx = PluginContext {
-            entity_root: entity_root.to_path_buf(),
-            entity_name: config.entity.name.clone(),
+            pulse_root: pulse_root.to_path_buf(),
+            pulse_name: config.pulse.name.clone(),
             provider,
         };
 
@@ -112,7 +112,7 @@ impl PluginManager {
     }
 
     /// Start all plugins. Individual plugin failures are logged but do not
-    /// abort the startup — the entity continues with reduced capabilities.
+    /// abort the startup — the pulse continues with reduced capabilities.
     /// Failed plugins are tracked and excluded from platform awareness.
     pub async fn start_all(&mut self) -> Result<(), crate::errors::PluginError> {
         for entry in &mut self.entries {
@@ -169,7 +169,7 @@ impl PluginManager {
                     entry.state = PluginState::Failed;
                     changed = true;
                     if let Some(ref bus) = self.event_bus {
-                        bus.emit(EntityEvent::PluginStateChanged {
+                        bus.emit(PulseEvent::PluginStateChanged {
                             plugin_name: meta.name.clone(),
                             new_state: PluginStateChange::Failed,
                         });
@@ -182,7 +182,7 @@ impl PluginManager {
                     entry.state = PluginState::Running;
                     changed = true;
                     if let Some(ref bus) = self.event_bus {
-                        bus.emit(EntityEvent::PluginStateChanged {
+                        bus.emit(PulseEvent::PluginStateChanged {
                             plugin_name: meta.name.clone(),
                             new_state: PluginStateChange::Recovered,
                         });
@@ -258,7 +258,7 @@ impl PluginManager {
     }
 
     /// Collect platform awareness descriptions from running plugins only.
-    /// Failed plugins are excluded — the entity should not think it has
+    /// Failed plugins are excluded — the pulse should not think it has
     /// capabilities that aren't actually available.
     pub fn collect_platform_descriptions(&self) -> Vec<(String, String)> {
         let mut descriptions = Vec::new();
@@ -315,14 +315,14 @@ impl PluginManager {
 mod tests {
     use super::*;
     use crate::config::{
-        AutonomyConfig, Config, EntityConfig, GraphConfig, LlmConfig, MemoryConfig,
+        AutonomyConfig, CaliberConfig, Config, GraphConfig, LlmConfig, MemoryConfig,
         MonitoringConfig, OutreachConfig, PipelineConfig, PlatformConfig, PredictionConfig,
         PulseConfig, SchedulerConfig, SecurityConfig, ServerConfig, SessionConfig, TrustConfig,
     };
 
     fn test_config() -> Config {
         Config {
-            entity: EntityConfig {
+            pulse: PulseConfig {
                 name: "Test".into(),
                 owner_name: "Owner".into(),
                 owner_alias: "O".into(),
@@ -356,7 +356,7 @@ mod tests {
             pipeline: PipelineConfig::default(),
             monitoring: MonitoringConfig::default(),
             autonomy: AutonomyConfig::default(),
-            pulse: PulseConfig::default(),
+            caliber: CaliberConfig::default(),
             graph: GraphConfig::default(),
             prediction: PredictionConfig::default(),
             tension: Default::default(),
@@ -368,6 +368,7 @@ mod tests {
             system_prompt_budget: crate::config::SystemPromptBudgetConfig::default(),
             peers: std::collections::HashMap::new(),
             plugins: std::collections::HashMap::new(),
+            tui: crate::config::TuiConfig::default(),
         }
     }
 

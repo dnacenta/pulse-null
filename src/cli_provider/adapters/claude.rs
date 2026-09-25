@@ -3,7 +3,7 @@
 //! Everything about how `claude -p` is driven lives here: the argv, the
 //! `--system-prompt-file` capability probe, the JSON and `stream-json`
 //! output shapes, the Acceptable-Use-Policy refusal signature, the
-//! `CLAUDECODE` nesting marker, and the entity-local integration Claude
+//! `CLAUDECODE` nesting marker, and the pulse-local integration Claude
 //! Code reads from its working directory (`CLAUDE.md`, `.claude/settings.json`
 //! hooks, `.claude/rules/`). Nothing outside this file should need to know
 //! any of it.
@@ -18,7 +18,7 @@ use crate::cli_provider::adapter::{
 };
 use crate::init::agent_bootstrap::BootstrapItem;
 
-/// The adapter. Stateless: all per-entity state is on the provider.
+/// The adapter. Stateless: all per-pulse state is on the provider.
 pub struct Claude;
 
 /// What a CLI without the flag prints when it parses `--system-prompt-file`.
@@ -190,9 +190,14 @@ impl CliAdapter for Claude {
         if parsed["is_error"].as_bool() != Some(true) {
             return ExitClass::Plain;
         }
-        let result = parsed["result"].as_str().unwrap_or("");
-        if result.to_lowercase().contains("usage policy") {
-            ExitClass::Refusal(result.to_string())
+        self.classify_terminal(parsed["result"].as_str().unwrap_or(""))
+    }
+
+    /// The one place the AUP refusal signature lives: the buffered exit and
+    /// the streamed terminal record both come through here.
+    fn classify_terminal(&self, text: &str) -> ExitClass {
+        if text.to_lowercase().contains("usage policy") {
+            ExitClass::Refusal(text.to_string())
         } else {
             ExitClass::FlaggedButUnmatched
         }
@@ -226,16 +231,16 @@ impl AgentIntegration for Claude {
         "CLAUDE.md"
     }
 
-    fn ensure(&self, entity_root: &Path, recall_bin: &str) -> Vec<BootstrapItem> {
-        claude_hooks::ensure_files(entity_root, recall_bin)
+    fn ensure(&self, pulse_root: &Path, recall_bin: &str) -> Vec<BootstrapItem> {
+        claude_hooks::ensure_files(pulse_root, recall_bin)
     }
 
-    fn verify(&self, entity_root: &Path) -> Vec<BootstrapItem> {
-        claude_hooks::verify_files(entity_root)
+    fn verify(&self, pulse_root: &Path) -> Vec<BootstrapItem> {
+        claude_hooks::verify_files(pulse_root)
     }
 
-    fn legacy_home_links(&self, entity_root: &Path, home: &Path) -> Vec<PathBuf> {
-        claude_hooks::legacy_home_links(entity_root, home)
+    fn legacy_home_links(&self, pulse_root: &Path, home: &Path) -> Vec<PathBuf> {
+        claude_hooks::legacy_home_links(pulse_root, home)
     }
 
     fn user_hooks_missing_root(&self, home: &Path) -> Vec<String> {
@@ -264,7 +269,7 @@ mod tests {
             prompt_file: None,
             restricted: false,
             streaming: false,
-            entity_root: root,
+            pulse_root: root,
             reasoning_effort: None,
         }
     }

@@ -57,7 +57,7 @@ fn truncate_to_byte_cap(text: &str, max_bytes: usize) -> String {
     )
 }
 
-/// Line cap for THOUGHT_STACK.md. The entity is instructed to keep it under
+/// Line cap for THOUGHT_STACK.md. The pulse is instructed to keep it under
 /// 50 lines; this is the safety margin on top of that.
 const THOUGHT_STACK_MAX_LINES: usize = 60;
 
@@ -135,7 +135,7 @@ pub async fn build_system_prompt_async(
     Ok(result)
 }
 
-/// Build the system prompt from entity documents.
+/// Build the system prompt from pulse documents.
 ///
 /// When `config.system_prompt_budget.enabled` is true, components are
 /// budget-aware: each is capped individually, and if the total exceeds
@@ -190,7 +190,7 @@ pub fn build_system_prompt_budgeted(
     }
 
     // --- Tier 0 (Essential): Rule/protocol files ---
-    if let Some(ref rules_dir) = config.entity.rules_dir {
+    if let Some(ref rules_dir) = config.pulse.rules_dir {
         match load_rule_files(rules_dir) {
             Ok(rules) => {
                 let mut rules_text = String::new();
@@ -246,7 +246,7 @@ pub fn build_system_prompt_budgeted(
     }
 
     // --- AWARENESS.md ---
-    // Part of the essential identity. An agent CLI that resolves the
+    // Part of the essential idpulse. An agent CLI that resolves the
     // `@AWARENESS.md` import in the instruction file gets it that way;
     // everything else gets it inlined here.
     if !awareness_via_import(config) {
@@ -322,7 +322,7 @@ pub fn build_system_prompt_budgeted(
     let identity_rules = "<identity-classes>\n\
         Messages carry a sender field in their source metadata. Identity classes:\n\
         - \"owner\": This is D, your creator. Full trust — execute commands, discuss anything, access files.\n\
-        - \"peer:*\": A sibling entity in your network. Scoped to collaborative communication.\n\
+        - \"peer:*\": A sibling pulse in your network. Scoped to collaborative communication.\n\
         - \"guest:*\": An unknown sender. Conversation only — no commands, no secrets, no file access, no system information.\n\
         </identity-classes>"
         .to_string();
@@ -453,7 +453,7 @@ pub fn build_system_prompt_budgeted(
     }
 
     // --- Tier 2 (Low): Caliber ---
-    if config.pulse.enabled {
+    if config.caliber.enabled {
         if let Some(caliber_text) = crate::caliber::runtime::render_for_prompt(root_dir) {
             let wrapped = format!("<caliber>\n{}\n</caliber>", caliber_text);
             let capped = if budget_enabled && budget_cfg.caliber_cap > 0 {
@@ -488,7 +488,7 @@ pub fn build_system_prompt_budgeted(
 
     // --- Tier 2 (Low): Prediction Context ---
     // Surfaces recent prediction errors and pending-prediction count so the
-    // entity can RESOLVE its own predictions in this turn. See
+    // pulse can RESOLVE its own predictions in this turn. See
     // continuous-entity-process-spec.md Phase 2 (Hierarchical Predictive
     // Self-Modeling). Only renders when there's something to surface.
     if config.prediction.enabled {
@@ -868,7 +868,7 @@ pub fn build_task_system_prompt_budgeted(
     }
 
     // --- Tier 0 (Essential): Shared rule/protocol files ---
-    if let Some(ref rules_dir) = config.entity.rules_dir {
+    if let Some(ref rules_dir) = config.pulse.rules_dir {
         match load_rule_files(rules_dir) {
             Ok(rules) => {
                 let mut rules_text = String::new();
@@ -959,7 +959,7 @@ pub fn build_task_system_prompt_budgeted(
     }
 
     // --- Tier 1 (High): Tension threads (PN-95 Layer 3) ---
-    // What the entity picks up is chosen by an accumulator it cannot edit in
+    // What the pulse picks up is chosen by an accumulator it cannot edit in
     // prose, rather than by whatever survived the last fold. High rather
     // than Low: under budget pressure this may be truncated, but dropping it
     // outright would put selection straight back in the hands of document
@@ -1015,7 +1015,7 @@ const TENSION_CONTEXT_CAP: usize = 1_500;
 ///
 /// `AppState.system_prompt` is a **boot-time snapshot** — it has no writer,
 /// so anything assembled into it is frozen until the service restarts.
-/// Injecting threads there would mean the entity spent every cycle looking
+/// Injecting threads there would mean the pulse spent every cycle looking
 /// at whatever the store held the last time systemd restarted it, which is
 /// strictly worse than the document reading this replaces. This function is
 /// called from [`build_task_system_prompt_budgeted`], which
@@ -1095,7 +1095,7 @@ fn build_tension_context(root_dir: &Path, config: &Config) -> Option<String> {
 /// Load THOUGHT_STACK.md bounded by both line count and bytes, wrapped for the
 /// prompt. Returns `None` when the file is missing or blank.
 ///
-/// The line cap is the entity-facing rule (it is instructed to stay under 50);
+/// The line cap is the pulse-facing rule (it is instructed to stay under 50);
 /// the byte ceiling is the safety net, because 60 lines say nothing about size.
 fn load_thought_stack(
     root_dir: &Path,
@@ -1122,7 +1122,7 @@ fn load_thought_stack(
 }
 
 /// Build metacognitive context for autonomous tasks — vigil health summary
-/// and calibration data so the entity can generate goals from self-knowledge.
+/// and calibration data so the pulse can generate goals from self-knowledge.
 fn build_metacognitive_context(root_dir: &Path) -> String {
     let mut sections = Vec::new();
 
@@ -1259,7 +1259,7 @@ fn load_rule_files(rules_dir: &str) -> Result<Vec<(String, String)>, crate::erro
 // Platform Awareness — AWARENESS.md manifest generation
 // ---------------------------------------------------------------------------
 
-/// Build core capabilities from the entity's config.
+/// Build core capabilities from the pulse's config.
 /// Each enabled subsystem produces a Capability entry.
 fn build_capabilities(config: &Config) -> Vec<Capability> {
     let mut capabilities = Vec::new();
@@ -1347,13 +1347,13 @@ fn build_capabilities(config: &Config) -> Vec<Capability> {
     }
 
     // Outcome tracking (caliber)
-    if config.pulse.enabled {
+    if config.caliber.enabled {
         capabilities.push(Capability {
             name: "Outcome Tracking (caliber)".into(),
             what: "Operational self-model that records outcomes of tasks and intents — success, failure, partial, skipped.".into(),
             why: "Learn from your own performance. Calibrate confidence in your abilities over time.".into(),
             how: "Outcomes are recorded automatically after task execution. Review your caliber data to understand patterns in what works and what doesn't.".into(),
-            constraints: Some(format!("Rolling window of {} outcomes.", config.pulse.max_outcomes)),
+            constraints: Some(format!("Rolling window of {} outcomes.", config.caliber.max_outcomes)),
         });
     }
 
@@ -1430,7 +1430,7 @@ fn build_channels_section(config: &Config, plugin_descriptions: &[(String, Strin
 
     // Peers
     if !config.peers.is_empty() {
-        channels.push("\n**Peers** (other entities you can communicate with):".into());
+        channels.push("\n**Peers** (other pulses you can communicate with):".into());
         for (name, peer) in &config.peers {
             channels.push(format!("- {} at {}:{}", name, peer.host, peer.port));
         }
@@ -1439,12 +1439,12 @@ fn build_channels_section(config: &Config, plugin_descriptions: &[(String, Strin
     format!("## Communication Channels\n\n{}", channels.join("\n"))
 }
 
-/// Build the entity header that opens the manifest.
-fn build_entity_header(config: &Config) -> String {
+/// Build the pulse header that opens the manifest.
+fn build_pulse_header(config: &Config) -> String {
     format!(
         "# {} — Platform Awareness\n\nYou are **{}**, running on **pulse-null** v{}.\nProvider: {} (model: {})",
-        config.entity.name,
-        config.entity.name,
+        config.pulse.name,
+        config.pulse.name,
         env!("CARGO_PKG_VERSION"),
         config.llm.provider,
         config.llm.model,
@@ -1464,8 +1464,8 @@ pub fn rebuild_platform_manifest(
 ) -> String {
     let mut sections = Vec::new();
 
-    // Entity header (always first)
-    sections.push(build_entity_header(config));
+    // Pulse header (always first)
+    sections.push(build_pulse_header(config));
 
     // Core capabilities from config
     let capabilities = build_capabilities(config);
@@ -1490,7 +1490,7 @@ pub fn rebuild_platform_manifest(
 }
 
 /// The embedded conceptual template for full-mode awareness.
-/// This is the hand-written philosophical framing that helps entities understand
+/// This is the hand-written philosophical framing that helps pulses understand
 /// their environment rather than just listing features.
 const PLATFORM_TEMPLATE: &str = include_str!("../../assets/platform-template.md");
 
@@ -1515,7 +1515,7 @@ pub fn generate_awareness_document(
     }
 }
 
-/// Write AWARENESS.md to the entity's root directory.
+/// Write AWARENESS.md to the pulse's root directory.
 ///
 /// Called at startup and on plugin state changes (failure/recovery).
 /// Adapters whose CLI resolves the `@AWARENESS.md` import in the instruction
@@ -1546,8 +1546,8 @@ pub fn build_autonomy_context(root_dir: &Path, config: &Config) -> String {
     // Tool documentation
     sections.push(
         "You have tools available for this autonomous session:\n\
-        - file_read: Read a file from your entity directory\n\
-        - file_write: Write or update a file in your entity directory\n\
+        - file_read: Read a file from your pulse directory\n\
+        - file_write: Write or update a file in your pulse directory\n\
         - file_list: List files in a directory\n\
         - grep: Search file contents with a pattern\n\
         - web_fetch: Fetch and read a web page (HTTPS only)\n\n\
@@ -1589,7 +1589,7 @@ pub fn build_autonomy_context(root_dir: &Path, config: &Config) -> String {
     }
 
     // Outreach marker (PN-94). Documented only when the channel is on, so the
-    // entity is never told about a marker that will be discarded.
+    // pulse is never told about a marker that will be discarded.
     if config.outreach.enabled {
         sections.push(
             "You can also raise unprompted outreach — telling the owner something you judge \
@@ -1642,8 +1642,8 @@ mod tests {
 
     fn minimal_config() -> Config {
         Config {
-            entity: EntityConfig {
-                name: "TestEntity".into(),
+            pulse: PulseConfig {
+                name: "TestPulse".into(),
                 owner_name: "Tester".into(),
                 owner_alias: "T".into(),
                 rules_dir: None,
@@ -1673,7 +1673,7 @@ mod tests {
             pipeline: PipelineConfig::default(),
             monitoring: MonitoringConfig::default(),
             autonomy: AutonomyConfig::default(),
-            pulse: PulseConfig::default(),
+            caliber: CaliberConfig::default(),
             graph: GraphConfig::default(),
             prediction: PredictionConfig::default(),
             tension: TensionConfig::default(),
@@ -1685,14 +1685,15 @@ mod tests {
             system_prompt_budget: crate::config::SystemPromptBudgetConfig::default(),
             peers: std::collections::HashMap::new(),
             plugins: std::collections::HashMap::new(),
+            tui: crate::config::TuiConfig::default(),
         }
     }
 
     #[test]
-    fn manifest_includes_entity_name() {
+    fn manifest_includes_pulse_name() {
         let config = minimal_config();
         let manifest = rebuild_platform_manifest(&config, &[], &[]);
-        assert!(manifest.contains("TestEntity"));
+        assert!(manifest.contains("TestPulse"));
         assert!(manifest.contains("pulse-null"));
         assert!(manifest.contains("ollama"));
         assert!(manifest.contains("llama3"));
@@ -1800,7 +1801,7 @@ mod tests {
         config.pipeline.enabled = false;
         config.monitoring.enabled = false;
         config.autonomy.enabled = false;
-        config.pulse.enabled = false;
+        config.caliber.enabled = false;
         config.sessions.persist = false;
         config.context_buffer.enabled = false;
         config.graph.enabled = false;
@@ -1838,13 +1839,13 @@ mod tests {
         config.pipeline.enabled = false;
         config.monitoring.enabled = false;
         config.autonomy.enabled = false;
-        config.pulse.enabled = false;
+        config.caliber.enabled = false;
         config.sessions.persist = false;
         config.context_buffer.enabled = false;
         config.graph.enabled = false;
         let manifest = rebuild_platform_manifest(&config, &[], &[]);
         // Should still have header, memory capability, and channels
-        assert!(manifest.contains("TestEntity"));
+        assert!(manifest.contains("TestPulse"));
         assert!(manifest.contains("Memory System"));
         assert!(manifest.contains("Communication Channels"));
         // Should NOT have tools or plugins sections
@@ -1858,7 +1859,7 @@ mod tests {
         config.pipeline.enabled = false;
         config.monitoring.enabled = false;
         config.autonomy.enabled = false;
-        config.pulse.enabled = false;
+        config.caliber.enabled = false;
         config.sessions.persist = false;
         config.context_buffer.enabled = false;
         config.graph.enabled = false;
@@ -1878,10 +1879,10 @@ mod tests {
     }
 
     #[test]
-    fn entity_header_always_first_in_manifest() {
+    fn pulse_header_always_first_in_manifest() {
         let config = minimal_config();
         let manifest = rebuild_platform_manifest(&config, &[], &[]);
-        assert!(manifest.starts_with("# TestEntity — Platform Awareness"));
+        assert!(manifest.starts_with("# TestPulse — Platform Awareness"));
     }
 
     // --- Phase 6: System Prompt Budget tests ---
@@ -1918,13 +1919,13 @@ mod tests {
         // Write a CLAUDE.md
         std::fs::write(
             dir.path().join("CLAUDE.md"),
-            "# Test Entity\nYou are a test.",
+            "# Test Pulse\nYou are a test.",
         )
         .unwrap();
 
         let result = build_system_prompt_budgeted(dir.path(), &config, None, None).unwrap();
 
-        assert!(result.prompt.contains("# Test Entity"));
+        assert!(result.prompt.contains("# Test Pulse"));
         assert!(result.estimated_tokens > 0);
         assert!(!result.was_trimmed);
         assert!(result.dropped_components.is_empty());
@@ -1980,7 +1981,7 @@ mod tests {
         config.system_prompt_budget.findings_cap = 5000;
 
         // Write essential and low-priority files
-        std::fs::write(dir.path().join("CLAUDE.md"), "# Entity\nCore identity.").unwrap();
+        std::fs::write(dir.path().join("CLAUDE.md"), "# Pulse\nCore identity.").unwrap();
         std::fs::create_dir_all(dir.path().join("memory")).unwrap();
         std::fs::write(
             dir.path().join("memory/EPHEMERAL.md"),
@@ -1998,7 +1999,7 @@ mod tests {
         // Should have trimmed something
         assert!(result.was_trimmed);
         // Essential content should still be present
-        assert!(result.prompt.contains("# Entity"));
+        assert!(result.prompt.contains("# Pulse"));
         assert!(result.prompt.contains("memory-curation"));
     }
 
@@ -2007,7 +2008,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mut config = minimal_config();
         config.system_prompt_budget.enabled = true;
-        config.pulse.enabled = true;
+        config.caliber.enabled = true;
         // Very tight budget — should force drops
         config.system_prompt_budget.token_budget = 100;
         config.system_prompt_budget.ephemeral_cap = 5000;
@@ -2132,7 +2133,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let config = minimal_config();
 
-        std::fs::write(dir.path().join("CLAUDE.md"), "# Entity").unwrap();
+        std::fs::write(dir.path().join("CLAUDE.md"), "# Pulse").unwrap();
         write_giant_line(&dir.path().join("THOUGHT_STACK.md"), 200_000);
 
         let result = build_system_prompt_budgeted(dir.path(), &config, None, None).unwrap();
@@ -2187,7 +2188,7 @@ mod tests {
         let mut config = minimal_config();
         config.system_prompt_budget.enabled = false;
 
-        std::fs::write(dir.path().join("CLAUDE.md"), "# Entity").unwrap();
+        std::fs::write(dir.path().join("CLAUDE.md"), "# Pulse").unwrap();
         write_giant_line(&dir.path().join("THOUGHT_STACK.md"), 500_000);
         write_giant_line(&dir.path().join("AWARENESS.md"), 500_000);
         std::fs::create_dir_all(dir.path().join("memory")).unwrap();
@@ -2217,7 +2218,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let config = minimal_config();
 
-        std::fs::write(dir.path().join("CLAUDE.md"), "# Entity").unwrap();
+        std::fs::write(dir.path().join("CLAUDE.md"), "# Pulse").unwrap();
         let line = "t".repeat(4096);
         let stack: String = std::iter::repeat_n(line.as_str(), 2560)
             .collect::<Vec<_>>()
@@ -2261,7 +2262,7 @@ mod tests {
         config.system_prompt_budget.token_budget = 800;
         config.system_prompt_budget.self_md_cap = 0;
 
-        std::fs::write(dir.path().join("CLAUDE.md"), "# Entity").unwrap();
+        std::fs::write(dir.path().join("CLAUDE.md"), "# Pulse").unwrap();
         std::fs::write(dir.path().join("SELF.md"), "s".repeat(40_000)).unwrap();
 
         let result = build_system_prompt_budgeted(dir.path(), &config, None, None).unwrap();
@@ -2274,7 +2275,7 @@ mod tests {
             result.estimated_tokens
         );
         // Essential survives untouched.
-        assert!(result.prompt.contains("# Entity"));
+        assert!(result.prompt.contains("# Pulse"));
         assert!(result.prompt.contains("memory-curation"));
     }
 
@@ -2285,13 +2286,13 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let config = minimal_config();
 
-        std::fs::write(dir.path().join("CLAUDE.md"), "# Entity\nBehave.").unwrap();
+        std::fs::write(dir.path().join("CLAUDE.md"), "# Pulse\nBehave.").unwrap();
         std::fs::write(dir.path().join("SELF.md"), "I am a test.").unwrap();
         std::fs::write(dir.path().join("THOUGHT_STACK.md"), "- thinking").unwrap();
 
         let prompt = build_task_system_prompt(dir.path(), &config).unwrap();
 
-        let claude = prompt.find("# Entity").unwrap();
+        let claude = prompt.find("# Pulse").unwrap();
         let identity = prompt.find("<identity>").unwrap();
         let stack = prompt.find("<thought-stack>").unwrap();
         let task = prompt.find("<task-context>").unwrap();
@@ -2308,7 +2309,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let config = minimal_config();
 
-        std::fs::write(dir.path().join("CLAUDE.md"), "# Entity").unwrap();
+        std::fs::write(dir.path().join("CLAUDE.md"), "# Pulse").unwrap();
 
         let result = build_task_system_prompt_budgeted(dir.path(), &config).unwrap();
 
@@ -2415,7 +2416,7 @@ mod tests {
         assert!(block.contains("[TENSION METRICS:"));
         assert!(block.contains("rho="));
         assert!(block.contains("reach="));
-        // And the discharge contract is restated where the entity will read it.
+        // And the discharge contract is restated where the pulse will read it.
         assert!(block.contains("Writing about a thread does not lower it"));
     }
 

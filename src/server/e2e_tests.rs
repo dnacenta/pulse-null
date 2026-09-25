@@ -13,7 +13,7 @@ use tokio::sync::RwLock;
 use tower::ServiceExt;
 
 use crate::config::{
-    AutonomyConfig, Config, EntityConfig, GraphConfig, LlmConfig, MemoryConfig, MonitoringConfig,
+    AutonomyConfig, CaliberConfig, Config, GraphConfig, LlmConfig, MemoryConfig, MonitoringConfig,
     OutreachConfig, PipelineConfig, PredictionConfig, PulseConfig, SchedulerConfig, SecurityConfig,
     ServerConfig, SessionConfig, TrustConfig,
 };
@@ -55,6 +55,8 @@ impl MockProvider {
         }
     }
 }
+
+impl crate::streaming::StreamingProvider for MockProvider {}
 
 impl LmProvider for MockProvider {
     fn invoke(
@@ -104,6 +106,8 @@ impl LmProvider for MockProvider {
 /// network drop / timeout / empty result. Must trigger rollback, never fallback.
 struct FailingProvider;
 
+impl crate::streaming::StreamingProvider for FailingProvider {}
+
 impl LmProvider for FailingProvider {
     fn invoke(
         &self,
@@ -126,6 +130,8 @@ impl LmProvider for FailingProvider {
 
 /// A provider that always issues an AUP refusal (the fable classifier firing).
 struct RefusingProvider;
+
+impl crate::streaming::StreamingProvider for RefusingProvider {}
 
 impl LmProvider for RefusingProvider {
     fn invoke(
@@ -158,8 +164,8 @@ impl LmProvider for RefusingProvider {
 
 fn test_config() -> Config {
     Config {
-        entity: EntityConfig {
-            name: "TestEntity".to_string(),
+        pulse: PulseConfig {
+            name: "TestPulse".to_string(),
             owner_name: "Tester".to_string(),
             owner_alias: "T".to_string(),
             rules_dir: None,
@@ -189,7 +195,7 @@ fn test_config() -> Config {
         pipeline: PipelineConfig::default(),
         monitoring: MonitoringConfig::default(),
         autonomy: AutonomyConfig::default(),
-        pulse: PulseConfig::default(),
+        caliber: CaliberConfig::default(),
         graph: GraphConfig::default(),
         prediction: PredictionConfig::default(),
         tension: Default::default(),
@@ -201,6 +207,7 @@ fn test_config() -> Config {
         system_prompt_budget: crate::config::SystemPromptBudgetConfig::default(),
         peers: HashMap::new(),
         plugins: HashMap::new(),
+        tui: crate::config::TuiConfig::default(),
     }
 }
 
@@ -208,6 +215,19 @@ fn build_app(state: Arc<AppState>) -> Router {
     Router::new()
         .route("/health", get(handlers::health::health))
         .route("/chat", post(handlers::chat::chat))
+        .route("/api/chat/stream", post(handlers::chat::chat_stream))
+        .route("/api/events", get(handlers::events::events))
+        .route("/api/session/{channel}", get(handlers::sessions::history))
+        .route("/api/ledger", get(handlers::events::ledger))
+        .route(
+            "/api/schedule/{id}/disable",
+            post(handlers::schedule::disable),
+        )
+        .route(
+            "/api/sessions/reset",
+            post(handlers::sessions::reset_session),
+        )
+        .route("/api/alerts/drain", post(handlers::alerts::drain_alerts))
         .route_layer(middleware::from_fn_with_state(
             Arc::clone(&state),
             crate::server::auth::require_auth,
@@ -231,14 +251,14 @@ async fn build_state_in(
 /// the rollback / refusal tests that need a provider which returns an error.
 async fn build_state_boxed_with_config(
     root_dir: std::path::PathBuf,
-    provider: Box<dyn LmProvider>,
+    provider: Box<dyn crate::streaming::StreamingProvider>,
     tools: ToolRegistry,
     config: Config,
 ) -> Arc<AppState> {
     let wal =
         crate::wal::WalWriter::new(&root_dir.join("sessions"), crate::wal::WalFsync::None).ok();
     let session_store =
-        crate::session_store::SessionStore::new(&root_dir, &config.sessions, &config.entity.name)
+        crate::session_store::SessionStore::new(&root_dir, &config.sessions, &config.pulse.name)
             .await;
     let plugin_manager = crate::plugins::manager::PluginManager::new(&config);
     let alert_queue = crate::scheduler::alerts::AlertQueue::load(&root_dir);
@@ -246,7 +266,7 @@ async fn build_state_boxed_with_config(
         config,
         provider,
         session_store,
-        system_prompt: RwLock::new("You are a test entity.".to_string()),
+        system_prompt: RwLock::new("You are a test pulse.".to_string()),
         tools,
         event_bus: Arc::new(EventBus::new(16)),
         root_dir,
@@ -260,6 +280,9 @@ async fn build_state_boxed_with_config(
         alert_queue: tokio::sync::Mutex::new(alert_queue),
         provider_status: crate::provider_status::new_shared(),
         leadership: std::sync::atomic::AtomicBool::new(false),
+        event_permits: crate::server::stream_pools().0,
+        chat_permits: crate::server::stream_pools().1,
+        ledger: Arc::new(crate::ledger::LedgerRing::new(64)),
     })
 }
 
@@ -1051,4 +1074,482 @@ async fn e2e_refusal_without_fallback_rolls_back() {
         0,
         "refused turn (fallback disabled) poisoned the session"
     );
+}
+
+// ---------------------------------------------------------------------------
+// Streaming chat (PN-102): delta/done framing, disconnect rollback, SSE auth
+// ---------------------------------------------------------------------------
+
+/// Yields one delta and then never finishes — the shape of a turn whose
+/// client walks away mid-stream.
+struct HangingProvider;
+
+impl LmProvider for HangingProvider {
+    fn invoke(
+        &self,
+        _system_prompt: &str,
+        _messages: &[Message],
+        _max_tokens: u32,
+        _tools: Option<&[serde_json::Value]>,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<
+                    Output = Result<LlmResponse, Box<dyn std::error::Error + Send + Sync>>,
+                > + Send
+                + '_,
+        >,
+    > {
+        Box::pin(async { std::future::pending().await })
+    }
+    fn name(&self) -> &str {
+        "hanging"
+    }
+}
+
+impl crate::streaming::StreamingProvider for HangingProvider {
+    fn supports_streaming(&self) -> bool {
+        true
+    }
+    fn invoke_streaming(
+        &self,
+        _system_prompt: &str,
+        _messages: &[Message],
+        _max_tokens: u32,
+        _tools: Option<&[serde_json::Value]>,
+    ) -> crate::streaming::StreamResult<'_> {
+        Box::pin(async_stream::stream! {
+            yield crate::streaming::StreamEvent::TextDelta("partial".to_string());
+            std::future::pending::<()>().await;
+        })
+    }
+}
+
+async fn post_chat_stream(app: &Router, message: &str) -> axum::response::Response {
+    let body = serde_json::json!({ "message": message });
+    let req = Request::builder()
+        .method("POST")
+        .uri("/api/chat/stream")
+        .header("Content-Type", "application/json")
+        .body(Body::from(serde_json::to_string(&body).unwrap()))
+        .unwrap();
+    app.clone().oneshot(req).await.unwrap()
+}
+
+/// A buffered provider streams through the default adapter as one delta, and
+/// the stream closes with a `done` carrying the same text.
+#[tokio::test]
+async fn e2e_chat_stream_emits_delta_then_done() {
+    let dir = tempfile::tempdir().unwrap();
+    let provider = MockProvider::new(vec![LlmResponse {
+        content: vec![ContentBlock::Text {
+            text: "hello world".to_string(),
+        }],
+        stop_reason: StopReason::EndTurn,
+        model: "mock".to_string(),
+        input_tokens: Some(5),
+        output_tokens: Some(2),
+    }]);
+    let state = build_state_in(dir.path().to_path_buf(), provider, ToolRegistry::new()).await;
+    let app = build_app(Arc::clone(&state));
+
+    let response = post_chat_stream(&app, "hi").await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let text = String::from_utf8_lossy(&bytes);
+
+    let delta_at = text.find("event: delta").expect("no delta event");
+    let done_at = text.find("event: done").expect("no done event");
+    assert!(delta_at < done_at, "delta must precede done:\n{text}");
+    assert!(text.contains("event: status"), "no status event:\n{text}");
+    assert!(
+        text.contains(r#""text":"hello world""#),
+        "delta/done text missing:\n{text}"
+    );
+    assert!(text.contains(r#""tokens_in":5"#), "usage missing:\n{text}");
+    assert!(!text.contains("event: error"), "unexpected error:\n{text}");
+
+    // The daemon persisted the turn: user + assistant on the trunk.
+    assert_eq!(trunk_len(&state).await, 2);
+}
+
+/// Dropping the SSE response mid-turn aborts the turn and rolls the user
+/// message back, exactly like a failed turn — no dangling user turn, no
+/// partial assistant message.
+#[tokio::test]
+async fn e2e_chat_stream_disconnect_rolls_back_user_turn() {
+    use tokio_stream::StreamExt as _;
+
+    let dir = tempfile::tempdir().unwrap();
+    let state = build_state_boxed_with_config(
+        dir.path().to_path_buf(),
+        Box::new(HangingProvider),
+        ToolRegistry::new(),
+        test_config(),
+    )
+    .await;
+    let app = build_app(Arc::clone(&state));
+
+    let response = post_chat_stream(&app, "are you there?").await;
+    assert_eq!(response.status(), StatusCode::OK);
+
+    // Read until the partial delta has arrived, proving the turn is mid-flight
+    // with the user message on the trunk.
+    let mut body = response.into_body().into_data_stream();
+    let mut seen = String::new();
+    while !seen.contains("partial") {
+        let chunk = tokio::time::timeout(std::time::Duration::from_secs(5), body.next())
+            .await
+            .expect("stream stalled before the first delta")
+            .expect("stream ended before the first delta")
+            .expect("body error");
+        seen.push_str(&String::from_utf8_lossy(&chunk));
+    }
+    // The turn holds the session write lock while it streams, so the trunk
+    // cannot be read here without deadlocking; the delta having arrived is the
+    // proof that the user message is on the trunk mid-turn.
+
+    // The client walks away.
+    drop(body);
+
+    // The abort guard fires on drop; the rollback task needs the session lock,
+    // which the aborted turn releases as it unwinds.
+    let mut rolled_back = false;
+    for _ in 0..50 {
+        if trunk_len(&state).await == 0 {
+            rolled_back = true;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    assert!(rolled_back, "disconnect left the user message on the trunk");
+}
+
+/// `/api/events` sits behind the same auth as `/chat`: no secret, no stream.
+#[tokio::test]
+async fn e2e_events_requires_secret_when_configured() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut config = test_config();
+    config.security.secret = Some("s3cret".to_string());
+    let state = build_state_boxed_with_config(
+        dir.path().to_path_buf(),
+        Box::new(MockProvider::new(vec![])),
+        ToolRegistry::new(),
+        config,
+    )
+    .await;
+    let app = build_app(Arc::clone(&state));
+
+    let denied = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/api/events")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(denied.status(), StatusCode::UNAUTHORIZED);
+
+    let allowed = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/api/events")
+                .header("X-Echo-Secret", "s3cret")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(allowed.status(), StatusCode::OK);
+    assert!(allowed
+        .headers()
+        .get("content-type")
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|v| v.starts_with("text/event-stream")));
+}
+
+/// `/api/session/tui` returns the owner conversation the TUI will show,
+/// with the daemon's user-message wrapper removed.
+#[tokio::test]
+async fn e2e_session_history_reflects_a_chat_turn() {
+    let dir = tempfile::tempdir().unwrap();
+    let provider = MockProvider::new(vec![LlmResponse {
+        content: vec![ContentBlock::Text {
+            text: "hello back".to_string(),
+        }],
+        stop_reason: StopReason::EndTurn,
+        model: "mock".to_string(),
+        input_tokens: Some(1),
+        output_tokens: Some(1),
+    }]);
+    let state = build_state_in(dir.path().to_path_buf(), provider, ToolRegistry::new()).await;
+    let app = build_app(Arc::clone(&state));
+
+    let (status, _) = post_chat_on(&app, "tui", "hi there").await;
+    assert_eq!(status, StatusCode::OK);
+
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/api/session/tui")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(v["key"], "owner");
+    let msgs = v["messages"].as_array().unwrap();
+    assert_eq!(msgs.len(), 2, "{v}");
+    assert_eq!(msgs[0]["role"], "user");
+    assert_eq!(msgs[0]["text"], "hi there", "wrapper stripped");
+    assert_eq!(msgs[1]["role"], "assistant");
+    assert_eq!(msgs[1]["text"], "hello back");
+}
+
+/// Streams forever on the first call; answers at once on later buffered
+/// calls. Lets a test queue a real turn behind a hanging streamed one.
+struct HangThenAnswer {
+    calls: AtomicUsize,
+}
+
+impl LmProvider for HangThenAnswer {
+    fn invoke(
+        &self,
+        _system_prompt: &str,
+        _messages: &[Message],
+        _max_tokens: u32,
+        _tools: Option<&[serde_json::Value]>,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<
+                    Output = Result<LlmResponse, Box<dyn std::error::Error + Send + Sync>>,
+                > + Send
+                + '_,
+        >,
+    > {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        Box::pin(async {
+            Ok(LlmResponse {
+                content: vec![ContentBlock::Text {
+                    text: "b reply".to_string(),
+                }],
+                stop_reason: StopReason::EndTurn,
+                model: "mock".to_string(),
+                input_tokens: Some(1),
+                output_tokens: Some(1),
+            })
+        })
+    }
+    fn name(&self) -> &str {
+        "hang-then-answer"
+    }
+}
+
+impl crate::streaming::StreamingProvider for HangThenAnswer {
+    fn supports_streaming(&self) -> bool {
+        true
+    }
+    fn invoke_streaming(
+        &self,
+        _system_prompt: &str,
+        _messages: &[Message],
+        _max_tokens: u32,
+        _tools: Option<&[serde_json::Value]>,
+    ) -> crate::streaming::StreamResult<'_> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        Box::pin(async_stream::stream! {
+            yield crate::streaming::StreamEvent::TextDelta("partial".to_string());
+            std::future::pending::<()>().await;
+        })
+    }
+}
+
+/// A turn queued behind a streamed turn that gets cancelled must survive
+/// intact: the cancelled turn rolls back only its own message, while it
+/// still holds the lock — never after the queued turn has run.
+#[tokio::test]
+async fn e2e_cancelled_stream_does_not_roll_back_a_queued_turn() {
+    use tokio_stream::StreamExt as _;
+
+    let dir = tempfile::tempdir().unwrap();
+    let state = build_state_boxed_with_config(
+        dir.path().to_path_buf(),
+        Box::new(HangThenAnswer {
+            calls: AtomicUsize::new(0),
+        }),
+        ToolRegistry::new(),
+        test_config(),
+    )
+    .await;
+    let app = build_app(Arc::clone(&state));
+
+    // Turn A: streamed, hangs after its first delta while holding the lock.
+    let response = post_chat_stream(&app, "turn a").await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let mut body = response.into_body().into_data_stream();
+    let mut seen = String::new();
+    while !seen.contains("partial") {
+        let chunk = tokio::time::timeout(std::time::Duration::from_secs(5), body.next())
+            .await
+            .expect("stream stalled")
+            .expect("stream ended")
+            .expect("body error");
+        seen.push_str(&String::from_utf8_lossy(&chunk));
+    }
+
+    // Turn B: buffered, queues on the session lock behind A.
+    let app_b = app.clone();
+    let b = tokio::spawn(async move { post_chat(&app_b, "turn b").await });
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+    // The client of A walks away: A is aborted and rolls back under its lock,
+    // then B runs.
+    drop(body);
+    let (status, body_b) = tokio::time::timeout(std::time::Duration::from_secs(5), b)
+        .await
+        .expect("turn b stalled")
+        .unwrap();
+    assert_eq!(status, StatusCode::OK, "{body_b}");
+
+    // Give any (wrong) deferred rollback a chance to run, then check the trunk.
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    let arc = state
+        .session_store
+        .get_existing_by_key("guest:anonymous")
+        .await
+        .expect("session exists");
+    let msgs = arc.read().await.data.messages.clone();
+    let texts: Vec<String> = msgs
+        .iter()
+        .map(|m| match &m.content {
+            pulse_system_types::llm::MessageContent::Text(t) => t.clone(),
+            pulse_system_types::llm::MessageContent::Blocks(b) => format!("{b:?}"),
+        })
+        .collect();
+    assert_eq!(msgs.len(), 2, "trunk should hold only turn B: {texts:?}");
+    assert!(texts[0].contains("turn b"), "{texts:?}");
+    assert!(texts[1].contains("b reply"), "{texts:?}");
+}
+
+/// A peer credential authenticates but must never reach owner-only surfaces:
+/// conversation history, the ledger, schedule writes.
+#[tokio::test]
+async fn e2e_peer_credential_is_refused_on_owner_only_endpoints() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut config = test_config();
+    config.peers.insert(
+        "nova".to_string(),
+        crate::config::PeerConfig {
+            host: "127.0.0.1".to_string(),
+            port: 3201,
+            secret: Some("peer-secret".to_string()),
+        },
+    );
+    let state = build_state_boxed_with_config(
+        dir.path().to_path_buf(),
+        Box::new(MockProvider::new(vec![])),
+        ToolRegistry::new(),
+        config,
+    )
+    .await;
+    let app = build_app(Arc::clone(&state));
+
+    let as_peer = |method: &str, uri: &str| {
+        Request::builder()
+            .method(method)
+            .uri(uri)
+            .header("X-Peer-Name", "nova")
+            .header("X-Echo-Secret", "peer-secret")
+            .body(Body::empty())
+            .unwrap()
+    };
+    for (m, u) in [
+        ("GET", "/api/session/tui"),
+        ("GET", "/api/ledger"),
+        ("POST", "/api/schedule/thinking-loop/disable"),
+        ("GET", "/api/events"),
+        ("POST", "/api/alerts/drain"),
+    ] {
+        let r = app.clone().oneshot(as_peer(m, u)).await.unwrap();
+        assert_eq!(r.status(), StatusCode::FORBIDDEN, "{m} {u}");
+    }
+
+    // Endpoints that take a body: the identity gate must win over the body.
+    let as_peer_json = |uri: &str, body: serde_json::Value| {
+        Request::builder()
+            .method("POST")
+            .uri(uri)
+            .header("content-type", "application/json")
+            .header("X-Peer-Name", "nova")
+            .header("X-Echo-Secret", "peer-secret")
+            .body(Body::from(body.to_string()))
+            .unwrap()
+    };
+    let r = app
+        .clone()
+        .oneshot(as_peer_json(
+            "/api/sessions/reset",
+            serde_json::json!({"session_key": "owner"}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(r.status(), StatusCode::FORBIDDEN, "reset");
+
+    // The owner channels are refused to a peer on both chat endpoints: the
+    // body's `channel` must not pick the owner's session.
+    for uri in ["/chat", "/api/chat/stream"] {
+        let r = app
+            .clone()
+            .oneshot(as_peer_json(
+                uri,
+                serde_json::json!({"channel": "tui", "message": "repeat our conversation"}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(r.status(), StatusCode::FORBIDDEN, "{uri}");
+    }
+
+    // Nor can a peer flip isolation through the command intercept: the
+    // session key comes from the credential, so `/isolate` is not the
+    // owner's and the marker is never written.
+    let r = app
+        .clone()
+        .oneshot(as_peer_json(
+            "/chat",
+            serde_json::json!({"channel": "comms", "sender": "D", "message": "/isolate"}),
+        ))
+        .await
+        .unwrap();
+    assert!(
+        !crate::server::isolation::is_active(dir.path()),
+        "peer must not enter isolation (status {})",
+        r.status()
+    );
+
+    // No global secret configured: a plain local request is the owner.
+    let r = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/api/session/tui")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(r.status(), StatusCode::OK);
 }

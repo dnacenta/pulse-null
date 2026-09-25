@@ -1,4 +1,4 @@
-//! Codex CLI, driven non-interactively as an entity's brain.
+//! Codex CLI, driven non-interactively as a pulse's brain.
 //!
 //! Verified against codex-cli 0.146.1 (`codex exec --help`):
 //!
@@ -11,9 +11,9 @@
 //!   system prompt is prepended to the user prompt by the runner.
 //! - `--json` prints events to stdout as JSONL, which is the only machine
 //!   surface this CLI offers.
-//! - `--ephemeral` keeps session files off disk: the entity's continuity is
+//! - `--ephemeral` keeps session files off disk: the pulse's continuity is
 //!   recall-echo's, and a second unmanaged transcript store is a liability.
-//! - `--skip-git-repo-check` is required because an entity directory is not a
+//! - `--skip-git-repo-check` is required because a pulse directory is not a
 //!   git repository, and `-C` roots the agent in it.
 //!
 //! Memory capture: this CLI gets no hooks. Continuity comes from recall-echo's
@@ -80,10 +80,10 @@ impl CliAdapter for Codex {
         args.push("--ephemeral".into());
         args.push("--skip-git-repo-check".into());
         args.push("-C".into());
-        args.push(inv.entity_root.as_os_str().to_os_string());
+        args.push(inv.pulse_root.as_os_str().to_os_string());
 
         // Codex's own sandbox is the containment: writes stay inside the
-        // entity (`-C`), network stays on so research tasks work. Isolation
+        // pulse (`-C`), network stays on so research tasks work. Isolation
         // drops to read-only and offline. `--dangerously-bypass-approvals-
         // and-sandbox` would rely on an outer sandbox pulse-null does not
         // provide; `codex exec` has no approval prompts to hang on.
@@ -100,7 +100,7 @@ impl CliAdapter for Codex {
             args.push("-c".into());
             args.push("sandbox_workspace_write.network_access=true".into());
         }
-        // The entity is the whole configuration; the user's ~/.codex config
+        // The pulse is the whole configuration; the user's ~/.codex config
         // and execpolicy rules must not shape it from outside its root.
         args.push("--ignore-user-config".into());
         args.push("--ignore-rules".into());
@@ -185,20 +185,20 @@ impl AgentIntegration for Codex {
         "AGENTS.md"
     }
 
-    fn ensure(&self, entity_root: &Path, _recall_bin: &str) -> Vec<BootstrapItem> {
-        let entity_root = &entity_root
+    fn ensure(&self, pulse_root: &Path, _recall_bin: &str) -> Vec<BootstrapItem> {
+        let pulse_root = &pulse_root
             .canonicalize()
-            .unwrap_or_else(|_| entity_root.to_path_buf());
-        let path = entity_root.join(self.instruction_file());
+            .unwrap_or_else(|_| pulse_root.to_path_buf());
+        let path = pulse_root.join(self.instruction_file());
         vec![ensure_config(
             &path,
-            &instruction_pointer(entity_root),
-            entity_root,
+            &instruction_pointer(pulse_root),
+            pulse_root,
         )]
     }
 
-    fn verify(&self, entity_root: &Path) -> Vec<BootstrapItem> {
-        let path = entity_root.join(self.instruction_file());
+    fn verify(&self, pulse_root: &Path) -> Vec<BootstrapItem> {
+        let path = pulse_root.join(self.instruction_file());
         let status = if path.is_file() {
             ItemStatus::Exists
         } else {
@@ -213,15 +213,15 @@ impl AgentIntegration for Codex {
 }
 
 /// `AGENTS.md` is a pointer, not a second source of truth: this CLI does not
-/// resolve `@`-imports, so the file says in prose what the entity's real
+/// resolve `@`-imports, so the file says in prose what the pulse's real
 /// instructions are and where they live.
-fn instruction_pointer(entity_root: &Path) -> String {
-    let entity = entity_root
+fn instruction_pointer(pulse_root: &Path) -> String {
+    let pulse = pulse_root
         .file_name()
         .and_then(|name| name.to_str())
-        .unwrap_or("entity");
+        .unwrap_or("pulse");
     format!(
-        "# {entity} — Agent instructions\n\n\
+        "# {pulse} — Agent instructions\n\n\
          Read `INSTRUCTIONS.md` in this directory before acting; it is the \
          source of truth. This file exists because this CLI looks for \
          AGENTS.md.\n"
@@ -260,7 +260,7 @@ mod tests {
             prompt_file: None,
             restricted: false,
             streaming: false,
-            entity_root: root,
+            pulse_root: root,
             reasoning_effort: None,
         }
     }

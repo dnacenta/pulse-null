@@ -36,7 +36,7 @@ pub async fn list() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-/// Add a plugin to the entity config
+/// Add a plugin to the pulse config
 pub async fn add(name: String) -> Result<(), Box<dyn std::error::Error>> {
     let entry = registry::find_plugin(&name).ok_or_else(|| {
         format!(
@@ -80,7 +80,7 @@ pub async fn add(name: String) -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-/// Remove a plugin from the entity config
+/// Remove a plugin from the pulse config
 pub async fn remove(name: String) -> Result<(), Box<dyn std::error::Error>> {
     let config = Config::load()?;
 

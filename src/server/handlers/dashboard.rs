@@ -5,17 +5,19 @@ use axum::Json;
 
 use pulse_system_types::monitoring::{CognitiveStatus, DocumentHealth, ThresholdStatus, Trend};
 
+use crate::wire::{CognitiveHealth, CognitiveSignals, CognitiveStatus as WireStatus};
+
 use crate::server::AppState;
 
 pub async fn dashboard(State(state): State<Arc<AppState>>) -> Json<serde_json::Value> {
     let config = &state.config;
     let version = env!("CARGO_PKG_VERSION");
 
-    // Entity metadata
+    // Pulse metadata
     let plugins: Vec<String> = config.plugins.keys().cloned().collect();
-    let entity = serde_json::json!({
-        "name": config.entity.name,
-        "user": config.entity.owner_alias,
+    let pulse = serde_json::json!({
+        "name": config.pulse.name,
+        "user": config.pulse.owner_alias,
         "model": config.llm.model,
         "version": version,
         "plugins": plugins,
@@ -44,30 +46,35 @@ pub async fn dashboard(State(state): State<Arc<AppState>>) -> Json<serde_json::V
             config.monitoring.window_size,
             config.monitoring.min_samples,
         );
-        if health.sufficient_data {
-            serde_json::json!({
-                "status": status_string(&health.status),
-                "sufficient_data": true,
-                "signals": {
-                    "vocabulary": trend_string(&health.vocabulary_trend),
-                    "questions": trend_string(&health.question_trend),
-                    "grounding": trend_string(&health.evidence_trend),
-                    "lifecycle": trend_string(&health.progress_trend),
-                },
-                "suggestions": health.suggestions,
-            })
+        // One struct for both sides of the wire (`crate::wire`): a renamed
+        // field here is a compile error in the TUI, not a missing banner.
+        let wire = if health.sufficient_data {
+            CognitiveHealth {
+                status: WireStatus::from(&health.status),
+                sufficient_data: true,
+                signals: Some(CognitiveSignals {
+                    vocabulary: trend_string(&health.vocabulary_trend).to_string(),
+                    questions: trend_string(&health.question_trend).to_string(),
+                    grounding: trend_string(&health.evidence_trend).to_string(),
+                    lifecycle: trend_string(&health.progress_trend).to_string(),
+                }),
+                suggestions: health.suggestions.clone(),
+            }
         } else {
-            serde_json::json!({
-                "status": "healthy",
-                "sufficient_data": false,
-            })
-        }
+            CognitiveHealth {
+                status: WireStatus::Healthy,
+                sufficient_data: false,
+                signals: None,
+                suggestions: Vec::new(),
+            }
+        };
+        serde_json::to_value(wire).unwrap_or(serde_json::Value::Null)
     } else {
         serde_json::Value::Null
     };
 
     Json(serde_json::json!({
-        "entity": entity,
+        "pulse": pulse,
         "pipeline": pipeline_data,
         "cognitive_health": cognitive_data,
     }))
@@ -85,12 +92,16 @@ fn doc_json(doc: &DocumentHealth) -> serde_json::Value {
     })
 }
 
-fn status_string(status: &CognitiveStatus) -> &'static str {
-    match status {
-        CognitiveStatus::Healthy => "healthy",
-        CognitiveStatus::Watch => "watch",
-        CognitiveStatus::Concern => "concern",
-        CognitiveStatus::Alert => "alert",
+/// The wire form of the monitor's verdict — one definition shared with
+/// clients, which must not depend on `pulse-system-types`.
+impl From<&CognitiveStatus> for WireStatus {
+    fn from(status: &CognitiveStatus) -> Self {
+        match status {
+            CognitiveStatus::Healthy => Self::Healthy,
+            CognitiveStatus::Watch => Self::Watch,
+            CognitiveStatus::Concern => Self::Concern,
+            CognitiveStatus::Alert => Self::Alert,
+        }
     }
 }
 

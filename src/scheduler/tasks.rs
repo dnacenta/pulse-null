@@ -31,7 +31,7 @@ pub fn default_timescale_for(task_id: &str) -> crate::prediction::Timescale {
     }
 }
 
-/// Create the default cognitive schedule for a new entity.
+/// Create the default cognitive schedule for a new pulse.
 pub fn default_tasks() -> Vec<ScheduledTask> {
     vec![
         ScheduledTask {
@@ -65,7 +65,7 @@ pub fn default_tasks() -> Vec<ScheduledTask> {
                 "predicted the wrong thing, hit something entirely novel — or well-calibrated, ",
                 "meaning the prediction held and your confidence matched reality?\n\n",
                 "STEP 4 — UPDATE:\n",
-                "When you're done, update your THOUGHT_STACK.md (in your entity root) with:\n",
+                "When you're done, update your THOUGHT_STACK.md (in your pulse root) with:\n",
                 "- **Active thread**: What you're exploring, where you are, what's next\n",
                 "- **Parked threads**: Ideas to return to later\n",
                 "- **Recent insights**: Things that clicked this iteration\n\n",

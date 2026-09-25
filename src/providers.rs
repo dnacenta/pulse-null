@@ -10,8 +10,8 @@ use crate::errors::ProviderError;
 use crate::ollama_provider::OllamaProvider;
 use crate::streaming::StreamingProvider;
 
-/// Build the subprocess provider for the entity's configured adapter.
-fn cli_provider_for(config: &Config, entity_root: &Path) -> Result<CliProvider, ProviderError> {
+/// Build the subprocess provider for the pulse's configured adapter.
+fn cli_provider_for(config: &Config, pulse_root: &Path) -> Result<CliProvider, ProviderError> {
     let name = config
         .llm
         .cli_adapter()
@@ -22,7 +22,7 @@ fn cli_provider_for(config: &Config, entity_root: &Path) -> Result<CliProvider, 
         adapter,
         config.llm.cli_bin.clone(),
         config.llm.model.clone(),
-        entity_root.to_path_buf(),
+        pulse_root.to_path_buf(),
     )
     .with_reasoning_effort(config.llm.reasoning_effort.clone());
     tracing::debug!(
@@ -35,42 +35,25 @@ fn cli_provider_for(config: &Config, entity_root: &Path) -> Result<CliProvider, 
 
 /// Create a boxed provider based on config.
 ///
-/// `entity_root` is the entity the provider speaks for. The `cli` backend
+/// `pulse_root` is the pulse the provider speaks for. The `cli` backend
 /// runs every subprocess from inside it (PN-104); the HTTP backends ignore
 /// it. Callers pass the root they already hold rather than letting the
 /// factory re-derive one from the process cwd, which is wrong whenever one
-/// process serves several entities.
+/// process serves several pulses.
 pub fn create_provider(
     config: &Config,
-    entity_root: &Path,
+    pulse_root: &Path,
 ) -> Result<Box<dyn LmProvider>, ProviderError> {
-    match config.llm.provider.as_str() {
-        "anthropic" | "claude" => {
-            // vendor-ok: pre-PN-106 alias
-            let api_key = config.resolve_api_key().ok_or_else(|| {
-                ProviderError::MissingApiKey(
-                    "No API key found. Set it in pulse-null.toml or ANTHROPIC_API_KEY env var."
-                        .into(),
-                )
-            })?;
-            Ok(Box::new(AnthropicProvider::new(
-                api_key,
-                config.llm.model.clone(),
-            )))
-        }
-        "ollama" => Ok(Box::new(OllamaProvider::new(
-            config.llm.model.clone(),
-            config.llm.base_url.clone(),
-        ))),
-        "cli" | "claude-code" => Ok(Box::new(cli_provider_for(config, entity_root)?)), // vendor-ok: pre-PN-106 alias
-        other => Err(ProviderError::Unknown(other.to_string())),
-    }
+    // One construction site: every provider streams, and a streaming
+    // provider is an `LmProvider` (trait upcasting).
+    let provider: Box<dyn StreamingProvider> = create_streaming_provider(config, pulse_root)?;
+    Ok(provider)
 }
 
 /// Create a streaming-capable provider based on config.
 pub fn create_streaming_provider(
     config: &Config,
-    entity_root: &Path,
+    pulse_root: &Path,
 ) -> Result<Box<dyn StreamingProvider>, ProviderError> {
     match config.llm.provider.as_str() {
         "anthropic" | "claude" => {
@@ -90,7 +73,7 @@ pub fn create_streaming_provider(
             config.llm.model.clone(),
             config.llm.base_url.clone(),
         ))),
-        "cli" | "claude-code" => Ok(Box::new(cli_provider_for(config, entity_root)?)), // vendor-ok: pre-PN-106 alias
+        "cli" | "claude-code" => Ok(Box::new(cli_provider_for(config, pulse_root)?)), // vendor-ok: pre-PN-106 alias
         other => Err(ProviderError::Unknown(other.to_string())),
     }
 }
@@ -98,9 +81,9 @@ pub fn create_streaming_provider(
 /// Create an Arc-wrapped provider (for server/plugin usage where shared ownership is needed).
 pub fn create_provider_arc(
     config: &Config,
-    entity_root: &Path,
+    pulse_root: &Path,
 ) -> Result<Arc<Box<dyn LmProvider>>, ProviderError> {
-    Ok(Arc::new(create_provider(config, entity_root)?))
+    Ok(Arc::new(create_provider(config, pulse_root)?))
 }
 
 /// Create a provider that talks to `model` instead of `[llm] model`.
@@ -112,10 +95,10 @@ pub fn create_provider_arc(
 /// minutes apart, so it is built per execution rather than cached.
 pub fn create_provider_with_model(
     config: &Config,
-    entity_root: &Path,
+    pulse_root: &Path,
     model: &str,
 ) -> Result<Box<dyn LmProvider>, ProviderError> {
-    create_provider(&with_model(config, model), entity_root)
+    create_provider(&with_model(config, model), pulse_root)
 }
 
 /// The same configuration, pointed at a different model.

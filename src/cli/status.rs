@@ -10,10 +10,10 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let config = Config::load()?;
     let root_dir = config.root_dir()?;
 
-    println!("Entity: {}", config.entity.name);
+    println!("Pulse: {}", config.pulse.name);
     println!(
         "Owner: {} ({})",
-        config.entity.owner_name, config.entity.owner_alias
+        config.pulse.owner_name, config.pulse.owner_alias
     );
     println!("LLM: {}", config.llm.provider);
     println!("Server: {}:{}", config.server.host, config.server.port);
@@ -60,11 +60,11 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-/// What the entity is currently carrying (spec §8 Q2, answered yes).
+/// What the pulse is currently carrying (spec §8 Q2, answered yes).
 ///
 /// The tension store is the cheapest possible window into what is actually
-/// nagging the entity, and — unlike every journal document — it is a
-/// channel the entity cannot edit in prose. The §3 discriminator ships here
+/// nagging the pulse, and — unlike every journal document — it is a
+/// channel the pulse cannot edit in prose. The §3 discriminator ships here
 /// too, so the question "is this accumulator doing any independent work?"
 /// is answerable from an SSH glance rather than from a report nobody opens.
 fn print_tension(config: &Config, root_dir: &std::path::Path) {
@@ -73,7 +73,7 @@ fn print_tension(config: &Config, root_dir: &std::path::Path) {
     }
     let store = crate::tension::store::load(root_dir, config.tension.clone());
     let now = Utc::now();
-    // Show exactly what the entity itself is shown, so D and Echo are
+    // Show exactly what the pulse itself is shown, so D and Echo are
     // looking at the same list rather than two differently-truncated ones.
     let top_k = config.tension.top_k_injected;
 
@@ -100,7 +100,7 @@ fn print_tension(config: &Config, root_dir: &std::path::Path) {
 
     // Tombstones are retained rather than deleted (§8 Q3), so show the most
     // recent ones: an abandonment nobody ever reads is a deletion with extra
-    // bytes, and "what did the entity give up on, and why" is exactly the
+    // bytes, and "what did the pulse give up on, and why" is exactly the
     // question this store exists to answer honestly.
     let mut retired: Vec<_> = store.tombstones().collect();
     retired.sort_by_key(|t| std::cmp::Reverse(t.resolved_at));
@@ -164,7 +164,7 @@ const RETIRED_SHOWN: usize = 3;
 /// Per-task liveness: last-success age, failure streak, staleness and
 /// flapping markers.
 ///
-/// This is the SSH glance that answers "is the entity actually alive?" —
+/// This is the SSH glance that answers "is the pulse actually alive?" —
 /// the question that went unanswered for seven weeks. It answers "is it
 /// *half* alive?" too, so a task whose last cycle happened to pass cannot
 /// read as `[ OK ]` while most of its cycles die.

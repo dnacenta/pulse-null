@@ -120,8 +120,8 @@ pub struct CompactionMetrics {
     pub system_prompt_tokens: usize,
     /// Currently active plan or task description.
     /// Survives compaction — re-injected into post-compaction context.
-    /// Set when the entity commits to a multi-step task; cleared on
-    /// session reset or when the entity completes/abandons the plan.
+    /// Set when the pulse commits to a multi-step task; cleared on
+    /// session reset or when the pulse completes/abandons the plan.
     #[serde(default)]
     pub active_plan: Option<String>,
     /// Context quality score: ratio of high-quality tokens (recent window +
@@ -240,7 +240,7 @@ impl SessionData {
     /// Set the active plan for this session.
     ///
     /// The plan survives compaction and is re-injected into post-compaction
-    /// context so the entity always knows what it's working on.
+    /// context so the pulse always knows what it's working on.
     #[allow(dead_code)]
     pub fn set_active_plan(&mut self, plan: &str) {
         self.compaction.active_plan = Some(plan.to_string());
@@ -359,11 +359,7 @@ impl SessionData {
 /// Archives the current conversation (via end_session), clears the session,
 /// and inserts a handoff summary as the first message of the new session.
 /// Returns the archive path if archiving succeeded.
-pub fn reset_session(
-    data: &mut SessionData,
-    root_dir: &Path,
-    entity_name: &str,
-) -> Option<PathBuf> {
+pub fn reset_session(data: &mut SessionData, root_dir: &Path, pulse_name: &str) -> Option<PathBuf> {
     if data.messages.is_empty() && data.quarantine.is_empty() {
         return None;
     }
@@ -382,13 +378,13 @@ pub fn reset_session(
     // context across the session boundary.
     let archive_path = crate::session::end_session(
         root_dir,
-        entity_name,
+        pulse_name,
         &data.messages,
         &data.channel,
         "session-reset",
         Some(&data.key),
     );
-    crate::session::archive_quarantine(root_dir, entity_name, &data.key, &data.quarantine);
+    crate::session::archive_quarantine(root_dir, pulse_name, &data.key, &data.quarantine);
 
     tracing::info!(
         "[session-reset] key={} msgs={} compactions={} hallucinations={} → fresh session",
@@ -430,8 +426,8 @@ pub fn reset_session(
 /// limits. The channel is treated as metadata, not as a session boundary.
 ///
 /// Returns one of:
-/// - `"owner"` — the entity's creator/owner
-/// - `"peer:{name}"` — a known sibling entity in the network
+/// - `"owner"` — the pulse's creator/owner
+/// - `"peer:{name}"` — a known sibling pulse in the network
 /// - `"guest:{sender}"` — an unknown or unrecognized sender
 pub fn resolve_sender(
     channel: &str,
@@ -463,7 +459,7 @@ pub fn resolve_sender(
         }
     }
 
-    // Known peer entities
+    // Known peer pulses
     if channel == "comms" && peers.contains_key(sender) {
         return format!("peer:{}", sender);
     }
@@ -549,7 +545,7 @@ pub struct SessionStore {
     sessions: RwLock<HashMap<String, std::sync::Arc<RwLock<Session>>>>,
     sessions_dir: PathBuf,
     root_dir: PathBuf,
-    entity_name: String,
+    pulse_name: String,
     ttl_seconds: u64,
     max_sessions: usize,
     coordinator: Option<Arc<PersistCoordinator>>,
@@ -569,12 +565,12 @@ impl SessionStore {
     pub async fn new(
         root_dir: &Path,
         config: &crate::config::SessionConfig,
-        entity_name: &str,
+        pulse_name: &str,
     ) -> Self {
         Self::with_identity(
             root_dir,
             config,
-            entity_name,
+            pulse_name,
             &OwnerConfig::default(),
             &HashMap::new(),
         )
@@ -589,7 +585,7 @@ impl SessionStore {
     pub async fn with_identity(
         root_dir: &Path,
         config: &crate::config::SessionConfig,
-        entity_name: &str,
+        pulse_name: &str,
         owner: &OwnerConfig,
         peers: &HashMap<String, crate::config::PeerConfig>,
     ) -> Self {
@@ -602,7 +598,7 @@ impl SessionStore {
             sessions: RwLock::new(HashMap::new()),
             sessions_dir: sessions_dir.clone(),
             root_dir: root_dir.to_path_buf(),
-            entity_name: entity_name.to_string(),
+            pulse_name: pulse_name.to_string(),
             ttl_seconds: config.ttl_seconds,
             max_sessions: config.max_sessions,
             coordinator: None,
@@ -682,7 +678,7 @@ impl SessionStore {
                             if !data.messages.is_empty() {
                                 crate::session::end_session(
                                     &self.root_dir,
-                                    &self.entity_name,
+                                    &self.pulse_name,
                                     &data.messages,
                                     &data.channel,
                                     "session-expired-on-load",
@@ -985,7 +981,7 @@ impl SessionStore {
 
     /// Clean up expired sessions, archiving them first.
     /// Returns the paths of any archived conversations (for graph ingestion).
-    pub async fn cleanup_expired(&self, root_dir: &Path, entity_name: &str) -> Vec<PathBuf> {
+    pub async fn cleanup_expired(&self, root_dir: &Path, pulse_name: &str) -> Vec<PathBuf> {
         let mut expired_keys = Vec::new();
 
         {
@@ -1011,7 +1007,7 @@ impl SessionStore {
                     // Full session end: archive + EPHEMERAL + LOGBOOK
                     if let Some(path) = crate::session::end_session(
                         root_dir,
-                        entity_name,
+                        pulse_name,
                         &session.data.messages,
                         &session.data.channel,
                         "session-expired",
@@ -1035,7 +1031,7 @@ impl SessionStore {
 
     /// Archive all sessions (for shutdown).
     /// Returns the paths of archived conversations (for graph ingestion).
-    pub async fn archive_all(&self, root_dir: &Path, entity_name: &str) -> Vec<PathBuf> {
+    pub async fn archive_all(&self, root_dir: &Path, pulse_name: &str) -> Vec<PathBuf> {
         let sessions = self.sessions.read().await;
         let mut archived_paths = Vec::new();
 
@@ -1051,7 +1047,7 @@ impl SessionStore {
             // (SEC-003) so it never reaches EPHEMERAL or the graph.
             if let Some(path) = crate::session::end_session(
                 root_dir,
-                entity_name,
+                pulse_name,
                 &session.data.messages,
                 &session.data.channel,
                 "server-shutdown",
@@ -1060,12 +1056,7 @@ impl SessionStore {
                 tracing::info!("Archived session {} to {}", key, path.display());
                 archived_paths.push(path);
             }
-            crate::session::archive_quarantine(
-                root_dir,
-                entity_name,
-                key,
-                &session.data.quarantine,
-            );
+            crate::session::archive_quarantine(root_dir, pulse_name, key, &session.data.quarantine);
         }
 
         // Persist all to disk so they can be restored on restart
@@ -1139,21 +1130,6 @@ impl SessionStore {
         }
 
         snapshots
-    }
-
-    /// Replace a session's messages and persist the change.
-    ///
-    /// Used by the TUI to sync its conversation back into the session store
-    /// after each completion. The session is marked dirty so it will be
-    /// flushed to disk on the next persist cycle.
-    pub async fn update_messages(&self, key: &str, messages: Vec<Message>) {
-        if let Some(session_arc) = self.get_existing_by_key(key).await {
-            let mut session = session_arc.write().await;
-            session.data.message_count = session.data.message_count.max(messages.len());
-            session.data.messages = messages;
-            session.data.last_active = Utc::now();
-            session.mark_dirty();
-        }
     }
 
     /// Get the total number of active sessions.
@@ -1498,39 +1474,6 @@ mod tests {
         assert_eq!(key, "guest:stranger");
     }
 
-    #[tokio::test]
-    async fn update_messages_replaces_and_marks_dirty() {
-        let store = SessionStore::new(
-            std::path::Path::new("/tmp/pulse-test-update-msgs"),
-            &crate::config::SessionConfig::default(),
-            "test-entity",
-        )
-        .await;
-
-        // Create a session first
-        let session = store.get_or_create_by_key("owner", "tui", "D").await;
-        {
-            let s = session.read().await;
-            assert!(s.data.messages.is_empty());
-        }
-
-        // Update messages
-        let msgs = vec![Message {
-            role: Role::User,
-            content: MessageContent::Text("hello".into()),
-            source: Some(MessageSource::Human {
-                channel: "tui".into(),
-                sender: "owner".into(),
-            }),
-        }];
-        store.update_messages("owner", msgs).await;
-
-        // Verify
-        let s = session.read().await;
-        assert_eq!(s.data.messages.len(), 1);
-        assert!(s.dirty);
-    }
-
     fn user_msg(text: &str) -> Message {
         Message {
             role: Role::User,
@@ -1613,7 +1556,7 @@ mod tests {
         session.data.quarantine.push(user_msg("spicy"));
         session.data.quarantine.push(asst_msg("opus reply"));
 
-        let archive = reset_session(&mut session.data, tmp.path(), "TestEntity");
+        let archive = reset_session(&mut session.data, tmp.path(), "TestPulse");
 
         assert!(
             archive.is_some(),
@@ -1649,7 +1592,7 @@ mod tests {
             .quarantine
             .push(asst_msg("opus reply to the spicy question"));
 
-        reset_session(&mut session.data, tmp.path(), "TestEntity");
+        reset_session(&mut session.data, tmp.path(), "TestPulse");
 
         // EPHEMERAL must contain the clean trunk topic and NOT the quarantined
         // content (SEC-003) — EPHEMERAL auto-loads into the default model.

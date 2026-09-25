@@ -2,7 +2,7 @@
 # Vendor-name lint: generic code must not name a provider.
 #
 # The subprocess provider drives several vendors' CLIs through adapters, and
-# the entity bootstrap wires each entity for the adapter it chose. Anything
+# the pulse bootstrap wires each pulse for the adapter it chose. Anything
 # that names a vendor belongs in that vendor's adapter (src/cli_provider/
 # adapters/<vendor>.rs) or in a provider-specific HTTP adapter. This lint
 # fails the gate when a vendor name leaks into generic source.

@@ -1,8 +1,8 @@
 //! The subprocess provider: one agent CLI, spawned per invocation, anchored
-//! to the entity it speaks for.
+//! to the pulse it speaks for.
 //!
 //! This module is vendor-blind. It stages the prompts in private files,
-//! builds a command rooted in the entity directory with `RECALL_ECHO_HOME`
+//! builds a command rooted in the pulse directory with `RECALL_ECHO_HOME`
 //! set, feeds the prompt the way the adapter asks, enforces the timeout,
 //! and hands the output back to the adapter to interpret. Which flags, which
 //! output format, what a refusal looks like — all of that is the adapter's
@@ -35,7 +35,7 @@ use adapter::{
 /// Default timeout for a CLI subprocess.
 ///
 /// This is not an API call — it is an agent that reads files, runs tools and
-/// writes for as long as the task needs. Measured on the live entity, a
+/// writes for as long as the task needs. Measured on the live pulse, a
 /// thinking-loop cycle takes 3.8-4.4 minutes and grows with the size of the
 /// memory it reasons over; at the old 300s ceiling roughly half of them were
 /// killed mid-thought. Fifteen minutes leaves headroom for that growth while
@@ -46,8 +46,12 @@ const DEFAULT_SUBPROCESS_TIMEOUT_SECS: u64 = 900;
 /// Timeout for a one-off capability probe.
 const PROBE_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// Environment variable recall-echo reads to locate the entity root when a
-/// hook or MCP invocation carries no explicit `--entity-root`.
+/// How much of the CLI's stderr the streaming path keeps for the log when a
+/// turn fails. The pipe is drained in full so the child never blocks on it.
+const STDERR_TAIL_BYTES: usize = 4096;
+
+/// Environment variable recall-echo reads to locate the pulse root when a
+/// hook or MCP invocation carries no explicit `--pulse-root`.
 pub const RECALL_ECHO_HOME: &str = "RECALL_ECHO_HOME";
 
 /// Environment variable naming the CLI binary when `[llm] cli_bin` is unset.
@@ -64,22 +68,22 @@ fn subprocess_timeout() -> Duration {
     Duration::from_secs(secs)
 }
 
-/// One agent CLI, anchored to one entity.
+/// One agent CLI, anchored to one pulse.
 pub struct CliProvider {
     adapter: Box<dyn CliAdapter>,
     bin: String,
     model: String,
     /// `[llm] reasoning_effort`, handed to adapters whose CLI takes one.
     reasoning_effort: Option<String>,
-    /// The entity this provider speaks for. Every subprocess runs with this
+    /// The pulse this provider speaks for. Every subprocess runs with this
     /// as its working directory and as `RECALL_ECHO_HOME`, so the CLI picks
-    /// up the entity's own instruction file, hooks and rules, and recall-echo
-    /// resolves the entity's memory — independent of the daemon's cwd and of
+    /// up the pulse's own instruction file, hooks and rules, and recall-echo
+    /// resolves the pulse's memory — independent of the daemon's cwd and of
     /// the user's home. It is also consulted per invocation for the
     /// isolation marker: while isolated, the spawned CLI is restricted to
     /// read-only tools, because the in-process tool registry swap cannot
     /// reach a subprocess that brings its own tools.
-    entity_root: PathBuf,
+    pulse_root: PathBuf,
 }
 
 impl CliProvider {
@@ -89,7 +93,7 @@ impl CliProvider {
         adapter: Box<dyn CliAdapter>,
         bin: Option<String>,
         model: String,
-        entity_root: PathBuf,
+        pulse_root: PathBuf,
     ) -> Self {
         let bin = bin
             .or_else(|| std::env::var(CLI_BIN_ENV).ok())
@@ -99,7 +103,7 @@ impl CliProvider {
             bin,
             model,
             reasoning_effort: None,
-            entity_root,
+            pulse_root,
         }
     }
 
@@ -116,8 +120,8 @@ impl CliProvider {
     }
 
     #[cfg(test)]
-    pub fn entity_root(&self) -> &Path {
-        &self.entity_root
+    pub fn pulse_root(&self) -> &Path {
+        &self.pulse_root
     }
 
     #[cfg(test)]
@@ -171,23 +175,23 @@ fn env_allowed(key: &str, adapter: &dyn CliAdapter) -> bool {
             .any(|prefix| key.starts_with(prefix))
 }
 
-/// A command for `bin` anchored to `entity_root`: cwd and `RECALL_ECHO_HOME`
-/// point at the entity root, and the child sees only the allowlisted
+/// A command for `bin` anchored to `pulse_root`: cwd and `RECALL_ECHO_HOME`
+/// point at the pulse root, and the child sees only the allowlisted
 /// environment plus what the adapter sets. Free function so the spawn shape
 /// can be tested without spawning.
-fn entity_command(
+fn pulse_command(
     bin: &str,
-    entity_root: &Path,
+    pulse_root: &Path,
     adapter: &dyn CliAdapter,
 ) -> tokio::process::Command {
     let mut cmd = tokio::process::Command::new(bin);
-    cmd.current_dir(entity_root).env_clear();
+    cmd.current_dir(pulse_root).env_clear();
     for (key, value) in std::env::vars_os() {
         if key.to_str().is_some_and(|k| env_allowed(k, adapter)) {
             cmd.env(key, value);
         }
     }
-    cmd.env(RECALL_ECHO_HOME, entity_root);
+    cmd.env(RECALL_ECHO_HOME, pulse_root);
     for (key, value) in adapter.env_set() {
         cmd.env(key, value);
     }
@@ -309,7 +313,7 @@ fn probe_cache() -> &'static Mutex<HashMap<(String, String), bool>> {
 async fn ensure_capability(
     adapter: &dyn CliAdapter,
     bin: &str,
-    entity_root: &Path,
+    pulse_root: &Path,
 ) -> Result<(), CliError> {
     let absent = std::env::temp_dir().join(format!("pulse-null-probe-{}.md", uuid::Uuid::new_v4()));
     let Some(probe) = adapter.probe(&absent) else {
@@ -328,7 +332,7 @@ async fn ensure_capability(
             // Same cwd and environment as a real invocation: a CLI that
             // checks its working directory during argument parsing must
             // answer the probe the way it will answer the call.
-            let mut cmd = entity_command(bin, entity_root, adapter);
+            let mut cmd = pulse_command(bin, pulse_root, adapter);
             cmd.args(&probe.args)
                 .stdin(Stdio::null())
                 .stdout(Stdio::piped())
@@ -467,16 +471,16 @@ impl LmProvider for CliProvider {
         let messages = messages.to_vec();
         let model = self.model.clone();
         let bin = self.bin.clone();
-        let entity_root = self.entity_root.clone();
+        let pulse_root = self.pulse_root.clone();
         let reasoning_effort = self.reasoning_effort.clone();
-        let restricted = crate::server::isolation::is_active(&self.entity_root);
+        let restricted = crate::server::isolation::is_active(&self.pulse_root);
         let adapter: &dyn CliAdapter = self.adapter.as_ref();
 
         Box::pin(async move {
             let prompt = serialize_messages(&messages);
             let name = adapter.name();
 
-            ensure_capability(adapter, &bin, &entity_root).await?;
+            ensure_capability(adapter, &bin, &pulse_root).await?;
             // Dropped on every exit from this future — success, error, timeout
             // and cancellation — which unlinks the staged prompts.
             let staged = stage(adapter, &system_prompt, &prompt)?;
@@ -488,11 +492,11 @@ impl LmProvider for CliProvider {
                 prompt_file: staged.prompt_file.as_ref().map(StagedFile::path),
                 restricted,
                 streaming: false,
-                entity_root: &entity_root,
+                pulse_root: &pulse_root,
                 reasoning_effort: reasoning_effort.as_deref(),
             });
 
-            let mut cmd = entity_command(&bin, &entity_root, adapter);
+            let mut cmd = pulse_command(&bin, &pulse_root, adapter);
             cmd.args(&args)
                 .stdin(if staged.stdin_text.is_some() {
                     Stdio::piped()
@@ -619,16 +623,16 @@ impl StreamingProvider for CliProvider {
         let messages = messages.to_vec();
         let model = self.model.clone();
         let bin = self.bin.clone();
-        let entity_root = self.entity_root.clone();
+        let pulse_root = self.pulse_root.clone();
         let reasoning_effort = self.reasoning_effort.clone();
-        let restricted = crate::server::isolation::is_active(&self.entity_root);
+        let restricted = crate::server::isolation::is_active(&self.pulse_root);
         let adapter: &dyn CliAdapter = self.adapter.as_ref();
 
         Box::pin(async_stream::stream! {
             let prompt = serialize_messages(&messages);
             let name = adapter.name();
 
-            if let Err(e) = ensure_capability(adapter, &bin, &entity_root).await {
+            if let Err(e) = ensure_capability(adapter, &bin, &pulse_root).await {
                 yield StreamEvent::Error(format!("{e}"));
                 return;
             }
@@ -649,11 +653,11 @@ impl StreamingProvider for CliProvider {
                 prompt_file: staged.prompt_file.as_ref().map(StagedFile::path),
                 restricted,
                 streaming: true,
-                entity_root: &entity_root,
+                pulse_root: &pulse_root,
                 reasoning_effort: reasoning_effort.as_deref(),
             });
 
-            let mut cmd = entity_command(&bin, &entity_root, adapter);
+            let mut cmd = pulse_command(&bin, &pulse_root, adapter);
             cmd.args(&args)
                 .stdin(if staged.stdin_text.is_some() { Stdio::piped() } else { Stdio::null() })
                 .stdout(Stdio::piped())
@@ -669,11 +673,28 @@ impl StreamingProvider for CliProvider {
                 }
             };
 
+            let stderr_tail = child.stderr.take().map(|err| tokio::spawn(drain_stderr(err)));
+
+            // The idle bound: no single wait on the child — the prompt write,
+            // each output line, the exit — may exceed it. A model that is
+            // still talking is never cut off; one that has gone silent does
+            // not hold the turn (and the session lock behind it) forever.
+            let idle = subprocess_timeout();
+            let timed_out = || StreamEvent::Error(format!("{name} timed out after {}s", idle.as_secs()));
+
             if let (Some(text), Some(mut stdin)) = (&staged.stdin_text, child.stdin.take()) {
                 use tokio::io::AsyncWriteExt;
-                if let Err(e) = stdin.write_all(text.as_bytes()).await {
-                    yield StreamEvent::Error(format!("failed to write to {name} stdin: {e}"));
-                    return;
+                match tokio::time::timeout(idle, stdin.write_all(text.as_bytes())).await {
+                    Ok(Ok(())) => {}
+                    Ok(Err(e)) => {
+                        yield StreamEvent::Error(format!("failed to write to {name} stdin: {e}"));
+                        return;
+                    }
+                    Err(_) => {
+                        let _ = child.start_kill();
+                        yield timed_out();
+                        return;
+                    }
                 }
             }
 
@@ -690,9 +711,15 @@ impl StreamingProvider for CliProvider {
                     let mut terminal: Option<(String, bool, Option<Usage>)> = None;
                     let mut usage_seen = None;
 
+                    let mut failure: Option<StreamEvent> = None;
                     loop {
-                        match lines.next_line().await {
-                            Ok(Some(line)) => match adapter.parse_stream_line(&line) {
+                        match tokio::time::timeout(idle, lines.next_line()).await {
+                            Err(_) => {
+                                let _ = child.start_kill();
+                                failure = Some(timed_out());
+                                break;
+                            }
+                            Ok(Ok(Some(line))) => match adapter.parse_stream_line(&line) {
                                 StreamLine::Delta(text) => {
                                     assembled.push_str(&text);
                                     yield StreamEvent::TextDelta(text);
@@ -703,19 +730,34 @@ impl StreamingProvider for CliProvider {
                                 StreamLine::Usage(usage) => usage_seen = Some(usage),
                                 StreamLine::Other => {}
                             },
-                            Ok(None) => break,
-                            Err(e) => {
-                                yield StreamEvent::Error(format!("reading {name} output: {e}"));
+                            Ok(Ok(None)) => break,
+                            Ok(Err(e)) => {
+                                failure = Some(StreamEvent::Error(format!("reading {name} output: {e}")));
                                 break;
                             }
                         }
                     }
 
-                    let _ = child.wait().await;
+                    let _ = tokio::time::timeout(idle, child.wait()).await;
 
-                    match settle(adapter, assembled, terminal, usage_seen) {
+                    // A terminal record flagged as an error: a policy refusal
+                    // is a typed event (the chat handler falls back on it);
+                    // anything else is a plain error.
+                    let flagged = matches!(terminal, Some((_, true, _)));
+                    let outcome = match failure {
+                        Some(event) => Err(event),
+                        None => match settle(adapter, assembled, terminal, usage_seen) {
+                            Ok(reply) => Ok(reply),
+                            Err(text) if flagged => Err(classify_stream_failure(adapter, &model, text)),
+                            Err(text) => Err(StreamEvent::Error(text)),
+                        },
+                    };
+                    if outcome.is_err() {
+                        log_stderr_tail(name, stderr_tail).await;
+                    }
+                    match outcome {
                         Ok(reply) => yield StreamEvent::Done(response(reply, &model)),
-                        Err(e) => yield StreamEvent::Error(e),
+                        Err(event) => yield event,
                     }
                 }
                 OutputMode::SingleJson => {
@@ -728,14 +770,74 @@ impl StreamingProvider for CliProvider {
                         yield StreamEvent::Error(format!("reading {name} output: {e}"));
                         return;
                     }
-                    let _ = child.wait().await;
+                    let _ = tokio::time::timeout(idle, child.wait()).await;
                     match adapter.parse_single(&body) {
                         Ok(reply) => yield StreamEvent::Done(response(reply, &model)),
-                        Err(e) => yield StreamEvent::Error(e),
+                        Err(e) => {
+                            log_stderr_tail(name, stderr_tail).await;
+                            yield StreamEvent::Error(e);
+                        }
                     }
                 }
             }
         })
+    }
+}
+
+/// Map a streamed terminal record flagged as an error to the event the chat
+/// handler expects: a typed [`StreamEvent::Refused`] for a policy refusal
+/// (so the refusal fallback fires for streamed turns too), a plain
+/// [`StreamEvent::Error`] for everything else (quota, timeout, empty). The
+/// adapter owns the signature, so buffered and streamed turns agree.
+fn classify_stream_failure(adapter: &dyn CliAdapter, model: &str, text: String) -> StreamEvent {
+    match adapter.classify_terminal(&text) {
+        ExitClass::Refusal(detail) => StreamEvent::Refused {
+            model: model.to_string(),
+            detail: truncate(&detail, 500).to_string(),
+        },
+        ExitClass::FlaggedButUnmatched => {
+            warn!(
+                model = %model,
+                adapter = adapter.name(),
+                "stream ended with an error-flagged result that did not match the \
+                 refusal signature — detection may have drifted"
+            );
+            StreamEvent::Error(text)
+        }
+        ExitClass::Plain => StreamEvent::Error(text),
+    }
+}
+
+/// Read a child's stderr to the end, keeping only the last
+/// [`STDERR_TAIL_BYTES`]. Reading everything is the point: a pipe nobody
+/// drains blocks the child once it fills.
+async fn drain_stderr(mut err: tokio::process::ChildStderr) -> String {
+    use tokio::io::AsyncReadExt;
+    let mut tail: Vec<u8> = Vec::new();
+    let mut buf = [0u8; 4096];
+    loop {
+        match err.read(&mut buf).await {
+            Ok(0) | Err(_) => break,
+            Ok(n) => {
+                tail.extend_from_slice(&buf[..n]);
+                if tail.len() > STDERR_TAIL_BYTES {
+                    let cut = tail.len() - STDERR_TAIL_BYTES;
+                    tail.drain(..cut);
+                }
+            }
+        }
+    }
+    String::from_utf8_lossy(&tail).into_owned()
+}
+
+/// Diagnostics for the log, only when the turn did not succeed.
+async fn log_stderr_tail(name: &str, tail: Option<tokio::task::JoinHandle<String>>) {
+    if let Some(handle) = tail {
+        if let Ok(Ok(tail)) = tokio::time::timeout(Duration::from_secs(2), handle).await {
+            if !tail.trim().is_empty() {
+                warn!("{name} stderr (tail): {}", tail.trim());
+            }
+        }
     }
 }
 

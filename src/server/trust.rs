@@ -76,14 +76,14 @@ impl TrustLevel {
 mod tests {
     use super::*;
     use crate::config::{
-        AutonomyConfig, Config, EntityConfig, GraphConfig, LlmConfig, MemoryConfig,
+        AutonomyConfig, CaliberConfig, Config, GraphConfig, LlmConfig, MemoryConfig,
         MonitoringConfig, OutreachConfig, PipelineConfig, PredictionConfig, PulseConfig,
         SchedulerConfig, SecurityConfig, ServerConfig, SessionConfig, TrustConfig,
     };
 
     fn test_config() -> Config {
         Config {
-            entity: EntityConfig {
+            pulse: PulseConfig {
                 name: "Test".into(),
                 owner_name: "Owner".into(),
                 owner_alias: "O".into(),
@@ -117,7 +117,7 @@ mod tests {
             pipeline: PipelineConfig::default(),
             monitoring: MonitoringConfig::default(),
             autonomy: AutonomyConfig::default(),
-            pulse: PulseConfig::default(),
+            caliber: CaliberConfig::default(),
             graph: GraphConfig::default(),
             prediction: PredictionConfig::default(),
             tension: Default::default(),
@@ -129,6 +129,7 @@ mod tests {
             system_prompt_budget: crate::config::SystemPromptBudgetConfig::default(),
             peers: std::collections::HashMap::new(),
             plugins: std::collections::HashMap::new(),
+            tui: crate::config::TuiConfig::default(),
         }
     }
 

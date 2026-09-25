@@ -7,6 +7,41 @@ use axum::response::Response;
 
 use super::AppState;
 
+/// Who a request authenticated as. Inserted as a request extension by
+/// [`require_auth`] so handlers can scope what they serve.
+///
+/// A request admitted because no `[security] secret` is configured counts
+/// as the owner: the loopback deployment has always trusted the host, and
+/// this keeps that behaviour explicit rather than silent. A peer presenting
+/// its own secret is a peer, never the owner.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AuthIdentity {
+    Owner,
+    Peer(String),
+}
+
+impl AuthIdentity {
+    /// Refuse anyone but the owner. Peers get 403, never a silent success.
+    pub fn require_owner(&self) -> Result<(), StatusCode> {
+        match self {
+            Self::Owner => Ok(()),
+            Self::Peer(name) => {
+                tracing::warn!("peer {name} asked for an owner-only endpoint");
+                Err(StatusCode::FORBIDDEN)
+            }
+        }
+    }
+}
+
+/// Constant-time string equality for secrets.
+fn ct_eq(a: &str, b: &str) -> bool {
+    let (a, b) = (a.as_bytes(), b.as_bytes());
+    if a.len() != b.len() {
+        return false;
+    }
+    a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
+}
+
 /// Authentication middleware.
 ///
 /// Checks authentication in this order:
@@ -16,7 +51,7 @@ use super::AppState;
 /// 4. If no global secret configured, allow all requests
 pub async fn require_auth(
     state: axum::extract::State<Arc<AppState>>,
-    req: Request,
+    mut req: Request,
     next: Next,
 ) -> Result<Response, StatusCode> {
     // Skip auth for health endpoint
@@ -26,23 +61,29 @@ pub async fn require_auth(
 
     // Check for peer authentication: if X-Peer-Name is present,
     // validate against that peer's configured secret
-    let peer_name = req
+    let peer_name: Option<String> = req
         .headers()
         .get("X-Peer-Name")
-        .and_then(|v| v.to_str().ok());
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_string);
 
     if let Some(name) = peer_name {
-        if let Some(peer_config) = state.config.peers.get(name) {
+        if let Some(peer_config) = state.config.peers.get(name.as_str()) {
             // Peer exists in config — check if it has a secret requirement
             if let Some(ref peer_secret) = peer_config.secret {
-                let provided = req
+                let accepted = req
                     .headers()
                     .get("X-Echo-Secret")
-                    .and_then(|v| v.to_str().ok());
+                    .and_then(|v| v.to_str().ok())
+                    .is_some_and(|value| ct_eq(value, peer_secret));
 
-                match provided {
-                    Some(value) if value == peer_secret => return Ok(next.run(req).await),
-                    _ => {
+                match accepted {
+                    true => {
+                        req.extensions_mut()
+                            .insert(AuthIdentity::Peer(name.clone()));
+                        return Ok(next.run(req).await);
+                    }
+                    false => {
                         tracing::warn!(
                             "Peer auth failed: {} provided wrong or missing secret for {}",
                             name,
@@ -63,18 +104,25 @@ pub async fn require_auth(
     // Fall back to global secret check
     let secret = match state.config.security.secret.as_deref() {
         Some(s) if !s.trim().is_empty() => s,
-        _ => return Ok(next.run(req).await),
+        _ => {
+            req.extensions_mut().insert(AuthIdentity::Owner);
+            return Ok(next.run(req).await);
+        }
     };
 
     // Check X-Echo-Secret header against global secret
-    let provided = req
+    let accepted = req
         .headers()
         .get("X-Echo-Secret")
-        .and_then(|v| v.to_str().ok());
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|value| ct_eq(value, secret));
 
-    match provided {
-        Some(value) if value == secret => Ok(next.run(req).await),
-        _ => {
+    match accepted {
+        true => {
+            req.extensions_mut().insert(AuthIdentity::Owner);
+            Ok(next.run(req).await)
+        }
+        false => {
             tracing::warn!(
                 "Unauthorized request to {} from {:?}",
                 req.uri().path(),
@@ -99,7 +147,7 @@ mod tests {
 
     use super::*;
     use crate::config::{
-        AutonomyConfig, Config, EntityConfig, GraphConfig, LlmConfig, MemoryConfig,
+        AutonomyConfig, CaliberConfig, Config, GraphConfig, LlmConfig, MemoryConfig,
         MonitoringConfig, OutreachConfig, PipelineConfig, PredictionConfig, PulseConfig,
         SchedulerConfig, SecurityConfig, ServerConfig, SessionConfig, TrustConfig,
     };
@@ -110,7 +158,7 @@ mod tests {
     async fn test_state(secret: Option<String>) -> Arc<AppState> {
         let root_dir = std::env::temp_dir();
         let config = Config {
-            entity: EntityConfig {
+            pulse: PulseConfig {
                 name: "Test".into(),
                 owner_name: "Owner".into(),
                 owner_alias: "O".into(),
@@ -141,7 +189,7 @@ mod tests {
             pipeline: PipelineConfig::default(),
             monitoring: MonitoringConfig::default(),
             autonomy: AutonomyConfig::default(),
-            pulse: PulseConfig::default(),
+            caliber: CaliberConfig::default(),
             graph: GraphConfig::default(),
             prediction: PredictionConfig::default(),
             tension: Default::default(),
@@ -153,11 +201,12 @@ mod tests {
             system_prompt_budget: crate::config::SystemPromptBudgetConfig::default(),
             peers: std::collections::HashMap::new(),
             plugins: std::collections::HashMap::new(),
+            tui: crate::config::TuiConfig::default(),
         };
         let session_store = crate::session_store::SessionStore::new(
             &root_dir,
             &config.sessions,
-            &config.entity.name,
+            &config.pulse.name,
         )
         .await;
         let plugin_manager = crate::plugins::manager::PluginManager::new(&config);
@@ -183,6 +232,9 @@ mod tests {
             alert_queue: tokio::sync::Mutex::new(alert_queue),
             provider_status: crate::provider_status::new_shared(),
             leadership: std::sync::atomic::AtomicBool::new(false),
+            event_permits: crate::server::stream_pools().0,
+            chat_permits: crate::server::stream_pools().1,
+            ledger: Arc::new(crate::ledger::LedgerRing::new(16)),
         })
     }
 
@@ -288,7 +340,7 @@ mod tests {
     ) -> Arc<AppState> {
         let root_dir = std::env::temp_dir();
         let config = Config {
-            entity: EntityConfig {
+            pulse: PulseConfig {
                 name: "Test".into(),
                 owner_name: "Owner".into(),
                 owner_alias: "O".into(),
@@ -319,7 +371,7 @@ mod tests {
             pipeline: PipelineConfig::default(),
             monitoring: MonitoringConfig::default(),
             autonomy: AutonomyConfig::default(),
-            pulse: PulseConfig::default(),
+            caliber: CaliberConfig::default(),
             graph: GraphConfig::default(),
             prediction: PredictionConfig::default(),
             tension: Default::default(),
@@ -331,11 +383,12 @@ mod tests {
             system_prompt_budget: crate::config::SystemPromptBudgetConfig::default(),
             peers,
             plugins: std::collections::HashMap::new(),
+            tui: crate::config::TuiConfig::default(),
         };
         let session_store = crate::session_store::SessionStore::new(
             &root_dir,
             &config.sessions,
-            &config.entity.name,
+            &config.pulse.name,
         )
         .await;
         let plugin_manager = crate::plugins::manager::PluginManager::new(&config);
@@ -361,6 +414,9 @@ mod tests {
             alert_queue: tokio::sync::Mutex::new(alert_queue),
             provider_status: crate::provider_status::new_shared(),
             leadership: std::sync::atomic::AtomicBool::new(false),
+            event_permits: crate::server::stream_pools().0,
+            chat_permits: crate::server::stream_pools().1,
+            ledger: Arc::new(crate::ledger::LedgerRing::new(16)),
         })
     }
 

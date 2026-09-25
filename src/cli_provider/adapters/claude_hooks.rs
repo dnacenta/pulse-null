@@ -1,6 +1,6 @@
-//! Claude Code's entity-local files: `.claude/settings.json` (recall-echo
-//! hooks that carry the entity root explicitly), `.claude/rules/recall-echo.md`
-//! (the memory protocol, entity-relative), and the leftovers of the
+//! Claude Code's pulse-local files: `.claude/settings.json` (recall-echo
+//! hooks that carry the pulse root explicitly), `.claude/rules/recall-echo.md`
+//! (the memory protocol, pulse-relative), and the leftovers of the
 //! pre-PN-104 user-level layout that `repair` retires. Claude Code reads
 //! these as project-scope configuration from its working directory —
 //! verified 2026-09-08 with a planted rule and a bare-directory control.
@@ -18,7 +18,10 @@ fn home_dir() -> Option<PathBuf> {
 
 /// The three recall-echo hook subcommands, in the event order Claude Code
 /// fires them. `consume` takes the root positionally; the other two take
-/// `--entity-root` — matching what `recall-echo init` itself writes.
+/// `--pulse-root` — matching what `recall-echo init` itself writes. Hooks
+/// written before PN-115 spell it `--pulse-root` (recall-echo ≥ 4.6.0 reads
+/// both); `ensure` rewrites them to the canonical form like any other stale
+/// recall-echo hook.
 const RECALL_HOOKS: [(&str, &str); 3] = [
     ("SessionStart", "consume"),
     ("PreCompact", "checkpoint"),
@@ -31,8 +34,8 @@ fn hook_command(recall_bin: &str, sub: &str, root: &Path) -> String {
     let root = shell_quote(root);
     match sub {
         "consume" => format!("{bin} consume {root}"),
-        "checkpoint" => format!("{bin} checkpoint --trigger precompact --entity-root {root}"),
-        _ => format!("{bin} {sub} --entity-root {root}"),
+        "checkpoint" => format!("{bin} checkpoint --trigger precompact --pulse-root {root}"),
+        _ => format!("{bin} {sub} --pulse-root {root}"),
     }
 }
 
@@ -211,18 +214,18 @@ fn ensure_settings(path: &Path, ours: &serde_json::Value, within: &Path) -> Boot
 }
 
 /// Generate the recall-echo.md rules file. Every path is relative to the
-/// entity root, which is the cwd Claude Code runs in for this entity.
+/// pulse root, which is the cwd Claude Code runs in for this pulse.
 fn render_rules_md() -> &'static str {
     r#"# recall-echo — Memory Protocol
 
 You have a persistent four-layer memory system. Use it to maintain continuity across sessions.
-All paths below are relative to your entity directory, which is the working directory you run in.
+All paths below are relative to your pulse directory, which is the working directory you run in.
 
 ## Memory Layers
 
 ### Layer 0 — Knowledge Graph (structured, semantic)
 - Embedded SurrealDB graph database with FastEmbed local embeddings.
-- Stores entities, relationships, and conversation episodes.
+- Stores pulses, relationships, and conversation episodes.
 - Bayesian confidence scoring on relationships — corroborated knowledge gains confidence over time.
 - Semantic search finds memories by meaning, not just keywords.
 - Queried via `recall-echo graph search`, `graph query`, or `graph traverse`.
@@ -274,9 +277,9 @@ current conversation.
 - `recall-echo archive-session` — Archive conversation from JSONL transcript (SessionEnd hook)
 - `recall-echo search <query>` — Search conversation archives
 - `recall-echo search <query> --ranked` — Ranked search with relevance scoring
-- `recall-echo graph search <query>` — Semantic search across graph entities
+- `recall-echo graph search <query>` — Semantic search across graph entitys
 - `recall-echo graph query <query>` — Hybrid search (semantic + graph expansion + episodes)
-- `recall-echo graph traverse <entity>` — Graph traversal with confidence display
+- `recall-echo graph traverse <pulse>` — Graph traversal with confidence display
 
 ## Rules
 
@@ -287,35 +290,35 @@ current conversation.
 "#
 }
 
-/// Create all Claude Code integration files for one entity.
+/// Create all Claude Code integration files for one pulse.
 /// Safe to run multiple times — skips anything already correct. A parent
 /// that is not a real directory (a symlink, say) stops everything under it:
 /// nothing is created through a component we did not verify.
-pub(super) fn ensure_files(entity_root: &Path, recall_bin: &str) -> Vec<BootstrapItem> {
-    let entity_root = entity_root
+pub(super) fn ensure_files(pulse_root: &Path, recall_bin: &str) -> Vec<BootstrapItem> {
+    let pulse_root = pulse_root
         .canonicalize()
-        .unwrap_or_else(|_| entity_root.to_path_buf());
-    if entity_root.to_str().is_none() {
+        .unwrap_or_else(|_| pulse_root.to_path_buf());
+    if pulse_root.to_str().is_none() {
         // The hook commands embed the root; a lossy conversion would persist
         // a hook pointing at a path that does not exist. Say so instead.
         return vec![BootstrapItem {
-            path: entity_root,
+            path: pulse_root,
             kind: ItemKind::Directory,
-            status: ItemStatus::Skipped("entity root is not valid UTF-8".into()),
+            status: ItemStatus::Skipped("pulse root is not valid UTF-8".into()),
         }];
     }
-    let claude_dir = entity_root.join(".claude");
+    let claude_dir = pulse_root.join(".claude");
     let ok = |item: &BootstrapItem| matches!(item.status, ItemStatus::Created | ItemStatus::Exists);
 
     let mut items = Vec::new();
-    // Claude Code reads CLAUDE.md; the entity's instructions live in the
+    // Claude Code reads CLAUDE.md; the pulse's instructions live in the
     // generic INSTRUCTIONS.md, so CLAUDE.md is a one-line import of it.
-    // Entities created before PN-106 already have a full CLAUDE.md, which
+    // Pulses created before PN-106 already have a full CLAUDE.md, which
     // `ensure_config` leaves alone.
     items.push(ensure_config(
-        &entity_root.join("CLAUDE.md"),
+        &pulse_root.join("CLAUDE.md"),
         "@INSTRUCTIONS.md\n",
-        &entity_root,
+        &pulse_root,
     ));
     let claude = ensure_dir(&claude_dir);
     let claude_ok = ok(&claude);
@@ -326,14 +329,14 @@ pub(super) fn ensure_files(entity_root: &Path, recall_bin: &str) -> Vec<Bootstra
         items.push(rules);
         items.push(ensure_settings(
             &claude_dir.join("settings.json"),
-            &render_hooks(recall_bin, &entity_root),
-            &entity_root,
+            &render_hooks(recall_bin, &pulse_root),
+            &pulse_root,
         ));
         if rules_ok {
             items.push(ensure_config(
                 &claude_dir.join("rules/recall-echo.md"),
                 render_rules_md(),
-                &entity_root,
+                &pulse_root,
             ));
         }
     }
@@ -341,12 +344,12 @@ pub(super) fn ensure_files(entity_root: &Path, recall_bin: &str) -> Vec<Bootstra
 }
 
 /// Verify Claude Code integration without creating anything. Also reports
-/// leftovers of the pre-PN-104 user-level layout that point at this entity.
-pub(super) fn verify_files(entity_root: &Path) -> Vec<BootstrapItem> {
-    let entity_root = entity_root
+/// leftovers of the pre-PN-104 user-level layout that point at this pulse.
+pub(super) fn verify_files(pulse_root: &Path) -> Vec<BootstrapItem> {
+    let pulse_root = pulse_root
         .canonicalize()
-        .unwrap_or_else(|_| entity_root.to_path_buf());
-    let claude_dir = entity_root.join(".claude");
+        .unwrap_or_else(|_| pulse_root.to_path_buf());
+    let claude_dir = pulse_root.join(".claude");
     let recall_bin = find_recall_echo_bin();
     let mut items = Vec::new();
 
@@ -355,7 +358,7 @@ pub(super) fn verify_files(entity_root: &Path) -> Vec<BootstrapItem> {
     let status = match read_small_file(&settings) {
         Ok(Some(text)) => match serde_json::from_str::<serde_json::Value>(&text) {
             Ok(existing) => {
-                let ours = render_hooks(&recall_bin, &entity_root);
+                let ours = render_hooks(&recall_bin, &pulse_root);
                 if has_canonical_hooks(&existing, &ours) {
                     ItemStatus::Exists
                 } else {
@@ -385,12 +388,12 @@ pub(super) fn verify_files(entity_root: &Path) -> Vec<BootstrapItem> {
     });
 
     if let Some(home) = home_dir() {
-        for link in legacy_home_links(&entity_root, &home) {
+        for link in legacy_home_links(&pulse_root, &home) {
             items.push(BootstrapItem {
                 path: link,
                 kind: ItemKind::Symlink,
                 status: ItemStatus::Wrong(
-                    "legacy user-level link into this entity — run 'pulse-null repair'".into(),
+                    "legacy user-level link into this pulse — run 'pulse-null repair'".into(),
                 ),
             });
         }
@@ -400,11 +403,11 @@ pub(super) fn verify_files(entity_root: &Path) -> Vec<BootstrapItem> {
 }
 
 /// Symlinks in `$HOME/.claude` left by the pre-PN-104 bootstrap that resolve
-/// into `entity_root`. Links into *other* entities are not ours to touch.
-pub(super) fn legacy_home_links(entity_root: &Path, home: &Path) -> Vec<PathBuf> {
-    let root = entity_root
+/// into `pulse_root`. Links into *other* pulses are not ours to touch.
+pub(super) fn legacy_home_links(pulse_root: &Path, home: &Path) -> Vec<PathBuf> {
+    let root = pulse_root
         .canonicalize()
-        .unwrap_or_else(|_| entity_root.to_path_buf());
+        .unwrap_or_else(|_| pulse_root.to_path_buf());
     ["ARCHIVE.md", "EPHEMERAL.md", "memories"]
         .iter()
         .map(|name| home.join(".claude").join(name))
@@ -418,7 +421,7 @@ pub(super) fn legacy_home_links(entity_root: &Path, home: &Path) -> Vec<PathBuf>
             } else {
                 link.parent().unwrap_or(Path::new("/")).join(target)
             };
-            // A dangling link cannot be shown to resolve inside the entity
+            // A dangling link cannot be shown to resolve inside the pulse
             // (`..` is not normalised lexically), so it is not ours to remove.
             let Ok(target) = target.canonicalize() else {
                 return false;
@@ -429,8 +432,8 @@ pub(super) fn legacy_home_links(entity_root: &Path, home: &Path) -> Vec<PathBuf>
 }
 
 /// recall-echo hook commands in the *user-level* `$HOME/.claude/settings.json`
-/// that carry no entity root. Under one entity per user they worked by
-/// accident of cwd; with several they fire for every entity and resolve to
+/// that carry no pulse root. Under one pulse per user they worked by
+/// accident of cwd; with several they fire for every pulse and resolve to
 /// the wrong one. Reported for the operator to remove — never edited here.
 pub(super) fn user_hooks_missing_root(home: &Path) -> Vec<String> {
     let path = home.join(".claude/settings.json");
@@ -454,7 +457,8 @@ pub(super) fn user_hooks_missing_root(home: &Path) -> Vec<String> {
                     if !ours {
                         continue;
                     }
-                    let carries_root = command.contains("--entity-root")
+                    let carries_root = command.contains("--pulse-root")
+                        || command.contains("--entity-root")
                         || (is_recall_command(command, "consume")
                             && command
                                 .split_whitespace()
@@ -488,7 +492,7 @@ mod tests {
         items
     }
 
-    fn entity() -> tempfile::TempDir {
+    fn pulse() -> tempfile::TempDir {
         let dir = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(dir.path().join("archives/conversations")).unwrap();
         std::fs::create_dir_all(dir.path().join("memory")).unwrap();
@@ -511,8 +515,8 @@ mod tests {
     }
 
     #[test]
-    fn ensure_fresh_entity_writes_all_items() {
-        let dir = entity();
+    fn ensure_fresh_pulse_writes_all_items() {
+        let dir = pulse();
         let root = dir.path().canonicalize().unwrap();
         let items = ensure_all(&root);
         assert!(
@@ -527,10 +531,10 @@ mod tests {
         assert_eq!(commands(&doc, "SessionStart").len(), 1);
         assert!(commands(&doc, "SessionStart")[0].ends_with(&format!("consume {quoted}")));
         assert!(commands(&doc, "PreCompact")[0].ends_with(&format!(
-            "checkpoint --trigger precompact --entity-root {quoted}"
+            "checkpoint --trigger precompact --pulse-root {quoted}"
         )));
         assert!(commands(&doc, "SessionEnd")[0]
-            .ends_with(&format!("archive-session --entity-root {quoted}")));
+            .ends_with(&format!("archive-session --pulse-root {quoted}")));
         assert_eq!(doc["hooks"]["SessionStart"][0]["matcher"], "startup|resume");
 
         assert!(root.join(".claude/rules/recall-echo.md").exists());
@@ -543,7 +547,7 @@ mod tests {
 
     #[test]
     fn ensure_is_idempotent() {
-        let dir = entity();
+        let dir = pulse();
         ensure_all(dir.path());
         let before = std::fs::read_to_string(dir.path().join(".claude/settings.json")).unwrap();
         let again = ensure_all(dir.path());
@@ -557,7 +561,7 @@ mod tests {
 
     #[test]
     fn merge_keeps_foreign_hooks_and_dedupes_ours() {
-        let dir = entity();
+        let dir = pulse();
         let root = dir.path().canonicalize().unwrap();
         std::fs::create_dir_all(root.join(".claude")).unwrap();
         std::fs::write(
@@ -592,12 +596,76 @@ mod tests {
         let end = commands(&doc, "SessionEnd");
         assert_eq!(end.len(), 2, "{end:?}");
         assert_eq!(end[0], "echo bye");
-        assert!(end[1].contains("--entity-root"));
+        assert!(end[1].contains("--pulse-root"));
         assert!(!end[1].contains("|| true"));
         let pre = commands(&doc, "PreCompact");
         assert_eq!(pre.len(), 1);
-        assert!(pre[0].contains("--entity-root"));
+        assert!(pre[0].contains("--pulse-root"));
         assert_eq!(commands(&doc, "SessionStart").len(), 1);
+    }
+
+    /// PN-115: hooks written by a pre-rename binary carry `--entity-root`.
+    /// `verify` reports them stale, `ensure` (what `repair` runs) rewrites
+    /// them to `--pulse-root` in place, and a second run changes nothing.
+    #[test]
+    fn repair_rewrites_legacy_entity_root_hooks() {
+        let dir = pulse();
+        let root = dir.path().canonicalize().unwrap();
+        let bin = find_recall_echo_bin();
+        let legacy = |cmd: &str| cmd.replace("--pulse-root", "--entity-root");
+        let ours = render_hooks(&bin, &root);
+        let mut old = ours.clone();
+        for (event, _) in RECALL_HOOKS {
+            let command = old[event][0]["hooks"][0]["command"]
+                .as_str()
+                .unwrap()
+                .to_string();
+            old[event][0]["hooks"][0]["command"] = legacy(&command).into();
+        }
+        std::fs::create_dir_all(root.join(".claude")).unwrap();
+        std::fs::write(
+            root.join(".claude/settings.json"),
+            serde_json::json!({ "hooks": old, "permissions": {"allow": []} }).to_string(),
+        )
+        .unwrap();
+        let before = read_settings(&root);
+        assert!(commands(&before, "SessionEnd")[0].contains("--entity-root"));
+
+        let stale = verify_all(&root);
+        let settings = stale
+            .iter()
+            .find(|i| i.path.ends_with("settings.json"))
+            .unwrap();
+        assert!(
+            matches!(settings.status, ItemStatus::Wrong(_)),
+            "{settings:?}"
+        );
+
+        let items = ensure_all(&root);
+        let settings = items
+            .iter()
+            .find(|i| i.path.ends_with("settings.json"))
+            .unwrap();
+        assert_eq!(settings.status, ItemStatus::Updated);
+        let doc = read_settings(&root);
+        let quoted = shell_quote(&root);
+        for (event, _) in RECALL_HOOKS {
+            let cmds = commands(&doc, event);
+            assert_eq!(cmds.len(), 1, "{event}: {cmds:?}");
+            assert!(!cmds[0].contains("--entity-root"), "{event}: {cmds:?}");
+        }
+        assert!(commands(&doc, "PreCompact")[0].ends_with(&format!(
+            "checkpoint --trigger precompact --pulse-root {quoted}"
+        )));
+        assert!(commands(&doc, "SessionEnd")[0]
+            .ends_with(&format!("archive-session --pulse-root {quoted}")));
+        assert!(doc["permissions"].is_object(), "foreign keys survive");
+
+        let again = ensure_all(&root);
+        assert!(
+            again.iter().all(|i| i.status == ItemStatus::Exists),
+            "{again:?}"
+        );
     }
 
     #[test]
@@ -610,10 +678,10 @@ mod tests {
     }
 
     #[test]
-    fn legacy_links_only_match_this_entity() {
-        let dir = entity();
+    fn legacy_links_only_match_this_pulse() {
+        let dir = pulse();
         let root = dir.path().canonicalize().unwrap();
-        let other = entity();
+        let other = pulse();
         let home = tempfile::tempdir().unwrap();
         let claude = home.path().join(".claude");
         std::fs::create_dir_all(&claude).unwrap();
@@ -638,7 +706,7 @@ mod tests {
         assert_eq!(for_other.len(), 1);
         assert!(for_other[0].ends_with("EPHEMERAL.md"));
 
-        // A dangling link cannot be shown to point inside the entity — even
+        // A dangling link cannot be shown to point inside the pulse — even
         // one whose lexical target escapes through `..` — so it is left alone.
         std::fs::remove_file(claude.join("ARCHIVE.md")).unwrap();
         std::os::unix::fs::symlink(root.join("../../etc/passwd"), claude.join("ARCHIVE.md"))
@@ -660,7 +728,8 @@ mod tests {
                 "PreCompact": [{"hooks": [{"type": "command", "command": "/usr/local/bin/recall-echo checkpoint --trigger precompact"}]}],
                 "SessionEnd": [{"hooks": [{"type": "command", "command": "/usr/local/bin/recall-echo archive-session || true"}]}],
                 "SessionStart": [{"hooks": [{"type": "command", "command": "/usr/local/bin/recall-echo consume '/srv/e'"}]}],
-                "Stop": [{"hooks": [{"type": "command", "command": "recall-echo checkpoint --trigger precompact --entity-root '/srv/e'"}]}]
+                "Stop": [{"hooks": [{"type": "command", "command": "recall-echo checkpoint --trigger precompact --pulse-root '/srv/e'"}]}],
+                "SubagentStop": [{"hooks": [{"type": "command", "command": "recall-echo checkpoint --trigger precompact --pulse-root '/srv/e'"}]}]
             }
         })
         .to_string();
@@ -708,7 +777,7 @@ mod tests {
 
     #[test]
     fn bootstrap_refuses_to_write_through_symlinks() {
-        let dir = entity();
+        let dir = pulse();
         let root = dir.path().canonicalize().unwrap();
         let elsewhere = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(root.join(".claude/rules")).unwrap();
@@ -767,7 +836,7 @@ mod tests {
 
     #[test]
     fn writes_never_follow_a_symlinked_parent_or_temp() {
-        let dir = entity();
+        let dir = pulse();
         let root = dir.path().canonicalize().unwrap();
         let elsewhere = tempfile::tempdir().unwrap();
         // `.claude` itself is a link out of the tree.
@@ -784,9 +853,9 @@ mod tests {
             .next()
             .is_none());
 
-        // A direct write whose parent resolves outside the entity is refused.
+        // A direct write whose parent resolves outside the pulse is refused.
         let err = write_regular_file(&elsewhere.path().join("x.json"), "{}", &root).unwrap_err();
-        assert!(err.contains("outside the entity"), "{err}");
+        assert!(err.contains("outside the pulse"), "{err}");
 
         // Temp files are O_EXCL: a planted name cannot be written through.
         std::fs::remove_file(root.join(".claude")).unwrap();
@@ -809,7 +878,7 @@ mod tests {
 
     #[test]
     fn verify_accepts_our_hook_in_any_position() {
-        let dir = entity();
+        let dir = pulse();
         let root = dir.path().canonicalize().unwrap();
         ensure_all(&root);
         // Move a foreign hook *after* ours in SessionEnd.

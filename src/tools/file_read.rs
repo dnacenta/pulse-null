@@ -2,14 +2,14 @@ use std::path::PathBuf;
 
 use super::{resolve_sandboxed_path, Tool, ToolError, ToolResult};
 
-/// Read a file from the entity's data directory.
+/// Read a file from the pulse's data directory.
 pub struct FileReadTool {
-    entity_root: PathBuf,
+    pulse_root: PathBuf,
 }
 
 impl FileReadTool {
-    pub fn new(entity_root: PathBuf) -> Self {
-        Self { entity_root }
+    pub fn new(pulse_root: PathBuf) -> Self {
+        Self { pulse_root }
     }
 }
 
@@ -19,7 +19,7 @@ impl Tool for FileReadTool {
     }
 
     fn description(&self) -> &str {
-        "Read a file from the entity's data directory"
+        "Read a file from the pulse's data directory"
     }
 
     fn input_schema(&self) -> serde_json::Value {
@@ -28,7 +28,7 @@ impl Tool for FileReadTool {
             "properties": {
                 "path": {
                     "type": "string",
-                    "description": "Path relative to the entity's data directory"
+                    "description": "Path relative to the pulse's data directory"
                 }
             },
             "required": ["path"]
@@ -36,13 +36,13 @@ impl Tool for FileReadTool {
     }
 
     fn execute(&self, input: serde_json::Value) -> ToolResult<'_> {
-        let entity_root = self.entity_root.clone();
+        let pulse_root = self.pulse_root.clone();
         Box::pin(async move {
             let path = input["path"].as_str().ok_or_else(|| {
                 ToolError::ExecutionFailed("Missing 'path' parameter".to_string())
             })?;
 
-            let resolved = resolve_sandboxed_path(&entity_root, path)?;
+            let resolved = resolve_sandboxed_path(&pulse_root, path)?;
 
             if !resolved.exists() {
                 return Err(ToolError::NotFound(format!("File not found: {}", path)));

@@ -3,7 +3,7 @@
 //! Everything a vendor's CLI does differently lives behind [`CliAdapter`]:
 //! how the user prompt and system prompt reach the process, the argv, how
 //! the reply and token usage come back, what a policy refusal looks like,
-//! which environment variables must be scrubbed, and how the entity
+//! which environment variables must be scrubbed, and how the pulse
 //! directory is wired for that CLI ([`AgentIntegration`]). The runner in
 //! [`super`] knows none of this — it stages files, spawns, feeds, waits,
 //! and hands bytes to the adapter.
@@ -114,12 +114,12 @@ pub struct Invocation<'a> {
     pub system_prompt: &'a str,
     /// The staged user prompt, when [`PromptDelivery::File`] is in use.
     pub prompt_file: Option<&'a Path>,
-    /// The entity is in isolation: deny tools that write, execute or leave
+    /// The pulse is in isolation: deny tools that write, execute or leave
     /// the machine.
     pub restricted: bool,
     /// Token-level streaming was requested.
     pub streaming: bool,
-    pub entity_root: &'a Path,
+    pub pulse_root: &'a Path,
     /// `[llm] reasoning_effort`, for CLIs that take one.
     pub reasoning_effort: Option<&'a str>,
 }
@@ -189,29 +189,37 @@ pub trait CliAdapter: Send + Sync {
     /// Classify a non-zero exit from its stdout and stderr.
     fn classify_exit(&self, stdout: &str, stderr: &str) -> ExitClass;
 
-    /// How this CLI's entity directory is wired (instruction file, hooks,
+    /// Classify the text of a streamed terminal record the CLI flagged as an
+    /// error. Flagged without a known refusal signature by default, so a
+    /// signature appearing in a later release is logged rather than
+    /// swallowed; adapters with a signature override this.
+    fn classify_terminal(&self, _text: &str) -> ExitClass {
+        ExitClass::FlaggedButUnmatched
+    }
+
+    /// How this CLI's pulse directory is wired (instruction file, hooks,
     /// rules) and what recall-echo should be told about it.
     fn integration(&self) -> &dyn AgentIntegration;
 }
 
-/// Entity-local wiring for one agent CLI.
+/// Pulse-local wiring for one agent CLI.
 pub trait AgentIntegration: Send + Sync {
     /// The value recall-echo's `[llm] provider` takes for this CLI.
     fn recall_echo_provider(&self) -> &'static str;
 
-    /// The instruction file this CLI reads from the entity directory
+    /// The instruction file this CLI reads from the pulse directory
     /// (its own convention, e.g. `AGENTS.md`).
     fn instruction_file(&self) -> &'static str;
 
-    /// Create or update this CLI's files inside the entity. Never touches
-    /// anything outside `entity_root`.
-    fn ensure(&self, entity_root: &Path, recall_bin: &str) -> Vec<BootstrapItem>;
+    /// Create or update this CLI's files inside the pulse. Never touches
+    /// anything outside `pulse_root`.
+    fn ensure(&self, pulse_root: &Path, recall_bin: &str) -> Vec<BootstrapItem>;
 
     /// Report the state of this CLI's files without changing anything.
-    fn verify(&self, entity_root: &Path) -> Vec<BootstrapItem>;
+    fn verify(&self, pulse_root: &Path) -> Vec<BootstrapItem>;
 
     /// Links in the user's home left by an older layout that resolve into
-    /// this entity — candidates for `repair` to retire.
+    /// this pulse — candidates for `repair` to retire.
     fn legacy_home_links(&self, _entity_root: &Path, _home: &Path) -> Vec<PathBuf> {
         Vec::new()
     }
@@ -221,15 +229,15 @@ pub trait AgentIntegration: Send + Sync {
         None
     }
 
-    /// Does this CLI resolve the `@AWARENESS.md` import in the entity's
+    /// Does this CLI resolve the `@AWARENESS.md` import in the pulse's
     /// instruction file itself? When false, the prompt builder inlines
     /// AWARENESS.md into the system prompt.
     fn imports_awareness(&self) -> bool {
         false
     }
 
-    /// User-level hook commands for this CLI that carry no entity root and
-    /// therefore fire for the wrong entity. Reported, never edited.
+    /// User-level hook commands for this CLI that carry no pulse root and
+    /// therefore fire for the wrong pulse. Reported, never edited.
     fn user_hooks_missing_root(&self, _home: &Path) -> Vec<String> {
         Vec::new()
     }

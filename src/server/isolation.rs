@@ -111,7 +111,7 @@ pub enum Intercept {
 
 /// Handle `/isolate` / `/resume` before anything else touches the turn —
 /// including the provider, which may itself be the suspect. Trusted senders
-/// only: a guest must not be able to flip the entity's operating posture.
+/// only: a guest must not be able to flip the pulse's operating posture.
 pub fn intercept_command(
     root_dir: &Path,
     message: &str,
@@ -126,7 +126,7 @@ pub fn intercept_command(
         return Intercept::None;
     }
 
-    // Owner only — not guests, not peers (a sibling entity must not be able
+    // Owner only — not guests, not peers (a sibling pulse must not be able
     // to /resume this one mid-diagnosis). The refusal conceals the posture.
     if resolved_key != "owner" {
         return Intercept::Handled {
