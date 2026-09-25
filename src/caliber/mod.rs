@@ -62,15 +62,19 @@ impl CaliberEcho {
     }
 
     fn health_check(&self) -> PluginHealth {
-        let caliber_path = self.docs_dir.join("CALIBER.md");
-        if !caliber_path.exists() {
-            return PluginHealth::Down("CALIBER.md not found".to_string());
-        }
-
         let dir = self.docs_dir.join("caliber");
         if !dir.exists() {
             return PluginHealth::Degraded(
                 "caliber/ directory missing — no outcome tracking yet".to_string(),
+            );
+        }
+
+        // CALIBER.md is written by the trajectory-mining task, so a pulse that
+        // tracks outcomes but has not mined yet is working, not down.
+        let caliber_path = self.docs_dir.join("CALIBER.md");
+        if !caliber_path.exists() {
+            return PluginHealth::Degraded(
+                "CALIBER.md not written yet — trajectory mining creates it".to_string(),
             );
         }
 
@@ -168,10 +172,20 @@ mod tests {
     use tempfile::TempDir;
 
     #[test]
-    fn health_down_when_no_caliber_md() {
+    fn health_degraded_when_nothing_exists() {
         let dir = TempDir::new().unwrap();
         let caliber = CaliberEcho::new(dir.path().to_path_buf());
-        assert!(matches!(caliber.health_check(), PluginHealth::Down(_)));
+        assert!(matches!(caliber.health_check(), PluginHealth::Degraded(_)));
+    }
+
+    #[test]
+    fn missing_caliber_md_with_outcome_tracking_is_degraded_not_down() {
+        // A pulse tracks outcomes before trajectory mining ever writes
+        // CALIBER.md; that is a working plugin, not a failed one.
+        let dir = TempDir::new().unwrap();
+        std::fs::create_dir(dir.path().join("caliber")).unwrap();
+        let caliber = CaliberEcho::new(dir.path().to_path_buf());
+        assert!(matches!(caliber.health_check(), PluginHealth::Degraded(_)));
     }
 
     #[test]
