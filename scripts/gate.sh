@@ -8,8 +8,9 @@
 #
 # Checks, in order (fail fast):
 #   1. cargo fmt --check        — formatting is canonical
-#   2. cargo clippy -D warnings — no warnings, all targets
-#   3. cargo test               — full test suite
+#   2. scripts/vendor-lint.sh   — no vendor names in generic code
+#   3. cargo clippy -D warnings — no warnings, all targets
+#   4. cargo test               — full test suite
 #
 # Usage: scripts/gate.sh
 # Exit codes: 0 = gate passed, non-zero = first failing check's code.
@@ -40,6 +41,7 @@ run() {
 }
 
 run "fmt"    cargo fmt --all -- --check
+run "vendor-lint" scripts/vendor-lint.sh
 run "clippy" cargo clippy --all-targets -- -D warnings
 run "test"   cargo test
 

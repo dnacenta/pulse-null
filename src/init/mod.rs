@@ -1,3 +1,3 @@
-pub mod claude_code_bootstrap;
+pub mod agent_bootstrap;
 pub mod templates;
 pub mod wizard;

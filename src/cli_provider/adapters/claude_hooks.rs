@@ -1,95 +1,25 @@
-//! Claude Code integration, scoped to one pulse.
-//!
-//! Everything Claude Code needs to run *as* a pulse lives inside that
-//! pulse's directory: `.claude/settings.json` (recall-echo hooks that carry
-//! the pulse root explicitly), `.claude/rules/recall-echo.md` (the memory
-//! protocol, pulse-relative), and `memory/.recall-echo.toml` (where
-//! recall-echo reads its config). The provider runs `claude` with the pulse
-//! as cwd, so Claude Code picks these up as project-scope configuration.
-//!
-//! Nothing here writes to `$HOME/.claude`. The previous design symlinked the
-//! user's `~/.claude/{ARCHIVE.md,EPHEMERAL.md,memories}` into one pulse,
-//! which made a second pulse under the same unix user impossible (PN-104).
-//! [`verify`] still *looks* at `$HOME/.claude`, but only to report leftovers
-//! from that design so `pulse-null repair` can retire them.
+//! Claude Code's pulse-local files: `.claude/settings.json` (recall-echo
+//! hooks that carry the pulse root explicitly), `.claude/rules/recall-echo.md`
+//! (the memory protocol, pulse-relative), and the leftovers of the
+//! pre-PN-104 user-level layout that `repair` retires. Claude Code reads
+//! these as project-scope configuration from its working directory —
+//! verified 2026-09-08 with a planted rule and a bare-directory control.
 
-use std::fmt;
 use std::path::{Path, PathBuf};
 
-#[derive(Debug)]
-pub struct BootstrapItem {
-    pub path: PathBuf,
-    #[allow(dead_code)]
-    pub kind: ItemKind,
-    pub status: ItemStatus,
-}
+use crate::init::agent_bootstrap::{
+    ensure_config, ensure_dir, find_recall_echo_bin, read_small_file, shell_quote,
+    write_regular_file, BootstrapItem, ItemKind, ItemStatus,
+};
 
-#[derive(Debug)]
-pub enum ItemKind {
-    Symlink,
-    Directory,
-    ConfigFile,
-}
-
-#[derive(Debug, PartialEq, Eq)]
-pub enum ItemStatus {
-    Created,
-    /// Existed with other content and was brought up to date (settings.json
-    /// merge, absolute → relative symlink).
-    Updated,
-    Exists,
-    Missing,
-    Wrong(String),
-    Skipped(String),
-}
-
-impl fmt::Display for BootstrapItem {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let icon = match &self.status {
-            ItemStatus::Created | ItemStatus::Updated => "\x1b[32m✓\x1b[0m",
-            ItemStatus::Exists => "\x1b[2m·\x1b[0m",
-            ItemStatus::Missing => "\x1b[33m✗\x1b[0m",
-            ItemStatus::Wrong(_) => "\x1b[33m✗\x1b[0m",
-            ItemStatus::Skipped(_) => "\x1b[33m⚠\x1b[0m",
-        };
-        let detail = match &self.status {
-            ItemStatus::Created => " created".to_string(),
-            ItemStatus::Updated => " updated".to_string(),
-            ItemStatus::Exists => " ok".to_string(),
-            ItemStatus::Missing => " missing".to_string(),
-            ItemStatus::Wrong(reason) => format!(" wrong: {reason}"),
-            ItemStatus::Skipped(reason) => format!(" skipped: {reason}"),
-        };
-        write!(
-            f,
-            "  {} {}{}",
-            icon,
-            printable(&self.path.display().to_string()),
-            printable(&detail)
-        )
-    }
-}
-
-/// Paths and reasons can come from files we did not write. Keep terminal
-/// control sequences and bidi overrides out of what we print about them.
-pub fn printable(s: &str) -> String {
-    s.chars()
-        .map(|c| {
-            if c.is_control()
-                || matches!(c, '\u{200B}'..='\u{200F}' | '\u{202A}'..='\u{202E}' | '\u{2066}'..='\u{2069}')
-            {
-                '\u{FFFD}'
-            } else {
-                c
-            }
-        })
-        .collect()
+fn home_dir() -> Option<PathBuf> {
+    std::env::var_os("HOME").map(PathBuf::from)
 }
 
 /// The three recall-echo hook subcommands, in the event order Claude Code
 /// fires them. `consume` takes the root positionally; the other two take
 /// `--pulse-root` — matching what `recall-echo init` itself writes. Hooks
-/// written before PN-115 spell it `--entity-root` (recall-echo ≥ 4.6.0 reads
+/// written before PN-115 spell it `--pulse-root` (recall-echo ≥ 4.6.0 reads
 /// both); `ensure` rewrites them to the canonical form like any other stale
 /// recall-echo hook.
 const RECALL_HOOKS: [(&str, &str); 3] = [
@@ -97,36 +27,6 @@ const RECALL_HOOKS: [(&str, &str); 3] = [
     ("PreCompact", "checkpoint"),
     ("SessionEnd", "archive-session"),
 ];
-
-/// Find the recall-echo binary path.
-pub fn find_recall_echo_bin() -> String {
-    find_recall_echo_bin_in(home_dir().as_deref())
-}
-
-fn find_recall_echo_bin_in(home: Option<&Path>) -> String {
-    let mut candidates = Vec::new();
-    if let Some(home) = home {
-        candidates.push(home.join(".cargo/bin/recall-echo"));
-    }
-    candidates.push(PathBuf::from("/usr/local/bin/recall-echo"));
-    for c in &candidates {
-        if c.is_file() {
-            return c.to_string_lossy().to_string();
-        }
-    }
-    "recall-echo".to_string()
-}
-
-fn home_dir() -> Option<PathBuf> {
-    std::env::var_os("HOME").map(PathBuf::from)
-}
-
-/// Single-quote a path for a `sh -c` hook command. The only character that
-/// needs care inside single quotes is the single quote itself.
-fn shell_quote(path: &Path) -> String {
-    let raw = path.to_string_lossy();
-    format!("'{}'", raw.replace('\'', "'\\''"))
-}
 
 /// The canonical hook command for one subcommand.
 fn hook_command(recall_bin: &str, sub: &str, root: &Path) -> String {
@@ -261,94 +161,6 @@ fn merge_hooks(mut existing: serde_json::Value, ours: &serde_json::Value) -> ser
     existing
 }
 
-/// Largest config file this module will read. These are hand-sized JSON
-/// documents; anything bigger is not one of ours.
-const MAX_CONFIG_BYTES: u64 = 1024 * 1024;
-
-/// Read a small regular file. `Ok(None)` when absent; an error names why a
-/// present path was refused (symlink, not a regular file, too large). The
-/// file is opened once with `O_NOFOLLOW` and inspected through the handle,
-/// so nothing can be swapped in between the check and the read.
-fn read_small_file(path: &Path) -> Result<Option<String>, String> {
-    use std::io::Read;
-    use std::os::unix::fs::OpenOptionsExt;
-    let file = match std::fs::OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_NOFOLLOW)
-        .open(path)
-    {
-        Ok(f) => f,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(e) if e.raw_os_error() == Some(libc::ELOOP) => {
-            return Err("is a symlink — refusing to follow it".into())
-        }
-        Err(e) => return Err(e.to_string()),
-    };
-    let meta = file.metadata().map_err(|e| e.to_string())?;
-    if !meta.is_file() {
-        return Err("not a regular file".into());
-    }
-    if meta.len() > MAX_CONFIG_BYTES {
-        return Err(format!("larger than {MAX_CONFIG_BYTES} bytes"));
-    }
-    let mut text = String::new();
-    file.take(MAX_CONFIG_BYTES)
-        .read_to_string(&mut text)
-        .map_err(|e| e.to_string())?;
-    Ok(Some(text))
-}
-
-/// Write `content` to `path` atomically, never through a symlink at any
-/// component: the parent must already exist and canonicalise inside
-/// `within`; the temp file is created `O_EXCL` with a random name and
-/// mode 0600 (or the mode of the file it replaces), fsynced, then renamed.
-fn write_regular_file(path: &Path, content: &str, within: &Path) -> Result<(), String> {
-    use std::io::Write;
-    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
-    let existing = match path.symlink_metadata() {
-        Ok(m) if m.file_type().is_symlink() => {
-            return Err("is a symlink — refusing to write through it".into());
-        }
-        Ok(m) => Some(m),
-        Err(_) => None,
-    };
-    let parent = path.parent().ok_or("no parent directory")?;
-    let parent_real = parent
-        .canonicalize()
-        .map_err(|e| format!("parent directory: {e}"))?;
-    if !parent_real.starts_with(within) {
-        return Err(format!(
-            "parent {} resolves outside the pulse ({})",
-            parent.display(),
-            parent_real.display()
-        ));
-    }
-    let name = path.file_name().ok_or("no file name")?.to_string_lossy();
-    let tmp = parent_real.join(format!(".{name}.tmp-{}", uuid::Uuid::new_v4().simple()));
-    let mode = existing
-        .map(|m| m.permissions().mode() & 0o777)
-        .unwrap_or(0o600);
-    let mut file = std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(mode)
-        .open(&tmp)
-        .map_err(|e| e.to_string())?;
-    let written = file
-        .write_all(content.as_bytes())
-        .and_then(|()| file.sync_all())
-        .map_err(|e| e.to_string());
-    drop(file);
-    if let Err(e) = written {
-        let _ = std::fs::remove_file(&tmp);
-        return Err(e);
-    }
-    std::fs::rename(&tmp, parent_real.join(&*name)).map_err(|e| {
-        let _ = std::fs::remove_file(&tmp);
-        e.to_string()
-    })
-}
-
 /// Does `existing` already carry our hooks — each event with exactly one
 /// recall-echo hook for its subcommand, in canonical form? Order among an
 /// event's entries does not matter; only `merge_hooks` normalises it.
@@ -401,135 +213,6 @@ fn ensure_settings(path: &Path, ours: &serde_json::Value, within: &Path) -> Boot
     }
 }
 
-/// Create a directory if it doesn't exist. A symlink where the directory
-/// should be is refused, not followed.
-fn ensure_dir(path: &Path) -> BootstrapItem {
-    if let Ok(meta) = path.symlink_metadata() {
-        let status = if meta.file_type().is_symlink() {
-            ItemStatus::Skipped("is a symlink — refusing to follow it".into())
-        } else if meta.is_dir() {
-            ItemStatus::Exists
-        } else {
-            ItemStatus::Skipped("regular file exists at path".into())
-        };
-        return BootstrapItem {
-            path: path.to_path_buf(),
-            kind: ItemKind::Directory,
-            status,
-        };
-    }
-    match std::fs::create_dir_all(path) {
-        Ok(()) => BootstrapItem {
-            path: path.to_path_buf(),
-            kind: ItemKind::Directory,
-            status: ItemStatus::Created,
-        },
-        Err(e) => BootstrapItem {
-            path: path.to_path_buf(),
-            kind: ItemKind::Directory,
-            status: ItemStatus::Skipped(e.to_string()),
-        },
-    }
-}
-
-/// Write a config file if it doesn't exist. Never overwrites: an existing
-/// file may carry hand-tuned settings (Echo's graph config lives in its
-/// `.recall-echo.toml`).
-fn ensure_config(path: &Path, content: &str, within: &Path) -> BootstrapItem {
-    let item = |status| BootstrapItem {
-        path: path.to_path_buf(),
-        kind: ItemKind::ConfigFile,
-        status,
-    };
-    if let Ok(meta) = path.symlink_metadata() {
-        return item(if meta.file_type().is_symlink() {
-            ItemStatus::Skipped("is a symlink — refusing to follow it".into())
-        } else {
-            ItemStatus::Exists
-        });
-    }
-    match write_regular_file(path, content, within) {
-        Ok(()) => item(ItemStatus::Created),
-        Err(e) => item(ItemStatus::Skipped(e)),
-    }
-}
-
-/// `memory/conversations -> ../archives/conversations`, relative so the
-/// pulse tree survives being moved. An absolute link to the same place is
-/// rewritten; anything else is left alone and reported.
-fn ensure_conversations_link(pulse_root: &Path) -> BootstrapItem {
-    let link = pulse_root.join("memory/conversations");
-    let target = pulse_root.join("archives/conversations");
-    let relative = PathBuf::from("../archives/conversations");
-    let item = |status| BootstrapItem {
-        path: link.clone(),
-        kind: ItemKind::Symlink,
-        status,
-    };
-    if !target.exists() {
-        return item(ItemStatus::Skipped(
-            "archives/conversations does not exist yet".into(),
-        ));
-    }
-    let mut replacing = false;
-    if link.symlink_metadata().is_ok() {
-        if !link.is_symlink() {
-            return item(ItemStatus::Skipped(
-                "regular file/dir exists at path".into(),
-            ));
-        }
-        match std::fs::read_link(&link) {
-            Ok(existing) if existing == relative => return item(ItemStatus::Exists),
-            Ok(_) => {
-                let same_place = link
-                    .canonicalize()
-                    .ok()
-                    .zip(target.canonicalize().ok())
-                    .is_some_and(|(a, b)| a == b);
-                if !same_place {
-                    return item(ItemStatus::Skipped(
-                        "points somewhere other than archives/conversations".into(),
-                    ));
-                }
-                if let Err(e) = std::fs::remove_file(&link) {
-                    return item(ItemStatus::Skipped(e.to_string()));
-                }
-                replacing = true;
-            }
-            Err(e) => return item(ItemStatus::Skipped(e.to_string())),
-        }
-    }
-    if let Some(parent) = link.parent() {
-        let _ = std::fs::create_dir_all(parent);
-    }
-    match std::os::unix::fs::symlink(&relative, &link) {
-        Ok(()) if replacing => item(ItemStatus::Updated),
-        Ok(()) => item(ItemStatus::Created),
-        Err(e) => item(ItemStatus::Skipped(e.to_string())),
-    }
-}
-
-/// Generate the recall-echo.toml config content.
-fn render_recall_echo_toml(pulse_root: &Path) -> String {
-    // A TOML string literal, escaped by the toml crate — a quote or newline
-    // in the path must not be able to open a new table.
-    let docs_dir = toml::Value::String(format!("{}/journal", pulse_root.display())).to_string();
-    format!(
-        r#"[ephemeral]
-max_entries = 5
-
-[llm]
-provider = "claude-code"
-model = ""
-api_base = ""
-
-[pipeline]
-docs_dir = {docs_dir}
-auto_sync = true
-"#
-    )
-}
-
 /// Generate the recall-echo.md rules file. Every path is relative to the
 /// pulse root, which is the cwd Claude Code runs in for this pulse.
 fn render_rules_md() -> &'static str {
@@ -542,7 +225,7 @@ All paths below are relative to your pulse directory, which is the working direc
 
 ### Layer 0 — Knowledge Graph (structured, semantic)
 - Embedded SurrealDB graph database with FastEmbed local embeddings.
-- Stores entities, relationships, and conversation episodes.
+- Stores pulses, relationships, and conversation episodes.
 - Bayesian confidence scoring on relationships — corroborated knowledge gains confidence over time.
 - Semantic search finds memories by meaning, not just keywords.
 - Queried via `recall-echo graph search`, `graph query`, or `graph traverse`.
@@ -594,9 +277,9 @@ current conversation.
 - `recall-echo archive-session` — Archive conversation from JSONL transcript (SessionEnd hook)
 - `recall-echo search <query>` — Search conversation archives
 - `recall-echo search <query> --ranked` — Ranked search with relevance scoring
-- `recall-echo graph search <query>` — Semantic search across graph entities
+- `recall-echo graph search <query>` — Semantic search across graph entitys
 - `recall-echo graph query <query>` — Hybrid search (semantic + graph expansion + episodes)
-- `recall-echo graph traverse <entity>` — Graph traversal with confidence display
+- `recall-echo graph traverse <pulse>` — Graph traversal with confidence display
 
 ## Rules
 
@@ -611,13 +294,13 @@ current conversation.
 /// Safe to run multiple times — skips anything already correct. A parent
 /// that is not a real directory (a symlink, say) stops everything under it:
 /// nothing is created through a component we did not verify.
-pub fn ensure(pulse_root: &Path) -> Vec<BootstrapItem> {
+pub(super) fn ensure_files(pulse_root: &Path, recall_bin: &str) -> Vec<BootstrapItem> {
     let pulse_root = pulse_root
         .canonicalize()
         .unwrap_or_else(|_| pulse_root.to_path_buf());
     if pulse_root.to_str().is_none() {
-        // A lossy conversion would persist a hook pointing at a path that
-        // does not exist. Say so instead.
+        // The hook commands embed the root; a lossy conversion would persist
+        // a hook pointing at a path that does not exist. Say so instead.
         return vec![BootstrapItem {
             path: pulse_root,
             kind: ItemKind::Directory,
@@ -625,11 +308,18 @@ pub fn ensure(pulse_root: &Path) -> Vec<BootstrapItem> {
         }];
     }
     let claude_dir = pulse_root.join(".claude");
-    let memory_dir = pulse_root.join("memory");
-    let recall_bin = find_recall_echo_bin();
     let ok = |item: &BootstrapItem| matches!(item.status, ItemStatus::Created | ItemStatus::Exists);
 
     let mut items = Vec::new();
+    // Claude Code reads CLAUDE.md; the pulse's instructions live in the
+    // generic INSTRUCTIONS.md, so CLAUDE.md is a one-line import of it.
+    // Pulses created before PN-106 already have a full CLAUDE.md, which
+    // `ensure_config` leaves alone.
+    items.push(ensure_config(
+        &pulse_root.join("CLAUDE.md"),
+        "@INSTRUCTIONS.md\n",
+        &pulse_root,
+    ));
     let claude = ensure_dir(&claude_dir);
     let claude_ok = ok(&claude);
     items.push(claude);
@@ -639,7 +329,7 @@ pub fn ensure(pulse_root: &Path) -> Vec<BootstrapItem> {
         items.push(rules);
         items.push(ensure_settings(
             &claude_dir.join("settings.json"),
-            &render_hooks(&recall_bin, &pulse_root),
+            &render_hooks(recall_bin, &pulse_root),
             &pulse_root,
         ));
         if rules_ok {
@@ -650,23 +340,12 @@ pub fn ensure(pulse_root: &Path) -> Vec<BootstrapItem> {
             ));
         }
     }
-    let memory = ensure_dir(&memory_dir);
-    let memory_ok = ok(&memory);
-    items.push(memory);
-    if memory_ok {
-        items.push(ensure_config(
-            &memory_dir.join(".recall-echo.toml"),
-            &render_recall_echo_toml(&pulse_root),
-            &pulse_root,
-        ));
-        items.push(ensure_conversations_link(&pulse_root));
-    }
     items
 }
 
 /// Verify Claude Code integration without creating anything. Also reports
 /// leftovers of the pre-PN-104 user-level layout that point at this pulse.
-pub fn verify(pulse_root: &Path) -> Vec<BootstrapItem> {
+pub(super) fn verify_files(pulse_root: &Path) -> Vec<BootstrapItem> {
     let pulse_root = pulse_root
         .canonicalize()
         .unwrap_or_else(|_| pulse_root.to_path_buf());
@@ -697,41 +376,16 @@ pub fn verify(pulse_root: &Path) -> Vec<BootstrapItem> {
         status,
     });
 
-    for path in [
-        claude_dir.join("rules/recall-echo.md"),
-        pulse_root.join("memory/.recall-echo.toml"),
-    ] {
-        let status = if path.exists() {
+    let rules = claude_dir.join("rules/recall-echo.md");
+    items.push(BootstrapItem {
+        status: if rules.exists() {
             ItemStatus::Exists
         } else {
             ItemStatus::Missing
-        };
-        items.push(BootstrapItem {
-            path,
-            kind: ItemKind::ConfigFile,
-            status,
-        });
-    }
-
-    let link = pulse_root.join("memory/conversations");
-    let status = if link.is_symlink() {
-        ItemStatus::Exists
-    } else {
-        ItemStatus::Missing
-    };
-    items.push(BootstrapItem {
-        path: link,
-        kind: ItemKind::Symlink,
-        status,
+        },
+        path: rules,
+        kind: ItemKind::ConfigFile,
     });
-
-    if recall_bin == "recall-echo" {
-        items.push(BootstrapItem {
-            path: PathBuf::from("recall-echo"),
-            kind: ItemKind::ConfigFile,
-            status: ItemStatus::Missing,
-        });
-    }
 
     if let Some(home) = home_dir() {
         for link in legacy_home_links(&pulse_root, &home) {
@@ -750,7 +404,7 @@ pub fn verify(pulse_root: &Path) -> Vec<BootstrapItem> {
 
 /// Symlinks in `$HOME/.claude` left by the pre-PN-104 bootstrap that resolve
 /// into `pulse_root`. Links into *other* pulses are not ours to touch.
-pub fn legacy_home_links(pulse_root: &Path, home: &Path) -> Vec<PathBuf> {
+pub(super) fn legacy_home_links(pulse_root: &Path, home: &Path) -> Vec<PathBuf> {
     let root = pulse_root
         .canonicalize()
         .unwrap_or_else(|_| pulse_root.to_path_buf());
@@ -781,7 +435,7 @@ pub fn legacy_home_links(pulse_root: &Path, home: &Path) -> Vec<PathBuf> {
 /// that carry no pulse root. Under one pulse per user they worked by
 /// accident of cwd; with several they fire for every pulse and resolve to
 /// the wrong one. Reported for the operator to remove — never edited here.
-pub fn user_hooks_missing_root(home: &Path) -> Vec<String> {
+pub(super) fn user_hooks_missing_root(home: &Path) -> Vec<String> {
     let path = home.join(".claude/settings.json");
     let Ok(Some(text)) = read_small_file(&path) else {
         return Vec::new();
@@ -824,6 +478,19 @@ pub fn user_hooks_missing_root(home: &Path) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::init::agent_bootstrap::{ensure_common, verify_common, write_regular_file};
+
+    fn ensure_all(root: &Path) -> Vec<BootstrapItem> {
+        let mut items = ensure_common(root, "claude-code");
+        items.extend(ensure_files(root, &find_recall_echo_bin()));
+        items
+    }
+
+    fn verify_all(root: &Path) -> Vec<BootstrapItem> {
+        let mut items = verify_common(root, "claude-code");
+        items.extend(verify_files(root));
+        items
+    }
 
     fn pulse() -> tempfile::TempDir {
         let dir = tempfile::tempdir().unwrap();
@@ -851,7 +518,7 @@ mod tests {
     fn ensure_fresh_pulse_writes_all_items() {
         let dir = pulse();
         let root = dir.path().canonicalize().unwrap();
-        let items = ensure(&root);
+        let items = ensure_all(&root);
         assert!(
             items
                 .iter()
@@ -881,9 +548,9 @@ mod tests {
     #[test]
     fn ensure_is_idempotent() {
         let dir = pulse();
-        ensure(dir.path());
+        ensure_all(dir.path());
         let before = std::fs::read_to_string(dir.path().join(".claude/settings.json")).unwrap();
-        let again = ensure(dir.path());
+        let again = ensure_all(dir.path());
         assert!(
             again.iter().all(|i| i.status == ItemStatus::Exists),
             "{again:?}"
@@ -916,7 +583,7 @@ mod tests {
         )
         .unwrap();
 
-        let items = ensure(&root);
+        let items = ensure_all(&root);
         let settings = items
             .iter()
             .find(|i| i.path.ends_with("settings.json"))
@@ -964,7 +631,7 @@ mod tests {
         let before = read_settings(&root);
         assert!(commands(&before, "SessionEnd")[0].contains("--entity-root"));
 
-        let stale = verify(&root);
+        let stale = verify_all(&root);
         let settings = stale
             .iter()
             .find(|i| i.path.ends_with("settings.json"))
@@ -974,7 +641,7 @@ mod tests {
             "{settings:?}"
         );
 
-        let items = ensure(&root);
+        let items = ensure_all(&root);
         let settings = items
             .iter()
             .find(|i| i.path.ends_with("settings.json"))
@@ -994,7 +661,7 @@ mod tests {
             .ends_with(&format!("archive-session --pulse-root {quoted}")));
         assert!(doc["permissions"].is_object(), "foreign keys survive");
 
-        let again = ensure(&root);
+        let again = ensure_all(&root);
         assert!(
             again.iter().all(|i| i.status == ItemStatus::Exists),
             "{again:?}"
@@ -1008,51 +675,6 @@ mod tests {
         assert!(!rules.contains("@~"));
         assert!(rules.contains("memory/MEMORY.md"));
         assert!(rules.contains("archives/conversations/"));
-    }
-
-    #[test]
-    fn existing_recall_toml_untouched() {
-        let dir = pulse();
-        let toml = dir.path().join("memory/.recall-echo.toml");
-        std::fs::write(&toml, "[graph]\nmode = \"server\"\n").unwrap();
-        ensure(dir.path());
-        assert_eq!(
-            std::fs::read_to_string(&toml).unwrap(),
-            "[graph]\nmode = \"server\"\n"
-        );
-    }
-
-    #[test]
-    fn conversations_link_is_relative() {
-        let dir = pulse();
-        let root = dir.path().canonicalize().unwrap();
-        // An absolute link to the right place gets rewritten as relative.
-        std::os::unix::fs::symlink(
-            root.join("archives/conversations"),
-            root.join("memory/conversations"),
-        )
-        .unwrap();
-        let items = ensure(&root);
-        let link = items
-            .iter()
-            .find(|i| i.path.ends_with("memory/conversations"))
-            .unwrap();
-        assert_eq!(link.status, ItemStatus::Updated);
-        assert_eq!(
-            std::fs::read_link(root.join("memory/conversations")).unwrap(),
-            PathBuf::from("../archives/conversations")
-        );
-
-        // A link somewhere else is left alone.
-        let other = tempfile::tempdir().unwrap();
-        std::fs::remove_file(root.join("memory/conversations")).unwrap();
-        std::os::unix::fs::symlink(other.path(), root.join("memory/conversations")).unwrap();
-        let items = ensure(&root);
-        let link = items
-            .iter()
-            .find(|i| i.path.ends_with("memory/conversations"))
-            .unwrap();
-        assert!(matches!(link.status, ItemStatus::Skipped(_)));
     }
 
     #[test]
@@ -1106,7 +728,7 @@ mod tests {
                 "PreCompact": [{"hooks": [{"type": "command", "command": "/usr/local/bin/recall-echo checkpoint --trigger precompact"}]}],
                 "SessionEnd": [{"hooks": [{"type": "command", "command": "/usr/local/bin/recall-echo archive-session || true"}]}],
                 "SessionStart": [{"hooks": [{"type": "command", "command": "/usr/local/bin/recall-echo consume '/srv/e'"}]}],
-                "Stop": [{"hooks": [{"type": "command", "command": "recall-echo checkpoint --trigger precompact --entity-root '/srv/e'"}]}],
+                "Stop": [{"hooks": [{"type": "command", "command": "recall-echo checkpoint --trigger precompact --pulse-root '/srv/e'"}]}],
                 "SubagentStop": [{"hooks": [{"type": "command", "command": "recall-echo checkpoint --trigger precompact --pulse-root '/srv/e'"}]}]
             }
         })
@@ -1176,7 +798,7 @@ mod tests {
         )
         .unwrap();
 
-        let items = ensure(&root);
+        let items = ensure_all(&root);
         for name in ["settings.json", "recall-echo.md", ".recall-echo.toml"] {
             let item = items.iter().find(|i| i.path.ends_with(name)).unwrap();
             assert!(
@@ -1192,21 +814,6 @@ mod tests {
                 .is_none(),
             "nothing written through the links"
         );
-    }
-
-    #[test]
-    fn recall_toml_escapes_the_path() {
-        let toml_text =
-            render_recall_echo_toml(Path::new("/srv/evil\"\n[llm]\napi_base = \"http://x"));
-        let parsed: toml::Value = toml::from_str(&toml_text).expect("still one document");
-        assert!(parsed
-            .get("llm")
-            .and_then(|l| l.get("api_base"))
-            .is_some_and(|v| v.as_str() == Some("")));
-        assert!(parsed["pipeline"]["docs_dir"]
-            .as_str()
-            .unwrap()
-            .starts_with("/srv/evil\""));
     }
 
     #[test]
@@ -1234,7 +841,7 @@ mod tests {
         let elsewhere = tempfile::tempdir().unwrap();
         // `.claude` itself is a link out of the tree.
         std::os::unix::fs::symlink(elsewhere.path(), root.join(".claude")).unwrap();
-        let items = ensure(&root);
+        let items = ensure_all(&root);
         let claude = items.iter().find(|i| i.path.ends_with(".claude")).unwrap();
         assert!(matches!(claude.status, ItemStatus::Skipped(_)));
         assert!(
@@ -1273,7 +880,7 @@ mod tests {
     fn verify_accepts_our_hook_in_any_position() {
         let dir = pulse();
         let root = dir.path().canonicalize().unwrap();
-        ensure(&root);
+        ensure_all(&root);
         // Move a foreign hook *after* ours in SessionEnd.
         let path = root.join(".claude/settings.json");
         let mut doc: serde_json::Value =
@@ -1283,7 +890,7 @@ mod tests {
             .unwrap()
             .push(serde_json::json!({"hooks": [{"type": "command", "command": "echo bye"}]}));
         std::fs::write(&path, doc.to_string()).unwrap();
-        let settings = verify(&root)
+        let settings = verify_all(&root)
             .into_iter()
             .find(|i| i.path.ends_with("settings.json"))
             .unwrap();
@@ -1307,17 +914,5 @@ mod tests {
             user_hooks_missing_root(home.path()),
             vec!["recall-echo consume || true".to_string()]
         );
-    }
-
-    #[test]
-    fn printable_scrubs_control_and_bidi_but_keeps_unicode() {
-        assert_eq!(printable("a\u{1b}[2Kb\u{202E}c"), "a\u{FFFD}[2Kb\u{FFFD}c");
-        assert_eq!(printable("café 日本 🦀"), "café 日本 🦀");
-    }
-
-    #[test]
-    fn shell_quote_escapes_single_quotes() {
-        assert_eq!(shell_quote(Path::new("/a/b c")), "'/a/b c'");
-        assert_eq!(shell_quote(Path::new("/a/it's")), "'/a/it'\\''s'");
     }
 }

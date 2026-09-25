@@ -7,7 +7,10 @@ use tokio_stream::StreamExt;
 use crate::session::strip_system_prefixes;
 use crate::streaming::{self, StreamEvent, StreamResult, StreamingProvider};
 
-pub struct ClaudeProvider {
+/// The model the wizard suggests for the Anthropic API.
+pub const DEFAULT_MODEL: &str = "claude-sonnet-4-20250514";
+
+pub struct AnthropicProvider {
     api_key: String,
     model: String,
     client: reqwest::Client,
@@ -16,7 +19,7 @@ pub struct ClaudeProvider {
 /// Default timeout for Claude API requests (2 minutes).
 const API_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
 
-impl ClaudeProvider {
+impl AnthropicProvider {
     pub fn new(api_key: String, model: String) -> Self {
         let client = reqwest::Client::builder()
             .timeout(API_TIMEOUT)
@@ -85,7 +88,7 @@ impl ClaudeProvider {
     }
 }
 
-impl LmProvider for ClaudeProvider {
+impl LmProvider for AnthropicProvider {
     fn invoke(
         &self,
         system_prompt: &str,
@@ -163,7 +166,7 @@ impl LmProvider for ClaudeProvider {
     }
 
     fn name(&self) -> &str {
-        "claude"
+        "anthropic"
     }
 
     fn supports_tools(&self) -> bool {
@@ -171,7 +174,7 @@ impl LmProvider for ClaudeProvider {
     }
 }
 
-impl StreamingProvider for ClaudeProvider {
+impl StreamingProvider for AnthropicProvider {
     fn supports_streaming(&self) -> bool {
         true
     }

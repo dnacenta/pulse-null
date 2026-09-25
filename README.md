@@ -184,15 +184,25 @@ The init wizard walks you through naming your pulse, defining its personality, c
 
 ### LLM Providers
 
-pulse-null is not tied to Claude, and there is no baked-in default: **you choose the pulse's brain in the init wizard**. The wizard preselects `claude-code` — the subscription-CLI route — but all three are one keystroke away:
+pulse-null is not tied to any vendor, and there is no baked-in default: **you choose the pulse's brain in the init wizard**.
 
 | Provider | Description |
 |----------|-------------|
-| `claude-code` | Drives an agent CLI as a subprocess — no API key, uses the CLI's own auth |
-| `claude` | Anthropic Claude API — per-token billing, needs an API key |
+| `cli` | Drives an installed agent CLI as a subprocess through an adapter — no API key, uses the CLI's own login |
+| `anthropic` | Anthropic HTTP API — per-token billing, needs an API key |
 | `ollama` | Local inference via Ollama — fully offline |
 
-The `claude-code` provider spawns any binary that speaks the Claude Code CLI's flag convention (`-p`, `--model`, `--output-format text`), set via `llm.claude_bin`. That means it also drives other vendors' CLIs — for example xAI's Grok Build CLI behind a thin argument-translating shim — so a pulse can run on a Claude, Grok, or other subscription instead of per-token API billing. Providers are pluggable via a factory pattern — adding a first-class one means implementing a single trait.
+The `cli` provider is generic. Everything a particular CLI does differently — its flags, how the prompt and system prompt reach it, its output format, what a policy refusal looks like, which files it reads from the pulse directory — lives in that CLI's adapter under `src/cli_provider/adapters/`. Three ship today:
+
+| `adapter` | CLI | Instruction file | Hooks |
+|-----------|-----|------------------|-------|
+| `claude` | Claude Code | `CLAUDE.md` (imports `INSTRUCTIONS.md`) | recall-echo hooks in `.claude/settings.json` |
+| `grok` | Grok Build | `AGENTS.md` | none — recall-echo's session sweep captures grok sessions |
+| `codex` | Codex CLI | `AGENTS.md` | none — same, via the sweep |
+
+The adapter you pick is written into the pulse's `memory/.recall-echo.toml` as recall-echo's `[llm] provider` and `[capture] sources`, so the CLI that does the pulse's thinking is the one recall-echo extracts with and captures from. Adding a CLI means implementing one trait; nothing outside its adapter file may name it — `scripts/gate.sh` lints for that.
+
+Pre-PN-106 configs keep working: `provider = "claude-code"` loads as `cli` + `adapter = "claude"`, `claude_bin` as `cli_bin`, and `provider = "claude"` as `anthropic`, each with a one-line deprecation warning at load.
 
 ## Pulse Structure
 
@@ -261,11 +271,11 @@ Running each pulse from its own directory is what production wants: one systemd 
 
 `pulse-null up` from anywhere opens the terminal UI's Home page, which lists every pulse you own with its state and starts one only when you pick it. `pulse-null up --headless` from the install root boots every pulse in one process; each binds the host and port from its own `pulse-null.toml`, and if that port is already taken it falls back to the next free port from 3200 upward and says so in the log. Pulses kept in a `pulses/` subdirectory (or the older `entities/`) are recognized too.
 
-When the provider is `claude-code`, the pulse runs `claude` from inside its own directory with `RECALL_ECHO_HOME` pointing at it, so Claude Code picks up the pulse's `CLAUDE.md`, hooks and rules, and recall-echo reads and writes that pulse's memory. `pulse-null repair` re-creates any of those files, rewrites recall-echo hooks written by older versions (`--entity-root` becomes `--pulse-root`; recall-echo 4.6.0 or later is required), and retires leftover `~/.claude` symlinks from older installs.
+When the provider is `cli`, the pulse runs its agent CLI from inside its own directory with `RECALL_ECHO_HOME` pointing at it, so the CLI picks up the pulse's instruction file, hooks and rules, and recall-echo reads and writes that pulse's memory. `pulse-null repair` re-creates any of those files for the pulse's adapter, rewrites recall-echo hooks written by older versions (`--entity-root` becomes `--pulse-root`; recall-echo 4.6.0 or later is required), and retires leftover user-level symlinks from older installs.
 
-Pulses under one unix user share that user's rights: each runs `claude` with permission prompts disabled and can read and write its siblings' directories. They do not collide, but they are not isolated from each other. Where isolation matters, give each pulse its own unix user.
+Pulses under one unix user share that user's rights: each runs its agent CLI with permission prompts disabled and can read and write its siblings' directories. They do not collide, but they are not isolated from each other. Where isolation matters, give each pulse its own unix user.
 
-**Do not run `init` or `up` as root.** Files would end up root-owned, and Claude Code refuses `--dangerously-skip-permissions` under root, so a claude-code pulse could never reach its provider. Both commands refuse and explain; `PULSE_NULL_ALLOW_ROOT=1` overrides for CI.
+**Do not run `init` or `up` as root.** Files would end up root-owned, and agent CLIs refuse to skip permission prompts under root, so a `cli` pulse could never reach its provider. Both commands refuse and explain; `PULSE_NULL_ALLOW_ROOT=1` overrides for CI.
 
 ## Configuration
 
@@ -278,12 +288,14 @@ Pulses under one unix user share that user's rights: each runs `claude` with per
 | `pulse` | `owner_alias` | — | How the pulse addresses you |
 | `server` | `host` | `127.0.0.1` | Bind address |
 | `server` | `port` | `3100` | Bind port |
-| `llm` | `provider` | set at init | LLM backend (`claude`, `claude-code`, `ollama`) — chosen in the wizard; a config missing the key falls back to `claude` |
-| `llm` | `api_key` | — | API key (or use env var; not needed for `claude-code`/`ollama`) |
+| `llm` | `provider` | set at init | LLM backend (`cli`, `anthropic`, `ollama`) — chosen in the wizard; a config missing the key falls back to `anthropic` |
+| `llm` | `adapter` | set at init | Which agent CLI drives the `cli` provider (`claude`, `grok`, `codex`) |
+| `llm` | `api_key` | — | API key (or use env var; not needed for `cli`/`ollama`) |
 | `llm` | `model` | set at init | Model name, passed through to the provider — the wizard suggests a per-provider default |
 | `llm` | `max_tokens` | `4096` | Max response tokens |
 | `llm` | `base_url` | `http://localhost:11434` | API base URL (used by `ollama`) |
-| `llm` | `claude_bin` | `claude` | CLI binary for `claude-code` — any Claude-CLI-compatible binary or shim |
+| `llm` | `cli_bin` | the adapter's binary | Path to the agent CLI binary for the `cli` provider; when unset, `PULSE_CLI_BIN` fills in before the adapter's default |
+| `llm` | `reasoning_effort` | `low` | Reasoning-effort hint for CLIs that take one |
 | `llm` | `context_budget` | `150000` | Estimated-token ceiling before conversation compaction |
 | `llm` | `fallback_model` | — | Model retried on a usage-policy refusal (empty disables) |
 | `llm` | `fallback_on_refusal` | `true` | Master switch for the refusal fallback |
