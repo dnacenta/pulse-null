@@ -681,6 +681,15 @@ pub struct GraphConfig {
     pub context_injection: bool,
     /// Maximum tokens for graph context block
     pub context_max_tokens: usize,
+    /// Extract entities and relationships from each archive right after it
+    /// is ingested, in the background, one archive at a time. Uses the
+    /// provider `memory/.recall-echo.toml` configures, spawned with this
+    /// pulse's allowlisted CLI environment.
+    pub extract: bool,
+    /// Tokens extraction may spend per UTC day; 0 means no cap. Checked
+    /// before each archive, so a day can overrun by at most one archive.
+    /// Spend is recorded in `<pulse>/graph_extraction.json`.
+    pub extract_daily_token_budget: u64,
 }
 
 impl Default for GraphConfig {
@@ -693,6 +702,8 @@ impl Default for GraphConfig {
             data_dir: None,
             context_injection: true,
             context_max_tokens: 500,
+            extract: true,
+            extract_daily_token_budget: 2_000_000,
         }
     }
 }

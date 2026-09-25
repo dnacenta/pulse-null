@@ -12,6 +12,7 @@ mod discovery;
 mod errors;
 mod events;
 mod graph_context;
+mod graph_extract;
 mod graph_feedback;
 mod init;
 mod intake_audit;

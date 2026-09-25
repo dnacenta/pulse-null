@@ -163,7 +163,11 @@ const BASE_ENV: &[&str] = &[
 ];
 
 /// Does the daemon environment variable `key` pass to a child of `adapter`?
-fn env_allowed(key: &str, adapter: &dyn CliAdapter) -> bool {
+/// With no adapter — a CLI no adapter describes — only the base list does.
+fn env_allowed(key: &str, adapter: Option<&dyn CliAdapter>) -> bool {
+    let Some(adapter) = adapter else {
+        return BASE_ENV.contains(&key) || key == RECALL_ECHO_HOME;
+    };
     if adapter.env_remove().contains(&key) {
         return false;
     }
@@ -175,26 +179,43 @@ fn env_allowed(key: &str, adapter: &dyn CliAdapter) -> bool {
             .any(|prefix| key.starts_with(prefix))
 }
 
+/// The complete environment a CLI child of this pulse runs with: the
+/// allowlisted part of the daemon's environment, `RECALL_ECHO_HOME` pointing
+/// at the pulse root, and whatever the adapter sets — in that order, so a
+/// later entry wins. Every process pulse-null spawns for an agent CLI gets
+/// exactly this, whether it answers a chat turn or extracts an archive.
+pub fn child_env(
+    pulse_root: &Path,
+    adapter: Option<&dyn CliAdapter>,
+) -> Vec<(std::ffi::OsString, std::ffi::OsString)> {
+    let mut env: Vec<(std::ffi::OsString, std::ffi::OsString)> = std::env::vars_os()
+        .filter(|(key, _)| key.to_str().is_some_and(|k| env_allowed(k, adapter)))
+        .filter(|(key, _)| key != RECALL_ECHO_HOME)
+        .collect();
+    env.push((RECALL_ECHO_HOME.into(), pulse_root.as_os_str().to_owned()));
+    if let Some(adapter) = adapter {
+        env.extend(
+            adapter
+                .env_set()
+                .into_iter()
+                .map(|(key, value)| (key.into(), value.into())),
+        );
+    }
+    env
+}
+
 /// A command for `bin` anchored to `pulse_root`: cwd and `RECALL_ECHO_HOME`
-/// point at the pulse root, and the child sees only the allowlisted
-/// environment plus what the adapter sets. Free function so the spawn shape
-/// can be tested without spawning.
+/// point at the pulse root, and the child sees only [`child_env`]. Free
+/// function so the spawn shape can be tested without spawning.
 fn pulse_command(
     bin: &str,
     pulse_root: &Path,
     adapter: &dyn CliAdapter,
 ) -> tokio::process::Command {
     let mut cmd = tokio::process::Command::new(bin);
-    cmd.current_dir(pulse_root).env_clear();
-    for (key, value) in std::env::vars_os() {
-        if key.to_str().is_some_and(|k| env_allowed(k, adapter)) {
-            cmd.env(key, value);
-        }
-    }
-    cmd.env(RECALL_ECHO_HOME, pulse_root);
-    for (key, value) in adapter.env_set() {
-        cmd.env(key, value);
-    }
+    cmd.current_dir(pulse_root)
+        .env_clear()
+        .envs(child_env(pulse_root, Some(adapter)));
     cmd
 }
 

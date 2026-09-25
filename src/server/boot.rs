@@ -110,6 +110,7 @@ pub async fn boot_pulse(
         ledger: Arc::new(crate::ledger::LedgerRing::new(
             crate::ledger::DEFAULT_RING_CAPACITY,
         )),
+        graph_extractor: crate::graph_extract::GraphExtractor::for_pulse(&config, &root_dir),
     });
 
     // Pipeline health check

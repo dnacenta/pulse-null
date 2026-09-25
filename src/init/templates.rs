@@ -142,6 +142,10 @@ cognitive_decline = true
 enabled = true
 auto_ingest = true
 pipeline_sync = true
+# Extract entities/relationships from each new archive in the background.
+extract = true
+# Token cap for that extraction per UTC day (0 = no cap).
+extract_daily_token_budget = 2000000
 
 {plugins_section}
 "#,
