@@ -80,7 +80,7 @@ libc = "0.2"
 pulse-system-types = "0.7"
 
 # Core dependencies (always included — these define a pulse)
-recall-echo = { git = "https://github.com/dnacenta/recall-echo.git", branch = "main", default-features = false, features = ["pulse-null", "server"] }
+recall-echo = { git = "https://github.com/dnacenta/recall-echo.git", branch = "main", default-features = false, features = ["pulse-null", "server", "llm"] }
 
 # SurrealDB (for server provisioning — per-pulse DB/user creation)
 surrealdb = { version = "3", default-features = false, features = ["protocol-ws"] }

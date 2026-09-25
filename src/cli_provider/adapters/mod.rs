@@ -31,6 +31,15 @@ pub fn for_config(provider: &str, adapter: Option<&str>) -> Option<Box<dyn CliAd
     }
 }
 
+/// The adapter whose CLI recall-echo names `provider` in its own `[llm]`
+/// section — the reverse of `AgentIntegration::recall_echo_provider`.
+pub fn by_recall_echo_provider(provider: &str) -> Option<Box<dyn CliAdapter>> {
+    REGISTRY
+        .iter()
+        .map(|(_, build)| build())
+        .find(|adapter| adapter.integration().recall_echo_provider() == provider)
+}
+
 /// Look an adapter up by its `[llm] adapter` value.
 pub fn by_name(name: &str) -> Option<Box<dyn CliAdapter>> {
     REGISTRY

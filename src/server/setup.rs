@@ -252,7 +252,7 @@ pub fn spawn_session_cleanup(config: &Config, state: &Arc<super::AppState>) {
                                 crate::session::graph_ingest_archive(
                                     &state_for_graph.root_dir,
                                     path,
-                                    Some(state_for_graph.provider.as_ref()),
+                                    state_for_graph.graph_extractor.as_ref(),
                                 )
                                 .await;
                             }

@@ -66,6 +66,9 @@ pub struct AppState {
     /// Cap on in-flight `/api/chat/stream` turns. Separate from the event
     /// pool so idle watchers can never refuse a message.
     pub chat_permits: Arc<tokio::sync::Semaphore>,
+    /// Background entity extraction for freshly ingested archives; `None`
+    /// when `[graph]` turns it off.
+    pub graph_extractor: Option<crate::graph_extract::GraphExtractor>,
 }
 
 /// Concurrent `/api/events` connections before a 503.
@@ -338,6 +341,7 @@ pub async fn start_in(
         event_permits: crate::server::stream_pools().0,
         chat_permits: crate::server::stream_pools().1,
         ledger,
+        graph_extractor: crate::graph_extract::GraphExtractor::for_pulse(&config, &root_dir),
     });
 
     // Startup pipeline health check
@@ -522,13 +526,11 @@ pub async fn start_in(
                 }
             };
             rt.block_on(async {
+                // No extraction on the way out: the process is exiting and
+                // would kill it mid-archive. These stay pending for later.
                 for path in &archived_paths {
-                    crate::session::graph_ingest_archive(
-                        &state_for_graph.root_dir,
-                        path,
-                        Some(state_for_graph.provider.as_ref()),
-                    )
-                    .await;
+                    crate::session::graph_ingest_archive(&state_for_graph.root_dir, path, None)
+                        .await;
                 }
             });
         })

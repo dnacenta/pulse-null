@@ -399,18 +399,18 @@ pub fn archive_comms_conversation(
 
 /// Ingest an archived conversation into the knowledge graph (async, non-blocking).
 ///
-/// Reads the archive file and calls recall-echo's graph bridge.
-/// Uses spawn_blocking + dedicated runtime since SurrealDB types aren't Send.
-/// Logs on failure but never panics or returns errors to the caller.
+/// Reads the archive file and writes its episodes. Uses spawn_blocking +
+/// dedicated runtime since SurrealDB types aren't Send. Logs on failure but
+/// never panics or returns errors to the caller.
 ///
-/// Note: the LLM provider parameter is dropped in the spawn_blocking path
-/// because `dyn LmProvider` can't cross the thread boundary. Graph ingestion
-/// still works (episode-level only, no entity extraction). Full entity
-/// extraction requires the LLM HTTP provider path in recall-echo.
+/// Ingest writes episodes only. When an `extractor` is given and the archive
+/// was ingested, it is queued for entity/relationship extraction, which runs
+/// in the background under the extractor's budget — this call does not wait
+/// for it.
 pub async fn graph_ingest_archive(
     root_dir: &Path,
     archive_path: &Path,
-    _provider: Option<&dyn pulse_system_types::llm::LmProvider>,
+    extractor: Option<&crate::graph_extract::GraphExtractor>,
 ) {
     let memory_dir = root_dir.join("memory");
 
@@ -466,6 +466,9 @@ pub async fn graph_ingest_archive(
                 report.entities_created,
                 report.relationships_created,
             );
+            if let (Some(extractor), Some(log_number)) = (extractor, log_number) {
+                extractor.enqueue(log_number);
+            }
         }
         Ok(Err(e)) => tracing::warn!("graph: ingestion failed for {}: {}", filename, e),
         Err(e) => tracing::warn!("graph: ingestion task panicked for {}: {}", filename, e),

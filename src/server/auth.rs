@@ -234,6 +234,7 @@ mod tests {
             leadership: std::sync::atomic::AtomicBool::new(false),
             event_permits: crate::server::stream_pools().0,
             chat_permits: crate::server::stream_pools().1,
+            graph_extractor: None,
             ledger: Arc::new(crate::ledger::LedgerRing::new(16)),
         })
     }
@@ -416,6 +417,7 @@ mod tests {
             leadership: std::sync::atomic::AtomicBool::new(false),
             event_permits: crate::server::stream_pools().0,
             chat_permits: crate::server::stream_pools().1,
+            graph_extractor: None,
             ledger: Arc::new(crate::ledger::LedgerRing::new(16)),
         })
     }

@@ -4625,8 +4625,8 @@ checksum = "bbc4a4ea2a66a41a1152c4b3d86e8954dc087bdf33af35446e6e176db4e73c8c"
 
 [[package]]
 name = "recall-echo"
-version = "4.6.0"
-source = "git+https://github.com/dnacenta/recall-echo.git?branch=main#69b917e3ad52ac1e271396cdbc18593a853a7138"
+version = "4.6.1"
+source = "git+https://github.com/dnacenta/recall-echo.git?branch=main#7db9b3146a95bfe8b6336a90d2dc05868a9cf90f"
 dependencies = [
  "async-trait",
  "chrono",
@@ -4637,6 +4637,7 @@ dependencies = [
  "libc",
  "pulse-system-types 0.7.0",
  "regex",
+ "reqwest",
  "serde",
  "serde_json",
  "surrealdb",
