@@ -91,6 +91,8 @@ pub enum StartError {
 struct Inner {
     turns: Vec<Turn>,
     phase: Phase,
+    /// The thinking phase a pause interrupted, restored on resume.
+    before_pause: Option<Phase>,
     abort: Option<tokio::task::AbortHandle>,
 }
 
@@ -153,6 +155,15 @@ impl Dialogue {
             if inner.phase.is_over() {
                 return;
             }
+            // A pause that landed while the loop was between turns wins
+            // over the loop's "thinking" until resume restores it; endings
+            // always apply.
+            if matches!(inner.phase, Phase::Paused)
+                && matches!(phase, Phase::LocalThinking | Phase::PeerThinking)
+            {
+                inner.before_pause = Some(phase);
+                return;
+            }
             inner.phase = phase;
         }
         let _ = self.tx.send(CommsEvent::Status(self.status()));
@@ -177,14 +188,28 @@ impl Dialogue {
         n
     }
 
-    /// Pause between turns (the turn in flight completes), or resume.
+    /// Pause between turns (the turn in flight completes), or resume. The
+    /// phase shows `paused` from the request until resume, which restores
+    /// the thinking phase the pause interrupted.
     pub fn set_paused(&self, paused: bool) {
         let _ = self.pause.send(!paused);
-        if paused {
-            self.set_phase(Phase::Paused);
-        } else {
-            let _ = self.tx.send(CommsEvent::Status(self.status()));
+        {
+            let mut inner = self.lock();
+            if inner.phase.is_over() {
+                return;
+            }
+            match (paused, &inner.phase) {
+                (true, Phase::LocalThinking | Phase::PeerThinking) => {
+                    inner.before_pause = Some(inner.phase.clone());
+                    inner.phase = Phase::Paused;
+                }
+                (false, Phase::Paused) => {
+                    inner.phase = inner.before_pause.take().unwrap_or(Phase::LocalThinking);
+                }
+                _ => return,
+            }
         }
+        let _ = self.tx.send(CommsEvent::Status(self.status()));
     }
 
     /// Stop now: the task is aborted and its guard archives what exists.
@@ -292,6 +317,7 @@ pub fn start(state: &Arc<AppState>, req: StartRequest) -> Result<String, StartEr
         inner: Mutex::new(Inner {
             turns: Vec::new(),
             phase: Phase::LocalThinking,
+            before_pause: None,
             abort: None,
         }),
         tx,

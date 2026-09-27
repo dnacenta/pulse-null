@@ -1962,6 +1962,48 @@ mod comms_e2e {
         assert_eq!(status, StatusCode::ACCEPTED);
     }
 
+    /// Pause holds the next turn (the one in flight completes) and shows
+    /// `paused`; resume restores the thinking phase and the dialogue runs
+    /// to its cap.
+    #[tokio::test]
+    async fn e2e_comms_pause_holds_turns_and_resume_continues() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = state_in(dir.path()).await;
+        let app = build_app(Arc::clone(&state));
+        let (port, _) = fake_peer(false, 100).await;
+        let (status, body) = post_json(&app, "/api/comms", start_body(port, 6)).await;
+        assert_eq!(status, StatusCode::ACCEPTED, "{body}");
+        let id = body["id"].as_str().unwrap().to_string();
+        let (status, _) = post_json(&app, &format!("/api/comms/{id}/pause"), String::new()).await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        let (_, body) = get_text(&app, "/api/comms").await;
+        let st: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(st["phase"], "paused", "{body}");
+        let held = st["turn"].as_u64().unwrap();
+        assert!(held <= 2, "at most the turn in flight completed: {held}");
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        let (_, body) = get_text(&app, "/api/comms").await;
+        let st: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(st["turn"].as_u64().unwrap(), held, "no turn while paused");
+
+        let (status, _) = post_json(&app, &format!("/api/comms/{id}/resume"), String::new()).await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+        let (_, body) = get_text(&app, "/api/comms").await;
+        let st: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_ne!(
+            st["phase"], "paused",
+            "resume restores a thinking phase: {body}"
+        );
+        let (_, text) = get_text(&app, &format!("/api/comms/{id}/stream")).await;
+        let fr = frames(&text);
+        assert_eq!(fr.last().unwrap().0, "done", "{text}");
+        let (_, body) = get_text(&app, "/api/comms").await;
+        let st: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(st["phase"], "finished");
+        assert_eq!(st["turn"], 6);
+    }
+
     #[tokio::test]
     async fn e2e_comms_retries_a_rate_limited_peer() {
         let dir = tempfile::tempdir().unwrap();
