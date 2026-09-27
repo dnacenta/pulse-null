@@ -62,6 +62,83 @@ fn truncate_to_byte_cap(text: &str, max_bytes: usize) -> String {
 /// 50 lines; this is the safety margin on top of that.
 const THOUGHT_STACK_MAX_LINES: usize = 60;
 
+/// Pulse-facing soft budget for THOUGHT_STACK.md, stricter than the hard
+/// ceiling carried in `thought_stack_max_bytes` (48 KiB).
+///
+/// The hard cap is where `truncate_to_byte_cap` starts deleting text; the soft
+/// budget is the size the pulse holds the file to, so that a cycle's additions
+/// land inside the ceiling rather than on top of it. Both appear in the
+/// utilisation report because they answer different questions: "am I about to
+/// lose content?" and "am I keeping the rule I was given?".
+const THOUGHT_STACK_SOFT_BUDGET_BYTES: usize = 45_000;
+
+/// How full a self-authored, capped document is against its limits.
+///
+/// `truncate_to_byte_cap` emits its marker only when it actually fires, so
+/// below the ceiling a document's size is never reported and the only way to
+/// learn it is to measure the file by hand. The report is taken on the read
+/// path every prompt assembly already walks, so the reading arrives whether or
+/// not anyone chose to take it. It is a report, not a gate: it never refuses,
+/// trims or warns.
+///
+/// The figures describe the file **as it is on disk**, before the line cap and
+/// the byte cap are applied. A post-trim count would understate the problem in
+/// exactly the case where the line cap has already dropped content silently.
+///
+/// It is logged, not rendered into the prompt. The chat prompt already runs
+/// over its token budget — every Low-tier block is dropped and THOUGHT_STACK.md
+/// is truncated to fit — so each token added to a High-tier block comes
+/// straight out of the thought stack's tail. The report must not cost the
+/// content it measures.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Utilisation {
+    label: &'static str,
+    bytes: usize,
+    byte_cap: usize,
+    soft_budget: Option<usize>,
+    lines: usize,
+    line_cap: usize,
+}
+
+impl Utilisation {
+    fn measure(label: &'static str, content: &str, byte_cap: usize, line_cap: usize) -> Self {
+        Self {
+            label,
+            bytes: content.len(),
+            byte_cap,
+            soft_budget: None,
+            lines: content.lines().count(),
+            line_cap,
+        }
+    }
+
+    #[must_use]
+    fn with_soft_budget(self, soft_budget: usize) -> Self {
+        Self {
+            soft_budget: Some(soft_budget),
+            ..self
+        }
+    }
+
+    fn log(&self) {
+        info!("[prompt-utilisation] {self}");
+    }
+}
+
+impl std::fmt::Display for Utilisation {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}: {} B", self.label, self.bytes)?;
+        if let Some(budget) = self.soft_budget {
+            write!(f, " / {budget} budget")?;
+        }
+        write!(
+            f,
+            " / {} cap, {} / {} lines",
+            self.byte_cap, self.lines, self.line_cap
+        )
+    }
+}
+
 /// Hard byte ceiling for the Essential tier as a whole.
 ///
 /// Essential components are never trimmed, so if they alone exceed this the
@@ -273,6 +350,15 @@ pub fn build_system_prompt_budgeted(
     let memory_path = root_dir.join("memory/MEMORY.md");
     if memory_path.exists() {
         let content = std::fs::read_to_string(&memory_path)?;
+        // MEMORY.md is self-authored against a line cap its author cannot see,
+        // exactly like THOUGHT_STACK.md, so it gets the same read-side report.
+        Utilisation::measure(
+            "MEMORY.md",
+            &content,
+            budget_cfg.memory_max_bytes,
+            config.memory.memory_max_lines,
+        )
+        .log();
         let limited: String = content
             .lines()
             .take(config.memory.memory_max_lines)
@@ -1140,6 +1226,7 @@ fn build_tension_context(root_dir: &Path, config: &Config) -> Option<String> {
 ///
 /// The line cap is the pulse-facing rule (it is instructed to stay under 50);
 /// the byte ceiling is the safety net, because 60 lines say nothing about size.
+/// Every load logs a [`Utilisation`] report against both.
 fn load_thought_stack(
     root_dir: &Path,
     max_bytes: usize,
@@ -1152,6 +1239,14 @@ fn load_thought_stack(
     if content.trim().is_empty() {
         return Ok(None);
     }
+    Utilisation::measure(
+        "THOUGHT_STACK.md",
+        &content,
+        max_bytes,
+        THOUGHT_STACK_MAX_LINES,
+    )
+    .with_soft_budget(THOUGHT_STACK_SOFT_BUDGET_BYTES)
+    .log();
     let limited: String = content
         .lines()
         .take(THOUGHT_STACK_MAX_LINES)
@@ -2202,6 +2297,55 @@ mod tests {
             "prompt should be bounded by the thought stack ceiling, got {} bytes",
             result.prompt.len()
         );
+    }
+
+    #[test]
+    fn utilisation_measures_the_file_on_disk_before_any_cap() {
+        let content = "alpha\nbeta\ngamma\n";
+        let report = Utilisation::measure("THOUGHT_STACK.md", content, 10, 2);
+
+        assert_eq!(report.bytes, content.len());
+        assert_eq!(report.lines, 3, "lines past the cap still count");
+        assert_eq!(report.soft_budget, None);
+    }
+
+    #[test]
+    fn utilisation_renders_soft_budget_between_size_and_cap() {
+        let report = Utilisation::measure("THOUGHT_STACK.md", "a\nb\n", 49_152, 60)
+            .with_soft_budget(THOUGHT_STACK_SOFT_BUDGET_BYTES);
+        assert_eq!(
+            report.to_string(),
+            "THOUGHT_STACK.md: 4 B / 45000 budget / 49152 cap, 2 / 60 lines"
+        );
+    }
+
+    #[test]
+    fn utilisation_without_soft_budget_shows_only_the_cap() {
+        let report = Utilisation::measure("MEMORY.md", "one\ntwo\n", 32_768, 200);
+        assert_eq!(
+            report.to_string(),
+            "MEMORY.md: 8 B / 32768 cap, 2 / 200 lines"
+        );
+    }
+
+    #[test]
+    fn utilisation_report_costs_no_prompt_tokens() {
+        // The chat prompt is already over budget; a report rendered into a
+        // High-tier block would evict thought-stack content to make room.
+        let dir = tempfile::tempdir().unwrap();
+        let config = minimal_config();
+        std::fs::create_dir_all(dir.path().join("memory")).unwrap();
+        std::fs::write(dir.path().join("CLAUDE.md"), "# Pulse").unwrap();
+        std::fs::write(dir.path().join("THOUGHT_STACK.md"), "alpha\nbeta\n").unwrap();
+        std::fs::write(dir.path().join("memory/MEMORY.md"), "one\ntwo\n").unwrap();
+
+        let result = build_system_prompt_budgeted(dir.path(), &config, None, None).unwrap();
+
+        assert!(result
+            .prompt
+            .contains("<thought-stack>\nalpha\nbeta\n</thought-stack>"));
+        assert!(result.prompt.contains("<memory>\none\ntwo\n</memory>"));
+        assert!(!result.prompt.contains(" cap, "));
     }
 
     #[test]
