@@ -174,22 +174,144 @@ impl PipelineState {
 // Pipeline health calculation
 // ---------------------------------------------------------------------------
 
-/// Count entries in a markdown file by counting ## and ### headers
-/// (excluding known structural headers).
+/// Count entries in a markdown file.
+///
+/// Uses the same [`JournalDocument`] parse the archiver cuts on, so the
+/// thresholds that decide *when* to archive always count the units the
+/// archiver can actually remove.
 fn count_entries(path: &Path) -> usize {
-    let content = match std::fs::read_to_string(path) {
-        Ok(c) => c,
-        Err(_) => return 0,
-    };
+    match std::fs::read_to_string(path) {
+        Ok(content) => JournalDocument::parse(&content).entry_count(),
+        Err(_) => 0,
+    }
+}
 
-    content
-        .lines()
-        .filter(|line| {
-            let trimmed = line.trim_start();
-            (trimmed.starts_with("## ") || trimmed.starts_with("### "))
-                && !is_structural_header(trimmed)
-        })
-        .count()
+/// How a single line participates in a journal document's structure.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LineRole {
+    /// Opens a new entry.
+    EntryStart,
+    /// A structural `## ` heading: document furniture, never an entry.
+    Structural,
+    /// Anything else, including `### ` subsections of an open `## ` entry.
+    Body,
+}
+
+/// Classify `line`, given whether a non-structural `## ` entry is open.
+///
+/// Nesting rule: a `### ` inside a `## ` entry is a subsection of that entry,
+/// not an entry of its own. A `### ` with no `## ` entry open above it is an
+/// entry in its own right — CURIOSITY.md keeps its entries under structural
+/// `## ` headings, and those must stay countable and archivable.
+fn classify_line(line: &str, inside_h2_entry: bool) -> LineRole {
+    let trimmed = line.trim_start();
+    if trimmed.starts_with("## ") {
+        if is_structural_header(trimmed) {
+            LineRole::Structural
+        } else {
+            LineRole::EntryStart
+        }
+    } else if trimmed.starts_with("### ") && !inside_h2_entry {
+        LineRole::EntryStart
+    } else {
+        LineRole::Body
+    }
+}
+
+/// One contiguous run of lines in a journal document.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Block {
+    /// Preamble, structural headings and the text under them. Never archived.
+    Furniture(String),
+    /// One entry: its heading plus everything up to the next entry or
+    /// structural heading, subsections included.
+    Entry(String),
+}
+
+impl Block {
+    fn text(&self) -> &str {
+        match self {
+            Block::Furniture(text) | Block::Entry(text) => text,
+        }
+    }
+
+    fn push_line(&mut self, line: &str) {
+        let (Block::Furniture(text) | Block::Entry(text)) = self;
+        text.push_str(line);
+        text.push('\n');
+    }
+}
+
+/// A journal document split into entries and the furniture around them.
+///
+/// This is the single definition of "one entry" for both counting and
+/// cutting. Structural headings are kept as furniture in place, so archiving
+/// entries never strips a document of its skeleton (e.g. CURIOSITY.md's
+/// `## Explored` stays put while the questions under it move out).
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct JournalDocument {
+    blocks: Vec<Block>,
+}
+
+impl JournalDocument {
+    fn parse(content: &str) -> Self {
+        let mut blocks = Vec::new();
+        let mut current = Block::Furniture(String::new());
+        let mut inside_h2_entry = false;
+
+        for line in content.lines() {
+            let role = classify_line(line, inside_h2_entry);
+            match role {
+                LineRole::EntryStart => {
+                    push_non_empty(&mut blocks, current);
+                    current = Block::Entry(String::new());
+                    inside_h2_entry = line.trim_start().starts_with("## ");
+                }
+                LineRole::Structural => {
+                    push_non_empty(&mut blocks, current);
+                    current = Block::Furniture(String::new());
+                    inside_h2_entry = false;
+                }
+                LineRole::Body => {}
+            }
+            current.push_line(line);
+        }
+        push_non_empty(&mut blocks, current);
+
+        Self { blocks }
+    }
+
+    fn entry_count(&self) -> usize {
+        self.blocks
+            .iter()
+            .filter(|block| matches!(block, Block::Entry(_)))
+            .count()
+    }
+
+    /// Remove the first `count` entries by file position and return their
+    /// text. Furniture and later entries keep their order.
+    fn remove_oldest_entries(&mut self, count: usize) -> Vec<String> {
+        let mut removed = Vec::with_capacity(count);
+        let mut kept = Vec::with_capacity(self.blocks.len());
+        for block in std::mem::take(&mut self.blocks) {
+            match block {
+                Block::Entry(text) if removed.len() < count => removed.push(text),
+                other => kept.push(other),
+            }
+        }
+        self.blocks = kept;
+        removed
+    }
+
+    fn render(&self) -> String {
+        self.blocks.iter().map(Block::text).collect()
+    }
+}
+
+fn push_non_empty(blocks: &mut Vec<Block>, block: Block) {
+    if !block.text().is_empty() {
+        blocks.push(block);
+    }
 }
 
 /// Headers that are document structure, not content entries.
@@ -378,14 +500,8 @@ fn archive_document(
     std::fs::create_dir_all(&archive_dir)?;
 
     let content = std::fs::read_to_string(&source_path)?;
-    let (header, sections) = split_by_headers(&content);
-
-    if sections.is_empty() {
-        return Ok(());
-    }
-
-    let split_point = sections.len() / 2;
-    let (to_archive, to_keep) = sections.split_at(split_point);
+    let mut document = JournalDocument::parse(&content);
+    let to_archive = document.remove_oldest_entries(document.entry_count() / 2);
 
     if to_archive.is_empty() {
         return Ok(());
@@ -408,8 +524,7 @@ fn archive_document(
     };
     std::fs::write(&archive_file, archive_content)?;
 
-    let new_content = format!("{}\n{}", header, to_keep.join("\n"));
-    std::fs::write(&source_path, new_content)?;
+    std::fs::write(&source_path, document.render())?;
 
     Ok(())
 }
@@ -436,40 +551,6 @@ pub fn archive_document_by_name(
 
     archive_document(root_dir, source, archive_dir)?;
     Ok(format!("Archived entries from {}", source))
-}
-
-/// Split markdown content into a header (everything before first ##) and sections.
-fn split_by_headers(content: &str) -> (String, Vec<String>) {
-    let mut header = String::new();
-    let mut sections: Vec<String> = Vec::new();
-    let mut current_section = String::new();
-    let mut in_header = true;
-
-    for line in content.lines() {
-        let trimmed = line.trim_start();
-        if (trimmed.starts_with("## ") || trimmed.starts_with("### "))
-            && !is_structural_header(trimmed)
-        {
-            if in_header {
-                in_header = false;
-            } else if !current_section.is_empty() {
-                sections.push(current_section.clone());
-            }
-            current_section = format!("{}\n", line);
-        } else if in_header {
-            header.push_str(line);
-            header.push('\n');
-        } else {
-            current_section.push_str(line);
-            current_section.push('\n');
-        }
-    }
-
-    if !current_section.is_empty() {
-        sections.push(current_section);
-    }
-
-    (header, sections)
 }
 
 /// List archived files for a document type.
@@ -727,6 +808,10 @@ mod tests {
         assert_eq!(count, 0);
     }
 
+    // Deliberately 2, not 3: `### Sub-thought` is a subsection of
+    // `## Second thought`, not a third entry. Counting it separately made a
+    // structured entry cost one slot per subsection and pushed the document
+    // to its hard limit early.
     #[test]
     fn test_count_entries_with_headers() {
         let dir = TempDir::new().unwrap();
@@ -736,7 +821,19 @@ mod tests {
             "# Thoughts\n\n## First thought\n\nContent.\n\n## Second thought\n\nMore content.\n\n### Sub-thought\n\nDetail.\n",
         );
         let count = count_entries(&dir.path().join("journal/THOUGHTS.md"));
-        assert_eq!(count, 3);
+        assert_eq!(count, 2);
+    }
+
+    #[test]
+    fn test_count_entries_subsections_cost_one_slot() {
+        let dir = TempDir::new().unwrap();
+        setup_journal(
+            dir.path(),
+            "LEARNING.md",
+            "# Learning\n\n## c794\n\nIntro.\n\n### Q1\n\na\n\n### Q2\n\nb\n\n### Q3\n\nc\n",
+        );
+        let count = count_entries(&dir.path().join("journal/LEARNING.md"));
+        assert_eq!(count, 1);
     }
 
     #[test]
@@ -839,16 +936,72 @@ mod tests {
         assert_eq!(state.sessions_without_movement, 0);
     }
 
+    fn entry_texts(document: &JournalDocument) -> Vec<&str> {
+        document
+            .blocks
+            .iter()
+            .filter_map(|block| match block {
+                Block::Entry(text) => Some(text.as_str()),
+                Block::Furniture(_) => None,
+            })
+            .collect()
+    }
+
     #[test]
-    fn test_split_by_headers() {
+    fn test_parse_separates_preamble_from_entries() {
         let content =
             "# Title\n\nPreamble.\n\n## Entry 1\n\nContent 1.\n\n## Entry 2\n\nContent 2.\n";
-        let (header, sections) = split_by_headers(content);
-        assert!(header.contains("Title"));
-        assert!(header.contains("Preamble"));
-        assert_eq!(sections.len(), 2);
-        assert!(sections[0].contains("Entry 1"));
-        assert!(sections[1].contains("Entry 2"));
+        let document = JournalDocument::parse(content);
+        assert!(matches!(&document.blocks[0], Block::Furniture(text) if text.contains("Preamble")));
+        let entries = entry_texts(&document);
+        assert_eq!(entries.len(), 2);
+        assert!(entries[0].contains("Entry 1"));
+        assert!(entries[1].contains("Entry 2"));
+    }
+
+    #[test]
+    fn test_parse_render_round_trips() {
+        let content = "# Curiosity\n\n## Open Questions\n\n### What is X?\n\na\n\n## Themes\n\n- t\n\n## Real entry\n\n### Part\n\nb\n";
+        assert_eq!(JournalDocument::parse(content).render(), content);
+    }
+
+    #[test]
+    fn test_parse_nests_subsections() {
+        let content = "# Title\n\nPreamble.\n\n## Entry 1\n\nIntro.\n\n### Part A\n\na\n\n### Part B\n\nb\n\n## Entry 2\n\nContent 2.\n";
+        let document = JournalDocument::parse(content);
+        let entries = entry_texts(&document);
+        assert_eq!(entries.len(), 2);
+        assert!(entries[0].contains("Entry 1"));
+        assert!(entries[0].contains("Part A"));
+        assert!(entries[0].contains("Part B"));
+        assert!(entries[1].contains("Entry 2"));
+        assert!(!entries[1].contains("Part"));
+    }
+
+    #[test]
+    fn test_parse_h3_without_parent_is_an_entry() {
+        // CURIOSITY.md's shape: entries live as `###` under structural `##`
+        // headings, so each of them must still be its own entry.
+        let content =
+            "# Curiosity\n\n## Open Questions\n\n### What is X?\n\na\n\n### What is Y?\n\nb\n";
+        let document = JournalDocument::parse(content);
+        let entries = entry_texts(&document);
+        assert_eq!(entries.len(), 2);
+        assert!(entries[0].contains("What is X?"));
+        assert!(entries[1].contains("What is Y?"));
+    }
+
+    #[test]
+    fn test_parse_structural_header_closes_an_entry() {
+        // A structural heading ends the nesting region: a later `###` is an
+        // entry again, and the heading itself belongs to neither entry.
+        let content = "# Curiosity\n\n## Real entry\n\na\n\n## Explored\n\n### Old question\n\nb\n";
+        let document = JournalDocument::parse(content);
+        let entries = entry_texts(&document);
+        assert_eq!(entries.len(), 2);
+        assert!(entries[0].contains("Real entry"));
+        assert!(!entries[0].contains("## Explored"));
+        assert!(entries[1].contains("Old question"));
     }
 
     #[test]
@@ -867,11 +1020,146 @@ mod tests {
         archive_document(dir.path(), "journal/LEARNING.md", "archives/learning").unwrap();
 
         let remaining = fs::read_to_string(journal.join("LEARNING.md")).unwrap();
-        let (_, sections) = split_by_headers(&remaining);
-        assert_eq!(sections.len(), 2);
+        assert_eq!(JournalDocument::parse(&remaining).entry_count(), 2);
+        assert!(remaining.contains("Preamble."));
 
         let archive_files: Vec<_> = fs::read_dir(&archives).unwrap().flatten().collect();
         assert_eq!(archive_files.len(), 1);
+    }
+
+    /// Regression test for the split that cut an entry in half: the `##`
+    /// parent was archived while its `###` children stayed resident, with
+    /// neither half referencing the other.
+    #[test]
+    fn test_archive_document_keeps_subsections_with_parent() {
+        let dir = TempDir::new().unwrap();
+        let journal = dir.path().join("journal");
+        let archives = dir.path().join("archives/learning");
+        fs::create_dir_all(&journal).unwrap();
+        fs::create_dir_all(&archives).unwrap();
+
+        // Four entries; the second and third each carry subsections, and the
+        // heading-count midpoint falls inside the second one.
+        fs::write(
+            journal.join("LEARNING.md"),
+            "# Learning\n\nPreamble.\n\n\
+             ## Topic 1\n\nOldest.\n\n\
+             ## Topic 2\n\nOld.\n\n### old-child-a\n\naa\n\n### old-child-b\n\nbb\n\n\
+             ## Topic 3\n\nNew.\n\n### new-child-a\n\ncc\n\n\
+             ## Topic 4\n\nNewest.\n",
+        )
+        .unwrap();
+
+        archive_document(dir.path(), "journal/LEARNING.md", "archives/learning").unwrap();
+
+        let remaining = fs::read_to_string(journal.join("LEARNING.md")).unwrap();
+        let archive_file = fs::read_dir(&archives).unwrap().flatten().next().unwrap();
+        let archived = fs::read_to_string(archive_file.path()).unwrap();
+
+        assert_eq!(JournalDocument::parse(&remaining).entry_count(), 2);
+
+        // The archived entry went whole: parent and both children together.
+        assert!(archived.contains("Topic 2"));
+        assert!(archived.contains("old-child-a"));
+        assert!(archived.contains("old-child-b"));
+        assert!(!remaining.contains("old-child-a"));
+        assert!(!remaining.contains("old-child-b"));
+
+        // The retained entry kept its own child rather than shedding it.
+        assert!(remaining.contains("Topic 3"));
+        assert!(remaining.contains("new-child-a"));
+        assert!(!archived.contains("new-child-a"));
+    }
+
+    /// CURIOSITY.md keeps its entries as `###` under structural `##`
+    /// headings. An archiver that only cuts at `##` sees zero entries there
+    /// and can never bring the document back under its hard limit; one that
+    /// cuts structural headings along with entries strips the document's
+    /// skeleton (later questions end up filed under the wrong heading).
+    #[test]
+    fn test_archive_curiosity_shape_at_hard_limit() {
+        let dir = TempDir::new().unwrap();
+        let journal = dir.path().join("journal");
+        fs::create_dir_all(&journal).unwrap();
+        for name in ["LEARNING.md", "THOUGHTS.md", "REFLECTIONS.md", "PRAXIS.md"] {
+            fs::write(journal.join(name), "# Doc\n").unwrap();
+        }
+        fs::write(
+            journal.join("CURIOSITY.md"),
+            "# Curiosity\n\n\
+             ## Open Questions\n\n\
+             ### Q1\n\na\n\n### Q2\n\nb\n\n### Q3\n\nc\n\n### Q4\n\nd\n\n\
+             ## Themes\n\n- recurring theme\n\n\
+             ## Explored\n\n\
+             ### E1\n\ne\n\n### E2\n\nf\n\n### E3\n\ng\n\n### E4\n\nh\n",
+        )
+        .unwrap();
+
+        let thresholds = Thresholds::default();
+        let health = calculate(dir.path(), &thresholds);
+        assert_eq!(health.curiosity.count, 8);
+        assert!(health.curiosity.count >= thresholds.curiosity_hard);
+
+        let archived = check_and_archive(dir.path(), &thresholds, &health);
+        assert_eq!(archived, vec!["CURIOSITY.md".to_string()]);
+
+        let after = calculate(dir.path(), &thresholds);
+        assert_eq!(after.curiosity.count, 4);
+        assert!(after.curiosity.count < thresholds.curiosity_hard);
+
+        let remaining = fs::read_to_string(journal.join("CURIOSITY.md")).unwrap();
+        // Every structural heading and its body stay resident, in order.
+        let open = remaining.find("## Open Questions").unwrap();
+        let themes = remaining.find("## Themes").unwrap();
+        let explored = remaining.find("## Explored").unwrap();
+        assert!(open < themes && themes < explored);
+        assert!(remaining.contains("- recurring theme"));
+        // Explored questions are still filed under `## Explored`.
+        assert!(remaining.find("### E1").unwrap() > explored);
+        for gone in ["### Q1", "### Q2", "### Q3", "### Q4"] {
+            assert!(!remaining.contains(gone));
+        }
+
+        let archive_dir = dir.path().join("archives/curiosity");
+        let archive_file = fs::read_dir(&archive_dir)
+            .unwrap()
+            .flatten()
+            .next()
+            .unwrap();
+        let archive = fs::read_to_string(archive_file.path()).unwrap();
+        assert!(archive.contains("### Q1") && archive.contains("### Q4"));
+        assert!(!archive.contains("## Themes"));
+        assert!(!archive.contains("## Explored"));
+    }
+
+    /// Counting and cutting agree on every shape: whenever a document holds
+    /// two or more entries, one archive pass removes exactly half of them.
+    #[test]
+    fn test_archive_removes_half_of_counted_entries_for_every_shape() {
+        let shapes = [
+            "# D\n\n## A\n\n## B\n\n## C\n",
+            "# D\n\n## A\n\n### a1\n\n### a2\n\n## B\n\n### b1\n",
+            "# D\n\n## Open Questions\n\n### A\n\n### B\n\n### C\n",
+            "# D\n\n## Open Questions\n\n### A\n\n## Real\n\n### sub\n\n## Explored\n\n### B\n",
+        ];
+        for shape in shapes {
+            let dir = TempDir::new().unwrap();
+            setup_journal(dir.path(), "THOUGHTS.md", shape);
+            let path = dir.path().join("journal/THOUGHTS.md");
+            let before = count_entries(&path);
+            assert!(
+                before >= 2,
+                "fixture must hold two or more entries: {shape:?}"
+            );
+
+            archive_document(dir.path(), "journal/THOUGHTS.md", "archives/thoughts").unwrap();
+
+            assert_eq!(
+                count_entries(&path),
+                before - before / 2,
+                "shape: {shape:?}"
+            );
+        }
     }
 
     #[test]
