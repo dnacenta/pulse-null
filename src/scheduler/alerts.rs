@@ -325,6 +325,20 @@ pub fn alert_from_tension_rejections(
     if shown < rejections.len() {
         let _ = write!(content, "\n…and {} more", rejections.len() - shown);
     }
+    // A capability refusal is not a fact about the pulse's conduct, and only
+    // the owner can do anything about it. Say so rather than leaving it to be
+    // inferred from the prose.
+    let capability = rejections
+        .iter()
+        .filter(|r| r.side == crate::tension::ingest::RejectionSide::ChannelCapability)
+        .count();
+    if capability > 0 {
+        let _ = write!(
+            content,
+            "\n\n{capability} of these are runtime limits rather than failed claims: \
+             the rung named cannot be verified under this configuration, whatever was done."
+        );
+    }
     Alert {
         id: format!(
             "alert-{}-{}",
@@ -466,5 +480,42 @@ mod tests {
         assert!(!alert.content.contains('@'));
         assert!(alert.content.contains("NOT"));
         assert!(!alert.id.contains(' ') && !alert.id.contains('\n'));
+    }
+
+    fn rejection(
+        side: crate::tension::ingest::RejectionSide,
+    ) -> crate::tension::ingest::IngestRejection {
+        crate::tension::ingest::IngestRejection {
+            marker: "THREAD-WORK",
+            thread_id: "t-00000001".to_string(),
+            reason: "refused".to_string(),
+            side,
+        }
+    }
+
+    /// A refusal that is a runtime limit is labelled as one for the owner,
+    /// who is the only party able to change the configuration.
+    #[test]
+    fn tension_rejection_alert_separates_runtime_limits_from_failed_claims() {
+        use crate::tension::ingest::RejectionSide;
+
+        let mixed = [
+            rejection(RejectionSide::ClaimantConduct),
+            rejection(RejectionSide::ChannelCapability),
+        ];
+        let alert = alert_from_tension_rejections("task", &mixed);
+        assert!(
+            alert.content.contains("1 of these are runtime limits"),
+            "{}",
+            alert.content
+        );
+
+        let conduct_only = [rejection(RejectionSide::ClaimantConduct)];
+        let alert = alert_from_tension_rejections("task", &conduct_only);
+        assert!(
+            !alert.content.contains("runtime limits"),
+            "{}",
+            alert.content
+        );
     }
 }

@@ -122,13 +122,23 @@ pub async fn close_cycle(state: &Arc<AppState>, root_dir: &Path, outcome: CycleO
     let raw_output = outcome.raw_output.to_string();
     let resolved: Vec<String> = outcome.resolved_prediction_ids.to_vec();
     let tool_rounds = outcome.tool_rounds;
+    // Whether that count is a measurement or a structural zero, so a refusal
+    // can say which side of the failure it is.
+    let tool_rounds_observable =
+        crate::providers::provider_reports_tool_rounds(&state.config.llm.provider);
     let started_at = outcome.started_at;
 
     let result = store::save_delta_async(
         root_dir.to_path_buf(),
         state.config.tension.clone(),
         move |s| {
-            let evidence = WorkEvidence::new(&root, &resolved, tool_rounds, started_at);
+            let evidence = WorkEvidence::new(
+                &root,
+                &resolved,
+                tool_rounds,
+                tool_rounds_observable,
+                started_at,
+            );
             ingest::apply_cycle(s, &raw_output, &evidence, stack.as_ref(), &resolved, now)
         },
     )

@@ -50,14 +50,61 @@ pub fn create_provider(
     Ok(provider)
 }
 
+/// The backend an `[llm] provider` name selects. One parse, shared by
+/// construction and by [`provider_reports_tool_rounds`], so the two cannot
+/// disagree about what a name means.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ProviderKind {
+    /// HTTP messages API with in-process tool use.
+    Anthropic,
+    /// Local HTTP model server with in-process tool use.
+    Ollama,
+    /// An agent CLI subprocess (every adapter) that runs its own tools.
+    Cli,
+}
+
+impl ProviderKind {
+    fn from_name(name: &str) -> Option<Self> {
+        match name {
+            "anthropic" | "claude" => Some(Self::Anthropic), // vendor-ok: pre-PN-106 alias
+            "ollama" => Some(Self::Ollama),
+            "cli" | "claude-code" => Some(Self::Cli), // vendor-ok: pre-PN-106 alias
+            _ => None,
+        }
+    }
+}
+
+/// Whether the provider `[llm] provider` names reports tool rounds back to
+/// the tool loop, i.e. whether a cycle's `tool_rounds` is a measurement.
+///
+/// The `cli` provider (every adapter, and the `claude-code` alias) runs the
+/// agent CLI's own tools inside the subprocess and returns only its final
+/// message; it is never handed tool definitions, so its `tool_rounds` is 0
+/// however many tools actually ran. Claiming a tool as evidence cannot be
+/// verified there, and callers must not report that as the pulse's fault.
+///
+/// Answered from the name because the callers (prompt assembly) hold a
+/// `Config`, not a live provider. An unknown name answers `false`: it never
+/// builds a provider, and crediting observability we cannot show is the
+/// defect this exists to prevent. Pinned to each provider's
+/// `supports_tools()` by `tool_round_table_matches_the_real_providers`.
+#[must_use]
+pub fn provider_reports_tool_rounds(provider: &str) -> bool {
+    match ProviderKind::from_name(provider) {
+        Some(ProviderKind::Anthropic | ProviderKind::Ollama) => true,
+        Some(ProviderKind::Cli) | None => false,
+    }
+}
+
 /// Create a streaming-capable provider based on config.
 pub fn create_streaming_provider(
     config: &Config,
     pulse_root: &Path,
 ) -> Result<Box<dyn StreamingProvider>, ProviderError> {
-    match config.llm.provider.as_str() {
-        "anthropic" | "claude" => {
-            // vendor-ok: pre-PN-106 alias
+    let name = config.llm.provider.as_str();
+    let kind = ProviderKind::from_name(name).ok_or_else(|| ProviderError::Unknown(name.into()))?;
+    match kind {
+        ProviderKind::Anthropic => {
             let api_key = config.resolve_api_key().ok_or_else(|| {
                 ProviderError::MissingApiKey(
                     "No API key found. Set it in pulse-null.toml or ANTHROPIC_API_KEY env var."
@@ -69,12 +116,11 @@ pub fn create_streaming_provider(
                 config.llm.model.clone(),
             )))
         }
-        "ollama" => Ok(Box::new(OllamaProvider::new(
+        ProviderKind::Ollama => Ok(Box::new(OllamaProvider::new(
             config.llm.model.clone(),
             config.llm.base_url.clone(),
         ))),
-        "cli" | "claude-code" => Ok(Box::new(cli_provider_for(config, pulse_root)?)), // vendor-ok: pre-PN-106 alias
-        other => Err(ProviderError::Unknown(other.to_string())),
+        ProviderKind::Cli => Ok(Box::new(cli_provider_for(config, pulse_root)?)),
     }
 }
 
@@ -172,5 +218,42 @@ mod tests {
         // The anchoring itself is asserted in `cli_provider::tests`
         // (`entity_command_sets_cwd_env_and_scrubs`); here we only need the
         // factory to accept an explicit root instead of reading the process cwd.
+    }
+
+    /// The tool-round table answers from a name; the truth lives in each
+    /// provider's `supports_tools()`. Build every real provider — every cli
+    /// adapter and the `claude-code` alias included — and compare, so a
+    /// provider that changes cannot silently start or stop advertising the
+    /// tool rung.
+    #[test]
+    fn tool_round_table_matches_the_real_providers() {
+        let root = tempfile::tempdir().unwrap();
+        let mut cases: Vec<(&str, Option<&str>)> = vec![
+            ("anthropic", None),
+            ("claude", None),
+            ("ollama", None),
+            ("claude-code", None),
+        ];
+        cases.extend(adapters::NAMES.iter().map(|&a| ("cli", Some(a))));
+
+        for (name, adapter) in cases {
+            let mut config = config();
+            config.llm.provider = name.into();
+            config.llm.adapter = adapter.map(Into::into);
+            let provider = create_provider(&config, root.path())
+                .unwrap_or_else(|e| panic!("provider '{name}'/{adapter:?} should build: {e}"));
+            assert_eq!(
+                provider_reports_tool_rounds(name),
+                provider.supports_tools(),
+                "tool-round table disagrees with '{name}'/{adapter:?} supports_tools()"
+            );
+        }
+    }
+
+    /// Naming a provider that does not exist cannot buy observability.
+    #[test]
+    fn an_unknown_provider_is_not_credited_with_tool_rounds() {
+        assert!(!provider_reports_tool_rounds("nonesuch"));
+        assert!(!provider_reports_tool_rounds(""));
     }
 }

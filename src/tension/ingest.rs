@@ -149,6 +149,24 @@ impl EvidenceClaim {
     }
 }
 
+/// Which side of the ladder a refusal is a fact about.
+///
+/// A rejection is read by the pulse as feedback, and the two sides call for
+/// opposite responses: a conduct refusal says *bring better evidence*, a
+/// capability refusal says *this rung cannot be checked on this runtime, use
+/// another*. Phrasing the second like the first blames the pulse for a
+/// configuration fact, so the distinction lives in the type, not only the
+/// prose.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RejectionSide {
+    /// The claim was checked and did not hold up. A statement about the claim.
+    ClaimantConduct,
+    /// The rung could not be checked at all here. A statement about the
+    /// channel — the same claim on a differently configured runtime might
+    /// well have verified.
+    ChannelCapability,
+}
+
 /// Why a discharge or resolution claim was refused.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum EvidenceRejection {
@@ -165,29 +183,68 @@ pub enum EvidenceRejection {
     FileUnchanged(String),
     /// The named prediction did not resolve this cycle.
     PredictionNotResolved(String),
-    /// No tool executed this cycle.
+    /// The runtime *can* see tool rounds and saw none. A fact about the cycle.
     NoToolRan(String),
+    /// The runtime cannot see tool rounds at all, so the rung is unverifiable
+    /// here whatever the pulse did. A fact about the configured provider —
+    /// see [`provider_reports_tool_rounds`](crate::providers::provider_reports_tool_rounds).
+    ToolRoundsUnobservable(String),
+}
+
+impl EvidenceRejection {
+    /// Whether this refusal is a fact about the claim or about the channel.
+    #[must_use]
+    pub fn side(&self) -> RejectionSide {
+        match self {
+            Self::ToolRoundsUnobservable(_) => RejectionSide::ChannelCapability,
+            Self::NoEvidence
+            | Self::PathOutsidePulse(_)
+            | Self::PathInJournal(_)
+            | Self::FileMissing(_)
+            | Self::FileUnchanged(_)
+            | Self::PredictionNotResolved(_)
+            | Self::NoToolRan(_) => RejectionSide::ClaimantConduct,
+        }
+    }
 }
 
 impl std::fmt::Display for EvidenceRejection {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Every message opens by naming its side, so a capability gap can
+        // never be read as a finding about the claim.
         match self {
             Self::NoEvidence => write!(
                 f,
-                "no artifact named — discharge needs a file changed outside the journal, \
+                "claim: no artifact named — discharge needs a file changed outside the journal, \
                  a resolved prediction id, or a tool that ran"
             ),
-            Self::PathOutsidePulse(p) => write!(f, "path '{p}' is not inside the pulse root"),
+            Self::PathOutsidePulse(p) => {
+                write!(f, "claim: path '{p}' is not inside the pulse root")
+            }
             Self::PathInJournal(p) => write!(
                 f,
-                "path '{p}' is journal text; writing about a thread is not working it"
+                "claim: path '{p}' is journal text; writing about a thread is not working it"
             ),
-            Self::FileMissing(p) => write!(f, "file '{p}' does not exist"),
-            Self::FileUnchanged(p) => write!(f, "file '{p}' was not modified during this cycle"),
-            Self::PredictionNotResolved(id) => {
-                write!(f, "prediction '{id}' did not resolve during this cycle")
+            Self::FileMissing(p) => write!(f, "claim: file '{p}' does not exist"),
+            Self::FileUnchanged(p) => {
+                write!(f, "claim: file '{p}' was not modified during this cycle")
             }
-            Self::NoToolRan(t) => write!(f, "no tool ran this cycle, so '{t}' cannot be evidence"),
+            Self::PredictionNotResolved(id) => {
+                write!(
+                    f,
+                    "claim: prediction '{id}' did not resolve during this cycle"
+                )
+            }
+            Self::NoToolRan(t) => write!(
+                f,
+                "claim: no tool ran this cycle, so '{t}' cannot be evidence"
+            ),
+            Self::ToolRoundsUnobservable(t) => write!(
+                f,
+                "channel: '{t}' may have run, but this runtime's agent CLI runs its own tools \
+                 and reports no tool rounds, so the tool rung cannot verify it — name the file \
+                 it changed or a resolved prediction"
+            ),
         }
     }
 }
@@ -201,21 +258,30 @@ pub struct WorkEvidence<'a> {
     root_dir: &'a Path,
     resolved_prediction_ids: &'a [String],
     tool_rounds: u32,
+    /// Whether `tool_rounds` is a measurement at all on this runtime. False
+    /// means the count is structurally 0 and carries no information, so a
+    /// zero must not be reported as *no tool ran*.
+    tool_rounds_observable: bool,
     cycle_started_at: DateTime<Utc>,
 }
 
 impl<'a> WorkEvidence<'a> {
+    /// `tool_rounds_observable` is deliberately a required argument rather
+    /// than a defaulted builder step: a caller that forgets it is a caller
+    /// that silently reinstates the misleading message.
     #[must_use]
     pub fn new(
         root_dir: &'a Path,
         resolved_prediction_ids: &'a [String],
         tool_rounds: u32,
+        tool_rounds_observable: bool,
         cycle_started_at: DateTime<Utc>,
     ) -> Self {
         Self {
             root_dir,
             resolved_prediction_ids,
             tool_rounds,
+            tool_rounds_observable,
             cycle_started_at,
         }
     }
@@ -252,7 +318,12 @@ impl<'a> WorkEvidence<'a> {
                     rounds: self.tool_rounds,
                 });
             }
-            last = EvidenceRejection::NoToolRan(tool);
+            // A zero from a runtime that cannot count is not a zero.
+            last = if self.tool_rounds_observable {
+                EvidenceRejection::NoToolRan(tool)
+            } else {
+                EvidenceRejection::ToolRoundsUnobservable(tool)
+            };
         }
         Err(last)
     }
@@ -290,6 +361,11 @@ pub struct IngestRejection {
     pub thread_id: String,
     /// Human-readable reason, safe to echo.
     pub reason: String,
+    /// Whether the refusal is a fact about the claim or about the runtime.
+    /// Carried alongside the prose so a reader of the alert can separate
+    /// *bring better evidence* from *this rung does not work here* without
+    /// parsing the sentence.
+    pub side: RejectionSide,
 }
 
 /// Everything one pass of [`apply_markers`] did.
@@ -367,6 +443,20 @@ pub fn apply_cycle(
         .chain(report.resolved.iter().map(String::as_str))
         .collect();
     report.mentions = note_mentions(store, raw_output, &acted_on);
+
+    // Keep this cycle's refusals for the next prompt, so the pulse that
+    // emitted them is told. Overwrite, never append: a clean cycle clears
+    // the notice, so it can never latch into a stale alarm.
+    store.last_refusals = report
+        .rejections
+        .iter()
+        .map(|r| crate::tension::RefusalNotice {
+            marker: r.marker.to_string(),
+            thread_id: r.thread_id.clone(),
+            reason: truncate_chars(&r.reason, MAX_REASON_LEN),
+        })
+        .collect();
+
     report
 }
 
@@ -402,6 +492,7 @@ fn apply_markers(
                     marker: "THREAD-WORK",
                     thread_id: work.id,
                     reason: rejection.to_string(),
+                    side: rejection.side(),
                 });
                 continue;
             }
@@ -414,6 +505,7 @@ fn apply_markers(
                 marker: "THREAD-WORK",
                 thread_id: work.id,
                 reason: work_outcome_reason(other),
+                side: RejectionSide::ClaimantConduct,
             }),
         }
     }
@@ -421,11 +513,12 @@ fn apply_markers(
     for parsed in parse_resolutions(raw_output) {
         let verdict = match build_verdict(&parsed, evidence) {
             Ok(v) => v,
-            Err(reason) => {
+            Err((reason, side)) => {
                 report.rejections.push(IngestRejection {
                     marker: "THREAD-RESOLVE",
                     thread_id: parsed.id,
                     reason,
+                    side,
                 });
                 continue;
             }
@@ -435,12 +528,14 @@ fn apply_markers(
             ResolveOutcome::AlreadyResolved => report.rejections.push(IngestRejection {
                 marker: "THREAD-RESOLVE",
                 thread_id: parsed.id,
-                reason: "thread is already resolved".to_string(),
+                reason: "claim: thread is already resolved".to_string(),
+                side: RejectionSide::ClaimantConduct,
             }),
             ResolveOutcome::UnknownThread => report.rejections.push(IngestRejection {
                 marker: "THREAD-RESOLVE",
                 thread_id: parsed.id,
-                reason: "no thread with this id".to_string(),
+                reason: "claim: no thread with this id".to_string(),
+                side: RejectionSide::ClaimantConduct,
             }),
         }
     }
@@ -479,38 +574,45 @@ fn work_outcome_reason(outcome: WorkOutcome) -> String {
     }
 }
 
+/// Errors carry the side as well as the prose, so a resolution refused
+/// because this runtime cannot check a rung is not filed as a refusal of what
+/// the entity actually did.
 fn build_verdict(
     parsed: &ParsedResolution,
     evidence: &WorkEvidence<'_>,
-) -> Result<ResolutionVerdict, String> {
+) -> Result<ResolutionVerdict, (String, RejectionSide)> {
+    let conduct = |reason: String| (reason, RejectionSide::ClaimantConduct);
     match parsed.kind {
         ResolutionKind::Answered => evidence
             .verify(&parsed.claim)
             .map(ResolutionVerdict::Answered)
-            .map_err(|e| format!("'answered' claims work was done: {e}")),
+            .map_err(|e| (format!("'answered' claims work was done: {e}"), e.side())),
         ResolutionKind::Superseded => {
-            let by =
-                parsed.by.clone().filter(|s| !s.is_empty()).ok_or_else(|| {
-                    "'superseded' needs a 'by' naming what replaced it".to_string()
-                })?;
+            let by = parsed.by.clone().filter(|s| !s.is_empty()).ok_or_else(|| {
+                conduct("'superseded' needs a 'by' naming what replaced it".to_string())
+            })?;
             evidence
                 .verify(&parsed.claim)
                 .map(|artifact| ResolutionVerdict::Superseded { by, artifact })
-                .map_err(|e| format!("'superseded' claims work was done: {e}"))
+                .map_err(|e| (format!("'superseded' claims work was done: {e}"), e.side()))
         }
         ResolutionKind::Dissolved => parsed
             .reason
             .clone()
             .filter(|s| !s.is_empty())
             .map(|reason| ResolutionVerdict::Dissolved { reason })
-            .ok_or_else(|| "'dissolved' needs a reason the question was malformed".to_string()),
+            .ok_or_else(|| {
+                conduct("'dissolved' needs a reason the question was malformed".to_string())
+            }),
         ResolutionKind::Abandoned => parsed
             .reason
             .clone()
             .filter(|s| !s.is_empty())
             .map(|reason| ResolutionVerdict::Abandoned { reason })
             .ok_or_else(|| {
-                "'abandoned' needs a reason — a give-up is recorded, not erased".to_string()
+                conduct(
+                    "'abandoned' needs a reason — a give-up is recorded, not erased".to_string(),
+                )
             }),
     }
 }
@@ -926,13 +1028,25 @@ mod tests {
         TensionStore::with_config(TensionConfig::default())
     }
 
+    /// A runtime that *can* count tool rounds — the shape most of these tests
+    /// want, so that a 0 means "none ran" rather than "cannot tell".
     fn evidence<'a>(
         root: &'a Path,
         resolved: &'a [String],
         tool_rounds: u32,
         started: DateTime<Utc>,
     ) -> WorkEvidence<'a> {
-        WorkEvidence::new(root, resolved, tool_rounds, started)
+        WorkEvidence::new(root, resolved, tool_rounds, true, started)
+    }
+
+    /// A runtime that cannot: `tool_rounds` is structurally 0 and carries no
+    /// information. This is every `cli` adapter — the live configuration.
+    fn blind_evidence<'a>(
+        root: &'a Path,
+        resolved: &'a [String],
+        started: DateTime<Utc>,
+    ) -> WorkEvidence<'a> {
+        WorkEvidence::new(root, resolved, 0, false, started)
     }
 
     /// `apply_cycle` with no prediction stack and no automatic discharges —
@@ -1150,6 +1264,45 @@ mod tests {
         assert_eq!(report.mentions, 1, "a refused claim is still just talk");
     }
 
+    /// The refusal is owed to the actor, so `apply_cycle` must leave it on
+    /// the store for the next prompt to carry — and a clean cycle must clear
+    /// it, so the notice can never latch into a stale alarm.
+    #[test]
+    fn refusals_are_persisted_for_the_pulse_and_cleared_by_a_clean_cycle() {
+        let mut s = store();
+        let tmp = TempDir::new().unwrap();
+        let t0 = Utc::now();
+        s.open(
+            ThreadDraft {
+                label: "l".to_string(),
+                content: "c".to_string(),
+                origin: ThreadOrigin::UserRaised("d".to_string()),
+            },
+            t0,
+        );
+        let id = s.live().next().unwrap().id.clone();
+
+        let text = format!(r#"[THREAD-WORK:{{"id":"{id}"}}]"#);
+        apply_cycle_t(&mut s, &text, &evidence(tmp.path(), &[], 0, t0), t0);
+
+        assert_eq!(s.last_refusals.len(), 1, "the pulse is owed the notice");
+        assert_eq!(s.last_refusals[0].marker, "THREAD-WORK");
+        assert_eq!(s.last_refusals[0].thread_id, id);
+        assert!(s.last_refusals[0].reason.contains("no artifact named"));
+
+        // A cycle with nothing refused clears it: overwrite, never append.
+        apply_cycle_t(
+            &mut s,
+            "no markers here",
+            &evidence(tmp.path(), &[], 0, t0),
+            t0,
+        );
+        assert!(
+            s.last_refusals.is_empty(),
+            "a clean cycle must clear the notice, or it latches"
+        );
+    }
+
     #[test]
     fn file_diff_outside_the_journal_discharges() {
         let mut s = store();
@@ -1282,6 +1435,88 @@ mod tests {
                 .unwrap_err(),
             EvidenceRejection::NoToolRan(_)
         ));
+    }
+
+    /// A runtime that cannot count tool rounds must refuse on
+    /// the channel, not on the claimant. Same input, same zero count — only
+    /// the observability bit differs, and the verdict's *side* flips.
+    #[test]
+    fn an_unobservable_tool_count_is_refused_as_a_channel_limit_not_a_finding() {
+        let tmp = TempDir::new().unwrap();
+        let claim = EvidenceClaim {
+            tool: Some("grep".to_string()),
+            ..EvidenceClaim::default()
+        };
+
+        let blind = blind_evidence(tmp.path(), &[], Utc::now());
+        let rejection = blind.verify(&claim).unwrap_err();
+        assert_eq!(
+            rejection,
+            EvidenceRejection::ToolRoundsUnobservable("grep".to_string())
+        );
+        assert_eq!(rejection.side(), RejectionSide::ChannelCapability);
+
+        let sighted = evidence(tmp.path(), &[], 0, Utc::now());
+        let rejection = sighted.verify(&claim).unwrap_err();
+        assert_eq!(rejection, EvidenceRejection::NoToolRan("grep".to_string()));
+        assert_eq!(rejection.side(), RejectionSide::ClaimantConduct);
+    }
+
+    /// Blindness to tool rounds must not leak into the other two rungs: a
+    /// file diff still discharges on the live configuration.
+    #[test]
+    fn a_blind_runtime_still_verifies_the_file_and_prediction_rungs() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("tools/thing.py");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, "x").unwrap();
+        let started = Utc::now() - Duration::minutes(5);
+
+        let resolved = vec!["pred-1".to_string()];
+        let blind = blind_evidence(tmp.path(), &resolved, started);
+
+        assert!(matches!(
+            blind.verify(&EvidenceClaim {
+                file: Some("tools/thing.py".to_string()),
+                ..EvidenceClaim::default()
+            }),
+            Ok(WorkArtifact::FileDiff { .. })
+        ));
+        assert!(matches!(
+            blind.verify(&EvidenceClaim {
+                prediction: Some("pred-1".to_string()),
+                ..EvidenceClaim::default()
+            }),
+            Ok(WorkArtifact::ResolvedPrediction { .. })
+        ));
+    }
+
+    /// Every refusal names its side in the first word, so no message can be
+    /// read as the wrong kind of fact. This is the whole point of the change;
+    /// a message added later without a side prefix should fail here.
+    #[test]
+    fn every_rejection_message_names_its_side() {
+        let all = [
+            EvidenceRejection::NoEvidence,
+            EvidenceRejection::PathOutsidePulse("/etc/passwd".into()),
+            EvidenceRejection::PathInJournal("journal/FINDINGS.md".into()),
+            EvidenceRejection::FileMissing("nope.txt".into()),
+            EvidenceRejection::FileUnchanged("old.txt".into()),
+            EvidenceRejection::PredictionNotResolved("pred-9".into()),
+            EvidenceRejection::NoToolRan("grep".into()),
+            EvidenceRejection::ToolRoundsUnobservable("grep".into()),
+        ];
+        for rejection in all {
+            let rendered = rejection.to_string();
+            let expected = match rejection.side() {
+                RejectionSide::ClaimantConduct => "claim: ",
+                RejectionSide::ChannelCapability => "channel: ",
+            };
+            assert!(
+                rendered.starts_with(expected),
+                "{rejection:?} rendered as {rendered:?}, which does not name its side"
+            );
+        }
     }
 
     // ----- resolution markers ---------------------------------------------
