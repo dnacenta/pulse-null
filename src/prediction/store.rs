@@ -301,6 +301,76 @@ mod tests {
     }
 
     #[test]
+    fn roundtrip_keeps_the_error_text_snapshot() {
+        let tmp = TempDir::new().unwrap();
+        let mut stack = PredictionStack::new();
+        let id = stack
+            .add_prediction(Timescale::Cycle, "it will rain".to_string(), 0.9)
+            .id
+            .clone();
+        stack.resolve(
+            &id,
+            PredictionResolution {
+                actual: "clear skies".to_string(),
+                surprise: 0.8,
+                direction: ErrorDirection::Overconfident,
+                insight: None,
+            },
+        );
+
+        save(tmp.path(), &stack).unwrap();
+        let loaded = load(tmp.path(), PredictionConfig::default());
+
+        assert_eq!(loaded.errors[0].predicted.as_deref(), Some("it will rain"));
+        assert_eq!(loaded.errors[0].actual.as_deref(), Some("clear skies"));
+    }
+
+    /// A `predictions.json` written before error records carried a text
+    /// snapshot must load intact. A deserialize failure here is not a soft
+    /// miss: `load` treats it as corruption and starts from an empty stack,
+    /// which the next save would then write over the live file.
+    #[test]
+    fn loads_error_records_written_before_the_text_snapshot() {
+        let tmp = TempDir::new().unwrap();
+        let legacy = r#"{
+            "predictions": [{
+                "id": "0b0e5f4e-1111-4222-8333-944455556666",
+                "timescale": "cycle",
+                "content": "the queue drains",
+                "confidence": 0.7,
+                "created_at": "2026-08-19T10:00:00Z",
+                "resolved_at": "2026-08-19T11:00:00Z",
+                "resolution": {
+                    "actual": "it grew",
+                    "surprise": 0.8,
+                    "direction": "overconfident",
+                    "insight": null
+                }
+            }],
+            "errors": [{
+                "prediction_id": "0b0e5f4e-1111-4222-8333-944455556666",
+                "surprise": 0.8,
+                "direction": "overconfident",
+                "insight": "queue model is wrong",
+                "created_at": "2026-08-19T11:00:00Z",
+                "processed": false
+            }]
+        }"#;
+        fs::write(tmp.path().join(PREDICTIONS_FILE), legacy).unwrap();
+
+        let loaded = load(tmp.path(), PredictionConfig::default());
+
+        assert_eq!(loaded.predictions.len(), 1);
+        assert_eq!(loaded.errors.len(), 1);
+        assert!(loaded.errors[0].predicted.is_none());
+        assert!(loaded.errors[0].actual.is_none());
+        assert_eq!(
+            loaded.errors[0].insight.as_deref(),
+            Some("queue model is wrong")
+        );
+    }
+
+    #[test]
     fn load_handles_corrupt_json() {
         let tmp = TempDir::new().unwrap();
         fs::write(tmp.path().join(PREDICTIONS_FILE), "not valid json {{{").unwrap();
