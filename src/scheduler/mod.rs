@@ -624,6 +624,52 @@ mod tests {
         assert_eq!(residual[0].0, "CURIOSITY");
     }
 
+    fn write_entries(journal: &std::path::Path, file: &str, entries: usize) {
+        let body = (1..=entries)
+            .map(|i| format!("## Entry {i}\n\nContent {i}.\n"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        std::fs::write(journal.join(file), format!("# Doc\n\nPreamble.\n\n{body}")).unwrap();
+    }
+
+    /// End to end against the real archiver, in the order both call sites use
+    /// (`check_and_archive` → `post_archive_health` → residual): a document the
+    /// sweep brings under its limit stays silent, while one that halving
+    /// leaves over the limit still alerts with its post-archive count.
+    #[test]
+    fn real_archive_sweep_alerts_only_on_the_residual() {
+        use pulse_system_types::monitoring::PipelineMonitor;
+
+        let dir = TempDir::new().unwrap();
+        let journal = dir.path().join("journal");
+        std::fs::create_dir_all(&journal).unwrap();
+        // LEARNING hard = 8: 8 entries halve to 4, cured.
+        write_entries(&journal, "LEARNING.md", 8);
+        // PRAXIS hard = 10: 25 entries halve to 13, still Red.
+        write_entries(&journal, "PRAXIS.md", 25);
+
+        let monitor = crate::praxis::runtime::PraxisMonitor::new();
+        let thresholds = crate::config::PipelineConfig::default().to_thresholds();
+        let pre = monitor.calculate(dir.path(), &thresholds);
+        let pre_red: Vec<_> = pipeline_alert_residual(&pre)
+            .into_iter()
+            .map(|(name, ..)| name)
+            .collect();
+        assert_eq!(pre_red, vec!["LEARNING", "PRAXIS"]);
+
+        let archived = monitor.check_and_archive(dir.path(), &thresholds, &pre);
+        assert_eq!(archived, vec!["LEARNING.md", "PRAXIS.md"]);
+
+        let post = post_archive_health(pre, &archived, || {
+            monitor.calculate(dir.path(), &thresholds)
+        });
+        assert_eq!(
+            pipeline_alert_residual(&post),
+            vec![("PRAXIS", 13, 10)],
+            "only the document the archiver could not cure may alert"
+        );
+    }
+
     /// MEDIUM-3 regression: concurrent save_delta callers must not lose
     /// updates (load-apply-save is serialized by the static mutex + flock).
     #[test]
