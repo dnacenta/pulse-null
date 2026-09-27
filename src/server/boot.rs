@@ -106,6 +106,7 @@ pub async fn boot_pulse(
         provider_status: crate::provider_status::new_shared(),
         leadership: std::sync::atomic::AtomicBool::new(false),
         event_permits: crate::server::stream_pools().0,
+        comms_permits: crate::server::comms_pool(),
         chat_permits: crate::server::stream_pools().1,
         comms: crate::comms::Slot::new(),
         ledger: Arc::new(crate::ledger::LedgerRing::new(

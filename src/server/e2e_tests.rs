@@ -292,6 +292,7 @@ async fn build_state_boxed_with_config(
         provider_status: crate::provider_status::new_shared(),
         leadership: std::sync::atomic::AtomicBool::new(false),
         event_permits: crate::server::stream_pools().0,
+        comms_permits: crate::server::comms_pool(),
         chat_permits: crate::server::stream_pools().1,
         comms: crate::comms::Slot::new(),
         graph_extractor: None,
@@ -2055,6 +2056,37 @@ mod comms_e2e {
         let st: serde_json::Value = serde_json::from_str(&body).unwrap();
         assert_eq!(st["phase"], "finished");
         assert_eq!(st["turn"], 6);
+    }
+
+    /// Watchers draw on their own pool: a full comms pool answers 503 with a
+    /// JSON error and leaves the event-stream pool untouched.
+    #[tokio::test]
+    async fn e2e_comms_watchers_have_their_own_pool() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = state_in(dir.path()).await;
+        let app = build_app(Arc::clone(&state));
+        let (port, _) = fake_peer(false, 1500).await;
+        let (status, body) = post_json(&app, "/api/comms", start_body(port, 6)).await;
+        assert_eq!(status, StatusCode::ACCEPTED, "{body}");
+        let id = body["id"].as_str().unwrap().to_string();
+        let _held: Vec<_> = (0..crate::server::MAX_COMMS_STREAMS)
+            .map(|_| {
+                Arc::clone(&state.comms_permits)
+                    .try_acquire_owned()
+                    .unwrap()
+            })
+            .collect();
+        let (status, text) = get_text(&app, &format!("/api/comms/{id}/stream")).await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{text}");
+        assert!(text.contains("watchers"), "{text}");
+        assert_eq!(
+            state.event_permits.available_permits(),
+            crate::server::MAX_EVENT_STREAMS,
+            "the event pool is not touched"
+        );
+        let (status, text) = get_text(&app, "/api/comms/nope/stream").await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert!(text.contains("error"), "JSON error like the others: {text}");
     }
 
     #[tokio::test]

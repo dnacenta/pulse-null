@@ -136,17 +136,29 @@ fn sse(ev: &CommsEvent) -> Event {
 }
 
 /// `GET /api/comms/{id}/stream` — the turns so far, then live, until the
-/// dialogue ends. Capped by the event-stream pool.
+/// dialogue ends. Capped by the comms watcher pool.
 pub async fn stream(
     State(state): State<Arc<AppState>>,
     axum::Extension(who): axum::Extension<AuthIdentity>,
     Path(id): Path<String>,
-) -> Result<Sse<impl Stream<Item = Result<Event, Infallible>>>, StatusCode> {
-    who.require_owner()?;
-    let dialogue = state.comms.get(&id).ok_or(StatusCode::NOT_FOUND)?;
-    let permit = Arc::clone(&state.event_permits)
+) -> Result<Sse<impl Stream<Item = Result<Event, Infallible>>>, (StatusCode, Json<serde_json::Value>)>
+{
+    owner(&who)?;
+    let dialogue = state
+        .comms
+        .get(&id)
+        .ok_or_else(|| err(StatusCode::NOT_FOUND, "no dialogue with that id"))?;
+    let permit = Arc::clone(&state.comms_permits)
         .try_acquire_owned()
-        .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
+        .map_err(|_| {
+            err(
+                StatusCode::SERVICE_UNAVAILABLE,
+                format!(
+                    "too many watchers ({} max)",
+                    crate::server::MAX_COMMS_STREAMS
+                ),
+            )
+        })?;
     let (turns, over, mut live) = dialogue.subscribe();
     let status = dialogue.status();
     let events = async_stream::stream! {
@@ -177,7 +189,26 @@ pub async fn stream(
                         return;
                     }
                 }
-                Err(RecvError::Lagged(_)) => continue,
+                Err(RecvError::Lagged(_)) => {
+                    // Behind the ring: re-snapshot and replay what this
+                    // watcher missed, in order, instead of dropping turns.
+                    let (turns, over, fresh) = dialogue.subscribe();
+                    live = fresh;
+                    let missed: Vec<_> = turns.into_iter().filter(|t| t.n > last_n).collect();
+                    for t in missed {
+                        last_n = t.n;
+                        yield Ok(sse(&CommsEvent::Turn { who: t.who, text: t.text, n: t.n }));
+                    }
+                    let status = dialogue.status();
+                    yield Ok(sse(&CommsEvent::Status(status.clone())));
+                    if over {
+                        yield Ok(sse(&match &status.error {
+                            Some(message) => CommsEvent::Error { message: message.clone() },
+                            None => CommsEvent::Done,
+                        }));
+                        return;
+                    }
+                }
                 Err(RecvError::Closed) => return,
             }
         }

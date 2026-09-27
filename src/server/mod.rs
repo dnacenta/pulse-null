@@ -68,6 +68,9 @@ pub struct AppState {
     pub chat_permits: Arc<tokio::sync::Semaphore>,
     /// The one peer-to-peer dialogue this daemon runs at a time (PN-123).
     pub comms: crate::comms::Slot,
+    /// Cap on open `/api/comms/{id}/stream` watchers — its own pool, so a
+    /// watched dialogue never refuses an `/api/events` client.
+    pub comms_permits: Arc<tokio::sync::Semaphore>,
     /// Background entity extraction for freshly ingested archives; `None`
     /// when `[graph]` turns it off.
     pub graph_extractor: Option<crate::graph_extract::GraphExtractor>,
@@ -77,6 +80,15 @@ pub struct AppState {
 pub const MAX_EVENT_STREAMS: usize = 4;
 /// Concurrent `/api/chat/stream` turns before a 503.
 pub const MAX_CHAT_STREAMS: usize = 4;
+
+/// Concurrent `/api/comms/{id}/stream` watchers before a 503.
+pub const MAX_COMMS_STREAMS: usize = 2;
+
+/// The comms watcher pool.
+#[must_use]
+pub fn comms_pool() -> Arc<tokio::sync::Semaphore> {
+    Arc::new(tokio::sync::Semaphore::new(MAX_COMMS_STREAMS))
+}
 
 /// The two stream pools, sized by the constants above.
 #[must_use]
@@ -341,6 +353,7 @@ pub async fn start_in(
         provider_status: crate::provider_status::new_shared(),
         leadership: std::sync::atomic::AtomicBool::new(false),
         event_permits: crate::server::stream_pools().0,
+        comms_permits: crate::server::comms_pool(),
         chat_permits: crate::server::stream_pools().1,
         comms: crate::comms::Slot::new(),
         ledger,
