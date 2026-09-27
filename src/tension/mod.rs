@@ -778,13 +778,20 @@ impl TensionStore {
         thread.resolution = Some(resolution);
         thread.resolution_reason = reason;
 
-        // Retiring a thread may satisfy an outstanding cap obligation.
-        if self
-            .triage
-            .as_ref()
-            .is_some_and(|_| self.live_count() <= self.config.max_live_threads)
-        {
-            self.triage = None;
+        // Retiring a thread may satisfy an outstanding cap obligation. If it
+        // does not, the demand *survives* — and a surviving demand must be
+        // retaken, not left as it was. The persisted snapshot carries both the
+        // candidate list and the live count from the moment it was raised, so
+        // leaving it untouched means the next prompt offers threads that are
+        // already retired and prints a live count that disagrees with the
+        // store's own. Re-raise it against the current state instead.
+        if self.triage.is_some() {
+            let live_count = self.live_count();
+            if live_count <= self.config.max_live_threads {
+                self.triage = None;
+            } else {
+                self.raise_triage(live_count, now);
+            }
         }
         ResolveOutcome::Resolved
     }
@@ -876,8 +883,13 @@ impl TensionStore {
                 age_hours: t.age_hours(now),
             })
             .collect();
+        // A refreshed obligation keeps its original clock. The demand is
+        // continuous until it is *discharged*, so resetting `raised_at` on
+        // every refresh would make a demand that is never met read as
+        // perpetually new — and `raised_at` is exactly what the alert reports.
+        let raised_at = self.triage.as_ref().map_or(now, |demand| demand.raised_at);
         self.triage = Some(TriageDemand {
-            raised_at: now,
+            raised_at,
             live_count,
             cap: self.config.max_live_threads,
             candidates,
@@ -1428,6 +1440,114 @@ mod tests {
             t0,
         );
         assert!(s.triage.is_none());
+    }
+
+    /// A demand that *survives* a retirement has to be retaken. Left as it was,
+    /// it goes on offering a thread that has already been retired — the prompt
+    /// then asks the entity to spend its one retirement on a dead id.
+    #[test]
+    fn surviving_triage_demand_drops_the_retired_thread_from_its_candidates() {
+        let mut s = TensionStore::with_config(TensionConfig {
+            max_live_threads: 2,
+            ..config()
+        });
+        let t0 = Utc::now();
+        for i in 0..5 {
+            open(&mut s, &format!("thread-{i}"), t0);
+        }
+        let named = s
+            .triage
+            .as_ref()
+            .expect("cap must raise a demand")
+            .candidates[0]
+            .id
+            .clone();
+
+        s.resolve(
+            &named,
+            ResolutionVerdict::Abandoned {
+                reason: "triaged".to_string(),
+            },
+            t0,
+        );
+
+        // Still over cap, so the obligation stands — but not on that thread.
+        let demand = s.triage.as_ref().expect("still over cap: demand survives");
+        assert!(
+            !demand.candidates.iter().any(|c| c.id == named),
+            "retired thread {named} is still offered as a triage candidate"
+        );
+        assert!(
+            s.threads
+                .iter()
+                .find(|t| t.id == named)
+                .is_some_and(|t| !t.is_live()),
+            "the thread the demand stopped naming must actually be retired"
+        );
+    }
+
+    /// The prompt prints the demand's `live_count` next to a header counting the
+    /// store. A stale snapshot makes the two disagree.
+    #[test]
+    fn surviving_triage_demand_reports_the_current_live_count() {
+        let mut s = TensionStore::with_config(TensionConfig {
+            max_live_threads: 2,
+            ..config()
+        });
+        let t0 = Utc::now();
+        let mut ids = Vec::new();
+        for i in 0..5 {
+            ids.push(open(&mut s, &format!("thread-{i}"), t0));
+        }
+        assert_eq!(s.triage.as_ref().expect("demand").live_count, 5);
+
+        s.resolve(
+            &ids[0],
+            ResolutionVerdict::Answered(WorkArtifact::ToolResult {
+                tool: "cargo".to_string(),
+                rounds: 1,
+            }),
+            t0,
+        );
+
+        let reported = s.triage.as_ref().expect("demand survives").live_count;
+        assert_eq!(
+            reported,
+            s.live_count(),
+            "demand.live_count must match the store it describes"
+        );
+        assert_eq!(reported, 4);
+    }
+
+    /// Refreshing is not re-raising: the obligation's clock is what says how
+    /// long it has stood unanswered, and the alert reports it.
+    #[test]
+    fn refreshing_a_surviving_demand_keeps_its_original_clock() {
+        let mut s = TensionStore::with_config(TensionConfig {
+            max_live_threads: 2,
+            ..config()
+        });
+        let t0 = Utc::now();
+        let mut ids = Vec::new();
+        for i in 0..5 {
+            ids.push(open(&mut s, &format!("thread-{i}"), t0));
+        }
+        let raised_at = s.triage.as_ref().expect("demand").raised_at;
+
+        let later = t0 + chrono::Duration::hours(9);
+        s.resolve(
+            &ids[0],
+            ResolutionVerdict::Abandoned {
+                reason: "triaged".to_string(),
+            },
+            later,
+        );
+
+        assert_eq!(
+            s.triage.as_ref().expect("demand survives").raised_at,
+            raised_at,
+            "a refreshed demand must not reset the clock on an undischarged obligation"
+        );
     }
 
     #[test]
