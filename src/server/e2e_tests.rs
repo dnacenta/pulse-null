@@ -1871,6 +1871,74 @@ mod comms_e2e {
         assert_eq!(status, StatusCode::ACCEPTED);
     }
 
+    /// Isolation entered under a running dialogue ends it before the next
+    /// turn, and its ending writes nothing (H1: nothing that writes).
+    #[tokio::test]
+    async fn e2e_comms_isolation_sheds_a_running_dialogue_and_its_archive() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = state_in(dir.path()).await;
+        let app = build_app(Arc::clone(&state));
+        let (port, _) = fake_peer(false, 300).await;
+        let (status, body) = post_json(&app, "/api/comms", start_body(port, 6)).await;
+        assert_eq!(status, StatusCode::ACCEPTED, "{body}");
+        let id = body["id"].as_str().unwrap().to_string();
+        // The opener lands; the slow peer holds the dialogue in peer_thinking.
+        for _ in 0..40 {
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+            let (_, body) = get_text(&app, "/api/comms").await;
+            let st: serde_json::Value = serde_json::from_str(&body).unwrap();
+            if st["turn"].as_u64().unwrap_or(0) >= 1 {
+                break;
+            }
+        }
+        crate::server::isolation::enter(dir.path(), "test", None).unwrap();
+        let (_, text) = get_text(&app, &format!("/api/comms/{id}/stream")).await;
+        let fr = frames(&text);
+        assert_eq!(fr.last().unwrap().0, "error", "{text}");
+        assert!(
+            fr.last().unwrap().1["message"]
+                .as_str()
+                .unwrap()
+                .contains("isolation"),
+            "{text}"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        assert!(
+            archived_dialogues(dir.path()).is_empty(),
+            "no archive while isolated"
+        );
+        crate::server::isolation::exit(dir.path()).unwrap();
+    }
+
+    /// The daemon's shutdown stops a running dialogue and waits for its
+    /// archive, so no provider or peer call outlives the drain.
+    #[tokio::test]
+    async fn e2e_comms_shutdown_stops_and_archives_the_dialogue() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = state_in(dir.path()).await;
+        let app = build_app(Arc::clone(&state));
+        let (port, _) = fake_peer(false, 1500).await;
+        let (status, body) = post_json(&app, "/api/comms", start_body(port, 6)).await;
+        assert_eq!(status, StatusCode::ACCEPTED, "{body}");
+        for _ in 0..40 {
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+            let (_, body) = get_text(&app, "/api/comms").await;
+            let st: serde_json::Value = serde_json::from_str(&body).unwrap();
+            if st["turn"].as_u64().unwrap_or(0) >= 1 {
+                break;
+            }
+        }
+        state.comms.shutdown().await;
+        let (_, body) = get_text(&app, "/api/comms").await;
+        let st: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(st["phase"], "cancelled");
+        assert_eq!(
+            archived_dialogues(dir.path()).len(),
+            1,
+            "archived before shutdown returned"
+        );
+    }
+
     #[tokio::test]
     async fn e2e_comms_retries_a_rate_limited_peer() {
         let dir = tempfile::tempdir().unwrap();

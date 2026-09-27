@@ -12,6 +12,7 @@
 use std::sync::{Arc, Mutex};
 
 use pulse_system_types::llm::{Message, MessageContent, MessageSource, Role};
+use tokio::sync::broadcast::error::RecvError;
 use tokio::sync::{broadcast, watch};
 
 use crate::config::PeerConfig;
@@ -25,6 +26,10 @@ use crate::wire::{CommsEvent, CommsStatus};
 /// Turn cap when the request names none, and the most a request may ask for.
 pub const DEFAULT_MAX_TURNS: u32 = 20;
 pub const MAX_MAX_TURNS: u32 = 50;
+/// How long shutdown waits for a stopped dialogue's ending.
+const SHUTDOWN_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
+/// The ending a dialogue gets when isolation mode starts underneath it.
+pub const SHED_BY_ISOLATION: &str = "shed by isolation mode";
 
 /// Where a dialogue is.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -217,6 +222,38 @@ impl Slot {
     pub fn get(&self, id: &str) -> Option<Arc<Dialogue>> {
         self.current().filter(|d| d.id == id)
     }
+
+    /// Stop the running dialogue (if any) and wait for its ending to be
+    /// archived — the daemon's shutdown sequence, before the drain, so no
+    /// provider or peer call outlives the scheduler's.
+    pub async fn shutdown(&self) {
+        let Some(d) = self.current().filter(|d| !d.is_over()) else {
+            return;
+        };
+        let (_, over, mut live) = d.subscribe();
+        if over {
+            return;
+        }
+        tracing::info!("[comms] shutdown — stopping dialogue {}", d.id);
+        d.stop();
+        let ended = async {
+            loop {
+                match live.recv().await {
+                    Ok(CommsEvent::Done | CommsEvent::Error { .. }) | Err(RecvError::Closed) => {
+                        break
+                    }
+                    Ok(_) | Err(RecvError::Lagged(_)) => continue,
+                }
+            }
+        };
+        if tokio::time::timeout(SHUTDOWN_WAIT, ended).await.is_err() {
+            tracing::warn!(
+                "[comms] dialogue {} did not end within {:?}",
+                d.id,
+                SHUTDOWN_WAIT
+            );
+        }
+    }
 }
 
 /// Start a dialogue with `req.peer` in this daemon. Returns its id.
@@ -376,6 +413,16 @@ fn archive(
     messages: &[(String, String)],
     trust: &ConversationTrust,
 ) {
+    // Nothing that writes while isolated (spec Stage 2): no archive, no
+    // logbook, no event, no ingest — the same shedding shutdown applies.
+    if crate::server::isolation::is_active(&state.root_dir) {
+        tracing::warn!(
+            "[comms] dialogue {} ended during ISOLATION — archive shed ({} turns)",
+            d.id,
+            messages.len()
+        );
+        return;
+    }
     if messages.is_empty() {
         tracing::info!(
             "[comms] dialogue {} ended with no turns; nothing to archive",
@@ -495,6 +542,19 @@ async fn run(
         true
     }
 
+    // Isolation mode started underneath us: end here, before another
+    // provider or peer call. Checked before every turn.
+    fn shed(state: &AppState, d: &Dialogue) -> bool {
+        if crate::server::isolation::is_active(&state.root_dir) {
+            d.set_phase(Phase::Failed(SHED_BY_ISOLATION.to_string()));
+            return true;
+        }
+        false
+    }
+
+    if shed(&state, &d) {
+        return;
+    }
     d.set_phase(Phase::LocalThinking);
     let mut last = match local_turn(
         provider,
@@ -514,7 +574,7 @@ async fn run(
     let mut turn = d.push_turn(&d.local, &last);
 
     while turn < d.max_turns {
-        if !gate(&mut pause_rx).await {
+        if !gate(&mut pause_rx).await || shed(&state, &d) {
             return;
         }
         d.set_phase(Phase::PeerThinking);
@@ -529,7 +589,7 @@ async fn run(
         if turn >= d.max_turns {
             break;
         }
-        if !gate(&mut pause_rx).await {
+        if !gate(&mut pause_rx).await || shed(&state, &d) {
             return;
         }
         conversation.push(Message {

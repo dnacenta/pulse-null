@@ -462,6 +462,9 @@ pub async fn start_in(
     //    directly and may hold long-running LLM requests) and releases the
     //    control-plane lease so a successor need not wait out the ttl.
     coordinator.shutdown().await;
+    // The peer dialogue is the other long-running caller: stop it and let
+    // its ending archive (or shed, when isolated) before the drain.
+    state.comms.shutdown().await;
 
     // 2. Stop plugins (Discord bot, etc.) so they stop generating new requests.
     state.plugin_manager.lock().await.stop_all().await;
