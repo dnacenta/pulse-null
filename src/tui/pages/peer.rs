@@ -13,6 +13,22 @@ use ratatui::Frame;
 
 use crate::wire::{CommsEvent, CommsStatus};
 
+/// What the loop's watch task reports: a daemon event, or something that
+/// happened to the watch itself — none of which means the dialogue ended.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Watch {
+    Event(CommsEvent),
+    /// The daemon refused to start (nothing runs, nothing is archived).
+    StartFailed(String),
+    /// Attached to a dialogue that was already running.
+    Attached,
+    /// The stream broke or closed without an ending; the dialogue may
+    /// still be running in the daemon.
+    Lost(String),
+    /// A pause/resume/stop request failed.
+    Notice(String),
+}
+
 use super::super::pane;
 use super::super::theme::Tokens;
 use super::super::transcript::{Transcript, Who};
@@ -38,6 +54,8 @@ pub struct Peer {
     pub ended: Option<Result<(), String>>,
     /// Before the daemon answered the start.
     pub starting: bool,
+    /// The watch broke before an ending: no spinner, no claims.
+    pub lost: bool,
     spinner: u64,
 }
 
@@ -51,14 +69,16 @@ impl Peer {
             status: None,
             ended: None,
             starting: true,
+            lost: false,
             spinner: 0,
         }
     }
 
-    /// Whether a turn is in flight (border breathes).
+    /// Whether a turn is in flight (the spinner runs).
     #[must_use]
     pub fn active(&self) -> bool {
         self.ended.is_none()
+            && !self.lost
             && (self.starting
                 || self
                     .status
@@ -79,6 +99,32 @@ impl Peer {
 
     pub fn tick(&mut self) {
         self.spinner = self.spinner.wrapping_add(1);
+    }
+
+    /// A one-line notice in the transcript.
+    pub fn notice(&mut self, text: &str) {
+        self.transcript.push_notice(text);
+    }
+
+    /// One report from the watch task.
+    pub fn on_watch(&mut self, w: Watch) {
+        match w {
+            Watch::Event(ev) => self.on_event(ev),
+            Watch::Attached => self.notice("a dialogue was already running — attached"),
+            Watch::StartFailed(why) => {
+                self.starting = false;
+                self.lost = true;
+                self.notice(&format!("could not start: {why}"));
+            }
+            Watch::Lost(why) => {
+                self.starting = false;
+                self.lost = true;
+                self.notice(&format!(
+                    "watch lost: {why} — the dialogue may still be running; q, then Enter on the pair re-attaches"
+                ));
+            }
+            Watch::Notice(text) => self.notice(&text),
+        }
     }
 
     /// One frame of the stream.
@@ -116,7 +162,10 @@ impl Peer {
             (KeyCode::Char(' '), false) if self.ended.is_none() && !self.starting => {
                 PeerAction::Pause(!self.paused())
             }
-            (KeyCode::Char('c'), true) if self.ended.is_none() => PeerAction::StopRequested,
+            (KeyCode::Char('c'), true) if self.ended.is_none() && self.status.is_some() => {
+                PeerAction::StopRequested
+            }
+            (KeyCode::Char('c'), true) if self.starting => PeerAction::None,
             (KeyCode::Char('c'), true) | (KeyCode::Char('q'), false) | (KeyCode::Esc, false) => {
                 PeerAction::Back
             }
@@ -163,6 +212,12 @@ impl Peer {
             return Line::default();
         };
         let count = format!("turn {}/{}", s.turn, s.max_turns);
+        if self.lost && !s.phase_is_over() {
+            return Line::from(vec![
+                Span::styled("○".to_string(), Style::default().fg(t.warn)),
+                Span::styled(format!(" {count} · watch lost"), dim),
+            ]);
+        }
         let (dot, color, what) = match s.phase.as_str() {
             "local_thinking" => (spin, t.pulse, format!("{} thinking…", self.local)),
             "peer_thinking" => (spin, t.intent, format!("{} thinking…", self.peer)),
@@ -293,12 +348,39 @@ mod tests {
     }
 
     #[test]
+    fn a_lost_watch_or_failed_start_never_claims_an_ending() {
+        let mut p = Peer::new("Echo", "Synth");
+        p.on_watch(Watch::StartFailed("409".into()));
+        assert!(!p.active() && p.ended.is_none());
+        let last = p.transcript.entries().last().unwrap();
+        assert!(last.text.contains("could not start") && !last.text.contains("archived"));
+
+        let mut p = Peer::new("Echo", "Synth");
+        p.on_event(CommsEvent::Status(status("peer_thinking", 2)));
+        p.on_watch(Watch::Lost("connection reset".into()));
+        assert!(!p.active(), "no spinner after the watch broke");
+        assert!(p.ended.is_none(), "the dialogue may still run");
+        assert!(p
+            .transcript
+            .entries()
+            .last()
+            .unwrap()
+            .text
+            .contains("re-attaches"));
+    }
+
+    #[test]
     fn keys_pause_stop_and_leave() {
         let mut p = Peer::new("Echo", "Synth");
         assert_eq!(
             p.on_key(key(KeyCode::Char(' '))),
             PeerAction::None,
             "nothing to pause yet"
+        );
+        assert_eq!(
+            p.on_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL)),
+            PeerAction::None,
+            "no id to stop yet"
         );
         p.on_event(CommsEvent::Status(status("local_thinking", 1)));
         assert_eq!(p.on_key(key(KeyCode::Char(' '))), PeerAction::Pause(true));

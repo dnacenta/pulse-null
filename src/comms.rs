@@ -24,8 +24,7 @@ use crate::tool_loop;
 use crate::wire::{CommsEvent, CommsStatus};
 
 /// Turn cap when the request names none, and the most a request may ask for.
-pub const DEFAULT_MAX_TURNS: u32 = 20;
-pub const MAX_MAX_TURNS: u32 = 50;
+pub use crate::wire::{DEFAULT_MAX_TURNS, MAX_TURNS_LIMIT};
 /// How long shutdown waits for a stopped dialogue's ending.
 const SHUTDOWN_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
 /// The ending a dialogue gets when isolation mode starts underneath it.
@@ -320,7 +319,7 @@ pub fn start(state: &Arc<AppState>, req: StartRequest) -> Result<String, StartEr
         local,
         peer: req.peer.clone(),
         topic: req.topic.clone(),
-        max_turns: req.max_turns.clamp(1, MAX_MAX_TURNS),
+        max_turns: req.max_turns.clamp(1, MAX_TURNS_LIMIT),
         inner: Mutex::new(Inner {
             turns: Vec::new(),
             phase: Phase::LocalThinking,

@@ -283,7 +283,7 @@ impl CommsSetup {
             a: a.to_string(),
             b: b.to_string(),
             topic: Prompt::new(),
-            max_turns: crate::comms::DEFAULT_MAX_TURNS,
+            max_turns: crate::wire::DEFAULT_MAX_TURNS,
         }
     }
 
@@ -299,11 +299,11 @@ impl CommsSetup {
                     max_turns: self.max_turns,
                 })
             }
-            (KeyCode::Up, _) | (KeyCode::Char('+'), false) => {
-                self.max_turns = (self.max_turns + 5).min(crate::comms::MAX_MAX_TURNS);
+            (KeyCode::Up, _) => {
+                self.max_turns = (self.max_turns + 5).min(crate::wire::MAX_TURNS_LIMIT);
                 FloatAction::None
             }
-            (KeyCode::Down, _) | (KeyCode::Char('-'), false) => {
+            (KeyCode::Down, _) => {
                 self.max_turns = self.max_turns.saturating_sub(5).max(1);
                 FloatAction::None
             }
@@ -378,7 +378,7 @@ impl CommsSetup {
         );
         frame.render_widget(
             Paragraph::new(Line::from(Span::styled(
-                "  Enter start (empty topic = free talk) · Esc cancel",
+                "  Enter start (empty topic = free talk) · ↑/↓ turn cap · Esc cancel",
                 Style::default().fg(t.dim),
             ))),
             rows[4],

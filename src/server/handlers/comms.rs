@@ -66,10 +66,10 @@ pub async fn start(
         (Some(_), None) => return Err(err(StatusCode::BAD_REQUEST, "a host needs a port")),
     };
     let max_turns = req.max_turns.unwrap_or(comms::DEFAULT_MAX_TURNS);
-    if max_turns == 0 || max_turns > comms::MAX_MAX_TURNS {
+    if max_turns == 0 || max_turns > comms::MAX_TURNS_LIMIT {
         return Err(err(
             StatusCode::BAD_REQUEST,
-            format!("max_turns must be 1–{}", comms::MAX_MAX_TURNS),
+            format!("max_turns must be 1–{}", comms::MAX_TURNS_LIMIT),
         ));
     }
     let topic = req

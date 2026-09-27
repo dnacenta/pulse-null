@@ -277,9 +277,6 @@ impl App {
     /// Periodic tick from the loop (spinner, aurora).
     pub fn tick(&mut self) {
         self.tick = self.tick.wrapping_add(1);
-        if self.screen == Screen::Peer {
-            self.peer.tick();
-        }
         if matches!(self.screen, Screen::Boot | Screen::Home) {
             self.boot.tick();
         }
@@ -314,7 +311,7 @@ impl App {
                     if let Some(running) = self.home.running_dialogue(i) {
                         return Action::CommsAttach {
                             pair: i,
-                            id: running.id.clone(),
+                            id: running.status.id.clone(),
                         };
                     }
                     let (a, b) = (self.home.pairs[i].a, self.home.pairs[i].b);
@@ -365,11 +362,7 @@ impl App {
                 PeerAction::None => Action::None,
                 PeerAction::Pause(p) => Action::PeerPause(p),
                 PeerAction::StopRequested => {
-                    self.open_float(Float::Confirm(Confirm {
-                        question: "Stop the dialogue? The turns so far are archived.".to_string(),
-                        yes: "stop",
-                        then: Command::PeerStop,
-                    }));
+                    self.confirm_peer_stop();
                     Action::None
                 }
                 PeerAction::Back => Action::Home,
@@ -558,11 +551,7 @@ impl App {
                 if confirmed {
                     Action::PeerStop
                 } else {
-                    self.open_float(Float::Confirm(Confirm {
-                        question: "Stop the dialogue? The turns so far are archived.".to_string(),
-                        yes: "stop",
-                        then: Command::PeerStop,
-                    }));
+                    self.confirm_peer_stop();
                     Action::None
                 }
             }
@@ -592,7 +581,14 @@ impl App {
         }
     }
 
-    /// A one-line notice where the user is looking.
+    fn confirm_peer_stop(&mut self) {
+        self.open_float(Float::Confirm(Confirm {
+            question: "Stop the dialogue? The turns so far are archived.".to_string(),
+            yes: "stop",
+            then: Command::PeerStop,
+        }));
+    }
+
     /// Names `:comms` can complete: the pulses Home saw up, minus the one
     /// open on Talk.
     fn comms_peers(&self) -> Vec<String> {
@@ -604,10 +600,11 @@ impl App {
             .collect()
     }
 
+    /// A one-line notice where the user is looking.
     pub(super) fn notice(&mut self, text: &str) {
         match self.screen {
             Screen::Talk | Screen::Boot => self.talk.notice(text),
-            Screen::Peer => self.peer.transcript.push_notice(text),
+            Screen::Peer => self.peer.notice(text),
             Screen::Home => self.home.notice = Some(text.to_string()),
         }
     }
@@ -666,7 +663,7 @@ impl App {
             (_, _, Some(Float::CmdLine(_))) => Context::CmdLine,
             (_, _, Some(Float::Confirm(_))) => Context::Confirm,
             (_, _, Some(Float::Help(_))) => Context::Help,
-            (_, _, Some(Float::CommsSetup(_))) => Context::Confirm,
+            (_, _, Some(Float::CommsSetup(_))) => Context::CommsSetup,
             (Screen::Boot, _, None) => Context::Boot,
             (Screen::Home, _, None) => Context::Home,
             (Screen::Peer, _, None) => Context::Peer {

@@ -100,6 +100,11 @@ impl CognitiveStatus {
 // Peer-to-peer dialogue (PN-123)
 // ---------------------------------------------------------------------------
 
+/// Turns a dialogue runs when the request names no cap.
+pub const DEFAULT_MAX_TURNS: u32 = 20;
+/// The most turns a dialogue may be asked for.
+pub const MAX_TURNS_LIMIT: u32 = 50;
+
 /// `POST /api/comms` body.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CommsStart {
@@ -135,6 +140,23 @@ pub struct CommsStatus {
     pub phase: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+}
+
+impl CommsStatus {
+    /// Phases a dialogue is still in (running or paused).
+    #[must_use]
+    pub fn phase_is_running(&self) -> bool {
+        matches!(
+            self.phase.as_str(),
+            "local_thinking" | "peer_thinking" | "paused"
+        )
+    }
+
+    /// Phases a dialogue has ended in.
+    #[must_use]
+    pub fn phase_is_over(&self) -> bool {
+        matches!(self.phase.as_str(), "finished" | "failed" | "cancelled")
+    }
 }
 
 /// One event of `GET /api/comms/{id}/stream`: `event:` is the variant name,

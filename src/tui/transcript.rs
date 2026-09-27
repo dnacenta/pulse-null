@@ -254,13 +254,13 @@ impl Transcript {
         self.faded_rows = usize::MAX; // history does not fade in
     }
 
-    /// The owner's message, echoed before the request leaves.
     /// A finished entry for `who` (a completed dialogue turn).
     pub fn push_done(&mut self, who: Who, text: &str) {
         self.entries.push(Entry::new(who, text, EntryState::Done));
         self.mark_new();
     }
 
+    /// The owner's message, echoed before the request leaves.
     pub fn push_owner(&mut self, text: &str) {
         self.entries
             .push(Entry::new(Who::Owner, text, EntryState::Done));

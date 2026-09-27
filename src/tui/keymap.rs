@@ -30,6 +30,8 @@ pub enum Context {
     },
     CmdLine,
     Confirm,
+    /// The topic/cap float a pair row opens.
+    CommsSetup,
     Help,
 }
 
@@ -82,6 +84,11 @@ pub fn bindings(ctx: Context) -> Vec<Binding> {
         ],
         Context::CmdLine => vec![b("Tab", "complete"), b("Enter", "run"), b("Esc", "close")],
         Context::Confirm => vec![b("Enter", "confirm"), b("Esc", "cancel")],
+        Context::CommsSetup => vec![
+            b("Enter", "start (empty topic = free talk)"),
+            b("↑ / ↓", "turn cap"),
+            b("Esc", "cancel"),
+        ],
         Context::Help => vec![b("Esc / ?", "close")],
     }
 }
@@ -143,6 +150,7 @@ mod tests {
             Context::Peer { paused: false },
             Context::CmdLine,
             Context::Confirm,
+            Context::CommsSetup,
             Context::Help,
         ] {
             let all = bindings(ctx);

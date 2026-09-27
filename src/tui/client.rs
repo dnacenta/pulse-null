@@ -23,6 +23,13 @@ pub enum ClientError {
     Json(#[from] serde_json::Error),
 }
 
+/// What `POST /api/comms` gave back: a fresh dialogue, or the running one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CommsStarted {
+    pub id: String,
+    pub already_running: bool,
+}
+
 /// The outcome of a health probe, coarse enough for a menu row.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Probe {
@@ -256,23 +263,42 @@ impl Client {
         Err(ClientError::Status { status, body })
     }
 
-    /// `POST /api/comms`: start a peer-to-peer dialogue; its id.
-    pub async fn comms_start(&self, req: &crate::wire::CommsStart) -> Result<String, ClientError> {
+    /// `POST /api/comms`: start a peer-to-peer dialogue. A 409 carries the
+    /// id of the one already running, which is what a watcher attaches to.
+    pub async fn comms_start(
+        &self,
+        req: &crate::wire::CommsStart,
+    ) -> Result<CommsStarted, ClientError> {
         let resp = self
             .post("/api/comms")
             .timeout(std::time::Duration::from_secs(10))
             .json(req)
             .send()
             .await?;
-        let v: serde_json::Value = Self::expect_ok(resp).await?.json().await?;
-        Ok(v["id"].as_str().unwrap_or_default().to_string())
+        let status = resp.status().as_u16();
+        let already_running = status == 409;
+        let v: serde_json::Value = if already_running {
+            resp.json().await?
+        } else {
+            Self::expect_ok(resp).await?.json().await?
+        };
+        match v["id"].as_str().filter(|id| !id.is_empty()) {
+            Some(id) => Ok(CommsStarted {
+                id: id.to_string(),
+                already_running,
+            }),
+            None => Err(ClientError::Status {
+                status,
+                body: "no dialogue id in the reply".to_string(),
+            }),
+        }
     }
 
     /// `GET /api/comms`: the daemon's current dialogue, if any.
     pub async fn comms_current(&self) -> Result<Option<crate::wire::CommsStatus>, ClientError> {
         let resp = self
             .get("/api/comms")
-            .timeout(std::time::Duration::from_secs(5))
+            .timeout(std::time::Duration::from_secs(2))
             .send()
             .await?;
         if resp.status().as_u16() == 404 {
