@@ -1581,6 +1581,59 @@ mod comms_e2e {
         fake_peer_with(fail, delay_ms, 0).await
     }
 
+    /// A peer that answers only when `X-Echo-Secret` matches, counting the
+    /// calls that carried it.
+    async fn fake_peer_checking_secret(secret: &'static str) -> (u16, Arc<AtomicUsize>) {
+        let seen = Arc::new(AtomicUsize::new(0));
+        let c = Arc::clone(&seen);
+        let app = Router::new().route(
+            "/chat",
+            post(move |headers: axum::http::HeaderMap| {
+                let c = Arc::clone(&c);
+                async move {
+                    if headers.get("X-Echo-Secret").and_then(|v| v.to_str().ok()) != Some(secret) {
+                        return (
+                            StatusCode::UNAUTHORIZED,
+                            axum::Json(serde_json::json!({"error": "no"})),
+                        );
+                    }
+                    c.fetch_add(1, Ordering::SeqCst);
+                    (
+                        StatusCode::OK,
+                        axum::Json(serde_json::json!({"response": "hi", "model": "fake"})),
+                    )
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        (port, seen)
+    }
+
+    /// A peer whose reply is far over the cap, with a long control-laden
+    /// error body on any second call.
+    async fn fake_peer_huge() -> u16 {
+        let app = Router::new().route(
+            "/chat",
+            post(|| async {
+                let big = "x".repeat(crate::peer::MAX_PEER_REPLY_BYTES + 10);
+                (
+                    StatusCode::OK,
+                    axum::Json(serde_json::json!({"response": big, "model": "fake"})),
+                )
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        port
+    }
+
     /// `rate_limit_first`: answer 429 to that many leading calls.
     async fn fake_peer_with(
         fail: bool,
@@ -2064,8 +2117,99 @@ mod comms_e2e {
         assert_eq!(status, StatusCode::BAD_REQUEST, "unknown configured peer");
         let (status, _) = post_json(&app, "/api/comms", start_body(1, 99)).await;
         assert_eq!(status, StatusCode::BAD_REQUEST, "cap above the max");
+        for bad in [
+            "peer bot",
+            "peer\"\nx: y",
+            "<peer>",
+            "TestPulse",
+            "testpulse",
+        ] {
+            let body = serde_json::json!({
+                "peer": { "name": bad, "host": "127.0.0.1", "port": 1 }
+            })
+            .to_string();
+            let (status, msg) = post_json(&app, "/api/comms", body).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "name {bad:?}: {msg}");
+        }
         let (status, _) = get_text(&app, "/api/comms").await;
         assert_eq!(status, StatusCode::NOT_FOUND, "nothing running");
+    }
+
+    /// A configured peer is dialled with its secret; a configured peer on
+    /// another host without one is never dialled.
+    #[tokio::test]
+    async fn e2e_comms_configured_peer_gets_its_secret_and_remote_needs_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let (port, seen) = fake_peer_checking_secret("s3cret").await;
+        let mut config = test_config();
+        config.peers.insert(
+            "nova".to_string(),
+            crate::config::PeerConfig {
+                host: "127.0.0.1".to_string(),
+                port,
+                secret: Some("s3cret".to_string()),
+            },
+        );
+        config.peers.insert(
+            "far".to_string(),
+            crate::config::PeerConfig {
+                host: "10.0.0.9".to_string(),
+                port: 3200,
+                secret: None,
+            },
+        );
+        let state = build_state_boxed_with_config(
+            dir.path().to_path_buf(),
+            Box::new(MockProvider::new(vec![])),
+            ToolRegistry::new(),
+            config,
+        )
+        .await;
+        let app = build_app(Arc::clone(&state));
+        let (status, body) = post_json(
+            &app,
+            "/api/comms",
+            serde_json::json!({"peer": {"name": "far"}, "max_turns": 2}).to_string(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert!(body["error"].as_str().unwrap().contains("secret"), "{body}");
+
+        let (status, body) = post_json(
+            &app,
+            "/api/comms",
+            serde_json::json!({"peer": {"name": "nova"}, "max_turns": 2}).to_string(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::ACCEPTED, "{body}");
+        let id = body["id"].as_str().unwrap().to_string();
+        let (_, text) = get_text(&app, &format!("/api/comms/{id}/stream")).await;
+        assert_eq!(frames(&text).last().unwrap().0, "done", "{text}");
+        assert_eq!(
+            seen.load(Ordering::SeqCst),
+            1,
+            "the peer saw the secret once"
+        );
+    }
+
+    /// A reply over the cap fails the turn instead of landing truncated
+    /// in the transcript; the error body excerpt is short and printable.
+    #[tokio::test]
+    async fn e2e_comms_oversized_reply_fails_the_dialogue() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = state_in(dir.path()).await;
+        let app = build_app(Arc::clone(&state));
+        let port = fake_peer_huge().await;
+        let (status, body) = post_json(&app, "/api/comms", start_body(port, 4)).await;
+        assert_eq!(status, StatusCode::ACCEPTED, "{body}");
+        let id = body["id"].as_str().unwrap().to_string();
+        let (_, text) = get_text(&app, &format!("/api/comms/{id}/stream")).await;
+        let fr = frames(&text);
+        let last = fr.last().unwrap();
+        assert_eq!(last.0, "error", "{text}");
+        let msg = last.1["message"].as_str().unwrap();
+        assert!(msg.contains("over"), "{msg}");
+        assert!(msg.len() < 700, "excerpt stays short: {}", msg.len());
     }
 
     #[tokio::test]
@@ -2092,6 +2236,8 @@ mod comms_e2e {
             ("POST", "/api/comms"),
             ("GET", "/api/comms"),
             ("GET", "/api/comms/x/stream"),
+            ("POST", "/api/comms/x/pause"),
+            ("POST", "/api/comms/x/resume"),
             ("DELETE", "/api/comms/x"),
         ] {
             let r = app

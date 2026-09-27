@@ -58,7 +58,7 @@ pub const RECALL_ECHO_HOME: &str = "RECALL_ECHO_HOME";
 pub const CLI_BIN_ENV: &str = "PULSE_CLI_BIN";
 
 /// Resolve the subprocess timeout, honouring an environment override.
-fn subprocess_timeout() -> Duration {
+pub(crate) fn subprocess_timeout() -> Duration {
     let secs = std::env::var("PULSE_LLM_TIMEOUT_SECS")
         .or_else(|_| std::env::var("RECALL_LLM_TIMEOUT_SECS"))
         .ok()

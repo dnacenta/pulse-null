@@ -28,10 +28,6 @@ fn err(status: StatusCode, message: impl Into<String>) -> (StatusCode, Json<serd
     (status, Json(serde_json::json!({ "error": message.into() })))
 }
 
-fn is_loopback(host: &str) -> bool {
-    matches!(host, "127.0.0.1" | "localhost" | "::1")
-}
-
 /// `POST /api/comms` — start a dialogue. 202 with its id.
 pub async fn start(
     State(state): State<Arc<AppState>>,
@@ -40,17 +36,26 @@ pub async fn start(
 ) -> Result<(StatusCode, Json<serde_json::Value>), (StatusCode, Json<serde_json::Value>)> {
     owner(&who)?;
     let name = req.peer.name.trim();
-    if name.is_empty() || name.len() > 64 {
+    // The name lands in prompts, the archive's front matter and the
+    // logbook unescaped: keep it to a plain identifier.
+    let plain = |c: char| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.');
+    if name.is_empty() || name.len() > 64 || !name.chars().all(plain) {
         return Err(err(
             StatusCode::BAD_REQUEST,
-            "peer name must be 1–64 characters",
+            "peer name: 1–64 of letters, digits, '-', '_' or '.'",
+        ));
+    }
+    if name.eq_ignore_ascii_case(&state.config.pulse.name) {
+        return Err(err(
+            StatusCode::BAD_REQUEST,
+            "a pulse cannot hold a dialogue with itself",
         ));
     }
     let local_port = match (&req.peer.host, req.peer.port) {
         (None, None) => None,
         (host, Some(port)) => {
             let host = host.as_deref().unwrap_or("127.0.0.1");
-            if !is_loopback(host) {
+            if !comms::is_loopback(host) {
                 return Err(err(
                     StatusCode::BAD_REQUEST,
                     "a peer on another host must be configured under [peers] with a secret",
@@ -94,6 +99,10 @@ pub async fn start(
         Err(StartError::UnknownPeer(p)) => Err(err(
             StatusCode::BAD_REQUEST,
             format!("unknown peer {p:?}: configure it under [peers] or give a port for a sibling on this box"),
+        )),
+        Err(StartError::NoSecret(p)) => Err(err(
+            StatusCode::BAD_REQUEST,
+            format!("peer {p:?} is on another host and has no secret under [peers]; not dialled"),
         )),
         Err(StartError::Isolated) => Err(err(
             StatusCode::CONFLICT,
