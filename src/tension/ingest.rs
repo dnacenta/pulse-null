@@ -644,17 +644,31 @@ pub fn ingest_prediction_errors(
 
         // Self-contained content (§8 Q4): the thread must still make sense
         // after predictions.json prunes the resolution it came from — which
-        // it will, because the prune target is max(cap, pending).
+        // it will, because the prune target is max(cap, pending), so once
+        // pending reaches the cap every resolved prediction is evicted on
+        // the next prune.
+        //
+        // Read the snapshot the resolve step took first; fall back to the
+        // live store only for error records written before that snapshot
+        // existed, and to a placeholder only when both miss.
         let prediction = stack
             .predictions
             .iter()
             .find(|p| p.id == error.prediction_id);
-        let predicted = prediction.map_or("(prediction text no longer on record)", |p| {
-            p.content.as_str()
-        });
-        let actual = prediction
-            .and_then(|p| p.resolution.as_ref())
-            .map_or("(outcome no longer on record)", |r| r.actual.as_str());
+        let predicted = error
+            .predicted
+            .as_deref()
+            .or_else(|| prediction.map(|p| p.content.as_str()))
+            .unwrap_or("(prediction text no longer on record)");
+        let actual = error
+            .actual
+            .as_deref()
+            .or_else(|| {
+                prediction
+                    .and_then(|p| p.resolution.as_ref())
+                    .map(|r| r.actual.as_str())
+            })
+            .unwrap_or("(outcome no longer on record)");
         let insight = error.insight.as_deref().unwrap_or("no insight recorded");
 
         let label = truncate_chars(&format!("prediction error: {insight}"), MAX_LABEL_LEN);
@@ -1658,6 +1672,56 @@ mod tests {
         assert!(thread.content.contains("the pipeline will move"));
         assert!(thread.content.contains("the pipeline froze"));
         assert!(thread.content.contains("freeze detector is blind"));
+    }
+
+    /// `prune` keeps `max(max_predictions, pending)` predictions, so once
+    /// pending reaches the cap every resolved prediction is evicted while its
+    /// error survives. A thread ingested after that point used to be born a
+    /// husk ("no longer on record"). The text now rides on the error record.
+    #[test]
+    fn prediction_error_thread_survives_eviction_of_its_prediction() {
+        let mut s = store();
+        let mut stack = stack_with_error(0.9);
+
+        stack.prune(0, 50);
+        assert!(
+            stack.predictions.is_empty(),
+            "precondition: the prediction must be gone"
+        );
+        assert_eq!(stack.errors.len(), 1, "its error must survive");
+
+        let report = ingest_prediction_errors(&mut s, &stack, Utc::now());
+        assert_eq!(report.opened.len(), 1);
+
+        let thread = s.live().next().unwrap();
+        assert!(thread.content.contains("the pipeline will move"));
+        assert!(thread.content.contains("the pipeline froze"));
+        assert!(!thread.content.contains("no longer on record"));
+    }
+
+    /// Error records written before the snapshot fields existed deserialize
+    /// with `None` and must still ingest — falling back to the live lookup,
+    /// and to the placeholder only when that also misses.
+    #[test]
+    fn legacy_error_without_snapshot_falls_back_then_degrades() {
+        let mut s = store();
+        let mut stack = stack_with_error(0.9);
+        stack.errors[0].predicted = None;
+        stack.errors[0].actual = None;
+
+        ingest_prediction_errors(&mut s, &stack, Utc::now());
+        let thread = s.live().next().unwrap();
+        assert!(thread.content.contains("the pipeline will move"));
+        assert!(thread.content.contains("the pipeline froze"));
+
+        let mut evicted = store();
+        stack.prune(0, 50);
+        ingest_prediction_errors(&mut evicted, &stack, Utc::now());
+        let thread = evicted.live().next().unwrap();
+        assert!(thread
+            .content
+            .contains("(prediction text no longer on record)"));
+        assert!(thread.content.contains("(outcome no longer on record)"));
     }
 
     #[test]

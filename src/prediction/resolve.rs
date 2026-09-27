@@ -66,9 +66,10 @@ pub struct ProcessSummary {
     /// RESOLVE markers that were rejected, with reasons — callers surface
     /// these loudly (alert queue) rather than silently dropping data.
     pub skipped_resolutions: Vec<SkippedResolution>,
-    /// Ids of predictions that actually transitioned to resolved in this
-    /// pass. This is a *state transition in another store*, which is why the
-    /// tension substrate (PN-95) accepts it as non-text evidence that a
+    /// Full (canonical) ids of predictions that actually transitioned to
+    /// resolved in this pass — never the abbreviation a marker used. This is
+    /// a *state transition in another store*, which is why the tension
+    /// substrate (PN-95) accepts it as non-text evidence that a
     /// thread was worked — the pulse cannot produce one by writing about a
     /// thread, only by resolving a prediction that was genuinely pending.
     pub resolved_prediction_ids: Vec<String>,
@@ -398,25 +399,32 @@ pub fn process_task_output(
             direction,
             insight,
         };
-        if stack.resolve(&prediction_id, resolution) {
-            tracing::info!(
-                task_id = %task_id,
-                prediction_id = %prediction_id,
-                surprise = %surprise,
-                direction = %direction,
-                "Prediction resolved"
-            );
-            resolved_prediction_ids.push(prediction_id);
-        } else {
-            // resolve() == false was the last silent drop channel: a
-            // well-formed marker against an unknown or already-resolved id
-            // vanished with only a buried warn (SEC-002). The id is
-            // sanitize_marker_id-scrubbed, safe to echo.
-            skipped_resolutions.push(SkippedResolution {
-                prediction_id,
-                reason: "no pending prediction with this id (unknown or already resolved)"
-                    .to_string(),
-            });
+        match stack.resolve_reference(&prediction_id, resolution) {
+            Ok(canonical_id) => {
+                tracing::info!(
+                    task_id = %task_id,
+                    prediction_id = %canonical_id,
+                    reference = %prediction_id,
+                    surprise = %surprise,
+                    direction = %direction,
+                    "Prediction resolved"
+                );
+                // The full id, never the abbreviation the marker carried:
+                // downstream consumers (tension thread credit, work evidence)
+                // match on the canonical id.
+                resolved_prediction_ids.push(canonical_id);
+            }
+            Err(rejection) => {
+                // A rejected resolve was the last silent drop channel: a
+                // well-formed marker against an unknown or already-resolved
+                // id vanished with only a buried warn (SEC-002). The id is
+                // sanitize_marker_id-scrubbed, safe to echo; the reason never
+                // carries candidate ids.
+                skipped_resolutions.push(SkippedResolution {
+                    prediction_id,
+                    reason: rejection.to_string(),
+                });
+            }
         }
     }
 
@@ -774,6 +782,49 @@ mod tests {
         assert!(summary.skipped_resolutions[0]
             .reason
             .contains("no pending prediction"));
+    }
+
+    /// A RESOLVE marker may carry the 8-character abbreviation of an id; the
+    /// summary must report the full id, because downstream consumers (tension
+    /// thread credit, work evidence) match on it.
+    #[test]
+    fn abbreviated_resolve_reports_the_full_id() {
+        let mut stack = PredictionStack::new();
+        let id = stack
+            .add_prediction(Timescale::Cycle, "p".to_string(), 0.5)
+            .id
+            .clone();
+        let text = format!(
+            r#"[RESOLVE:{{"id":"{}","outcome":"ok","surprise":0.2,"direction":"well-calibrated"}}]"#,
+            &id[..8]
+        );
+
+        let summary = process_task_output(&mut stack, &text, "test", Timescale::Cycle);
+
+        assert!(summary.skipped_resolutions.is_empty());
+        assert_eq!(summary.resolved_prediction_ids, vec![id]);
+        assert!(stack.predictions[0].resolution.is_some());
+    }
+
+    #[test]
+    fn ambiguous_abbreviated_resolve_is_rejected_with_a_clear_reason() {
+        let mut stack = PredictionStack::new();
+        stack.add_prediction(Timescale::Cycle, "a".to_string(), 0.5);
+        stack.add_prediction(Timescale::Cycle, "b".to_string(), 0.5);
+        stack.predictions[0].id = "bca890bc-0000-0000-0000-000000000001".to_string();
+        stack.predictions[1].id = "bca890bc-0000-0000-0000-000000000002".to_string();
+        let text =
+            r#"[RESOLVE:{"id":"bca890bc","outcome":"x","surprise":0.2,"direction":"novel"}]"#;
+
+        let summary = process_task_output(&mut stack, text, "test", Timescale::Cycle);
+
+        assert!(summary.resolved_prediction_ids.is_empty());
+        assert_eq!(summary.skipped_resolutions.len(), 1);
+        assert_eq!(summary.skipped_resolutions[0].prediction_id, "bca890bc");
+        assert!(summary.skipped_resolutions[0]
+            .reason
+            .contains("ambiguous id prefix"));
+        assert!(stack.predictions.iter().all(|p| p.is_pending()));
     }
 
     /// PN-86 (SEC-011): "well-calibrated" with surprise above the error

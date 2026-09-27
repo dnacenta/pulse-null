@@ -2302,3 +2302,115 @@ mod comms_e2e {
         }
     }
 }
+
+// ---------------------------------------------------------------------------
+// Voice channel: the spoken-reply block reaches the provider
+// ---------------------------------------------------------------------------
+
+/// Answers every turn and records the system prompt it was handed, so a test
+/// can assert what the model was actually told.
+struct SystemPromptRecorder {
+    seen: Arc<std::sync::Mutex<Vec<String>>>,
+}
+
+impl crate::streaming::StreamingProvider for SystemPromptRecorder {}
+
+impl LmProvider for SystemPromptRecorder {
+    fn invoke(
+        &self,
+        system_prompt: &str,
+        _messages: &[Message],
+        _max_tokens: u32,
+        _tools: Option<&[serde_json::Value]>,
+    ) -> LlmResult<'_> {
+        self.seen.lock().unwrap().push(system_prompt.to_string());
+        Box::pin(async {
+            Ok(LlmResponse {
+                content: vec![ContentBlock::Text {
+                    text: "Sure.".to_string(),
+                }],
+                stop_reason: StopReason::EndTurn,
+                model: "recorder".to_string(),
+                input_tokens: Some(1),
+                output_tokens: Some(1),
+            })
+        })
+    }
+
+    fn name(&self) -> &str {
+        "recorder"
+    }
+
+    fn supports_tools(&self) -> bool {
+        false
+    }
+}
+
+/// POST `body` to `/chat` and return the system prompt the provider saw.
+async fn system_prompt_for(body: serde_json::Value) -> String {
+    let dir = tempfile::tempdir().unwrap();
+    let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let provider = SystemPromptRecorder {
+        seen: Arc::clone(&seen),
+    };
+    let state = build_state_boxed_with_config(
+        dir.path().to_path_buf(),
+        Box::new(provider),
+        ToolRegistry::new(),
+        test_config(),
+    )
+    .await;
+    let app = build_app(state);
+
+    let req = Request::builder()
+        .method("POST")
+        .uri("/chat")
+        .header("Content-Type", "application/json")
+        .body(Body::from(body.to_string()))
+        .unwrap();
+    let response = app.oneshot(req).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let prompts = seen.lock().unwrap();
+    assert_eq!(prompts.len(), 1, "exactly one provider call expected");
+    prompts[0].clone()
+}
+
+/// The exact body both voice clients send: pulse-null-voice's `PulseClient`
+/// (`src/brain.rs`, pulse mode) and voice-echo's `BridgeClient`
+/// (`pipeline/bridge.rs`, used by the in-process plugin via `bridge_url`).
+/// They are field-for-field identical, so one fixture stands for both.
+fn voice_client_body() -> serde_json::Value {
+    serde_json::json!({
+        "channel": "voice",
+        "sender": "D",
+        "message": "What's on today?",
+        "metadata": {"call_sid": "CA0123456789abcdef"},
+    })
+}
+
+#[tokio::test]
+async fn e2e_voice_client_request_gets_spoken_reply_guidance() {
+    let prompt = system_prompt_for(voice_client_body()).await;
+
+    assert!(
+        prompt.starts_with("You are a test pulse."),
+        "identity must come first:\n{prompt}"
+    );
+    assert!(prompt.contains("<voice-call>"), "no voice block:\n{prompt}");
+    assert!(prompt.contains("Two sentences at most"));
+    assert!(prompt.contains("under thirty words"));
+}
+
+#[tokio::test]
+async fn e2e_non_voice_request_gets_no_voice_guidance() {
+    for channel in ["discord", "chat", "comms"] {
+        let mut body = voice_client_body();
+        body["channel"] = channel.into();
+        let prompt = system_prompt_for(body).await;
+        assert!(
+            !prompt.contains("<voice-call>"),
+            "{channel:?} must not receive voice guidance:\n{prompt}"
+        );
+    }
+}
