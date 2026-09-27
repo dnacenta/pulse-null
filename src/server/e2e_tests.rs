@@ -1939,6 +1939,29 @@ mod comms_e2e {
         );
     }
 
+    /// A stop that lands before the task's first poll still ends the
+    /// dialogue for its watchers (the guard travels with the future).
+    #[tokio::test]
+    async fn e2e_comms_stop_before_the_first_poll_still_ends() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = state_in(dir.path()).await;
+        let app = build_app(Arc::clone(&state));
+        let (port, _) = fake_peer(false, 0).await;
+        let (status, body) = post_json(&app, "/api/comms", start_body(port, 4)).await;
+        assert_eq!(status, StatusCode::ACCEPTED, "{body}");
+        let id = body["id"].as_str().unwrap().to_string();
+        state.comms.get(&id).unwrap().stop();
+        let (_, text) = get_text(&app, &format!("/api/comms/{id}/stream")).await;
+        let fr = frames(&text);
+        assert_eq!(fr.last().unwrap().0, "done", "{text}");
+        let (_, body) = get_text(&app, "/api/comms").await;
+        let st: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(st["phase"], "cancelled");
+        // A second start is accepted: the slot is free.
+        let (status, _) = post_json(&app, "/api/comms", start_body(port, 4)).await;
+        assert_eq!(status, StatusCode::ACCEPTED);
+    }
+
     #[tokio::test]
     async fn e2e_comms_retries_a_rate_limited_peer() {
         let dir = tempfile::tempdir().unwrap();

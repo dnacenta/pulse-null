@@ -96,6 +96,26 @@ fn index_path(root_dir: &Path) -> PathBuf {
 }
 
 /// Scan for the highest conversation-NNN.md number. Returns 0 if none exist.
+/// Claim the next conversation number with O_EXCL: chat, scheduler and the
+/// comms engine all archive into this directory, and a scan-then-write
+/// would let two writers pick the same number and silently overwrite one
+/// conversation with another.
+fn claim_log_file(conv_dir: &Path) -> Result<(fs::File, PathBuf, u32), String> {
+    let mut next_num = highest_log_number(conv_dir) + 1;
+    loop {
+        let candidate = conv_dir.join(format!("conversation-{next_num:03}.md"));
+        match fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&candidate)
+        {
+            Ok(f) => return Ok((f, candidate, next_num)),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => next_num += 1,
+            Err(e) => return Err(format!("Failed to create conversation archive: {e}")),
+        }
+    }
+}
+
 fn highest_log_number(dir: &Path) -> u32 {
     let entries = match fs::read_dir(dir) {
         Ok(e) => e,
@@ -146,22 +166,7 @@ pub fn archive_conversation(
         None => String::new(),
     };
 
-    // Claim the log number with O_EXCL: chat and scheduler paths both archive
-    // here, and a scan-then-write would let two writers pick the same number
-    // and silently overwrite one conversation with another.
-    let mut next_num = highest_log_number(&conv_dir) + 1;
-    let (mut file, log_path, next_num) = loop {
-        let candidate = conv_dir.join(format!("conversation-{next_num:03}.md"));
-        match fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&candidate)
-        {
-            Ok(f) => break (f, candidate, next_num),
-            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => next_num += 1,
-            Err(e) => return Err(format!("Failed to create conversation archive: {e}")),
-        }
-    };
+    let (mut file, log_path, next_num) = claim_log_file(&conv_dir)?;
 
     let content = format!(
         "---\nlog: {next_num}\ndate: \"{date_full}\"\ntrigger: {trigger}\nchannel: {channel}\npulse: \"{pulse}\"\n{session_key_line}message_count: {message_count}\n---\n\n# Conversation {next_num:03}\n\n{conversation_md}",
@@ -363,7 +368,7 @@ pub fn archive_comms_conversation(
     fs::create_dir_all(&conv_dir)
         .map_err(|e| format!("Failed to create conversations archive dir: {e}"))?;
 
-    let next_num = highest_log_number(&conv_dir) + 1;
+    let (mut file, log_path, next_num) = claim_log_file(&conv_dir)?;
     let now = Utc::now();
     let date_full = now.format("%Y-%m-%dT%H:%M:%SZ").to_string();
     let date_short = now.format("%Y-%m-%d").to_string();
@@ -382,8 +387,9 @@ pub fn archive_comms_conversation(
         "---\nlog: {next_num}\ndate: \"{date_full}\"\ntrigger: comms-end\nchannel: comms\npulse: \"{local_pulse}\"\npeer: \"{peer_pulse}\"\nmessage_count: {message_count}\n---\n\n# Conversation {next_num:03}\n\n{md}",
     );
 
-    let log_path = conv_dir.join(format!("conversation-{next_num:03}.md"));
-    fs::write(&log_path, &content).map_err(|e| format!("Failed to write comms archive: {e}"))?;
+    use std::io::Write as _;
+    file.write_all(content.as_bytes())
+        .map_err(|e| format!("Failed to write comms archive: {e}"))?;
 
     append_index(
         root_dir,

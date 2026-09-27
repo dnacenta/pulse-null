@@ -298,12 +298,20 @@ pub fn start(state: &Arc<AppState>, req: StartRequest) -> Result<String, StartEr
         pause,
     });
     let trust = trust_for_host(&peer_cfg.host);
+    // Built here, not inside the task: an abort before its first poll drops
+    // the future with its arguments, so the guard still ends the dialogue.
+    let guard = EndGuard {
+        state: Arc::clone(state),
+        dialogue: Arc::clone(&dialogue),
+        trust: trust.clone(),
+    };
     let task = tokio::spawn(run(
         Arc::clone(state),
         Arc::clone(&dialogue),
         peers,
         trust,
         pause_rx,
+        guard,
     ));
     dialogue.lock().abort = Some(task.abort_handle());
     let id = dialogue.id.clone();
@@ -442,9 +450,16 @@ fn archive(
             );
             state.event_bus.emit(interaction.to_event());
             if state.config.graph.enabled && state.config.graph.auto_ingest {
-                let root = state.root_dir.clone();
+                // The extractor rides along as the scheduler's does, so the
+                // dialogue gets entities and relationships, not only episodes.
+                let state = Arc::clone(state);
                 tokio::spawn(async move {
-                    crate::session::graph_ingest_archive(&root, &path, None).await;
+                    crate::session::graph_ingest_archive(
+                        &state.root_dir,
+                        &path,
+                        state.graph_extractor.as_ref(),
+                    )
+                    .await;
                 });
             }
         }
@@ -487,12 +502,8 @@ async fn run(
     peers: PeerClient,
     trust: ConversationTrust,
     mut pause_rx: watch::Receiver<bool>,
+    _guard: EndGuard,
 ) {
-    let _guard = EndGuard {
-        state: Arc::clone(&state),
-        dialogue: Arc::clone(&d),
-        trust: trust.clone(),
-    };
     let system_prompt = format!(
         "{}{}",
         state.system_prompt.read().await,
