@@ -1573,10 +1573,20 @@ async fn e2e_peer_credential_is_refused_on_owner_only_endpoints() {
 
 mod comms_e2e {
     use super::*;
+    use crate::wire::CommsEvent;
 
     /// A peer on a random port whose `/chat` answers with a numbered reply
     /// (or a 500 when `fail` is set). Returns the port and the call count.
     async fn fake_peer(fail: bool, delay_ms: u64) -> (u16, Arc<AtomicUsize>) {
+        fake_peer_with(fail, delay_ms, 0).await
+    }
+
+    /// `rate_limit_first`: answer 429 to that many leading calls.
+    async fn fake_peer_with(
+        fail: bool,
+        delay_ms: u64,
+        rate_limit_first: usize,
+    ) -> (u16, Arc<AtomicUsize>) {
         let calls = Arc::new(AtomicUsize::new(0));
         let c = Arc::clone(&calls);
         let app = Router::new().route(
@@ -1586,6 +1596,12 @@ mod comms_e2e {
                 async move {
                     let n = c.fetch_add(1, Ordering::SeqCst) + 1;
                     tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+                    if n <= rate_limit_first {
+                        return (
+                            StatusCode::TOO_MANY_REQUESTS,
+                            axum::Json(serde_json::json!({"error": "slow down"})),
+                        );
+                    }
                     if fail {
                         return (
                             StatusCode::INTERNAL_SERVER_ERROR,
@@ -1794,6 +1810,7 @@ mod comms_e2e {
         assert_eq!(body["id"], id);
 
         // Pause is accepted while running; stop ends it as cancelled.
+        let (_, _, mut live) = state.comms.current().expect("running").subscribe();
         let (status, _) = post_json(&app, &format!("/api/comms/{id}/pause"), String::new()).await;
         assert_eq!(status, StatusCode::NO_CONTENT);
         let r = app
@@ -1808,6 +1825,37 @@ mod comms_e2e {
             .await
             .unwrap();
         assert_eq!(r.status(), StatusCode::NO_CONTENT);
+        // A live watcher sees the cancelled status before `done`, not a stale
+        // "thinking" phase followed by the end.
+        let mut ending = Vec::new();
+        for _ in 0..40 {
+            match tokio::time::timeout(std::time::Duration::from_millis(50), live.recv()).await {
+                Ok(Ok(ev)) => {
+                    let over = matches!(ev, CommsEvent::Done | CommsEvent::Error { .. });
+                    ending.push(ev);
+                    if over {
+                        break;
+                    }
+                }
+                Ok(Err(_)) => break,
+                Err(_) => continue,
+            }
+        }
+        let phases: Vec<String> = ending
+            .iter()
+            .filter_map(|ev| match ev {
+                CommsEvent::Status(s) => Some(s.phase.clone()),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            phases.last().is_some_and(|p| p == "cancelled"),
+            "the last status before done is cancelled: {phases:?}"
+        );
+        assert!(
+            matches!(ending.last(), Some(CommsEvent::Done)),
+            "{ending:?}"
+        );
         // The stream of an ended dialogue replays and closes with done.
         let (_, text) = get_text(&app, &format!("/api/comms/{id}/stream")).await;
         let fr = frames(&text);
@@ -1821,6 +1869,25 @@ mod comms_e2e {
         // A stopped dialogue frees the slot.
         let (status, _) = post_json(&app, "/api/comms", start_body(port, 1)).await;
         assert_eq!(status, StatusCode::ACCEPTED);
+    }
+
+    #[tokio::test]
+    async fn e2e_comms_retries_a_rate_limited_peer() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = state_in(dir.path()).await;
+        let app = build_app(Arc::clone(&state));
+        let (port, calls) = fake_peer_with(false, 0, 1).await;
+        let (_, body) = post_json(&app, "/api/comms", start_body(port, 2)).await;
+        let id = body["id"].as_str().unwrap().to_string();
+        let (_, text) = get_text(&app, &format!("/api/comms/{id}/stream")).await;
+        let fr = frames(&text);
+        assert_eq!(fr.last().unwrap().0, "done", "{text}");
+        assert_eq!(fr.iter().filter(|(e, _)| e == "turn").count(), 2);
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            2,
+            "one 429, then the real answer"
+        );
     }
 
     #[tokio::test]

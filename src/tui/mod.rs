@@ -293,6 +293,72 @@ impl Drop for Session {
     }
 }
 
+/// Open (or reuse) the session on pulse `a` for a dialogue with `peer`, and
+/// show the Peer page. `None` when `a` is not up.
+fn open_peer(
+    app: &mut App,
+    session: &mut Option<Session>,
+    started: &mut Vec<Daemon>,
+    a: usize,
+    cfg_a: &Config,
+    peer: &str,
+) -> Option<Client> {
+    let root = app.home.rows[a].dir.clone();
+    if app.home.rows[a].state != home::PulseState::Up {
+        return None;
+    }
+    drop(session.take());
+    let s = Session::open(cfg_a, root, home::PulseState::Up, started).ok()?;
+    let client = s.client.clone();
+    *session = Some(s);
+    app.enter_pulse(cfg_a);
+    app.start_peer(&cfg_a.pulse.name, peer);
+    Some(client)
+}
+
+/// Start a dialogue (when `start` is given) and pump its stream into `tx`
+/// until it ends. Every failure reaches the page as an `Error` event.
+async fn comms_pump(
+    client: Client,
+    start: Option<crate::wire::CommsStart>,
+    attach: Option<String>,
+    tx: tokio::sync::mpsc::Sender<crate::wire::CommsEvent>,
+) {
+    let fail = |message: String| crate::wire::CommsEvent::Error { message };
+    let id = match (start, attach) {
+        (Some(req), _) => match client.comms_start(&req).await {
+            Ok(id) => id,
+            Err(e) => {
+                let _ = tx.send(fail(format!("could not start: {e}"))).await;
+                return;
+            }
+        },
+        (None, Some(id)) => id,
+        (None, None) => return,
+    };
+    let stream = match client.comms_stream(&id).await {
+        Ok(s) => s,
+        Err(e) => {
+            let _ = tx.send(fail(format!("stream: {e}"))).await;
+            return;
+        }
+    };
+    let mut stream = std::pin::pin!(stream);
+    while let Some(item) = stream.next().await {
+        match item {
+            Ok(ev) => {
+                if tx.send(ev).await.is_err() {
+                    return;
+                }
+            }
+            Err(e) => {
+                let _ = tx.send(fail(format!("stream: {e}"))).await;
+                return;
+            }
+        }
+    }
+}
+
 /// One item from the chat stream. Returns true when the stream is over.
 fn on_turn_item(app: &mut App, item: Option<Result<ChatEvent, ClientError>>) -> bool {
     match item {
@@ -398,6 +464,13 @@ async fn event_loop(
     // Probe results for Home's rows, from a task per tick.
     let (states_tx, mut states_rx) =
         tokio::sync::mpsc::channel::<Vec<(std::path::PathBuf, home::PulseState)>>(4);
+    // What each pair's left daemon says about its dialogue, per Home tick.
+    let (dialogues_tx, mut dialogues_rx) = tokio::sync::mpsc::channel::<
+        Vec<(std::path::PathBuf, Option<crate::wire::CommsStatus>)>,
+    >(4);
+    // The dialogue being watched on the Peer page: its event pump.
+    let mut comms_rx: Option<tokio::sync::mpsc::Receiver<crate::wire::CommsEvent>> = None;
+    let mut comms_task: Option<tokio::task::JoinHandle<()>> = None;
     // A ticker that is gated off for a while must not burst when it comes
     // back; skip the missed periods.
     for t in [
@@ -487,15 +560,106 @@ async fn event_loop(
                                 }
                             }
                             Action::Home => {
-                                // The poller and any turn go with the session; the
-                                // daemon this process started stays for Exit.
+                                // The poller, any turn and any watched dialogue go with
+                                // the session; the daemon this process started stays
+                                // for Exit, and a dialogue keeps running in its daemon.
                                 drop(session.take());
                                 if let Some(task) = turn_task.take() {
                                     task.abort();
                                 }
                                 turn_rx = None;
+                                if let Some(task) = comms_task.take() {
+                                    task.abort();
+                                }
+                                comms_rx = None;
                                 attached = false;
                                 app.start_home(rescan_home());
+                            }
+                            Action::Comms {
+                                pair,
+                                topic,
+                                max_turns,
+                            } => {
+                                let Some(p) = app.home.pairs.get(pair) else {
+                                    continue;
+                                };
+                                let (a, b) = (p.a, p.b);
+                                let (Some(cfg_a), Some(cfg_b)) =
+                                    (app.home.rows[a].config().cloned(), app.home.rows[b].config().cloned())
+                                else {
+                                    continue;
+                                };
+                                let req = crate::wire::CommsStart {
+                                    peer: crate::wire::CommsPeer {
+                                        name: cfg_b.pulse.name.clone(),
+                                        host: Some("127.0.0.1".to_string()),
+                                        port: Some(cfg_b.server.port),
+                                    },
+                                    topic,
+                                    max_turns: Some(max_turns),
+                                };
+                                match open_peer(app, &mut session, started, a, &cfg_a, &cfg_b.pulse.name) {
+                                    Some(client) => {
+                                        let (tx, rx) = tokio::sync::mpsc::channel(64);
+                                        comms_rx = Some(rx);
+                                        if let Some(task) = comms_task.take() {
+                                            task.abort();
+                                        }
+                                        comms_task = Some(tokio::spawn(comms_pump(client, Some(req), None, tx)));
+                                        if let Some(task) = turn_task.take() {
+                                            task.abort();
+                                        }
+                                        turn_rx = None;
+                                        attached = true;
+                                        daemon_base = session.as_ref().map(|s| s.client.base().to_string());
+                                    }
+                                    None => app.home.notice = Some(format!("{} is not up", cfg_a.pulse.name)),
+                                }
+                            }
+                            Action::CommsAttach { pair, id } => {
+                                let Some(p) = app.home.pairs.get(pair) else {
+                                    continue;
+                                };
+                                let (a, b) = (p.a, p.b);
+                                let (Some(cfg_a), Some(name_b)) =
+                                    (app.home.rows[a].config().cloned(), app.home.rows.get(b).map(|r| r.name.clone()))
+                                else {
+                                    continue;
+                                };
+                                if let Some(client) = open_peer(app, &mut session, started, a, &cfg_a, &name_b) {
+                                    let (tx, rx) = tokio::sync::mpsc::channel(64);
+                                    comms_rx = Some(rx);
+                                    if let Some(task) = comms_task.take() {
+                                        task.abort();
+                                    }
+                                    comms_task = Some(tokio::spawn(comms_pump(client, None, Some(id), tx)));
+                                    if let Some(task) = turn_task.take() {
+                                        task.abort();
+                                    }
+                                    turn_rx = None;
+                                    attached = true;
+                                    daemon_base = session.as_ref().map(|s| s.client.base().to_string());
+                                }
+                            }
+                            Action::PeerPause(paused) => {
+                                if let (Some(s), Some(id)) = (session.as_ref(), app.peer.id()) {
+                                    let (c, id) = (s.client.clone(), id.to_string());
+                                    tokio::spawn(async move {
+                                        if let Err(e) = c.comms_pause(&id, paused).await {
+                                            tracing::warn!("comms pause/resume: {e}");
+                                        }
+                                    });
+                                }
+                            }
+                            Action::PeerStop => {
+                                if let (Some(s), Some(id)) = (session.as_ref(), app.peer.id()) {
+                                    let (c, id) = (s.client.clone(), id.to_string());
+                                    tokio::spawn(async move {
+                                        if let Err(e) = c.comms_stop(&id).await {
+                                            tracing::warn!("comms stop: {e}");
+                                        }
+                                    });
+                                }
                             }
                             Action::Create => create = true,
                             Action::None => {}
@@ -539,6 +703,10 @@ async fn event_loop(
                         attached = false;
                         match app.screen {
                             app::Screen::Talk => app.daemon_lost(retry_in),
+                            app::Screen::Peer => app.peer.transcript.push_notice(&format!(
+                                "daemon unreachable — retrying in {}s",
+                                retry_in.as_secs().max(1)
+                            )),
                             app::Screen::Home => {
                                 app.home.notice = Some(format!(
                                     "no daemon answered at {} — retrying",
@@ -600,8 +768,9 @@ async fn event_loop(
                 }
                 dirty = true;
             }
-            _ = turn_tick.tick(), if app.talk.turn_active() => {
+            _ = turn_tick.tick(), if app.talk.turn_active() || (app.screen == app::Screen::Peer && app.peer.active()) => {
                 app.talk.tick();
+                app.peer.tick();
                 dirty = true;
             }
             _ = boot_tick.tick(), if app.screen == app::Screen::Boot
@@ -647,10 +816,62 @@ async fn event_loop(
                     }
                     let _ = tx.try_send(states);
                 });
+                // Each pair's left daemon: is a dialogue running there?
+                let lefts: Vec<(std::path::PathBuf, Client)> = app
+                    .home
+                    .pairs
+                    .iter()
+                    .filter_map(|p| {
+                        let r = &app.home.rows[p.a];
+                        r.client().map(|c| (r.dir.clone(), c))
+                    })
+                    .collect();
+                if !lefts.is_empty() {
+                    let tx = dialogues_tx.clone();
+                    tokio::spawn(async move {
+                        let mut set = tokio::task::JoinSet::new();
+                        for (dir, c) in lefts {
+                            set.spawn(async move { (dir, c.comms_current().await.ok().flatten()) });
+                        }
+                        let mut out = Vec::new();
+                        while let Some(r) = set.join_next().await {
+                            if let Ok(d) = r {
+                                out.push(d);
+                            }
+                        }
+                        let _ = tx.try_send(out);
+                    });
+                }
             }
             Some(states) = states_rx.recv() => {
                 app.home.apply_states(&states);
                 dirty |= app.screen == app::Screen::Home;
+            }
+            Some(dialogues) = dialogues_rx.recv() => {
+                app.home.apply_dialogues(&dialogues);
+                dirty |= app.screen == app::Screen::Home;
+            }
+            ev = async {
+                match comms_rx.as_mut() {
+                    Some(rx) => rx.recv().await,
+                    None => std::future::pending().await,
+                }
+            } => {
+                match ev {
+                    Some(ev) => {
+                        let over = matches!(ev, crate::wire::CommsEvent::Done | crate::wire::CommsEvent::Error { .. });
+                        app.peer.on_event(ev);
+                        if over {
+                            comms_rx = None;
+                            comms_task = None;
+                        }
+                    }
+                    None => {
+                        comms_rx = None;
+                        comms_task = None;
+                    }
+                }
+                dirty = true;
             }
             _ = theme_tick.tick() => {
                 if let Some(previous) = app.theme.poll() {

@@ -38,6 +38,14 @@ pub enum Command {
     Help,
     /// Back to the pulse menu; the daemon stays up.
     Home,
+    /// Start the dialogue of Home's `pairs[pair]` (from the setup float).
+    CommsStart {
+        pair: usize,
+        topic: Option<String>,
+        max_turns: u32,
+    },
+    /// Stop the running dialogue (after a confirm).
+    PeerStop,
 }
 
 /// Every command name, its argument hint, and where it lives.
@@ -224,6 +232,126 @@ pub fn completions(line: &str) -> Vec<String> {
                 .map(|v| format!("{name} {v}"))
                 .collect()
         }
+    }
+}
+
+/// The float Home opens on a pair row: a topic (optional) and the turn cap.
+pub struct CommsSetup {
+    pub pair: usize,
+    pub a: String,
+    pub b: String,
+    pub topic: Prompt,
+    pub max_turns: u32,
+}
+
+impl CommsSetup {
+    #[must_use]
+    pub fn new(pair: usize, a: &str, b: &str) -> Self {
+        Self {
+            pair,
+            a: a.to_string(),
+            b: b.to_string(),
+            topic: Prompt::new(),
+            max_turns: crate::comms::DEFAULT_MAX_TURNS,
+        }
+    }
+
+    pub fn on_key(&mut self, key: KeyEvent) -> FloatAction {
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        match (key.code, ctrl) {
+            (KeyCode::Esc, _) | (KeyCode::Char('c'), true) => FloatAction::Close,
+            (KeyCode::Enter, _) => {
+                let topic = self.topic.text().trim().to_string();
+                FloatAction::Run(Command::CommsStart {
+                    pair: self.pair,
+                    topic: if topic.is_empty() { None } else { Some(topic) },
+                    max_turns: self.max_turns,
+                })
+            }
+            (KeyCode::Up, _) | (KeyCode::Char('+'), false) => {
+                self.max_turns = (self.max_turns + 5).min(crate::comms::MAX_MAX_TURNS);
+                FloatAction::None
+            }
+            (KeyCode::Down, _) | (KeyCode::Char('-'), false) => {
+                self.max_turns = self.max_turns.saturating_sub(5).max(1);
+                FloatAction::None
+            }
+            (KeyCode::Backspace, _) => {
+                self.topic.backspace();
+                FloatAction::None
+            }
+            (KeyCode::Left, _) => {
+                self.topic.left();
+                FloatAction::None
+            }
+            (KeyCode::Right, _) => {
+                self.topic.right();
+                FloatAction::None
+            }
+            (KeyCode::Char('u'), true) => {
+                self.topic.kill_line_start();
+                FloatAction::None
+            }
+            (KeyCode::Char(c), false) => {
+                self.topic.insert_char(c);
+                FloatAction::None
+            }
+            _ => FloatAction::None,
+        }
+    }
+
+    #[must_use]
+    pub fn rect(area: Rect) -> Rect {
+        let w = area.width.saturating_sub(8).clamp(30, 64);
+        let h = 7;
+        Rect::new(
+            area.x + area.width.saturating_sub(w) / 2,
+            area.y + area.height.saturating_sub(h) / 2,
+            w,
+            h.min(area.height),
+        )
+    }
+
+    pub fn render(&mut self, frame: &mut Frame, area: Rect, t: Tokens) {
+        let rect = Self::rect(area);
+        frame.render_widget(Clear, rect);
+        let block = pane::frame("peer to peer", true, t);
+        let inner = block.inner(rect);
+        frame.render_widget(block, rect);
+        let rows = ratatui::layout::Layout::vertical([ratatui::layout::Constraint::Length(1); 5])
+            .split(inner);
+        frame.render_widget(
+            Paragraph::new(Line::from(vec![
+                Span::styled(
+                    format!("  {}", self.a),
+                    Style::default().fg(t.pulse).add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(" ↔ ", Style::default().fg(t.dim)),
+                Span::styled(
+                    self.b.clone(),
+                    Style::default().fg(t.intent).add_modifier(Modifier::BOLD),
+                ),
+            ])),
+            rows[0],
+        );
+        self.topic.render(frame, rows[2], t, true, "topic ›");
+        frame.render_widget(
+            Paragraph::new(Line::from(vec![
+                Span::styled(
+                    format!("  turns: {}", self.max_turns),
+                    Style::default().fg(t.ink),
+                ),
+                Span::styled("  ↑/↓ change", Style::default().fg(t.dim)),
+            ])),
+            rows[3],
+        );
+        frame.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                "  Enter start (empty topic = free talk) · Esc cancel",
+                Style::default().fg(t.dim),
+            ))),
+            rows[4],
+        );
     }
 }
 

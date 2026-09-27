@@ -140,6 +140,9 @@ impl Dialogue {
     }
 
     fn set_phase(&self, phase: Phase) {
+        if let Phase::Failed(why) = &phase {
+            tracing::warn!("[comms] dialogue {} failed: {why}", self.id);
+        }
         {
             let mut inner = self.lock();
             if inner.phase.is_over() {
@@ -337,19 +340,18 @@ struct EndGuard {
 impl Drop for EndGuard {
     fn drop(&mut self) {
         let d = &self.dialogue;
-        let changed = {
+        {
             let mut inner = d.lock();
-            let changed = !inner.phase.is_over();
-            if changed {
+            if !inner.phase.is_over() {
                 inner.phase = Phase::Cancelled;
             }
             inner.abort = None;
-            changed
-        };
-        let status = d.status();
-        if changed {
-            let _ = d.tx.send(CommsEvent::Status(status.clone()));
         }
+        // Always broadcast the final phase: `stop()` flips it to cancelled
+        // before the abort lands here, so live watchers would otherwise see
+        // `done` with a stale "thinking" status.
+        let status = d.status();
+        let _ = d.tx.send(CommsEvent::Status(status.clone()));
         let messages: Vec<(String, String)> = d
             .lock()
             .turns
@@ -400,6 +402,33 @@ fn archive(
             }
         }
         Err(e) => tracing::warn!("[comms] dialogue {} not archived: {e}", d.id),
+    }
+}
+
+/// How many times a rate-limited peer call is retried, a second apart. Two
+/// pulses on fast providers can outrun the peer's 2-per-second limiter;
+/// real turns take seconds, so this only ever bites on a burst.
+const RATE_LIMIT_RETRIES: u32 = 5;
+
+/// One peer turn, retried while the peer answers 429.
+async fn send_with_retry(
+    peers: &PeerClient,
+    peer: &str,
+    message: &str,
+    sender: &str,
+) -> Result<String, String> {
+    let mut tries = 0;
+    loop {
+        match peers.send_message(peer, message, sender, "comms").await {
+            Ok(r) => return Ok(r.response),
+            Err(crate::peer::PeerError::BadResponse(body))
+                if body.starts_with("429") && tries < RATE_LIMIT_RETRIES =>
+            {
+                tries += 1;
+                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+            }
+            Err(e) => return Err(e.to_string()),
+        }
     }
 }
 
@@ -489,8 +518,8 @@ async fn run(
             return;
         }
         d.set_phase(Phase::PeerThinking);
-        let reply = match peers.send_message(&d.peer, &last, &d.local, "comms").await {
-            Ok(r) => r.response,
+        let reply = match send_with_retry(&peers, &d.peer, &last, &d.local).await {
+            Ok(r) => r,
             Err(e) => {
                 d.set_phase(Phase::Failed(format!("{}: {e}", d.peer)));
                 return;

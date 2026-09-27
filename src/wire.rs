@@ -164,6 +164,17 @@ impl CommsEvent {
         let data = v.get("data").cloned().unwrap_or(serde_json::Value::Null);
         (name, data)
     }
+
+    /// Decode a frame; `None` for names or payloads this build does not know.
+    #[must_use]
+    pub fn from_sse_parts(name: &str, data: &str) -> Option<Self> {
+        let data: serde_json::Value = if data.trim().is_empty() {
+            serde_json::Value::Null
+        } else {
+            serde_json::from_str(data).ok()?
+        };
+        serde_json::from_value(serde_json::json!({ "event": name, "data": data })).ok()
+    }
 }
 
 /// The part of `/api/dashboard` the TUI reads. The server builds the rest
@@ -249,11 +260,11 @@ mod tests {
             },
         ] {
             let (name, data) = ev.to_sse_parts();
-            let back: CommsEvent =
-                serde_json::from_value(serde_json::json!({ "event": name, "data": data })).unwrap();
+            let back = CommsEvent::from_sse_parts(&name, &data.to_string()).unwrap();
             assert_eq!(back, ev, "{name}");
         }
         assert_eq!(CommsEvent::Done.to_sse_parts().0, "done");
+        assert!(CommsEvent::from_sse_parts("nonsense", "{}").is_none());
     }
 
     #[test]

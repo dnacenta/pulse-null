@@ -120,8 +120,19 @@ impl PulseRow {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Item {
     Pulse(usize),
+    /// `pairs[i]`: a peer-to-peer dialogue between two up pulses.
+    Pair(usize),
     Create,
     Exit,
+}
+
+/// Two pulses that are both up, and the dialogue running between them if
+/// any (as the left one's daemon reports it).
+#[derive(Debug, Clone)]
+pub struct Pair {
+    pub a: usize,
+    pub b: usize,
+    pub dialogue: Option<crate::wire::CommsStatus>,
 }
 
 /// What a key on Home asks the loop to do.
@@ -130,6 +141,8 @@ pub enum HomeAction {
     None,
     /// Open Talk for `rows[i]`.
     Open(usize),
+    /// Start (or re-attach to) the dialogue of `pairs[i]`.
+    Pair(usize),
     Create,
     Exit,
 }
@@ -137,6 +150,8 @@ pub enum HomeAction {
 /// Home state.
 pub struct Home {
     pub rows: Vec<PulseRow>,
+    /// Every pair of rows that are both up, in row order.
+    pub pairs: Vec<Pair>,
     /// Index into the menu (`item(i)`).
     pub selected: usize,
     /// One dim line under the menu (wizard result, port clash, ...).
@@ -159,6 +174,7 @@ impl Home {
         }
         let mut h = Self {
             rows,
+            pairs: Vec::new(),
             selected: 0,
             notice: None,
         };
@@ -204,21 +220,110 @@ impl Home {
         rows
     }
 
-    /// Menu length: the rows, Create, Exit.
+    /// Menu length: the rows, the pairs, Create, Exit.
     fn len(&self) -> usize {
-        self.rows.len() + 2
+        self.rows.len() + self.pairs.len() + 2
     }
 
     /// The menu line at `i`.
     #[must_use]
     pub fn item(&self, i: usize) -> Item {
-        if i < self.rows.len() {
+        let (r, p) = (self.rows.len(), self.pairs.len());
+        if i < r {
             Item::Pulse(i)
-        } else if i == self.rows.len() {
+        } else if i < r + p {
+            Item::Pair(i - r)
+        } else if i == r + p {
             Item::Create
         } else {
             Item::Exit
         }
+    }
+
+    /// Recompute the pair rows from the pulse states: every two rows that
+    /// are both up, keeping a known dialogue when the pair survives.
+    fn refresh_pairs(&mut self) {
+        let up: Vec<usize> = (0..self.rows.len())
+            .filter(|&i| self.rows[i].selectable() && self.rows[i].state == PulseState::Up)
+            .collect();
+        let old = std::mem::take(&mut self.pairs);
+        let mut pairs = Vec::new();
+        for (x, &a) in up.iter().enumerate() {
+            for &b in &up[x + 1..] {
+                let dialogue = old
+                    .iter()
+                    .find(|p| p.a == a && p.b == b)
+                    .and_then(|p| p.dialogue.clone());
+                pairs.push(Pair { a, b, dialogue });
+            }
+        }
+        self.pairs = pairs;
+        if self.selected >= self.len() {
+            self.selected = self.first_selectable();
+        }
+    }
+
+    /// Carry the probed states and known dialogues over from the Home this
+    /// one replaces (a rescan after `:home`), matched by directory, so the
+    /// menu does not go blank until the next probe.
+    pub fn inherit(&mut self, prev: &Home) {
+        for row in &mut self.rows {
+            if let Some(old) = prev.rows.iter().find(|r| r.dir == row.dir) {
+                if old.state != PulseState::Starting {
+                    row.state = old.state.clone();
+                }
+            }
+        }
+        self.refresh_pairs();
+        for pair in &mut self.pairs {
+            let (da, db) = (&self.rows[pair.a].dir, &self.rows[pair.b].dir);
+            if let Some(old) = prev
+                .pairs
+                .iter()
+                .find(|p| &prev.rows[p.a].dir == da && &prev.rows[p.b].dir == db)
+            {
+                pair.dialogue = old.dialogue.clone();
+            }
+        }
+    }
+
+    /// Record what the watched dialogue between `local` and `peer` last
+    /// reported, on the matching pair row.
+    pub fn note_dialogue(
+        &mut self,
+        local: &str,
+        peer: &str,
+        status: Option<crate::wire::CommsStatus>,
+    ) {
+        for pair in &mut self.pairs {
+            if self.rows[pair.a].name == local && self.rows[pair.b].name == peer {
+                pair.dialogue = status.clone();
+            }
+        }
+    }
+
+    /// What the left pulse's daemon says about its dialogue, per row dir.
+    pub fn apply_dialogues(&mut self, dialogues: &[(PathBuf, Option<crate::wire::CommsStatus>)]) {
+        for pair in &mut self.pairs {
+            let dir = &self.rows[pair.a].dir;
+            if let Some((_, d)) = dialogues.iter().find(|(p, _)| p == dir) {
+                pair.dialogue = d.clone().filter(|s| s.peer == self.rows[pair.b].name);
+            }
+        }
+    }
+
+    /// A dialogue still going (running or paused), by pair.
+    #[must_use]
+    pub fn running_dialogue(&self, pair: usize) -> Option<&crate::wire::CommsStatus> {
+        self.pairs
+            .get(pair)
+            .and_then(|p| p.dialogue.as_ref())
+            .filter(|s| {
+                matches!(
+                    s.phase.as_str(),
+                    "local_thinking" | "peer_thinking" | "paused"
+                )
+            })
     }
 
     /// The menu, in order.
@@ -237,7 +342,7 @@ impl Home {
     fn is_selectable(&self, item: Item) -> bool {
         match item {
             Item::Pulse(i) => self.rows[i].selectable(),
-            Item::Create | Item::Exit => true,
+            Item::Pair(_) | Item::Create | Item::Exit => true,
         }
     }
 
@@ -269,6 +374,7 @@ impl Home {
                 }
             }
         }
+        self.refresh_pairs();
     }
 
     /// The daemon this process started for `dir` has exited: the row goes
@@ -337,6 +443,7 @@ impl Home {
                 }
             },
             Item::Pulse(_) => HomeAction::None,
+            Item::Pair(i) => HomeAction::Pair(i),
             Item::Create => HomeAction::Create,
             Item::Exit => HomeAction::Exit,
         }
@@ -420,9 +527,16 @@ impl Home {
                 Span::styled(format!("{} ", n + 1), Style::default().fg(t.dim)),
                 Span::styled(format!("{label}{pad}"), base),
             ];
-            if let Item::Pulse(i) = item {
-                spans.push(Span::raw("  "));
-                spans.extend(state_spans(&self.rows[i], t, g, tick));
+            match item {
+                Item::Pulse(i) => {
+                    spans.push(Span::raw("  "));
+                    spans.extend(state_spans(&self.rows[i], t, g, tick));
+                }
+                Item::Pair(i) => {
+                    spans.push(Span::raw("  "));
+                    spans.extend(pair_spans(&self.pairs[i], t, g));
+                }
+                _ => {}
             }
             lines.push(Line::from(spans));
         }
@@ -463,9 +577,39 @@ impl Home {
                 }
                 s
             }
+            Item::Pair(i) => {
+                let p = &self.pairs[i];
+                format!(
+                    "Peer to peer · {} ↔ {}",
+                    self.rows[p.a].name, self.rows[p.b].name
+                )
+            }
             Item::Create => "Create a new pulse".to_string(),
             Item::Exit => "Exit".to_string(),
         }
+    }
+}
+
+fn pair_spans(p: &Pair, t: Tokens, g: &Glyphs) -> Vec<Span<'static>> {
+    match &p.dialogue {
+        Some(s) if s.phase == "paused" => vec![
+            Span::styled(g.dot.to_string(), Style::default().fg(t.warn)),
+            Span::styled(
+                format!(" dialogue paused · turn {}/{}", s.turn, s.max_turns),
+                Style::default().fg(t.dim),
+            ),
+        ],
+        Some(s) if s.phase == "local_thinking" || s.phase == "peer_thinking" => vec![
+            Span::styled(g.dot.to_string(), Style::default().fg(t.intent)),
+            Span::styled(
+                format!(" dialogue running · turn {}/{}", s.turn, s.max_turns),
+                Style::default().fg(t.dim),
+            ),
+        ],
+        _ => vec![Span::styled(
+            "· both up".to_string(),
+            Style::default().fg(t.dim),
+        )],
     }
 }
 
@@ -752,6 +896,89 @@ mod tests {
             PulseState::from(c.probe_detail("echo").await),
             PulseState::Up
         );
+    }
+
+    fn status(peer: &str, phase: &str, turn: u32) -> crate::wire::CommsStatus {
+        crate::wire::CommsStatus {
+            id: "d1".into(),
+            peer: peer.into(),
+            topic: None,
+            turn,
+            max_turns: 20,
+            phase: phase.into(),
+            error: None,
+        }
+    }
+
+    #[test]
+    fn pair_rows_exist_only_for_two_up_pulses() {
+        let (_tmp, rows) = selectable_rows(&["echo", "nova", "synth"]);
+        let dirs: Vec<PathBuf> = rows.iter().map(|r| r.dir.clone()).collect();
+        let mut h = Home::new(rows);
+        assert!(h.pairs.is_empty(), "nothing probed yet");
+        h.apply_states(&[(dirs[0].clone(), PulseState::Up)]);
+        assert!(h.pairs.is_empty(), "one up pulse makes no pair");
+        h.apply_states(&[(dirs[2].clone(), PulseState::Up)]);
+        assert_eq!(h.pairs.len(), 1);
+        assert_eq!((h.pairs[0].a, h.pairs[0].b), (0, 2));
+        assert_eq!(h.item(3), Item::Pair(0), "pairs come after the pulse rows");
+        assert_eq!(h.item(4), Item::Create);
+        assert_eq!(h.label(Item::Pair(0)), "Peer to peer · echo ↔ synth");
+        h.apply_states(&[(dirs[1].clone(), PulseState::Up)]);
+        assert_eq!(h.pairs.len(), 3, "three up pulses make three pairs");
+        // Enter on a pair asks for the dialogue.
+        h.selected = 3;
+        assert_eq!(h.on_key(key(KeyCode::Enter)), HomeAction::Pair(0));
+        // A pulse going down removes its pairs and keeps the selection valid.
+        h.selected = h.len() - 1;
+        h.apply_states(&[(dirs[0].clone(), PulseState::Stopped)]);
+        assert_eq!(h.pairs.len(), 1);
+        assert!(h.selected < h.len());
+    }
+
+    #[test]
+    fn pair_row_shows_a_running_dialogue_from_the_left_daemon() {
+        let (_tmp, rows) = selectable_rows(&["echo", "synth"]);
+        let dirs: Vec<PathBuf> = rows.iter().map(|r| r.dir.clone()).collect();
+        let mut h = Home::new(rows);
+        h.apply_states(&[
+            (dirs[0].clone(), PulseState::Up),
+            (dirs[1].clone(), PulseState::Up),
+        ]);
+        assert!(h.running_dialogue(0).is_none());
+        h.apply_dialogues(&[(dirs[0].clone(), Some(status("synth", "peer_thinking", 3)))]);
+        assert_eq!(h.running_dialogue(0).map(|s| s.turn), Some(3));
+        // A dialogue with some other peer is not this pair's.
+        h.apply_dialogues(&[(dirs[0].clone(), Some(status("nova", "peer_thinking", 1)))]);
+        assert!(h.running_dialogue(0).is_none());
+        // A finished one is not running.
+        h.apply_dialogues(&[(dirs[0].clone(), Some(status("synth", "finished", 20)))]);
+        assert!(h.running_dialogue(0).is_none());
+        // The pair survives a state refresh with its dialogue.
+        h.apply_dialogues(&[(dirs[0].clone(), Some(status("synth", "paused", 4)))]);
+        h.apply_states(&[(dirs[0].clone(), PulseState::Up)]);
+        assert_eq!(
+            h.running_dialogue(0).map(|s| s.phase.as_str()),
+            Some("paused")
+        );
+    }
+
+    #[test]
+    fn a_rescan_inherits_states_and_dialogues_by_directory() {
+        let (_tmp, rows) = selectable_rows(&["echo", "synth"]);
+        let dirs: Vec<PathBuf> = rows.iter().map(|r| r.dir.clone()).collect();
+        let mut old = Home::new(rows.clone());
+        old.apply_states(&[
+            (dirs[0].clone(), PulseState::Up),
+            (dirs[1].clone(), PulseState::Up),
+        ]);
+        old.note_dialogue("echo", "synth", Some(status("synth", "local_thinking", 5)));
+        let mut fresh = Home::new(rows);
+        assert!(fresh.pairs.is_empty());
+        fresh.inherit(&old);
+        assert_eq!(fresh.rows[0].state, PulseState::Up);
+        assert_eq!(fresh.pairs.len(), 1);
+        assert_eq!(fresh.running_dialogue(0).map(|s| s.turn), Some(5));
     }
 
     #[test]

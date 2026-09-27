@@ -19,6 +19,8 @@ use super::theme::Tokens;
 pub enum Who {
     Owner,
     Pulse,
+    /// The other pulse in a peer-to-peer dialogue, by name.
+    Peer(String),
     /// A dim system notice (errors, interruptions).
     Notice,
 }
@@ -253,6 +255,12 @@ impl Transcript {
     }
 
     /// The owner's message, echoed before the request leaves.
+    /// A finished entry for `who` (a completed dialogue turn).
+    pub fn push_done(&mut self, who: Who, text: &str) {
+        self.entries.push(Entry::new(who, text, EntryState::Done));
+        self.mark_new();
+    }
+
     pub fn push_owner(&mut self, text: &str) {
         self.entries
             .push(Entry::new(Who::Owner, text, EntryState::Done));
@@ -485,11 +493,12 @@ impl Transcript {
         let label_style = |who: &Who| match who {
             Who::Owner => Style::default().fg(t.accent).add_modifier(Modifier::BOLD),
             Who::Pulse => Style::default().fg(t.pulse).add_modifier(Modifier::BOLD),
+            Who::Peer(_) => Style::default().fg(t.intent).add_modifier(Modifier::BOLD),
             Who::Notice => Style::default().fg(t.dim).add_modifier(Modifier::ITALIC),
         };
         let body_style = |who: &Who| match who {
             Who::Notice => Style::default().fg(t.dim).add_modifier(Modifier::ITALIC),
-            Who::Owner | Who::Pulse => Style::default().fg(t.ink),
+            Who::Owner | Who::Pulse | Who::Peer(_) => Style::default().fg(t.ink),
         };
         let visible = |row: usize| row >= offset && row < end;
         let mut lines: Vec<Line<'static>> = Vec::with_capacity(self.viewport);
@@ -510,9 +519,10 @@ impl Transcript {
             }
             if b.header {
                 if visible(r) {
-                    let label = match e.who {
+                    let label = match &e.who {
                         Who::Owner => owner.to_string(),
                         Who::Pulse => pulse.to_string(),
+                        Who::Peer(name) => name.clone(),
                         Who::Notice => String::new(),
                     };
                     lines.push(Line::from(vec![

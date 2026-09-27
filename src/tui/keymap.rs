@@ -24,6 +24,10 @@ pub enum Context {
     },
     /// Talk, transcript focused.
     Transcript,
+    /// The peer-to-peer dialogue page.
+    Peer {
+        paused: bool,
+    },
     CmdLine,
     Confirm,
     Help,
@@ -60,6 +64,13 @@ pub fn bindings(ctx: Context) -> Vec<Binding> {
             b("↑ / ↓", "history when the prompt is one line"),
             b("Ctrl+u / Ctrl+w", "delete to line start / word"),
             b("PgUp / PgDn", "scroll the transcript"),
+        ],
+        Context::Peer { paused } => vec![
+            b("Space", if paused { "resume" } else { "pause" }),
+            b("Ctrl+c", "stop the dialogue"),
+            b("j / k", "scroll"),
+            b("g / G", "top / follow the tail"),
+            b("q", "back to Home (the dialogue keeps running)"),
         ],
         Context::Transcript => vec![
             b("j / k", "scroll"),
@@ -105,6 +116,8 @@ fn short_what(what: &'static str) -> &'static str {
         "history when the prompt is one line" => "history",
         "delete to line start / word" => "kill",
         "scroll the transcript" => "scroll",
+        "stop the dialogue" => "stop",
+        "back to Home (the dialogue keeps running)" => "home",
         "top / follow the tail" => "top/tail",
         "half page" => "half page",
         "focus the prompt" => "prompt",
@@ -127,6 +140,7 @@ mod tests {
             Context::Prompt { turn_active: false },
             Context::Prompt { turn_active: true },
             Context::Transcript,
+            Context::Peer { paused: false },
             Context::CmdLine,
             Context::Confirm,
             Context::Help,
