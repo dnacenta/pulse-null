@@ -282,6 +282,19 @@ impl Client {
         } else {
             Self::expect_ok(resp).await?.json().await?
         };
+        if already_running {
+            // Busy with another peer is a refusal, not something to watch.
+            let running = v["peer"].as_str().unwrap_or("");
+            if !running.eq_ignore_ascii_case(&req.peer.name) {
+                return Err(ClientError::Status {
+                    status,
+                    body: v["error"].as_str().map_or_else(
+                        || "a dialogue is already running".to_string(),
+                        str::to_string,
+                    ),
+                });
+            }
+        }
         match v["id"].as_str().filter(|id| !id.is_empty()) {
             Some(id) => Ok(CommsStarted {
                 id: id.to_string(),

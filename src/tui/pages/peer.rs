@@ -13,6 +13,10 @@ use ratatui::Frame;
 
 use crate::wire::{CommsEvent, CommsStatus};
 
+use super::super::pane;
+use super::super::theme::Tokens;
+use super::super::transcript::{Transcript, Who};
+
 /// What the loop's watch task reports: a daemon event, or something that
 /// happened to the watch itself — none of which means the dialogue ended.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -28,10 +32,6 @@ pub enum Watch {
     /// A pause/resume/stop request failed.
     Notice(String),
 }
-
-use super::super::pane;
-use super::super::theme::Tokens;
-use super::super::transcript::{Transcript, Who};
 
 /// What a key on the Peer page asks the loop to do.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -127,6 +127,14 @@ impl Peer {
         }
     }
 
+    fn archive_note(archived: bool) -> &'static str {
+        if archived {
+            "the turns are archived"
+        } else {
+            "nothing archived"
+        }
+    }
+
     /// One frame of the stream.
     pub fn on_event(&mut self, ev: CommsEvent) {
         self.starting = false;
@@ -140,17 +148,20 @@ impl Peer {
                 self.transcript.push_done(speaker, &text);
             }
             CommsEvent::Status(s) => self.status = Some(s),
-            CommsEvent::Done => {
-                let how = match self.status.as_ref().map(|s| s.phase.as_str()) {
-                    Some("cancelled") => "stopped — the turns so far are archived",
-                    _ => "finished — archived",
+            CommsEvent::Done { archived } => {
+                let what = match self.status.as_ref().map(|s| s.phase.as_str()) {
+                    Some("cancelled") => "stopped",
+                    _ => "finished",
                 };
-                self.transcript.push_notice(how);
+                self.transcript
+                    .push_notice(&format!("{what} — {}", Self::archive_note(archived)));
                 self.ended = Some(Ok(()));
             }
-            CommsEvent::Error { message } => {
-                self.transcript
-                    .push_notice(&format!("ended with an error: {message} — archived"));
+            CommsEvent::Error { message, archived } => {
+                self.transcript.push_notice(&format!(
+                    "ended with an error: {message} — {}",
+                    Self::archive_note(archived)
+                ));
                 self.ended = Some(Err(message));
             }
         }
@@ -308,6 +319,7 @@ mod tests {
             max_turns: 4,
             phase: phase.into(),
             error: None,
+            archived: false,
         }
     }
 
@@ -339,12 +351,19 @@ mod tests {
         p.on_event(CommsEvent::Status(status("peer_thinking", 2)));
         assert!(p.active());
         p.on_event(CommsEvent::Status(status("cancelled", 2)));
-        p.on_event(CommsEvent::Done);
+        p.on_event(CommsEvent::Done { archived: true });
         assert_eq!(p.ended, Some(Ok(())));
         assert!(!p.active());
         let last = p.transcript.entries().last().unwrap();
         assert_eq!(last.who, Who::Notice);
-        assert!(last.text.contains("stopped"));
+        assert!(last.text.contains("stopped") && last.text.contains("archived"));
+        let mut p = Peer::new("Echo", "Synth");
+        p.on_event(CommsEvent::Error {
+            message: "shed by isolation mode".into(),
+            archived: false,
+        });
+        let last = p.transcript.entries().last().unwrap();
+        assert!(last.text.contains("nothing archived"), "{}", last.text);
     }
 
     #[test]
@@ -391,7 +410,7 @@ mod tests {
             PeerAction::StopRequested
         );
         assert_eq!(p.on_key(key(KeyCode::Char('q'))), PeerAction::Back);
-        p.on_event(CommsEvent::Done);
+        p.on_event(CommsEvent::Done { archived: true });
         assert_eq!(
             p.on_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL)),
             PeerAction::Back,

@@ -77,13 +77,33 @@ async fn read_capped(mut resp: reqwest::Response, cap: usize) -> Result<Vec<u8>,
     Ok(buf)
 }
 
-/// An error body as one short, printable line (no forged log lines, no
-/// terminal escapes), for the message and the log.
+/// The first `n` bytes of a body, dropping the rest (for error pages, where
+/// a prefix is what the message needs).
+async fn read_prefix(mut resp: reqwest::Response, n: usize) -> Vec<u8> {
+    let mut buf = Vec::new();
+    while buf.len() <= n {
+        match resp.chunk().await {
+            Ok(Some(chunk)) => buf.extend_from_slice(&chunk),
+            _ => break,
+        }
+    }
+    buf
+}
+
+/// An error body as one short line of printable ASCII (no forged log
+/// lines, no terminal escapes, no bidi or zero-width tricks), for the
+/// message and the log. Longer bodies end in `…`.
 fn clean_excerpt(body: &[u8]) -> String {
     let text = String::from_utf8_lossy(body);
     let mut out: String = text
         .chars()
-        .map(|c| if c.is_control() { ' ' } else { c })
+        .map(|c| {
+            if c.is_ascii_graphic() || c == ' ' {
+                c
+            } else {
+                ' '
+            }
+        })
         .take(ERROR_BODY_EXCERPT)
         .collect();
     if text.chars().count() > ERROR_BODY_EXCERPT {
@@ -194,9 +214,7 @@ impl PeerClient {
 
         if !resp.status().is_success() {
             let status = resp.status().as_u16();
-            let body = read_capped(resp, ERROR_BODY_EXCERPT)
-                .await
-                .unwrap_or_default();
+            let body = read_prefix(resp, ERROR_BODY_EXCERPT).await;
             return Err(PeerError::Status(status, clean_excerpt(&body)));
         }
 
@@ -363,9 +381,11 @@ mod tests {
 
     #[test]
     fn error_excerpts_are_short_and_printable() {
-        let long = format!("bad\nline\x1b[31m{}", "y".repeat(2000));
+        let long = format!("bad\nline\x1b[31m\u{202e}\u{200b}{}", "y".repeat(2000));
         let out = clean_excerpt(long.as_bytes());
         assert!(!out.contains('\n') && !out.contains('\x1b'));
+        assert!(!out.contains('\u{202e}') && !out.contains('\u{200b}'));
+        assert!(out.trim_end_matches('…').is_ascii());
         assert!(out.chars().count() <= ERROR_BODY_EXCERPT + 1);
         assert!(out.ends_with('…'));
         assert_eq!(clean_excerpt(b"  plain  "), "plain");

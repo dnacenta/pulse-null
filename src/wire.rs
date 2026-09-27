@@ -140,6 +140,9 @@ pub struct CommsStatus {
     pub phase: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+    /// Once over: whether a conversation file was written.
+    #[serde(default)]
+    pub archived: bool,
 }
 
 impl CommsStatus {
@@ -171,9 +174,16 @@ pub enum CommsEvent {
         n: u32,
     },
     Status(CommsStatus),
-    Done,
+    /// The dialogue ended; `archived` says whether a conversation file was
+    /// written (not while isolated, not with zero turns).
+    Done {
+        #[serde(default)]
+        archived: bool,
+    },
     Error {
         message: String,
+        #[serde(default)]
+        archived: bool,
     },
 }
 
@@ -268,6 +278,7 @@ mod tests {
             max_turns: 20,
             phase: "peer_thinking".into(),
             error: None,
+            archived: false,
         };
         for ev in [
             CommsEvent::Turn {
@@ -276,16 +287,17 @@ mod tests {
                 n: 1,
             },
             CommsEvent::Status(status),
-            CommsEvent::Done,
+            CommsEvent::Done { archived: true },
             CommsEvent::Error {
                 message: "peer offline".into(),
+                archived: false,
             },
         ] {
             let (name, data) = ev.to_sse_parts();
             let back = CommsEvent::from_sse_parts(&name, &data.to_string()).unwrap();
             assert_eq!(back, ev, "{name}");
         }
-        assert_eq!(CommsEvent::Done.to_sse_parts().0, "done");
+        assert_eq!(CommsEvent::Done { archived: true }.to_sse_parts().0, "done");
         assert!(CommsEvent::from_sse_parts("nonsense", "{}").is_none());
     }
 

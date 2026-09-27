@@ -37,6 +37,7 @@ use app::{Action, App};
 use bar::Glyphs;
 use client::{ChatEvent, Client, ClientError};
 use motion::MotionLevel;
+use pages::peer::Watch;
 use poller::{Bg, Ctl};
 use theme::ThemeWatcher;
 
@@ -313,9 +314,6 @@ enum Launch {
     Attach(String),
 }
 
-/// Reports from the watch task to the Peer page.
-type Watch = pages::peer::Watch;
-
 /// Open (or reuse) the session on pulse `a` for a dialogue with `peer`, and
 /// show the Peer page. `None` when `a` is not up.
 fn open_peer(
@@ -372,7 +370,7 @@ async fn comms_pump(client: Client, launch: Launch, tx: tokio::sync::mpsc::Sende
             Ok(ev) => {
                 let over = matches!(
                     ev,
-                    crate::wire::CommsEvent::Done | crate::wire::CommsEvent::Error { .. }
+                    crate::wire::CommsEvent::Done { .. } | crate::wire::CommsEvent::Error { .. }
                 );
                 if tx.send(Watch::Event(ev)).await.is_err() || over {
                     return;
@@ -498,8 +496,9 @@ async fn event_loop(
     >(4);
     // The dialogue being watched on the Peer page: its event pump.
     let mut comms_rx: Option<tokio::sync::mpsc::Receiver<Watch>> = None;
-    // The watch's sender, kept so pause/stop failures reach the page too.
-    let mut comms_tx: Option<tokio::sync::mpsc::Sender<Watch>> = None;
+    // A weak handle on the watch's sender, so pause/stop failures reach the
+    // page while the pump alone decides when the channel closes.
+    let mut comms_tx: Option<tokio::sync::mpsc::WeakSender<Watch>> = None;
     let mut comms_launch: Option<CommsLaunch> = None;
     let mut comms_task: Option<tokio::task::JoinHandle<()>> = None;
     // A ticker that is gated off for a while must not burst when it comes
@@ -704,7 +703,7 @@ async fn event_loop(
                                     tokio::spawn(async move {
                                         if let Err(e) = c.comms_pause(&id, paused).await {
                                             tracing::warn!("comms pause/resume: {e}");
-                                            if let Some(tx) = tx {
+                                            if let Some(tx) = tx.and_then(|w| w.upgrade()) {
                                                 let what = if paused { "pause" } else { "resume" };
                                                 let _ = tx.send(Watch::Notice(format!("{what} failed: {e}"))).await;
                                             }
@@ -718,7 +717,7 @@ async fn event_loop(
                                     tokio::spawn(async move {
                                         if let Err(e) = c.comms_stop(&id).await {
                                             tracing::warn!("comms stop: {e}");
-                                            if let Some(tx) = tx {
+                                            if let Some(tx) = tx.and_then(|w| w.upgrade()) {
                                                 let _ = tx.send(Watch::Notice(format!("stop failed: {e}"))).await;
                                             }
                                         }
@@ -742,7 +741,7 @@ async fn event_loop(
                                 Ok(client) => {
                                     let (tx, rx) = tokio::sync::mpsc::channel(64);
                                     comms_rx = Some(rx);
-                                    comms_tx = Some(tx.clone());
+                                    comms_tx = Some(tx.downgrade());
                                     if let Some(task) = comms_task.take() {
                                         task.abort();
                                     }
@@ -958,7 +957,7 @@ async fn event_loop(
                     Some(w) => {
                         let over = matches!(
                             w,
-                            Watch::Event(crate::wire::CommsEvent::Done | crate::wire::CommsEvent::Error { .. })
+                            Watch::Event(crate::wire::CommsEvent::Done { .. } | crate::wire::CommsEvent::Error { .. })
                                 | Watch::StartFailed(_)
                                 | Watch::Lost(_)
                         );

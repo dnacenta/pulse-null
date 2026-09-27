@@ -1098,6 +1098,7 @@ mod tests {
                 max_turns: 20,
                 phase: "local_thinking".into(),
                 error: None,
+                archived: false,
             }),
         )]);
         a.on_key(key(KeyCode::Char('3')));
@@ -1124,6 +1125,7 @@ mod tests {
                 max_turns: 4,
                 phase: "peer_thinking".into(),
                 error: None,
+                archived: false,
             }));
         assert_eq!(a.on_key(key(KeyCode::Char(' '))), Action::PeerPause(true));
         assert_eq!(a.on_key(ctrl('c')), Action::None);

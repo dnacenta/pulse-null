@@ -61,6 +61,12 @@ pub async fn start(
                     "a peer on another host must be configured under [peers] with a secret",
                 ));
             }
+            if port == state.config.server.port {
+                return Err(err(
+                    StatusCode::BAD_REQUEST,
+                    "that is this daemon's own port",
+                ));
+            }
             Some(port)
         }
         (Some(_), None) => return Err(err(StatusCode::BAD_REQUEST, "a host needs a port")),
@@ -92,10 +98,20 @@ pub async fn start(
         },
     ) {
         Ok(id) => Ok((StatusCode::ACCEPTED, Json(serde_json::json!({ "id": id })))),
-        Err(StartError::Busy(id)) => Err((
-            StatusCode::CONFLICT,
-            Json(serde_json::json!({ "error": "a dialogue is already running", "id": id })),
-        )),
+        Err(StartError::Busy(id)) => {
+            let peer = state.comms.get(&id).map(|d| d.peer.clone());
+            Err((
+                StatusCode::CONFLICT,
+                Json(serde_json::json!({
+                    "error": format!(
+                        "a dialogue with {} is already running",
+                        peer.as_deref().unwrap_or("a peer")
+                    ),
+                    "id": id,
+                    "peer": peer,
+                })),
+            ))
+        }
         Err(StartError::UnknownPeer(p)) => Err(err(
             StatusCode::BAD_REQUEST,
             format!("unknown peer {p:?}: configure it under [peers] or give a port for a sibling on this box"),
@@ -104,8 +120,12 @@ pub async fn start(
             StatusCode::BAD_REQUEST,
             format!("peer {p:?} is on another host and has no secret under [peers]; not dialled"),
         )),
+        Err(StartError::Closing) => Err(err(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "the daemon is shutting down",
+        )),
         Err(StartError::Isolated) => Err(err(
-            StatusCode::CONFLICT,
+            StatusCode::SERVICE_UNAVAILABLE,
             format!(
                 "{} isolation mode active — dialogues are shed until /resume",
                 crate::server::isolation::BANNER
@@ -125,6 +145,20 @@ pub async fn current(
         .current()
         .map(|d| Json(d.status()))
         .ok_or_else(|| err(StatusCode::NOT_FOUND, "no dialogue"))
+}
+
+/// The replayed ending of a dialogue that is already over: whether it was
+/// archived is what the status says.
+fn ending(status: &CommsStatus) -> CommsEvent {
+    match &status.error {
+        Some(message) => CommsEvent::Error {
+            message: message.clone(),
+            archived: status.archived,
+        },
+        None => CommsEvent::Done {
+            archived: status.archived,
+        },
+    }
 }
 
 fn sse(ev: &CommsEvent) -> Event {
@@ -170,10 +204,7 @@ pub async fn stream(
         }
         yield Ok(sse(&CommsEvent::Status(status.clone())));
         if over {
-            yield Ok(sse(&match &status.error {
-                Some(message) => CommsEvent::Error { message: message.clone() },
-                None => CommsEvent::Done,
-            }));
+            yield Ok(sse(&ending(&status)));
             return;
         }
         loop {
@@ -183,7 +214,7 @@ pub async fn stream(
                     if let CommsEvent::Turn { n, .. } = &ev {
                         last_n = *n;
                     }
-                    let done = matches!(ev, CommsEvent::Done | CommsEvent::Error { .. });
+                    let done = matches!(ev, CommsEvent::Done { .. } | CommsEvent::Error { .. });
                     yield Ok(sse(&ev));
                     if done {
                         return;
@@ -202,10 +233,7 @@ pub async fn stream(
                     let status = dialogue.status();
                     yield Ok(sse(&CommsEvent::Status(status.clone())));
                     if over {
-                        yield Ok(sse(&match &status.error {
-                            Some(message) => CommsEvent::Error { message: message.clone() },
-                            None => CommsEvent::Done,
-                        }));
+                        yield Ok(sse(&ending(&status)));
                         return;
                     }
                 }

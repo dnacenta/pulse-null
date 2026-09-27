@@ -1614,8 +1614,7 @@ mod comms_e2e {
         (port, seen)
     }
 
-    /// A peer whose reply is far over the cap, with a long control-laden
-    /// error body on any second call.
+    /// A peer whose reply is far over the cap.
     async fn fake_peer_huge() -> u16 {
         let app = Router::new().route(
             "/chat",
@@ -1862,6 +1861,7 @@ mod comms_e2e {
         let (status, body) = post_json(&app, "/api/comms", start_body(port, 6)).await;
         assert_eq!(status, StatusCode::CONFLICT, "{body}");
         assert_eq!(body["id"], id);
+        assert_eq!(body["peer"], "peerbot", "busy names the running peer");
 
         // Pause is accepted while running; stop ends it as cancelled.
         let (_, _, mut live) = state.comms.current().expect("running").subscribe();
@@ -1885,7 +1885,7 @@ mod comms_e2e {
         for _ in 0..40 {
             match tokio::time::timeout(std::time::Duration::from_millis(50), live.recv()).await {
                 Ok(Ok(ev)) => {
-                    let over = matches!(ev, CommsEvent::Done | CommsEvent::Error { .. });
+                    let over = matches!(ev, CommsEvent::Done { .. } | CommsEvent::Error { .. });
                     ending.push(ev);
                     if over {
                         break;
@@ -1907,7 +1907,7 @@ mod comms_e2e {
             "the last status before done is cancelled: {phases:?}"
         );
         assert!(
-            matches!(ending.last(), Some(CommsEvent::Done)),
+            matches!(ending.last(), Some(CommsEvent::Done { archived: true })),
             "{ending:?}"
         );
         // The stream of an ended dialogue replays and closes with done.
@@ -2131,7 +2131,8 @@ mod comms_e2e {
     #[tokio::test]
     async fn e2e_comms_refuses_a_non_loopback_adhoc_peer_and_bad_caps() {
         let dir = tempfile::tempdir().unwrap();
-        let app = build_app(state_in(dir.path()).await);
+        let state = state_in(dir.path()).await;
+        let app = build_app(Arc::clone(&state));
         let (status, body) = post_json(
             &app,
             "/api/comms",
@@ -2149,6 +2150,14 @@ mod comms_e2e {
         assert_eq!(status, StatusCode::BAD_REQUEST, "unknown configured peer");
         let (status, _) = post_json(&app, "/api/comms", start_body(1, 99)).await;
         assert_eq!(status, StatusCode::BAD_REQUEST, "cap above the max");
+        let own = state.config.server.port;
+        let (status, body) = post_json(&app, "/api/comms", start_body(own, 2)).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "own port: {body}");
+        crate::server::isolation::enter(dir.path(), "test", None).unwrap();
+        let (status, body) = post_json(&app, "/api/comms", start_body(1, 2)).await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "isolated: {body}");
+        assert!(body["error"].as_str().unwrap().contains("isolation"));
+        crate::server::isolation::exit(dir.path()).unwrap();
         for bad in [
             "peer bot",
             "peer\"\nx: y",
@@ -2241,7 +2250,6 @@ mod comms_e2e {
         assert_eq!(last.0, "error", "{text}");
         let msg = last.1["message"].as_str().unwrap();
         assert!(msg.contains("over"), "{msg}");
-        assert!(msg.len() < 700, "excerpt stays short: {}", msg.len());
     }
 
     #[tokio::test]

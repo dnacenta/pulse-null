@@ -359,7 +359,15 @@ impl Home {
                         status: s.clone(),
                     })
             };
-            if let Some(d) = hosted(pair.a, pair.b).or_else(|| hosted(pair.b, pair.a)) {
+            // A running dialogue on either side beats an ended one the
+            // other side's slot still holds.
+            let running = |d: &PairDialogue| d.status.phase_is_running();
+            let pick = hosted(pair.a, pair.b)
+                .filter(running)
+                .or_else(|| hosted(pair.b, pair.a).filter(running))
+                .or_else(|| hosted(pair.a, pair.b))
+                .or_else(|| hosted(pair.b, pair.a));
+            if let Some(d) = pick {
                 pair.dialogue = Some(d);
             } else if let Some(cur) = &pair.dialogue {
                 if report(cur.host).is_some() {
@@ -976,6 +984,7 @@ mod tests {
             max_turns: 20,
             phase: phase.into(),
             error: None,
+            archived: false,
         }
     }
 
@@ -1055,6 +1064,14 @@ mod tests {
         // synth answering with nothing does.
         h.apply_dialogues(&[(dirs[1].clone(), None)]);
         assert!(h.running_dialogue(0).is_none());
+        // echo's slot still holds a finished dialogue while synth runs a
+        // new one: the running one wins, so Enter re-attaches, never
+        // starts a duplicate.
+        h.apply_dialogues(&[
+            (dirs[0].clone(), Some(status("synth", "finished", 20))),
+            (dirs[1].clone(), Some(status("echo", "peer_thinking", 1))),
+        ]);
+        assert_eq!(h.running_dialogue(0).map(|d| d.host), Some(1));
         // note_dialogue from a Peer page hosted on synth lands the same way.
         h.note_dialogue("synth", "echo", Some(status("echo", "paused", 1)));
         assert_eq!(h.running_dialogue(0).map(|d| d.host), Some(1));
@@ -1084,6 +1101,30 @@ mod tests {
         assert_eq!(h.item(2), Item::Pair(0));
         h.apply_states(&[(dirs[0].clone(), PulseState::Up)]);
         assert_eq!(h.item(h.selected), Item::Pair(0), "stays on the pair");
+    }
+
+    #[test]
+    fn the_cursor_stays_on_its_pair_when_a_pair_is_inserted_before_it() {
+        let (_tmp, rows) = selectable_rows(&["echo", "nova", "synth"]);
+        let dirs: Vec<PathBuf> = rows.iter().map(|r| r.dir.clone()).collect();
+        let mut h = Home::new(rows);
+        h.apply_states(&[
+            (dirs[0].clone(), PulseState::Up),
+            (dirs[2].clone(), PulseState::Up),
+        ]);
+        // pairs: (echo, synth) at item 3 — cursor on it.
+        h.selected = 3;
+        assert_eq!(h.pairs[0].a, 0);
+        assert_eq!(h.pairs[0].b, 2);
+        // nova comes up: pairs become (echo,nova), (echo,synth), (nova,synth).
+        h.apply_states(&[(dirs[1].clone(), PulseState::Up)]);
+        let Item::Pair(i) = h.item(h.selected) else {
+            panic!("still on a pair");
+        };
+        assert_eq!((h.pairs[i].a, h.pairs[i].b), (0, 2), "the same pair");
+        // Its pair going away sends the cursor to the first selectable item.
+        h.apply_states(&[(dirs[2].clone(), PulseState::Stopped)]);
+        assert!(h.selected < h.len());
     }
 
     #[test]
