@@ -38,8 +38,15 @@ pub enum PeerError {
     #[allow(dead_code)]
     Offline(String),
     RequestFailed(reqwest::Error),
+    /// A non-2xx answer: the status and a short, cleaned excerpt of the body.
+    Status(u16, String),
     BadResponse(String),
 }
+
+/// The most of a peer's reply body that is read (the inbound `/chat` cap).
+pub const MAX_PEER_REPLY_BYTES: usize = 100_000;
+/// How much of an error body is kept for the message and the log.
+const ERROR_BODY_EXCERPT: usize = 512;
 
 impl std::fmt::Display for PeerError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -48,9 +55,61 @@ impl std::fmt::Display for PeerError {
             PeerError::AlreadyExists(name) => write!(f, "peer already exists: {}", name),
             PeerError::Offline(name) => write!(f, "peer offline: {}", name),
             PeerError::RequestFailed(e) => write!(f, "request failed: {}", e),
+            PeerError::Status(code, body) => write!(f, "peer answered {code}: {body}"),
             PeerError::BadResponse(msg) => write!(f, "bad response: {}", msg),
         }
     }
+}
+
+/// Read a response body up to `cap` bytes; more than that is an error, not
+/// a truncation, so a peer cannot slip a cut-off reply into the transcript.
+async fn read_capped(mut resp: reqwest::Response, cap: usize) -> Result<Vec<u8>, PeerError> {
+    if resp.content_length().is_some_and(|n| n > cap as u64) {
+        return Err(PeerError::BadResponse(format!("reply over {cap} bytes")));
+    }
+    let mut buf = Vec::new();
+    while let Some(chunk) = resp.chunk().await.map_err(PeerError::RequestFailed)? {
+        if buf.len() + chunk.len() > cap {
+            return Err(PeerError::BadResponse(format!("reply over {cap} bytes")));
+        }
+        buf.extend_from_slice(&chunk);
+    }
+    Ok(buf)
+}
+
+/// The first `n` bytes of a body, dropping the rest (for error pages, where
+/// a prefix is what the message needs).
+async fn read_prefix(mut resp: reqwest::Response, n: usize) -> Vec<u8> {
+    let mut buf = Vec::new();
+    while buf.len() <= n {
+        match resp.chunk().await {
+            Ok(Some(chunk)) => buf.extend_from_slice(&chunk),
+            _ => break,
+        }
+    }
+    buf
+}
+
+/// An error body as one short line of printable ASCII (no forged log
+/// lines, no terminal escapes, no bidi or zero-width tricks), for the
+/// message and the log. Longer bodies end in `…`.
+fn clean_excerpt(body: &[u8]) -> String {
+    let text = String::from_utf8_lossy(body);
+    let mut out: String = text
+        .chars()
+        .map(|c| {
+            if c.is_ascii_graphic() || c == ' ' {
+                c
+            } else {
+                ' '
+            }
+        })
+        .take(ERROR_BODY_EXCERPT)
+        .collect();
+    if text.chars().count() > ERROR_BODY_EXCERPT {
+        out.push('…');
+    }
+    out.trim().to_string()
 }
 
 // ─── PeerClient ───
@@ -67,6 +126,9 @@ impl PeerClient {
         Self {
             http: reqwest::Client::builder()
                 .timeout(Duration::from_secs(120))
+                // A peer (or whoever holds its port) must not be able to
+                // redirect a request — with its X-Echo-Secret — elsewhere.
+                .redirect(reqwest::redirect::Policy::none())
                 .build()
                 .expect("failed to build HTTP client"),
             peers,
@@ -110,6 +172,21 @@ impl PeerClient {
         sender: &str,
         channel: &str,
     ) -> Result<PeerChatResponse, PeerError> {
+        self.send_message_within(peer_name, message, sender, channel, None)
+            .await
+    }
+
+    /// `send_message` with its own deadline: a peer's `/chat` runs a whole
+    /// agent turn, so a dialogue gives it the local turn's budget rather
+    /// than the client's 120 s.
+    pub async fn send_message_within(
+        &self,
+        peer_name: &str,
+        message: &str,
+        sender: &str,
+        channel: &str,
+        timeout: Option<Duration>,
+    ) -> Result<PeerChatResponse, PeerError> {
         let peer = self
             .peers
             .get(peer_name)
@@ -122,6 +199,9 @@ impl PeerClient {
             "channel": channel,
             "sender": sender,
         }));
+        if let Some(t) = timeout {
+            req = req.timeout(t);
+        }
 
         // Identify ourselves for peer authentication
         req = req.header("X-Peer-Name", &self.pulse_name);
@@ -133,12 +213,17 @@ impl PeerClient {
         let resp = req.send().await.map_err(PeerError::RequestFailed)?;
 
         if !resp.status().is_success() {
-            let status = resp.status();
-            let body = resp.text().await.unwrap_or_default();
-            return Err(PeerError::BadResponse(format!("{}: {}", status, body)));
+            let status = resp.status().as_u16();
+            let body = read_prefix(resp, ERROR_BODY_EXCERPT).await;
+            return Err(PeerError::Status(status, clean_excerpt(&body)));
         }
 
-        resp.json().await.map_err(PeerError::RequestFailed)
+        // Read the body in chunks under a cap: the peer decides the size,
+        // and a reply lands in the transcript, every later prompt and the
+        // archive.
+        let body = read_capped(resp, MAX_PEER_REPLY_BYTES).await?;
+        serde_json::from_slice(&body)
+            .map_err(|e| PeerError::BadResponse(format!("reply is not JSON: {e}")))
     }
 
     /// List all configured peers with their online status.
@@ -287,5 +372,22 @@ pub async fn test_connection(host: &str, port: u16) -> (bool, Option<u64>) {
             (true, Some(ms))
         }
         _ => (false, None),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn error_excerpts_are_short_and_printable() {
+        let long = format!("bad\nline\x1b[31m\u{202e}\u{200b}{}", "y".repeat(2000));
+        let out = clean_excerpt(long.as_bytes());
+        assert!(!out.contains('\n') && !out.contains('\x1b'));
+        assert!(!out.contains('\u{202e}') && !out.contains('\u{200b}'));
+        assert!(out.trim_end_matches('…').is_ascii());
+        assert!(out.chars().count() <= ERROR_BODY_EXCERPT + 1);
+        assert!(out.ends_with('…'));
+        assert_eq!(clean_excerpt(b"  plain  "), "plain");
     }
 }

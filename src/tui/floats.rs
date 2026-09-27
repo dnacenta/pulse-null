@@ -38,6 +38,20 @@ pub enum Command {
     Help,
     /// Back to the pulse menu; the daemon stays up.
     Home,
+    /// Start the dialogue of Home's `pairs[pair]` (from the setup float).
+    CommsStart {
+        pair: usize,
+        topic: Option<String>,
+        max_turns: u32,
+    },
+    /// Stop the running dialogue (after a confirm).
+    PeerStop,
+    /// `:comms <peer> [topic]` from Talk: a dialogue between this pulse and
+    /// `peer` (a sibling on this box by name, or one under `[peers]`).
+    Comms {
+        peer: String,
+        topic: Option<String>,
+    },
 }
 
 /// Every command name, its argument hint, and where it lives.
@@ -106,9 +120,9 @@ const SPECS: &[Spec] = &[
     },
     Spec {
         name: "comms",
-        args: "<peer> <topic>",
-        what: "start a peer dialogue",
-        later: Some("the Setup page (phase 4)"),
+        args: "<peer> [topic]",
+        what: "talk to another pulse (Peer page)",
+        later: None,
     },
     Spec {
         name: "theme",
@@ -190,6 +204,25 @@ pub fn run_command(line: &str) -> FloatAction {
                 ))
             }
         }
+        "comms" => {
+            let mut words = arg.splitn(2, char::is_whitespace);
+            let peer = words.next().unwrap_or("").trim();
+            if peer.is_empty() {
+                return FloatAction::Notice(
+                    ":comms needs a peer — :comms <pulse> [topic]; Tab lists the pulses up on this box"
+                        .to_string(),
+                );
+            }
+            let topic = words
+                .next()
+                .map(str::trim)
+                .filter(|t| !t.is_empty())
+                .map(str::to_string);
+            FloatAction::Run(Command::Comms {
+                peer: peer.to_string(),
+                topic,
+            })
+        }
         "motion" => match arg {
             "full" => FloatAction::Run(Command::Motion(MotionLevel::Full)),
             "reduced" => FloatAction::Run(Command::Motion(MotionLevel::Reduced)),
@@ -201,9 +234,10 @@ pub fn run_command(line: &str) -> FloatAction {
 }
 
 /// Completions for the current line: command names, or argument values for
-/// `theme` and `motion`. Each is the full text the line would become.
+/// `theme`, `motion` and `comms` (`peers` = the pulses up on this box, from
+/// Home). Each is the full text the line would become.
 #[must_use]
-pub fn completions(line: &str) -> Vec<String> {
+pub fn completions(line: &str, peers: &[String]) -> Vec<String> {
     let trimmed = line.trim_start();
     match trimmed.split_once(char::is_whitespace) {
         None => SPECS
@@ -213,9 +247,14 @@ pub fn completions(line: &str) -> Vec<String> {
             .collect(),
         Some((name, arg)) => {
             let arg = arg.trim();
+            // `:comms <peer> topic…` — the peer is the first word only.
+            if name == "comms" && arg.contains(char::is_whitespace) {
+                return Vec::new();
+            }
             let values: Vec<&str> = match name {
                 "theme" => BUILTIN_NAMES.iter().copied().chain(["system"]).collect(),
                 "motion" => vec!["full", "reduced", "off"],
+                "comms" => peers.iter().map(String::as_str).collect(),
                 _ => Vec::new(),
             };
             values
@@ -227,9 +266,131 @@ pub fn completions(line: &str) -> Vec<String> {
     }
 }
 
+/// The float Home opens on a pair row: a topic (optional) and the turn cap.
+pub struct CommsSetup {
+    pub pair: usize,
+    pub a: String,
+    pub b: String,
+    pub topic: Prompt,
+    pub max_turns: u32,
+}
+
+impl CommsSetup {
+    #[must_use]
+    pub fn new(pair: usize, a: &str, b: &str) -> Self {
+        Self {
+            pair,
+            a: a.to_string(),
+            b: b.to_string(),
+            topic: Prompt::new(),
+            max_turns: crate::wire::DEFAULT_MAX_TURNS,
+        }
+    }
+
+    pub fn on_key(&mut self, key: KeyEvent) -> FloatAction {
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        match (key.code, ctrl) {
+            (KeyCode::Esc, _) | (KeyCode::Char('c'), true) => FloatAction::Close,
+            (KeyCode::Enter, _) => {
+                let topic = self.topic.text().trim().to_string();
+                FloatAction::Run(Command::CommsStart {
+                    pair: self.pair,
+                    topic: if topic.is_empty() { None } else { Some(topic) },
+                    max_turns: self.max_turns,
+                })
+            }
+            (KeyCode::Up, _) => {
+                self.max_turns = (self.max_turns + 5).min(crate::wire::MAX_TURNS_LIMIT);
+                FloatAction::None
+            }
+            (KeyCode::Down, _) => {
+                self.max_turns = self.max_turns.saturating_sub(5).max(1);
+                FloatAction::None
+            }
+            (KeyCode::Backspace, _) => {
+                self.topic.backspace();
+                FloatAction::None
+            }
+            (KeyCode::Left, _) => {
+                self.topic.left();
+                FloatAction::None
+            }
+            (KeyCode::Right, _) => {
+                self.topic.right();
+                FloatAction::None
+            }
+            (KeyCode::Char('u'), true) => {
+                self.topic.kill_line_start();
+                FloatAction::None
+            }
+            (KeyCode::Char(c), false) => {
+                self.topic.insert_char(c);
+                FloatAction::None
+            }
+            _ => FloatAction::None,
+        }
+    }
+
+    #[must_use]
+    pub fn rect(area: Rect) -> Rect {
+        let w = area.width.saturating_sub(8).clamp(30, 64);
+        let h = 7;
+        Rect::new(
+            area.x + area.width.saturating_sub(w) / 2,
+            area.y + area.height.saturating_sub(h) / 2,
+            w,
+            h.min(area.height),
+        )
+    }
+
+    pub fn render(&mut self, frame: &mut Frame, area: Rect, t: Tokens) {
+        let rect = Self::rect(area);
+        frame.render_widget(Clear, rect);
+        let block = pane::frame("peer to peer", true, t);
+        let inner = block.inner(rect);
+        frame.render_widget(block, rect);
+        let rows = ratatui::layout::Layout::vertical([ratatui::layout::Constraint::Length(1); 5])
+            .split(inner);
+        frame.render_widget(
+            Paragraph::new(Line::from(vec![
+                Span::styled(
+                    format!("  {}", self.a),
+                    Style::default().fg(t.pulse).add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(" ↔ ", Style::default().fg(t.dim)),
+                Span::styled(
+                    self.b.clone(),
+                    Style::default().fg(t.intent).add_modifier(Modifier::BOLD),
+                ),
+            ])),
+            rows[0],
+        );
+        self.topic.render(frame, rows[2], t, true, "topic ›");
+        frame.render_widget(
+            Paragraph::new(Line::from(vec![
+                Span::styled(
+                    format!("  turns: {}", self.max_turns),
+                    Style::default().fg(t.ink),
+                ),
+                Span::styled("  ↑/↓ change", Style::default().fg(t.dim)),
+            ])),
+            rows[3],
+        );
+        frame.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                "  Enter start (empty topic = free talk) · ↑/↓ turn cap · Esc cancel",
+                Style::default().fg(t.dim),
+            ))),
+            rows[4],
+        );
+    }
+}
+
 /// The `:` command line.
 pub struct CmdLine {
     pub input: Prompt,
+    /// Pulses up on this box, offered by `:comms` completion.
+    pub peers: Vec<String>,
 }
 
 impl Default for CmdLine {
@@ -241,8 +402,14 @@ impl Default for CmdLine {
 impl CmdLine {
     #[must_use]
     pub fn new() -> Self {
+        Self::with_peers(Vec::new())
+    }
+
+    #[must_use]
+    pub fn with_peers(peers: Vec<String>) -> Self {
         Self {
             input: Prompt::new(),
+            peers,
         }
     }
 
@@ -252,7 +419,7 @@ impl CmdLine {
             (KeyCode::Esc, _) | (KeyCode::Char('c'), true) => FloatAction::Close,
             (KeyCode::Enter, _) => run_command(&self.input.take()),
             (KeyCode::Tab, _) => {
-                let cands = completions(&self.input.text());
+                let cands = completions(&self.input.text(), &self.peers);
                 if let Some(first) = cands.first() {
                     let text = if cands.len() == 1 || self.input.text().trim().is_empty() {
                         first.clone()
@@ -319,7 +486,7 @@ impl CmdLine {
         let input_row = Rect { height: 1, ..inner };
         self.input.render(frame, input_row, t, true, ":");
 
-        let cands = completions(&self.input.text());
+        let cands = completions(&self.input.text(), &self.peers);
         let mut lines = Vec::new();
         for c in cands
             .iter()
@@ -512,16 +679,54 @@ mod tests {
     #[test]
     fn completions_prefix_match_commands_and_values() {
         assert_eq!(
-            completions("mo"),
+            completions("mo", &[]),
             vec!["motion", "model"],
             "ambiguous prefix"
         );
-        assert_eq!(completions("mot"), vec!["motion"]);
-        assert_eq!(completions("motion r"), vec!["motion reduced"]);
-        assert!(completions("theme ").contains(&"theme system".to_string()));
-        assert!(completions("theme g").contains(&"theme gruvbox".to_string()));
-        assert_eq!(completions("zzz"), Vec::<String>::new());
-        assert_eq!(completions("").len(), SPECS.len());
+        assert_eq!(completions("mot", &[]), vec!["motion"]);
+        assert_eq!(completions("motion r", &[]), vec!["motion reduced"]);
+        assert!(completions("theme ", &[]).contains(&"theme system".to_string()));
+        assert!(completions("theme g", &[]).contains(&"theme gruvbox".to_string()));
+        assert_eq!(completions("zzz", &[]), Vec::<String>::new());
+        assert_eq!(completions("", &[]).len(), SPECS.len());
+    }
+
+    #[test]
+    fn comms_completes_the_peer_from_the_pulses_up_and_parses_a_topic() {
+        let peers = vec!["synth".to_string(), "sage".to_string()];
+        assert_eq!(
+            completions("comms s", &peers),
+            vec!["comms synth", "comms sage"]
+        );
+        assert_eq!(completions("comms sy", &peers), vec!["comms synth"]);
+        assert_eq!(
+            completions("comms synth ho", &peers),
+            Vec::<String>::new(),
+            "the topic is free text"
+        );
+        assert_eq!(
+            run_command("comms synth"),
+            FloatAction::Run(Command::Comms {
+                peer: "synth".into(),
+                topic: None
+            })
+        );
+        assert_eq!(
+            run_command("comms synth  what should we build next?"),
+            FloatAction::Run(Command::Comms {
+                peer: "synth".into(),
+                topic: Some("what should we build next?".into())
+            })
+        );
+        assert!(
+            matches!(run_command("comms"), FloatAction::Notice(m) if m.contains("needs a peer"))
+        );
+        let mut c = CmdLine::with_peers(peers);
+        for ch in "comms sy".chars() {
+            c.on_key(KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE));
+        }
+        c.on_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        assert_eq!(c.input.text(), "comms synth");
     }
 
     #[test]

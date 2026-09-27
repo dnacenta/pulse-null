@@ -96,6 +96,119 @@ impl CognitiveStatus {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Peer-to-peer dialogue (PN-123)
+// ---------------------------------------------------------------------------
+
+/// Turns a dialogue runs when the request names no cap.
+pub const DEFAULT_MAX_TURNS: u32 = 20;
+/// The most turns a dialogue may be asked for.
+pub const MAX_TURNS_LIMIT: u32 = 50;
+
+/// `POST /api/comms` body.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CommsStart {
+    pub peer: CommsPeer,
+    #[serde(default)]
+    pub topic: Option<String>,
+    #[serde(default)]
+    pub max_turns: Option<u32>,
+}
+
+/// The peer to talk to: a configured `[peers.<name>]`, or a sibling on this
+/// box named by port (loopback only).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CommsPeer {
+    pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub port: Option<u16>,
+}
+
+/// `GET /api/comms` and the `status` stream event.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CommsStatus {
+    pub id: String,
+    pub peer: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub topic: Option<String>,
+    /// Turns completed so far.
+    pub turn: u32,
+    pub max_turns: u32,
+    /// `local_thinking`, `peer_thinking`, `paused`, `finished`, `failed`, `cancelled`.
+    pub phase: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+    /// Once over: whether a conversation file was written.
+    #[serde(default)]
+    pub archived: bool,
+}
+
+impl CommsStatus {
+    /// Phases a dialogue is still in (running or paused).
+    #[must_use]
+    pub fn phase_is_running(&self) -> bool {
+        matches!(
+            self.phase.as_str(),
+            "local_thinking" | "peer_thinking" | "paused"
+        )
+    }
+
+    /// Phases a dialogue has ended in.
+    #[must_use]
+    pub fn phase_is_over(&self) -> bool {
+        matches!(self.phase.as_str(), "finished" | "failed" | "cancelled")
+    }
+}
+
+/// One event of `GET /api/comms/{id}/stream`: `event:` is the variant name,
+/// `data:` the payload.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "event", content = "data", rename_all = "lowercase")]
+pub enum CommsEvent {
+    /// A completed turn; `n` counts from 1 and never repeats on a stream.
+    Turn {
+        who: String,
+        text: String,
+        n: u32,
+    },
+    Status(CommsStatus),
+    /// The dialogue ended; `archived` says whether a conversation file was
+    /// written (not while isolated, not with zero turns).
+    Done {
+        #[serde(default)]
+        archived: bool,
+    },
+    Error {
+        message: String,
+        #[serde(default)]
+        archived: bool,
+    },
+}
+
+impl CommsEvent {
+    /// `(event name, data)` for an SSE frame.
+    #[must_use]
+    pub fn to_sse_parts(&self) -> (String, serde_json::Value) {
+        let v = serde_json::to_value(self).unwrap_or_default();
+        let name = v["event"].as_str().unwrap_or("error").to_string();
+        let data = v.get("data").cloned().unwrap_or(serde_json::Value::Null);
+        (name, data)
+    }
+
+    /// Decode a frame; `None` for names or payloads this build does not know.
+    #[must_use]
+    pub fn from_sse_parts(name: &str, data: &str) -> Option<Self> {
+        let data: serde_json::Value = if data.trim().is_empty() {
+            serde_json::Value::Null
+        } else {
+            serde_json::from_str(data).ok()?
+        };
+        serde_json::from_value(serde_json::json!({ "event": name, "data": data })).ok()
+    }
+}
+
 /// The part of `/api/dashboard` the TUI reads. The server builds the rest
 /// of the dashboard by hand, but `cognitive_health` is this very struct.
 #[derive(Debug, Clone, Deserialize)]
@@ -154,6 +267,52 @@ pub struct HealthResponse {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn comms_events_round_trip_through_sse_parts() {
+        let status = CommsStatus {
+            id: "abc".into(),
+            peer: "Synth".into(),
+            topic: Some("ports".into()),
+            turn: 3,
+            max_turns: 20,
+            phase: "peer_thinking".into(),
+            error: None,
+            archived: false,
+        };
+        for ev in [
+            CommsEvent::Turn {
+                who: "Echo".into(),
+                text: "hi".into(),
+                n: 1,
+            },
+            CommsEvent::Status(status),
+            CommsEvent::Done { archived: true },
+            CommsEvent::Error {
+                message: "peer offline".into(),
+                archived: false,
+            },
+        ] {
+            let (name, data) = ev.to_sse_parts();
+            let back = CommsEvent::from_sse_parts(&name, &data.to_string()).unwrap();
+            assert_eq!(back, ev, "{name}");
+        }
+        assert_eq!(CommsEvent::Done { archived: true }.to_sse_parts().0, "done");
+        assert!(CommsEvent::from_sse_parts("nonsense", "{}").is_none());
+    }
+
+    #[test]
+    fn comms_start_accepts_a_name_or_a_sibling_by_port() {
+        let by_name: CommsStart =
+            serde_json::from_str(r#"{"peer":{"name":"synth"},"topic":"ports"}"#).unwrap();
+        assert!(by_name.peer.port.is_none());
+        let sibling: CommsStart = serde_json::from_str(
+            r#"{"peer":{"name":"synth","host":"127.0.0.1","port":3201},"max_turns":4}"#,
+        )
+        .unwrap();
+        assert_eq!(sibling.peer.port, Some(3201));
+        assert_eq!(sibling.max_turns, Some(4));
+    }
 
     /// PN-115: a daemon from before the rename names the pulse `entity`.
     #[test]

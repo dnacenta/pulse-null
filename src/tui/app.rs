@@ -13,10 +13,11 @@ use tachyonfx::Motion as Sweep;
 
 use super::bar::{self, BarState, DaemonState, Glyphs};
 use super::boot::Boot;
-use super::floats::{CmdLine, Command, Confirm, FloatAction, Help};
+use super::floats::{CmdLine, Command, CommsSetup, Confirm, FloatAction, Help};
 use super::home::{Home, HomeAction};
 use super::keymap::{self, Context};
 use super::motion::{Key, Moment, Motion, MotionLevel, Palette};
+use super::pages::peer::{Peer, PeerAction};
 use super::pages::talk::{Talk, TalkAction};
 use super::pane::{neighbour, Dir, PaneId};
 use super::theme::{ThemeWatcher, Tokens};
@@ -33,10 +34,12 @@ pub enum Screen {
     /// Waiting for a daemon (`pulse-null chat` with none up).
     Boot,
     Talk,
+    /// Watching a peer-to-peer dialogue (PN-123).
+    Peer,
 }
 
 /// What the loop should do after a key.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Action {
     None,
     /// Back to the pulse menu (the loop drops the session, keeps daemons).
@@ -45,6 +48,26 @@ pub enum Action {
     Open(usize),
     /// Run the pulse wizard.
     Create,
+    /// Start the dialogue of `home.pairs[pair]` and watch it.
+    Comms {
+        pair: usize,
+        topic: Option<String>,
+        max_turns: u32,
+    },
+    /// Re-attach to the running dialogue `id` of `home.pairs[pair]`.
+    CommsAttach {
+        pair: usize,
+        id: String,
+    },
+    /// `:comms` from Talk: a dialogue between the open pulse and `peer`.
+    CommsNamed {
+        peer: String,
+        topic: Option<String>,
+    },
+    /// Pause (`true`) or resume the watched dialogue.
+    PeerPause(bool),
+    /// Stop the watched dialogue (confirmed).
+    PeerStop,
     Quit,
 }
 
@@ -53,6 +76,7 @@ pub enum Float {
     CmdLine(CmdLine),
     Confirm(Confirm),
     Help(Help),
+    CommsSetup(CommsSetup),
 }
 
 pub struct App {
@@ -66,6 +90,7 @@ pub struct App {
     pub boot: Boot,
     pub home: Home,
     pub talk: Talk,
+    pub peer: Peer,
     pub owner: String,
     tick: u64,
     last_frame: Instant,
@@ -97,6 +122,7 @@ impl App {
             boot: Boot::new("connecting to the daemon"),
             home: Home::new(Vec::new()),
             talk: Talk::new(),
+            peer: Peer::new("", ""),
             owner: owner.to_string(),
             tick: 0,
             last_frame: Instant::now(),
@@ -116,9 +142,27 @@ impl App {
         }
     }
 
+    /// Watch a dialogue between `local` (whose daemon runs it) and `peer`.
+    pub fn start_peer(&mut self, local: &str, peer: &str) {
+        self.peer = Peer::new(local, peer);
+        self.screen = Screen::Peer;
+        self.pending = None;
+        self.float = None;
+        self.bar.daemon = DaemonState::Connected;
+    }
+
     /// Home is the start screen: the menu, with `rows` from `Home::scan`.
     pub fn start_home(&mut self, rows: Vec<super::home::PulseRow>) {
-        self.home = Home::new(rows);
+        if self.screen == Screen::Peer {
+            let (local, peer, status) = (
+                self.peer.local.clone(),
+                self.peer.peer.clone(),
+                self.peer.status.clone(),
+            );
+            self.home.note_dialogue(&local, &peer, status);
+        }
+        let prev = std::mem::replace(&mut self.home, Home::new(rows));
+        self.home.inherit(&prev);
         self.screen = Screen::Home;
         self.pending = None;
         self.float = None;
@@ -263,6 +307,19 @@ impl App {
             return match self.home.on_key(key) {
                 HomeAction::None => Action::None,
                 HomeAction::Open(i) => Action::Open(i),
+                HomeAction::Pair(i) => {
+                    if let Some(running) = self.home.running_dialogue(i) {
+                        return Action::CommsAttach {
+                            pair: i,
+                            id: running.status.id.clone(),
+                        };
+                    }
+                    let (a, b) = (self.home.pairs[i].a, self.home.pairs[i].b);
+                    let setup =
+                        CommsSetup::new(i, &self.home.rows[a].name, &self.home.rows[b].name);
+                    self.open_float(Float::CommsSetup(setup));
+                    Action::None
+                }
                 HomeAction::Create => Action::Create,
                 HomeAction::Exit => Action::Quit,
             };
@@ -289,13 +346,35 @@ impl App {
                 _ => Action::None,
             };
         }
+        if self.screen == Screen::Peer {
+            match key.code {
+                KeyCode::Char(':') => {
+                    self.open_float(Float::CmdLine(CmdLine::with_peers(self.comms_peers())));
+                    return Action::None;
+                }
+                KeyCode::Char('?') => {
+                    self.open_help();
+                    return Action::None;
+                }
+                _ => {}
+            }
+            return match self.peer.on_key(key) {
+                PeerAction::None => Action::None,
+                PeerAction::Pause(p) => Action::PeerPause(p),
+                PeerAction::StopRequested => {
+                    self.confirm_peer_stop();
+                    Action::None
+                }
+                PeerAction::Back => Action::Home,
+            };
+        }
         // `:` and `?` open floats from anywhere except an in-progress prompt
         // draft, where they are ordinary characters.
         let prompt_typing = self.focus == PaneId::Prompt && !self.talk.prompt.is_empty();
         if !prompt_typing {
             match key.code {
                 KeyCode::Char(':') => {
-                    self.open_float(Float::CmdLine(CmdLine::new()));
+                    self.open_float(Float::CmdLine(CmdLine::with_peers(self.comms_peers())));
                     return Action::None;
                 }
                 KeyCode::Char('?') => {
@@ -354,6 +433,12 @@ impl App {
         let (ctx, title) = match (self.screen, self.focus) {
             (Screen::Boot, _) => (Context::Boot, "boot"),
             (Screen::Home, _) => (Context::Home, "home"),
+            (Screen::Peer, _) => (
+                Context::Peer {
+                    paused: self.peer.paused(),
+                },
+                "peer to peer",
+            ),
             (Screen::Talk, PaneId::Prompt) => (
                 Context::Prompt {
                     turn_active: self.talk.turn_active(),
@@ -370,6 +455,7 @@ impl App {
             Some(Float::CmdLine(_)) => CmdLine::rect(area),
             Some(Float::Confirm(_)) => Confirm::rect(area),
             Some(Float::Help(h)) => h.rect(area),
+            Some(Float::CommsSetup(_)) => CommsSetup::rect(area),
             None => Rect::default(),
         }
     }
@@ -399,6 +485,7 @@ impl App {
             Some(Float::CmdLine(c)) => c.on_key(key),
             Some(Float::Confirm(c)) => c.on_key(key),
             Some(Float::Help(_)) => Help::on_key(key),
+            Some(Float::CommsSetup(c)) => c.on_key(key),
             None => FloatAction::Close,
         };
         match action {
@@ -409,7 +496,7 @@ impl App {
             }
             FloatAction::Notice(text) => {
                 self.close_float();
-                self.talk.notice(&text);
+                self.notice(&text);
                 Action::None
             }
             FloatAction::Run(cmd) => {
@@ -434,10 +521,38 @@ impl App {
                 Action::None
             }
             Command::Home => {
-                if confirmed {
+                if confirmed || self.screen != Screen::Talk {
                     Action::Home
                 } else {
                     self.request_home()
+                }
+            }
+            Command::CommsStart {
+                pair,
+                topic,
+                max_turns,
+            } => Action::Comms {
+                pair,
+                topic,
+                max_turns,
+            },
+            Command::Comms { peer, topic } => match self.screen {
+                Screen::Talk => Action::CommsNamed { peer, topic },
+                Screen::Peer => {
+                    self.notice("a dialogue is already showing — q for Home, then pick a pair");
+                    Action::None
+                }
+                Screen::Home | Screen::Boot => {
+                    self.notice(":comms works from Talk — here, pick a Peer to peer row");
+                    Action::None
+                }
+            },
+            Command::PeerStop => {
+                if confirmed {
+                    Action::PeerStop
+                } else {
+                    self.confirm_peer_stop();
+                    Action::None
                 }
             }
             Command::Theme(name) => {
@@ -449,20 +564,48 @@ impl App {
                     self.theme.set_builtin(&name)
                 };
                 if !known {
-                    self.talk.notice(&format!("theme: unknown {name:?}"));
+                    self.notice(&format!("theme: unknown {name:?}"));
                     return Action::None;
                 }
                 if self.theme.tokens() != before {
                     self.theme_changed(before);
                 }
-                self.talk.notice(&format!("theme: {name}"));
+                self.notice(&format!("theme: {name}"));
                 Action::None
             }
             Command::Motion(level) => {
                 self.motion.set_level(level);
-                self.talk.notice(&format!("motion: {}", level.as_str()));
+                self.notice(&format!("motion: {}", level.as_str()));
                 Action::None
             }
+        }
+    }
+
+    fn confirm_peer_stop(&mut self) {
+        self.open_float(Float::Confirm(Confirm {
+            question: "Stop the dialogue? The turns so far are archived.".to_string(),
+            yes: "stop",
+            then: Command::PeerStop,
+        }));
+    }
+
+    /// Names `:comms` can complete: the pulses Home saw up, minus the one
+    /// open on Talk.
+    fn comms_peers(&self) -> Vec<String> {
+        self.home
+            .rows
+            .iter()
+            .filter(|r| r.state == super::home::PulseState::Up && r.name != self.bar.pulse)
+            .map(|r| r.name.clone())
+            .collect()
+    }
+
+    /// A one-line notice where the user is looking.
+    pub(super) fn notice(&mut self, text: &str) {
+        match self.screen {
+            Screen::Talk | Screen::Boot => self.talk.notice(text),
+            Screen::Peer => self.peer.notice(text),
+            Screen::Home => self.home.notice = Some(text.to_string()),
         }
     }
 
@@ -520,15 +663,19 @@ impl App {
             (_, _, Some(Float::CmdLine(_))) => Context::CmdLine,
             (_, _, Some(Float::Confirm(_))) => Context::Confirm,
             (_, _, Some(Float::Help(_))) => Context::Help,
+            (_, _, Some(Float::CommsSetup(_))) => Context::CommsSetup,
             (Screen::Boot, _, None) => Context::Boot,
             (Screen::Home, _, None) => Context::Home,
+            (Screen::Peer, _, None) => Context::Peer {
+                paused: self.peer.paused(),
+            },
             (Screen::Talk, PaneId::Prompt, None) => Context::Prompt {
                 turn_active: self.talk.turn_active(),
             },
             (Screen::Talk, PaneId::Transcript, None) => Context::Transcript,
         };
         let mut h = keymap::hints(ctx, 4);
-        if self.float.is_none() && self.screen == Screen::Talk {
+        if self.float.is_none() && matches!(self.screen, Screen::Talk | Screen::Peer) {
             h.push((":", "command"));
             h.push(("?", "keys"));
         }
@@ -574,6 +721,19 @@ impl App {
                 let glyphs = self.glyphs;
                 self.home
                     .render(frame, area, t, self.tick, &mut self.boot, &glyphs);
+                self.render_float(frame, area, t);
+            }
+            Screen::Peer => {
+                let [top, content, bottom] = Layout::vertical([
+                    Constraint::Length(1),
+                    Constraint::Fill(1),
+                    Constraint::Length(1),
+                ])
+                .areas(area);
+                bar::draw_top(frame, top, &self.bar, &[("peer", true)], t, self.glyphs);
+                self.peer.render(frame, content, t);
+                bar::draw_hints(frame, bottom, &self.hints(), t);
+                self.render_float(frame, area, t);
             }
             Screen::Boot => {
                 if first_frame {
@@ -622,16 +782,21 @@ impl App {
                     );
                     bar::draw_hints(frame, bottom, &self.hints(), t);
                 }
-                match self.float.as_mut() {
-                    Some(Float::CmdLine(c)) => c.render(frame, area, t),
-                    Some(Float::Confirm(c)) => c.render(frame, area, t),
-                    Some(Float::Help(h)) => h.render(frame, area, t),
-                    None => {}
-                }
+                self.render_float(frame, area, t);
             }
         }
 
         self.motion.process(elapsed, frame.buffer_mut(), area);
+    }
+
+    fn render_float(&mut self, frame: &mut Frame, area: Rect, t: Tokens) {
+        match self.float.as_mut() {
+            Some(Float::CmdLine(c)) => c.render(frame, area, t),
+            Some(Float::Confirm(c)) => c.render(frame, area, t),
+            Some(Float::Help(h)) => h.render(frame, area, t),
+            Some(Float::CommsSetup(c)) => c.render(frame, area, t),
+            None => {}
+        }
     }
 
     /// Called by the loop after `draw` returns.
@@ -845,6 +1010,139 @@ mod tests {
             Action::Home,
             "Enter confirms"
         );
+    }
+
+    #[test]
+    fn comms_command_runs_from_talk_and_completes_the_pulses_up() {
+        // On Talk (pulse "echo" open, synth up on Home) `:comms synth topic`
+        // asks the loop for a dialogue; Tab completes the sibling.
+        let mut a = app();
+        two_up_pulses(&mut a);
+        a.screen = Screen::Talk;
+        a.on_key(key(KeyCode::Char(':')));
+        match &a.float {
+            Some(Float::CmdLine(c)) => assert_eq!(c.peers, vec!["synth".to_string()]),
+            _ => panic!("command line"),
+        }
+        type_text(&mut a, "comms sy");
+        a.on_key(key(KeyCode::Tab));
+        type_text(&mut a, " what next?");
+        assert_eq!(
+            a.on_key(key(KeyCode::Enter)),
+            Action::CommsNamed {
+                peer: "synth".into(),
+                topic: Some("what next?".into())
+            }
+        );
+        // On the Peer page (Home has no command line) it is a notice.
+        let mut a = app();
+        two_up_pulses(&mut a);
+        a.start_peer("echo", "synth");
+        a.on_key(key(KeyCode::Char(':')));
+        type_text(&mut a, "comms synth");
+        assert_eq!(a.on_key(key(KeyCode::Enter)), Action::None);
+        let last = a.peer.transcript.entries().last().unwrap();
+        assert!(last.text.contains("already showing"), "{}", last.text);
+    }
+
+    fn two_up_pulses(a: &mut App) {
+        let rows = vec![pulse_row("echo", 3200), pulse_row("synth", 3201)];
+        let dirs: Vec<std::path::PathBuf> = rows.iter().map(|r| r.dir.clone()).collect();
+        a.start_home(rows);
+        a.home.apply_states(&[
+            (dirs[0].clone(), super::super::home::PulseState::Up),
+            (dirs[1].clone(), super::super::home::PulseState::Up),
+        ]);
+        assert_eq!(a.home.pairs.len(), 1);
+    }
+
+    #[test]
+    fn pair_enter_opens_the_setup_float_and_enter_starts() {
+        let mut a = app();
+        two_up_pulses(&mut a);
+        a.on_key(key(KeyCode::Char('3')));
+        assert_eq!(a.on_key(key(KeyCode::Enter)), Action::None);
+        assert!(
+            matches!(a.float, Some(Float::CommsSetup(_))),
+            "the topic float"
+        );
+        type_text(&mut a, "ports");
+        a.on_key(key(KeyCode::Up));
+        assert_eq!(
+            a.on_key(key(KeyCode::Enter)),
+            Action::Comms {
+                pair: 0,
+                topic: Some("ports".into()),
+                max_turns: 25
+            }
+        );
+        assert!(a.float.is_none());
+        // Esc on the float starts nothing.
+        a.on_key(key(KeyCode::Enter));
+        assert_eq!(a.on_key(key(KeyCode::Esc)), Action::None);
+        assert!(a.float.is_none());
+    }
+
+    #[test]
+    fn pair_enter_reattaches_when_a_dialogue_runs() {
+        let mut a = app();
+        two_up_pulses(&mut a);
+        let dir = a.home.rows[0].dir.clone();
+        a.home.apply_dialogues(&[(
+            dir,
+            Some(crate::wire::CommsStatus {
+                id: "run1".into(),
+                peer: "synth".into(),
+                topic: None,
+                turn: 2,
+                max_turns: 20,
+                phase: "local_thinking".into(),
+                error: None,
+                archived: false,
+            }),
+        )]);
+        a.on_key(key(KeyCode::Char('3')));
+        assert_eq!(
+            a.on_key(key(KeyCode::Enter)),
+            Action::CommsAttach {
+                pair: 0,
+                id: "run1".into()
+            }
+        );
+    }
+
+    #[test]
+    fn peer_page_space_pauses_and_ctrl_c_confirms_stop() {
+        let mut a = app();
+        a.start_peer("echo", "synth");
+        assert_eq!(a.screen, Screen::Peer);
+        a.peer
+            .on_event(crate::wire::CommsEvent::Status(crate::wire::CommsStatus {
+                id: "run1".into(),
+                peer: "synth".into(),
+                topic: None,
+                turn: 1,
+                max_turns: 4,
+                phase: "peer_thinking".into(),
+                error: None,
+                archived: false,
+            }));
+        assert_eq!(a.on_key(key(KeyCode::Char(' '))), Action::PeerPause(true));
+        assert_eq!(a.on_key(ctrl('c')), Action::None);
+        assert!(
+            matches!(a.float, Some(Float::Confirm(_))),
+            "asks before stopping"
+        );
+        assert_eq!(a.on_key(key(KeyCode::Esc)), Action::None);
+        assert!(a.float.is_none());
+        a.on_key(ctrl('c'));
+        assert_eq!(a.on_key(key(KeyCode::Enter)), Action::PeerStop);
+        // q leaves; the dialogue is the daemon's business.
+        assert_eq!(a.on_key(key(KeyCode::Char('q'))), Action::Home);
+        // :home works from the Peer page without a confirm.
+        a.on_key(key(KeyCode::Char(':')));
+        type_text(&mut a, "home");
+        assert_eq!(a.on_key(key(KeyCode::Enter)), Action::Home);
     }
 
     #[test]

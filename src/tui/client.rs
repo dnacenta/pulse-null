@@ -23,6 +23,13 @@ pub enum ClientError {
     Json(#[from] serde_json::Error),
 }
 
+/// What `POST /api/comms` gave back: a fresh dialogue, or the running one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CommsStarted {
+    pub id: String,
+    pub already_running: bool,
+}
+
 /// The outcome of a health probe, coarse enough for a menu row.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Probe {
@@ -229,6 +236,145 @@ impl Client {
                 }
             }
         })
+    }
+
+    fn post(&self, path: &str) -> reqwest::RequestBuilder {
+        let mut r = self.http.post(format!("{}{}", self.base, path));
+        if let Some(s) = &self.secret {
+            r = r.header("X-Echo-Secret", s);
+        }
+        r
+    }
+
+    fn delete(&self, path: &str) -> reqwest::RequestBuilder {
+        let mut r = self.http.delete(format!("{}{}", self.base, path));
+        if let Some(s) = &self.secret {
+            r = r.header("X-Echo-Secret", s);
+        }
+        r
+    }
+
+    async fn expect_ok(resp: reqwest::Response) -> Result<reqwest::Response, ClientError> {
+        if resp.status().is_success() {
+            return Ok(resp);
+        }
+        let status = resp.status().as_u16();
+        let body = resp.text().await.unwrap_or_default();
+        Err(ClientError::Status { status, body })
+    }
+
+    /// `POST /api/comms`: start a peer-to-peer dialogue. A 409 carries the
+    /// id of the one already running, which is what a watcher attaches to.
+    pub async fn comms_start(
+        &self,
+        req: &crate::wire::CommsStart,
+    ) -> Result<CommsStarted, ClientError> {
+        let resp = self
+            .post("/api/comms")
+            .timeout(std::time::Duration::from_secs(10))
+            .json(req)
+            .send()
+            .await?;
+        let status = resp.status().as_u16();
+        let already_running = status == 409;
+        let v: serde_json::Value = if already_running {
+            resp.json().await?
+        } else {
+            Self::expect_ok(resp).await?.json().await?
+        };
+        if already_running {
+            // Busy with another peer is a refusal, not something to watch.
+            let running = v["peer"].as_str().unwrap_or("");
+            if !running.eq_ignore_ascii_case(&req.peer.name) {
+                return Err(ClientError::Status {
+                    status,
+                    body: v["error"].as_str().map_or_else(
+                        || "a dialogue is already running".to_string(),
+                        str::to_string,
+                    ),
+                });
+            }
+        }
+        match v["id"].as_str().filter(|id| !id.is_empty()) {
+            Some(id) => Ok(CommsStarted {
+                id: id.to_string(),
+                already_running,
+            }),
+            None => Err(ClientError::Status {
+                status,
+                body: "no dialogue id in the reply".to_string(),
+            }),
+        }
+    }
+
+    /// `GET /api/comms`: the daemon's current dialogue, if any.
+    pub async fn comms_current(&self) -> Result<Option<crate::wire::CommsStatus>, ClientError> {
+        let resp = self
+            .get("/api/comms")
+            .timeout(std::time::Duration::from_secs(2))
+            .send()
+            .await?;
+        if resp.status().as_u16() == 404 {
+            return Ok(None);
+        }
+        Ok(Some(Self::expect_ok(resp).await?.json().await?))
+    }
+
+    /// `GET /api/comms/{id}/stream`: the turns so far, then live, until it ends.
+    pub async fn comms_stream(
+        &self,
+        id: &str,
+    ) -> Result<impl Stream<Item = Result<crate::wire::CommsEvent, ClientError>> + Send, ClientError>
+    {
+        let resp = self
+            .get(&format!("/api/comms/{id}/stream"))
+            .header("Accept", "text/event-stream")
+            .send()
+            .await?;
+        let resp = Self::expect_ok(resp).await?;
+        let events = sse_stream(resp);
+        Ok(async_stream::stream! {
+            let mut events = std::pin::pin!(events);
+            while let Some(item) = events.next().await {
+                match item {
+                    Ok(ev) => {
+                        if let Some(name) = ev.event.as_deref() {
+                            if let Some(ce) = crate::wire::CommsEvent::from_sse_parts(name, &ev.data) {
+                                yield Ok(ce);
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        yield Err(e);
+                        return;
+                    }
+                }
+            }
+        })
+    }
+
+    /// `POST /api/comms/{id}/pause` or `…/resume`.
+    pub async fn comms_pause(&self, id: &str, paused: bool) -> Result<(), ClientError> {
+        let path = format!(
+            "/api/comms/{id}/{}",
+            if paused { "pause" } else { "resume" }
+        );
+        let resp = self
+            .post(&path)
+            .timeout(std::time::Duration::from_secs(5))
+            .send()
+            .await?;
+        Self::expect_ok(resp).await.map(|_| ())
+    }
+
+    /// `DELETE /api/comms/{id}`: stop the dialogue.
+    pub async fn comms_stop(&self, id: &str) -> Result<(), ClientError> {
+        let resp = self
+            .delete(&format!("/api/comms/{id}"))
+            .timeout(std::time::Duration::from_secs(5))
+            .send()
+            .await?;
+        Self::expect_ok(resp).await.map(|_| ())
     }
 
     /// Open `GET /api/events`, resuming after `after` when given.

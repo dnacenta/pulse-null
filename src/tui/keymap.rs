@@ -24,8 +24,14 @@ pub enum Context {
     },
     /// Talk, transcript focused.
     Transcript,
+    /// The peer-to-peer dialogue page.
+    Peer {
+        paused: bool,
+    },
     CmdLine,
     Confirm,
+    /// The topic/cap float a pair row opens.
+    CommsSetup,
     Help,
 }
 
@@ -61,6 +67,13 @@ pub fn bindings(ctx: Context) -> Vec<Binding> {
             b("Ctrl+u / Ctrl+w", "delete to line start / word"),
             b("PgUp / PgDn", "scroll the transcript"),
         ],
+        Context::Peer { paused } => vec![
+            b("Space", if paused { "resume" } else { "pause" }),
+            b("Ctrl+c", "stop the dialogue"),
+            b("j / k", "scroll"),
+            b("g / G", "top / follow the tail"),
+            b("q", "back to Home (the dialogue keeps running)"),
+        ],
         Context::Transcript => vec![
             b("j / k", "scroll"),
             b("g / G", "top / follow the tail"),
@@ -71,6 +84,11 @@ pub fn bindings(ctx: Context) -> Vec<Binding> {
         ],
         Context::CmdLine => vec![b("Tab", "complete"), b("Enter", "run"), b("Esc", "close")],
         Context::Confirm => vec![b("Enter", "confirm"), b("Esc", "cancel")],
+        Context::CommsSetup => vec![
+            b("Enter", "start (empty topic = free talk)"),
+            b("↑ / ↓", "turn cap"),
+            b("Esc", "cancel"),
+        ],
         Context::Help => vec![b("Esc / ?", "close")],
     }
 }
@@ -105,6 +123,8 @@ fn short_what(what: &'static str) -> &'static str {
         "history when the prompt is one line" => "history",
         "delete to line start / word" => "kill",
         "scroll the transcript" => "scroll",
+        "stop the dialogue" => "stop",
+        "back to Home (the dialogue keeps running)" => "home",
         "top / follow the tail" => "top/tail",
         "half page" => "half page",
         "focus the prompt" => "prompt",
@@ -127,8 +147,10 @@ mod tests {
             Context::Prompt { turn_active: false },
             Context::Prompt { turn_active: true },
             Context::Transcript,
+            Context::Peer { paused: false },
             Context::CmdLine,
             Context::Confirm,
+            Context::CommsSetup,
             Context::Help,
         ] {
             let all = bindings(ctx);
