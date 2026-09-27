@@ -59,6 +59,11 @@ pub enum Action {
         pair: usize,
         id: String,
     },
+    /// `:comms` from Talk: a dialogue between the open pulse and `peer`.
+    CommsNamed {
+        peer: String,
+        topic: Option<String>,
+    },
     /// Pause (`true`) or resume the watched dialogue.
     PeerPause(bool),
     /// Stop the watched dialogue (confirmed).
@@ -347,7 +352,7 @@ impl App {
         if self.screen == Screen::Peer {
             match key.code {
                 KeyCode::Char(':') => {
-                    self.open_float(Float::CmdLine(CmdLine::new()));
+                    self.open_float(Float::CmdLine(CmdLine::with_peers(self.comms_peers())));
                     return Action::None;
                 }
                 KeyCode::Char('?') => {
@@ -376,7 +381,7 @@ impl App {
         if !prompt_typing {
             match key.code {
                 KeyCode::Char(':') => {
-                    self.open_float(Float::CmdLine(CmdLine::new()));
+                    self.open_float(Float::CmdLine(CmdLine::with_peers(self.comms_peers())));
                     return Action::None;
                 }
                 KeyCode::Char('?') => {
@@ -538,6 +543,17 @@ impl App {
                 topic,
                 max_turns,
             },
+            Command::Comms { peer, topic } => match self.screen {
+                Screen::Talk => Action::CommsNamed { peer, topic },
+                Screen::Peer => {
+                    self.notice("a dialogue is already showing — q for Home, then pick a pair");
+                    Action::None
+                }
+                Screen::Home | Screen::Boot => {
+                    self.notice(":comms works from Talk — here, pick a Peer to peer row");
+                    Action::None
+                }
+            },
             Command::PeerStop => {
                 if confirmed {
                     Action::PeerStop
@@ -577,7 +593,18 @@ impl App {
     }
 
     /// A one-line notice where the user is looking.
-    fn notice(&mut self, text: &str) {
+    /// Names `:comms` can complete: the pulses Home saw up, minus the one
+    /// open on Talk.
+    fn comms_peers(&self) -> Vec<String> {
+        self.home
+            .rows
+            .iter()
+            .filter(|r| r.state == super::home::PulseState::Up && r.name != self.bar.pulse)
+            .map(|r| r.name.clone())
+            .collect()
+    }
+
+    pub(super) fn notice(&mut self, text: &str) {
         match self.screen {
             Screen::Talk | Screen::Boot => self.talk.notice(text),
             Screen::Peer => self.peer.transcript.push_notice(text),
@@ -986,6 +1013,39 @@ mod tests {
             Action::Home,
             "Enter confirms"
         );
+    }
+
+    #[test]
+    fn comms_command_runs_from_talk_and_completes_the_pulses_up() {
+        // On Talk (pulse "echo" open, synth up on Home) `:comms synth topic`
+        // asks the loop for a dialogue; Tab completes the sibling.
+        let mut a = app();
+        two_up_pulses(&mut a);
+        a.screen = Screen::Talk;
+        a.on_key(key(KeyCode::Char(':')));
+        match &a.float {
+            Some(Float::CmdLine(c)) => assert_eq!(c.peers, vec!["synth".to_string()]),
+            _ => panic!("command line"),
+        }
+        type_text(&mut a, "comms sy");
+        a.on_key(key(KeyCode::Tab));
+        type_text(&mut a, " what next?");
+        assert_eq!(
+            a.on_key(key(KeyCode::Enter)),
+            Action::CommsNamed {
+                peer: "synth".into(),
+                topic: Some("what next?".into())
+            }
+        );
+        // On the Peer page (Home has no command line) it is a notice.
+        let mut a = app();
+        two_up_pulses(&mut a);
+        a.start_peer("echo", "synth");
+        a.on_key(key(KeyCode::Char(':')));
+        type_text(&mut a, "comms synth");
+        assert_eq!(a.on_key(key(KeyCode::Enter)), Action::None);
+        let last = a.peer.transcript.entries().last().unwrap();
+        assert!(last.text.contains("already showing"), "{}", last.text);
     }
 
     fn two_up_pulses(a: &mut App) {

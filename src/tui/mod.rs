@@ -229,6 +229,8 @@ struct Session {
     poller: tokio::task::JoinHandle<()>,
     /// Whether `/health` answered when the session opened.
     attached: bool,
+    /// The pulse directory this session is on (finds its Home row).
+    root: std::path::PathBuf,
 }
 
 impl Session {
@@ -247,6 +249,7 @@ impl Session {
         if let Some(why) = crate::discovery::untrusted_reason(&root) {
             return Err(why);
         }
+        let session_root = root.clone();
         let attached = match state {
             home::PulseState::Up => true,
             home::PulseState::Stopped | home::PulseState::Starting | home::PulseState::Unknown => {
@@ -283,6 +286,7 @@ impl Session {
             bg,
             poller,
             attached,
+            root: session_root,
         })
     }
 }
@@ -291,6 +295,17 @@ impl Drop for Session {
     fn drop(&mut self) {
         self.poller.abort();
     }
+}
+
+/// What the loop needs to put a dialogue on the Peer page: the row of the
+/// local pulse A, its config, the peer's name, and either a start request
+/// or the id of a running dialogue to re-attach to.
+struct CommsLaunch {
+    a: usize,
+    cfg_a: Config,
+    peer: String,
+    start: Option<crate::wire::CommsStart>,
+    attach: Option<String>,
 }
 
 /// Open (or reuse) the session on pulse `a` for a dialogue with `peer`, and
@@ -470,6 +485,7 @@ async fn event_loop(
     >(4);
     // The dialogue being watched on the Peer page: its event pump.
     let mut comms_rx: Option<tokio::sync::mpsc::Receiver<crate::wire::CommsEvent>> = None;
+    let mut comms_launch: Option<CommsLaunch> = None;
     let mut comms_task: Option<tokio::task::JoinHandle<()>> = None;
     // A ticker that is gated off for a while must not burst when it comes
     // back; skip the missed periods.
@@ -598,23 +614,55 @@ async fn event_loop(
                                     topic,
                                     max_turns: Some(max_turns),
                                 };
-                                match open_peer(app, &mut session, started, a, &cfg_a, &cfg_b.pulse.name) {
-                                    Some(client) => {
-                                        let (tx, rx) = tokio::sync::mpsc::channel(64);
-                                        comms_rx = Some(rx);
-                                        if let Some(task) = comms_task.take() {
-                                            task.abort();
-                                        }
-                                        comms_task = Some(tokio::spawn(comms_pump(client, Some(req), None, tx)));
-                                        if let Some(task) = turn_task.take() {
-                                            task.abort();
-                                        }
-                                        turn_rx = None;
-                                        attached = true;
-                                        daemon_base = session.as_ref().map(|s| s.client.base().to_string());
-                                    }
-                                    None => app.home.notice = Some(format!("{} is not up", cfg_a.pulse.name)),
-                                }
+                                comms_launch = Some(CommsLaunch {
+                                    a,
+                                    cfg_a,
+                                    peer: cfg_b.pulse.name.clone(),
+                                    start: Some(req),
+                                    attach: None,
+                                });
+                            }
+                            Action::CommsNamed { peer, topic } => {
+                                // The pulse open on Talk is A; the peer is a sibling
+                                // Home saw up (by name, any case) or a `[peers]` entry
+                                // A's daemon resolves itself.
+                                let Some(a) = session
+                                    .as_ref()
+                                    .and_then(|s| app.home.rows.iter().position(|r| r.dir == s.root))
+                                else {
+                                    app.talk.notice("no pulse is open");
+                                    continue;
+                                };
+                                let Some(cfg_a) = app.home.rows[a].config().cloned() else {
+                                    continue;
+                                };
+                                let sibling = app
+                                    .home
+                                    .rows
+                                    .iter()
+                                    .enumerate()
+                                    .find(|(i, r)| {
+                                        *i != a
+                                            && r.state == home::PulseState::Up
+                                            && r.name.eq_ignore_ascii_case(&peer)
+                                    })
+                                    .and_then(|(_, r)| r.config().map(|c| (r.name.clone(), c.server.port)));
+                                let (name, host, port) = match sibling {
+                                    Some((name, port)) => (name, Some("127.0.0.1".to_string()), Some(port)),
+                                    None => (peer, None, None),
+                                };
+                                let req = crate::wire::CommsStart {
+                                    peer: crate::wire::CommsPeer { name: name.clone(), host, port },
+                                    topic,
+                                    max_turns: None,
+                                };
+                                comms_launch = Some(CommsLaunch {
+                                    a,
+                                    cfg_a,
+                                    peer: name,
+                                    start: Some(req),
+                                    attach: None,
+                                });
                             }
                             Action::CommsAttach { pair, id } => {
                                 let Some(p) = app.home.pairs.get(pair) else {
@@ -626,20 +674,13 @@ async fn event_loop(
                                 else {
                                     continue;
                                 };
-                                if let Some(client) = open_peer(app, &mut session, started, a, &cfg_a, &name_b) {
-                                    let (tx, rx) = tokio::sync::mpsc::channel(64);
-                                    comms_rx = Some(rx);
-                                    if let Some(task) = comms_task.take() {
-                                        task.abort();
-                                    }
-                                    comms_task = Some(tokio::spawn(comms_pump(client, None, Some(id), tx)));
-                                    if let Some(task) = turn_task.take() {
-                                        task.abort();
-                                    }
-                                    turn_rx = None;
-                                    attached = true;
-                                    daemon_base = session.as_ref().map(|s| s.client.base().to_string());
-                                }
+                                comms_launch = Some(CommsLaunch {
+                                    a,
+                                    cfg_a,
+                                    peer: name_b,
+                                    start: None,
+                                    attach: Some(id),
+                                });
                             }
                             Action::PeerPause(paused) => {
                                 if let (Some(s), Some(id)) = (session.as_ref(), app.peer.id()) {
@@ -663,6 +704,35 @@ async fn event_loop(
                             }
                             Action::Create => create = true,
                             Action::None => {}
+                        }
+                        // Start or re-attach a dialogue on pulse A and watch it on
+                        // the Peer page (the pair row, the setup float and `:comms`
+                        // all land here).
+                        if let Some(CommsLaunch {
+                            a,
+                            cfg_a,
+                            peer,
+                            start,
+                            attach,
+                        }) = comms_launch.take()
+                        {
+                            match open_peer(app, &mut session, started, a, &cfg_a, &peer) {
+                                Some(client) => {
+                                    let (tx, rx) = tokio::sync::mpsc::channel(64);
+                                    comms_rx = Some(rx);
+                                    if let Some(task) = comms_task.take() {
+                                        task.abort();
+                                    }
+                                    comms_task = Some(tokio::spawn(comms_pump(client, start, attach, tx)));
+                                    if let Some(task) = turn_task.take() {
+                                        task.abort();
+                                    }
+                                    turn_rx = None;
+                                    attached = true;
+                                    daemon_base = session.as_ref().map(|s| s.client.base().to_string());
+                                }
+                                None => app.notice(&format!("{} is not up", cfg_a.pulse.name)),
+                            }
                         }
                         dirty = true;
                     }

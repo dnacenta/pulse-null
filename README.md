@@ -364,7 +364,9 @@ The window model follows Hyprland: panes with a one-cell gap, one accent border 
 
 **Talk** is the conversation page. Your message appears the instant you press Enter; the reply streams token by token as the provider produces it; typing works during a reply and Enter queues one message; `Ctrl+c` cancels a reply (the daemon rolls the turn back); scrolling up during a reply holds your place and shows `↓ new`, `G` glides back to the tail. Further pages (Watch, Remember, Setup) arrive in later releases; `:` lists them.
 
-`:` opens the command line (`Tab` completes): `:home`, `:theme <name|system>`, `:motion <full|reduced|off>`, `:quit`, `:help`. `?` shows the keys for the focused pane.
+**Peer to peer** is a dialogue between two of your pulses, run by the first one's daemon. When two pulses are up, Home lists a *Peer to peer · A ↔ B* row for each pair; Enter asks for an optional topic and a turn cap (20 by default, 50 at most) and opens the **Peer** page, where the turns stream in with each side in its own colour and a status line counts them. `Space` pauses and resumes, `Ctrl+c` stops (after a confirm), `q` goes back to Home while the dialogue keeps running there — the row then reads `dialogue running · turn n/max` and Enter re-attaches with the turns so far. From Talk, `:comms <pulse> [topic]` does the same for the open pulse (`Tab` completes the pulses up on this box; a name under `[peers]` works too). Every dialogue is archived like a conversation when it ends, however it ends.
+
+`:` opens the command line (`Tab` completes): `:home`, `:comms <pulse> [topic]`, `:theme <name|system>`, `:motion <full|reduced|off>`, `:quit`, `:help`. `?` shows the keys for the focused pane.
 
 ```toml
 [tui]
@@ -387,6 +389,10 @@ All endpoints except `/health` require `X-Echo-Secret` header when `security.sec
 | POST | `/chat` | Send a message, get the whole reply |
 | POST | `/api/chat/stream` | Same turn as `/chat`, streamed as server-sent events: `status`, `delta`, then `done` or `error`. Closing the connection cancels the turn. |
 | GET | `/api/session/{channel}` | The conversation on a channel as the TUI shows it |
+| POST | `/api/comms` | Start a dialogue with a peer (`{"peer": {"name", "host"?, "port"?}, "topic"?, "max_turns"?}`): 202 with its id, 409 while one runs. Owner only; one per daemon. |
+| GET | `/api/comms` | The current dialogue's status (`turn`, `max_turns`, `phase`), or 404 |
+| GET | `/api/comms/{id}/stream` | The turns so far, then live, as server-sent events: `turn`, `status`, then `done` or `error` |
+| POST | `/api/comms/{id}/pause`, `…/resume`, DELETE `/api/comms/{id}` | Pause, resume or stop it (the turns so far are archived) |
 | GET | `/api/events` | Live ledger of what the pulse does (SSE, `Last-Event-ID` replay) |
 | GET | `/api/ledger` | Ledger backfill from disk (`since`, `kind`, `limit`) |
 | GET | `/api/schedule` | Scheduled tasks with cadence, last run, next fire |
