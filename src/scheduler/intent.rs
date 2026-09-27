@@ -528,6 +528,11 @@ pub async fn drain_loop(
         let claimed = claim_next_intent(&leases, &holder, &candidates).await;
         let Some(intent) = claimed else { continue };
 
+        if premise_cleared(&intent, &state) {
+            commit_intent_completion(&state.root_dir, &queue, &leases, &holder, &intent.id).await;
+            continue;
+        }
+
         // Rate limit check — release the claim and re-check later; the
         // intent never left the queue, so there is nothing to re-queue.
         if !rate_tracker.record_and_check() {
@@ -573,6 +578,40 @@ pub async fn drain_loop(
         // re-runs — the at-least-once direction the queue already accepts.
         commit_intent_completion(&state.root_dir, &queue, &leases, &holder, &intent.id).await;
     }
+}
+
+/// A queued intent whose triggering condition has cleared since it was
+/// queued — run it and the pulse chases a problem that is gone.
+fn premise_cleared(intent: &Intent, state: &AppState) -> bool {
+    let cleared = pipeline_premise_cleared(
+        intent,
+        state.pipeline_monitor.as_deref(),
+        &state.root_dir,
+        state.config.pipeline.freeze_threshold,
+    );
+    if cleared {
+        tracing::info!(
+            "Intent '{}' dropped: the pipeline has moved since it was queued",
+            intent.id
+        );
+    }
+    cleared
+}
+
+/// [`premise_cleared`] without the `AppState`, so it can be tested against
+/// a real monitor reading a real `pipeline-state.json`.
+fn pipeline_premise_cleared(
+    intent: &Intent,
+    monitor: Option<&dyn pulse_system_types::monitoring::PipelineMonitor>,
+    root_dir: &Path,
+    freeze_threshold: u32,
+) -> bool {
+    let Some(monitor) = monitor else {
+        return false;
+    };
+    crate::events::listener::pipeline_freeze_cleared(intent, freeze_threshold, || {
+        monitor.load_state(root_dir).sessions_without_movement
+    })
 }
 
 /// Lease resource id for an intent claim.
@@ -1262,6 +1301,48 @@ fn log_intent_execution(root_dir: &Path, intent: &Intent, summary: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// End to end over the real monitor: a frozen intent is dropped once
+    /// `pipeline-state.json` shows movement, and kept while it does not.
+    #[test]
+    fn a_frozen_intent_is_dropped_once_pipeline_state_shows_movement() {
+        let dir = tempfile::tempdir().unwrap();
+        let monitor = crate::praxis::runtime::PraxisMonitor::new();
+        let mut intent = make_intent("frozen", IntentPriority::Normal);
+        intent.source = IntentSource::Event("pipeline_frozen".into());
+
+        let write_state = |sessions: u32| {
+            std::fs::write(
+                dir.path().join("pipeline-state.json"),
+                format!(
+                    r#"{{"last_updated": null, "session_count": 9,
+                        "sessions_without_movement": {sessions},
+                        "last_counts": {{"learning": 1, "thoughts": 1, "curiosity": 1,
+                                         "reflections": 1, "praxis": 1}}}}"#
+                ),
+            )
+            .unwrap();
+        };
+
+        write_state(5);
+        assert!(!pipeline_premise_cleared(
+            &intent,
+            Some(&monitor),
+            dir.path(),
+            3
+        ));
+        write_state(0);
+        assert!(pipeline_premise_cleared(
+            &intent,
+            Some(&monitor),
+            dir.path(),
+            3
+        ));
+        assert!(
+            !pipeline_premise_cleared(&intent, None, dir.path(), 3),
+            "no monitor, no evidence the premise cleared"
+        );
+    }
 
     fn make_intent(id: &str, priority: IntentPriority) -> Intent {
         Intent {
