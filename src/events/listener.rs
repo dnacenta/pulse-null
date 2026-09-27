@@ -424,6 +424,12 @@ fn translate_event(event: &PulseEvent, config: &EventsConfig) -> Option<Intent> 
             if !config.pipeline_frozen {
                 return None;
             }
+            // The freeze clears on its own the moment the journal moves, and
+            // this intent can sit in the queue for hours. So the payload
+            // states the observation with its time rather than as a present
+            // fact, and `pipeline_freeze_cleared` drops the intent at claim
+            // time if the premise no longer holds.
+            let fired_at = Utc::now();
             Some(Intent {
                 id: format!(
                     "event-pipeline-frozen-{}",
@@ -431,17 +437,19 @@ fn translate_event(event: &PulseEvent, config: &EventsConfig) -> Option<Intent> 
                 ),
                 description: "Pipeline frozen — investigate stagnation".to_string(),
                 prompt: format!(
-                    "The document pipeline has had no movement for {} sessions. \
-                    Something may be stuck. Read LEARNING.md, THOUGHTS.md, CURIOSITY.md, \
+                    "As of {}, the document pipeline had gone {} session(s) without movement; \
+                    the runtime re-checked this when the intent started and it still held. \
+                    Read LEARNING.md, THOUGHTS.md, CURIOSITY.md, \
                     and REFLECTIONS.md to understand the current state. \
                     Look for: threads that need development, thoughts ready to graduate, \
                     questions that need research, or stale content that should be archived. \
                     Take at least one concrete action to restart the pipeline flow.",
+                    fired_at.format("%Y-%m-%dT%H:%M:%SZ"),
                     sessions_without_movement
                 ),
-                source: IntentSource::Event("pipeline_frozen".to_string()),
+                source: IntentSource::Event(PIPELINE_FROZEN_EVENT.to_string()),
                 priority: IntentPriority::Normal,
-                created_at: Utc::now(),
+                created_at: fired_at,
                 chain: None,
                 output_routing: IntentOutput::Silent,
                 depth: 0,
@@ -648,6 +656,29 @@ fn is_better_or_equal(current: &str, previous: &str) -> bool {
     rank(current) >= rank(previous)
 }
 
+/// Event name of the intent queued for a frozen pipeline.
+const PIPELINE_FROZEN_EVENT: &str = "pipeline_frozen";
+
+/// Whether `intent` is a pipeline-frozen intent whose premise has cleared
+/// since it was queued.
+///
+/// The freeze counter resets as soon as a session moves the pipeline, with
+/// no action from the pulse, so a queued intent can outlive its cause. The
+/// drain loop asks this before running one, and drops it instead of sending
+/// the pulse to hunt for stagnation that is no longer there.
+///
+/// `sessions_without_movement` is only read for a pipeline-frozen intent, so
+/// every other intent costs no disk read.
+#[must_use]
+pub fn pipeline_freeze_cleared(
+    intent: &Intent,
+    freeze_threshold: u32,
+    sessions_without_movement: impl FnOnce() -> u32,
+) -> bool {
+    matches!(&intent.source, IntentSource::Event(name) if name == PIPELINE_FROZEN_EVENT)
+        && sessions_without_movement() < freeze_threshold
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -741,6 +772,52 @@ mod tests {
         };
         let intent = translate_event(&event, &config).unwrap();
         assert!(intent.description.contains("frozen"));
+        // The observation carries its own time, not a present-tense claim.
+        let stamp = intent.created_at.format("%Y-%m-%dT%H:%M:%SZ").to_string();
+        assert!(
+            intent.prompt.starts_with(&format!("As of {stamp}")),
+            "{}",
+            intent.prompt
+        );
+        assert!(intent.prompt.contains("5 session(s) without movement"));
+    }
+
+    #[test]
+    fn a_frozen_intent_is_dropped_once_the_pipeline_has_moved() {
+        let config = EventsConfig {
+            pipeline_frozen: true,
+            ..EventsConfig::default()
+        };
+        let event = PulseEvent::PipelineFrozen {
+            sessions_without_movement: 5,
+        };
+        let intent = translate_event(&event, &config).unwrap();
+
+        assert!(!pipeline_freeze_cleared(&intent, 3, || 5), "still frozen");
+        assert!(
+            !pipeline_freeze_cleared(&intent, 3, || 3),
+            "at threshold is frozen"
+        );
+        assert!(
+            pipeline_freeze_cleared(&intent, 3, || 0),
+            "moved since it fired"
+        );
+    }
+
+    #[test]
+    fn only_the_frozen_intent_is_subject_to_the_freeze_recheck() {
+        let config = EventsConfig {
+            pipeline_alert: true,
+            ..EventsConfig::default()
+        };
+        let event = PulseEvent::PipelineAlert {
+            document: "LEARNING".to_string(),
+            count: 9,
+            hard_limit: 8,
+        };
+        let intent = translate_event(&event, &config).unwrap();
+        let never_read = || panic!("only a frozen intent reads the pipeline state");
+        assert!(!pipeline_freeze_cleared(&intent, 3, never_read));
     }
 
     #[test]

@@ -6,6 +6,7 @@ use tracing::{info, warn};
 
 use super::capability::{self, Capability};
 use crate::config::{AwarenessMode, Config};
+use crate::providers::provider_reports_tool_rounds;
 use crate::scheduler::intent::IntentQueue;
 
 // ---------------------------------------------------------------------------
@@ -1003,6 +1004,36 @@ pub fn build_task_system_prompt_budgeted(
     enforce_budget_and_assemble(components, budget_cfg, "task")
 }
 
+/// Refusals shown in the notice before the rest are summarised as a count.
+/// The notice sits inside the capped `<tension-context>` block, so a cycle
+/// that refused a dozen markers must not crowd out the threads themselves.
+const REFUSAL_NOTICE_SHOWN: usize = 3;
+
+/// `[TENSION REFUSED: …]` — the last cycle's refused markers, one clause each.
+fn render_refusal_notice(refusals: &[crate::tension::RefusalNotice]) -> String {
+    use std::fmt::Write as _;
+    let mut notice = String::from(
+        "[TENSION REFUSED last cycle — these markers discharged nothing; \
+         re-emit with a real artifact or drop the claim:",
+    );
+    for refusal in refusals.iter().take(REFUSAL_NOTICE_SHOWN) {
+        let _ = write!(
+            &mut notice,
+            " {} {}: {};",
+            refusal.marker, refusal.thread_id, refusal.reason
+        );
+    }
+    if refusals.len() > REFUSAL_NOTICE_SHOWN {
+        let _ = write!(
+            &mut notice,
+            " …and {} more;",
+            refusals.len() - REFUSAL_NOTICE_SHOWN
+        );
+    }
+    notice.push_str("]\n");
+    notice
+}
+
 /// Token cap for the `<tension-context>` block. Wide enough for
 /// `top_k_injected` threads with their self-contained content at the
 /// sanitizer's 800-char ceiling, which is what §8 Q4 costs.
@@ -1084,10 +1115,22 @@ fn build_tension_context(root_dir: &Path, config: &Config) -> Option<String> {
         block.push_str("]\n");
     }
 
-    block.push_str(
-        "Tension falls only for work with an artifact behind it — a file changed outside \
-         the journal, a prediction resolved, a tool that ran. Writing about a thread does \
-         not lower it.\n</tension-context>",
+    // Refused markers are told to the pulse that emitted them, not only to
+    // the owner's alert queue: the pulse is the only one who can re-emit.
+    if !store.last_refusals.is_empty() {
+        block.push_str(&render_refusal_notice(&store.last_refusals));
+    }
+
+    // Name only the rungs this runtime can verify.
+    let rungs = if provider_reports_tool_rounds(&config.llm.provider) {
+        "a file changed outside the journal, a prediction resolved, a tool that ran"
+    } else {
+        "a file changed outside the journal, or a prediction resolved"
+    };
+    let _ = write!(
+        &mut block,
+        "Tension falls only for work with an artifact behind it — {rungs}. Writing about a \
+         thread does not lower it.\n</tension-context>"
     );
     Some(block)
 }
@@ -1573,19 +1616,33 @@ pub fn build_autonomy_context(root_dir: &Path, config: &Config) -> String {
     // they mutate an accumulator, and two of the three are refused unless
     // they name something outside this text.
     if config.tension.enabled {
-        sections.push(
+        // The tool rung checks the executor's tool-round count, which is
+        // always 0 when the agent CLI runs its own tools. Advertising it there
+        // invites a marker that cannot pass — same discipline as the outreach
+        // block below: document only what the runtime can honour.
+        let (work_line, checked_against) = if provider_reports_tool_rounds(&config.llm.provider) {
+            (
+                "Instead of \"file\" you may name \"prediction\" (an id you resolved this cycle) or \"tool\" (a tool that ran this cycle).",
+                "the filesystem, the prediction store and the executor's tool count",
+            )
+        } else {
+            (
+                "Instead of \"file\" you may name \"prediction\" (an id you resolved this cycle). \"tool\" cannot be verified on this runtime — name the file the tool changed.",
+                "the filesystem and the prediction store",
+            )
+        };
+        sections.push(format!(
             "Tension threads accumulate pressure between cycles. Three markers act on them:\n\
-            - [THREAD: {\"label\": \"short name\", \"content\": \"self-contained statement of the open thing — it must still make sense after the journal folds\", \"origin\": \"open_question|callback|adverse|user_raised\", \"ref\": \"optional source\"}] — open a thread\n\
-            - [THREAD-WORK: {\"id\": \"t-abc12345\", \"file\": \"relative/path/you/changed\"}] — claim a discharge. Instead of \"file\" you may name \"prediction\" (an id you resolved this cycle) or \"tool\" (a tool that ran this cycle).\n\
-            - [THREAD-RESOLVE: {\"id\": \"t-abc12345\", \"resolution\": \"answered|dissolved|superseded|abandoned\", \"reason\": \"...\", \"by\": \"...\"}] — retire a thread\n\n\
+            - [THREAD: {{\"label\": \"short name\", \"content\": \"self-contained statement of the open thing — it must still make sense after the journal folds\", \"origin\": \"open_question|callback|adverse|user_raised\", \"ref\": \"optional source\"}}] — open a thread\n\
+            - [THREAD-WORK: {{\"id\": \"t-abc12345\", \"file\": \"relative/path/you/changed\"}}] — claim a discharge. {work_line}\n\
+            - [THREAD-RESOLVE: {{\"id\": \"t-abc12345\", \"resolution\": \"answered|dissolved|superseded|abandoned\", \"reason\": \"...\", \"by\": \"...\"}}] — retire a thread\n\n\
             Discharge requires an artifact, not a description. A [THREAD-WORK:] or \"answered\" \
-            claim is checked against the filesystem, the prediction store and the executor's \
-            tool count, and is refused if it does not check out — writing about a thread does \
-            not lower its tension, and a thread mentioned but never worked is recorded as \
-            exactly that. \"abandoned\" and \"dissolved\" need a reason instead of an artifact; \
-            they are honest give-ups, they are kept as tombstones, and D sees them."
-                .to_string(),
-        );
+            claim is checked against {checked_against}, and is refused if it does not check out \
+            — writing about a thread does not lower its tension, and a thread mentioned but \
+            never worked is recorded as exactly that. \"abandoned\" and \"dissolved\" need a \
+            reason instead of an artifact; they are honest give-ups, they are kept as \
+            tombstones, and D sees them."
+        ));
     }
 
     // Outreach marker (PN-94). Documented only when the channel is on, so the
@@ -2420,6 +2477,76 @@ mod tests {
         assert!(block.contains("Writing about a thread does not lower it"));
     }
 
+    /// The refusal has to reach the pulse, not only the owner's alert queue:
+    /// the owner cannot re-emit a marker on the pulse's behalf.
+    #[test]
+    fn tension_context_surfaces_last_cycles_refusals_to_the_pulse() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = minimal_config();
+
+        seed_tension(dir.path(), &config, |store| {
+            store.open(
+                ThreadDraft {
+                    label: "a thread".to_string(),
+                    content: "content".to_string(),
+                    origin: ThreadOrigin::UserRaised("a thread".to_string()),
+                },
+                chrono::Utc::now(),
+            );
+            store.last_refusals = vec![crate::tension::RefusalNotice {
+                marker: "THREAD-WORK".to_string(),
+                thread_id: "t-deadbeef".to_string(),
+                reason: "no artifact named".to_string(),
+            }];
+        });
+
+        let block = build_tension_context(dir.path(), &config).expect("threads exist");
+        assert!(block.contains("[TENSION REFUSED"), "{block}");
+        assert!(block.contains("THREAD-WORK"), "{block}");
+        assert!(block.contains("t-deadbeef"), "{block}");
+        assert!(block.contains("no artifact named"), "{block}");
+    }
+
+    /// A cycle that refused nothing must say nothing — the notice reflects
+    /// the last cycle only, never a latch.
+    #[test]
+    fn tension_context_omits_the_refusal_notice_when_there_were_none() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = minimal_config();
+
+        seed_tension(dir.path(), &config, |store| {
+            store.open(
+                ThreadDraft {
+                    label: "a thread".to_string(),
+                    content: "content".to_string(),
+                    origin: ThreadOrigin::UserRaised("a thread".to_string()),
+                },
+                chrono::Utc::now(),
+            );
+        });
+
+        let block = build_tension_context(dir.path(), &config).expect("threads exist");
+        assert!(!block.contains("[TENSION REFUSED"), "{block}");
+    }
+
+    /// The notice lives inside a capped block; a cycle that refused many
+    /// markers shows a few and counts the rest.
+    #[test]
+    fn refusal_notice_is_bounded() {
+        let refusals: Vec<_> = (0..REFUSAL_NOTICE_SHOWN + 2)
+            .map(|i| crate::tension::RefusalNotice {
+                marker: "THREAD-WORK".to_string(),
+                thread_id: format!("t-{i:08}"),
+                reason: "claim: no artifact named".to_string(),
+            })
+            .collect();
+
+        let notice = render_refusal_notice(&refusals);
+        assert_eq!(notice.matches("THREAD-WORK").count(), REFUSAL_NOTICE_SHOWN);
+        assert!(notice.contains("…and 2 more;"), "{notice}");
+        assert!(notice.ends_with("]\n"), "{notice}");
+    }
+
     #[test]
     fn tension_context_surfaces_an_outstanding_triage_demand() {
         let dir = tempfile::tempdir().unwrap();
@@ -2482,5 +2609,77 @@ mod tests {
         let mut off = minimal_config();
         off.tension.enabled = false;
         assert!(!build_autonomy_context(dir.path(), &off).contains("[THREAD:"));
+    }
+
+    /// Providers whose tool rounds are observable, and ones whose are not:
+    /// every `cli` adapter runs its own tools, and so does the pre-PN-106
+    /// alias for one of them.
+    const SIGHTED: [&str; 2] = ["anthropic", "ollama"];
+    const BLIND: [&str; 2] = ["cli", "claude-code"];
+
+    /// The tool rung checks a count that is always 0 under a provider that
+    /// runs its own tools. The vocabulary must follow the runtime, both ways.
+    #[test]
+    fn the_tool_rung_is_documented_only_where_it_can_verify() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = minimal_config();
+
+        for provider in SIGHTED {
+            config.llm.provider = provider.into();
+            let context = build_autonomy_context(dir.path(), &config);
+            assert!(context.contains("a tool that ran this cycle"), "{provider}");
+            assert!(context.contains("the executor's tool count"), "{provider}");
+        }
+
+        for provider in BLIND {
+            config.llm.provider = provider.into();
+            let context = build_autonomy_context(dir.path(), &config);
+            assert!(
+                !context.contains("a tool that ran this cycle"),
+                "{provider}"
+            );
+            assert!(!context.contains("the executor's tool count"), "{provider}");
+            assert!(
+                context.contains("cannot be verified on this runtime"),
+                "{provider}"
+            );
+            // The other rungs survive, and the marker itself is still offered.
+            assert!(context.contains("[THREAD-WORK:"), "{provider}");
+            assert!(
+                context.contains("an id you resolved this cycle"),
+                "{provider}"
+            );
+        }
+    }
+
+    /// The same rule applies to the tension block injected into task prompts,
+    /// which states the artifact rule a second time in its own words.
+    #[test]
+    fn the_tension_context_footer_follows_the_runtime_too() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = minimal_config();
+        seed_tension(dir.path(), &config, |store| {
+            store.open(
+                ThreadDraft {
+                    label: "a thread".to_string(),
+                    content: "something open enough to be injected".to_string(),
+                    origin: ThreadOrigin::UserRaised("d".to_string()),
+                },
+                chrono::Utc::now(),
+            );
+        });
+
+        for provider in SIGHTED {
+            config.llm.provider = provider.into();
+            let block = build_tension_context(dir.path(), &config).expect("threads exist");
+            assert!(block.contains("a tool that ran"), "{provider}");
+        }
+        for provider in BLIND {
+            config.llm.provider = provider.into();
+            let block = build_tension_context(dir.path(), &config).expect("threads exist");
+            assert!(!block.contains("a tool that ran"), "{provider}");
+            assert!(block.contains("or a prediction resolved"), "{provider}");
+            assert!(block.ends_with("</tension-context>"), "{provider}");
+        }
     }
 }
