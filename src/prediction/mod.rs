@@ -47,6 +47,30 @@ use uuid::Uuid;
 
 use crate::config::PredictionConfig;
 
+/// Shortest abbreviation of a prediction id accepted as a resolution reference.
+///
+/// Eight hex characters is 32 bits, which keeps collisions negligible for a
+/// store bounded at tens of predictions, and matches the abbreviation length
+/// display surfaces use for UUIDs. Shorter references are rejected rather
+/// than matched, on the same reasoning git uses for object names: an
+/// abbreviation that is unique in a small store stops being unique as the
+/// store grows, so the floor is set by the population, not by taste.
+pub const MIN_ABBREVIATED_ID_LEN: usize = 8;
+
+/// Character cap on the text snapshotted into a [`PredictionError`].
+///
+/// Mirrors `resolve::MAX_MARKER_FIELD_LEN`. Marker-sourced text is already
+/// capped there, but [`PredictionStack::resolve_reference`] is a public API,
+/// and callers that build a [`PredictionResolution`] directly do not pass
+/// through the marker parser, so the cap is re-applied at the point of
+/// storage rather than assumed.
+const MAX_SNAPSHOT_FIELD_LEN: usize = 200;
+
+/// Truncate on a character boundary, never a byte one.
+fn truncate_snapshot(s: &str) -> String {
+    s.chars().take(MAX_SNAPSHOT_FIELD_LEN).collect()
+}
+
 /// The timescale at which a prediction operates.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -189,6 +213,93 @@ pub struct PredictionError {
     pub created_at: DateTime<Utc>,
     /// Whether this error has been processed by the attention system.
     pub processed: bool,
+    /// Snapshot of the prediction's text, taken at resolve time.
+    ///
+    /// The error record outlives the prediction that produced it: `prune`
+    /// keeps `max(max_predictions, pending)` predictions, so once pending
+    /// reaches the cap every resolved prediction is evicted on the next
+    /// prune while its error survives in `errors`. A consumer that looks
+    /// `prediction_id` up in the live store therefore reads a hole.
+    /// Capturing the text here — the one moment both halves are in hand —
+    /// makes a prediction error self-contained.
+    ///
+    /// `None` on records written before this field existed.
+    #[serde(default)]
+    pub predicted: Option<String>,
+    /// Snapshot of the resolution's `actual` text, taken at resolve time.
+    /// Same rationale and same migration default as [`Self::predicted`].
+    #[serde(default)]
+    pub actual: Option<String>,
+}
+
+/// Why a resolution reference did not name exactly one pending prediction.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ResolveRejection {
+    /// Neither an id nor an id prefix of any prediction on record.
+    NotFound,
+    /// Names exactly one prediction, which has already been resolved.
+    AlreadyResolved {
+        /// The full id of the prediction the reference named.
+        canonical_id: String,
+    },
+    /// A prefix shorter than [`MIN_ABBREVIATED_ID_LEN`] that matches at
+    /// least one prediction — too short to trust as unique.
+    TooShort,
+    /// A prefix shared by more than one prediction.
+    Ambiguous {
+        /// Full ids of every prediction the prefix matches.
+        candidates: Vec<String>,
+    },
+}
+
+impl std::fmt::Display for ResolveRejection {
+    /// Human-readable reason, safe to echo into owner-facing alerts: it never
+    /// includes the candidate ids, only their count.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NotFound => {
+                f.write_str("no pending prediction with this id (unknown or already resolved)")
+            }
+            Self::AlreadyResolved { .. } => {
+                f.write_str("no pending prediction with this id (already resolved)")
+            }
+            Self::TooShort => write!(
+                f,
+                "id prefix shorter than {MIN_ABBREVIATED_ID_LEN} characters; \
+                 use at least {MIN_ABBREVIATED_ID_LEN} or the full id"
+            ),
+            Self::Ambiguous { candidates } => write!(
+                f,
+                "ambiguous id prefix: matches {} predictions; use the full id",
+                candidates.len()
+            ),
+        }
+    }
+}
+
+fn log_rejected_reference(reference: &str, rejection: &ResolveRejection) {
+    match rejection {
+        ResolveRejection::Ambiguous { candidates } => tracing::warn!(
+            prediction_id = reference,
+            candidates = ?candidates,
+            "Rejected prediction reference: id prefix is ambiguous, matches {} predictions",
+            candidates.len()
+        ),
+        ResolveRejection::TooShort => tracing::warn!(
+            prediction_id = reference,
+            min_len = MIN_ABBREVIATED_ID_LEN,
+            "Rejected prediction reference: id prefix too short to disambiguate"
+        ),
+        ResolveRejection::AlreadyResolved { canonical_id } => tracing::warn!(
+            prediction_id = reference,
+            canonical_id = %canonical_id,
+            "Rejected prediction reference: prediction already resolved"
+        ),
+        ResolveRejection::NotFound => tracing::warn!(
+            prediction_id = reference,
+            "Attempted to resolve unknown or already-resolved prediction"
+        ),
+    }
 }
 
 /// The prediction stack — holds all predictions and their errors.
@@ -303,40 +414,58 @@ impl PredictionStack {
             .filter(move |p| p.timescale == timescale && p.is_pending())
     }
 
-    /// Resolve a prediction by ID.
+    /// Resolve a prediction by id. Returns `true` if a pending prediction was
+    /// resolved.
+    ///
+    /// Convenience over [`Self::resolve_reference`] for callers that do not
+    /// need the canonical id or the rejection reason. `#[cfg(test)]`-gated:
+    /// production resolves through `resolve_reference`, whose canonical id
+    /// feeds `ProcessSummary::resolved_prediction_ids`.
+    #[cfg(test)]
+    pub fn resolve(&mut self, reference: &str, resolution: PredictionResolution) -> bool {
+        self.resolve_reference(reference, resolution).is_ok()
+    }
+
+    /// Resolve a prediction by its full id or an unambiguous abbreviation of
+    /// it, returning the prediction's full (canonical) id.
+    ///
+    /// Following git's object-name rule, an abbreviation is a valid input
+    /// form: a reference of at least [`MIN_ABBREVIATED_ID_LEN`] characters
+    /// that prefixes exactly one prediction on record names that prediction.
+    /// Uniqueness is judged against *all* predictions, resolved ones
+    /// included, so a reference aimed at an already-resolved prediction can
+    /// never land on a different pending one. An exact id match always wins
+    /// over a prefix match. Every rejection is logged.
     ///
     /// If the resolution's surprise exceeds `self.config.surprise_threshold`,
-    /// a `PredictionError` is created and added to the error queue. Returns
-    /// `true` if the prediction was found and resolved, `false` if not found
-    /// or already resolved.
-    pub fn resolve(&mut self, prediction_id: &str, resolution: PredictionResolution) -> bool {
-        let prediction = self
-            .predictions
-            .iter_mut()
-            .find(|p| p.id == prediction_id && p.is_pending());
-
-        let prediction = match prediction {
-            Some(p) => p,
-            None => {
-                tracing::warn!(
-                    prediction_id,
-                    "Attempted to resolve unknown or already-resolved prediction"
-                );
-                return false;
-            }
-        };
-
+    /// a [`PredictionError`] is queued — keyed by the canonical id, since an
+    /// abbreviation that is unique today may not be later — carrying a
+    /// snapshot of both the predicted and the actual text.
+    pub fn resolve_reference(
+        &mut self,
+        reference: &str,
+        resolution: PredictionResolution,
+    ) -> Result<String, ResolveRejection> {
+        let index = self.find_pending(reference).inspect_err(|rejection| {
+            log_rejected_reference(reference, rejection);
+        })?;
+        let prediction = &mut self.predictions[index];
+        let canonical_id = prediction.id.clone();
         let surprise = resolution.surprise.clamp(0.0, 1.0);
 
-        // Create a prediction error if surprise exceeds the configured threshold.
         if surprise > self.config.surprise_threshold {
+            // Snapshot both texts here: this is the only point in the
+            // lifecycle where the prediction and its outcome are both in
+            // hand; after the next prune the prediction may be gone.
             self.errors.push(PredictionError {
-                prediction_id: prediction_id.to_string(),
+                prediction_id: canonical_id.clone(),
                 surprise,
                 direction: resolution.direction,
                 insight: resolution.insight.clone(),
                 created_at: Utc::now(),
                 processed: false,
+                predicted: Some(truncate_snapshot(&prediction.content)),
+                actual: Some(truncate_snapshot(&resolution.actual)),
             });
         }
 
@@ -346,7 +475,50 @@ impl PredictionStack {
             ..resolution
         });
 
-        true
+        Ok(canonical_id)
+    }
+
+    /// Index of the single pending prediction `reference` names.
+    fn find_pending(&self, reference: &str) -> Result<usize, ResolveRejection> {
+        let reference = reference.trim();
+        let index = match self.predictions.iter().position(|p| p.id == reference) {
+            Some(exact) => exact,
+            None => self.find_by_prefix(reference)?,
+        };
+        let prediction = &self.predictions[index];
+        if prediction.is_pending() {
+            Ok(index)
+        } else {
+            Err(ResolveRejection::AlreadyResolved {
+                canonical_id: prediction.id.clone(),
+            })
+        }
+    }
+
+    /// Index of the single prediction on record whose id starts with `prefix`.
+    fn find_by_prefix(&self, prefix: &str) -> Result<usize, ResolveRejection> {
+        if prefix.is_empty() {
+            return Err(ResolveRejection::NotFound);
+        }
+        let matches: Vec<usize> = self
+            .predictions
+            .iter()
+            .enumerate()
+            .filter(|(_, p)| p.id.starts_with(prefix))
+            .map(|(index, _)| index)
+            .collect();
+
+        match matches.as_slice() {
+            [] => Err(ResolveRejection::NotFound),
+            _ if prefix.chars().count() < MIN_ABBREVIATED_ID_LEN => Err(ResolveRejection::TooShort),
+            [one] => Ok(*one),
+            many => Err(ResolveRejection::Ambiguous {
+                candidates: many
+                    .iter()
+                    .map(|&index| self.predictions[index].id.clone())
+                    .collect(),
+            }),
+        }
     }
 
     /// Iterate over unprocessed prediction errors.
@@ -541,6 +713,247 @@ mod tests {
             insight: None,
         };
         assert!(!stack.resolve("nonexistent", resolution));
+    }
+
+    fn resolution(actual: &str, surprise: f64, direction: ErrorDirection) -> PredictionResolution {
+        PredictionResolution {
+            actual: actual.to_string(),
+            surprise,
+            direction,
+            insight: None,
+        }
+    }
+
+    /// Two predictions whose ids share an 8-character prefix.
+    fn stack_with_shared_prefix() -> PredictionStack {
+        let mut stack = PredictionStack::new();
+        stack.add_prediction(Timescale::Cycle, "first".to_string(), 0.8);
+        stack.add_prediction(Timescale::Cycle, "second".to_string(), 0.8);
+        stack.predictions[0].id = "abcd1234-0000-0000-0000-000000000001".to_string();
+        stack.predictions[1].id = "abcd1234-0000-0000-0000-000000000002".to_string();
+        stack
+    }
+
+    #[test]
+    fn resolve_accepts_unambiguous_abbreviation_and_returns_the_full_id() {
+        let mut stack = PredictionStack::new();
+        let id = stack
+            .add_prediction(Timescale::Cycle, "test".to_string(), 0.8)
+            .id
+            .clone();
+
+        let resolved = stack.resolve_reference(
+            &id[..MIN_ABBREVIATED_ID_LEN],
+            resolution("held", 0.1, ErrorDirection::WellCalibrated),
+        );
+
+        assert_eq!(resolved, Ok(id));
+        assert!(stack.predictions[0].resolved_at.is_some());
+    }
+
+    #[test]
+    fn resolve_by_abbreviation_keys_the_error_by_the_full_id() {
+        let mut stack = PredictionStack::new();
+        let id = stack
+            .add_prediction(Timescale::Cycle, "test".to_string(), 0.8)
+            .id
+            .clone();
+
+        assert!(stack.resolve(
+            &id[..MIN_ABBREVIATED_ID_LEN],
+            resolution("surprising", 0.7, ErrorDirection::Misdirected),
+        ));
+        // Keyed by the full id, not the abbreviation that happened to be
+        // typed — abbreviations rot as the store grows.
+        assert_eq!(stack.errors[0].prediction_id, id);
+    }
+
+    #[test]
+    fn resolve_rejects_ambiguous_abbreviation() {
+        let mut stack = stack_with_shared_prefix();
+
+        let rejected = stack.resolve_reference(
+            "abcd1234",
+            resolution("whichever", 0.5, ErrorDirection::Novel),
+        );
+
+        assert_eq!(
+            rejected,
+            Err(ResolveRejection::Ambiguous {
+                candidates: vec![
+                    "abcd1234-0000-0000-0000-000000000001".to_string(),
+                    "abcd1234-0000-0000-0000-000000000002".to_string(),
+                ],
+            })
+        );
+        assert!(stack.predictions.iter().all(Prediction::is_pending));
+        assert!(stack.errors.is_empty());
+    }
+
+    /// A prefix shared with an already-resolved prediction is ambiguous: the
+    /// reference may have been aimed at the resolved one, so it must not
+    /// silently land on the pending one.
+    #[test]
+    fn resolve_counts_resolved_predictions_when_judging_ambiguity() {
+        let mut stack = stack_with_shared_prefix();
+        let first = stack.predictions[0].id.clone();
+        assert!(stack.resolve(
+            &first,
+            resolution("done", 0.1, ErrorDirection::WellCalibrated)
+        ));
+
+        let rejected =
+            stack.resolve_reference("abcd1234", resolution("again", 0.1, ErrorDirection::Novel));
+
+        assert!(matches!(rejected, Err(ResolveRejection::Ambiguous { .. })));
+        assert!(stack.predictions[1].is_pending());
+    }
+
+    #[test]
+    fn resolve_by_abbreviation_of_a_resolved_prediction_is_already_resolved() {
+        let mut stack = PredictionStack::new();
+        let id = stack
+            .add_prediction(Timescale::Cycle, "test".to_string(), 0.8)
+            .id
+            .clone();
+        assert!(stack.resolve(&id, resolution("done", 0.1, ErrorDirection::WellCalibrated)));
+
+        let again = stack.resolve_reference(
+            &id[..MIN_ABBREVIATED_ID_LEN],
+            resolution("again", 0.1, ErrorDirection::WellCalibrated),
+        );
+
+        assert_eq!(
+            again,
+            Err(ResolveRejection::AlreadyResolved { canonical_id: id })
+        );
+    }
+
+    #[test]
+    fn resolve_rejects_reference_shorter_than_minimum() {
+        let mut stack = PredictionStack::new();
+        let id = stack
+            .add_prediction(Timescale::Cycle, "test".to_string(), 0.8)
+            .id
+            .clone();
+
+        let rejected = stack.resolve_reference(
+            &id[..4],
+            resolution("too short", 0.5, ErrorDirection::Novel),
+        );
+
+        assert_eq!(rejected, Err(ResolveRejection::TooShort));
+        assert!(stack.predictions[0].is_pending());
+    }
+
+    #[test]
+    fn resolve_prefers_exact_match_over_prefix_match() {
+        let mut stack = PredictionStack::new();
+        stack.add_prediction(Timescale::Cycle, "short id".to_string(), 0.8);
+        stack.add_prediction(Timescale::Cycle, "longer id".to_string(), 0.8);
+        stack.predictions[0].id = "abcd1234".to_string();
+        stack.predictions[1].id = "abcd1234-0000-0000-0000-000000000002".to_string();
+
+        let resolved = stack.resolve_reference(
+            "abcd1234",
+            resolution("exact wins", 0.1, ErrorDirection::WellCalibrated),
+        );
+
+        assert_eq!(resolved, Ok("abcd1234".to_string()));
+        assert!(stack.predictions[1].is_pending());
+    }
+
+    #[test]
+    fn rejection_reasons_are_distinct_and_never_list_candidate_ids() {
+        let ambiguous = ResolveRejection::Ambiguous {
+            candidates: vec!["abcd1234-1".to_string(), "abcd1234-2".to_string()],
+        }
+        .to_string();
+        assert!(ambiguous.contains("ambiguous id prefix"));
+        assert!(ambiguous.contains('2'));
+        assert!(!ambiguous.contains("abcd1234"));
+
+        assert!(ResolveRejection::TooShort
+            .to_string()
+            .contains(&MIN_ABBREVIATED_ID_LEN.to_string()));
+        assert!(ResolveRejection::NotFound
+            .to_string()
+            .contains("no pending prediction"));
+    }
+
+    /// The error must carry its own copy of both texts, because it outlives
+    /// the prediction they came from.
+    #[test]
+    fn resolve_snapshots_both_texts_into_the_error() {
+        let mut stack = PredictionStack::new();
+        let id = stack
+            .add_prediction(Timescale::Cycle, "the alert will fire".to_string(), 0.8)
+            .id
+            .clone();
+
+        stack.resolve(
+            &id,
+            resolution("it stayed silent", 0.7, ErrorDirection::Overconfident),
+        );
+
+        assert_eq!(
+            stack.errors[0].predicted.as_deref(),
+            Some("the alert will fire")
+        );
+        assert_eq!(stack.errors[0].actual.as_deref(), Some("it stayed silent"));
+
+        // And it survives the eviction of the prediction itself.
+        stack.prune(0, 50);
+        assert!(stack.predictions.is_empty());
+        assert_eq!(
+            stack.errors[0].predicted.as_deref(),
+            Some("the alert will fire")
+        );
+    }
+
+    #[test]
+    fn snapshot_fields_respect_the_field_cap() {
+        let mut stack = PredictionStack::new();
+        // Multi-byte, to prove the cut lands on a char boundary, not a byte.
+        let long = "é".repeat(MAX_SNAPSHOT_FIELD_LEN + 50);
+        let id = stack
+            .add_prediction(Timescale::Cycle, long.clone(), 0.8)
+            .id
+            .clone();
+
+        stack.resolve(&id, resolution(&long, 0.9, ErrorDirection::Misdirected));
+
+        let error = &stack.errors[0];
+        assert_eq!(
+            error.predicted.as_deref().unwrap().chars().count(),
+            MAX_SNAPSHOT_FIELD_LEN
+        );
+        assert_eq!(
+            error.actual.as_deref().unwrap().chars().count(),
+            MAX_SNAPSHOT_FIELD_LEN
+        );
+    }
+
+    /// Existing `predictions.json` files have no `predicted`/`actual` keys on
+    /// their error records. They must load, not fail the whole snapshot.
+    #[test]
+    fn error_record_without_snapshot_fields_deserializes() {
+        let legacy = r#"{
+            "predictions": [],
+            "errors": [{
+                "prediction_id": "abc",
+                "surprise": 0.5,
+                "direction": "misdirected",
+                "insight": null,
+                "created_at": "2026-08-20T00:00:00Z",
+                "processed": false
+            }]
+        }"#;
+
+        let snapshot: PredictionStackSnapshot = serde_json::from_str(legacy).unwrap();
+        assert_eq!(snapshot.errors.len(), 1);
+        assert!(snapshot.errors[0].predicted.is_none());
+        assert!(snapshot.errors[0].actual.is_none());
     }
 
     #[test]
