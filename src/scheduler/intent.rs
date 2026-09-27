@@ -1245,24 +1245,6 @@ async fn execute_intent(
             &format!("intent:{}", intent.description),
         );
 
-        // Emit PipelineAlert for documents at hard limit
-        let docs = [
-            ("LEARNING", &health.learning),
-            ("THOUGHTS", &health.thoughts),
-            ("CURIOSITY", &health.curiosity),
-            ("REFLECTIONS", &health.reflections),
-            ("PRAXIS", &health.praxis),
-        ];
-        for (name, doc_health) in &docs {
-            if doc_health.status == pulse_system_types::monitoring::ThresholdStatus::Red {
-                state.event_bus.emit(PulseEvent::PipelineAlert {
-                    document: name.to_string(),
-                    count: doc_health.count,
-                    hard_limit: doc_health.hard,
-                });
-            }
-        }
-
         // Emit PipelineFrozen if pipeline is stuck
         if pipeline_state.sessions_without_movement >= state.config.pipeline.freeze_threshold {
             state.event_bus.emit(PulseEvent::PipelineFrozen {
@@ -1274,6 +1256,13 @@ async fn execute_intent(
         for doc in &archived {
             tracing::info!("Auto-archived overflow from {} (intent)", doc);
         }
+
+        // Alert only on what the archiver did NOT fix. Must stay below
+        // `check_and_archive` -- see `crate::scheduler::emit_pipeline_alerts`.
+        let health = crate::scheduler::post_archive_health(health, &archived, || {
+            monitor.calculate(&root_dir, &thresholds)
+        });
+        crate::scheduler::emit_pipeline_alerts(state, &health);
     }
 
     // Graph pipeline sync (if enabled)
