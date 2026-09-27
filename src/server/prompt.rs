@@ -6,6 +6,7 @@ use tracing::{info, warn};
 
 use super::capability::{self, Capability};
 use crate::config::{AwarenessMode, Config};
+use crate::providers::provider_reports_tool_rounds;
 use crate::scheduler::intent::IntentQueue;
 
 // ---------------------------------------------------------------------------
@@ -60,6 +61,83 @@ fn truncate_to_byte_cap(text: &str, max_bytes: usize) -> String {
 /// Line cap for THOUGHT_STACK.md. The pulse is instructed to keep it under
 /// 50 lines; this is the safety margin on top of that.
 const THOUGHT_STACK_MAX_LINES: usize = 60;
+
+/// Pulse-facing soft budget for THOUGHT_STACK.md, stricter than the hard
+/// ceiling carried in `thought_stack_max_bytes` (48 KiB).
+///
+/// The hard cap is where `truncate_to_byte_cap` starts deleting text; the soft
+/// budget is the size the pulse holds the file to, so that a cycle's additions
+/// land inside the ceiling rather than on top of it. Both appear in the
+/// utilisation report because they answer different questions: "am I about to
+/// lose content?" and "am I keeping the rule I was given?".
+const THOUGHT_STACK_SOFT_BUDGET_BYTES: usize = 45_000;
+
+/// How full a self-authored, capped document is against its limits.
+///
+/// `truncate_to_byte_cap` emits its marker only when it actually fires, so
+/// below the ceiling a document's size is never reported and the only way to
+/// learn it is to measure the file by hand. The report is taken on the read
+/// path every prompt assembly already walks, so the reading arrives whether or
+/// not anyone chose to take it. It is a report, not a gate: it never refuses,
+/// trims or warns.
+///
+/// The figures describe the file **as it is on disk**, before the line cap and
+/// the byte cap are applied. A post-trim count would understate the problem in
+/// exactly the case where the line cap has already dropped content silently.
+///
+/// It is logged, not rendered into the prompt. The chat prompt already runs
+/// over its token budget — every Low-tier block is dropped and THOUGHT_STACK.md
+/// is truncated to fit — so each token added to a High-tier block comes
+/// straight out of the thought stack's tail. The report must not cost the
+/// content it measures.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Utilisation {
+    label: &'static str,
+    bytes: usize,
+    byte_cap: usize,
+    soft_budget: Option<usize>,
+    lines: usize,
+    line_cap: usize,
+}
+
+impl Utilisation {
+    fn measure(label: &'static str, content: &str, byte_cap: usize, line_cap: usize) -> Self {
+        Self {
+            label,
+            bytes: content.len(),
+            byte_cap,
+            soft_budget: None,
+            lines: content.lines().count(),
+            line_cap,
+        }
+    }
+
+    #[must_use]
+    fn with_soft_budget(self, soft_budget: usize) -> Self {
+        Self {
+            soft_budget: Some(soft_budget),
+            ..self
+        }
+    }
+
+    fn log(&self) {
+        info!("[prompt-utilisation] {self}");
+    }
+}
+
+impl std::fmt::Display for Utilisation {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}: {} B", self.label, self.bytes)?;
+        if let Some(budget) = self.soft_budget {
+            write!(f, " / {budget} budget")?;
+        }
+        write!(
+            f,
+            " / {} cap, {} / {} lines",
+            self.byte_cap, self.lines, self.line_cap
+        )
+    }
+}
 
 /// Hard byte ceiling for the Essential tier as a whole.
 ///
@@ -272,6 +350,15 @@ pub fn build_system_prompt_budgeted(
     let memory_path = root_dir.join("memory/MEMORY.md");
     if memory_path.exists() {
         let content = std::fs::read_to_string(&memory_path)?;
+        // MEMORY.md is self-authored against a line cap its author cannot see,
+        // exactly like THOUGHT_STACK.md, so it gets the same read-side report.
+        Utilisation::measure(
+            "MEMORY.md",
+            &content,
+            budget_cfg.memory_max_bytes,
+            config.memory.memory_max_lines,
+        )
+        .log();
         let limited: String = content
             .lines()
             .take(config.memory.memory_max_lines)
@@ -1003,6 +1090,36 @@ pub fn build_task_system_prompt_budgeted(
     enforce_budget_and_assemble(components, budget_cfg, "task")
 }
 
+/// Refusals shown in the notice before the rest are summarised as a count.
+/// The notice sits inside the capped `<tension-context>` block, so a cycle
+/// that refused a dozen markers must not crowd out the threads themselves.
+const REFUSAL_NOTICE_SHOWN: usize = 3;
+
+/// `[TENSION REFUSED: …]` — the last cycle's refused markers, one clause each.
+fn render_refusal_notice(refusals: &[crate::tension::RefusalNotice]) -> String {
+    use std::fmt::Write as _;
+    let mut notice = String::from(
+        "[TENSION REFUSED last cycle — these markers discharged nothing; \
+         re-emit with a real artifact or drop the claim:",
+    );
+    for refusal in refusals.iter().take(REFUSAL_NOTICE_SHOWN) {
+        let _ = write!(
+            &mut notice,
+            " {} {}: {};",
+            refusal.marker, refusal.thread_id, refusal.reason
+        );
+    }
+    if refusals.len() > REFUSAL_NOTICE_SHOWN {
+        let _ = write!(
+            &mut notice,
+            " …and {} more;",
+            refusals.len() - REFUSAL_NOTICE_SHOWN
+        );
+    }
+    notice.push_str("]\n");
+    notice
+}
+
 /// Token cap for the `<tension-context>` block. Wide enough for
 /// `top_k_injected` threads with their self-contained content at the
 /// sanitizer's 800-char ceiling, which is what §8 Q4 costs.
@@ -1084,10 +1201,22 @@ fn build_tension_context(root_dir: &Path, config: &Config) -> Option<String> {
         block.push_str("]\n");
     }
 
-    block.push_str(
-        "Tension falls only for work with an artifact behind it — a file changed outside \
-         the journal, a prediction resolved, a tool that ran. Writing about a thread does \
-         not lower it.\n</tension-context>",
+    // Refused markers are told to the pulse that emitted them, not only to
+    // the owner's alert queue: the pulse is the only one who can re-emit.
+    if !store.last_refusals.is_empty() {
+        block.push_str(&render_refusal_notice(&store.last_refusals));
+    }
+
+    // Name only the rungs this runtime can verify.
+    let rungs = if provider_reports_tool_rounds(&config.llm.provider) {
+        "a file changed outside the journal, a prediction resolved, a tool that ran"
+    } else {
+        "a file changed outside the journal, or a prediction resolved"
+    };
+    let _ = write!(
+        &mut block,
+        "Tension falls only for work with an artifact behind it — {rungs}. Writing about a \
+         thread does not lower it.\n</tension-context>"
     );
     Some(block)
 }
@@ -1097,6 +1226,7 @@ fn build_tension_context(root_dir: &Path, config: &Config) -> Option<String> {
 ///
 /// The line cap is the pulse-facing rule (it is instructed to stay under 50);
 /// the byte ceiling is the safety net, because 60 lines say nothing about size.
+/// Every load logs a [`Utilisation`] report against both.
 fn load_thought_stack(
     root_dir: &Path,
     max_bytes: usize,
@@ -1109,6 +1239,14 @@ fn load_thought_stack(
     if content.trim().is_empty() {
         return Ok(None);
     }
+    Utilisation::measure(
+        "THOUGHT_STACK.md",
+        &content,
+        max_bytes,
+        THOUGHT_STACK_MAX_LINES,
+    )
+    .with_soft_budget(THOUGHT_STACK_SOFT_BUDGET_BYTES)
+    .log();
     let limited: String = content
         .lines()
         .take(THOUGHT_STACK_MAX_LINES)
@@ -1573,19 +1711,33 @@ pub fn build_autonomy_context(root_dir: &Path, config: &Config) -> String {
     // they mutate an accumulator, and two of the three are refused unless
     // they name something outside this text.
     if config.tension.enabled {
-        sections.push(
+        // The tool rung checks the executor's tool-round count, which is
+        // always 0 when the agent CLI runs its own tools. Advertising it there
+        // invites a marker that cannot pass — same discipline as the outreach
+        // block below: document only what the runtime can honour.
+        let (work_line, checked_against) = if provider_reports_tool_rounds(&config.llm.provider) {
+            (
+                "Instead of \"file\" you may name \"prediction\" (an id you resolved this cycle) or \"tool\" (a tool that ran this cycle).",
+                "the filesystem, the prediction store and the executor's tool count",
+            )
+        } else {
+            (
+                "Instead of \"file\" you may name \"prediction\" (an id you resolved this cycle). \"tool\" cannot be verified on this runtime — name the file the tool changed.",
+                "the filesystem and the prediction store",
+            )
+        };
+        sections.push(format!(
             "Tension threads accumulate pressure between cycles. Three markers act on them:\n\
-            - [THREAD: {\"label\": \"short name\", \"content\": \"self-contained statement of the open thing — it must still make sense after the journal folds\", \"origin\": \"open_question|callback|adverse|user_raised\", \"ref\": \"optional source\"}] — open a thread\n\
-            - [THREAD-WORK: {\"id\": \"t-abc12345\", \"file\": \"relative/path/you/changed\"}] — claim a discharge. Instead of \"file\" you may name \"prediction\" (an id you resolved this cycle) or \"tool\" (a tool that ran this cycle).\n\
-            - [THREAD-RESOLVE: {\"id\": \"t-abc12345\", \"resolution\": \"answered|dissolved|superseded|abandoned\", \"reason\": \"...\", \"by\": \"...\"}] — retire a thread\n\n\
+            - [THREAD: {{\"label\": \"short name\", \"content\": \"self-contained statement of the open thing — it must still make sense after the journal folds\", \"origin\": \"open_question|callback|adverse|user_raised\", \"ref\": \"optional source\"}}] — open a thread\n\
+            - [THREAD-WORK: {{\"id\": \"t-abc12345\", \"file\": \"relative/path/you/changed\"}}] — claim a discharge. {work_line}\n\
+            - [THREAD-RESOLVE: {{\"id\": \"t-abc12345\", \"resolution\": \"answered|dissolved|superseded|abandoned\", \"reason\": \"...\", \"by\": \"...\"}}] — retire a thread\n\n\
             Discharge requires an artifact, not a description. A [THREAD-WORK:] or \"answered\" \
-            claim is checked against the filesystem, the prediction store and the executor's \
-            tool count, and is refused if it does not check out — writing about a thread does \
-            not lower its tension, and a thread mentioned but never worked is recorded as \
-            exactly that. \"abandoned\" and \"dissolved\" need a reason instead of an artifact; \
-            they are honest give-ups, they are kept as tombstones, and D sees them."
-                .to_string(),
-        );
+            claim is checked against {checked_against}, and is refused if it does not check out \
+            — writing about a thread does not lower its tension, and a thread mentioned but \
+            never worked is recorded as exactly that. \"abandoned\" and \"dissolved\" need a \
+            reason instead of an artifact; they are honest give-ups, they are kept as \
+            tombstones, and D sees them."
+        ));
     }
 
     // Outreach marker (PN-94). Documented only when the channel is on, so the
@@ -2148,6 +2300,55 @@ mod tests {
     }
 
     #[test]
+    fn utilisation_measures_the_file_on_disk_before_any_cap() {
+        let content = "alpha\nbeta\ngamma\n";
+        let report = Utilisation::measure("THOUGHT_STACK.md", content, 10, 2);
+
+        assert_eq!(report.bytes, content.len());
+        assert_eq!(report.lines, 3, "lines past the cap still count");
+        assert_eq!(report.soft_budget, None);
+    }
+
+    #[test]
+    fn utilisation_renders_soft_budget_between_size_and_cap() {
+        let report = Utilisation::measure("THOUGHT_STACK.md", "a\nb\n", 49_152, 60)
+            .with_soft_budget(THOUGHT_STACK_SOFT_BUDGET_BYTES);
+        assert_eq!(
+            report.to_string(),
+            "THOUGHT_STACK.md: 4 B / 45000 budget / 49152 cap, 2 / 60 lines"
+        );
+    }
+
+    #[test]
+    fn utilisation_without_soft_budget_shows_only_the_cap() {
+        let report = Utilisation::measure("MEMORY.md", "one\ntwo\n", 32_768, 200);
+        assert_eq!(
+            report.to_string(),
+            "MEMORY.md: 8 B / 32768 cap, 2 / 200 lines"
+        );
+    }
+
+    #[test]
+    fn utilisation_report_costs_no_prompt_tokens() {
+        // The chat prompt is already over budget; a report rendered into a
+        // High-tier block would evict thought-stack content to make room.
+        let dir = tempfile::tempdir().unwrap();
+        let config = minimal_config();
+        std::fs::create_dir_all(dir.path().join("memory")).unwrap();
+        std::fs::write(dir.path().join("CLAUDE.md"), "# Pulse").unwrap();
+        std::fs::write(dir.path().join("THOUGHT_STACK.md"), "alpha\nbeta\n").unwrap();
+        std::fs::write(dir.path().join("memory/MEMORY.md"), "one\ntwo\n").unwrap();
+
+        let result = build_system_prompt_budgeted(dir.path(), &config, None, None).unwrap();
+
+        assert!(result
+            .prompt
+            .contains("<thought-stack>\nalpha\nbeta\n</thought-stack>"));
+        assert!(result.prompt.contains("<memory>\none\ntwo\n</memory>"));
+        assert!(!result.prompt.contains(" cap, "));
+    }
+
+    #[test]
     fn memory_enforces_byte_ceiling() {
         let dir = tempfile::tempdir().unwrap();
         let mut config = minimal_config();
@@ -2420,6 +2621,76 @@ mod tests {
         assert!(block.contains("Writing about a thread does not lower it"));
     }
 
+    /// The refusal has to reach the pulse, not only the owner's alert queue:
+    /// the owner cannot re-emit a marker on the pulse's behalf.
+    #[test]
+    fn tension_context_surfaces_last_cycles_refusals_to_the_pulse() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = minimal_config();
+
+        seed_tension(dir.path(), &config, |store| {
+            store.open(
+                ThreadDraft {
+                    label: "a thread".to_string(),
+                    content: "content".to_string(),
+                    origin: ThreadOrigin::UserRaised("a thread".to_string()),
+                },
+                chrono::Utc::now(),
+            );
+            store.last_refusals = vec![crate::tension::RefusalNotice {
+                marker: "THREAD-WORK".to_string(),
+                thread_id: "t-deadbeef".to_string(),
+                reason: "no artifact named".to_string(),
+            }];
+        });
+
+        let block = build_tension_context(dir.path(), &config).expect("threads exist");
+        assert!(block.contains("[TENSION REFUSED"), "{block}");
+        assert!(block.contains("THREAD-WORK"), "{block}");
+        assert!(block.contains("t-deadbeef"), "{block}");
+        assert!(block.contains("no artifact named"), "{block}");
+    }
+
+    /// A cycle that refused nothing must say nothing — the notice reflects
+    /// the last cycle only, never a latch.
+    #[test]
+    fn tension_context_omits_the_refusal_notice_when_there_were_none() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = minimal_config();
+
+        seed_tension(dir.path(), &config, |store| {
+            store.open(
+                ThreadDraft {
+                    label: "a thread".to_string(),
+                    content: "content".to_string(),
+                    origin: ThreadOrigin::UserRaised("a thread".to_string()),
+                },
+                chrono::Utc::now(),
+            );
+        });
+
+        let block = build_tension_context(dir.path(), &config).expect("threads exist");
+        assert!(!block.contains("[TENSION REFUSED"), "{block}");
+    }
+
+    /// The notice lives inside a capped block; a cycle that refused many
+    /// markers shows a few and counts the rest.
+    #[test]
+    fn refusal_notice_is_bounded() {
+        let refusals: Vec<_> = (0..REFUSAL_NOTICE_SHOWN + 2)
+            .map(|i| crate::tension::RefusalNotice {
+                marker: "THREAD-WORK".to_string(),
+                thread_id: format!("t-{i:08}"),
+                reason: "claim: no artifact named".to_string(),
+            })
+            .collect();
+
+        let notice = render_refusal_notice(&refusals);
+        assert_eq!(notice.matches("THREAD-WORK").count(), REFUSAL_NOTICE_SHOWN);
+        assert!(notice.contains("…and 2 more;"), "{notice}");
+        assert!(notice.ends_with("]\n"), "{notice}");
+    }
+
     #[test]
     fn tension_context_surfaces_an_outstanding_triage_demand() {
         let dir = tempfile::tempdir().unwrap();
@@ -2482,5 +2753,77 @@ mod tests {
         let mut off = minimal_config();
         off.tension.enabled = false;
         assert!(!build_autonomy_context(dir.path(), &off).contains("[THREAD:"));
+    }
+
+    /// Providers whose tool rounds are observable, and ones whose are not:
+    /// every `cli` adapter runs its own tools, and so does the pre-PN-106
+    /// alias for one of them.
+    const SIGHTED: [&str; 2] = ["anthropic", "ollama"];
+    const BLIND: [&str; 2] = ["cli", "claude-code"];
+
+    /// The tool rung checks a count that is always 0 under a provider that
+    /// runs its own tools. The vocabulary must follow the runtime, both ways.
+    #[test]
+    fn the_tool_rung_is_documented_only_where_it_can_verify() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = minimal_config();
+
+        for provider in SIGHTED {
+            config.llm.provider = provider.into();
+            let context = build_autonomy_context(dir.path(), &config);
+            assert!(context.contains("a tool that ran this cycle"), "{provider}");
+            assert!(context.contains("the executor's tool count"), "{provider}");
+        }
+
+        for provider in BLIND {
+            config.llm.provider = provider.into();
+            let context = build_autonomy_context(dir.path(), &config);
+            assert!(
+                !context.contains("a tool that ran this cycle"),
+                "{provider}"
+            );
+            assert!(!context.contains("the executor's tool count"), "{provider}");
+            assert!(
+                context.contains("cannot be verified on this runtime"),
+                "{provider}"
+            );
+            // The other rungs survive, and the marker itself is still offered.
+            assert!(context.contains("[THREAD-WORK:"), "{provider}");
+            assert!(
+                context.contains("an id you resolved this cycle"),
+                "{provider}"
+            );
+        }
+    }
+
+    /// The same rule applies to the tension block injected into task prompts,
+    /// which states the artifact rule a second time in its own words.
+    #[test]
+    fn the_tension_context_footer_follows_the_runtime_too() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = minimal_config();
+        seed_tension(dir.path(), &config, |store| {
+            store.open(
+                ThreadDraft {
+                    label: "a thread".to_string(),
+                    content: "something open enough to be injected".to_string(),
+                    origin: ThreadOrigin::UserRaised("d".to_string()),
+                },
+                chrono::Utc::now(),
+            );
+        });
+
+        for provider in SIGHTED {
+            config.llm.provider = provider.into();
+            let block = build_tension_context(dir.path(), &config).expect("threads exist");
+            assert!(block.contains("a tool that ran"), "{provider}");
+        }
+        for provider in BLIND {
+            config.llm.provider = provider.into();
+            let block = build_tension_context(dir.path(), &config).expect("threads exist");
+            assert!(!block.contains("a tool that ran"), "{provider}");
+            assert!(block.contains("or a prediction resolved"), "{provider}");
+            assert!(block.ends_with("</tension-context>"), "{provider}");
+        }
     }
 }
