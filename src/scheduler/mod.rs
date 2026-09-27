@@ -32,13 +32,14 @@ pub use pulse_system_types::{OutputRouting, ScheduledTask, TaskCreator};
 /// which is the common case and keeps the file scan off the hot path.
 ///
 /// Deliberately *not* implemented as "suppress every document named in
-/// `archived`". `archive_document` halves the section count and reports
-/// success; it does not promise to bring a document back under its hard limit,
-/// and it returns `Ok(())` without writing anything when the document has no
-/// splittable sections. Filtering on the name would therefore silence exactly
-/// the document that is furthest over the limit — turning a false-positive
-/// defect into a false-negative one. Only a fresh measurement distinguishes
-/// "cured" from "attempted".
+/// `archived`". `archive_document` halves the section count; it does not
+/// promise to bring a document back under its hard limit, so a document at
+/// more than twice its limit is named in `archived` and still Red. Filtering
+/// on the name would therefore silence exactly the document that is furthest
+/// over the limit — turning a false-positive defect into a false-negative one.
+/// Only a fresh measurement distinguishes "cured" from "attempted". (A no-op
+/// archive is never named in `archived`, so it keeps the pre-archive health
+/// and still alerts.)
 pub fn post_archive_health(
     pre: pulse_system_types::monitoring::PipelineHealth,
     archived: &[String],
@@ -580,10 +581,9 @@ mod tests {
     }
 
     /// The reason this re-measures instead of filtering on the names in
-    /// `archived`: `archive_document` halves the section count and reports
-    /// success, and returns `Ok(())` having written nothing when the document
-    /// has no splittable sections. A document can therefore appear in
-    /// `archived` and still be over its hard limit. Suppressing on the name
+    /// `archived`: `archive_document` halves the section count, which leaves a
+    /// document that was more than twice its limit still over it. A document
+    /// can therefore appear in `archived` and still be Red. Suppressing on the name
     /// would silence precisely the worst-off document -- swapping a
     /// false-positive defect for a false-negative one.
     #[test]

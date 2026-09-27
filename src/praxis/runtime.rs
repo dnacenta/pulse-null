@@ -339,27 +339,28 @@ pub fn check_and_archive(
     let mut archived = Vec::new();
 
     if health.learning.count >= thresholds.learning_hard
-        && archive_document(root_dir, "journal/LEARNING.md", "archives/learning").is_ok()
+        && archive_document(root_dir, "journal/LEARNING.md", "archives/learning").unwrap_or(false)
     {
         archived.push("LEARNING.md".to_string());
     }
     if health.thoughts.count >= thresholds.thoughts_hard
-        && archive_document(root_dir, "journal/THOUGHTS.md", "archives/thoughts").is_ok()
+        && archive_document(root_dir, "journal/THOUGHTS.md", "archives/thoughts").unwrap_or(false)
     {
         archived.push("THOUGHTS.md".to_string());
     }
     if health.curiosity.count >= thresholds.curiosity_hard
-        && archive_document(root_dir, "journal/CURIOSITY.md", "archives/curiosity").is_ok()
+        && archive_document(root_dir, "journal/CURIOSITY.md", "archives/curiosity").unwrap_or(false)
     {
         archived.push("CURIOSITY.md".to_string());
     }
     if health.reflections.count >= thresholds.reflections_hard
-        && archive_document(root_dir, "journal/REFLECTIONS.md", "archives/reflections").is_ok()
+        && archive_document(root_dir, "journal/REFLECTIONS.md", "archives/reflections")
+            .unwrap_or(false)
     {
         archived.push("REFLECTIONS.md".to_string());
     }
     if health.praxis.count >= thresholds.praxis_hard
-        && archive_document(root_dir, "journal/PRAXIS.md", "archives/praxis").is_ok()
+        && archive_document(root_dir, "journal/PRAXIS.md", "archives/praxis").unwrap_or(false)
     {
         archived.push("PRAXIS.md".to_string());
     }
@@ -368,11 +369,15 @@ pub fn check_and_archive(
 }
 
 /// Archive a single document: move oldest entries to archive file, keep recent ones.
+///
+/// Returns `Ok(true)` only if entries were actually moved out of the source
+/// document. `Ok(false)` means the call was a no-op (nothing to split), which
+/// callers must not report as remediation.
 fn archive_document(
     root_dir: &Path,
     source_rel: &str,
     archive_dir_rel: &str,
-) -> Result<(), Box<dyn std::error::Error>> {
+) -> Result<bool, Box<dyn std::error::Error>> {
     let source_path = root_dir.join(source_rel);
     let archive_dir = root_dir.join(archive_dir_rel);
     std::fs::create_dir_all(&archive_dir)?;
@@ -381,14 +386,14 @@ fn archive_document(
     let (header, sections) = split_by_headers(&content);
 
     if sections.is_empty() {
-        return Ok(());
+        return Ok(false);
     }
 
     let split_point = sections.len() / 2;
     let (to_archive, to_keep) = sections.split_at(split_point);
 
     if to_archive.is_empty() {
-        return Ok(());
+        return Ok(false);
     }
 
     let date = super::state::today_iso();
@@ -411,7 +416,7 @@ fn archive_document(
     let new_content = format!("{}\n{}", header, to_keep.join("\n"));
     std::fs::write(&source_path, new_content)?;
 
-    Ok(())
+    Ok(true)
 }
 
 /// Manually archive a specific document (for CLI use).
@@ -434,8 +439,14 @@ pub fn archive_document_by_name(
         }
     };
 
-    archive_document(root_dir, source, archive_dir)?;
-    Ok(format!("Archived entries from {}", source))
+    if archive_document(root_dir, source, archive_dir)? {
+        Ok(format!("Archived entries from {}", source))
+    } else {
+        Ok(format!(
+            "Nothing to archive in {} — too few entries",
+            source
+        ))
+    }
 }
 
 /// Split markdown content into a header (everything before first ##) and sections.
@@ -864,7 +875,9 @@ mod tests {
             "# Learning\n\nPreamble.\n\n## Topic 1\n\nOld content.\n\n## Topic 2\n\nOlder content.\n\n## Topic 3\n\nNew content.\n\n## Topic 4\n\nNewest content.\n",
         ).unwrap();
 
-        archive_document(dir.path(), "journal/LEARNING.md", "archives/learning").unwrap();
+        let moved =
+            archive_document(dir.path(), "journal/LEARNING.md", "archives/learning").unwrap();
+        assert!(moved, "entries were moved, so it must report true");
 
         let remaining = fs::read_to_string(journal.join("LEARNING.md")).unwrap();
         let (_, sections) = split_by_headers(&remaining);
@@ -872,6 +885,88 @@ mod tests {
 
         let archive_files: Vec<_> = fs::read_dir(&archives).unwrap().flatten().collect();
         assert_eq!(archive_files.len(), 1);
+    }
+
+    /// A no-op archive must not report itself as remediation: `check_and_archive`
+    /// would otherwise log "auto-archived overflow" and the CLI would claim it
+    /// archived entries for a document it never wrote.
+    #[test]
+    fn test_archive_document_reports_false_when_nothing_moves() {
+        let dir = TempDir::new().unwrap();
+        let journal = dir.path().join("journal");
+        fs::create_dir_all(&journal).unwrap();
+
+        // Single section: split_point == 0, so nothing can be archived.
+        let single = "# Learning\n\nPreamble.\n\n## Only topic\n\nContent.\n";
+        fs::write(journal.join("LEARNING.md"), single).unwrap();
+        let moved =
+            archive_document(dir.path(), "journal/LEARNING.md", "archives/learning").unwrap();
+        assert!(!moved, "nothing moved, so it must not report remediation");
+        assert_eq!(
+            fs::read_to_string(journal.join("LEARNING.md")).unwrap(),
+            single,
+            "a no-op must leave the source untouched"
+        );
+
+        // Empty document: no sections at all.
+        fs::write(journal.join("THOUGHTS.md"), "# Thoughts\n\nNothing yet.\n").unwrap();
+        let moved =
+            archive_document(dir.path(), "journal/THOUGHTS.md", "archives/thoughts").unwrap();
+        assert!(!moved, "no sections, so it must not report remediation");
+    }
+
+    #[test]
+    fn test_archive_document_by_name_reports_a_no_op() {
+        let dir = TempDir::new().unwrap();
+        let journal = dir.path().join("journal");
+        fs::create_dir_all(&journal).unwrap();
+        fs::write(
+            journal.join("PRAXIS.md"),
+            "# Praxis\n\n## Only entry\n\nContent.\n",
+        )
+        .unwrap();
+
+        let message = archive_document_by_name(dir.path(), "praxis").unwrap();
+        assert!(
+            message.starts_with("Nothing to archive"),
+            "CLI claimed an archive that did not happen: {message}"
+        );
+    }
+
+    /// `check_and_archive` lists only documents it actually changed. With a
+    /// hard limit of 1 a single-entry document is Red yet cannot be split, so
+    /// the archiver's attempt is a no-op and must not be reported.
+    #[test]
+    fn test_check_and_archive_omits_no_op_documents() {
+        let dir = TempDir::new().unwrap();
+        let journal = dir.path().join("journal");
+        fs::create_dir_all(&journal).unwrap();
+
+        let ten_entries = (1..=10)
+            .map(|i| format!("## Entry {i}\n\nContent {i}.\n"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        fs::write(
+            journal.join("PRAXIS.md"),
+            format!("# Praxis\n\nPreamble.\n\n{ten_entries}"),
+        )
+        .unwrap();
+        fs::write(
+            journal.join("LEARNING.md"),
+            "# Learning\n\n## Only topic\n\nContent.\n",
+        )
+        .unwrap();
+
+        let thresholds = Thresholds {
+            learning_hard: 1,
+            ..Thresholds::default()
+        };
+        let health = calculate(dir.path(), &thresholds);
+        assert_eq!(health.learning.status, ThresholdStatus::Red);
+        assert_eq!(health.praxis.status, ThresholdStatus::Red);
+
+        let archived = check_and_archive(dir.path(), &thresholds, &health);
+        assert_eq!(archived, vec!["PRAXIS.md".to_string()]);
     }
 
     #[test]
