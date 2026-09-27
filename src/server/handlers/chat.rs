@@ -1361,6 +1361,10 @@ fn conversation_trust_from_identity(resolved_key: &str) -> crate::events::Conver
 /// of speech per turn — several paragraphs the caller had to sit through
 /// before they could say anything.
 ///
+/// Every voice client posts `channel: "voice"` — the pulse-null-voice brain
+/// in pulse mode and the in-process voice-echo plugin (Twilio and the Discord
+/// voice sidecar alike) — so this one match covers phone and Discord calls.
+///
 /// The identity prompt is left untouched; this only says how to speak, never
 /// who to be.
 fn apply_channel_style(prompt: String, channel: &str) -> String {
@@ -1369,7 +1373,7 @@ fn apply_channel_style(prompt: String, channel: &str) -> String {
     }
     format!(
         "{prompt}\n\n<voice-call>\n\
-         This reply will be spoken aloud on a phone call, not read.\n\n\
+         This reply will be spoken aloud on a call, not read.\n\n\
          - Two sentences at most, and aim under thirty words. Three long \
          sentences are as bad as five short ones — what matters is how long \
          the caller sits in silence, unable to skim or interrupt politely.\n\
