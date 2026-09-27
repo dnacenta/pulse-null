@@ -1003,6 +1003,36 @@ pub fn build_task_system_prompt_budgeted(
     enforce_budget_and_assemble(components, budget_cfg, "task")
 }
 
+/// Refusals shown in the notice before the rest are summarised as a count.
+/// The notice sits inside the capped `<tension-context>` block, so a cycle
+/// that refused a dozen markers must not crowd out the threads themselves.
+const REFUSAL_NOTICE_SHOWN: usize = 3;
+
+/// `[TENSION REFUSED: …]` — the last cycle's refused markers, one clause each.
+fn render_refusal_notice(refusals: &[crate::tension::RefusalNotice]) -> String {
+    use std::fmt::Write as _;
+    let mut notice = String::from(
+        "[TENSION REFUSED last cycle — these markers discharged nothing; \
+         re-emit with a real artifact or drop the claim:",
+    );
+    for refusal in refusals.iter().take(REFUSAL_NOTICE_SHOWN) {
+        let _ = write!(
+            &mut notice,
+            " {} {}: {};",
+            refusal.marker, refusal.thread_id, refusal.reason
+        );
+    }
+    if refusals.len() > REFUSAL_NOTICE_SHOWN {
+        let _ = write!(
+            &mut notice,
+            " …and {} more;",
+            refusals.len() - REFUSAL_NOTICE_SHOWN
+        );
+    }
+    notice.push_str("]\n");
+    notice
+}
+
 /// Token cap for the `<tension-context>` block. Wide enough for
 /// `top_k_injected` threads with their self-contained content at the
 /// sanitizer's 800-char ceiling, which is what §8 Q4 costs.
@@ -1082,6 +1112,12 @@ fn build_tension_context(root_dir: &Path, config: &Config) -> Option<String> {
             );
         }
         block.push_str("]\n");
+    }
+
+    // Refused markers are told to the pulse that emitted them, not only to
+    // the owner's alert queue: the pulse is the only one who can re-emit.
+    if !store.last_refusals.is_empty() {
+        block.push_str(&render_refusal_notice(&store.last_refusals));
     }
 
     block.push_str(
@@ -2418,6 +2454,76 @@ mod tests {
         assert!(block.contains("reach="));
         // And the discharge contract is restated where the pulse will read it.
         assert!(block.contains("Writing about a thread does not lower it"));
+    }
+
+    /// The refusal has to reach the pulse, not only the owner's alert queue:
+    /// the owner cannot re-emit a marker on the pulse's behalf.
+    #[test]
+    fn tension_context_surfaces_last_cycles_refusals_to_the_pulse() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = minimal_config();
+
+        seed_tension(dir.path(), &config, |store| {
+            store.open(
+                ThreadDraft {
+                    label: "a thread".to_string(),
+                    content: "content".to_string(),
+                    origin: ThreadOrigin::UserRaised("a thread".to_string()),
+                },
+                chrono::Utc::now(),
+            );
+            store.last_refusals = vec![crate::tension::RefusalNotice {
+                marker: "THREAD-WORK".to_string(),
+                thread_id: "t-deadbeef".to_string(),
+                reason: "no artifact named".to_string(),
+            }];
+        });
+
+        let block = build_tension_context(dir.path(), &config).expect("threads exist");
+        assert!(block.contains("[TENSION REFUSED"), "{block}");
+        assert!(block.contains("THREAD-WORK"), "{block}");
+        assert!(block.contains("t-deadbeef"), "{block}");
+        assert!(block.contains("no artifact named"), "{block}");
+    }
+
+    /// A cycle that refused nothing must say nothing — the notice reflects
+    /// the last cycle only, never a latch.
+    #[test]
+    fn tension_context_omits_the_refusal_notice_when_there_were_none() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = minimal_config();
+
+        seed_tension(dir.path(), &config, |store| {
+            store.open(
+                ThreadDraft {
+                    label: "a thread".to_string(),
+                    content: "content".to_string(),
+                    origin: ThreadOrigin::UserRaised("a thread".to_string()),
+                },
+                chrono::Utc::now(),
+            );
+        });
+
+        let block = build_tension_context(dir.path(), &config).expect("threads exist");
+        assert!(!block.contains("[TENSION REFUSED"), "{block}");
+    }
+
+    /// The notice lives inside a capped block; a cycle that refused many
+    /// markers shows a few and counts the rest.
+    #[test]
+    fn refusal_notice_is_bounded() {
+        let refusals: Vec<_> = (0..REFUSAL_NOTICE_SHOWN + 2)
+            .map(|i| crate::tension::RefusalNotice {
+                marker: "THREAD-WORK".to_string(),
+                thread_id: format!("t-{i:08}"),
+                reason: "claim: no artifact named".to_string(),
+            })
+            .collect();
+
+        let notice = render_refusal_notice(&refusals);
+        assert_eq!(notice.matches("THREAD-WORK").count(), REFUSAL_NOTICE_SHOWN);
+        assert!(notice.contains("…and 2 more;"), "{notice}");
+        assert!(notice.ends_with("]\n"), "{notice}");
     }
 
     #[test]

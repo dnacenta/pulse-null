@@ -480,6 +480,25 @@ impl DiscriminatorMetrics {
     }
 }
 
+/// One refused marker, kept so the pulse that emitted it is told.
+///
+/// Before this the refusal reached only a log line and the owner's alert
+/// queue (`scheduler::tension_cycle::surface`) — neither of which is read by
+/// the one party that can fix it by re-emitting a well-formed marker.
+///
+/// Overwritten every cycle, never accumulated: the notice is actionable only
+/// in the cycle right after the one that earned it, and a latched notice
+/// would turn into a stale alarm.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RefusalNotice {
+    /// Marker name, e.g. `THREAD-WORK`.
+    pub marker: String,
+    /// Sanitized thread id, or `?` when none could be extracted.
+    pub thread_id: String,
+    /// Why it was refused — the same text the owner's alert carries.
+    pub reason: String,
+}
+
 /// On-disk format. `config` lives in `pulse-null.toml`, never in the
 /// per-pulse snapshot, so a deserializer cannot silently default it and
 /// drift away from `Config::tension`.
@@ -493,6 +512,9 @@ pub struct TensionSnapshot {
     pub last_tick_at: Option<DateTime<Utc>>,
     #[serde(default)]
     pub triage: Option<TriageDemand>,
+    /// Markers refused by the cycle that just ended, owed to the actor.
+    #[serde(default)]
+    pub last_refusals: Vec<RefusalNotice>,
 }
 
 impl TensionSnapshot {
@@ -504,6 +526,7 @@ impl TensionSnapshot {
             cycles: store.cycles.clone(),
             last_tick_at: store.last_tick_at,
             triage: store.triage.clone(),
+            last_refusals: store.last_refusals.clone(),
         }
     }
 
@@ -515,6 +538,7 @@ impl TensionSnapshot {
             cycles: self.cycles,
             last_tick_at: self.last_tick_at,
             triage: self.triage,
+            last_refusals: self.last_refusals,
             config,
         }
     }
@@ -530,6 +554,9 @@ pub struct TensionStore {
     pub last_tick_at: Option<DateTime<Utc>>,
     /// Outstanding cap obligation, if any.
     pub triage: Option<TriageDemand>,
+    /// Markers the last finished cycle refused. Owed to the actor, surfaced
+    /// in the next cycle's `<tension-context>` block. See [`RefusalNotice`].
+    pub last_refusals: Vec<RefusalNotice>,
     /// Calibration knobs — loaded from `Config::tension`, never from disk.
     pub config: TensionConfig,
 }
@@ -543,6 +570,7 @@ impl TensionStore {
             cycles: CycleLedger::default(),
             last_tick_at: None,
             triage: None,
+            last_refusals: Vec::new(),
             config,
         }
     }
@@ -1779,6 +1807,15 @@ mod tests {
         assert_eq!(restored.threads[0].work_log.len(), 1);
         assert_eq!(restored.cycles.cycles_run, 1);
         assert!((restored.config.base_rate - 9.9).abs() < f64::EPSILON);
+    }
+
+    /// A `tension.json` written before refusals were kept still loads, with
+    /// no notice pending.
+    #[test]
+    fn a_snapshot_without_refusals_loads_with_none_pending() {
+        let json = r#"{"threads": []}"#;
+        let snapshot: TensionSnapshot = serde_json::from_str(json).unwrap();
+        assert!(snapshot.into_store(config()).last_refusals.is_empty());
     }
 
     /// Every origin and resolution shape survives the disk round trip

@@ -367,6 +367,20 @@ pub fn apply_cycle(
         .chain(report.resolved.iter().map(String::as_str))
         .collect();
     report.mentions = note_mentions(store, raw_output, &acted_on);
+
+    // Keep this cycle's refusals for the next prompt, so the pulse that
+    // emitted them is told. Overwrite, never append: a clean cycle clears
+    // the notice, so it can never latch into a stale alarm.
+    store.last_refusals = report
+        .rejections
+        .iter()
+        .map(|r| crate::tension::RefusalNotice {
+            marker: r.marker.to_string(),
+            thread_id: r.thread_id.clone(),
+            reason: truncate_chars(&r.reason, MAX_REASON_LEN),
+        })
+        .collect();
+
     report
 }
 
@@ -1148,6 +1162,45 @@ mod tests {
         assert_eq!(report.rejections[0].marker, "THREAD-WORK");
         assert!(report.rejections[0].reason.contains("no artifact named"));
         assert_eq!(report.mentions, 1, "a refused claim is still just talk");
+    }
+
+    /// The refusal is owed to the actor, so `apply_cycle` must leave it on
+    /// the store for the next prompt to carry — and a clean cycle must clear
+    /// it, so the notice can never latch into a stale alarm.
+    #[test]
+    fn refusals_are_persisted_for_the_pulse_and_cleared_by_a_clean_cycle() {
+        let mut s = store();
+        let tmp = TempDir::new().unwrap();
+        let t0 = Utc::now();
+        s.open(
+            ThreadDraft {
+                label: "l".to_string(),
+                content: "c".to_string(),
+                origin: ThreadOrigin::UserRaised("d".to_string()),
+            },
+            t0,
+        );
+        let id = s.live().next().unwrap().id.clone();
+
+        let text = format!(r#"[THREAD-WORK:{{"id":"{id}"}}]"#);
+        apply_cycle_t(&mut s, &text, &evidence(tmp.path(), &[], 0, t0), t0);
+
+        assert_eq!(s.last_refusals.len(), 1, "the pulse is owed the notice");
+        assert_eq!(s.last_refusals[0].marker, "THREAD-WORK");
+        assert_eq!(s.last_refusals[0].thread_id, id);
+        assert!(s.last_refusals[0].reason.contains("no artifact named"));
+
+        // A cycle with nothing refused clears it: overwrite, never append.
+        apply_cycle_t(
+            &mut s,
+            "no markers here",
+            &evidence(tmp.path(), &[], 0, t0),
+            t0,
+        );
+        assert!(
+            s.last_refusals.is_empty(),
+            "a clean cycle must clear the notice, or it latches"
+        );
     }
 
     #[test]
