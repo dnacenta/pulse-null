@@ -66,6 +66,8 @@ pub struct AppState {
     /// Cap on in-flight `/api/chat/stream` turns. Separate from the event
     /// pool so idle watchers can never refuse a message.
     pub chat_permits: Arc<tokio::sync::Semaphore>,
+    /// The one peer-to-peer dialogue this daemon runs at a time (PN-123).
+    pub comms: crate::comms::Slot,
     /// Background entity extraction for freshly ingested archives; `None`
     /// when `[graph]` turns it off.
     pub graph_extractor: Option<crate::graph_extract::GraphExtractor>,
@@ -340,6 +342,7 @@ pub async fn start_in(
         leadership: std::sync::atomic::AtomicBool::new(false),
         event_permits: crate::server::stream_pools().0,
         chat_permits: crate::server::stream_pools().1,
+        comms: crate::comms::Slot::new(),
         ledger,
         graph_extractor: crate::graph_extract::GraphExtractor::for_pulse(&config, &root_dir),
     });
@@ -581,6 +584,17 @@ pub fn build_router(state: Arc<AppState>, plugin_routes: Router<()>) -> Router {
         )
         .route("/api/schedule/{id}/last", get(handlers::schedule::last))
         .route("/api/session/{channel}", get(handlers::sessions::history))
+        .route(
+            "/api/comms",
+            post(handlers::comms::start).get(handlers::comms::current),
+        )
+        .route("/api/comms/{id}/stream", get(handlers::comms::stream))
+        .route("/api/comms/{id}/pause", post(handlers::comms::pause))
+        .route("/api/comms/{id}/resume", post(handlers::comms::resume))
+        .route(
+            "/api/comms/{id}",
+            axum::routing::delete(handlers::comms::stop),
+        )
         .route(
             "/api/sessions/reset",
             post(handlers::sessions::reset_session),

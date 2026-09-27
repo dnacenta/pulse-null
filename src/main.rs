@@ -4,6 +4,7 @@ mod anthropic_provider;
 mod caliber;
 mod cli;
 mod cli_provider;
+mod comms;
 mod config;
 mod context;
 mod context_buffer;

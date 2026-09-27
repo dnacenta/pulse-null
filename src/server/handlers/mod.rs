@@ -1,5 +1,6 @@
 pub mod alerts;
 pub mod chat;
+pub mod comms;
 pub mod dashboard;
 pub mod events;
 pub mod health;

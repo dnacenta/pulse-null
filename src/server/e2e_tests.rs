@@ -228,6 +228,17 @@ fn build_app(state: Arc<AppState>) -> Router {
             post(handlers::sessions::reset_session),
         )
         .route("/api/alerts/drain", post(handlers::alerts::drain_alerts))
+        .route(
+            "/api/comms",
+            post(handlers::comms::start).get(handlers::comms::current),
+        )
+        .route("/api/comms/{id}/stream", get(handlers::comms::stream))
+        .route("/api/comms/{id}/pause", post(handlers::comms::pause))
+        .route("/api/comms/{id}/resume", post(handlers::comms::resume))
+        .route(
+            "/api/comms/{id}",
+            axum::routing::delete(handlers::comms::stop),
+        )
         .route_layer(middleware::from_fn_with_state(
             Arc::clone(&state),
             crate::server::auth::require_auth,
@@ -282,6 +293,7 @@ async fn build_state_boxed_with_config(
         leadership: std::sync::atomic::AtomicBool::new(false),
         event_permits: crate::server::stream_pools().0,
         chat_permits: crate::server::stream_pools().1,
+        comms: crate::comms::Slot::new(),
         graph_extractor: None,
         ledger: Arc::new(crate::ledger::LedgerRing::new(64)),
     })
@@ -1553,4 +1565,354 @@ async fn e2e_peer_credential_is_refused_on_owner_only_endpoints() {
         .await
         .unwrap();
     assert_eq!(r.status(), StatusCode::OK);
+}
+
+// ---------------------------------------------------------------------------
+// PN-123: peer-to-peer dialogue run by the daemon
+// ---------------------------------------------------------------------------
+
+mod comms_e2e {
+    use super::*;
+
+    /// A peer on a random port whose `/chat` answers with a numbered reply
+    /// (or a 500 when `fail` is set). Returns the port and the call count.
+    async fn fake_peer(fail: bool, delay_ms: u64) -> (u16, Arc<AtomicUsize>) {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let c = Arc::clone(&calls);
+        let app = Router::new().route(
+            "/chat",
+            post(move |axum::Json(body): axum::Json<serde_json::Value>| {
+                let c = Arc::clone(&c);
+                async move {
+                    let n = c.fetch_add(1, Ordering::SeqCst) + 1;
+                    tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+                    if fail {
+                        return (
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            axum::Json(serde_json::json!({"error": "boom"})),
+                        );
+                    }
+                    let heard = body["message"].as_str().unwrap_or("").len();
+                    let sender = body["sender"].as_str().unwrap_or("").to_string();
+                    (
+                        StatusCode::OK,
+                        axum::Json(serde_json::json!({
+                            "response": format!("peer reply {n} to {sender} ({heard} chars)"),
+                            "model": "fake-peer"
+                        })),
+                    )
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        (port, calls)
+    }
+
+    async fn state_in(dir: &std::path::Path) -> Arc<AppState> {
+        build_state_boxed_with_config(
+            dir.to_path_buf(),
+            Box::new(MockProvider::new(vec![])),
+            ToolRegistry::new(),
+            test_config(),
+        )
+        .await
+    }
+
+    fn start_body(port: u16, max_turns: u32) -> String {
+        serde_json::json!({
+            "peer": { "name": "peerbot", "host": "127.0.0.1", "port": port },
+            "topic": "ports",
+            "max_turns": max_turns
+        })
+        .to_string()
+    }
+
+    async fn post_json(app: &Router, uri: &str, body: String) -> (StatusCode, serde_json::Value) {
+        let r = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(uri)
+                    .header("content-type", "application/json")
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = r.status();
+        let bytes = axum::body::to_bytes(r.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        (
+            status,
+            serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null),
+        )
+    }
+
+    async fn get_text(app: &Router, uri: &str) -> (StatusCode, String) {
+        let r = app
+            .clone()
+            .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        let status = r.status();
+        let bytes = axum::body::to_bytes(r.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        (status, String::from_utf8_lossy(&bytes).into_owned())
+    }
+
+    /// `(event, data)` pairs of an SSE body.
+    fn frames(body: &str) -> Vec<(String, serde_json::Value)> {
+        body.split("\n\n")
+            .filter_map(|f| {
+                let mut ev = None;
+                let mut data = String::new();
+                for line in f.lines() {
+                    if let Some(v) = line.strip_prefix("event: ") {
+                        ev = Some(v.trim().to_string());
+                    } else if let Some(v) = line.strip_prefix("data: ") {
+                        data.push_str(v);
+                    }
+                }
+                ev.map(|e| {
+                    (
+                        e,
+                        serde_json::from_str(&data).unwrap_or(serde_json::Value::Null),
+                    )
+                })
+            })
+            .collect()
+    }
+
+    fn archived_dialogues(root: &std::path::Path) -> Vec<std::path::PathBuf> {
+        let dir = root.join("archives").join("conversations");
+        let mut out: Vec<_> = std::fs::read_dir(&dir)
+            .map(|rd| {
+                rd.flatten()
+                    .map(|e| e.path())
+                    .filter(|p| {
+                        std::fs::read_to_string(p)
+                            .map(|t| t.contains("trigger: comms-end"))
+                            .unwrap_or(false)
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        out.sort();
+        out
+    }
+
+    #[tokio::test]
+    async fn e2e_comms_start_stream_done_with_a_fake_peer() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = state_in(dir.path()).await;
+        let mut bus = state.event_bus.subscribe();
+        let app = build_app(Arc::clone(&state));
+        let (port, calls) = fake_peer(false, 0).await;
+
+        let (status, body) = post_json(&app, "/api/comms", start_body(port, 4)).await;
+        assert_eq!(status, StatusCode::ACCEPTED, "{body}");
+        let id = body["id"].as_str().unwrap().to_string();
+
+        let (status, text) = get_text(&app, &format!("/api/comms/{id}/stream")).await;
+        assert_eq!(status, StatusCode::OK);
+        let fr = frames(&text);
+        let turns: Vec<&serde_json::Value> = fr
+            .iter()
+            .filter(|(e, _)| e == "turn")
+            .map(|(_, d)| d)
+            .collect();
+        assert_eq!(turns.len(), 4, "{text}");
+        let who: Vec<&str> = turns.iter().map(|t| t["who"].as_str().unwrap()).collect();
+        assert_eq!(who, vec!["TestPulse", "peerbot", "TestPulse", "peerbot"]);
+        let ns: Vec<u64> = turns.iter().map(|t| t["n"].as_u64().unwrap()).collect();
+        assert_eq!(ns, vec![1, 2, 3, 4], "turn numbers never repeat");
+        assert_eq!(fr.last().unwrap().0, "done", "{text}");
+        assert_eq!(calls.load(Ordering::SeqCst), 2, "the peer answered twice");
+
+        // The ending: status finished, archived once, interaction emitted.
+        let (status, body) = get_text(&app, "/api/comms").await;
+        assert_eq!(status, StatusCode::OK);
+        let st: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(st["phase"], "finished");
+        assert_eq!(st["turn"], 4);
+        assert_eq!(
+            archived_dialogues(dir.path()).len(),
+            1,
+            "archived exactly once"
+        );
+        let ev = tokio::time::timeout(std::time::Duration::from_secs(2), bus.recv())
+            .await
+            .expect("an interaction event")
+            .unwrap();
+        match ev {
+            crate::events::PulseEvent::PostInteraction { source, .. } => {
+                assert!(
+                    matches!(source, crate::events::InteractionSource::Comms { ref peer } if peer == "peerbot"),
+                    "{source:?}"
+                );
+            }
+            other => panic!("expected PostInteraction, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn e2e_comms_refuses_a_second_dialogue_then_stop_archives() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = state_in(dir.path()).await;
+        let app = build_app(Arc::clone(&state));
+        // A slow peer keeps the first dialogue running while we poke it.
+        let (port, _) = fake_peer(false, 1500).await;
+
+        let (status, body) = post_json(&app, "/api/comms", start_body(port, 6)).await;
+        assert_eq!(status, StatusCode::ACCEPTED, "{body}");
+        let id = body["id"].as_str().unwrap().to_string();
+
+        // Let the local opener land (the slow peer then holds the dialogue
+        // in peer_thinking), so the stop below has something to archive.
+        let mut turns = 0;
+        for _ in 0..40 {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            let (_, body) = get_text(&app, "/api/comms").await;
+            turns = serde_json::from_str::<serde_json::Value>(&body).unwrap()["turn"]
+                .as_u64()
+                .unwrap_or(0);
+            if turns >= 1 {
+                break;
+            }
+        }
+        assert_eq!(turns, 1, "the opener turn should be in by now");
+
+        let (status, body) = post_json(&app, "/api/comms", start_body(port, 6)).await;
+        assert_eq!(status, StatusCode::CONFLICT, "{body}");
+        assert_eq!(body["id"], id);
+
+        // Pause is accepted while running; stop ends it as cancelled.
+        let (status, _) = post_json(&app, &format!("/api/comms/{id}/pause"), String::new()).await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+        let r = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("DELETE")
+                    .uri(format!("/api/comms/{id}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(r.status(), StatusCode::NO_CONTENT);
+        // The stream of an ended dialogue replays and closes with done.
+        let (_, text) = get_text(&app, &format!("/api/comms/{id}/stream")).await;
+        let fr = frames(&text);
+        assert_eq!(fr.last().unwrap().0, "done", "{text}");
+        let (_, body) = get_text(&app, "/api/comms").await;
+        let st: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(st["phase"], "cancelled");
+        // The opener turn was made before the stop: archived.
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        assert_eq!(archived_dialogues(dir.path()).len(), 1);
+        // A stopped dialogue frees the slot.
+        let (status, _) = post_json(&app, "/api/comms", start_body(port, 1)).await;
+        assert_eq!(status, StatusCode::ACCEPTED);
+    }
+
+    #[tokio::test]
+    async fn e2e_comms_peer_error_ends_with_error_and_archives_the_opener() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = state_in(dir.path()).await;
+        let app = build_app(Arc::clone(&state));
+        let (port, _) = fake_peer(true, 0).await;
+        let (_, body) = post_json(&app, "/api/comms", start_body(port, 4)).await;
+        let id = body["id"].as_str().unwrap().to_string();
+        let (_, text) = get_text(&app, &format!("/api/comms/{id}/stream")).await;
+        let fr = frames(&text);
+        assert_eq!(fr.iter().filter(|(e, _)| e == "turn").count(), 1, "{text}");
+        let (e, d) = fr.last().unwrap();
+        assert_eq!(e, "error", "{text}");
+        assert!(d["message"].as_str().unwrap().contains("peerbot"), "{d}");
+        let (_, body) = get_text(&app, "/api/comms").await;
+        let st: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(st["phase"], "failed");
+        assert_eq!(archived_dialogues(dir.path()).len(), 1);
+    }
+
+    #[tokio::test]
+    async fn e2e_comms_refuses_a_non_loopback_adhoc_peer_and_bad_caps() {
+        let dir = tempfile::tempdir().unwrap();
+        let app = build_app(state_in(dir.path()).await);
+        let (status, body) = post_json(
+            &app,
+            "/api/comms",
+            serde_json::json!({"peer": {"name": "nova", "host": "10.0.0.5", "port": 3200}})
+                .to_string(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        let (status, _) = post_json(
+            &app,
+            "/api/comms",
+            serde_json::json!({"peer": {"name": "nova"}}).to_string(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "unknown configured peer");
+        let (status, _) = post_json(&app, "/api/comms", start_body(1, 99)).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "cap above the max");
+        let (status, _) = get_text(&app, "/api/comms").await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "nothing running");
+    }
+
+    #[tokio::test]
+    async fn e2e_comms_endpoints_are_owner_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = test_config();
+        config.peers.insert(
+            "nova".to_string(),
+            crate::config::PeerConfig {
+                host: "127.0.0.1".to_string(),
+                port: 3201,
+                secret: Some("peer-secret".to_string()),
+            },
+        );
+        let state = build_state_boxed_with_config(
+            dir.path().to_path_buf(),
+            Box::new(MockProvider::new(vec![])),
+            ToolRegistry::new(),
+            config,
+        )
+        .await;
+        let app = build_app(state);
+        for (m, u) in [
+            ("POST", "/api/comms"),
+            ("GET", "/api/comms"),
+            ("GET", "/api/comms/x/stream"),
+            ("DELETE", "/api/comms/x"),
+        ] {
+            let r = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method(m)
+                        .uri(u)
+                        .header("content-type", "application/json")
+                        .header("X-Peer-Name", "nova")
+                        .header("X-Echo-Secret", "peer-secret")
+                        .body(Body::from(if m == "POST" {
+                            start_body(1, 1)
+                        } else {
+                            String::new()
+                        }))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(r.status(), StatusCode::FORBIDDEN, "{m} {u}");
+        }
+    }
 }
