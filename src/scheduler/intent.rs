@@ -696,7 +696,7 @@ async fn execute_intent(
 
     // Build user message with autonomy context
     let autonomy_context = prompt::build_autonomy_context(&root_dir, &state.config);
-    let user_message = super::runner::with_refusal_notice(
+    let (user_message, refusal_notice) = crate::prediction::refusals::with_notice(
         &root_dir,
         format!(
             "{}\n\n{}\n\n{}",
@@ -743,6 +743,9 @@ async fn execute_intent(
 
     // A success clears what a failure recorded, as on the task path.
     state.provider_status.write().await.record_success();
+    if let Some(ref notice) = refusal_notice {
+        crate::prediction::refusals::acknowledge(&root_dir, notice);
+    }
 
     tracing::info!(
         "Intent '{}' completed ({} tokens in, {} tokens out, {} tool rounds)",
@@ -757,7 +760,7 @@ async fn execute_intent(
 
     // Prediction markers are refused, never applied (PN-133); same as the
     // task path.
-    super::runner::refuse_prediction_markers(&root_dir, &result.response_text);
+    crate::prediction::refusals::refuse_markers(&root_dir, &result.response_text);
     let resolved_prediction_ids: Vec<String> = Vec::new();
 
     // Persistent cognition substrate (PN-95) — same ordering as the task
@@ -856,7 +859,7 @@ async fn execute_intent(
                     // resolves (SEC-007).
                     let chain_prompt = chain.prompt.replace(
                         "{result}",
-                        &crate::prediction::resolve::strip_prediction_markers(
+                        &crate::prediction::markers::strip_prediction_markers(
                             &parsed.clean_content,
                         ),
                     );
@@ -894,7 +897,7 @@ async fn execute_intent(
             // Same marker-replay guard as the [CHAIN:] path above (SEC-007).
             let chain_prompt = chain.prompt.replace(
                 "{result}",
-                &crate::prediction::resolve::strip_prediction_markers(&parsed.clean_content),
+                &crate::prediction::markers::strip_prediction_markers(&parsed.clean_content),
             );
             let chain_intent = Intent {
                 id: format!(

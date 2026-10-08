@@ -698,54 +698,31 @@ impl Default for GraphConfig {
     }
 }
 
-/// Configuration for the prediction engine (Hierarchical Predictive Self-Modeling).
-/// See `continuous-entity-process-spec.md` Phase 2.
+/// `[prediction]` — what is left of the prediction store (PN-133).
+///
+/// Free-form predictions were retired in Phase 0: nothing writes
+/// `predictions.json` except the boot migration that voids open ones, which
+/// runs regardless of this section. `enabled` now only decides whether the
+/// tension substrate reads the store's recorded prediction errors and opens
+/// threads for those above `surprise_threshold`. The other keys older
+/// configs carry (`cycle_predictions`, `session_predictions`,
+/// `weekly_predictions`, `importance_threshold`, `max_unresolved`,
+/// `max_errors`) are ignored.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct PredictionConfig {
-    /// Enable prediction generation, resolution, and prompt injection.
+    /// Let the tension substrate ingest recorded prediction errors.
     pub enabled: bool,
-    /// Generate Cycle-timescale predictions in the thinking loop.
-    pub cycle_predictions: bool,
-    /// Generate Session-timescale predictions in morning-orientation.
-    pub session_predictions: bool,
-    /// Generate Weekly-timescale predictions in weekly-synthesis.
-    pub weekly_predictions: bool,
-    /// INITIAL GUESS — calibration pending. Surprise score is the LLM's
-    /// self-assessed dissimilarity between prediction and actual on a 0.0
-    /// (matched) to 1.0 (completely wrong) scale. Resolutions with surprise
-    /// at or above this threshold create attention-demanding PredictionErrors.
-    /// Not cited from a source; revisit after collecting ≥30 resolved
-    /// predictions per timescale.
+    /// Surprise above which a recorded prediction error opens a tension
+    /// thread. Surprise is the LLM's own 0.0–1.0 self-assessment.
     pub surprise_threshold: f64,
-    /// INITIAL GUESS — calibration pending. Importance is the unweighted sum
-    /// of unprocessed-error surprise values. With surprise in [0,1], a 3.0
-    /// threshold corresponds to roughly three fully-surprising errors or six
-    /// half-surprising ones. Not a port of Park et al.'s 150 (which was
-    /// importance per memory on a 1-10 scale, not accumulated). Revisit
-    /// alongside surprise_threshold.
-    pub importance_threshold: f64,
-    /// Cap on the prediction stack size. Oldest resolved predictions are
-    /// pruned first; pending predictions are always kept.
-    pub max_unresolved: usize,
-    /// Cap on accumulated prediction errors before pruning. Unprocessed
-    /// errors are always kept; processed ones are pruned oldest-first when
-    /// the cap is exceeded. 50 keeps several reflection-window cycles of
-    /// history available for trend analysis without unbounded growth.
-    pub max_errors: usize,
 }
 
 impl Default for PredictionConfig {
     fn default() -> Self {
         Self {
             enabled: true,
-            cycle_predictions: true,
-            session_predictions: true,
-            weekly_predictions: true,
             surprise_threshold: 0.3,
-            importance_threshold: 3.0,
-            max_unresolved: 20,
-            max_errors: 50,
         }
     }
 }
@@ -1516,6 +1493,22 @@ mod pulse_rename_tests {
         );
         let cfg = Config::from_toml_str(&text).unwrap();
         assert!(!cfg.autonomy.events.provider_error);
+    }
+
+    /// The `[prediction]` keys PN-133 retired still parse in a live config;
+    /// the two that remain are honoured.
+    #[test]
+    fn removed_prediction_keys_still_parse() {
+        let text = format!(
+            "{}{REST}[prediction]\nenabled = false\ncycle_predictions = true\n\
+             session_predictions = true\nweekly_predictions = true\n\
+             surprise_threshold = 0.5\nimportance_threshold = 3.0\n\
+             max_unresolved = 20\nmax_errors = 50\n",
+            identity("pulse")
+        );
+        let cfg = Config::from_toml_str(&text).unwrap();
+        assert!(!cfg.prediction.enabled);
+        assert!((cfg.prediction.surprise_threshold - 0.5).abs() < f64::EPSILON);
     }
 
     #[test]

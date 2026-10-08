@@ -37,53 +37,21 @@
 //! # Frozen since PN-133 (Phase 0)
 //!
 //! Free-form predictions had no checkable referent, so no production path
-//! writes this store any more: markers are refused (`resolve`,
-//! `refusals`), and the one boot migration
-//! [`store::void_open_predictions`] closes every open prediction as
-//! [`ErrorDirection::Void`]. The mutation API (`add_prediction`, `resolve`,
-//! `prune`, `store::save_delta`, …) is compiled for tests only, where it
-//! builds fixtures; it returns with a checkable prediction kind.
+//! writes this store any more: markers are refused (`markers`, `refusals`),
+//! and the one boot migration [`store::void_open_predictions`] closes every
+//! open prediction as [`ErrorDirection::Void`]. What is left is read-only:
+//! the types `predictions.json` deserializes into, and the error records the
+//! tension substrate still ingests. Writing returns with a checkable
+//! prediction kind.
 
+pub mod markers;
 pub mod refusals;
-pub mod resolve;
 pub mod store;
-
-#[cfg(test)]
-mod integration_tests;
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-#[cfg(test)]
-use uuid::Uuid;
 
 use crate::config::PredictionConfig;
-
-/// Shortest abbreviation of a prediction id accepted as a resolution reference.
-///
-/// Eight hex characters is 32 bits, which keeps collisions negligible for a
-/// store bounded at tens of predictions, and matches the abbreviation length
-/// display surfaces use for UUIDs. Shorter references are rejected rather
-/// than matched, on the same reasoning git uses for object names: an
-/// abbreviation that is unique in a small store stops being unique as the
-/// store grows, so the floor is set by the population, not by taste.
-#[cfg(test)]
-pub const MIN_ABBREVIATED_ID_LEN: usize = 8;
-
-/// Character cap on the text snapshotted into a [`PredictionError`].
-///
-/// Mirrors `resolve::MAX_MARKER_FIELD_LEN`. Marker-sourced text is already
-/// capped there, but [`PredictionStack::resolve_reference`] is a public API,
-/// and callers that build a [`PredictionResolution`] directly do not pass
-/// through the marker parser, so the cap is re-applied at the point of
-/// storage rather than assumed.
-#[cfg(test)]
-const MAX_SNAPSHOT_FIELD_LEN: usize = 200;
-
-/// Truncate on a character boundary, never a byte one.
-#[cfg(test)]
-fn truncate_snapshot(s: &str) -> String {
-    s.chars().take(MAX_SNAPSHOT_FIELD_LEN).collect()
-}
 
 /// The timescale at which a prediction operates.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -127,13 +95,13 @@ pub enum ErrorDirection {
     /// Retired without a verdict: the Phase 0 migration (PN-133) closed every
     /// open free-form prediction this way, because none had a referent that
     /// could be checked. Not evidence of anything — neither a hit nor an
-    /// error — and no marker can produce it (`from_str_loose` rejects it).
+    /// error — and only the runtime writes it.
     Void,
     /// Catch-all for direction values written to disk by a newer release
     /// than this binary (SEC-006). Without it, one unrecognized direction
     /// makes the whole snapshot fail to deserialize, `load` fail-opens to
     /// an empty stack, and the next save erases the pulse's entire
-    /// prediction history. Never produced by the marker parser.
+    /// prediction history.
     #[serde(other)]
     Unknown,
 }
@@ -148,32 +116,6 @@ impl std::fmt::Display for ErrorDirection {
             ErrorDirection::WellCalibrated => write!(f, "well-calibrated"),
             ErrorDirection::Void => write!(f, "void"),
             ErrorDirection::Unknown => write!(f, "unknown"),
-        }
-    }
-}
-
-impl ErrorDirection {
-    /// Parse from a string, case-insensitive. ASCII-only, allocation-free.
-    /// Never yields [`Self::Void`]: voiding is the runtime's act, not a
-    /// marker's.
-    #[cfg(test)]
-    pub fn from_str_loose(s: &str) -> Option<Self> {
-        let trimmed = s.trim();
-        if trimmed.eq_ignore_ascii_case("overconfident") {
-            Some(Self::Overconfident)
-        } else if trimmed.eq_ignore_ascii_case("underconfident") {
-            Some(Self::Underconfident)
-        } else if trimmed.eq_ignore_ascii_case("misdirected") {
-            Some(Self::Misdirected)
-        } else if trimmed.eq_ignore_ascii_case("novel") {
-            Some(Self::Novel)
-        } else if trimmed.eq_ignore_ascii_case("well-calibrated")
-            || trimmed.eq_ignore_ascii_case("well_calibrated")
-            || trimmed.eq_ignore_ascii_case("wellcalibrated")
-        {
-            Some(Self::WellCalibrated)
-        } else {
-            None
         }
     }
 }
@@ -211,13 +153,6 @@ pub struct Prediction {
 }
 
 impl Prediction {
-    /// Whether this prediction is still awaiting resolution.
-    #[cfg(test)]
-    #[must_use]
-    pub fn is_pending(&self) -> bool {
-        self.resolution.is_none()
-    }
-
     /// Whether this prediction was voided rather than resolved. A void
     /// prediction is closed but is not evidence that anything happened.
     #[must_use]
@@ -246,13 +181,10 @@ pub struct PredictionError {
     pub processed: bool,
     /// Snapshot of the prediction's text, taken at resolve time.
     ///
-    /// The error record outlives the prediction that produced it: `prune`
-    /// keeps `max(max_predictions, pending)` predictions, so once pending
-    /// reaches the cap every resolved prediction is evicted on the next
-    /// prune while its error survives in `errors`. A consumer that looks
-    /// `prediction_id` up in the live store therefore reads a hole.
-    /// Capturing the text here — the one moment both halves are in hand —
-    /// makes a prediction error self-contained.
+    /// The error record outlived the prediction that produced it: the old
+    /// writer's prune evicted resolved predictions while their errors
+    /// survived, so a consumer looking `prediction_id` up in the store could
+    /// read a hole. The text snapshotted here makes the error self-contained.
     ///
     /// `None` on records written before this field existed.
     #[serde(default)]
@@ -263,84 +195,7 @@ pub struct PredictionError {
     pub actual: Option<String>,
 }
 
-/// Why a resolution reference did not name exactly one pending prediction.
-#[cfg(test)]
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum ResolveRejection {
-    /// Neither an id nor an id prefix of any prediction on record.
-    NotFound,
-    /// Names exactly one prediction, which has already been resolved.
-    AlreadyResolved {
-        /// The full id of the prediction the reference named.
-        canonical_id: String,
-    },
-    /// A prefix shorter than [`MIN_ABBREVIATED_ID_LEN`] that matches at
-    /// least one prediction — too short to trust as unique.
-    TooShort,
-    /// A prefix shared by more than one prediction.
-    Ambiguous {
-        /// Full ids of every prediction the prefix matches.
-        candidates: Vec<String>,
-    },
-}
-
-#[cfg(test)]
-impl std::fmt::Display for ResolveRejection {
-    /// Human-readable reason, safe to echo into owner-facing alerts: it never
-    /// includes the candidate ids, only their count.
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::NotFound => {
-                f.write_str("no pending prediction with this id (unknown or already resolved)")
-            }
-            Self::AlreadyResolved { .. } => {
-                f.write_str("no pending prediction with this id (already resolved)")
-            }
-            Self::TooShort => write!(
-                f,
-                "id prefix shorter than {MIN_ABBREVIATED_ID_LEN} characters; \
-                 use at least {MIN_ABBREVIATED_ID_LEN} or the full id"
-            ),
-            Self::Ambiguous { candidates } => write!(
-                f,
-                "ambiguous id prefix: matches {} predictions; use the full id",
-                candidates.len()
-            ),
-        }
-    }
-}
-
-#[cfg(test)]
-fn log_rejected_reference(reference: &str, rejection: &ResolveRejection) {
-    match rejection {
-        ResolveRejection::Ambiguous { candidates } => tracing::warn!(
-            prediction_id = reference,
-            candidates = ?candidates,
-            "Rejected prediction reference: id prefix is ambiguous, matches {} predictions",
-            candidates.len()
-        ),
-        ResolveRejection::TooShort => tracing::warn!(
-            prediction_id = reference,
-            min_len = MIN_ABBREVIATED_ID_LEN,
-            "Rejected prediction reference: id prefix too short to disambiguate"
-        ),
-        ResolveRejection::AlreadyResolved { canonical_id } => tracing::warn!(
-            prediction_id = reference,
-            canonical_id = %canonical_id,
-            "Rejected prediction reference: prediction already resolved"
-        ),
-        ResolveRejection::NotFound => tracing::warn!(
-            prediction_id = reference,
-            "Attempted to resolve unknown or already-resolved prediction"
-        ),
-    }
-}
-
-/// The prediction stack — holds all predictions and their errors.
-///
-/// This is the main data structure for the prediction engine. It accumulates
-/// predictions from cognitive cycles, tracks their resolution, and surfaces
-/// high-surprise errors for the attention system to consume.
+/// The prediction stack as read from disk, stamped with the live config.
 ///
 /// Not directly `Serialize`/`Deserialize`. The on-disk format is
 /// [`PredictionStackSnapshot`] — `config` lives in `pulse-null.toml`, not
@@ -349,11 +204,11 @@ fn log_rejected_reference(reference: &str, rejection: &ResolveRejection) {
 /// quietly drift away from `Config::prediction` (M7).
 #[derive(Debug, Clone, Default)]
 pub struct PredictionStack {
-    /// All predictions (pending and resolved).
+    /// All predictions (pending, resolved and void).
     pub predictions: Vec<Prediction>,
-    /// Prediction errors generated from high-surprise resolutions.
+    /// Prediction errors recorded from high-surprise resolutions.
     pub errors: Vec<PredictionError>,
-    /// Calibration knobs (thresholds, caps) — loaded from `Config::prediction`.
+    /// Loaded from `Config::prediction`.
     pub config: PredictionConfig,
 }
 
@@ -367,16 +222,6 @@ pub struct PredictionStackSnapshot {
 }
 
 impl PredictionStackSnapshot {
-    /// Build the on-disk snapshot view of a stack (borrowed clone — cheap
-    /// for typical stack sizes capped by `PredictionConfig::max_*`).
-    #[cfg(test)]
-    pub fn from_stack(stack: &PredictionStack) -> Self {
-        Self {
-            predictions: stack.predictions.clone(),
-            errors: stack.errors.clone(),
-        }
-    }
-
     /// Promote a deserialized snapshot into a runtime `PredictionStack`,
     /// stamped with the pulse's live `PredictionConfig`.
     #[must_use]
@@ -390,22 +235,8 @@ impl PredictionStackSnapshot {
 }
 
 impl PredictionStack {
-    /// Create an empty prediction stack with default config.
-    ///
-    /// `#[cfg(test)]`-gated — production callers always know the pulse's
-    /// `PredictionConfig` and should construct via `with_config`, which
-    /// `store::load` does for them.
-    #[cfg(test)]
-    #[must_use]
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    /// Create an empty prediction stack with the given config.
-    ///
-    /// Production constructs this from `state.config.prediction.clone()`;
-    /// tests construct ad-hoc configs to vary thresholds without threading
-    /// values through every call site.
+    /// An empty stack with the given config — what `store::load` returns
+    /// when there is no readable file.
     #[must_use]
     pub fn with_config(config: PredictionConfig) -> Self {
         Self {
@@ -415,226 +246,74 @@ impl PredictionStack {
         }
     }
 
-    /// Add a new prediction to the stack.
-    ///
-    /// Confidence is clamped to [0.0, 1.0]. Returns a reference to the
-    /// newly created prediction.
-    #[cfg(test)]
-    pub fn add_prediction(
-        &mut self,
-        timescale: Timescale,
-        content: String,
-        confidence: f64,
-    ) -> &Prediction {
-        let prediction = Prediction {
-            id: Uuid::new_v4().to_string(),
-            timescale,
-            content,
-            confidence: confidence.clamp(0.0, 1.0),
-            created_at: Utc::now(),
-            resolved_at: None,
-            resolution: None,
-        };
-        self.predictions.push(prediction);
-        self.predictions.last().expect("just pushed")
-    }
-
-    /// Iterate over unresolved predictions at the given timescale.
-    ///
-    /// `#[cfg(test)]`-gated until Phase 2 Increment 3 wires the
-    /// reflection-window evaluator that filters by timescale.
-    #[cfg(test)]
-    pub fn pending(&self, timescale: Timescale) -> impl Iterator<Item = &Prediction> {
-        self.predictions
-            .iter()
-            .filter(move |p| p.timescale == timescale && p.is_pending())
-    }
-
-    /// Resolve a prediction by id. Returns `true` if a pending prediction was
-    /// resolved.
-    ///
-    /// Convenience over [`Self::resolve_reference`] for callers that do not
-    /// need the canonical id or the rejection reason. `#[cfg(test)]`-gated:
-    /// production resolves through `resolve_reference`, whose canonical id
-    /// feeds `ProcessSummary::resolved_prediction_ids`.
-    #[cfg(test)]
-    pub fn resolve(&mut self, reference: &str, resolution: PredictionResolution) -> bool {
-        self.resolve_reference(reference, resolution).is_ok()
-    }
-
-    /// Resolve a prediction by its full id or an unambiguous abbreviation of
-    /// it, returning the prediction's full (canonical) id.
-    ///
-    /// Following git's object-name rule, an abbreviation is a valid input
-    /// form: a reference of at least [`MIN_ABBREVIATED_ID_LEN`] characters
-    /// that prefixes exactly one prediction on record names that prediction.
-    /// Uniqueness is judged against *all* predictions, resolved ones
-    /// included, so a reference aimed at an already-resolved prediction can
-    /// never land on a different pending one. An exact id match always wins
-    /// over a prefix match. Every rejection is logged.
-    ///
-    /// If the resolution's surprise exceeds `self.config.surprise_threshold`,
-    /// a [`PredictionError`] is queued — keyed by the canonical id, since an
-    /// abbreviation that is unique today may not be later — carrying a
-    /// snapshot of both the predicted and the actual text.
-    #[cfg(test)]
-    pub fn resolve_reference(
-        &mut self,
-        reference: &str,
-        resolution: PredictionResolution,
-    ) -> Result<String, ResolveRejection> {
-        let index = self.find_pending(reference).inspect_err(|rejection| {
-            log_rejected_reference(reference, rejection);
-        })?;
-        let prediction = &mut self.predictions[index];
-        let canonical_id = prediction.id.clone();
-        let surprise = resolution.surprise.clamp(0.0, 1.0);
-
-        if surprise > self.config.surprise_threshold {
-            // Snapshot both texts here: this is the only point in the
-            // lifecycle where the prediction and its outcome are both in
-            // hand; after the next prune the prediction may be gone.
-            self.errors.push(PredictionError {
-                prediction_id: canonical_id.clone(),
-                surprise,
-                direction: resolution.direction,
-                insight: resolution.insight.clone(),
-                created_at: Utc::now(),
-                processed: false,
-                predicted: Some(truncate_snapshot(&prediction.content)),
-                actual: Some(truncate_snapshot(&resolution.actual)),
-            });
-        }
-
-        prediction.resolved_at = Some(Utc::now());
-        prediction.resolution = Some(PredictionResolution {
-            surprise,
-            ..resolution
-        });
-
-        Ok(canonical_id)
-    }
-
-    /// Index of the single pending prediction `reference` names.
-    #[cfg(test)]
-    fn find_pending(&self, reference: &str) -> Result<usize, ResolveRejection> {
-        let reference = reference.trim();
-        let index = match self.predictions.iter().position(|p| p.id == reference) {
-            Some(exact) => exact,
-            None => self.find_by_prefix(reference)?,
-        };
-        let prediction = &self.predictions[index];
-        if prediction.is_pending() {
-            Ok(index)
-        } else {
-            Err(ResolveRejection::AlreadyResolved {
-                canonical_id: prediction.id.clone(),
-            })
-        }
-    }
-
-    /// Index of the single prediction on record whose id starts with `prefix`.
-    #[cfg(test)]
-    fn find_by_prefix(&self, prefix: &str) -> Result<usize, ResolveRejection> {
-        if prefix.is_empty() {
-            return Err(ResolveRejection::NotFound);
-        }
-        let matches: Vec<usize> = self
-            .predictions
-            .iter()
-            .enumerate()
-            .filter(|(_, p)| p.id.starts_with(prefix))
-            .map(|(index, _)| index)
-            .collect();
-
-        match matches.as_slice() {
-            [] => Err(ResolveRejection::NotFound),
-            _ if prefix.chars().count() < MIN_ABBREVIATED_ID_LEN => Err(ResolveRejection::TooShort),
-            [one] => Ok(*one),
-            many => Err(ResolveRejection::Ambiguous {
-                candidates: many
-                    .iter()
-                    .map(|&index| self.predictions[index].id.clone())
-                    .collect(),
-            }),
-        }
-    }
-
     /// Iterate over unprocessed prediction errors.
     pub fn unprocessed_errors(&self) -> impl Iterator<Item = &PredictionError> {
         self.errors.iter().filter(|e| !e.processed)
     }
+}
 
-    /// Mark a set of prediction errors as processed by their prediction IDs.
-    ///
-    /// `#[cfg(test)]`-gated until Phase 2 Increment 3 wires the
-    /// reflection-window pipeline-graduation hook that consumes errors.
-    #[cfg(test)]
-    pub fn mark_errors_processed(&mut self, ids: &[String]) {
-        for error in &mut self.errors {
-            if ids.contains(&error.prediction_id) {
-                error.processed = true;
-            }
-        }
+/// Raw-JSON `predictions.json` fixtures. Tests build the store the way it
+/// sits on disk, since nothing in production writes one any more.
+#[cfg(test)]
+pub mod fixtures {
+    use std::path::Path;
+
+    use serde_json::{json, Value};
+
+    use super::{PredictionStack, PredictionStackSnapshot};
+    use crate::config::PredictionConfig;
+
+    /// A pending prediction entry.
+    pub fn pending(id: &str, content: &str) -> Value {
+        json!({
+            "id": id, "timescale": "cycle", "content": content, "confidence": 0.5,
+            "created_at": "2026-10-01T00:00:00Z", "resolved_at": null, "resolution": null,
+        })
     }
 
-    /// Total accumulated surprise from unprocessed errors.
-    ///
-    /// This value drives attention allocation — higher accumulated importance
-    /// means the pulse should pay more attention to what it failed to predict.
-    #[cfg(test)]
-    #[must_use]
-    pub fn accumulated_importance(&self) -> f64 {
-        self.unprocessed_errors().map(|e| e.surprise).sum()
+    /// A resolved prediction entry.
+    pub fn resolved(
+        id: &str,
+        content: &str,
+        actual: &str,
+        surprise: f64,
+        direction: &str,
+    ) -> Value {
+        json!({
+            "id": id, "timescale": "cycle", "content": content, "confidence": 0.6,
+            "created_at": "2026-10-01T00:00:00Z", "resolved_at": "2026-10-02T00:00:00Z",
+            "resolution": {
+                "actual": actual, "surprise": surprise, "direction": direction,
+                "insight": "an insight",
+            },
+        })
     }
 
-    /// Prune the stack to stay within size limits.
-    ///
-    /// Keeps the most recent predictions and errors, dropping the oldest
-    /// resolved predictions and processed errors first. Pending predictions
-    /// and unprocessed errors are always kept (even if their count alone
-    /// exceeds the cap); insertion order is preserved within each group
-    /// thanks to the stable sort.
-    ///
-    /// (M3: rewritten in-place — was double-cloning the stack via two
-    /// `filter().cloned().collect()` passes per side.)
-    #[cfg(test)]
-    pub fn prune(&mut self, max_predictions: usize, max_errors: usize) {
-        if self.predictions.len() > max_predictions {
-            // Stable sort: pending first (insertion order), resolved after
-            // (newest first within resolved). Equal-key elements keep their
-            // relative order so pending entries don't get reshuffled.
-            self.predictions.sort_by(|a, b| {
-                match (a.is_pending(), b.is_pending()) {
-                    (true, false) => std::cmp::Ordering::Less,
-                    (false, true) => std::cmp::Ordering::Greater,
-                    (false, false) => b.created_at.cmp(&a.created_at), // newest first among resolved
-                    (true, true) => std::cmp::Ordering::Equal,         // preserve insertion order
-                }
-            });
-            let pending_count = self
-                .predictions
-                .iter()
-                .take_while(|p| p.is_pending())
-                .count();
-            let target = max_predictions.max(pending_count);
-            self.predictions.truncate(target);
-        }
+    /// An unprocessed error record, with the text snapshots the writer took.
+    pub fn error(prediction_id: &str, predicted: &str, actual: &str, surprise: f64) -> Value {
+        json!({
+            "prediction_id": prediction_id, "surprise": surprise, "direction": "overconfident",
+            "insight": "freeze detector is blind to soft limits",
+            "created_at": "2026-10-02T00:00:00Z", "processed": false,
+            "predicted": predicted, "actual": actual,
+        })
+    }
 
-        if self.errors.len() > max_errors {
-            // Unprocessed first (insertion order); processed after (newest
-            // first). Same stable-sort trick — preserves order of equal keys.
-            self.errors
-                .sort_by(|a, b| match (a.processed, b.processed) {
-                    (false, true) => std::cmp::Ordering::Less,
-                    (true, false) => std::cmp::Ordering::Greater,
-                    (true, true) => b.created_at.cmp(&a.created_at), // newest first among processed
-                    (false, false) => std::cmp::Ordering::Equal,     // preserve insertion order
-                });
-            let unprocessed_count = self.errors.iter().take_while(|e| !e.processed).count();
-            let target = max_errors.max(unprocessed_count);
-            self.errors.truncate(target);
-        }
+    /// The whole document.
+    pub fn document(predictions: Vec<Value>, errors: Vec<Value>) -> Value {
+        json!({ "predictions": predictions, "errors": errors })
+    }
+
+    /// Write `predictions.json` into `root`.
+    pub fn write_store(root: &Path, doc: &Value) {
+        std::fs::write(root.join("predictions.json"), doc.to_string()).unwrap();
+    }
+
+    /// The stack `store::load` would produce for `doc`.
+    pub fn stack(doc: Value, config: PredictionConfig) -> PredictionStack {
+        serde_json::from_value::<PredictionStackSnapshot>(doc)
+            .unwrap()
+            .into_stack(config)
     }
 }
 
@@ -642,324 +321,7 @@ impl PredictionStack {
 mod tests {
     use super::*;
 
-    #[test]
-    fn new_stack_is_empty() {
-        let stack = PredictionStack::new();
-        assert!(stack.predictions.is_empty());
-        assert!(stack.errors.is_empty());
-        assert_eq!(stack.accumulated_importance(), 0.0);
-    }
-
-    #[test]
-    fn add_prediction_creates_with_uuid() {
-        let mut stack = PredictionStack::new();
-        let prediction = stack.add_prediction(Timescale::Cycle, "test".to_string(), 0.8);
-        assert!(!prediction.id.is_empty());
-        assert_eq!(prediction.timescale, Timescale::Cycle);
-        assert_eq!(prediction.content, "test");
-        assert_eq!(prediction.confidence, 0.8);
-        assert!(prediction.is_pending());
-    }
-
-    #[test]
-    fn confidence_is_clamped() {
-        let mut stack = PredictionStack::new();
-        let over = stack.add_prediction(Timescale::Cycle, "over".to_string(), 1.5);
-        assert_eq!(over.confidence, 1.0);
-
-        let under = stack.add_prediction(Timescale::Cycle, "under".to_string(), -0.3);
-        assert_eq!(under.confidence, 0.0);
-    }
-
-    #[test]
-    fn pending_filters_by_timescale() {
-        let mut stack = PredictionStack::new();
-        stack.add_prediction(Timescale::Cycle, "cycle1".to_string(), 0.5);
-        stack.add_prediction(Timescale::Session, "session1".to_string(), 0.7);
-        stack.add_prediction(Timescale::Cycle, "cycle2".to_string(), 0.6);
-
-        let cycle_pending: Vec<_> = stack.pending(Timescale::Cycle).collect();
-        assert_eq!(cycle_pending.len(), 2);
-
-        let session_pending: Vec<_> = stack.pending(Timescale::Session).collect();
-        assert_eq!(session_pending.len(), 1);
-
-        let weekly_pending: Vec<_> = stack.pending(Timescale::Weekly).collect();
-        assert_eq!(weekly_pending.len(), 0);
-    }
-
-    #[test]
-    fn resolve_creates_error_above_threshold() {
-        let mut stack = PredictionStack::new();
-        let id = stack
-            .add_prediction(Timescale::Cycle, "test".to_string(), 0.8)
-            .id
-            .clone();
-
-        let resolution = PredictionResolution {
-            actual: "something unexpected".to_string(),
-            surprise: 0.7,
-            direction: ErrorDirection::Misdirected,
-            insight: Some("learned something".to_string()),
-        };
-
-        assert!(stack.resolve(&id, resolution));
-        assert_eq!(stack.errors.len(), 1);
-        assert_eq!(stack.errors[0].surprise, 0.7);
-        assert!(!stack.errors[0].processed);
-    }
-
-    #[test]
-    fn resolve_no_error_below_threshold() {
-        let mut stack = PredictionStack::new();
-        let id = stack
-            .add_prediction(Timescale::Cycle, "test".to_string(), 0.8)
-            .id
-            .clone();
-
-        let resolution = PredictionResolution {
-            actual: "as expected".to_string(),
-            surprise: 0.1,
-            direction: ErrorDirection::Underconfident,
-            insight: None,
-        };
-
-        assert!(stack.resolve(&id, resolution));
-        assert!(stack.errors.is_empty());
-    }
-
-    #[test]
-    fn resolve_unknown_prediction_returns_false() {
-        let mut stack = PredictionStack::new();
-        let resolution = PredictionResolution {
-            actual: "whatever".to_string(),
-            surprise: 0.5,
-            direction: ErrorDirection::Novel,
-            insight: None,
-        };
-        assert!(!stack.resolve("nonexistent", resolution));
-    }
-
-    fn resolution(actual: &str, surprise: f64, direction: ErrorDirection) -> PredictionResolution {
-        PredictionResolution {
-            actual: actual.to_string(),
-            surprise,
-            direction,
-            insight: None,
-        }
-    }
-
-    /// Two predictions whose ids share an 8-character prefix.
-    fn stack_with_shared_prefix() -> PredictionStack {
-        let mut stack = PredictionStack::new();
-        stack.add_prediction(Timescale::Cycle, "first".to_string(), 0.8);
-        stack.add_prediction(Timescale::Cycle, "second".to_string(), 0.8);
-        stack.predictions[0].id = "abcd1234-0000-0000-0000-000000000001".to_string();
-        stack.predictions[1].id = "abcd1234-0000-0000-0000-000000000002".to_string();
-        stack
-    }
-
-    #[test]
-    fn resolve_accepts_unambiguous_abbreviation_and_returns_the_full_id() {
-        let mut stack = PredictionStack::new();
-        let id = stack
-            .add_prediction(Timescale::Cycle, "test".to_string(), 0.8)
-            .id
-            .clone();
-
-        let resolved = stack.resolve_reference(
-            &id[..MIN_ABBREVIATED_ID_LEN],
-            resolution("held", 0.1, ErrorDirection::WellCalibrated),
-        );
-
-        assert_eq!(resolved, Ok(id));
-        assert!(stack.predictions[0].resolved_at.is_some());
-    }
-
-    #[test]
-    fn resolve_by_abbreviation_keys_the_error_by_the_full_id() {
-        let mut stack = PredictionStack::new();
-        let id = stack
-            .add_prediction(Timescale::Cycle, "test".to_string(), 0.8)
-            .id
-            .clone();
-
-        assert!(stack.resolve(
-            &id[..MIN_ABBREVIATED_ID_LEN],
-            resolution("surprising", 0.7, ErrorDirection::Misdirected),
-        ));
-        // Keyed by the full id, not the abbreviation that happened to be
-        // typed — abbreviations rot as the store grows.
-        assert_eq!(stack.errors[0].prediction_id, id);
-    }
-
-    #[test]
-    fn resolve_rejects_ambiguous_abbreviation() {
-        let mut stack = stack_with_shared_prefix();
-
-        let rejected = stack.resolve_reference(
-            "abcd1234",
-            resolution("whichever", 0.5, ErrorDirection::Novel),
-        );
-
-        assert_eq!(
-            rejected,
-            Err(ResolveRejection::Ambiguous {
-                candidates: vec![
-                    "abcd1234-0000-0000-0000-000000000001".to_string(),
-                    "abcd1234-0000-0000-0000-000000000002".to_string(),
-                ],
-            })
-        );
-        assert!(stack.predictions.iter().all(Prediction::is_pending));
-        assert!(stack.errors.is_empty());
-    }
-
-    /// A prefix shared with an already-resolved prediction is ambiguous: the
-    /// reference may have been aimed at the resolved one, so it must not
-    /// silently land on the pending one.
-    #[test]
-    fn resolve_counts_resolved_predictions_when_judging_ambiguity() {
-        let mut stack = stack_with_shared_prefix();
-        let first = stack.predictions[0].id.clone();
-        assert!(stack.resolve(
-            &first,
-            resolution("done", 0.1, ErrorDirection::WellCalibrated)
-        ));
-
-        let rejected =
-            stack.resolve_reference("abcd1234", resolution("again", 0.1, ErrorDirection::Novel));
-
-        assert!(matches!(rejected, Err(ResolveRejection::Ambiguous { .. })));
-        assert!(stack.predictions[1].is_pending());
-    }
-
-    #[test]
-    fn resolve_by_abbreviation_of_a_resolved_prediction_is_already_resolved() {
-        let mut stack = PredictionStack::new();
-        let id = stack
-            .add_prediction(Timescale::Cycle, "test".to_string(), 0.8)
-            .id
-            .clone();
-        assert!(stack.resolve(&id, resolution("done", 0.1, ErrorDirection::WellCalibrated)));
-
-        let again = stack.resolve_reference(
-            &id[..MIN_ABBREVIATED_ID_LEN],
-            resolution("again", 0.1, ErrorDirection::WellCalibrated),
-        );
-
-        assert_eq!(
-            again,
-            Err(ResolveRejection::AlreadyResolved { canonical_id: id })
-        );
-    }
-
-    #[test]
-    fn resolve_rejects_reference_shorter_than_minimum() {
-        let mut stack = PredictionStack::new();
-        let id = stack
-            .add_prediction(Timescale::Cycle, "test".to_string(), 0.8)
-            .id
-            .clone();
-
-        let rejected = stack.resolve_reference(
-            &id[..4],
-            resolution("too short", 0.5, ErrorDirection::Novel),
-        );
-
-        assert_eq!(rejected, Err(ResolveRejection::TooShort));
-        assert!(stack.predictions[0].is_pending());
-    }
-
-    #[test]
-    fn resolve_prefers_exact_match_over_prefix_match() {
-        let mut stack = PredictionStack::new();
-        stack.add_prediction(Timescale::Cycle, "short id".to_string(), 0.8);
-        stack.add_prediction(Timescale::Cycle, "longer id".to_string(), 0.8);
-        stack.predictions[0].id = "abcd1234".to_string();
-        stack.predictions[1].id = "abcd1234-0000-0000-0000-000000000002".to_string();
-
-        let resolved = stack.resolve_reference(
-            "abcd1234",
-            resolution("exact wins", 0.1, ErrorDirection::WellCalibrated),
-        );
-
-        assert_eq!(resolved, Ok("abcd1234".to_string()));
-        assert!(stack.predictions[1].is_pending());
-    }
-
-    #[test]
-    fn rejection_reasons_are_distinct_and_never_list_candidate_ids() {
-        let ambiguous = ResolveRejection::Ambiguous {
-            candidates: vec!["abcd1234-1".to_string(), "abcd1234-2".to_string()],
-        }
-        .to_string();
-        assert!(ambiguous.contains("ambiguous id prefix"));
-        assert!(ambiguous.contains('2'));
-        assert!(!ambiguous.contains("abcd1234"));
-
-        assert!(ResolveRejection::TooShort
-            .to_string()
-            .contains(&MIN_ABBREVIATED_ID_LEN.to_string()));
-        assert!(ResolveRejection::NotFound
-            .to_string()
-            .contains("no pending prediction"));
-    }
-
-    /// The error must carry its own copy of both texts, because it outlives
-    /// the prediction they came from.
-    #[test]
-    fn resolve_snapshots_both_texts_into_the_error() {
-        let mut stack = PredictionStack::new();
-        let id = stack
-            .add_prediction(Timescale::Cycle, "the alert will fire".to_string(), 0.8)
-            .id
-            .clone();
-
-        stack.resolve(
-            &id,
-            resolution("it stayed silent", 0.7, ErrorDirection::Overconfident),
-        );
-
-        assert_eq!(
-            stack.errors[0].predicted.as_deref(),
-            Some("the alert will fire")
-        );
-        assert_eq!(stack.errors[0].actual.as_deref(), Some("it stayed silent"));
-
-        // And it survives the eviction of the prediction itself.
-        stack.prune(0, 50);
-        assert!(stack.predictions.is_empty());
-        assert_eq!(
-            stack.errors[0].predicted.as_deref(),
-            Some("the alert will fire")
-        );
-    }
-
-    #[test]
-    fn snapshot_fields_respect_the_field_cap() {
-        let mut stack = PredictionStack::new();
-        // Multi-byte, to prove the cut lands on a char boundary, not a byte.
-        let long = "é".repeat(MAX_SNAPSHOT_FIELD_LEN + 50);
-        let id = stack
-            .add_prediction(Timescale::Cycle, long.clone(), 0.8)
-            .id
-            .clone();
-
-        stack.resolve(&id, resolution(&long, 0.9, ErrorDirection::Misdirected));
-
-        let error = &stack.errors[0];
-        assert_eq!(
-            error.predicted.as_deref().unwrap().chars().count(),
-            MAX_SNAPSHOT_FIELD_LEN
-        );
-        assert_eq!(
-            error.actual.as_deref().unwrap().chars().count(),
-            MAX_SNAPSHOT_FIELD_LEN
-        );
-    }
-
-    /// Existing `predictions.json` files have no `predicted`/`actual` keys on
+    /// Records written before the snapshot fields existed lack them in
     /// their error records. They must load, not fail the whole snapshot.
     #[test]
     fn error_record_without_snapshot_fields_deserializes() {
@@ -982,168 +344,6 @@ mod tests {
     }
 
     #[test]
-    fn resolve_already_resolved_returns_false() {
-        let mut stack = PredictionStack::new();
-        let id = stack
-            .add_prediction(Timescale::Cycle, "test".to_string(), 0.8)
-            .id
-            .clone();
-
-        let resolution = PredictionResolution {
-            actual: "first".to_string(),
-            surprise: 0.5,
-            direction: ErrorDirection::Overconfident,
-            insight: None,
-        };
-        assert!(stack.resolve(&id, resolution));
-
-        let resolution2 = PredictionResolution {
-            actual: "second".to_string(),
-            surprise: 0.9,
-            direction: ErrorDirection::Novel,
-            insight: None,
-        };
-        assert!(!stack.resolve(&id, resolution2));
-    }
-
-    #[test]
-    fn mark_errors_processed() {
-        let mut stack = PredictionStack::new();
-        let id1 = stack
-            .add_prediction(Timescale::Cycle, "a".to_string(), 0.5)
-            .id
-            .clone();
-        let id2 = stack
-            .add_prediction(Timescale::Cycle, "b".to_string(), 0.5)
-            .id
-            .clone();
-
-        let high_surprise = PredictionResolution {
-            actual: "unexpected".to_string(),
-            surprise: 0.8,
-            direction: ErrorDirection::Novel,
-            insight: None,
-        };
-        stack.resolve(&id1, high_surprise.clone());
-        stack.resolve(&id2, high_surprise);
-
-        assert_eq!(stack.unprocessed_errors().count(), 2);
-
-        stack.mark_errors_processed(&[id1]);
-        assert_eq!(stack.unprocessed_errors().count(), 1);
-    }
-
-    #[test]
-    fn accumulated_importance_sums_unprocessed() {
-        let mut stack = PredictionStack::new();
-        let id1 = stack
-            .add_prediction(Timescale::Cycle, "a".to_string(), 0.5)
-            .id
-            .clone();
-        let id2 = stack
-            .add_prediction(Timescale::Cycle, "b".to_string(), 0.5)
-            .id
-            .clone();
-
-        stack.resolve(
-            &id1,
-            PredictionResolution {
-                actual: "x".to_string(),
-                surprise: 0.6,
-                direction: ErrorDirection::Overconfident,
-                insight: None,
-            },
-        );
-        stack.resolve(
-            &id2,
-            PredictionResolution {
-                actual: "y".to_string(),
-                surprise: 0.8,
-                direction: ErrorDirection::Novel,
-                insight: None,
-            },
-        );
-
-        let importance = stack.accumulated_importance();
-        assert!((importance - 1.4).abs() < f64::EPSILON);
-
-        // Mark one processed — importance should drop
-        stack.mark_errors_processed(&[id1]);
-        assert!((stack.accumulated_importance() - 0.8).abs() < f64::EPSILON);
-    }
-
-    #[test]
-    fn prune_keeps_pending_and_recent() {
-        let mut stack = PredictionStack::new();
-
-        // Add 5 predictions, resolve the first 3
-        let mut ids = Vec::new();
-        for i in 0..5 {
-            let id = stack
-                .add_prediction(Timescale::Cycle, format!("pred-{i}"), 0.5)
-                .id
-                .clone();
-            ids.push(id);
-        }
-
-        for id in &ids[..3] {
-            stack.resolve(
-                id,
-                PredictionResolution {
-                    actual: "done".to_string(),
-                    surprise: 0.1,
-                    direction: ErrorDirection::Underconfident,
-                    insight: None,
-                },
-            );
-        }
-
-        // 2 pending, 3 resolved. Prune to max 3 predictions.
-        stack.prune(3, 100);
-
-        // Should keep 2 pending + 1 most recent resolved = 3
-        assert_eq!(stack.predictions.len(), 3);
-        let pending_count = stack.predictions.iter().filter(|p| p.is_pending()).count();
-        assert_eq!(pending_count, 2);
-    }
-
-    #[test]
-    fn prune_errors_keeps_unprocessed() {
-        let mut stack = PredictionStack::new();
-
-        for i in 0..5 {
-            let id = stack
-                .add_prediction(Timescale::Cycle, format!("pred-{i}"), 0.5)
-                .id
-                .clone();
-            stack.resolve(
-                &id,
-                PredictionResolution {
-                    actual: "surprise".to_string(),
-                    surprise: 0.9,
-                    direction: ErrorDirection::Novel,
-                    insight: None,
-                },
-            );
-        }
-
-        // Mark first 3 processed
-        let processed_ids: Vec<String> = stack.errors[..3]
-            .iter()
-            .map(|e| e.prediction_id.clone())
-            .collect();
-        stack.mark_errors_processed(&processed_ids);
-
-        // Prune to max 3 errors
-        stack.prune(100, 3);
-
-        // Should keep 2 unprocessed + 1 most recent processed = 3
-        assert_eq!(stack.errors.len(), 3);
-        let unprocessed = stack.errors.iter().filter(|e| !e.processed).count();
-        assert_eq!(unprocessed, 2);
-    }
-
-    #[test]
     fn timescale_display() {
         assert_eq!(Timescale::Cycle.to_string(), "cycle");
         assert_eq!(Timescale::Session.to_string(), "session");
@@ -1151,117 +351,56 @@ mod tests {
     }
 
     #[test]
-    fn error_direction_display_and_parse() {
+    fn error_direction_display_and_serde() {
         assert_eq!(ErrorDirection::Overconfident.to_string(), "overconfident");
-        assert_eq!(
-            ErrorDirection::from_str_loose("OVERCONFIDENT"),
-            Some(ErrorDirection::Overconfident)
-        );
-        assert_eq!(
-            ErrorDirection::from_str_loose("novel"),
-            Some(ErrorDirection::Novel)
-        );
         assert_eq!(
             ErrorDirection::WellCalibrated.to_string(),
             "well-calibrated"
         );
+        assert_eq!(ErrorDirection::Void.to_string(), "void");
         assert_eq!(
-            ErrorDirection::from_str_loose("well-calibrated"),
-            Some(ErrorDirection::WellCalibrated)
+            serde_json::to_string(&ErrorDirection::Void).unwrap(),
+            "\"void\""
         );
         assert_eq!(
-            ErrorDirection::from_str_loose("Well_Calibrated"),
-            Some(ErrorDirection::WellCalibrated)
-        );
-        assert_eq!(
-            ErrorDirection::from_str_loose("wellcalibrated"),
-            Some(ErrorDirection::WellCalibrated)
-        );
-        assert_eq!(ErrorDirection::from_str_loose("unknown"), None);
-    }
-
-    /// A well-calibrated resolution is the normal "I was right" outcome:
-    /// low surprise, no PredictionError. The variant must also survive the
-    /// snapshot serde round-trip (it reaches disk via resolutions).
-    #[test]
-    fn well_calibrated_resolution_no_error_and_roundtrips() {
-        let mut stack = PredictionStack::new();
-        let id = stack
-            .add_prediction(Timescale::Cycle, "as planned".to_string(), 0.8)
-            .id
-            .clone();
-        assert!(stack.resolve(
-            &id,
-            PredictionResolution {
-                actual: "went as planned".to_string(),
-                surprise: 0.1,
-                direction: ErrorDirection::WellCalibrated,
-                insight: None,
-            },
-        ));
-        assert!(stack.errors.is_empty());
-
-        let snapshot = PredictionStackSnapshot::from_stack(&stack);
-        let json = serde_json::to_string(&snapshot).unwrap();
-        assert!(json.contains("\"well_calibrated\""));
-        let back: PredictionStackSnapshot = serde_json::from_str(&json).unwrap();
-        assert_eq!(
-            back.predictions[0].resolution.as_ref().unwrap().direction,
+            serde_json::from_str::<ErrorDirection>("\"well_calibrated\"").unwrap(),
             ErrorDirection::WellCalibrated
         );
     }
 
     /// SEC-006: a direction value written by a newer release must not fail
     /// the whole snapshot deserialization — that would fail-open `load` to
-    /// an empty stack, and the next save would erase the pulse's entire
-    /// prediction history.
+    /// an empty stack.
     #[test]
     fn unknown_direction_value_deserializes_to_catch_all() {
         let json = r#"{"predictions":[],"errors":[{"prediction_id":"p1","surprise":0.9,"direction":"some_future_direction","insight":null,"created_at":"2026-08-09T00:00:00Z","processed":false}]}"#;
         let snapshot: PredictionStackSnapshot = serde_json::from_str(json).unwrap();
         assert_eq!(snapshot.errors[0].direction, ErrorDirection::Unknown);
         assert_eq!(ErrorDirection::Unknown.to_string(), "unknown");
-        // The marker parser never produces it.
-        assert_eq!(ErrorDirection::from_str_loose("unknown"), None);
     }
 
-    /// Snapshot is the only thing that round-trips via JSON; `PredictionStack`
-    /// itself no longer derives Serialize/Deserialize so that callers can't
-    /// silently get a default config (M7).
+    /// The snapshot carries predictions and errors only; rehydrating stamps
+    /// the caller's config, never a default (M7).
     #[test]
-    fn snapshot_roundtrip_preserves_predictions_and_errors() {
-        let mut stack = PredictionStack::new();
-        let id = stack
-            .add_prediction(Timescale::Session, "will it rain".to_string(), 0.6)
-            .id
-            .clone();
-        stack.resolve(
-            &id,
-            PredictionResolution {
-                actual: "it rained".to_string(),
-                surprise: 0.4,
-                direction: ErrorDirection::Overconfident,
-                insight: Some("weather is hard".to_string()),
-            },
+    fn snapshot_rehydrates_with_the_callers_config() {
+        let doc = fixtures::document(
+            vec![fixtures::resolved(
+                "p-1",
+                "will it rain",
+                "it rained",
+                0.4,
+                "overconfident",
+            )],
+            vec![fixtures::error("p-1", "will it rain", "it rained", 0.4)],
         );
-
-        let snapshot = PredictionStackSnapshot::from_stack(&stack);
-        let json = serde_json::to_string_pretty(&snapshot).unwrap();
-        let deserialized: PredictionStackSnapshot = serde_json::from_str(&json).unwrap();
-
-        // Snapshot carries predictions + errors only — no config field.
-        assert!(!json.contains("\"config\""));
-        assert_eq!(deserialized.predictions.len(), 1);
-        assert_eq!(deserialized.errors.len(), 1);
-        assert_eq!(deserialized.predictions[0].id, id);
-
-        // Rehydrating into a stack uses the caller-supplied config —
-        // never the default just because the file didn't contain one.
         let custom = PredictionConfig {
             surprise_threshold: 0.95,
             ..PredictionConfig::default()
         };
-        let restored = deserialized.into_stack(custom);
-        assert!((restored.config.surprise_threshold - 0.95).abs() < f64::EPSILON);
+        let stack = fixtures::stack(doc, custom);
+        assert_eq!(stack.predictions.len(), 1);
+        assert_eq!(stack.unprocessed_errors().count(), 1);
+        assert!((stack.config.surprise_threshold - 0.95).abs() < f64::EPSILON);
+        assert!(!stack.predictions[0].is_void());
     }
 }

@@ -151,16 +151,22 @@ pub async fn awareness_then_system_prompt(
 /// Void every open free-form prediction (PN-133 Phase 0). Runs whether or not
 /// `[prediction]` is enabled: the point is that no open free-form prediction
 /// is ever shown or counted again, and the file outlives the setting. Shed
-/// while isolated (nothing that writes); the next boot runs it. Never aborts
-/// boot.
-pub fn void_open_predictions(root_dir: &Path) {
+/// while isolated (nothing that writes); the next boot runs it. The file IO
+/// and the bounded lock wait run on the blocking pool. Never aborts boot.
+pub async fn void_open_predictions(root_dir: &Path) {
     if crate::server::isolation::is_active(root_dir) {
         return;
     }
-    match crate::prediction::store::void_open_predictions(root_dir) {
-        Ok(0) => {}
-        Ok(n) => tracing::info!("voided {n} open predictions"),
-        Err(e) => tracing::error!("Failed to void open predictions: {e}"),
+    let root = root_dir.to_path_buf();
+    match tokio::task::spawn_blocking(move || {
+        crate::prediction::store::void_open_predictions(&root)
+    })
+    .await
+    {
+        Ok(Ok(0)) => {}
+        Ok(Ok(n)) => tracing::info!("voided {n} open predictions"),
+        Ok(Err(e)) => tracing::error!("Failed to void open predictions: {e}"),
+        Err(e) => tracing::error!("Void-predictions migration panicked: {e}"),
     }
 }
 

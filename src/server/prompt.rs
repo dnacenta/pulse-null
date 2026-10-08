@@ -2214,23 +2214,19 @@ mod tests {
             "# Caliber\n\n## Capability Map\n\n| Domain | Confidence |\n|---|---|\n| research | 0.8 |\n",
         )
         .unwrap();
-        crate::prediction::store::save_delta(root, config.prediction.clone(), |stack| {
-            let id = stack
-                .add_prediction(crate::prediction::Timescale::Cycle, "p".into(), 0.9)
-                .id
-                .clone();
-            stack.resolve(
-                &id,
-                crate::prediction::PredictionResolution {
-                    actual: "not that".into(),
-                    surprise: 0.9,
-                    direction: crate::prediction::ErrorDirection::Overconfident,
-                    insight: Some("an insight".into()),
-                },
+        {
+            use crate::prediction::fixtures;
+            fixtures::write_store(
+                root,
+                &fixtures::document(
+                    vec![
+                        fixtures::resolved("p-1", "p", "not that", 0.9, "overconfident"),
+                        fixtures::pending("p-2", "q"),
+                    ],
+                    vec![fixtures::error("p-1", "p", "not that", 0.9)],
+                ),
             );
-            stack.add_prediction(crate::prediction::Timescale::Cycle, "q".into(), 0.5);
-        })
-        .unwrap();
+        }
         seed_tension(root, config, |store| {
             for label in ["one", "two"] {
                 store.open(

@@ -111,7 +111,7 @@ pub async fn boot_pulse(
 
     // Pipeline health check
     super::setup::startup_pipeline_check(&root_dir, &config, &state.pipeline_monitor);
-    super::setup::void_open_predictions(&root_dir);
+    super::setup::void_open_predictions(&root_dir).await;
 
     // Scheduler — gated on control-plane leadership (fail-open: the pulse's
     // interactive surfaces never wait on the coordinator).

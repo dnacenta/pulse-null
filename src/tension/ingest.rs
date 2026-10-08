@@ -1051,7 +1051,7 @@ pub fn render_tombstone(thread: &Thread) -> String {
 mod tests {
     use super::*;
     use crate::config::{PredictionConfig, TensionConfig};
-    use crate::prediction::{ErrorDirection, PredictionResolution, Timescale};
+    use crate::prediction::fixtures;
     use crate::tension::{ThreadResolution, WorkOutcome};
     use chrono::Duration;
     use tempfile::TempDir;
@@ -1104,25 +1104,18 @@ mod tests {
     fn void_predictions_are_not_outreach_or_tension_evidence() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
-        let mut stack = PredictionStack::with_config(PredictionConfig::default());
-        let resolved = stack
-            .add_prediction(Timescale::Cycle, "resolved".into(), 0.5)
-            .id
-            .clone();
-        stack.resolve(
-            &resolved,
-            PredictionResolution {
-                actual: "it happened".into(),
-                surprise: 0.6,
-                direction: ErrorDirection::Misdirected,
-                insight: None,
-            },
+        let resolved = "p-resolved".to_string();
+        let voided = "p-free-form".to_string();
+        fixtures::write_store(
+            root,
+            &fixtures::document(
+                vec![
+                    fixtures::resolved(&resolved, "resolved", "it happened", 0.6, "misdirected"),
+                    fixtures::pending(&voided, "free-form"),
+                ],
+                vec![],
+            ),
         );
-        let voided = stack
-            .add_prediction(Timescale::Cycle, "free-form".into(), 0.5)
-            .id
-            .clone();
-        crate::prediction::store::save(root, &stack).unwrap();
         assert_eq!(
             crate::prediction::store::void_open_predictions(root).unwrap(),
             1
@@ -1712,25 +1705,30 @@ mod tests {
 
     // ----- prediction-error ingest ----------------------------------------
 
+    /// A store holding one resolved prediction and the error it recorded.
     fn stack_with_error(surprise: f64) -> PredictionStack {
-        let mut stack = PredictionStack::with_config(PredictionConfig {
-            surprise_threshold: 0.3,
-            ..PredictionConfig::default()
-        });
-        let id = stack
-            .add_prediction(Timescale::Cycle, "the pipeline will move".to_string(), 0.8)
-            .id
-            .clone();
-        stack.resolve(
-            &id,
-            PredictionResolution {
-                actual: "the pipeline froze".to_string(),
+        let doc = fixtures::document(
+            vec![fixtures::resolved(
+                "p-1",
+                "the pipeline will move",
+                "the pipeline froze",
                 surprise,
-                direction: ErrorDirection::Overconfident,
-                insight: Some("freeze detector is blind to soft limits".to_string()),
-            },
+                "overconfident",
+            )],
+            vec![fixtures::error(
+                "p-1",
+                "the pipeline will move",
+                "the pipeline froze",
+                surprise,
+            )],
         );
-        stack
+        fixtures::stack(
+            doc,
+            PredictionConfig {
+                surprise_threshold: 0.3,
+                ..PredictionConfig::default()
+            },
+        )
     }
 
     #[test]
@@ -1750,16 +1748,16 @@ mod tests {
         assert!(thread.content.contains("freeze detector is blind"));
     }
 
-    /// `prune` keeps `max(max_predictions, pending)` predictions, so once
-    /// pending reaches the cap every resolved prediction is evicted while its
-    /// error survives. A thread ingested after that point used to be born a
+    /// The old writer's prune kept `max(max_predictions, pending)`
+    /// predictions, so a resolved prediction could be evicted while its error
+    /// survived. A thread ingested after that point used to be born a
     /// husk ("no longer on record"). The text now rides on the error record.
     #[test]
     fn prediction_error_thread_survives_eviction_of_its_prediction() {
         let mut s = store();
         let mut stack = stack_with_error(0.9);
 
-        stack.prune(0, 50);
+        stack.predictions.clear(); // the old writer's prune evicted it
         assert!(
             stack.predictions.is_empty(),
             "precondition: the prediction must be gone"
@@ -1791,7 +1789,7 @@ mod tests {
         assert!(thread.content.contains("the pipeline froze"));
 
         let mut evicted = store();
-        stack.prune(0, 50);
+        stack.predictions.clear(); // the old writer's prune evicted it
         ingest_prediction_errors(&mut evicted, &stack, Utc::now());
         let thread = evicted.live().next().unwrap();
         assert!(thread

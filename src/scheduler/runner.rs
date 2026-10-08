@@ -362,7 +362,7 @@ async fn execute_task(
     } else {
         String::new()
     };
-    let user_message = with_refusal_notice(
+    let (user_message, refusal_notice) = crate::prediction::refusals::with_notice(
         &root_dir,
         format!(
             "[Scheduled task: {} | Time: {} | Channel: {}]\n\n{}{}",
@@ -485,6 +485,11 @@ async fn execute_task(
     {
         let mut ps = state.provider_status.write().await;
         ps.record_success();
+    }
+
+    // The turn that carried the refused-marker notice succeeded: clear it.
+    if let Some(ref notice) = refusal_notice {
+        crate::prediction::refusals::acknowledge(&root_dir, notice);
     }
 
     // Log hallucination guard events for autonomous tasks
@@ -709,7 +714,7 @@ async fn execute_task(
     // not written. The refusal is told to the pulse in its next prompt.
     // Counted on the RAW response: the lazy SHARE/CALL regexes can swallow an
     // embedded marker while stripping (SEC-013).
-    refuse_prediction_markers(&root_dir, &response_text);
+    crate::prediction::refusals::refuse_markers(&root_dir, &response_text);
     let resolved_prediction_ids: Vec<String> = Vec::new();
 
     // Post-execution: the persistent cognition substrate (PN-95). Runs after
@@ -966,7 +971,7 @@ async fn route_output_markers(
                     let chain_prompt = chain.prompt.replace(
                         "{result}",
                         &crate::tension::ingest::strip_thread_markers(
-                            &crate::prediction::resolve::strip_prediction_markers(
+                            &crate::prediction::markers::strip_prediction_markers(
                                 &parsed.clean_content,
                             ),
                         ),
@@ -1038,26 +1043,6 @@ fn log_execution(root_dir: &std::path::Path, task: &ScheduledTask, summary: &str
     crate::logbook::write_entry(root_dir, "Task", &task.name, summary);
 }
 
-/// Count this turn's `[PREDICT:]` / `[RESOLVE:]` markers into the refusal
-/// notice the next task or intent prompt shows (PN-133). Nothing reaches the
-/// prediction store, and the owner is not alerted.
-pub(super) fn refuse_prediction_markers(root_dir: &std::path::Path, raw_output: &str) {
-    let counts = crate::prediction::resolve::count_prediction_markers(raw_output);
-    if let Err(e) = crate::prediction::refusals::record(root_dir, counts) {
-        tracing::warn!("Failed to record refused prediction markers: {e}");
-    }
-}
-
-/// The user message for one autonomous turn, with the pending notice of
-/// refused prediction markers appended once (PN-133).
-pub(super) fn with_refusal_notice(root_dir: &std::path::Path, mut message: String) -> String {
-    if let Some(notice) = crate::prediction::refusals::take_notice(root_dir) {
-        message.push_str("\n\n");
-        message.push_str(&notice);
-    }
-    message
-}
-
 /// True while this tenure's holder still owns an unexpired control-plane
 /// lease. Task loops check it before each fire so a wedged coordinator's
 /// orphans stop themselves instead of acting as a stale tenure.
@@ -1069,42 +1054,4 @@ async fn tenure_still_leads(
     table
         .get(crate::coordinator::control::CONTROL_PLANE_RESOURCE)
         .is_some_and(|l| l.holder_id == tenure_holder && !l.is_expired(chrono::Utc::now()))
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn predict_and_resolve_markers_are_refused_without_store_writes() {
-        let dir = tempfile::tempdir().unwrap();
-        let root = dir.path();
-        let store = root.join("predictions.json");
-        std::fs::write(
-            &store,
-            r#"{"predictions":[{"id":"p-1","timescale":"cycle","content":"x","confidence":0.5,"created_at":"2026-10-01T00:00:00Z","resolved_at":null,"resolution":null}],"errors":[]}"#,
-        )
-        .unwrap();
-        let before = std::fs::read(&store).unwrap();
-
-        let output = r#"Thinking. [PREDICT:{"content":"a","confidence":0.7}]
-            [PREDICT:{"content":"b","confidence":0.2}]
-            [RESOLVE:{"id":"p-1","outcome":"o","surprise":0.4,"direction":"novel"}]"#;
-        refuse_prediction_markers(root, output);
-
-        assert_eq!(std::fs::read(&store).unwrap(), before, "store untouched");
-
-        let first = with_refusal_notice(root, "task prompt".to_string());
-        assert!(first.starts_with("task prompt\n\n"), "{first}");
-        assert!(
-            first.contains("[MARKERS REFUSED: 2 [PREDICT:] and 1 [RESOLVE:]"),
-            "{first}"
-        );
-        // Shown once, then cleared.
-        assert_eq!(
-            with_refusal_notice(root, "next prompt".to_string()),
-            "next prompt"
-        );
-        assert_eq!(std::fs::read(&store).unwrap(), before);
-    }
 }
