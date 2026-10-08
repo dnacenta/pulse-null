@@ -6,7 +6,9 @@ use cron::Schedule as CronSchedule;
 use tokio::sync::RwLock;
 
 use super::diagnostics;
-use super::evaluator::{resolve_docs_dir, resolve_task_evaluator, EvalDecision, SchedulerState};
+use super::evaluator::{
+    resolve_docs_dir, resolve_task_evaluator, EvalDecision, SchedulerState, UNGATED_EVALUATORS,
+};
 use super::executor::{self, ExecutionConfig};
 use super::intent::{self, IntentQueue, IntentSource};
 use super::liveness::{self, SharedTaskHealth, TaskOutcome};
@@ -57,7 +59,6 @@ pub async fn run_task_loop(
     let mut eval_state = tokio::task::spawn_blocking(move || SchedulerState::load(&rd))
         .await
         .unwrap_or_default();
-    let docs_dir = resolve_docs_dir(&root_dir);
 
     loop {
         // Calculate next fire time in the configured timezone
@@ -121,22 +122,20 @@ pub async fn run_task_loop(
                 .await
                 .unwrap_or_default();
 
-            let decision = match resolve_task_evaluator(
-                evaluator_type,
-                &root_dir,
-                &docs_dir,
-                &state.config.tension,
-            ) {
-                Some(eval) => eval.evaluate(&eval_state),
-                None => {
-                    tracing::warn!(
-                        "Unknown evaluator type '{}' for task '{}' — firing anyway",
-                        evaluator_type,
-                        task.id
-                    );
-                    EvalDecision::Fire
-                }
-            };
+            let decision =
+                match resolve_task_evaluator(evaluator_type, &root_dir, &state.config.tension) {
+                    Some(eval) => eval.evaluate(&eval_state),
+                    None => {
+                        if !UNGATED_EVALUATORS.contains(&evaluator_type.as_str()) {
+                            tracing::warn!(
+                                "Unknown evaluator type '{}' for task '{}' — firing anyway",
+                                evaluator_type,
+                                task.id
+                            );
+                        }
+                        EvalDecision::Fire
+                    }
+                };
 
             if decision == EvalDecision::Suppress {
                 tracing::debug!(

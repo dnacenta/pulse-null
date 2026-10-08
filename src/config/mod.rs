@@ -627,21 +627,16 @@ impl Default for AutonomyConfig {
     }
 }
 
-/// Which internal events auto-queue intents
+/// Event-driven behaviour under `[autonomy.events]`.
+///
+/// The five switches that let the pulse's own activity queue intents
+/// (`post_conversation`, `pipeline_alert`, `pipeline_frozen`,
+/// `cognitive_decline`, `pipeline_conversion_low`) were removed in PN-133:
+/// those events never become intents now. Old configs that still set them
+/// parse fine; unknown keys are ignored.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct EventsConfig {
-    /// Queue reflection intent after chat conversations end
-    pub post_conversation: bool,
-    /// Queue archiving intent when a document hits its hard limit
-    pub pipeline_alert: bool,
-    /// Queue investigation intent when pipeline has no movement
-    pub pipeline_frozen: bool,
-    /// Queue adjustment intent when cognitive health declines
-    pub cognitive_decline: bool,
-    /// Queue investigation when conversations archive but pipeline docs don't update
-    #[serde(default = "default_true")]
-    pub pipeline_conversion_low: bool,
     /// Send a `[task-error]` diagnostic when a scheduled task fails.
     ///
     /// The diagnostic is state-aware: one per failure streak plus one per
@@ -653,11 +648,6 @@ pub struct EventsConfig {
 impl Default for EventsConfig {
     fn default() -> Self {
         Self {
-            post_conversation: true,
-            pipeline_alert: true,
-            pipeline_frozen: true,
-            cognitive_decline: true,
-            pipeline_conversion_low: true,
             provider_error: true,
         }
     }
@@ -1512,6 +1502,20 @@ mod pulse_rename_tests {
 
     fn identity(section: &str) -> String {
         format!("[{section}]\nname = \"Echo\"\nowner_name = \"D\"\nowner_alias = \"D\"\n")
+    }
+
+    /// The five `[autonomy.events]` switches PN-133 removed still parse in a
+    /// live config; they are ignored, and the one switch left is honoured.
+    #[test]
+    fn removed_autonomy_event_keys_still_parse() {
+        let text = format!(
+            "{}{REST}[autonomy.events]\npost_conversation = true\npipeline_alert = true\n\
+             pipeline_frozen = false\ncognitive_decline = true\n\
+             pipeline_conversion_low = true\nprovider_error = false\n",
+            identity("pulse")
+        );
+        let cfg = Config::from_toml_str(&text).unwrap();
+        assert!(!cfg.autonomy.events.provider_error);
     }
 
     #[test]

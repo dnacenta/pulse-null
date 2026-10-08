@@ -55,7 +55,7 @@ pub fn default_tasks() -> Vec<ScheduledTask> {
             output_routing: super::OutputRouting::Silent,
             enabled: false,
             created_by: super::TaskCreator::System,
-            evaluator: Some("pipeline".to_string()),
+            evaluator: None,
         },
         ScheduledTask {
             id: "research-session".to_string(),
@@ -88,7 +88,7 @@ pub fn default_tasks() -> Vec<ScheduledTask> {
             output_routing: super::OutputRouting::Silent,
             enabled: false,
             created_by: super::TaskCreator::System,
-            evaluator: Some("pipeline".to_string()),
+            evaluator: None,
         },
         ScheduledTask {
             id: "health-check".to_string(),
@@ -120,7 +120,7 @@ pub fn default_tasks() -> Vec<ScheduledTask> {
             output_routing: super::OutputRouting::Silent,
             enabled: false,
             created_by: super::TaskCreator::System,
-            evaluator: Some("pipeline".to_string()),
+            evaluator: None,
         },
         ScheduledTask {
             id: WEEKLY_SYNTHESIS_TASK_ID.to_string(),
@@ -139,7 +139,7 @@ pub fn default_tasks() -> Vec<ScheduledTask> {
             output_routing: super::OutputRouting::Silent,
             enabled: false,
             created_by: super::TaskCreator::System,
-            evaluator: Some("pipeline".to_string()),
+            evaluator: None,
         },
     ]
 }

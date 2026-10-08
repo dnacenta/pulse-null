@@ -133,10 +133,7 @@ max_intents_per_hour = 10
 max_chain_depth = 5
 
 [autonomy.events]
-post_conversation = true
-pipeline_alert = true
-pipeline_frozen = true
-cognitive_decline = true
+provider_error = true
 
 [graph]
 enabled = true

@@ -4,8 +4,10 @@
 //! checks whether anything has actually changed since the last fire. If not,
 //! the task is suppressed — no tokens wasted, no redundant diagnosis.
 //!
-//! Phase 1: pipeline_frozen evaluator (timestamp-based document change detection).
-//! Phase 2: cognitive_decline evaluator (signal-based gating) + response quality feedback.
+//! Today the only gate is the salience rule for cognitive cycles. The
+//! pipeline_frozen, cognitive_decline, conversion-low and post-interaction
+//! evaluators gated intents the event listener queued from the pulse's own
+//! activity; PN-133 removed those intents, and the evaluators with them.
 
 use std::collections::HashMap;
 use std::fs;
@@ -24,13 +26,6 @@ const PIPELINE_DOCS: &[&str] = &[
     "PRAXIS.md",
 ];
 
-/// Safety net: always fire after this many hours of suppression.
-const SAFETY_NET_HOURS: i64 = 48;
-
-/// Extended cooldown multiplier when last response had no tool calls.
-/// If the pulse did nothing useful, wait longer before trying again.
-const NO_TOOLS_COOLDOWN_MULTIPLIER: i64 = 2;
-
 /// Per-event tracking state.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EventState {
@@ -45,7 +40,8 @@ pub struct EventState {
     /// How many times this event was suppressed since last fire.
     #[serde(default)]
     pub suppression_count: u32,
-    /// Number of signal frames at the time of last fire (for cognitive_decline).
+    /// Signal-frame count at last fire, written by the retired
+    /// cognitive_decline evaluator; kept so older state files round-trip.
     #[serde(default)]
     pub signal_count_at_fire: Option<usize>,
 }
@@ -107,26 +103,6 @@ impl SchedulerState {
         );
     }
 
-    /// Record that an event fired with signal count tracking (for cognitive_decline).
-    pub fn record_fire_with_signals(
-        &mut self,
-        event_type: &str,
-        docs_dir: &Path,
-        signal_count: usize,
-    ) {
-        let doc_timestamps = read_doc_timestamps(docs_dir);
-        self.events.insert(
-            event_type.to_string(),
-            EventState {
-                last_fired: Utc::now(),
-                doc_timestamps,
-                last_response_had_tools: false,
-                suppression_count: 0,
-                signal_count_at_fire: Some(signal_count),
-            },
-        );
-    }
-
     /// Record that an event was suppressed.
     pub fn record_suppression(&mut self, event_type: &str) {
         if let Some(state) = self.events.get_mut(event_type) {
@@ -151,160 +127,6 @@ pub enum EvalDecision {
     Suppress,
 }
 
-/// Evaluate whether a pipeline_frozen event should fire.
-///
-/// Returns `Fire` if:
-/// - This event has never fired before (first time)
-/// - Any pipeline document has been modified since the last fire
-/// - The safety net duration has elapsed (48 hours)
-///
-/// Returns `Suppress` if:
-/// - No pipeline documents have changed since the last fire
-/// - The safety net hasn't elapsed yet
-pub fn evaluate_pipeline_frozen(state: &SchedulerState, docs_dir: &Path) -> EvalDecision {
-    let event_type = "pipeline_frozen";
-
-    let event_state = match state.events.get(event_type) {
-        Some(s) => s,
-        None => return EvalDecision::Fire, // Never fired before
-    };
-
-    // Safety net: always fire after SAFETY_NET_HOURS
-    // Extended if last response produced no tool calls.
-    let effective_safety_net = if event_state.last_response_had_tools {
-        SAFETY_NET_HOURS
-    } else {
-        SAFETY_NET_HOURS * NO_TOOLS_COOLDOWN_MULTIPLIER
-    };
-
-    let elapsed = Utc::now() - event_state.last_fired;
-    if elapsed.num_hours() >= effective_safety_net {
-        tracing::debug!(
-            "pipeline_frozen: safety net triggered ({}h since last fire, threshold: {}h)",
-            elapsed.num_hours(),
-            effective_safety_net
-        );
-        return EvalDecision::Fire;
-    }
-
-    // Check if any pipeline document has been modified
-    let current_timestamps = read_doc_timestamps(docs_dir);
-    for (doc, current_ts) in &current_timestamps {
-        if let Some(last_ts) = event_state.doc_timestamps.get(doc) {
-            if current_ts != last_ts {
-                tracing::debug!("pipeline_frozen: {} has changed since last fire", doc);
-                return EvalDecision::Fire;
-            }
-        } else {
-            // Document didn't exist at last fire but exists now
-            tracing::debug!("pipeline_frozen: {} is new since last fire", doc);
-            return EvalDecision::Fire;
-        }
-    }
-
-    tracing::debug!(
-        "pipeline_frozen: suppressed — no document changes since last fire (suppression #{})",
-        event_state.suppression_count + 1
-    );
-    EvalDecision::Suppress
-}
-
-/// Evaluate whether a cognitive_decline event should fire.
-///
-/// Returns `Fire` if:
-/// - This event has never fired before
-/// - New signal frames have been recorded since the last fire
-/// - The safety net has elapsed
-///
-/// Returns `Suppress` if:
-/// - No new signal data since the last fire
-/// - The last response produced no tool calls (extended cooldown)
-pub fn evaluate_cognitive_decline(state: &SchedulerState, root_dir: &Path) -> EvalDecision {
-    let event_type = "cognitive_decline";
-
-    let event_state = match state.events.get(event_type) {
-        Some(s) => s,
-        None => return EvalDecision::Fire, // Never fired before
-    };
-
-    let elapsed = Utc::now() - event_state.last_fired;
-
-    // Safety net: always fire after threshold (extended if last response had no tools)
-    let effective_safety_net = if event_state.last_response_had_tools {
-        SAFETY_NET_HOURS
-    } else {
-        SAFETY_NET_HOURS * NO_TOOLS_COOLDOWN_MULTIPLIER
-    };
-    if elapsed.num_hours() >= effective_safety_net {
-        tracing::debug!(
-            "cognitive_decline: safety net triggered ({}h since last fire, threshold: {}h)",
-            elapsed.num_hours(),
-            effective_safety_net
-        );
-        return EvalDecision::Fire;
-    }
-
-    // Check if new signal frames have been added since last fire.
-    // New data always triggers evaluation, regardless of response quality.
-    let current_signal_count = count_signal_frames(root_dir);
-    let last_count = event_state.signal_count_at_fire.unwrap_or(0);
-
-    if current_signal_count > last_count {
-        tracing::debug!(
-            "cognitive_decline: {} new signal frames since last fire ({} → {})",
-            current_signal_count - last_count,
-            last_count,
-            current_signal_count
-        );
-        return EvalDecision::Fire;
-    }
-
-    tracing::debug!(
-        "cognitive_decline: suppressed — no new signals since last fire (count: {}, suppression #{})",
-        current_signal_count,
-        event_state.suppression_count + 1
-    );
-    EvalDecision::Suppress
-}
-
-/// Evaluate whether a pipeline_conversion_low event should fire.
-/// Same timestamp logic as pipeline_frozen — suppress if nothing changed.
-/// Extended cooldown if last response had no tool calls.
-pub fn evaluate_pipeline_conversion_low(state: &SchedulerState, docs_dir: &Path) -> EvalDecision {
-    let event_type = "pipeline_conversion_low";
-
-    let event_state = match state.events.get(event_type) {
-        Some(s) => s,
-        None => return EvalDecision::Fire,
-    };
-
-    // Safety net — extended if last response had no tools
-    let effective_safety_net = if event_state.last_response_had_tools {
-        SAFETY_NET_HOURS
-    } else {
-        SAFETY_NET_HOURS * NO_TOOLS_COOLDOWN_MULTIPLIER
-    };
-
-    let elapsed = Utc::now() - event_state.last_fired;
-    if elapsed.num_hours() >= effective_safety_net {
-        return EvalDecision::Fire;
-    }
-
-    // Check document changes
-    let current_timestamps = read_doc_timestamps(docs_dir);
-    for (doc, current_ts) in &current_timestamps {
-        if let Some(last_ts) = event_state.doc_timestamps.get(doc) {
-            if current_ts != last_ts {
-                return EvalDecision::Fire;
-            }
-        } else {
-            return EvalDecision::Fire;
-        }
-    }
-
-    EvalDecision::Suppress
-}
-
 /// Read modification timestamps for all pipeline documents.
 fn read_doc_timestamps(docs_dir: &Path) -> HashMap<String, i64> {
     let mut timestamps = HashMap::new();
@@ -323,24 +145,6 @@ fn read_doc_timestamps(docs_dir: &Path) -> HashMap<String, i64> {
     timestamps
 }
 
-/// Count signal frames in the monitoring signals file.
-/// Used by the cognitive_decline evaluator to check for new data.
-fn count_signal_frames(root_dir: &Path) -> usize {
-    let path = root_dir.join("monitoring/signals.json");
-    if !path.exists() {
-        return 0;
-    }
-    match fs::read_to_string(&path) {
-        Ok(content) => {
-            // Parse as JSON array and count elements
-            serde_json::from_str::<Vec<serde_json::Value>>(&content)
-                .map(|v| v.len())
-                .unwrap_or(0)
-        }
-        Err(_) => 0,
-    }
-}
-
 /// Get the docs_dir for pipeline documents from root_dir.
 /// Pipeline documents live in the pulse's journal directory.
 pub fn resolve_docs_dir(root_dir: &Path) -> PathBuf {
@@ -353,28 +157,6 @@ pub fn resolve_docs_dir(root_dir: &Path) -> PathBuf {
     root_dir.to_path_buf()
 }
 
-// --- Post-interaction token threshold ---
-
-/// Minimum total tokens (input + output) for a PostInteraction event to warrant
-/// self-assessment. Trivial exchanges ("ok", "thanks") don't need LLM analysis.
-pub const MIN_INTERACTION_TOKENS: u32 = 100;
-
-/// Evaluate whether a PostInteraction event is substantial enough to warrant
-/// self-assessment. Trivial exchanges (under MIN_INTERACTION_TOKENS) are suppressed.
-pub fn evaluate_post_interaction(input_tokens: u32, output_tokens: u32) -> EvalDecision {
-    let total = input_tokens.saturating_add(output_tokens);
-    if total < MIN_INTERACTION_TOKENS {
-        tracing::debug!(
-            "post_interaction: suppressed — {} total tokens below minimum {}",
-            total,
-            MIN_INTERACTION_TOKENS
-        );
-        EvalDecision::Suppress
-    } else {
-        EvalDecision::Fire
-    }
-}
-
 // --- Evaluator Trait ---
 
 /// Trait for structural precondition evaluators.
@@ -383,104 +165,12 @@ pub fn evaluate_post_interaction(input_tokens: u32, output_tokens: u32) -> EvalD
 /// (timestamps, token counts, signal deltas) without involving the LLM.
 /// New event types implement this trait to register their own gating logic.
 pub trait Evaluator: Send {
-    /// Check whether this event/task should fire.
+    /// Check whether this event/task should fire. The runner records the
+    /// fire itself, keyed by task id.
     fn evaluate(&self, state: &SchedulerState) -> EvalDecision;
-    /// Record that this event fired — updates evaluator state.
-    fn record_fire(&self, state: &mut SchedulerState);
     /// The key used for state tracking in SchedulerState.
     #[allow(dead_code)]
     fn event_key(&self) -> &str;
-}
-
-/// Pipeline document change evaluator.
-/// Used for both pipeline_frozen and pipeline_conversion_low events.
-pub struct PipelineDocEval {
-    event_key: String,
-    docs_dir: PathBuf,
-}
-
-impl PipelineDocEval {
-    pub fn new(event_key: &str, docs_dir: PathBuf) -> Self {
-        Self {
-            event_key: event_key.to_string(),
-            docs_dir,
-        }
-    }
-}
-
-impl Evaluator for PipelineDocEval {
-    fn evaluate(&self, state: &SchedulerState) -> EvalDecision {
-        match self.event_key.as_str() {
-            "pipeline_frozen" => evaluate_pipeline_frozen(state, &self.docs_dir),
-            "pipeline_conversion_low" => evaluate_pipeline_conversion_low(state, &self.docs_dir),
-            _ => EvalDecision::Fire,
-        }
-    }
-
-    fn record_fire(&self, state: &mut SchedulerState) {
-        state.record_fire(&self.event_key, &self.docs_dir);
-    }
-
-    fn event_key(&self) -> &str {
-        &self.event_key
-    }
-}
-
-/// Cognitive health signal evaluator.
-pub struct CognitiveEval {
-    root_dir: PathBuf,
-    docs_dir: PathBuf,
-}
-
-impl CognitiveEval {
-    pub fn new(root_dir: PathBuf, docs_dir: PathBuf) -> Self {
-        Self { root_dir, docs_dir }
-    }
-}
-
-impl Evaluator for CognitiveEval {
-    fn evaluate(&self, state: &SchedulerState) -> EvalDecision {
-        evaluate_cognitive_decline(state, &self.root_dir)
-    }
-
-    fn record_fire(&self, state: &mut SchedulerState) {
-        let signal_count = count_signal_frames(&self.root_dir);
-        state.record_fire_with_signals("cognitive_decline", &self.docs_dir, signal_count);
-    }
-
-    fn event_key(&self) -> &str {
-        "cognitive_decline"
-    }
-}
-
-/// Post-interaction token threshold evaluator.
-/// Suppresses self-assessment for trivial interactions below the minimum token count.
-pub struct PostInteractionEval {
-    input_tokens: u32,
-    output_tokens: u32,
-}
-
-impl PostInteractionEval {
-    pub fn new(input_tokens: u32, output_tokens: u32) -> Self {
-        Self {
-            input_tokens,
-            output_tokens,
-        }
-    }
-}
-
-impl Evaluator for PostInteractionEval {
-    fn evaluate(&self, _state: &SchedulerState) -> EvalDecision {
-        evaluate_post_interaction(self.input_tokens, self.output_tokens)
-    }
-
-    fn record_fire(&self, _state: &mut SchedulerState) {
-        // PostInteraction is unique per interaction — no persistent state needed.
-    }
-
-    fn event_key(&self) -> &str {
-        "post_interaction"
-    }
 }
 
 // --- Layer 2: salience-gated cycles (PN-95) ---
@@ -630,17 +320,12 @@ pub fn vigil_signal_declining(root_dir: &Path) -> bool {
 /// this decides whether the cycle is worth spending.
 pub struct SalienceEval {
     root_dir: PathBuf,
-    docs_dir: PathBuf,
     config: crate::config::TensionConfig,
 }
 
 impl SalienceEval {
-    pub fn new(root_dir: PathBuf, docs_dir: PathBuf, config: crate::config::TensionConfig) -> Self {
-        Self {
-            root_dir,
-            docs_dir,
-            config,
-        }
+    pub fn new(root_dir: PathBuf, config: crate::config::TensionConfig) -> Self {
+        Self { root_dir, config }
     }
 
     /// The full decision, for callers that want the numbers as well as the
@@ -666,41 +351,32 @@ impl Evaluator for SalienceEval {
         decision.decision
     }
 
-    fn record_fire(&self, state: &mut SchedulerState) {
-        // The cycle itself is recorded in the tension store by
-        // `tension_cycle::open_cycle`; this only keeps the suppression
-        // bookkeeping consistent with the other evaluators.
-        state.record_fire(SALIENCE_EVENT_KEY, &self.docs_dir);
-    }
-
     fn event_key(&self) -> &str {
         SALIENCE_EVENT_KEY
     }
 }
 
+/// Evaluator names that gated tasks on state only the event listener wrote
+/// (`pipeline_frozen` / `pipeline_conversion_low` fire records). PN-133 stopped
+/// the listener writing it, so these resolve to no gate: the task fires on its
+/// cron, without the "unknown evaluator" warning. Kept so live
+/// `schedule.json` entries that still name them stay quiet.
+pub const UNGATED_EVALUATORS: &[&str] = &["pipeline", "pipeline_conversion"];
+
 /// Resolve the evaluator for a scheduled task's evaluator type string.
-/// Returns None for unknown types (task fires without gating).
+/// Returns None for unknown types and for [`UNGATED_EVALUATORS`] (task fires
+/// without gating).
 pub fn resolve_task_evaluator(
     evaluator_type: &str,
     root_dir: &Path,
-    docs_dir: &Path,
     tension: &crate::config::TensionConfig,
 ) -> Option<Box<dyn Evaluator>> {
     match evaluator_type {
-        "pipeline" => Some(Box::new(PipelineDocEval::new(
-            "pipeline_frozen",
-            docs_dir.to_path_buf(),
-        ))),
-        "pipeline_conversion" => Some(Box::new(PipelineDocEval::new(
-            "pipeline_conversion_low",
-            docs_dir.to_path_buf(),
-        ))),
         // A task pinned to the salience gate with the substrate switched off
         // would be gated by a store that never accrues, i.e. permanently
         // suppressed. Fall through to ungated instead.
         "salience" if tension.enabled => Some(Box::new(SalienceEval::new(
             root_dir.to_path_buf(),
-            docs_dir.to_path_buf(),
             tension.clone(),
         ))),
         _ => None,
@@ -716,71 +392,6 @@ mod tests {
         for doc in PIPELINE_DOCS {
             fs::write(dir.join(doc), "# Test content").unwrap();
         }
-    }
-
-    #[test]
-    fn first_fire_always_fires() {
-        let state = SchedulerState::default();
-        let tmp = TempDir::new().unwrap();
-        setup_docs(tmp.path());
-        assert_eq!(
-            evaluate_pipeline_frozen(&state, tmp.path()),
-            EvalDecision::Fire
-        );
-    }
-
-    #[test]
-    fn suppress_when_no_changes() {
-        let tmp = TempDir::new().unwrap();
-        setup_docs(tmp.path());
-
-        let mut state = SchedulerState::default();
-        state.record_fire("pipeline_frozen", tmp.path());
-
-        // No changes — should suppress
-        assert_eq!(
-            evaluate_pipeline_frozen(&state, tmp.path()),
-            EvalDecision::Suppress
-        );
-    }
-
-    #[test]
-    fn fire_when_document_changes() {
-        let tmp = TempDir::new().unwrap();
-        setup_docs(tmp.path());
-
-        let mut state = SchedulerState::default();
-        state.record_fire("pipeline_frozen", tmp.path());
-
-        // Simulate a document change by backdating the recorded timestamp
-        if let Some(es) = state.events.get_mut("pipeline_frozen") {
-            es.doc_timestamps.insert("LEARNING.md".to_string(), 1000000);
-        }
-
-        assert_eq!(
-            evaluate_pipeline_frozen(&state, tmp.path()),
-            EvalDecision::Fire
-        );
-    }
-
-    #[test]
-    fn safety_net_fires_after_timeout() {
-        let tmp = TempDir::new().unwrap();
-        setup_docs(tmp.path());
-
-        let mut state = SchedulerState::default();
-        state.record_fire("pipeline_frozen", tmp.path());
-
-        // Manually set last_fired to 49 hours ago with tools used (standard 48h safety net)
-        if let Some(es) = state.events.get_mut("pipeline_frozen") {
-            es.last_fired = Utc::now() - chrono::Duration::hours(49);
-            es.last_response_had_tools = true;
-        }
-
-        assert_eq!(
-            evaluate_pipeline_frozen(&state, tmp.path()),
-            EvalDecision::Fire
-        );
     }
 
     #[test]
@@ -813,186 +424,6 @@ mod tests {
     }
 
     #[test]
-    fn new_document_triggers_fire() {
-        let tmp = TempDir::new().unwrap();
-        // Only create some docs initially
-        fs::write(tmp.path().join("LEARNING.md"), "# Test").unwrap();
-
-        let mut state = SchedulerState::default();
-        state.record_fire("pipeline_frozen", tmp.path());
-
-        // Add a new document that wasn't there before
-        fs::write(tmp.path().join("THOUGHTS.md"), "# New").unwrap();
-
-        assert_eq!(
-            evaluate_pipeline_frozen(&state, tmp.path()),
-            EvalDecision::Fire
-        );
-    }
-
-    #[test]
-    fn pipeline_conversion_low_same_logic() {
-        let tmp = TempDir::new().unwrap();
-        setup_docs(tmp.path());
-
-        let mut state = SchedulerState::default();
-        state.record_fire("pipeline_conversion_low", tmp.path());
-
-        // No changes — suppress
-        assert_eq!(
-            evaluate_pipeline_conversion_low(&state, tmp.path()),
-            EvalDecision::Suppress
-        );
-    }
-
-    // --- Phase 2 tests ---
-
-    #[test]
-    fn cognitive_decline_first_fire() {
-        let state = SchedulerState::default();
-        let tmp = TempDir::new().unwrap();
-        assert_eq!(
-            evaluate_cognitive_decline(&state, tmp.path()),
-            EvalDecision::Fire
-        );
-    }
-
-    #[test]
-    fn cognitive_decline_suppress_no_new_signals() {
-        let tmp = TempDir::new().unwrap();
-        // Create monitoring dir with empty signals
-        fs::create_dir_all(tmp.path().join("monitoring")).unwrap();
-        fs::write(tmp.path().join("monitoring/signals.json"), "[]").unwrap();
-
-        let mut state = SchedulerState::default();
-        state.record_fire_with_signals("cognitive_decline", tmp.path(), 0);
-
-        // No new signals — should suppress
-        assert_eq!(
-            evaluate_cognitive_decline(&state, tmp.path()),
-            EvalDecision::Suppress
-        );
-    }
-
-    #[test]
-    fn cognitive_decline_fire_on_new_signals() {
-        let tmp = TempDir::new().unwrap();
-        fs::create_dir_all(tmp.path().join("monitoring")).unwrap();
-
-        // Start with 0 signals at last fire
-        let mut state = SchedulerState::default();
-        state.record_fire_with_signals("cognitive_decline", tmp.path(), 0);
-
-        // Add 2 signal frames
-        let signals = r#"[{"timestamp":"2026-04-02T10:00:00Z","task_id":"test","vocabulary_diversity":0.7,"question_count":3,"evidence_references":2,"thought_progress":true},{"timestamp":"2026-04-02T11:00:00Z","task_id":"test","vocabulary_diversity":0.6,"question_count":1,"evidence_references":1,"thought_progress":false}]"#;
-        fs::write(tmp.path().join("monitoring/signals.json"), signals).unwrap();
-
-        // New signals available — should fire
-        assert_eq!(
-            evaluate_cognitive_decline(&state, tmp.path()),
-            EvalDecision::Fire
-        );
-    }
-
-    #[test]
-    fn cognitive_decline_safety_net() {
-        let tmp = TempDir::new().unwrap();
-        fs::create_dir_all(tmp.path().join("monitoring")).unwrap();
-        fs::write(tmp.path().join("monitoring/signals.json"), "[]").unwrap();
-
-        let mut state = SchedulerState::default();
-        state.record_fire_with_signals("cognitive_decline", tmp.path(), 0);
-
-        // Set last_fired to 49 hours ago
-        if let Some(es) = state.events.get_mut("cognitive_decline") {
-            es.last_fired = Utc::now() - chrono::Duration::hours(49);
-            es.last_response_had_tools = true; // Standard safety net (48h)
-        }
-
-        assert_eq!(
-            evaluate_cognitive_decline(&state, tmp.path()),
-            EvalDecision::Fire
-        );
-    }
-
-    #[test]
-    fn cognitive_decline_extended_cooldown_no_tools() {
-        let tmp = TempDir::new().unwrap();
-        fs::create_dir_all(tmp.path().join("monitoring")).unwrap();
-        fs::write(tmp.path().join("monitoring/signals.json"), "[]").unwrap();
-
-        let mut state = SchedulerState::default();
-        state.record_fire_with_signals("cognitive_decline", tmp.path(), 0);
-
-        // Set last_fired to 49 hours ago but last response had no tools
-        if let Some(es) = state.events.get_mut("cognitive_decline") {
-            es.last_fired = Utc::now() - chrono::Duration::hours(49);
-            es.last_response_had_tools = false; // Extended cooldown (96h)
-        }
-
-        // 49h < 96h extended cooldown — should still suppress
-        assert_eq!(
-            evaluate_cognitive_decline(&state, tmp.path()),
-            EvalDecision::Suppress
-        );
-    }
-
-    #[test]
-    fn pipeline_frozen_extended_cooldown_no_tools() {
-        let tmp = TempDir::new().unwrap();
-        setup_docs(tmp.path());
-
-        let mut state = SchedulerState::default();
-        state.record_fire("pipeline_frozen", tmp.path());
-
-        // Set last response had no tools and 49 hours elapsed
-        if let Some(es) = state.events.get_mut("pipeline_frozen") {
-            es.last_fired = Utc::now() - chrono::Duration::hours(49);
-            es.last_response_had_tools = false; // Extended to 96h
-        }
-
-        // 49h < 96h extended safety net — should still suppress
-        assert_eq!(
-            evaluate_pipeline_frozen(&state, tmp.path()),
-            EvalDecision::Suppress
-        );
-    }
-
-    #[test]
-    fn pipeline_frozen_normal_cooldown_with_tools() {
-        let tmp = TempDir::new().unwrap();
-        setup_docs(tmp.path());
-
-        let mut state = SchedulerState::default();
-        state.record_fire("pipeline_frozen", tmp.path());
-
-        // Set last response had tools and 49 hours elapsed
-        if let Some(es) = state.events.get_mut("pipeline_frozen") {
-            es.last_fired = Utc::now() - chrono::Duration::hours(49);
-            es.last_response_had_tools = true; // Standard 48h
-        }
-
-        // 49h > 48h standard safety net — should fire
-        assert_eq!(
-            evaluate_pipeline_frozen(&state, tmp.path()),
-            EvalDecision::Fire
-        );
-    }
-
-    #[test]
-    fn record_fire_with_signals_tracks_count() {
-        let tmp = TempDir::new().unwrap();
-        setup_docs(tmp.path());
-
-        let mut state = SchedulerState::default();
-        state.record_fire_with_signals("cognitive_decline", tmp.path(), 42);
-
-        let es = state.events.get("cognitive_decline").unwrap();
-        assert_eq!(es.signal_count_at_fire, Some(42));
-        assert_eq!(es.suppression_count, 0);
-    }
-
-    #[test]
     fn save_creates_parent_directories() {
         let tmp = TempDir::new().unwrap();
         let nested = tmp.path().join("deep/nested/dir");
@@ -1004,122 +435,35 @@ mod tests {
     }
 
     #[test]
-    fn count_signal_frames_empty() {
-        let tmp = TempDir::new().unwrap();
-        assert_eq!(count_signal_frames(tmp.path()), 0);
-    }
-
-    #[test]
-    fn count_signal_frames_with_data() {
-        let tmp = TempDir::new().unwrap();
-        fs::create_dir_all(tmp.path().join("monitoring")).unwrap();
-        let signals = r#"[{"a":1},{"b":2},{"c":3}]"#;
-        fs::write(tmp.path().join("monitoring/signals.json"), signals).unwrap();
-        assert_eq!(count_signal_frames(tmp.path()), 3);
-    }
-
-    // --- Post-interaction evaluator tests ---
-
-    #[test]
-    fn post_interaction_suppress_trivial() {
-        // 50 + 30 = 80 tokens, below 100 threshold
-        assert_eq!(evaluate_post_interaction(50, 30), EvalDecision::Suppress);
-    }
-
-    #[test]
-    fn post_interaction_fire_substantial() {
-        // 100 + 200 = 300 tokens, above threshold
-        assert_eq!(evaluate_post_interaction(100, 200), EvalDecision::Fire);
-    }
-
-    #[test]
-    fn post_interaction_fire_at_threshold() {
-        // Exactly 100 tokens — should fire (not strictly less)
-        assert_eq!(evaluate_post_interaction(50, 50), EvalDecision::Fire);
-    }
-
-    #[test]
-    fn post_interaction_suppress_zero_tokens() {
-        assert_eq!(evaluate_post_interaction(0, 0), EvalDecision::Suppress);
-    }
-
-    // --- Evaluator trait tests ---
-
-    #[test]
-    fn trait_pipeline_doc_eval_delegates() {
-        let tmp = TempDir::new().unwrap();
-        setup_docs(tmp.path());
-
-        let eval = PipelineDocEval::new("pipeline_frozen", tmp.path().to_path_buf());
-        let state = SchedulerState::default();
-
-        // First fire — should fire
-        assert_eq!(eval.evaluate(&state), EvalDecision::Fire);
-        assert_eq!(eval.event_key(), "pipeline_frozen");
-    }
-
-    #[test]
-    fn trait_pipeline_doc_eval_record_fire() {
-        let tmp = TempDir::new().unwrap();
-        setup_docs(tmp.path());
-
-        let eval = PipelineDocEval::new("pipeline_frozen", tmp.path().to_path_buf());
-        let mut state = SchedulerState::default();
-
-        eval.record_fire(&mut state);
-        assert!(state.events.contains_key("pipeline_frozen"));
-
-        // After recording, should suppress (no changes)
-        assert_eq!(eval.evaluate(&state), EvalDecision::Suppress);
-    }
-
-    #[test]
-    fn trait_cognitive_eval_delegates() {
-        let tmp = TempDir::new().unwrap();
-        let eval = CognitiveEval::new(tmp.path().to_path_buf(), tmp.path().to_path_buf());
-        let state = SchedulerState::default();
-
-        assert_eq!(eval.evaluate(&state), EvalDecision::Fire);
-        assert_eq!(eval.event_key(), "cognitive_decline");
-    }
-
-    #[test]
-    fn trait_post_interaction_eval() {
-        let state = SchedulerState::default();
-
-        let trivial = PostInteractionEval::new(20, 30);
-        assert_eq!(trivial.evaluate(&state), EvalDecision::Suppress);
-        assert_eq!(trivial.event_key(), "post_interaction");
-
-        let substantial = PostInteractionEval::new(500, 1000);
-        assert_eq!(substantial.evaluate(&state), EvalDecision::Fire);
-    }
-
-    #[test]
     fn resolve_task_evaluator_known_types() {
         let tmp = TempDir::new().unwrap();
         setup_docs(tmp.path());
         let tension = crate::config::TensionConfig::default();
 
-        let pipeline = resolve_task_evaluator("pipeline", tmp.path(), tmp.path(), &tension);
-        assert!(pipeline.is_some());
-        assert_eq!(pipeline.unwrap().event_key(), "pipeline_frozen");
-
-        let conversion =
-            resolve_task_evaluator("pipeline_conversion", tmp.path(), tmp.path(), &tension);
-        assert!(conversion.is_some());
-        assert_eq!(conversion.unwrap().event_key(), "pipeline_conversion_low");
-
-        let salience = resolve_task_evaluator("salience", tmp.path(), tmp.path(), &tension);
+        let salience = resolve_task_evaluator("salience", tmp.path(), &tension);
         assert!(salience.is_some());
         assert_eq!(salience.unwrap().event_key(), SALIENCE_EVENT_KEY);
+    }
+
+    /// The retired pipeline gates read state nothing writes any more; they
+    /// resolve to no gate rather than to an evaluator that always fires.
+    #[test]
+    fn retired_pipeline_evaluators_resolve_to_no_gate() {
+        let tmp = TempDir::new().unwrap();
+        let tension = crate::config::TensionConfig::default();
+        for name in UNGATED_EVALUATORS {
+            assert!(
+                resolve_task_evaluator(name, tmp.path(), &tension).is_none(),
+                "{name}"
+            );
+        }
     }
 
     #[test]
     fn resolve_task_evaluator_unknown_type() {
         let tmp = TempDir::new().unwrap();
         let tension = crate::config::TensionConfig::default();
-        assert!(resolve_task_evaluator("nonexistent", tmp.path(), tmp.path(), &tension).is_none());
+        assert!(resolve_task_evaluator("nonexistent", tmp.path(), &tension).is_none());
     }
 
     /// Gating a task on a store that never accrues would suppress it
@@ -1131,7 +475,7 @@ mod tests {
             enabled: false,
             ..crate::config::TensionConfig::default()
         };
-        assert!(resolve_task_evaluator("salience", tmp.path(), tmp.path(), &tension).is_none());
+        assert!(resolve_task_evaluator("salience", tmp.path(), &tension).is_none());
     }
 
     // ----- Layer 2: salience gating (PN-95 §2.2) --------------------------
@@ -1316,7 +660,7 @@ mod tests {
         })
         .unwrap();
 
-        let eval = SalienceEval::new(tmp.path().to_path_buf(), tmp.path().to_path_buf(), config);
+        let eval = SalienceEval::new(tmp.path().to_path_buf(), config);
         assert_eq!(
             eval.evaluate(&SchedulerState::default()),
             EvalDecision::Fire
