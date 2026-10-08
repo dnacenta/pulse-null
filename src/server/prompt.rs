@@ -314,26 +314,8 @@ pub fn build_system_prompt_budgeted(
     }
 
     // --- AWARENESS.md ---
-    // Part of the essential idpulse. An agent CLI that resolves the
-    // `@AWARENESS.md` import in the instruction file gets it that way;
-    // everything else gets it inlined here.
-    if !awareness_via_import(config) {
-        let awareness_path = root_dir.join("AWARENESS.md");
-        if awareness_path.exists() {
-            let content = std::fs::read_to_string(&awareness_path)?;
-            if !content.trim().is_empty() {
-                let bounded = truncate_to_byte_cap(&content, budget_cfg.awareness_max_bytes);
-                let wrapped = format!("<platform>\n{}\n</platform>", bounded);
-                let tokens = estimate_tokens(&wrapped);
-                components.push(PromptComponent {
-                    name: "AWARENESS.md",
-                    content: wrapped,
-                    tokens,
-                    tier: PromptTier::High,
-                    cap: 0, // no separate cap
-                });
-            }
-        }
+    if let Some(component) = awareness_component(root_dir, config)? {
+        components.push(component);
     }
 
     // --- Tier 1 (High): MEMORY.md ---
@@ -773,6 +755,36 @@ fn file_write_tool(config: &Config) -> &'static str {
     }
 }
 
+/// AWARENESS.md as a `<platform>` component (High tier, bounded by
+/// `awareness_max_bytes`), for every profile. An agent CLI that resolves the
+/// `@AWARENESS.md` import in its instruction file gets it that way; everything
+/// else gets it inlined here. `None` when imported, missing or blank.
+fn awareness_component(
+    root_dir: &Path,
+    config: &Config,
+) -> Result<Option<PromptComponent>, crate::errors::PromptError> {
+    if awareness_via_import(config) {
+        return Ok(None);
+    }
+    let awareness_path = root_dir.join("AWARENESS.md");
+    if !awareness_path.exists() {
+        return Ok(None);
+    }
+    let content = std::fs::read_to_string(&awareness_path)?;
+    if content.trim().is_empty() {
+        return Ok(None);
+    }
+    let bounded = truncate_to_byte_cap(&content, config.system_prompt_budget.awareness_max_bytes);
+    let wrapped = format!("<platform>\n{}\n</platform>", bounded);
+    Ok(Some(PromptComponent {
+        name: "AWARENESS.md",
+        tokens: estimate_tokens(&wrapped),
+        content: wrapped,
+        tier: PromptTier::High,
+        cap: 0, // no separate cap
+    }))
+}
+
 /// The adapter for the agent CLI this config drives, if any.
 fn agent_cli(config: &Config) -> Option<Box<dyn crate::cli_provider::adapter::CliAdapter>> {
     config
@@ -790,7 +802,8 @@ fn awareness_via_import(config: &Config) -> bool {
 /// Build a minimal system prompt for scheduled tasks (Phase 5: Task Isolation).
 ///
 /// Includes only the identity core: the instruction file + rules + SELF.md,
-/// plus the thought stack and tension threads.
+/// plus AWARENESS.md (unless the CLI imports it), the thought stack, the
+/// journal counts and the tension threads.
 /// Excludes: MEMORY.md, EPHEMERAL.md and FINDINGS.md. This keeps the task's
 /// context small and focused, leaving more room for the task prompt and tool
 /// output.
@@ -891,6 +904,11 @@ pub fn build_task_system_prompt_budgeted(
             tier: PromptTier::High,
             cap: budget_cfg.self_md_cap,
         });
+    }
+
+    // --- Tier 1 (High): AWARENESS.md — every profile, not only chat ---
+    if let Some(component) = awareness_component(root_dir, config)? {
+        components.push(component);
     }
 
     // --- Tier 1 (High): THOUGHT_STACK.md — working memory ---
@@ -1081,10 +1099,12 @@ const JOURNAL_COUNTED: [&str; 3] = ["LEARNING", "THOUGHTS", "REFLECTIONS"];
 /// Token cap for the `<journal-counts>` line; it is one short line.
 const JOURNAL_COUNTS_CAP: usize = 50;
 
-/// `<journal-counts written-by="runtime">` — entry counts of the journal
-/// documents and how long ago the newest of them changed. A plain runtime
-/// fact: no advice, never a wake, never a reward input. `None` when the
-/// pipeline is off or no counted journal file exists.
+/// `<journal-counts written-by="runtime" as-of="…">` — entry counts of the
+/// journal documents and how long ago the newest of them changed. A plain
+/// runtime fact: no advice, never a wake, never a reward input. `as-of` is
+/// the assembly time, so a copy frozen in a boot-time snapshot (the chat
+/// prompt) is visibly dated. `None` when the pipeline is off or no counted
+/// journal file exists.
 fn journal_counts_line(root_dir: &Path, config: &Config) -> Option<String> {
     if !config.pipeline.enabled {
         return None;
@@ -1108,12 +1128,18 @@ fn journal_counts_line(root_dir: &Path, config: &Config) -> Option<String> {
             health.reflections.count,
         ],
         age_days,
+        chrono::Utc::now(),
     ))
 }
 
-fn render_journal_counts(counts: [usize; 3], age_days: u64) -> String {
+/// `age_days` is whole days since the newest change, so 0 means under 24 h.
+fn render_journal_counts(
+    counts: [usize; 3],
+    age_days: u64,
+    as_of: chrono::DateTime<chrono::Utc>,
+) -> String {
     let age = match age_days {
-        0 => "today".to_string(),
+        0 => "under 1 d ago".to_string(),
         n => format!("{n} d ago"),
     };
     let counts: Vec<String> = JOURNAL_COUNTED
@@ -1122,7 +1148,8 @@ fn render_journal_counts(counts: [usize; 3], age_days: u64) -> String {
         .map(|(doc, count)| format!("{doc} {count}"))
         .collect();
     format!(
-        "<journal-counts written-by=\"runtime\">{} · last change {age}</journal-counts>",
+        "<journal-counts written-by=\"runtime\" as-of=\"{}\">{} · last change {age}</journal-counts>",
+        as_of.format("%Y-%m-%d %H:%M UTC"),
         counts.join(" · ")
     )
 }
@@ -1313,7 +1340,7 @@ fn build_capabilities(config: &Config) -> Vec<Capability> {
         };
         capabilities.push(Capability {
             name: "Knowledge Graph".into(),
-            what: "Semantic knowledge graph with your accumulated knowledge. Check <graph-awareness> in your prompt for current stats.".into(),
+            what: "Semantic knowledge graph built from your conversation archives.".into(),
             why: "Structured knowledge that memory files can't capture — relationships between concepts, people, and ideas with confidence scores.".into(),
             how: format!("{query}Graph is populated automatically from conversation archives. Storage is SurrealDB."),
             constraints: Some("Bayesian confidence model on edges. Priors vary by extraction context. Multi-hop path confidence is the product of edge confidences.".into()),
@@ -1325,7 +1352,7 @@ fn build_capabilities(config: &Config) -> Vec<Capability> {
         capabilities.push(Capability {
             name: "Document Pipeline".into(),
             what: "Growth pipeline: LEARNING.md → THOUGHTS.md → REFLECTIONS.md → SELF.md / PRAXIS.md. Tracked in journal/ directory.".into(),
-            why: "Turns encounters into identity. Raw captures become incubated thoughts, then crystallized observations, then integrated changes to who you are.".into(),
+            why: String::new(),
             how: "Write to LEARNING.md when you learn something new. Move ideas to THOUGHTS.md for incubation. Crystallize into REFLECTIONS.md. Integrate into SELF.md or PRAXIS.md when mature.".into(),
             constraints: Some(format!(
                 "Thresholds — LEARNING: {}/{}, THOUGHTS: {}/{}, CURIOSITY: {}/{}, REFLECTIONS: {}/{}, PRAXIS: {}/{}. Archive when hitting limits.",
@@ -1343,8 +1370,8 @@ fn build_capabilities(config: &Config) -> Vec<Capability> {
         capabilities.push(Capability {
             name: "Cognitive Monitoring (vigil)".into(),
             what: "Metacognitive monitoring that tracks vocabulary diversity, question generation, thought lifecycle, and evidence grounding.".into(),
-            why: "Detects mechanical reflection. Keeps your growth genuine rather than performative.".into(),
-            how: "Vigil runs automatically and records its data for the owner. Nothing from it is injected into your context.".into(),
+            why: String::new(),
+            how: "Vigil records signal frames from task and intent output for the owner; none of it is placed in your prompt. If a scheduled task is gated on salience, a declining vigil analysis is one of the conditions that lets that task's cycle run.".into(),
             constraints: Some(format!("Window size: {} samples, minimum {} before signals appear.", config.monitoring.window_size, config.monitoring.min_samples)),
         });
     }
@@ -1353,11 +1380,11 @@ fn build_capabilities(config: &Config) -> Vec<Capability> {
     if config.pipeline.enabled {
         capabilities.push(Capability {
             name: "Pipeline Monitoring (praxis)".into(),
-            what: "Enforces pipeline health — tracks document counts, staleness, and frozen pipeline alerts.".into(),
-            why: "Ideas should move through stages, not stagnate. Praxis ensures the pipeline flows.".into(),
-            how: "Praxis runs automatically and records its data for the owner. Nothing from it is injected into your context.".into(),
+            what: "Counts journal entries and tracks staleness and sessions without movement; at boot it archives the overflow of documents over their hard limit.".into(),
+            why: String::new(),
+            how: "The entry counts appear in your prompt as the one-line <journal-counts> runtime fact. The rest is recorded for the owner.".into(),
             constraints: Some(format!(
-                "Staleness: thoughts after {} days, curiosity after {} days. Freeze alert after {} sessions without movement.",
+                "Staleness: thoughts after {} days, curiosity after {} days. A freeze is recorded after {} sessions without movement.",
                 config.pipeline.thoughts_staleness_days,
                 config.pipeline.curiosity_staleness_days,
                 config.pipeline.freeze_threshold,
@@ -1392,9 +1419,9 @@ fn build_capabilities(config: &Config) -> Vec<Capability> {
     if config.caliber.enabled {
         capabilities.push(Capability {
             name: "Outcome Tracking (caliber)".into(),
-            what: "Operational self-model that records outcomes of tasks and intents — success, failure, partial, skipped.".into(),
-            why: "Learn from your own performance. Calibrate confidence in your abilities over time.".into(),
-            how: "Outcomes are recorded automatically after task execution. Review your caliber data to understand patterns in what works and what doesn't.".into(),
+            what: "Records the outcome of each conversation, task and intent (success, failure, partial, surprising) for the owner.".into(),
+            why: String::new(),
+            how: "Recorded automatically; none of it is placed in your prompt.".into(),
             constraints: Some(format!("Rolling window of {} outcomes.", config.caliber.max_outcomes)),
         });
     }
@@ -1457,17 +1484,21 @@ fn build_cli_tools_section(
             list.join("\n")
         ));
     }
-    let note = adapter.tool_surface_note();
-    if !note.is_empty() {
-        parts.push(note.to_string());
-    }
     let removed: Vec<&str> = surface
         .iter()
         .copied()
         .filter(|t| !isolated.contains(t))
         .collect();
     if !removed.is_empty() {
-        parts.push(format!("Isolation mode removes {}.", removed.join(", ")));
+        // Scoped to this list: the adapter's note says what it does not cover.
+        parts.push(format!(
+            "Isolation mode removes, from this list: {}.",
+            removed.join(", ")
+        ));
+    }
+    let note = adapter.tool_surface_note();
+    if !note.is_empty() {
+        parts.push(note.to_string());
     }
     if parts.is_empty() {
         return None;
@@ -1583,12 +1614,16 @@ pub fn rebuild_platform_manifest(
 /// their environment rather than just listing features.
 const PLATFORM_TEMPLATE: &str = include_str!("../../assets/platform-template.md");
 
+/// Prefix of the last line of AWARENESS.md, which stamps when it was made.
+const AWARENESS_STAMP_PREFIX: &str = "Generated at ";
+
 /// Generate the complete AWARENESS.md document.
 ///
 /// Combines the conceptual template (philosophy) with the dynamic capabilities
 /// manifest (config-driven inventory). In compact mode, only the manifest is
-/// included to save context tokens. The template's `{generated_at}` is
-/// stamped with the current UTC time, so a reader can tell how old it is.
+/// included to save context tokens. Both modes end with a
+/// `Generated at <UTC time>.` line, so a reader can tell how old it is; it is
+/// the last line so everything above it stays byte-stable for prompt caching.
 ///
 /// Returns the full document content ready to write to disk or inject into
 /// a system prompt.
@@ -1598,22 +1633,26 @@ pub fn generate_awareness_document(
     tool_names: &[String],
 ) -> String {
     let manifest = rebuild_platform_manifest(config, plugin_descriptions, tool_names);
-
-    match config.platform.mode {
+    let body = match config.platform.mode {
         AwarenessMode::Compact => manifest,
-        AwarenessMode::Full => {
-            let generated_at = chrono::Utc::now().format("%Y-%m-%d %H:%M:%S UTC");
-            let template = PLATFORM_TEMPLATE
-                .trim()
-                .replace("{generated_at}", &generated_at.to_string());
-            format!("{template}\n\n{manifest}")
-        }
+        AwarenessMode::Full => format!("{}\n\n{manifest}", PLATFORM_TEMPLATE.trim()),
+    };
+    let generated_at = chrono::Utc::now().format("%Y-%m-%d %H:%M:%S UTC");
+    format!("{body}\n\n{AWARENESS_STAMP_PREFIX}{generated_at}.")
+}
+
+/// The document without its trailing `Generated at` line.
+fn awareness_without_stamp(doc: &str) -> &str {
+    match doc.trim_end().rsplit_once('\n') {
+        Some((body, last)) if last.starts_with(AWARENESS_STAMP_PREFIX) => body.trim_end(),
+        _ => doc.trim_end(),
     }
 }
 
 /// Write AWARENESS.md to the pulse's root directory.
 ///
-/// Called at startup and on plugin state changes (failure/recovery).
+/// Called at startup and on plugin state changes (failure/recovery). Skips
+/// the write when only the trailing stamp would change.
 /// Adapters whose CLI resolves the `@AWARENESS.md` import in the instruction
 /// file get it that way; for every other provider the content is injected
 /// directly into the system prompt.
@@ -1625,6 +1664,14 @@ pub fn write_awareness_file(
 ) -> Result<(), crate::errors::PromptError> {
     let content = generate_awareness_document(config, plugin_descriptions, tool_names);
     let awareness_path = root_dir.join("AWARENESS.md");
+    // A rebuild that changes nothing but the stamp (a plugin flapping down
+    // and back up) keeps the old bytes, so the prompt cache survives it. The
+    // stamp then says when the content last changed.
+    if let Ok(existing) = std::fs::read_to_string(&awareness_path) {
+        if awareness_without_stamp(&existing) == awareness_without_stamp(&content) {
+            return Ok(());
+        }
+    }
     std::fs::write(&awareness_path, &content)?;
     info!(
         "Generated AWARENESS.md ({} bytes, mode: {})",
@@ -2035,6 +2082,22 @@ mod tests {
         generate_awareness_document(config, &plugins, &tools)
     }
 
+    /// Claims AWARENESS used to make that were false or aspirational.
+    fn assert_no_false_capability_claims(doc: &str, label: &str) {
+        for claim in [
+            "nothing from it is injected",
+            "Calibrate confidence",
+            "Review your caliber data",
+            "growth genuine",
+            "pipeline flows",
+            "<graph-awareness>",
+        ] {
+            assert!(!doc.contains(claim), "{label}: AWARENESS claims {claim:?}");
+        }
+        // Praxis' one injected fact is named, not denied.
+        assert!(doc.contains("<journal-counts>"), "{label}");
+    }
+
     #[test]
     fn awareness_names_only_tools_the_adapter_exposes() {
         const ADAPTERS: [&str; 3] = ["claude", "grok", "codex"];
@@ -2078,14 +2141,16 @@ mod tests {
             assert!(doc.contains("## Your tools"), "{name}");
             assert!(doc.contains(cli.tool_surface_note()), "{name}");
             assert!(!doc.contains("## Available Tools"), "{name}");
+            assert_no_false_capability_claims(&doc, name);
         }
 
         assert!(awareness_for(&cli_config("claude"))
-            .contains("Isolation mode removes Bash, Write, Edit, Agent."));
+            .contains("Isolation mode removes, from this list: Bash, Write, Edit, Agent."));
         assert!(!awareness_for(&cli_config("codex")).contains("Isolation mode"));
 
         // An API provider is handed the registry, so it is listed.
         let doc = awareness_for(&with_every_plugin(minimal_config()));
+        assert_no_false_capability_claims(&doc, "ollama");
         assert!(doc.contains("## Available Tools"));
         assert!(!doc.contains("## Your tools"));
         for tool in REGISTRY_ONLY_TOOLS {
@@ -2250,12 +2315,15 @@ mod tests {
 
     #[test]
     fn journal_counts_line_is_a_fact_without_advice() {
+        let as_of = chrono::DateTime::parse_from_rfc3339("2026-10-08T21:40:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
         assert_eq!(
-            render_journal_counts([7, 5, 14], 9),
-            "<journal-counts written-by=\"runtime\">LEARNING 7 · THOUGHTS 5 · REFLECTIONS 14 · last change 9 d ago</journal-counts>"
+            render_journal_counts([7, 5, 14], 9, as_of),
+            "<journal-counts written-by=\"runtime\" as-of=\"2026-10-08 21:40 UTC\">LEARNING 7 · THOUGHTS 5 · REFLECTIONS 14 · last change 9 d ago</journal-counts>"
         );
-        assert!(render_journal_counts([0, 0, 0], 0).contains("last change today"));
-        assert!(render_journal_counts([0, 0, 0], 1).contains("last change 1 d ago"));
+        assert!(render_journal_counts([0, 0, 0], 0, as_of).contains("last change under 1 d ago"));
+        assert!(render_journal_counts([0, 0, 0], 1, as_of).contains("last change 1 d ago"));
 
         let dir = tempfile::tempdir().unwrap();
         let mut config = minimal_config();
@@ -2281,7 +2349,8 @@ mod tests {
                 .unwrap();
         }
         let line = journal_counts_line(dir.path(), &config).expect("journal files exist");
-        assert!(line.starts_with("<journal-counts written-by=\"runtime\">LEARNING "));
+        assert!(line.starts_with("<journal-counts written-by=\"runtime\" as-of=\""));
+        assert!(line.contains(" UTC\">LEARNING "), "{line}");
         assert!(
             line.ends_with("· last change 9 d ago</journal-counts>"),
             "{line}"
@@ -2294,8 +2363,15 @@ mod tests {
 
         let chat = build_system_prompt(dir.path(), &config).unwrap();
         let task = build_task_system_prompt(dir.path(), &config).unwrap();
-        assert!(chat.contains(&line), "chat profile carries the line");
-        assert!(task.contains(&line), "task profile carries the line");
+        // `as-of` is the assembly minute, which may tick between calls.
+        let (_, body) = line.split_once("\">").unwrap();
+        for (profile, text) in [("chat", &chat), ("task", &task)] {
+            assert!(
+                text.contains("<journal-counts written-by=\"runtime\" as-of=\""),
+                "{profile}"
+            );
+            assert!(text.contains(body), "{profile} carries the line");
+        }
 
         config.pipeline.enabled = false;
         assert!(journal_counts_line(dir.path(), &config).is_none());
@@ -2365,6 +2441,49 @@ mod tests {
     }
 
     #[test]
+    fn awareness_reaches_every_profile_for_every_adapter() {
+        let mut configs = vec![("ollama", unbudgeted(minimal_config()))];
+        for adapter in ["grok", "codex", "claude"] {
+            configs.push((adapter, unbudgeted(cli_config(adapter))));
+        }
+        for (label, config) in configs {
+            // The claude CLI resolves the `@AWARENESS.md` import itself.
+            let inlined = label != "claude";
+            for (profile, text) in every_profile(&config) {
+                assert_eq!(
+                    text.contains("<platform>"),
+                    inlined,
+                    "{label}/{profile}: AWARENESS inlined = {}",
+                    !inlined
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn awareness_rewrite_differing_only_by_the_stamp_keeps_the_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = minimal_config();
+        let path = dir.path().join("AWARENESS.md");
+        write_awareness_file(dir.path(), &config, &[], &[]).unwrap();
+
+        // Back-date the stamp, as an earlier boot would have left it.
+        let first = std::fs::read_to_string(&path).unwrap();
+        let (body, _) = first.rsplit_once('\n').unwrap();
+        let old = format!("{body}\nGenerated at 2026-01-01 00:00:00 UTC.");
+        std::fs::write(&path, &old).unwrap();
+
+        write_awareness_file(dir.path(), &config, &[], &[]).unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), old, "same content");
+
+        let plugins = vec![("recall-echo".to_string(), "memory".to_string())];
+        write_awareness_file(dir.path(), &config, &plugins, &[]).unwrap();
+        let changed = std::fs::read_to_string(&path).unwrap();
+        assert_ne!(changed, old, "a real change is written");
+        assert!(!changed.contains("2026-01-01"));
+    }
+
+    #[test]
     fn awareness_template_is_stamped_and_claims_no_proprioception() {
         let doc = generate_awareness_document(&minimal_config(), &[], &[]);
         let stamp = doc
@@ -2373,6 +2492,23 @@ mod tests {
             .expect("Generated at line");
         assert!(stamp.ends_with(" UTC."), "{stamp}");
         assert!(!doc.contains("{generated_at}"));
+        // Last, so the bytes above it stay stable for prompt caching; and
+        // compact mode is stamped too.
+        assert!(doc
+            .trim_end()
+            .lines()
+            .last()
+            .unwrap()
+            .starts_with("Generated at "));
+        let mut compact = minimal_config();
+        compact.platform.mode = AwarenessMode::Compact;
+        let compact = generate_awareness_document(&compact, &[], &[]);
+        assert!(compact
+            .trim_end()
+            .lines()
+            .last()
+            .unwrap()
+            .starts_with("Generated at "));
         assert!(!doc.contains("proprioception"));
         assert!(!doc.contains("what is real right now"));
         assert!(doc.contains("regenerated at boot and when a plugin changes state"));
@@ -2737,13 +2873,15 @@ mod tests {
         );
         assert_eq!(chat.prompt.matches("byte ceiling").count(), 3);
 
+        // The task profile carries the thought stack (48 KiB ceiling) and,
+        // since PN-133, AWARENESS (16 KiB ceiling).
         let task = build_task_system_prompt_budgeted(dir.path(), &config).unwrap();
         assert!(
-            task.prompt.len() < 64 * 1024,
+            task.prompt.len() < 72 * 1024,
             "task prompt unbounded with budget disabled: {} bytes",
             task.prompt.len()
         );
-        assert!(task.prompt.contains("byte ceiling"));
+        assert_eq!(task.prompt.matches("byte ceiling").count(), 2);
     }
 
     /// AC1 (prompt side): a 10MB THOUGHT_STACK of 4KB lines still assembles

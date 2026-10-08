@@ -11,10 +11,13 @@ pub struct Capability {
 
 /// Render a single capability as a markdown section.
 pub fn render(cap: &Capability) -> String {
-    let mut out = format!(
-        "### {}\n**What:** {}\n**Why:** {}\n**How:** {}",
-        cap.name, cap.what, cap.why, cap.how
-    );
+    let mut out = format!("### {}\n**What:** {}", cap.name, cap.what);
+    // A capability with no factual reason to state says nothing rather than
+    // something aspirational.
+    if !cap.why.is_empty() {
+        out.push_str(&format!("\n**Why:** {}", cap.why));
+    }
+    out.push_str(&format!("\n**How:** {}", cap.how));
     if let Some(ref c) = cap.constraints {
         out.push_str(&format!("\n**Constraints:** {}", c));
     }
@@ -50,6 +53,20 @@ mod tests {
         assert!(rendered.contains("**Why:** Because"));
         assert!(rendered.contains("**How:** Like this"));
         assert!(rendered.contains("**Constraints:** Max 10"));
+    }
+
+    #[test]
+    fn render_omits_why_when_empty() {
+        let cap = Capability {
+            name: "Plain".into(),
+            what: "W".into(),
+            why: String::new(),
+            how: "H".into(),
+            constraints: None,
+        };
+        let rendered = render(&cap);
+        assert!(!rendered.contains("**Why:**"));
+        assert!(rendered.contains("**What:** W\n**How:** H"));
     }
 
     #[test]

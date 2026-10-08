@@ -283,7 +283,7 @@ impl Plugin for VigilEchoPlugin {
             "Metacognitive monitoring system. Tracks vocabulary diversity, \
              question generation, thought lifecycle, and evidence grounding \
              across your reflective output. Records this monitoring data \
-             for the owner; nothing from it is injected into your context."
+             for the owner; none of it is placed in your prompt."
                 .to_string(),
         )
     }

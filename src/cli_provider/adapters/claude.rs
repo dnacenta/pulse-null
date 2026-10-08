@@ -232,7 +232,8 @@ impl CliAdapter for Claude {
     }
 
     fn tool_surface_note(&self) -> &'static str {
-        "Measured on Claude Code 2.1.282; more tools load on demand through ToolSearch."
+        "Measured on Claude Code 2.1.282. More tools load on demand through ToolSearch and \
+         are not covered by this list; isolation removes the write and shell tools by name."
     }
 
     /// The one place the AUP refusal signature lives: the buffered exit and
