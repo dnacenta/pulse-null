@@ -148,6 +148,22 @@ pub async fn awareness_then_system_prompt(
     super::prompt::build_system_prompt_async(root_dir.to_path_buf(), config.clone()).await
 }
 
+/// Void every open free-form prediction (PN-133 Phase 0). Runs whether or not
+/// `[prediction]` is enabled: the point is that no open free-form prediction
+/// is ever shown or counted again, and the file outlives the setting. Shed
+/// while isolated (nothing that writes); the next boot runs it. Never aborts
+/// boot.
+pub fn void_open_predictions(root_dir: &Path) {
+    if crate::server::isolation::is_active(root_dir) {
+        return;
+    }
+    match crate::prediction::store::void_open_predictions(root_dir) {
+        Ok(0) => {}
+        Ok(n) => tracing::info!("voided {n} open predictions"),
+        Err(e) => tracing::error!("Failed to void open predictions: {e}"),
+    }
+}
+
 /// Run the startup pipeline health check and auto-archive bloated documents.
 pub fn startup_pipeline_check(
     root_dir: &Path,

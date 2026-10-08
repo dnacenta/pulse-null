@@ -120,7 +120,7 @@ pub async fn close_cycle(state: &Arc<AppState>, root_dir: &Path, outcome: CycleO
 
     let root = root_dir.to_path_buf();
     let raw_output = outcome.raw_output.to_string();
-    let resolved: Vec<String> = outcome.resolved_prediction_ids.to_vec();
+    let resolved = ingest::evidential_resolutions(outcome.resolved_prediction_ids, stack.as_ref());
     let tool_rounds = outcome.tool_rounds;
     // Whether that count is a measurement or a structural zero, so a refusal
     // can say which side of the failure it is.

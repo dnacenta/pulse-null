@@ -277,18 +277,6 @@ pub fn project(event: &PulseEvent, id: u64, at: DateTime<Utc>) -> Option<LedgerR
             detail_ref: None,
         }),
 
-        PulseEvent::PredictionPressure {
-            accumulated_importance,
-            triggering_prediction_id,
-            ..
-        } => Some(alert_row(
-            id,
-            at,
-            &format!(
-                "prediction pressure {accumulated_importance:.1} ({triggering_prediction_id})"
-            ),
-        )),
-
         PulseEvent::Salience { kind, headline, .. } => {
             Some(alert_row(id, at, &format!("{kind}: {headline}")))
         }

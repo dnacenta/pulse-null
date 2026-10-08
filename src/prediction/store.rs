@@ -6,16 +6,12 @@
 //!
 //! ## Sync vs. async
 //!
-//! `load` and `save` are sync — fast on local disk, and the only synchronous
-//! caller (`prompt::build_system_prompt_budgeted`) already runs inside the
-//! `tokio::task::spawn_blocking` issued by `build_system_prompt_async`, so
-//! the runtime never sees a blocking read on a worker thread.
+//! `load` is sync — fast on local disk. Async callers go through
+//! `load_async`, which wraps it in `spawn_blocking`.
 //!
-//! Async callers go through `load_async` (reads) and `save_delta_async`
-//! (writes), which wrap the sync core in `spawn_blocking` per the
-//! established `SchedulerState::load/save` pattern in `runner.rs:41`.
-//! All writes are locked read-modify-write via `save_delta` (PN-86) —
-//! there is no production path that writes back a previously-loaded stack.
+//! Since PN-133 the only production write is the boot migration
+//! [`void_open_predictions`]; `save_delta` and `save` remain for test
+//! fixtures.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -28,6 +24,16 @@ const PREDICTIONS_FILE: &str = "predictions.json";
 
 /// Temporary file used during atomic writes.
 const PREDICTIONS_TMP: &str = "predictions.json.tmp";
+
+/// Cross-process lock file for read-modify-write on the store.
+const PREDICTIONS_LOCK: &str = "predictions.json.lock";
+
+/// Serializes in-process writers; [`PREDICTIONS_LOCK`] covers other processes.
+static IN_PROCESS: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// What a voided prediction records as its outcome and insight.
+pub const VOID_EXPLANATION: &str =
+    "voided at Phase 0: free-form prediction with no checkable referent";
 
 /// Load the prediction stack from disk and apply the given config.
 ///
@@ -88,6 +94,7 @@ pub fn load(root_dir: &Path, config: PredictionConfig) -> PredictionStack {
 /// of wedging every future write forever (SEC-003): this call still errors
 /// — loud, callers alert — but the next `save_delta` starts from a fresh
 /// empty stack, and the corrupt bytes are kept for forensics.
+#[cfg(test)]
 fn load_strict(
     root_dir: &Path,
     config: PredictionConfig,
@@ -133,16 +140,16 @@ fn load_strict(
 /// (PN-80): serialize in-process via a static mutex, cross-process via an
 /// exclusive lock on `predictions.json.lock`, and always apply against a
 /// fresh load from disk. Returns whatever `apply` returns.
+#[cfg(test)]
 pub fn save_delta<T>(
     root_dir: &Path,
     config: PredictionConfig,
     apply: impl FnOnce(&mut PredictionStack) -> T,
 ) -> Result<T, Box<dyn std::error::Error + Send + Sync>> {
-    static IN_PROCESS: std::sync::Mutex<()> = std::sync::Mutex::new(());
     let _guard = IN_PROCESS.lock().unwrap_or_else(|p| p.into_inner());
 
     fs::create_dir_all(root_dir)?;
-    let lock_path = root_dir.join("predictions.json.lock");
+    let lock_path = root_dir.join(PREDICTIONS_LOCK);
     let lock_file = fs::OpenOptions::new()
         .create(true)
         .write(true)
@@ -157,18 +164,79 @@ pub fn save_delta<T>(
     // lock_file drop releases the flock
 }
 
-/// Async wrapper for [`save_delta`] — offloads the locked IO to a blocking
-/// thread so the flock (and any in-process mutex wait) never parks a tokio
-/// worker.
-pub async fn save_delta_async<T: Send + 'static>(
-    root_dir: PathBuf,
-    config: PredictionConfig,
-    apply: impl FnOnce(&mut PredictionStack) -> T + Send + 'static,
-) -> Result<T, Box<dyn std::error::Error + Send + Sync>> {
-    match tokio::task::spawn_blocking(move || save_delta(&root_dir, config, apply)).await {
-        Ok(result) => result,
-        Err(join_err) => Err(Box::new(join_err)),
+/// Close every open prediction as [`ErrorDirection::Void`] (PN-133 Phase 0).
+///
+/// Free-form predictions had no referent that could be checked, so none can
+/// be honestly resolved; voiding retires them without claiming an outcome.
+/// Each pending prediction gets `resolution = {direction: void, surprise: 0}`
+/// and `resolved_at = now`. Nothing else in the file changes: resolved
+/// predictions and `errors` are carried through as they are on disk, and
+/// there is **no prune** (a prune would evict the rows this keeps).
+///
+/// Strict: an unreadable or unparseable file is an error and is left
+/// untouched (not quarantined, not overwritten). A missing file is a no-op
+/// and is not created. Idempotent: with nothing pending it writes nothing
+/// and returns 0. Holds the same locks as [`save_delta`].
+///
+/// Returns the number of predictions voided.
+///
+/// [`ErrorDirection::Void`]: super::ErrorDirection::Void
+pub fn void_open_predictions(
+    root_dir: &Path,
+) -> Result<usize, Box<dyn std::error::Error + Send + Sync>> {
+    use serde_json::Value;
+
+    let path = root_dir.join(PREDICTIONS_FILE);
+    if !path.exists() {
+        return Ok(0);
     }
+
+    let _guard = IN_PROCESS.lock().unwrap_or_else(|p| p.into_inner());
+    let lock_file = fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(false)
+        .open(root_dir.join(PREDICTIONS_LOCK))?;
+    lock_file.lock()?;
+
+    let content = match fs::read_to_string(&path) {
+        Ok(c) => c,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+        Err(e) => return Err(Box::new(e)),
+    };
+    // Validate against the store's own shape before touching anything; the
+    // edit itself goes through `Value` so fields this binary does not know
+    // survive exactly as written.
+    serde_json::from_str::<PredictionStackSnapshot>(&content)?;
+    let mut doc: Value = serde_json::from_str(&content)?;
+
+    let resolution = serde_json::to_value(super::PredictionResolution {
+        actual: VOID_EXPLANATION.to_string(),
+        surprise: 0.0,
+        direction: super::ErrorDirection::Void,
+        insight: Some(VOID_EXPLANATION.to_string()),
+    })?;
+    let resolved_at = serde_json::to_value(chrono::Utc::now())?;
+
+    let mut voided = 0;
+    if let Some(predictions) = doc.get_mut("predictions").and_then(Value::as_array_mut) {
+        for prediction in predictions {
+            if prediction.get("resolution").is_none_or(Value::is_null) {
+                prediction["resolution"] = resolution.clone();
+                prediction["resolved_at"] = resolved_at.clone();
+                voided += 1;
+            }
+        }
+    }
+    if voided == 0 {
+        return Ok(0);
+    }
+
+    let tmp_path = root_dir.join(PREDICTIONS_TMP);
+    fs::write(&tmp_path, serde_json::to_string(&doc)?)?;
+    fs::rename(&tmp_path, &path)?;
+    Ok(voided)
+    // lock_file drop releases the flock
 }
 
 /// Save the prediction stack to disk atomically.
@@ -180,6 +248,7 @@ pub async fn save_delta_async<T: Send + 'static>(
 /// Returns `Box<dyn Error + Send + Sync>` so `save_async` can propagate
 /// the error chain across `spawn_blocking` without stringifying it
 /// (Q-MEDIUM "save error type drops source chain in save_async").
+#[cfg(test)]
 pub fn save(
     root_dir: &Path,
     stack: &PredictionStack,
@@ -242,10 +311,9 @@ pub async fn load_async(root_dir: PathBuf, config: PredictionConfig) -> Predicti
 /// The sync `save` now returns `Send + Sync`, so we can pass the error
 /// chain through `spawn_blocking` without stringifying it (M2).
 ///
-/// Test-only since PN-86 (SEC-012): production writers MUST go through
-/// [`save_delta_async`] — an unlocked write-back of a previously-loaded
-/// stack is exactly the lost-update bug PN-86 fixed. Gated so a future
-/// caller cannot quietly reintroduce it.
+/// Test-only since PN-86 (SEC-012): an unlocked write-back of a
+/// previously-loaded stack is exactly the lost-update bug PN-86 fixed.
+/// Gated so a future caller cannot quietly reintroduce it.
 #[cfg(test)]
 pub async fn save_async(
     root_dir: PathBuf,
@@ -262,6 +330,133 @@ mod tests {
     use super::*;
     use crate::prediction::{ErrorDirection, PredictionResolution, Timescale};
     use tempfile::TempDir;
+
+    /// A store shaped like the live ones: pending predictions, resolved
+    /// predictions, and prediction errors. Returns (pending ids, resolved ids).
+    fn seed_live_shaped_store(root: &Path) -> (Vec<String>, Vec<String>) {
+        let mut stack = PredictionStack::with_config(PredictionConfig {
+            surprise_threshold: 0.0,
+            ..PredictionConfig::default()
+        });
+        let mut resolved = Vec::new();
+        for (i, surprise) in [0.8, 0.1].into_iter().enumerate() {
+            let id = stack
+                .add_prediction(Timescale::Cycle, format!("resolved {i}"), 0.6)
+                .id
+                .clone();
+            stack.resolve(
+                &id,
+                PredictionResolution {
+                    actual: format!("actual {i}"),
+                    surprise,
+                    direction: ErrorDirection::Misdirected,
+                    insight: Some("an insight".into()),
+                },
+            );
+            resolved.push(id);
+        }
+        let pending: Vec<String> = (0..3)
+            .map(|i| {
+                stack
+                    .add_prediction(Timescale::Session, format!("pending {i}"), 0.5)
+                    .id
+                    .clone()
+            })
+            .collect();
+        save(root, &stack).unwrap();
+        (pending, resolved)
+    }
+
+    fn raw(root: &Path) -> serde_json::Value {
+        serde_json::from_str(&fs::read_to_string(root.join(PREDICTIONS_FILE)).unwrap()).unwrap()
+    }
+
+    fn prediction<'a>(doc: &'a serde_json::Value, id: &str) -> &'a serde_json::Value {
+        doc["predictions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|p| p["id"] == id)
+            .unwrap()
+    }
+
+    #[test]
+    fn void_open_predictions_voids_pending_only_and_is_idempotent() {
+        let tmp = TempDir::new().unwrap();
+        let (pending, resolved) = seed_live_shaped_store(tmp.path());
+        let before = raw(tmp.path());
+        assert!(!before["errors"].as_array().unwrap().is_empty());
+
+        assert_eq!(void_open_predictions(tmp.path()).unwrap(), pending.len());
+
+        let after = raw(tmp.path());
+        assert_eq!(after["errors"], before["errors"], "errors untouched");
+        for id in &resolved {
+            assert_eq!(prediction(&after, id), prediction(&before, id), "{id}");
+        }
+        for id in &pending {
+            let p = prediction(&after, id);
+            assert_eq!(p["resolution"]["direction"], "void");
+            assert_eq!(p["resolution"]["surprise"], 0.0);
+            assert_eq!(p["resolution"]["actual"], VOID_EXPLANATION);
+            assert!(p["resolved_at"].is_string());
+            // Everything but the resolution is what it was.
+            assert_eq!(p["content"], prediction(&before, id)["content"]);
+        }
+        assert_eq!(
+            after["predictions"].as_array().unwrap().len(),
+            before["predictions"].as_array().unwrap().len(),
+            "no prune"
+        );
+
+        let bytes = fs::read(tmp.path().join(PREDICTIONS_FILE)).unwrap();
+        assert_eq!(void_open_predictions(tmp.path()).unwrap(), 0);
+        assert_eq!(
+            fs::read(tmp.path().join(PREDICTIONS_FILE)).unwrap(),
+            bytes,
+            "second run writes nothing"
+        );
+    }
+
+    #[test]
+    fn void_open_predictions_missing_file_is_noop() {
+        let tmp = TempDir::new().unwrap();
+        assert_eq!(void_open_predictions(tmp.path()).unwrap(), 0);
+        assert_eq!(
+            fs::read_dir(tmp.path()).unwrap().count(),
+            0,
+            "nothing created"
+        );
+    }
+
+    #[test]
+    fn void_open_predictions_leaves_a_corrupt_file_alone() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join(PREDICTIONS_FILE);
+        fs::write(&path, "{not json").unwrap();
+        assert!(void_open_predictions(tmp.path()).is_err());
+        assert_eq!(fs::read_to_string(&path).unwrap(), "{not json");
+    }
+
+    #[test]
+    fn void_survives_reload_and_is_not_pending() {
+        let tmp = TempDir::new().unwrap();
+        let (pending, resolved) = seed_live_shaped_store(tmp.path());
+        void_open_predictions(tmp.path()).unwrap();
+
+        let stack = load(tmp.path(), PredictionConfig::default());
+        for p in &stack.predictions {
+            assert!(!p.is_pending(), "{}", p.id);
+            assert_eq!(p.is_void(), pending.contains(&p.id), "{}", p.id);
+        }
+        assert!(resolved.iter().all(|id| stack
+            .predictions
+            .iter()
+            .any(|p| &p.id == id && !p.is_void())));
+        assert_eq!(ErrorDirection::Void.to_string(), "void");
+        assert_eq!(ErrorDirection::from_str_loose("void"), None);
+        assert_eq!(ErrorDirection::from_str_loose("VOID"), None);
+    }
 
     #[test]
     fn load_returns_empty_when_missing() {

@@ -185,49 +185,6 @@ fn slug_for_alert_id(s: &str) -> String {
         .collect()
 }
 
-/// Create an alert reporting rejected `[RESOLVE:]` markers (PN-86).
-/// A dropped resolution is lost calibration data — it must reach the owner
-/// through the alert drain, not die as a `tracing::warn` nobody reads.
-pub fn alert_from_skipped_resolutions(
-    task_name: &str,
-    skipped: &[crate::prediction::resolve::SkippedResolution],
-) -> Alert {
-    use std::fmt::Write as _;
-    let name = sanitize_alert_text(task_name, 80);
-    let mut content = format!(
-        "{} RESOLVE marker(s) rejected during '{}' — calibration data lost unless re-emitted:",
-        skipped.len(),
-        name
-    );
-    let mut shown = 0usize;
-    for s in skipped.iter().take(MAX_ALERT_SKIP_ENTRIES) {
-        let line = format!(
-            "\n- id {}: {}",
-            sanitize_alert_text(&s.prediction_id, 64),
-            sanitize_alert_text(&s.reason, 300)
-        );
-        if content.len() + line.len() > MAX_ALERT_CONTENT_LEN {
-            break;
-        }
-        content.push_str(&line);
-        shown += 1;
-    }
-    if shown < skipped.len() {
-        let _ = write!(content, "\n…and {} more", skipped.len() - shown);
-    }
-    Alert {
-        id: format!(
-            "alert-{}-{}",
-            slug_for_alert_id(&name),
-            &uuid::Uuid::new_v4().to_string()[..8]
-        ),
-        source_task: name,
-        content,
-        created_at: Utc::now(),
-        target_channel: None,
-    }
-}
-
 /// Create an alert for a failed prediction-store write (SEC-012). When the
 /// locked save aborts — corrupt file quarantined, lock unopenable, disk
 /// full — the resolutions AND their skip report are both lost; that is the
@@ -440,40 +397,6 @@ mod tests {
         assert!(alert.target_channel.is_none());
     }
 
-    /// PN-86 (SEC-001/SEC-005/SEC-009): LLM-influenced fields entering alert
-    /// content are sanitized (no pings, no injected lines) and the alert is
-    /// entry- and size-capped so a hostile output can't produce a multi-MB
-    /// undeliverable message.
-    #[test]
-    fn skipped_resolutions_alert_is_sanitized_and_bounded() {
-        use crate::prediction::resolve::SkippedResolution;
-        let skipped: Vec<SkippedResolution> = (0..50)
-            .map(|i| SkippedResolution {
-                prediction_id: format!("id-{i}"),
-                reason: "unknown direction '@everyone urgent\ncall D now'".to_string(),
-            })
-            .collect();
-        let alert = alert_from_skipped_resolutions("task\n**name** @here", &skipped);
-
-        // Size cap: content plus the trailing summary line stays deliverable.
-        assert!(
-            alert.content.len() <= MAX_ALERT_CONTENT_LEN + 40,
-            "content length {}",
-            alert.content.len()
-        );
-        // Pings defused everywhere.
-        assert!(!alert.content.contains('@'), "{}", alert.content);
-        // Only our frame adds lines — 1 header + at most 10 entries + 1 tail.
-        assert!(alert.content.lines().count() <= 12);
-        assert!(alert.content.contains("and 40 more"));
-        // Identifier is a strict slug.
-        assert!(!alert.id.contains('\n'));
-        assert!(!alert.id.contains(' '));
-        assert!(!alert.source_task.contains('\n'));
-    }
-
-    /// PN-86 (SEC-012): store-failure alerts carry a sanitized error and
-    /// name.
     #[test]
     fn store_failure_alert_is_sanitized() {
         let alert = alert_from_store_failure("intent @everyone\ntitle", "disk full\n@here");

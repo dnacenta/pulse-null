@@ -162,17 +162,6 @@ pub enum PulseEvent {
         task_id: String,
     },
 
-    /// Emitted when accumulated prediction-error importance crosses
-    /// `PredictionConfig::importance_threshold`. Carries enough context for
-    /// downstream listeners (vigil-pulse feed, reflection-window prompt
-    /// augmentation) to point the pulse at the specific prediction that
-    /// most needs graduation.
-    PredictionPressure {
-        accumulated_importance: f64,
-        triggering_prediction_id: String,
-        triggering_surprise: f64,
-    },
-
     /// Emitted when the pulse's own cognition produces something it judges
     /// worth telling the owner about, unprompted (PN-94, spec §2.1).
     ///
@@ -212,7 +201,6 @@ impl PulseEvent {
                 format!("plugin_state_{}", plugin_name)
             }
             PulseEvent::ProviderError { .. } => "provider_error".into(),
-            PulseEvent::PredictionPressure { .. } => "prediction_pressure".into(),
             PulseEvent::Salience { kind, .. } => format!("salience_{kind}"),
         }
     }

@@ -3,29 +3,11 @@ use super::ScheduledTask;
 /// Task id of the reflection-window task.
 pub const REFLECTION_WINDOW_TASK_ID: &str = "reflection-window";
 
-/// Task id of the morning-orientation task. Spec 2a: predictions emitted
-/// from this task carry the Session timescale. Resolved by night-reflection.
+/// Task id of the morning-orientation task.
 pub const MORNING_ORIENTATION_TASK_ID: &str = "morning-orientation";
 
-/// Task id of the weekly-synthesis task. Spec 2a: predictions emitted from
-/// this task carry the Weekly timescale. Resolved by next week's synthesis.
+/// Task id of the weekly-synthesis task.
 pub const WEEKLY_SYNTHESIS_TASK_ID: &str = "weekly-synthesis";
-
-/// Map a scheduled-task id to the default timescale for any
-/// `[PREDICT:{...}]` markers it emits (spec 2a). The runner uses this when
-/// calling `prediction::resolve::process_task_output` so that morning-
-/// orientation predictions are persisted as `Session` and weekly-synthesis
-/// predictions as `Weekly`, not all stamped `Cycle`. Unknown ids fall back
-/// to `Cycle` — the safe default for any cognitive-cycle-style task.
-#[must_use]
-pub fn default_timescale_for(task_id: &str) -> crate::prediction::Timescale {
-    use crate::prediction::Timescale;
-    match task_id {
-        MORNING_ORIENTATION_TASK_ID => Timescale::Session,
-        WEEKLY_SYNTHESIS_TASK_ID => Timescale::Weekly,
-        _ => Timescale::Cycle,
-    }
-}
 
 /// Create the default cognitive schedule for a new pulse. Every task starts
 /// disabled: the owner turns on what the pulse should run.
@@ -220,31 +202,8 @@ mod tests {
         assert!(tasks.iter().all(|t| !t.enabled));
     }
 
-    /// Spec 2a: predictions emitted by each task carry the right timescale.
-    /// Verifies the mapping the runner uses when persisting predictions.
     #[test]
-    fn default_timescale_for_known_tasks() {
-        use crate::prediction::Timescale;
-        assert_eq!(
-            default_timescale_for(MORNING_ORIENTATION_TASK_ID),
-            Timescale::Session
-        );
-        assert_eq!(
-            default_timescale_for(WEEKLY_SYNTHESIS_TASK_ID),
-            Timescale::Weekly
-        );
-        assert_eq!(
-            default_timescale_for(REFLECTION_WINDOW_TASK_ID),
-            Timescale::Cycle
-        );
-        assert_eq!(default_timescale_for("thinking-loop"), Timescale::Cycle);
-        assert_eq!(default_timescale_for("some-unknown-task"), Timescale::Cycle);
-    }
-
-    /// MORNING_ORIENTATION_TASK_ID + WEEKLY_SYNTHESIS_TASK_ID must be wired
-    /// into the `default_tasks()` definitions consumed by `default_timescale_for`.
-    #[test]
-    fn timescale_task_ids_present_in_default_tasks() {
+    fn named_task_ids_present_in_default_tasks() {
         let ids: Vec<String> = default_tasks().iter().map(|t| t.id.clone()).collect();
         assert!(ids.iter().any(|i| i == MORNING_ORIENTATION_TASK_ID));
         assert!(ids.iter().any(|i| i == WEEKLY_SYNTHESIS_TASK_ID));

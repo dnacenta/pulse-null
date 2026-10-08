@@ -355,6 +355,7 @@ pub async fn start_in(
 
     // Startup pipeline health check
     setup::startup_pipeline_check(&root_dir, &config, &state.pipeline_monitor);
+    setup::void_open_predictions(&root_dir);
 
     // Load schedule and intent queue; the coordinator gates the scheduler on
     // control-plane leadership (fail-open: chat/voice never wait on this).

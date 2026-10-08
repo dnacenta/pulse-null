@@ -735,11 +735,14 @@ async fn execute_intent(
 
     // Build user message with autonomy context
     let autonomy_context = prompt::build_autonomy_context(&root_dir, &state.config);
-    let user_message = format!(
-        "{}\n\n{}\n\n{}",
-        intent_header(intent),
-        intent.prompt,
-        autonomy_context
+    let user_message = super::runner::with_refusal_notice(
+        &root_dir,
+        format!(
+            "{}\n\n{}\n\n{}",
+            intent_header(intent),
+            intent.prompt,
+            autonomy_context
+        ),
     );
 
     // Capture start time for accurate duration tracking
@@ -791,66 +794,10 @@ async fn execute_intent(
     // Parse output for markers
     let parsed = output::parse_output(&result.response_text);
 
-    // Handle [PREDICT:] / [RESOLVE:] markers (PN-86). Until now the intent
-    // path silently dropped them — process_task_output's only call site was
-    // the task path in runner.rs, so predictions and resolutions emitted
-    // during intent sessions never reached predictions.json. Applies via
-    // the store's locked load-apply-save, racing task fires safely.
-    let mut resolved_prediction_ids: Vec<String> = Vec::new();
-    if state.config.prediction.enabled {
-        let intent_id = intent.id.clone();
-        // Raw response, not clean_content: the lazy SHARE/CALL regexes can
-        // swallow an embedded [RESOLVE:] span while stripping (SEC-013).
-        let content = result.response_text.clone();
-        let max_unresolved = state.config.prediction.max_unresolved;
-        let max_errors = state.config.prediction.max_errors;
-        let processed = crate::prediction::store::save_delta_async(
-            root_dir.clone(),
-            state.config.prediction.clone(),
-            move |stack| {
-                let summary = crate::prediction::resolve::process_task_output(
-                    stack,
-                    &content,
-                    &intent_id,
-                    crate::prediction::Timescale::Cycle,
-                );
-                stack.prune(max_unresolved, max_errors);
-                summary
-            },
-        )
-        .await;
-        match processed {
-            Ok(summary) => {
-                if summary.new_errors > 0 {
-                    tracing::info!(
-                        "Intent '{}': {} new prediction errors",
-                        intent.id,
-                        summary.new_errors
-                    );
-                }
-                if !summary.skipped_resolutions.is_empty() {
-                    let alert = super::alerts::alert_from_skipped_resolutions(
-                        &intent.description,
-                        &summary.skipped_resolutions,
-                    );
-                    state.alert_queue.lock().await.push(alert);
-                }
-                resolved_prediction_ids = summary.resolved_prediction_ids;
-            }
-            Err(e) => {
-                // Infrastructure failure loses the resolutions AND their
-                // skip report — alert, don't just log (SEC-012).
-                tracing::error!(
-                    "Failed to process prediction markers for intent '{}': {}",
-                    intent.id,
-                    e
-                );
-                let alert =
-                    super::alerts::alert_from_store_failure(&intent.description, &e.to_string());
-                state.alert_queue.lock().await.push(alert);
-            }
-        }
-    }
+    // Prediction markers are refused, never applied (PN-133); same as the
+    // task path.
+    super::runner::refuse_prediction_markers(&root_dir, &result.response_text);
+    let resolved_prediction_ids: Vec<String> = Vec::new();
 
     // Persistent cognition substrate (PN-95) — same ordering as the task
     // path: after prediction post-processing, so resolutions are available

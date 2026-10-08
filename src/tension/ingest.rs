@@ -216,7 +216,7 @@ impl std::fmt::Display for EvidenceRejection {
             Self::NoEvidence => write!(
                 f,
                 "claim: no artifact named — discharge needs a file changed outside the journal, \
-                 a resolved prediction id, or a tool that ran"
+                 or a tool that ran"
             ),
             Self::PathOutsidePulse(p) => {
                 write!(f, "claim: path '{p}' is not inside the pulse root")
@@ -243,7 +243,7 @@ impl std::fmt::Display for EvidenceRejection {
                 f,
                 "channel: '{t}' may have run, but this runtime's agent CLI runs its own tools \
                  and reports no tool rounds, so the tool rung cannot verify it — name the file \
-                 it changed or a resolved prediction"
+                 it changed"
             ),
         }
     }
@@ -700,6 +700,24 @@ pub fn ingest_prediction_errors(
     report
 }
 
+/// The resolved-prediction ids that count as discharge evidence: a voided
+/// prediction (PN-133) is closed, but nothing happened, so it never credits
+/// a thread or passes a `prediction` claim.
+#[must_use]
+pub fn evidential_resolutions(ids: &[String], stack: Option<&PredictionStack>) -> Vec<String> {
+    ids.iter()
+        .filter(|id| {
+            !stack.is_some_and(|stack| {
+                stack
+                    .predictions
+                    .iter()
+                    .any(|p| &p.id == *id && p.is_void())
+            })
+        })
+        .cloned()
+        .collect()
+}
+
 /// Discharge threads whose originating prediction resolved this cycle.
 ///
 /// The automatic half of the discharge path, and the strongest one: no
@@ -1081,6 +1099,64 @@ mod tests {
     }
 
     // ----- marker parsing --------------------------------------------------
+
+    #[test]
+    fn void_predictions_are_not_outreach_or_tension_evidence() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let mut stack = PredictionStack::with_config(PredictionConfig::default());
+        let resolved = stack
+            .add_prediction(Timescale::Cycle, "resolved".into(), 0.5)
+            .id
+            .clone();
+        stack.resolve(
+            &resolved,
+            PredictionResolution {
+                actual: "it happened".into(),
+                surprise: 0.6,
+                direction: ErrorDirection::Misdirected,
+                insight: None,
+            },
+        );
+        let voided = stack
+            .add_prediction(Timescale::Cycle, "free-form".into(), 0.5)
+            .id
+            .clone();
+        crate::prediction::store::save(root, &stack).unwrap();
+        assert_eq!(
+            crate::prediction::store::void_open_predictions(root).unwrap(),
+            1
+        );
+
+        // Outreach gate 2: only the genuinely resolved id is a referent.
+        let referents = crate::outreach::store::resolved_prediction_ids(root);
+        assert!(referents.contains(&resolved));
+        assert!(!referents.contains(&voided));
+
+        // Tension: a void id neither credits a thread nor passes a claim.
+        let stack = crate::prediction::store::load(root, PredictionConfig::default());
+        let ids = vec![voided.clone(), resolved.clone()];
+        assert_eq!(evidential_resolutions(&ids, Some(&stack)), vec![resolved]);
+
+        let mut store = TensionStore::with_config(TensionConfig::default());
+        let now = Utc::now();
+        store.open(
+            ThreadDraft {
+                label: "from a void prediction".into(),
+                content: "c".into(),
+                origin: ThreadOrigin::PredictionError(voided.clone()),
+            },
+            now,
+        );
+        let evidential = evidential_resolutions(std::slice::from_ref(&voided), Some(&stack));
+        assert!(credit_resolved_predictions(&mut store, &evidential, now).is_empty());
+        let evidence = WorkEvidence::new(root, &evidential, 0, true, now);
+        let claim = EvidenceClaim {
+            prediction: Some(voided),
+            ..EvidenceClaim::default()
+        };
+        assert!(evidence.verify(&claim).is_err());
+    }
 
     #[test]
     fn thread_marker_opens_a_thread() {

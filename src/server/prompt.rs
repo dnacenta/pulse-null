@@ -1063,9 +1063,9 @@ fn build_tension_context(root_dir: &Path, config: &Config) -> Option<String> {
 
     // Name only the rungs this runtime can verify.
     let rungs = if provider_reports_tool_rounds(&config.llm.provider) {
-        "a file changed outside the journal, a prediction resolved, a tool that ran"
+        "a file changed outside the journal, or a tool that ran"
     } else {
-        "a file changed outside the journal, or a prediction resolved"
+        "a file changed outside the journal"
     };
     let _ = write!(
         &mut block,
@@ -1684,13 +1684,13 @@ pub fn build_autonomy_context(root_dir: &Path, config: &Config) -> String {
         // block below: document only what the runtime can honour.
         let (work_line, checked_against) = if provider_reports_tool_rounds(&config.llm.provider) {
             (
-                "Instead of \"file\" you may name \"prediction\" (an id you resolved this cycle) or \"tool\" (a tool that ran this cycle).",
-                "the filesystem, the prediction store and the executor's tool count",
+                "Instead of \"file\" you may name \"tool\" (a tool that ran this cycle).",
+                "the filesystem and the executor's tool count",
             )
         } else {
             (
-                "Instead of \"file\" you may name \"prediction\" (an id you resolved this cycle). \"tool\" cannot be verified on this runtime — name the file the tool changed.",
-                "the filesystem and the prediction store",
+                "\"tool\" cannot be verified on this runtime — name the file the tool changed.",
+                "the filesystem",
             )
         };
         sections.push(format!(
@@ -1722,7 +1722,7 @@ pub fn build_autonomy_context(root_dir: &Path, config: &Config) -> String {
             1. The headline must not restate anything already in your journal or a previous \
             outreach message.\n\
             2. The evidence must cite something you did not write: a file path with a line \
-            number, a URL you fetched, the id of a prediction that resolved, or a number from \
+            number, a URL you fetched, or a number from \
             a command you ran (quote the command). Prose about your own thinking is not \
             evidence, and this check is stricter for 'development', not looser.\n\
             3. The cost must be stated: are you asking for nothing, a read, or a decision?\n\n\
@@ -3149,12 +3149,20 @@ mod tests {
                 context.contains("cannot be verified on this runtime"),
                 "{provider}"
             );
-            // The other rungs survive, and the marker itself is still offered.
+            // The file rung survives, and the marker itself is still offered.
             assert!(context.contains("[THREAD-WORK:"), "{provider}");
             assert!(
-                context.contains("an id you resolved this cycle"),
+                context.contains("name the file the tool changed"),
                 "{provider}"
             );
+        }
+
+        // Predictions are retired (PN-133): no provider is offered that rung.
+        for provider in SIGHTED.into_iter().chain(BLIND) {
+            config.llm.provider = provider.into();
+            let context = build_autonomy_context(dir.path(), &config);
+            assert!(!context.contains("\"prediction\""), "{provider}");
+            assert!(!context.contains("prediction that resolved"), "{provider}");
         }
     }
 
@@ -3184,8 +3192,16 @@ mod tests {
             config.llm.provider = provider.into();
             let block = build_tension_context(dir.path(), &config).expect("threads exist");
             assert!(!block.contains("a tool that ran"), "{provider}");
-            assert!(block.contains("or a prediction resolved"), "{provider}");
+            assert!(
+                block.contains("a file changed outside the journal."),
+                "{provider}"
+            );
             assert!(block.ends_with("</tension-context>"), "{provider}");
+        }
+        for provider in SIGHTED.into_iter().chain(BLIND) {
+            config.llm.provider = provider.into();
+            let block = build_tension_context(dir.path(), &config).expect("threads exist");
+            assert!(!block.contains("prediction"), "{provider}");
         }
     }
 }

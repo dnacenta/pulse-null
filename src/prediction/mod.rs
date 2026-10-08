@@ -32,9 +32,19 @@
 //! Each prediction has a self-assessed confidence level. When resolved, a
 //! surprise score (0.0 = perfectly predicted, 1.0 = maximally surprising)
 //! and error direction are recorded. High-surprise errors bubble up as
-//! unprocessed `PredictionError`s, which the prompt builder surfaces back
-//! to the pulse in the next turn.
+//! unprocessed `PredictionError`s.
+//!
+//! # Frozen since PN-133 (Phase 0)
+//!
+//! Free-form predictions had no checkable referent, so no production path
+//! writes this store any more: markers are refused (`resolve`,
+//! `refusals`), and the one boot migration
+//! [`store::void_open_predictions`] closes every open prediction as
+//! [`ErrorDirection::Void`]. The mutation API (`add_prediction`, `resolve`,
+//! `prune`, `store::save_delta`, …) is compiled for tests only, where it
+//! builds fixtures; it returns with a checkable prediction kind.
 
+pub mod refusals;
 pub mod resolve;
 pub mod store;
 
@@ -43,6 +53,7 @@ mod integration_tests;
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+#[cfg(test)]
 use uuid::Uuid;
 
 use crate::config::PredictionConfig;
@@ -55,6 +66,7 @@ use crate::config::PredictionConfig;
 /// than matched, on the same reasoning git uses for object names: an
 /// abbreviation that is unique in a small store stops being unique as the
 /// store grows, so the floor is set by the population, not by taste.
+#[cfg(test)]
 pub const MIN_ABBREVIATED_ID_LEN: usize = 8;
 
 /// Character cap on the text snapshotted into a [`PredictionError`].
@@ -64,9 +76,11 @@ pub const MIN_ABBREVIATED_ID_LEN: usize = 8;
 /// and callers that build a [`PredictionResolution`] directly do not pass
 /// through the marker parser, so the cap is re-applied at the point of
 /// storage rather than assumed.
+#[cfg(test)]
 const MAX_SNAPSHOT_FIELD_LEN: usize = 200;
 
 /// Truncate on a character boundary, never a byte one.
+#[cfg(test)]
 fn truncate_snapshot(s: &str) -> String {
     s.chars().take(MAX_SNAPSHOT_FIELD_LEN).collect()
 }
@@ -108,10 +122,13 @@ pub enum ErrorDirection {
     /// The prediction held: confidence matched the outcome. Not an error
     /// direction — a calibration system that cannot record being right is
     /// measuring the wrong thing (PN-86). A well-calibrated resolution
-    /// normally carries low surprise; a well-calibrated resolution with
-    /// surprise above threshold is rejected as self-contradictory in
-    /// `resolve::process_task_output`.
+    /// normally carries low surprise.
     WellCalibrated,
+    /// Retired without a verdict: the Phase 0 migration (PN-133) closed every
+    /// open free-form prediction this way, because none had a referent that
+    /// could be checked. Not evidence of anything — neither a hit nor an
+    /// error — and no marker can produce it (`from_str_loose` rejects it).
+    Void,
     /// Catch-all for direction values written to disk by a newer release
     /// than this binary (SEC-006). Without it, one unrecognized direction
     /// makes the whole snapshot fail to deserialize, `load` fail-opens to
@@ -129,6 +146,7 @@ impl std::fmt::Display for ErrorDirection {
             ErrorDirection::Misdirected => write!(f, "misdirected"),
             ErrorDirection::Novel => write!(f, "novel"),
             ErrorDirection::WellCalibrated => write!(f, "well-calibrated"),
+            ErrorDirection::Void => write!(f, "void"),
             ErrorDirection::Unknown => write!(f, "unknown"),
         }
     }
@@ -136,6 +154,9 @@ impl std::fmt::Display for ErrorDirection {
 
 impl ErrorDirection {
     /// Parse from a string, case-insensitive. ASCII-only, allocation-free.
+    /// Never yields [`Self::Void`]: voiding is the runtime's act, not a
+    /// marker's.
+    #[cfg(test)]
     pub fn from_str_loose(s: &str) -> Option<Self> {
         let trimmed = s.trim();
         if trimmed.eq_ignore_ascii_case("overconfident") {
@@ -191,9 +212,19 @@ pub struct Prediction {
 
 impl Prediction {
     /// Whether this prediction is still awaiting resolution.
+    #[cfg(test)]
     #[must_use]
     pub fn is_pending(&self) -> bool {
         self.resolution.is_none()
+    }
+
+    /// Whether this prediction was voided rather than resolved. A void
+    /// prediction is closed but is not evidence that anything happened.
+    #[must_use]
+    pub fn is_void(&self) -> bool {
+        self.resolution
+            .as_ref()
+            .is_some_and(|r| r.direction == ErrorDirection::Void)
     }
 }
 
@@ -233,6 +264,7 @@ pub struct PredictionError {
 }
 
 /// Why a resolution reference did not name exactly one pending prediction.
+#[cfg(test)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ResolveRejection {
     /// Neither an id nor an id prefix of any prediction on record.
@@ -252,6 +284,7 @@ pub enum ResolveRejection {
     },
 }
 
+#[cfg(test)]
 impl std::fmt::Display for ResolveRejection {
     /// Human-readable reason, safe to echo into owner-facing alerts: it never
     /// includes the candidate ids, only their count.
@@ -277,6 +310,7 @@ impl std::fmt::Display for ResolveRejection {
     }
 }
 
+#[cfg(test)]
 fn log_rejected_reference(reference: &str, rejection: &ResolveRejection) {
     match rejection {
         ResolveRejection::Ambiguous { candidates } => tracing::warn!(
@@ -335,6 +369,7 @@ pub struct PredictionStackSnapshot {
 impl PredictionStackSnapshot {
     /// Build the on-disk snapshot view of a stack (borrowed clone — cheap
     /// for typical stack sizes capped by `PredictionConfig::max_*`).
+    #[cfg(test)]
     pub fn from_stack(stack: &PredictionStack) -> Self {
         Self {
             predictions: stack.predictions.clone(),
@@ -384,6 +419,7 @@ impl PredictionStack {
     ///
     /// Confidence is clamped to [0.0, 1.0]. Returns a reference to the
     /// newly created prediction.
+    #[cfg(test)]
     pub fn add_prediction(
         &mut self,
         timescale: Timescale,
@@ -441,6 +477,7 @@ impl PredictionStack {
     /// a [`PredictionError`] is queued — keyed by the canonical id, since an
     /// abbreviation that is unique today may not be later — carrying a
     /// snapshot of both the predicted and the actual text.
+    #[cfg(test)]
     pub fn resolve_reference(
         &mut self,
         reference: &str,
@@ -479,6 +516,7 @@ impl PredictionStack {
     }
 
     /// Index of the single pending prediction `reference` names.
+    #[cfg(test)]
     fn find_pending(&self, reference: &str) -> Result<usize, ResolveRejection> {
         let reference = reference.trim();
         let index = match self.predictions.iter().position(|p| p.id == reference) {
@@ -496,6 +534,7 @@ impl PredictionStack {
     }
 
     /// Index of the single prediction on record whose id starts with `prefix`.
+    #[cfg(test)]
     fn find_by_prefix(&self, prefix: &str) -> Result<usize, ResolveRejection> {
         if prefix.is_empty() {
             return Err(ResolveRejection::NotFound);
@@ -543,6 +582,7 @@ impl PredictionStack {
     ///
     /// This value drives attention allocation — higher accumulated importance
     /// means the pulse should pay more attention to what it failed to predict.
+    #[cfg(test)]
     #[must_use]
     pub fn accumulated_importance(&self) -> f64 {
         self.unprocessed_errors().map(|e| e.surprise).sum()
@@ -558,6 +598,7 @@ impl PredictionStack {
     ///
     /// (M3: rewritten in-place — was double-cloning the stack via two
     /// `filter().cloned().collect()` passes per side.)
+    #[cfg(test)]
     pub fn prune(&mut self, max_predictions: usize, max_errors: usize) {
         if self.predictions.len() > max_predictions {
             // Stable sort: pending first (insertion order), resolved after

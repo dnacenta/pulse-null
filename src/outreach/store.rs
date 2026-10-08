@@ -380,13 +380,14 @@ pub fn save(
 /// Gate 2 accepts a prediction id as an external referent only if it names a
 /// prediction that resolved — an unresolved id is a pointer to the pulse's
 /// own expectation, which is exactly the self-authored evidence the gate
-/// exists to reject.
+/// exists to reject. A voided prediction (PN-133) is closed without an
+/// outcome, so it is not evidence either.
 #[must_use]
 pub fn resolved_prediction_ids(root_dir: &Path) -> HashSet<String> {
     crate::prediction::store::load(root_dir, crate::config::PredictionConfig::default())
         .predictions
         .iter()
-        .filter(|p| p.resolution.is_some())
+        .filter(|p| p.resolution.is_some() && !p.is_void())
         .map(|p| p.id.clone())
         .collect()
 }

@@ -716,11 +716,6 @@ fn translate_event(event: &PulseEvent, config: &EventsConfig) -> Option<Intent> 
         // is likely down when this fires.
         PulseEvent::ProviderError { .. } => None,
 
-        // Prediction pressure never becomes an autonomous LLM intent. Nothing
-        // emits it since PN-133 removed the reflection-window directive; the
-        // variant stays for the ledger and older event logs.
-        PulseEvent::PredictionPressure { .. } => None,
-
         // Salience has already cleared the outreach admission by the time it
         // gets here (see `admit_salience`), so this only shapes the message.
         // Routing is `Share`: `Call` stays manual until the Discord channel

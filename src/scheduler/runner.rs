@@ -363,13 +363,16 @@ async fn execute_task(
     } else {
         String::new()
     };
-    let user_message = format!(
-        "[Scheduled task: {} | Time: {} | Channel: {}]\n\n{}{}",
-        task.name,
-        now.format("%Y-%m-%d %H:%M UTC"),
-        task.channel,
-        task.prompt,
-        autonomy_context,
+    let user_message = with_refusal_notice(
+        &root_dir,
+        format!(
+            "[Scheduled task: {} | Time: {} | Channel: {}]\n\n{}{}",
+            task.name,
+            now.format("%Y-%m-%d %H:%M UTC"),
+            task.channel,
+            task.prompt,
+            autonomy_context,
+        ),
     );
 
     // Capture start time for accurate duration tracking in InteractionRecord
@@ -703,16 +706,12 @@ async fn execute_task(
         .await;
     }
 
-    // Post-execution: extract prediction markers from task output. Applies
-    // against a locked load of the store (PN-86). Parses the RAW response,
-    // not clean_content: the lazy SHARE/CALL regexes can swallow an embedded
-    // [RESOLVE:] span while stripping, silently destroying the resolution
-    // before prediction parsing ran (SEC-013).
-    let resolved_prediction_ids = if state.config.prediction.enabled {
-        post_process_predictions(state, task, &root_dir, &response_text).await
-    } else {
-        Vec::new()
-    };
+    // Prediction markers are refused, never applied (PN-133): the store is
+    // not written. The refusal is told to the pulse in its next prompt.
+    // Counted on the RAW response: the lazy SHARE/CALL regexes can swallow an
+    // embedded marker while stripping (SEC-013).
+    refuse_prediction_markers(&root_dir, &response_text);
+    let resolved_prediction_ids: Vec<String> = Vec::new();
 
     // Post-execution: the persistent cognition substrate (PN-95). Runs after
     // prediction post-processing so that predictions resolved this cycle are
@@ -1040,70 +1039,24 @@ fn log_execution(root_dir: &std::path::Path, task: &ScheduledTask, summary: &str
     crate::logbook::write_entry(root_dir, "Task", &task.name, summary);
 }
 
-/// Post-LLM phase of the prediction loop: parse `[PREDICT:...]` / `[RESOLVE:...]`
-/// markers from the task output, prune to configured caps, and persist.
-///
-/// Runs as a locked load-apply-save against the store (PN-86) rather than
-/// writing back a stack loaded before the provider call: that call takes
-/// minutes, and an overlapping task fire or intent completion may have
-/// written the store meanwhile — saving a stale snapshot would erase their
-/// updates.
-///
-/// Extracted from `execute_task` (Q-H1).
-///
-/// Returns the ids of predictions that actually transitioned to resolved, so
-/// the tension substrate can credit the threads they opened (PN-95). An
-/// empty vec on the failure path is correct: no confirmed resolution, no
-/// discharge evidence.
-async fn post_process_predictions(
-    state: &Arc<AppState>,
-    task: &ScheduledTask,
-    root_dir: &std::path::Path,
-    raw_output: &str,
-) -> Vec<String> {
-    let task_id = task.id.clone();
-    let timescale = super::tasks::default_timescale_for(&task.id);
-    let content = raw_output.to_string();
-    let max_unresolved = state.config.prediction.max_unresolved;
-    let max_errors = state.config.prediction.max_errors;
-    let result = crate::prediction::store::save_delta_async(
-        root_dir.to_path_buf(),
-        state.config.prediction.clone(),
-        move |stack| {
-            let summary = crate::prediction::resolve::process_task_output(
-                stack, &content, &task_id, timescale,
-            );
-            stack.prune(max_unresolved, max_errors);
-            (summary, stack.accumulated_importance())
-        },
-    )
-    .await;
-    match result {
-        Ok((summary, importance)) => {
-            if summary.new_errors > 0 {
-                tracing::info!(
-                    "Prediction errors: {} new (accumulated importance: {importance:.2})",
-                    summary.new_errors,
-                );
-            }
-            if !summary.skipped_resolutions.is_empty() {
-                let alert = super::alerts::alert_from_skipped_resolutions(
-                    &task.name,
-                    &summary.skipped_resolutions,
-                );
-                state.alert_queue.lock().await.push(alert);
-            }
-            summary.resolved_prediction_ids
-        }
-        Err(e) => {
-            // Infrastructure failure loses the resolutions AND their skip
-            // report — the highest-impact drop, so it alerts too (SEC-012).
-            tracing::error!("Failed to save prediction stack: {e}");
-            let alert = super::alerts::alert_from_store_failure(&task.name, &e.to_string());
-            state.alert_queue.lock().await.push(alert);
-            Vec::new()
-        }
+/// Count this turn's `[PREDICT:]` / `[RESOLVE:]` markers into the refusal
+/// notice the next task or intent prompt shows (PN-133). Nothing reaches the
+/// prediction store, and the owner is not alerted.
+pub(super) fn refuse_prediction_markers(root_dir: &std::path::Path, raw_output: &str) {
+    let counts = crate::prediction::resolve::count_prediction_markers(raw_output);
+    if let Err(e) = crate::prediction::refusals::record(root_dir, counts) {
+        tracing::warn!("Failed to record refused prediction markers: {e}");
     }
+}
+
+/// The user message for one autonomous turn, with the pending notice of
+/// refused prediction markers appended once (PN-133).
+pub(super) fn with_refusal_notice(root_dir: &std::path::Path, mut message: String) -> String {
+    if let Some(notice) = crate::prediction::refusals::take_notice(root_dir) {
+        message.push_str("\n\n");
+        message.push_str(&notice);
+    }
+    message
 }
 
 /// True while this tenure's holder still owns an unexpired control-plane
@@ -1117,4 +1070,42 @@ async fn tenure_still_leads(
     table
         .get(crate::coordinator::control::CONTROL_PLANE_RESOURCE)
         .is_some_and(|l| l.holder_id == tenure_holder && !l.is_expired(chrono::Utc::now()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn predict_and_resolve_markers_are_refused_without_store_writes() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let store = root.join("predictions.json");
+        std::fs::write(
+            &store,
+            r#"{"predictions":[{"id":"p-1","timescale":"cycle","content":"x","confidence":0.5,"created_at":"2026-10-01T00:00:00Z","resolved_at":null,"resolution":null}],"errors":[]}"#,
+        )
+        .unwrap();
+        let before = std::fs::read(&store).unwrap();
+
+        let output = r#"Thinking. [PREDICT:{"content":"a","confidence":0.7}]
+            [PREDICT:{"content":"b","confidence":0.2}]
+            [RESOLVE:{"id":"p-1","outcome":"o","surprise":0.4,"direction":"novel"}]"#;
+        refuse_prediction_markers(root, output);
+
+        assert_eq!(std::fs::read(&store).unwrap(), before, "store untouched");
+
+        let first = with_refusal_notice(root, "task prompt".to_string());
+        assert!(first.starts_with("task prompt\n\n"), "{first}");
+        assert!(
+            first.contains("[MARKERS REFUSED: 2 [PREDICT:] and 1 [RESOLVE:]"),
+            "{first}"
+        );
+        // Shown once, then cleared.
+        assert_eq!(
+            with_refusal_notice(root, "next prompt".to_string()),
+            "next prompt"
+        );
+        assert_eq!(std::fs::read(&store).unwrap(), before);
+    }
 }
