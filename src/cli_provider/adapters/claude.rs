@@ -30,6 +30,23 @@ const UNKNOWN_OPTION_MARKER: &str = "unknown option";
 const ISOLATION_DISALLOWED_TOOLS: &str =
     "Write,Edit,MultiEdit,NotebookEdit,Bash,WebFetch,WebSearch,Task";
 
+/// The tools Claude Code loads up front, measured on 2.1.282. Others load on
+/// demand through `ToolSearch`.
+const TOOL_SURFACE: &[&str] = &[
+    "Bash",
+    "Read",
+    "Write",
+    "Edit",
+    "Agent",
+    "Skill",
+    "ToolSearch",
+];
+
+/// [`TOOL_SURFACE`] minus what [`ISOLATION_DISALLOWED_TOOLS`] removes. `Agent`
+/// goes too: the disallow list still names it by its pre-2.1.63 name `Task`,
+/// which Claude Code keeps matching. Tied to both lists by a test.
+const ISOLATED_TOOL_SURFACE: &[&str] = &["Read", "Skill", "ToolSearch"];
+
 impl CliAdapter for Claude {
     fn name(&self) -> &'static str {
         "claude"
@@ -193,6 +210,18 @@ impl CliAdapter for Claude {
         self.classify_terminal(parsed["result"].as_str().unwrap_or(""))
     }
 
+    fn tool_surface(&self, restricted: bool) -> &'static [&'static str] {
+        if restricted {
+            ISOLATED_TOOL_SURFACE
+        } else {
+            TOOL_SURFACE
+        }
+    }
+
+    fn tool_surface_note(&self) -> &'static str {
+        "Measured on Claude Code 2.1.282; more tools load on demand through ToolSearch."
+    }
+
     /// The one place the AUP refusal signature lives: the buffered exit and
     /// the streamed terminal record both come through here.
     fn classify_terminal(&self, text: &str) -> ExitClass {
@@ -320,6 +349,42 @@ mod tests {
     fn normal_argv_is_unrestricted() {
         let args = Claude.invoke_args(&inv("opus", None, Path::new("/e")));
         assert!(!args.iter().any(|a| a == "--disallowedTools"));
+    }
+
+    #[test]
+    fn tool_surface_is_the_measured_list() {
+        assert_eq!(
+            Claude.tool_surface(false),
+            [
+                "Bash",
+                "Read",
+                "Write",
+                "Edit",
+                "Agent",
+                "Skill",
+                "ToolSearch"
+            ]
+        );
+        assert!(Claude.tool_surface_note().contains("2.1.282"));
+    }
+
+    #[test]
+    fn isolated_tool_surface_is_the_surface_minus_the_disallow_list() {
+        // `Agent` is disallowed under its pre-2.1.63 name.
+        let disallowed = |tool: &str| {
+            let name = if tool == "Agent" { "Task" } else { tool };
+            ISOLATION_DISALLOWED_TOOLS.split(',').any(|d| d == name)
+        };
+        let expected: Vec<&str> = Claude
+            .tool_surface(false)
+            .iter()
+            .copied()
+            .filter(|tool| !disallowed(tool))
+            .collect();
+        assert_eq!(Claude.tool_surface(true), expected.as_slice());
+        for gone in ["Bash", "Write", "Edit", "Agent"] {
+            assert!(!Claude.tool_surface(true).contains(&gone), "{gone}");
+        }
     }
 
     #[test]

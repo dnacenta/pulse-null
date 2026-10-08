@@ -40,7 +40,20 @@ use crate::init::agent_bootstrap::{ensure_config, BootstrapItem, ItemKind, ItemS
 /// writers; the two marketplace tools survive an allowlist and go through
 /// `--disallowed-tools`, and `--disable-web-search` covers the web pair.
 /// With all three, the session's tool list is exactly this.
-const ISOLATED_TOOLS: &str = "read_file,list_dir,grep,todo_write";
+const ISOLATED_TOOLS: &[&str] = &["read_file", "list_dir", "grep", "todo_write"];
+
+/// The built-in tools grok gives a session, by grok's identifiers, as
+/// observed in the pulse's grok sessions (2026-10).
+const TOOL_SURFACE: &[&str] = &[
+    "read_file",
+    "grep",
+    "search_replace",
+    "write",
+    "list_dir",
+    "run_terminal_command",
+    "web_fetch",
+    "todo_write",
+];
 
 /// Tools that survive a `--tools` allowlist and must be removed by name.
 const ISOLATED_REMOVE: &str = "search_tool,use_tool,workflow";
@@ -154,7 +167,7 @@ impl CliAdapter for Grok {
 
         if inv.restricted {
             args.push("--tools".into());
-            args.push(ISOLATED_TOOLS.into());
+            args.push(ISOLATED_TOOLS.join(",").into());
             args.push("--disallowed-tools".into());
             args.push(ISOLATED_REMOVE.into());
             args.push("--disable-web-search".into());
@@ -208,6 +221,18 @@ impl CliAdapter for Grok {
         } else {
             ExitClass::Plain
         }
+    }
+
+    fn tool_surface(&self, restricted: bool) -> &'static [&'static str] {
+        if restricted {
+            ISOLATED_TOOLS
+        } else {
+            TOOL_SURFACE
+        }
+    }
+
+    fn tool_surface_note(&self) -> &'static str {
+        "Observed in grok CLI sessions, 2026-10."
     }
 
     fn integration(&self) -> &dyn AgentIntegration {
@@ -453,7 +478,10 @@ mod tests {
         let guarded = strings(&Grok.invoke_args(&inv));
         // Isolation is an allowlist of grok's read-only tools (its names),
         // plus the two removals an allowlist does not cover and the web pair.
-        assert_eq!(value_of(&guarded, "--tools"), Some(ISOLATED_TOOLS));
+        assert_eq!(
+            value_of(&guarded, "--tools"),
+            Some(ISOLATED_TOOLS.join(",").as_str())
+        );
         assert_eq!(
             value_of(&guarded, "--disallowed-tools"),
             Some(ISOLATED_REMOVE)
@@ -461,13 +489,38 @@ mod tests {
         assert!(guarded.iter().any(|arg| arg == "--disable-web-search"));
         for shell_or_write in ["run_terminal_command", "write", "search_replace"] {
             assert!(
-                !ISOLATED_TOOLS.split(',').any(|t| t == shell_or_write),
+                !ISOLATED_TOOLS.contains(&shell_or_write),
                 "{shell_or_write} must not be allowed in isolation"
             );
         }
         assert!(guarded
             .iter()
             .any(|arg| arg == "--include-partial-messages"));
+    }
+
+    #[test]
+    fn tool_surface_is_observed_and_isolation_keeps_the_allowlist() {
+        assert_eq!(
+            Grok.tool_surface(false),
+            [
+                "read_file",
+                "grep",
+                "search_replace",
+                "write",
+                "list_dir",
+                "run_terminal_command",
+                "web_fetch",
+                "todo_write",
+            ]
+        );
+        assert_eq!(
+            Grok.tool_surface(true),
+            ["read_file", "list_dir", "grep", "todo_write"]
+        );
+        for tool in Grok.tool_surface(true) {
+            assert!(Grok.tool_surface(false).contains(tool), "{tool}");
+        }
+        assert!(!Grok.tool_surface_note().is_empty());
     }
 
     #[test]

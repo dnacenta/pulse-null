@@ -171,6 +171,12 @@ impl CliAdapter for Codex {
         }
     }
 
+    /// No measured list: [`tool_surface`](CliAdapter::tool_surface) stays
+    /// empty and AWARENESS names the CLI as the source instead.
+    fn tool_surface_note(&self) -> &'static str {
+        "Tools are provided by the codex CLI."
+    }
+
     fn integration(&self) -> &dyn AgentIntegration {
         self
     }
@@ -373,6 +379,16 @@ mod tests {
             ExitClass::FlaggedButUnmatched
         );
         assert_eq!(Codex.classify_exit("", "boom"), ExitClass::Plain);
+    }
+
+    #[test]
+    fn tool_surface_is_unmeasured_and_the_note_names_the_cli() {
+        assert!(Codex.tool_surface(false).is_empty());
+        assert!(Codex.tool_surface(true).is_empty());
+        assert_eq!(
+            Codex.tool_surface_note(),
+            "Tools are provided by the codex CLI."
+        );
     }
 
     #[test]

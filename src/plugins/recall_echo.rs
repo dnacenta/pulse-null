@@ -75,8 +75,7 @@ impl Plugin for RecallEchoPlugin {
         Some(
             "Three-layer persistent memory system with session archival. \
              Manages MEMORY.md (curated), EPHEMERAL.md (session summaries), \
-             and full conversation archives. Handles checkpoint saves before \
-             context compaction and automatic session archiving on exit."
+             and full conversation archives."
                 .to_string(),
         )
     }

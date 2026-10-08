@@ -900,14 +900,18 @@ fn instruction_label(path: &Path) -> &'static str {
     }
 }
 
-/// Does the entity's agent CLI pull AWARENESS.md in by itself (through an
-/// import in its instruction file)? When not, the prompt builder inlines it.
-fn awareness_via_import(config: &Config) -> bool {
+/// The adapter for the agent CLI this config drives, if any.
+fn agent_cli(config: &Config) -> Option<Box<dyn crate::cli_provider::adapter::CliAdapter>> {
     config
         .llm
         .cli_adapter()
         .and_then(crate::cli_provider::adapters::by_name)
-        .is_some_and(|adapter| adapter.integration().imports_awareness())
+}
+
+/// Does the entity's agent CLI pull AWARENESS.md in by itself (through an
+/// import in its instruction file)? When not, the prompt builder inlines it.
+fn awareness_via_import(config: &Config) -> bool {
+    agent_cli(config).is_some_and(|adapter| adapter.integration().imports_awareness())
 }
 
 /// Build a minimal system prompt for scheduled tasks (Phase 5: Task Isolation).
@@ -1407,17 +1411,24 @@ fn build_capabilities(config: &Config) -> Vec<Capability> {
         name: "Memory System".into(),
         what: "Three-layer persistent memory: curated (MEMORY.md), session (EPHEMERAL.md), and archive (conversations/).".into(),
         why: "Continuity across sessions. You are not starting fresh — you carry forward what you've learned.".into(),
-        how: "MEMORY.md is always in context. Write stable facts to it using file_write. EPHEMERAL.md is consumed at session start. Archives are searchable with grep.".into(),
+        how: "MEMORY.md is always in context. Write stable facts to it. EPHEMERAL.md is consumed at session start. Archives are kept in conversations/.".into(),
         constraints: Some(format!("MEMORY.md limited to {} lines. Keep it concise — it costs context on every conversation.", config.memory.memory_max_lines)),
     });
 
     // Graph memory
     if config.graph.enabled {
+        // graph_query is a registry tool: only providers that call the
+        // registry can use it.
+        let query = if provider_reports_tool_rounds(&config.llm.provider) {
+            "Use the graph_query tool to search by semantic similarity or query relationships. "
+        } else {
+            ""
+        };
         capabilities.push(Capability {
             name: "Knowledge Graph".into(),
             what: "Semantic knowledge graph with your accumulated knowledge. Check <graph-awareness> in your prompt for current stats.".into(),
             why: "Structured knowledge that memory files can't capture — relationships between concepts, people, and ideas with confidence scores.".into(),
-            how: "Use the graph_query tool to search by semantic similarity or query relationships. Graph is populated automatically from conversation archives. Storage is SurrealDB.".into(),
+            how: format!("{query}Graph is populated automatically from conversation archives. Storage is SurrealDB."),
             constraints: Some("Bayesian confidence model on edges. Priors vary by extraction context. Multi-hop path confidence is the product of edge confidences.".into()),
         });
     }
@@ -1524,8 +1535,55 @@ fn build_capabilities(config: &Config) -> Vec<Capability> {
     capabilities
 }
 
-/// Build the "## Available Tools" section from registered tool names.
-fn build_tools_section(tool_names: &[String]) -> Option<String> {
+/// Build the tools section. An agent CLI runs its own tools and is never
+/// handed the in-process registry, so a CLI pulse is shown its adapter's
+/// surface; the registry is listed only for providers that call it.
+fn build_tools_section(config: &Config, tool_names: &[String]) -> Option<String> {
+    if let Some(adapter) = agent_cli(config) {
+        return build_cli_tools_section(adapter.as_ref());
+    }
+    if !provider_reports_tool_rounds(&config.llm.provider) {
+        return None;
+    }
+    build_registry_tools_section(tool_names)
+}
+
+/// "## Your tools" from the adapter's measured surface. The unrestricted list
+/// is rendered with what isolation removes, rather than the surface of the
+/// moment: the file and the chat prompt outlive an isolation toggle.
+fn build_cli_tools_section(
+    adapter: &dyn crate::cli_provider::adapter::CliAdapter,
+) -> Option<String> {
+    let surface = adapter.tool_surface(false);
+    let isolated = adapter.tool_surface(true);
+    let mut parts = Vec::new();
+    if !surface.is_empty() {
+        let list: Vec<String> = surface.iter().map(|t| format!("- {t}")).collect();
+        parts.push(format!(
+            "Your agent CLI runs these tools itself:\n{}",
+            list.join("\n")
+        ));
+    }
+    let note = adapter.tool_surface_note();
+    if !note.is_empty() {
+        parts.push(note.to_string());
+    }
+    let removed: Vec<&str> = surface
+        .iter()
+        .copied()
+        .filter(|t| !isolated.contains(t))
+        .collect();
+    if !removed.is_empty() {
+        parts.push(format!("Isolation mode removes {}.", removed.join(", ")));
+    }
+    if parts.is_empty() {
+        return None;
+    }
+    Some(format!("## Your tools\n\n{}", parts.join("\n\n")))
+}
+
+/// "## Available Tools" from the in-process registry's tool names.
+fn build_registry_tools_section(tool_names: &[String]) -> Option<String> {
     if tool_names.is_empty() {
         return None;
     }
@@ -1612,7 +1670,7 @@ pub fn rebuild_platform_manifest(
     }
 
     // Tools
-    if let Some(tools_section) = build_tools_section(tool_names) {
+    if let Some(tools_section) = build_tools_section(config, tool_names) {
         sections.push(tools_section);
     }
 
@@ -1636,7 +1694,8 @@ const PLATFORM_TEMPLATE: &str = include_str!("../../assets/platform-template.md"
 ///
 /// Combines the conceptual template (philosophy) with the dynamic capabilities
 /// manifest (config-driven inventory). In compact mode, only the manifest is
-/// included to save context tokens.
+/// included to save context tokens. The template's `{generated_at}` is
+/// stamped with the current UTC time, so a reader can tell how old it is.
 ///
 /// Returns the full document content ready to write to disk or inject into
 /// a system prompt.
@@ -1649,7 +1708,13 @@ pub fn generate_awareness_document(
 
     match config.platform.mode {
         AwarenessMode::Compact => manifest,
-        AwarenessMode::Full => format!("{}\n\n{}", PLATFORM_TEMPLATE.trim(), manifest),
+        AwarenessMode::Full => {
+            let generated_at = chrono::Utc::now().format("%Y-%m-%d %H:%M:%S UTC");
+            let template = PLATFORM_TEMPLATE
+                .trim()
+                .replace("{generated_at}", &generated_at.to_string());
+            format!("{template}\n\n{manifest}")
+        }
     }
 }
 
@@ -1970,7 +2035,9 @@ mod tests {
         let config = minimal_config();
         let doc = generate_awareness_document(&config, &[], &[]);
         assert!(doc.contains("What You Are"));
-        assert!(doc.contains("How to Think About All This"));
+        assert!(doc.contains("How to Use This"));
+        assert!(doc.contains("Each turn runs a language model once, in a fresh process."));
+        assert!(!doc.contains("living thing"));
         assert!(doc.contains("Memory System"));
     }
 
@@ -2022,7 +2089,120 @@ mod tests {
 
     #[test]
     fn build_tools_section_returns_none_when_empty() {
-        assert!(build_tools_section(&[]).is_none());
+        assert!(build_tools_section(&minimal_config(), &[]).is_none());
+        assert!(build_registry_tools_section(&[]).is_none());
+    }
+
+    /// Registry tools an agent CLI is never handed.
+    const REGISTRY_ONLY_TOOLS: [&str; 5] = [
+        "file_write",
+        "graph_query",
+        "discord_post",
+        "file_read",
+        "file_list",
+    ];
+
+    /// `config` with every plugin compiled into this build enabled, so their
+    /// AWARENESS descriptions are checked too.
+    fn with_every_plugin(mut config: Config) -> Config {
+        for entry in crate::plugins::registry::known_plugins() {
+            config
+                .plugins
+                .insert(entry.name, toml::Value::Table(toml::map::Map::new()));
+        }
+        config
+    }
+
+    fn cli_config(adapter: &str) -> Config {
+        let mut config = minimal_config();
+        config.llm.provider = "cli".into();
+        config.llm.adapter = Some(adapter.into());
+        with_every_plugin(config)
+    }
+
+    /// AWARENESS.md as boot would write it, with every registry tool
+    /// registered (plugin tools included).
+    fn awareness_for(config: &Config) -> String {
+        let plugins =
+            crate::plugins::manager::PluginManager::new(config).collect_platform_descriptions();
+        let tools: Vec<String> = REGISTRY_ONLY_TOOLS
+            .iter()
+            .chain(&["grep", "web_fetch"])
+            .map(|t| t.to_string())
+            .collect();
+        generate_awareness_document(config, &plugins, &tools)
+    }
+
+    #[test]
+    fn awareness_names_only_tools_the_adapter_exposes() {
+        const ADAPTERS: [&str; 3] = ["claude", "grok", "codex"];
+        let adapter = |name: &str| crate::cli_provider::adapters::by_name(name).unwrap();
+        let known: Vec<&str> = ADAPTERS
+            .iter()
+            .flat_map(|name| adapter(name).tool_surface(false).to_vec())
+            .chain(REGISTRY_ONLY_TOOLS)
+            .chain(["grep", "web_fetch"])
+            .collect();
+
+        for name in ADAPTERS {
+            let cli = adapter(name);
+            let surface = cli.tool_surface(false);
+            let doc = awareness_for(&cli_config(name));
+
+            for registry_tool in REGISTRY_ONLY_TOOLS {
+                assert!(
+                    !doc.contains(registry_tool),
+                    "{name}: AWARENESS names registry tool `{registry_tool}`"
+                );
+            }
+            // Every tool the document lists, or names by a snake_case
+            // identifier, is one the adapter exposes.
+            let listed = doc.lines().filter_map(|l| l.strip_prefix("- "));
+            let identifiers = doc
+                .split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+                .filter(|t| t.contains('_'));
+            for tool in listed.chain(identifiers).filter(|t| known.contains(t)) {
+                assert!(
+                    surface.contains(&tool),
+                    "{name}: AWARENESS names `{tool}`, which the adapter does not expose"
+                );
+            }
+            for tool in surface {
+                assert!(
+                    doc.lines().any(|l| l == format!("- {tool}")),
+                    "{name}: {tool}"
+                );
+            }
+            assert!(doc.contains("## Your tools"), "{name}");
+            assert!(doc.contains(cli.tool_surface_note()), "{name}");
+            assert!(!doc.contains("## Available Tools"), "{name}");
+        }
+
+        assert!(awareness_for(&cli_config("claude"))
+            .contains("Isolation mode removes Bash, Write, Edit, Agent."));
+        assert!(!awareness_for(&cli_config("codex")).contains("Isolation mode"));
+
+        // An API provider is handed the registry, so it is listed.
+        let doc = awareness_for(&with_every_plugin(minimal_config()));
+        assert!(doc.contains("## Available Tools"));
+        assert!(!doc.contains("## Your tools"));
+        for tool in REGISTRY_ONLY_TOOLS {
+            assert!(doc.lines().any(|l| l == format!("- {tool}")), "{tool}");
+        }
+    }
+
+    #[test]
+    fn awareness_template_is_stamped_and_claims_no_proprioception() {
+        let doc = generate_awareness_document(&minimal_config(), &[], &[]);
+        let stamp = doc
+            .lines()
+            .find_map(|l| l.strip_prefix("Generated at "))
+            .expect("Generated at line");
+        assert!(stamp.ends_with(" UTC."), "{stamp}");
+        assert!(!doc.contains("{generated_at}"));
+        assert!(!doc.contains("proprioception"));
+        assert!(!doc.contains("what is real right now"));
+        assert!(doc.contains("regenerated at boot and when a plugin changes state"));
     }
 
     #[test]

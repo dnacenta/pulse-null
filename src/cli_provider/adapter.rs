@@ -197,6 +197,20 @@ pub trait CliAdapter: Send + Sync {
         ExitClass::FlaggedButUnmatched
     }
 
+    /// The tools this CLI gives the pulse, by the CLI's own names, for
+    /// AWARENESS.md. `restricted` asks for the isolation-mode surface. Empty
+    /// means the adapter does not know the list; listing fewer tools than the
+    /// CLI has is honest, listing one it lacks is not.
+    fn tool_surface(&self, _restricted: bool) -> &'static [&'static str] {
+        &[]
+    }
+
+    /// One sentence on where [`tool_surface`](Self::tool_surface) comes from
+    /// (CLI version measured, tools that load on demand). Empty for none.
+    fn tool_surface_note(&self) -> &'static str {
+        ""
+    }
+
     /// How this CLI's pulse directory is wired (instruction file, hooks,
     /// rules) and what recall-echo should be told about it.
     fn integration(&self) -> &dyn AgentIntegration;

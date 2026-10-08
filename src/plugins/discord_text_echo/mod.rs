@@ -109,9 +109,9 @@ impl Plugin for DiscordTextEchoPlugin {
 
     fn platform_description(&self) -> Option<String> {
         Some(
-            "Discord text channel integration. Reads messages from \
-             configured channels and can post messages via the discord_post \
-             tool. Messages from Discord arrive as verified-trust input."
+            "Discord text channel integration. Messages from configured \
+             channels reach you as verified-trust input, and the runtime \
+             posts your reply back to the channel."
                 .to_string(),
         )
     }

@@ -135,6 +135,26 @@ pub fn generate_awareness(
     }
 }
 
+/// Regenerate AWARENESS.md, then build the chat system prompt. The prompt is a
+/// boot-time snapshot that inlines AWARENESS.md for adapters that do not
+/// import it, so it must be built from this boot's file, not the last one's.
+pub async fn awareness_then_system_prompt(
+    root_dir: &Path,
+    config: &Config,
+    plugin_manager: &PluginManager,
+    tools: &ToolRegistry,
+    monitors: &Monitors,
+) -> Result<String, crate::errors::PromptError> {
+    generate_awareness(root_dir, config, plugin_manager, tools);
+    super::prompt::build_system_prompt_async(
+        root_dir.to_path_buf(),
+        config.clone(),
+        monitors.pipeline.clone(),
+        monitors.cognitive.clone(),
+    )
+    .await
+}
+
 /// Run the startup pipeline health check and auto-archive bloated documents.
 pub fn startup_pipeline_check(
     root_dir: &Path,
@@ -263,5 +283,41 @@ pub fn spawn_session_cleanup(config: &Config, state: &Arc<super::AppState>) {
             }
         });
         tracing::info!("Session cleanup task started (every {}s)", cleanup_interval);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn chat_prompt_is_built_after_awareness_regeneration() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::write(
+            root.join("AWARENESS.md"),
+            "STALE AWARENESS FROM THE LAST BOOT",
+        )
+        .unwrap();
+        let mut config = crate::config::test_support::minimal_config();
+        // No agent CLI: AWARENESS.md is inlined into the chat prompt.
+        config.llm.provider = "ollama".into();
+        let monitors = create_monitors(&config);
+        let tools = register_builtin_tools(root, &config);
+        let plugin_manager = PluginManager::new(&config);
+
+        let prompt =
+            awareness_then_system_prompt(root, &config, &plugin_manager, &tools, &monitors)
+                .await
+                .unwrap();
+
+        let fresh = std::fs::read_to_string(root.join("AWARENESS.md")).unwrap();
+        let stamp = fresh
+            .lines()
+            .find(|l| l.starts_with("Generated at "))
+            .expect("regenerated AWARENESS.md is stamped");
+        assert!(prompt.contains(stamp), "prompt carries this boot's file");
+        assert!(prompt.contains("Test — Platform Awareness"));
+        assert!(!prompt.contains("STALE AWARENESS"));
     }
 }
