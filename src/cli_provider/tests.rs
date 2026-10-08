@@ -453,6 +453,46 @@ async fn refusal_is_a_typed_error() {
     );
 }
 
+/// An exit-0 `is_error` document carrying the refusal signature is the same
+/// typed refusal as a non-zero exit, so the refusal fallback still fires.
+#[tokio::test]
+async fn is_error_refusal_document_is_a_typed_refusal() {
+    let mock = MockCli::new(
+        "printf '{\"type\":\"result\",\"is_error\":true,\"result\":\"This violates the Usage Policy\"}'; exit 0",
+    );
+    let err = mock
+        .provider("m")
+        .invoke("sys", &[user("x")], 10, None)
+        .await
+        .unwrap_err();
+    let refusal = err
+        .downcast_ref::<crate::errors::RefusalError>()
+        .unwrap_or_else(|| panic!("expected RefusalError, got {err}"));
+    assert_eq!(refusal.model, "m");
+    assert!(refusal.detail.contains("Usage Policy"));
+}
+
+/// A spent quota reaches the caller as an error whose text classifies as
+/// quota, whether the CLI exits non-zero or exits 0 with `is_error`.
+#[tokio::test]
+async fn spent_quota_is_an_error_that_classifies_as_quota() {
+    for exit in ["exit 1", "exit 0"] {
+        let mock = MockCli::new(&format!(
+            "printf '{{\"type\":\"result\",\"is_error\":true,\"result\":\"You are out of extra usage\",\"session_id\":\"s\"}}'; {exit}"
+        ));
+        let err = mock
+            .provider("m")
+            .invoke("sys", &[user("x")], 10, None)
+            .await
+            .unwrap_err();
+        assert_eq!(
+            crate::provider_status::classify_error(&err.to_string()),
+            crate::provider_status::ErrorKind::QuotaExhausted,
+            "{exit}: {err}"
+        );
+    }
+}
+
 #[test]
 fn env_set_reaches_the_child() {
     let root = tempfile::tempdir().unwrap();

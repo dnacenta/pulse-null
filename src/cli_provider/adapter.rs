@@ -88,6 +88,9 @@ pub enum ExitClass {
     /// adapter's refusal signature — worth a warning, since a signature can
     /// drift between CLI releases.
     FlaggedButUnmatched,
+    /// The account's usage quota or credit is spent. Not recoverable by a
+    /// retry or a model fallback; the error text still carries the detail.
+    QuotaExhausted,
     /// An ordinary failure.
     Plain,
 }
@@ -190,11 +193,17 @@ pub trait CliAdapter: Send + Sync {
     fn classify_exit(&self, stdout: &str, stderr: &str) -> ExitClass;
 
     /// Classify the text of a streamed terminal record the CLI flagged as an
-    /// error. Flagged without a known refusal signature by default, so a
+    /// error. Quota exhaustion is recognised here for every CLI; anything
+    /// else is flagged without a known refusal signature by default, so a
     /// signature appearing in a later release is logged rather than
-    /// swallowed; adapters with a signature override this.
-    fn classify_terminal(&self, _text: &str) -> ExitClass {
-        ExitClass::FlaggedButUnmatched
+    /// swallowed. Adapters with a refusal signature override this and keep
+    /// the quota check.
+    fn classify_terminal(&self, text: &str) -> ExitClass {
+        if crate::provider_status::is_quota_exhausted(text) {
+            ExitClass::QuotaExhausted
+        } else {
+            ExitClass::FlaggedButUnmatched
+        }
     }
 
     /// The tools this CLI gives the pulse, by the CLI's own names, for
@@ -209,6 +218,19 @@ pub trait CliAdapter: Send + Sync {
     /// (CLI version measured, tools that load on demand). Empty for none.
     fn tool_surface_note(&self) -> &'static str {
         ""
+    }
+
+    /// The pulse's own rules directory, when this CLI does not load it by
+    /// itself and the prompt builder must inline it. `None` when the CLI
+    /// reads the rules on its own (or the pulse has none to give it).
+    fn project_rules_dir(&self, _root: &Path) -> Option<PathBuf> {
+        None
+    }
+
+    /// File names in [`project_rules_dir`](Self::project_rules_dir) that are
+    /// not to be inlined, because what they say is false for this CLI.
+    fn project_rules_exclude(&self) -> &'static [&'static str] {
+        &[]
     }
 
     /// How this CLI's pulse directory is wired (instruction file, hooks,

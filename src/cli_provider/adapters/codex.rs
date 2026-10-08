@@ -163,9 +163,12 @@ impl CliAdapter for Codex {
 
     /// Codex has no known policy-refusal signature. A structured error line is
     /// flagged so a signature appearing in a later release is not swallowed.
-    fn classify_exit(&self, stdout: &str, _stderr: &str) -> ExitClass {
-        if has_error_record(stdout) {
-            ExitClass::FlaggedButUnmatched
+    /// A spent quota, on stderr or in the error record, is its own class.
+    fn classify_exit(&self, stdout: &str, stderr: &str) -> ExitClass {
+        if crate::provider_status::is_quota_exhausted(stderr) {
+            ExitClass::QuotaExhausted
+        } else if has_error_record(stdout) {
+            self.classify_terminal(stdout)
         } else {
             ExitClass::Plain
         }
@@ -175,6 +178,17 @@ impl CliAdapter for Codex {
     /// empty and AWARENESS names the CLI as the source instead.
     fn tool_surface_note(&self) -> &'static str {
         "Tools are provided by the codex CLI."
+    }
+
+    /// This CLI does not read `.claude/rules/`; the prompt builder inlines it.
+    fn project_rules_dir(&self, root: &Path) -> Option<std::path::PathBuf> {
+        Some(root.join(".claude/rules"))
+    }
+
+    /// `recall-echo.md` is written by the claude integration and describes
+    /// hooks only Claude Code runs.
+    fn project_rules_exclude(&self) -> &'static [&'static str] {
+        &["recall-echo.md"]
     }
 
     fn integration(&self) -> &dyn AgentIntegration {
@@ -379,6 +393,25 @@ mod tests {
             ExitClass::FlaggedButUnmatched
         );
         assert_eq!(Codex.classify_exit("", "boom"), ExitClass::Plain);
+    }
+
+    #[test]
+    fn spent_quota_is_its_own_exit_class() {
+        assert_eq!(
+            Codex.classify_exit("", "HTTP 402 Payment Required"),
+            ExitClass::QuotaExhausted
+        );
+        let stdout = r#"{"type":"error","message":"Your credit balance is too low"}"#;
+        assert_eq!(Codex.classify_exit(stdout, ""), ExitClass::QuotaExhausted);
+    }
+
+    #[test]
+    fn pulse_rules_are_inlined_without_the_claude_hook_file() {
+        assert_eq!(
+            Codex.project_rules_dir(Path::new("/p")),
+            Some(PathBuf::from("/p/.claude/rules"))
+        );
+        assert_eq!(Codex.project_rules_exclude(), ["recall-echo.md"]);
     }
 
     #[test]

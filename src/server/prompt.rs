@@ -288,6 +288,11 @@ pub fn build_system_prompt_budgeted(
         }
     }
 
+    // --- Tier 0 (Essential): the pulse's own rules, for CLIs that skip them ---
+    if let Some(component) = pulse_rules_component(root_dir, config) {
+        components.push(component);
+    }
+
     // --- Tier 1 (High): SELF.md ---
     let self_path = root_dir.join("SELF.md");
     if self_path.exists() {
@@ -418,6 +423,17 @@ pub fn build_system_prompt_budgeted(
             tokens,
             tier: PromptTier::High,
             cap: 0,
+        });
+    }
+
+    // --- Tier 1 (High): journal counts (a runtime fact, Amendment C) ---
+    if let Some(line) = journal_counts_line(root_dir, config) {
+        components.push(PromptComponent {
+            name: "journal-counts",
+            tokens: estimate_tokens(&line),
+            content: line,
+            tier: PromptTier::High,
+            cap: JOURNAL_COUNTS_CAP,
         });
     }
 
@@ -852,6 +868,11 @@ pub fn build_task_system_prompt_budgeted(
         }
     }
 
+    // --- Tier 0 (Essential): the pulse's own rules, for CLIs that skip them ---
+    if let Some(component) = pulse_rules_component(root_dir, config) {
+        components.push(component);
+    }
+
     // --- Tier 1 (High): SELF.md — identity ---
     let self_path = root_dir.join("SELF.md");
     if self_path.exists() {
@@ -881,6 +902,17 @@ pub fn build_task_system_prompt_budgeted(
             tokens,
             tier: PromptTier::High,
             cap: 0,
+        });
+    }
+
+    // --- Tier 1 (High): journal counts (a runtime fact, Amendment C) ---
+    if let Some(line) = journal_counts_line(root_dir, config) {
+        components.push(PromptComponent {
+            name: "journal-counts",
+            tokens: estimate_tokens(&line),
+            content: line,
+            tier: PromptTier::High,
+            cap: JOURNAL_COUNTS_CAP,
         });
     }
 
@@ -1041,6 +1073,108 @@ fn build_tension_context(root_dir: &Path, config: &Config) -> Option<String> {
          thread does not lower it.\n</tension-context>"
     );
     Some(block)
+}
+
+/// Journal documents whose entry counts the runtime reports.
+const JOURNAL_COUNTED: [&str; 3] = ["LEARNING", "THOUGHTS", "REFLECTIONS"];
+
+/// Token cap for the `<journal-counts>` line; it is one short line.
+const JOURNAL_COUNTS_CAP: usize = 50;
+
+/// `<journal-counts written-by="runtime">` — entry counts of the journal
+/// documents and how long ago the newest of them changed. A plain runtime
+/// fact: no advice, never a wake, never a reward input. `None` when the
+/// pipeline is off or no counted journal file exists.
+fn journal_counts_line(root_dir: &Path, config: &Config) -> Option<String> {
+    if !config.pipeline.enabled {
+        return None;
+    }
+    let journal = root_dir.join("journal");
+    let newest = JOURNAL_COUNTED
+        .iter()
+        .filter_map(|doc| {
+            std::fs::metadata(journal.join(format!("{doc}.md")))
+                .and_then(|m| m.modified())
+                .ok()
+        })
+        .max()?;
+    let age_days = newest.elapsed().map_or(0, |d| d.as_secs() / 86_400);
+    let health =
+        crate::praxis::runtime::calculate(root_dir, &crate::praxis::runtime::Thresholds::default());
+    Some(render_journal_counts(
+        [
+            health.learning.count,
+            health.thoughts.count,
+            health.reflections.count,
+        ],
+        age_days,
+    ))
+}
+
+fn render_journal_counts(counts: [usize; 3], age_days: u64) -> String {
+    let age = match age_days {
+        0 => "today".to_string(),
+        n => format!("{n} d ago"),
+    };
+    let counts: Vec<String> = JOURNAL_COUNTED
+        .iter()
+        .zip(counts)
+        .map(|(doc, count)| format!("{doc} {count}"))
+        .collect();
+    format!(
+        "<journal-counts written-by=\"runtime\">{} · last change {age}</journal-counts>",
+        counts.join(" · ")
+    )
+}
+
+/// The pulse's own `.claude/rules/`-style directory, inlined for an agent CLI
+/// that does not load it itself (the adapter says where, and which files are
+/// false for it). Skipped when the operator's `pulse.rules_dir` already is
+/// that directory, so no file is included twice.
+fn pulse_rules_component(root_dir: &Path, config: &Config) -> Option<PromptComponent> {
+    let adapter = agent_cli(config)?;
+    let dir = adapter.project_rules_dir(root_dir)?;
+    if let Some(operator) = &config.pulse.rules_dir {
+        let same = |a: &Path, b: &Path| match (a.canonicalize(), b.canonicalize()) {
+            (Ok(a), Ok(b)) => a == b,
+            _ => false,
+        };
+        if same(Path::new(operator), &dir) {
+            return None;
+        }
+    }
+    let exclude = adapter.project_rules_exclude();
+    let rules = match load_rule_files(&dir.to_string_lossy()) {
+        Ok(rules) => rules,
+        Err(e) => {
+            warn!("Failed to load pulse rules from {}: {}", dir.display(), e);
+            return None;
+        }
+    };
+    let text: Vec<String> = rules
+        .into_iter()
+        .filter(|(name, _)| !exclude.contains(&format!("{name}.md").as_str()))
+        .map(|(name, content)| {
+            format!("<protocol source=\"pulse-rules\" name=\"{name}\">\n{content}\n</protocol>")
+        })
+        .collect();
+    if text.is_empty() {
+        return None;
+    }
+    let budget_cfg = &config.system_prompt_budget;
+    let joined = text.join("\n\n");
+    let content = if budget_cfg.enabled && budget_cfg.rules_cap > 0 {
+        truncate_to_token_cap(&joined, budget_cfg.rules_cap)
+    } else {
+        joined
+    };
+    Some(PromptComponent {
+        name: "pulse-rules",
+        tokens: estimate_tokens(&content),
+        content,
+        tier: PromptTier::Essential,
+        cap: budget_cfg.rules_cap,
+    })
 }
 
 /// Load THOUGHT_STACK.md bounded by both line count and bytes, wrapped for the
@@ -2112,6 +2246,122 @@ mod tests {
         assert!(chat.contains("file_write"));
         assert!(chat.contains("graph_query"));
         assert!(intent.contains("file_read"));
+    }
+
+    #[test]
+    fn journal_counts_line_is_a_fact_without_advice() {
+        assert_eq!(
+            render_journal_counts([7, 5, 14], 9),
+            "<journal-counts written-by=\"runtime\">LEARNING 7 · THOUGHTS 5 · REFLECTIONS 14 · last change 9 d ago</journal-counts>"
+        );
+        assert!(render_journal_counts([0, 0, 0], 0).contains("last change today"));
+        assert!(render_journal_counts([0, 0, 0], 1).contains("last change 1 d ago"));
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = minimal_config();
+        config.system_prompt_budget.enabled = false;
+        // No journal files: no line.
+        assert!(journal_counts_line(dir.path(), &config).is_none());
+
+        std::fs::create_dir_all(dir.path().join("journal")).unwrap();
+        let nine_days_ago =
+            std::time::SystemTime::now() - std::time::Duration::from_secs(9 * 86_400 + 60);
+        for doc in JOURNAL_COUNTED {
+            let path = dir.path().join(format!("journal/{doc}.md"));
+            std::fs::write(
+                &path,
+                "## 2026-10-01 — one\nbody\n\n## 2026-10-02 — two\nbody\n",
+            )
+            .unwrap();
+            std::fs::File::options()
+                .write(true)
+                .open(&path)
+                .unwrap()
+                .set_modified(nine_days_ago)
+                .unwrap();
+        }
+        let line = journal_counts_line(dir.path(), &config).expect("journal files exist");
+        assert!(line.starts_with("<journal-counts written-by=\"runtime\">LEARNING "));
+        assert!(
+            line.ends_with("· last change 9 d ago</journal-counts>"),
+            "{line}"
+        );
+        for advice in [
+            "should", "reflect", "archive", "consider", "need", "must", "try",
+        ] {
+            assert!(!line.contains(advice), "{advice} in {line}");
+        }
+
+        let chat = build_system_prompt(dir.path(), &config).unwrap();
+        let task = build_task_system_prompt(dir.path(), &config).unwrap();
+        assert!(chat.contains(&line), "chat profile carries the line");
+        assert!(task.contains(&line), "task profile carries the line");
+
+        config.pipeline.enabled = false;
+        assert!(journal_counts_line(dir.path(), &config).is_none());
+    }
+
+    /// A pulse whose rules dir holds a real rule and the claude hook rule.
+    fn seed_pulse_rules(root: &Path) -> PathBuf {
+        let rules = root.join(".claude/rules");
+        std::fs::create_dir_all(&rules).unwrap();
+        std::fs::write(rules.join("self-work.md"), "SELF-WORK-RULE").unwrap();
+        std::fs::write(rules.join("recall-echo.md"), "RECALL-HOOK-RULE").unwrap();
+        std::fs::write(rules.join("a-first.md"), "FIRST-RULE").unwrap();
+        rules
+    }
+
+    #[test]
+    fn grok_inlines_pulse_rules_except_claude_hook_rules() {
+        for adapter in ["grok", "codex"] {
+            let dir = tempfile::tempdir().unwrap();
+            let rules = seed_pulse_rules(dir.path());
+            let mut config = cli_config(adapter);
+            config.system_prompt_budget.enabled = false;
+
+            let chat = build_system_prompt(dir.path(), &config).unwrap();
+            let task = build_task_system_prompt(dir.path(), &config).unwrap();
+            for (profile, text) in [("chat", &chat), ("task", &task)] {
+                assert!(
+                    text.contains("<protocol source=\"pulse-rules\""),
+                    "{adapter}/{profile}"
+                );
+                assert!(text.contains("SELF-WORK-RULE"), "{adapter}/{profile}");
+                assert!(!text.contains("RECALL-HOOK-RULE"), "{adapter}/{profile}");
+                let first = text.find("FIRST-RULE").unwrap();
+                assert!(
+                    first < text.find("SELF-WORK-RULE").unwrap(),
+                    "sorted by name"
+                );
+            }
+
+            // The operator pointing rules_dir at the same directory does not
+            // include it twice.
+            config.pulse.rules_dir = Some(rules.to_string_lossy().into_owned());
+            let chat = build_system_prompt(dir.path(), &config).unwrap();
+            assert_eq!(chat.matches("SELF-WORK-RULE").count(), 1, "{adapter}");
+        }
+    }
+
+    #[test]
+    fn claude_does_not_duplicate_rules() {
+        let dir = tempfile::tempdir().unwrap();
+        let rules = seed_pulse_rules(dir.path());
+        let mut config = cli_config("claude");
+        config.system_prompt_budget.enabled = false;
+
+        // Claude Code loads `.claude/rules/` itself.
+        let chat = build_system_prompt(dir.path(), &config).unwrap();
+        let task = build_task_system_prompt(dir.path(), &config).unwrap();
+        for text in [&chat, &task] {
+            assert!(!text.contains("pulse-rules"));
+            assert!(!text.contains("SELF-WORK-RULE"));
+        }
+
+        // An operator rules_dir is still honoured, once.
+        config.pulse.rules_dir = Some(rules.to_string_lossy().into_owned());
+        let chat = build_system_prompt(dir.path(), &config).unwrap();
+        assert_eq!(chat.matches("SELF-WORK-RULE").count(), 1);
     }
 
     #[test]

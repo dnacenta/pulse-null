@@ -581,6 +581,13 @@ impl LmProvider for CliProvider {
                              the refusal signature — detection may have drifted"
                         );
                     }
+                    ExitClass::QuotaExhausted => {
+                        warn!(
+                            model = %model,
+                            adapter = name,
+                            "CLI exited non-zero: the provider's usage quota is exhausted"
+                        );
+                    }
                     ExitClass::Plain => {}
                 }
 
@@ -593,6 +600,7 @@ impl LmProvider for CliProvider {
                         parsed["error"]
                             .as_str()
                             .or_else(|| parsed["message"].as_str())
+                            .or_else(|| parsed["result"].as_str())
                             .unwrap_or_else(|| truncate(&stdout, 500))
                             .to_string()
                     } else {
@@ -611,10 +619,22 @@ impl LmProvider for CliProvider {
             }
 
             let reply = match adapter.output_mode(false) {
-                OutputMode::SingleJson => adapter.parse_single(&stdout),
-                OutputMode::Ndjson => reply_from_ndjson(adapter, &stdout),
-            }
-            .map_err(|e| -> BoxError { e.into() })?;
+                // An exit-0 document flagged as an error may be a policy
+                // refusal; type it like the exit-non-zero path does so the
+                // refusal fallback still fires.
+                OutputMode::SingleJson => adapter.parse_single(&stdout).map_err(|e| match adapter
+                    .classify_terminal(&e)
+                {
+                    ExitClass::Refusal(detail) => Box::new(RefusalError {
+                        model: model.clone(),
+                        detail: truncate(&detail, 500).to_string(),
+                    }) as BoxError,
+                    _ => e.into(),
+                }),
+                OutputMode::Ndjson => {
+                    reply_from_ndjson(adapter, &stdout).map_err(|e| -> BoxError { e.into() })
+                }
+            }?;
             Ok(response(reply, &model))
         })
     }
@@ -822,6 +842,14 @@ fn classify_stream_failure(adapter: &dyn CliAdapter, model: &str, text: String) 
                 adapter = adapter.name(),
                 "stream ended with an error-flagged result that did not match the \
                  refusal signature — detection may have drifted"
+            );
+            StreamEvent::Error(text)
+        }
+        ExitClass::QuotaExhausted => {
+            warn!(
+                model = %model,
+                adapter = adapter.name(),
+                "stream ended with an error: the provider's usage quota is exhausted"
             );
             StreamEvent::Error(text)
         }

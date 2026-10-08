@@ -21,6 +21,9 @@ pub enum ErrorKind {
     RateLimit,
     NetworkError,
     ProcessSpawn,
+    /// The account's usage or credit is spent (402, "out of extra usage").
+    /// Retrying does not help until the owner tops up or the window resets.
+    QuotaExhausted,
     Unknown,
 }
 
@@ -31,6 +34,7 @@ impl std::fmt::Display for ErrorKind {
             ErrorKind::RateLimit => write!(f, "rate_limit"),
             ErrorKind::NetworkError => write!(f, "network_error"),
             ErrorKind::ProcessSpawn => write!(f, "process_spawn"),
+            ErrorKind::QuotaExhausted => write!(f, "quota"),
             ErrorKind::Unknown => write!(f, "unknown"),
         }
     }
@@ -77,7 +81,7 @@ impl ProviderStatus {
         self.error_kind = Some(kind.clone());
 
         self.state = match kind {
-            ErrorKind::AuthExpired => ProviderState::Offline,
+            ErrorKind::AuthExpired | ErrorKind::QuotaExhausted => ProviderState::Offline,
             ErrorKind::RateLimit => ProviderState::Degraded,
             _ if self.consecutive_failures >= 3 => ProviderState::Offline,
             _ => ProviderState::Degraded,
@@ -91,17 +95,44 @@ pub fn new_shared() -> SharedProviderStatus {
     Arc::new(RwLock::new(ProviderStatus::default()))
 }
 
+/// Phrases providers use when the account's usage or credit is spent.
+const QUOTA_PHRASES: [&str; 5] = [
+    "payment required",
+    "usage balance exhausted",
+    "out of extra usage",
+    "hit your limit",
+    "credit balance",
+];
+
+/// Does this provider error text say the usage quota or credit is spent?
+/// Checked before every other class: a quota error often also carries
+/// words like "limit" or "expired" that would misfile it.
+#[must_use]
+pub fn is_quota_exhausted(text: &str) -> bool {
+    let lower = text.to_lowercase();
+    has_status_token(&lower, "402") || QUOTA_PHRASES.iter().any(|p| lower.contains(p))
+}
+
+/// Does `text` carry `code` as a standalone token? Digits inside a timestamp
+/// or an id (`14:02:29.4013`, `7c4291ab`) are not a status code.
+fn has_status_token(text: &str, code: &str) -> bool {
+    text.split(|c: char| !c.is_ascii_alphanumeric())
+        .any(|token| token == code)
+}
+
 /// Classify an error message into a known error kind.
 pub fn classify_error(error_msg: &str) -> ErrorKind {
     let lower = error_msg.to_lowercase();
-    if lower.contains("401")
+    if is_quota_exhausted(&lower) {
+        ErrorKind::QuotaExhausted
+    } else if has_status_token(&lower, "401")
         || lower.contains("unauthorized")
         || lower.contains("auth")
         || lower.contains("expired")
         || lower.contains("invalid api key")
     {
         ErrorKind::AuthExpired
-    } else if lower.contains("429")
+    } else if has_status_token(&lower, "429")
         || lower.contains("rate limit")
         || lower.contains("too many requests")
     {
@@ -179,6 +210,46 @@ mod tests {
             ErrorKind::ProcessSpawn
         );
         assert_eq!(classify_error("permission denied"), ErrorKind::ProcessSpawn);
+    }
+
+    /// The two quota failures that reached the live pulses, verbatim.
+    const SYNTH_402: &str = r#"claude -p exited exit status: 1: …ERROR responses API error status=402 Payment Required error_message=Grok Build usage balance exhausted body_preview={"error":"Grok Build usage balance exhausted"}"#;
+    const ECHO_LIMIT: &str =
+        r#"{"is_error":true,…,"result":"You've hit your limit · resets Aug 12, 6am (UTC)",…}"#;
+
+    #[test]
+    fn quota_errors_classify_as_quota_exhausted() {
+        for text in [
+            SYNTH_402,
+            ECHO_LIMIT,
+            "HTTP 402",
+            "You're out of extra usage",
+            "Your credit balance is too low to access the API",
+        ] {
+            assert_eq!(classify_error(text), ErrorKind::QuotaExhausted, "{text}");
+            assert!(is_quota_exhausted(text), "{text}");
+        }
+        assert_eq!(ErrorKind::QuotaExhausted.to_string(), "quota");
+    }
+
+    #[test]
+    fn status_codes_match_as_tokens_not_digits() {
+        assert_eq!(
+            classify_error("session 7c4291ab at 14:02:29.4013"),
+            ErrorKind::Unknown
+        );
+        assert_eq!(classify_error("request id 84020"), ErrorKind::Unknown);
+        assert_eq!(classify_error("status=401"), ErrorKind::AuthExpired);
+        assert_eq!(classify_error("(429)"), ErrorKind::RateLimit);
+        assert_eq!(classify_error("status=402"), ErrorKind::QuotaExhausted);
+    }
+
+    #[test]
+    fn quota_error_immediately_offline() {
+        let mut status = ProviderStatus::default();
+        status.record_failure(SYNTH_402, ErrorKind::QuotaExhausted);
+        assert_eq!(status.state, ProviderState::Offline);
+        assert_eq!(status.error_kind, Some(ErrorKind::QuotaExhausted));
     }
 
     #[test]

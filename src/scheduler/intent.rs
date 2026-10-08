@@ -770,9 +770,15 @@ async fn execute_intent(
         Ok(r) => r,
         Err(e) => {
             tracing::error!("LLM invocation failed for intent '{}': {}", intent.id, e);
+            // Same provider bookkeeping as a failed task: classify, update
+            // status, emit ProviderError. The intent is still dropped.
+            super::runner::handle_provider_error(state, &intent.id, &e.to_string()).await;
             return None;
         }
     };
+
+    // A success clears what a failure recorded, as on the task path.
+    state.provider_status.write().await.record_success();
 
     tracing::info!(
         "Intent '{}' completed ({} tokens in, {} tokens out, {} tool rounds)",

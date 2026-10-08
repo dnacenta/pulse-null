@@ -716,9 +716,9 @@ fn translate_event(event: &PulseEvent, config: &EventsConfig) -> Option<Intent> 
         // is likely down when this fires.
         PulseEvent::ProviderError { .. } => None,
 
-        // Prediction pressure is observed and routed by the runner via
-        // reflection-window prompt augmentation, not via an autonomous LLM
-        // intent. The event exists for vigil-pulse and future listeners.
+        // Prediction pressure never becomes an autonomous LLM intent. Nothing
+        // emits it since PN-133 removed the reflection-window directive; the
+        // variant stays for the ledger and older event logs.
         PulseEvent::PredictionPressure { .. } => None,
 
         // Salience has already cleared the outreach admission by the time it

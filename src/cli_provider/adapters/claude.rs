@@ -151,6 +151,15 @@ impl CliAdapter for Claude {
         let parsed: serde_json::Value =
             serde_json::from_str(stdout).map_err(|e| format!("failed to parse JSON reply: {e}"))?;
         let text = parsed["result"].as_str().unwrap_or("").trim().to_string();
+        // An exit-0 document flagged as an error (a spent quota, for one)
+        // carries the error in `result`; it is not the reply.
+        if parsed["is_error"].as_bool() == Some(true) {
+            return Err(if text.is_empty() {
+                "error result with no detail".into()
+            } else {
+                text
+            });
+        }
         if text.is_empty() {
             return Err("empty result".into());
         }
@@ -197,10 +206,14 @@ impl CliAdapter for Claude {
     }
 
     /// A refusal is valid JSON with `is_error == true` **and** a `result`
-    /// body containing the Usage-Policy signature. Anything else (non-JSON
+    /// body containing the Usage-Policy signature. A spent quota is
+    /// recognised in that `result` or on stderr. Anything else (non-JSON
     /// stderr, `is_error` absent/false) is a generic error and must not
     /// trigger fallback.
-    fn classify_exit(&self, stdout: &str, _stderr: &str) -> ExitClass {
+    fn classify_exit(&self, stdout: &str, stderr: &str) -> ExitClass {
+        if crate::provider_status::is_quota_exhausted(stderr) {
+            return ExitClass::QuotaExhausted;
+        }
         let Ok(parsed) = serde_json::from_str::<serde_json::Value>(stdout.trim()) else {
             return ExitClass::Plain;
         };
@@ -227,6 +240,8 @@ impl CliAdapter for Claude {
     fn classify_terminal(&self, text: &str) -> ExitClass {
         if text.to_lowercase().contains("usage policy") {
             ExitClass::Refusal(text.to_string())
+        } else if crate::provider_status::is_quota_exhausted(text) {
+            ExitClass::QuotaExhausted
         } else {
             ExitClass::FlaggedButUnmatched
         }
@@ -513,9 +528,57 @@ mod tests {
     #[test]
     fn classify_flags_error_without_policy_text_for_drift() {
         assert_eq!(
-            Claude.classify_exit(r#"{"is_error":true,"result":"out of extra usage"}"#, ""),
+            Claude.classify_exit(r#"{"is_error":true,"result":"something unexpected"}"#, ""),
             ExitClass::FlaggedButUnmatched
         );
+    }
+
+    #[test]
+    fn classify_recognises_a_spent_quota() {
+        assert_eq!(
+            Claude.classify_exit(r#"{"is_error":true,"result":"out of extra usage"}"#, ""),
+            ExitClass::QuotaExhausted
+        );
+        assert_eq!(
+            Claude.classify_exit(
+                r#"{"is_error":true,"result":"You've hit your limit · resets Aug 12, 6am (UTC)"}"#,
+                ""
+            ),
+            ExitClass::QuotaExhausted
+        );
+        assert_eq!(
+            Claude.classify_exit("", "API error status=402 Payment Required"),
+            ExitClass::QuotaExhausted
+        );
+        assert_eq!(
+            Claude.classify_terminal("You're out of extra usage"),
+            ExitClass::QuotaExhausted
+        );
+        // The refusal signature still wins.
+        assert!(matches!(
+            Claude.classify_terminal("Usage Policy: no. Also out of extra usage."),
+            ExitClass::Refusal(_)
+        ));
+    }
+
+    #[test]
+    fn is_error_document_is_an_error_not_a_reply() {
+        let err = Claude
+            .parse_single(
+                r#"{"type":"result","is_error":true,"result":"You've hit your limit · resets Aug 12, 6am (UTC)"}"#,
+            )
+            .unwrap_err();
+        assert!(err.contains("hit your limit"), "{err}");
+        assert!(Claude.parse_single(r#"{"is_error":true}"#).is_err());
+        assert!(Claude
+            .parse_single(r#"{"is_error":false,"result":"fine"}"#)
+            .is_ok());
+    }
+
+    #[test]
+    fn claude_code_loads_its_own_rules() {
+        assert!(Claude.project_rules_dir(Path::new("/p")).is_none());
+        assert!(Claude.project_rules_exclude().is_empty());
     }
 
     #[test]

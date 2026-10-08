@@ -864,7 +864,7 @@ fn resolve_provider_override(
 /// The operator-facing notification is not sent here — every failure path,
 /// including the ones that never reach the provider, is reported once from
 /// [`run_task_loop`] via [`diagnostics::report_failure`].
-async fn handle_provider_error(state: &Arc<AppState>, task_id: &str, error_msg: &str) {
+pub(super) async fn handle_provider_error(state: &Arc<AppState>, task_id: &str, error_msg: &str) {
     let kind = provider_status::classify_error(error_msg);
     let kind_str = kind.to_string();
 
