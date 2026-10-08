@@ -22,28 +22,62 @@ use super::markers::{count_prediction_markers, MarkerCounts};
 /// State file in the pulse root.
 const REFUSALS_FILE: &str = "marker_refusals.json";
 
+/// Largest state file read; a bigger one is not one the runtime wrote.
+const MAX_REFUSALS_BYTES: u64 = 64 * 1024;
+
 /// Serializes every read-modify-write of [`REFUSALS_FILE`] in this process.
 static FILE_LOCK: Mutex<()> = Mutex::new(());
 
-/// Markers refused and not yet acknowledged.
+/// Marker counts.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 struct Pending {
     predict: usize,
     resolve: usize,
 }
 
-/// A notice placed in a turn's prompt, with the counts it showed, so the
-/// same counts can be cleared once that turn succeeds.
+/// Refusals recorded and not yet acknowledged, as numbered entries.
+///
+/// Counts recorded after a notice was shown go to a new entry, so an
+/// acknowledgement clears exactly the entries its notice showed (`id <=
+/// upto`). Two turns that showed the same notice acknowledge the same
+/// entries, so the second acknowledgement removes nothing more.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+struct State {
+    next_id: u64,
+    /// Highest entry id any notice has shown.
+    shown_through: u64,
+    entries: Vec<Entry>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct Entry {
+    id: u64,
+    counts: Pending,
+}
+
+impl State {
+    fn total(&self) -> Pending {
+        self.entries
+            .iter()
+            .fold(Pending::default(), |acc, e| Pending {
+                predict: acc.predict.saturating_add(e.counts.predict),
+                resolve: acc.resolve.saturating_add(e.counts.resolve),
+            })
+    }
+}
+
+/// A notice placed in a turn's prompt, with the entries it showed, so they
+/// can be cleared once that turn succeeds.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ShownNotice {
-    pub text: String,
-    shown: Pending,
+pub(crate) struct ShownNotice {
+    text: String,
+    upto: u64,
 }
 
 /// Count `raw_output`'s `[PREDICT:]` / `[RESOLVE:]` markers into the pending
 /// notice. Nothing reaches the prediction store, and the owner is not
 /// alerted. Failures are logged: a lost count only costs the notice.
-pub fn refuse_markers(root_dir: &Path, raw_output: &str) {
+pub(crate) fn refuse_markers(root_dir: &Path, raw_output: &str) {
     if let Err(e) = record(root_dir, count_prediction_markers(raw_output)) {
         tracing::warn!("Failed to record refused prediction markers: {e}");
     }
@@ -51,7 +85,7 @@ pub fn refuse_markers(root_dir: &Path, raw_output: &str) {
 
 /// `message` with the pending notice appended, and the notice shown, if
 /// any. Pass the notice to [`acknowledge`] once the turn succeeds.
-pub fn with_notice(root_dir: &Path, mut message: String) -> (String, Option<ShownNotice>) {
+pub(crate) fn with_notice(root_dir: &Path, mut message: String) -> (String, Option<ShownNotice>) {
     let shown = peek_notice(root_dir);
     if let Some(ref notice) = shown {
         message.push_str("\n\n");
@@ -61,60 +95,81 @@ pub fn with_notice(root_dir: &Path, mut message: String) -> (String, Option<Show
 }
 
 /// Add these counts to the pending notice. No-op when there are none.
-pub fn record(root_dir: &Path, counts: MarkerCounts) -> std::io::Result<()> {
+fn record(root_dir: &Path, counts: MarkerCounts) -> std::io::Result<()> {
     if counts.is_empty() {
         return Ok(());
     }
     let _guard = FILE_LOCK.lock().unwrap_or_else(|p| p.into_inner());
-    let mut pending = load(root_dir);
-    pending.predict += counts.predict;
-    pending.resolve += counts.resolve;
-    store(root_dir, pending)
+    let mut state = load(root_dir);
+    let unshown = state.shown_through;
+    match state.entries.last_mut() {
+        Some(last) if last.id > unshown => {
+            last.counts.predict = last.counts.predict.saturating_add(counts.predict);
+            last.counts.resolve = last.counts.resolve.saturating_add(counts.resolve);
+        }
+        _ => {
+            state.next_id = state.next_id.saturating_add(1);
+            state.entries.push(Entry {
+                id: state.next_id,
+                counts: Pending {
+                    predict: counts.predict,
+                    resolve: counts.resolve,
+                },
+            });
+        }
+    }
+    store(root_dir, &state)
 }
 
 /// The pending notice, without clearing it.
-pub fn peek_notice(root_dir: &Path) -> Option<ShownNotice> {
+fn peek_notice(root_dir: &Path) -> Option<ShownNotice> {
     let _guard = FILE_LOCK.lock().unwrap_or_else(|p| p.into_inner());
-    let pending = load(root_dir);
-    render(pending).map(|text| ShownNotice {
-        text,
-        shown: pending,
-    })
+    let mut state = load(root_dir);
+    let text = render(state.total())?;
+    let upto = state.entries.last().map_or(0, |e| e.id);
+    if upto > state.shown_through {
+        state.shown_through = upto;
+        if let Err(e) = store(root_dir, &state) {
+            tracing::warn!("Failed to record the refused-marker notice as shown: {e}");
+        }
+    }
+    Some(ShownNotice { text, upto })
 }
 
-/// The turn that carried `notice` succeeded: clear the counts it showed.
-/// Refusals recorded since it was built stay pending.
-pub fn acknowledge(root_dir: &Path, notice: &ShownNotice) {
+/// The turn that carried `notice` succeeded: clear the entries it showed.
+/// Refusals recorded since it was built stay pending; acknowledging the
+/// same notice twice clears nothing more.
+pub(crate) fn acknowledge(root_dir: &Path, notice: &ShownNotice) {
     let _guard = FILE_LOCK.lock().unwrap_or_else(|p| p.into_inner());
-    let mut pending = load(root_dir);
-    pending.predict = pending.predict.saturating_sub(notice.shown.predict);
-    pending.resolve = pending.resolve.saturating_sub(notice.shown.resolve);
-    if let Err(e) = store(root_dir, pending) {
+    let mut state = load(root_dir);
+    state.entries.retain(|e| e.id > notice.upto);
+    if let Err(e) = store(root_dir, &state) {
         tracing::warn!("Failed to clear the refused-marker notice: {e}");
     }
 }
 
-/// Pending counts; a missing or unreadable file is none.
-fn load(root_dir: &Path) -> Pending {
-    match fs::read_to_string(root_dir.join(REFUSALS_FILE)) {
-        Ok(content) => serde_json::from_str(&content).unwrap_or_default(),
-        Err(_) => Pending::default(),
+/// The state; a missing, unreadable, oversized or odd file is none.
+fn load(root_dir: &Path) -> State {
+    match crate::fs_safe::read_bounded(&root_dir.join(REFUSALS_FILE), MAX_REFUSALS_BYTES) {
+        Ok(Some(content)) => serde_json::from_str(&content).unwrap_or_default(),
+        Ok(None) => State::default(),
+        Err(e) => {
+            tracing::warn!("Ignoring the refused-marker state file: {e}");
+            State::default()
+        }
     }
 }
 
-/// Write `pending`, or remove the file when nothing is pending. The tmp
-/// name is unique, so two writers never share one.
-fn store(root_dir: &Path, pending: Pending) -> std::io::Result<()> {
+/// Write the state, or remove the file when nothing is pending.
+fn store(root_dir: &Path, state: &State) -> std::io::Result<()> {
     let path = root_dir.join(REFUSALS_FILE);
-    if pending == Pending::default() {
+    if state.entries.is_empty() {
         return match fs::remove_file(&path) {
             Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(e),
             _ => Ok(()),
         };
     }
-    let tmp = root_dir.join(format!("{REFUSALS_FILE}.{}.tmp", uuid::Uuid::new_v4()));
-    fs::write(&tmp, serde_json::to_string(&pending)?)?;
-    fs::rename(&tmp, &path)
+    crate::fs_safe::write_atomic(&path, serde_json::to_string(state)?.as_bytes())
 }
 
 fn render(pending: Pending) -> Option<String> {
@@ -264,5 +319,43 @@ mod tests {
             })
             .count();
         assert_eq!(leftovers, 0, "no tmp files left behind");
+    }
+
+    /// E3-3: a task and an intent peek the same notice and both succeed. The
+    /// counts they showed are cleared once, and a refusal recorded between
+    /// the peeks and the acknowledgements survives both.
+    #[test]
+    fn two_turns_acknowledging_the_same_notice_clear_it_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+        let two = MarkerCounts {
+            predict: 2,
+            resolve: 0,
+        };
+        record(&root, two).unwrap();
+
+        let (task, intent) = std::thread::scope(|scope| {
+            let a = scope.spawn(|| peek_notice(&root).unwrap());
+            let b = scope.spawn(|| peek_notice(&root).unwrap());
+            (a.join().unwrap(), b.join().unwrap())
+        });
+        assert_eq!(task, intent, "both turns showed the same notice");
+
+        record(
+            &root,
+            MarkerCounts {
+                predict: 0,
+                resolve: 1,
+            },
+        )
+        .unwrap();
+
+        std::thread::scope(|scope| {
+            scope.spawn(|| acknowledge(&root, &task));
+            scope.spawn(|| acknowledge(&root, &intent));
+        });
+        let left = peek_notice(&root).expect("the later refusal is still pending");
+        assert!(left.text.contains("1 [RESOLVE:]"), "{}", left.text);
+        assert!(!left.text.contains("[PREDICT:]"), "{}", left.text);
     }
 }

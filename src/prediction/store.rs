@@ -14,8 +14,9 @@ use crate::config::PredictionConfig;
 /// File name for the prediction stack on disk.
 const PREDICTIONS_FILE: &str = "predictions.json";
 
-/// Temporary file used by the migration's atomic write.
-const PREDICTIONS_TMP: &str = "predictions.json.tmp";
+/// Largest `predictions.json` read. The live stores are tens of KB; a file
+/// past this is not one the runtime wrote, and is skipped, not parsed.
+const MAX_PREDICTIONS_BYTES: u64 = 8 * 1024 * 1024;
 
 /// Cross-process lock file older writers took for read-modify-write; the
 /// migration takes it too, so it never interleaves with one.
@@ -44,16 +45,16 @@ pub const VOID_EXPLANATION: &str =
 pub fn load(root_dir: &Path, config: PredictionConfig) -> PredictionStack {
     let path = root_dir.join(PREDICTIONS_FILE);
 
-    let content = match fs::read_to_string(&path) {
-        Ok(c) => c,
+    // The pulse can write this file: read it bounded, regular files only.
+    let content = match crate::fs_safe::read_bounded(&path, MAX_PREDICTIONS_BYTES) {
+        Ok(Some(c)) => c,
+        Ok(None) => return PredictionStack::with_config(config),
         Err(e) => {
-            if e.kind() != std::io::ErrorKind::NotFound {
-                tracing::warn!(
-                    path = %path.display(),
-                    error = %e,
-                    "Failed to read predictions file, starting with empty stack"
-                );
-            }
+            tracing::warn!(
+                path = %path.display(),
+                error = %e,
+                "Failed to read predictions file, starting with empty stack"
+            );
             return PredictionStack::with_config(config);
         }
     };
@@ -86,8 +87,9 @@ pub fn load(root_dir: &Path, config: PredictionConfig) -> PredictionStack {
 /// Nothing else in the file changes: resolved predictions and `errors` are
 /// carried through as they are on disk, and there is **no prune**.
 ///
-/// Strict: an unreadable or unparseable file, or a prediction entry that is
-/// not a JSON object, is an error and the file is left untouched. A missing
+/// Strict: an unreadable, oversized or unparseable file, a symlink or other
+/// non-regular file, or a prediction entry that is not a JSON object, is an
+/// error and the file is left untouched. A missing
 /// file is a no-op and is not created. Idempotent: with nothing pending it
 /// writes nothing and returns 0. Waits at most a few seconds for the store
 /// lock; if another holder keeps it, the migration is skipped for this boot
@@ -109,15 +111,15 @@ fn void_open_predictions_within(
     use serde_json::Value;
 
     let path = root_dir.join(PREDICTIONS_FILE);
-    if !path.exists() {
-        return Ok(0);
+    // Without following a symlink: a missing store is a no-op and must not
+    // create anything, the lock file included.
+    match fs::symlink_metadata(&path) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+        Err(e) => return Err(Box::new(e)),
+        Ok(_) => {}
     }
 
-    let lock_file = fs::OpenOptions::new()
-        .create(true)
-        .write(true)
-        .truncate(false)
-        .open(root_dir.join(PREDICTIONS_LOCK))?;
+    let lock_file = crate::fs_safe::open_lock(&root_dir.join(PREDICTIONS_LOCK))?;
     let deadline = Instant::now() + lock_wait;
     loop {
         match lock_file.try_lock() {
@@ -137,10 +139,10 @@ fn void_open_predictions_within(
         }
     }
 
-    let content = match fs::read_to_string(&path) {
-        Ok(c) => c,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(0),
-        Err(e) => return Err(Box::new(e)),
+    // Bounded, regular files only; an oversized or odd file is an error and
+    // is left untouched.
+    let Some(content) = crate::fs_safe::read_bounded(&path, MAX_PREDICTIONS_BYTES)? else {
+        return Ok(0);
     };
     // Validate against the store's own shape before touching anything; the
     // edit itself goes through `Value` so fields this binary does not know
@@ -179,9 +181,7 @@ fn void_open_predictions_within(
         return Ok(0);
     }
 
-    let tmp_path = root_dir.join(PREDICTIONS_TMP);
-    fs::write(&tmp_path, serde_json::to_string(&doc)?)?;
-    fs::rename(&tmp_path, &path)?;
+    crate::fs_safe::write_atomic(&path, serde_json::to_string(&doc)?.as_bytes())?;
     Ok(voided)
     // lock_file drop releases the flock
 }
@@ -341,6 +341,44 @@ mod tests {
 
         drop(holder);
         assert_eq!(void_open_predictions(tmp.path()).unwrap(), 3);
+    }
+
+    /// R2-05: the pulse can plant a symlink as the store or a FIFO as its
+    /// lock. Neither is followed or blocked on; the migration errors (boot
+    /// logs it) and nothing outside is touched.
+    #[test]
+    fn void_open_predictions_refuses_a_planted_symlink_or_lock_fifo() {
+        let tmp = TempDir::new().unwrap();
+        let outside = tmp.path().join("outside.json");
+        fixtures::write_store(
+            tmp.path(),
+            &fixtures::document(vec![fixtures::pending("p-1", "x")], vec![]),
+        );
+        fs::rename(tmp.path().join(PREDICTIONS_FILE), &outside).unwrap();
+        let before = fs::read(&outside).unwrap();
+        std::os::unix::fs::symlink(&outside, tmp.path().join(PREDICTIONS_FILE)).unwrap();
+        assert!(void_open_predictions(tmp.path()).is_err());
+        assert_eq!(
+            fs::read(&outside).unwrap(),
+            before,
+            "symlink target untouched"
+        );
+
+        let tmp = TempDir::new().unwrap();
+        seed_live_shaped_store(tmp.path());
+        let lock = std::ffi::CString::new(
+            tmp.path()
+                .join(PREDICTIONS_LOCK)
+                .to_string_lossy()
+                .into_owned(),
+        )
+        .unwrap();
+        // SAFETY: `lock` is a valid NUL-terminated path; mkfifo only creates
+        // a node at it.
+        assert_eq!(unsafe { libc::mkfifo(lock.as_ptr(), 0o600) }, 0);
+        let started = Instant::now();
+        assert!(void_open_predictions(tmp.path()).is_err());
+        assert!(started.elapsed() < Duration::from_secs(2), "never blocked");
     }
 
     #[test]

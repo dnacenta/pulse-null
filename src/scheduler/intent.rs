@@ -666,7 +666,7 @@ fn intent_header(intent: &Intent) -> String {
 /// The user message of one intent turn: its header, its prompt and the
 /// autonomy context, with the refused-marker notice appended once (PN-133).
 /// Also returns the notice it showed, to acknowledge once the turn succeeds.
-pub fn intent_user_message(
+pub(crate) fn intent_user_message(
     root_dir: &Path,
     config: &crate::config::Config,
     intent: &Intent,

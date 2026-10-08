@@ -1,8 +1,11 @@
-//! Hierarchical Predictive Self-Modeling — multi-timescale prediction loop.
+//! The prediction store — a read-only record of past predictions and their
+//! errors (PN-133).
 //!
-//! Pulses generate structured predictions before each cognitive cycle, then
-//! resolve them against actual outcomes to compute "surprise" scores.
-//! Prediction errors drive attention allocation and pipeline graduation.
+//! Pulses once wrote free-form predictions in their cycles and resolved them
+//! with a self-assessed "surprise" score. Phase 0 retired that: open
+//! predictions are voided at boot, markers are refused, and the only reader
+//! left is the tension substrate, which opens threads for recorded errors.
+//! The sections below describe the model the data was written under.
 //!
 //! # What this is NOT (vs. Active Inference)
 //!
@@ -177,7 +180,8 @@ pub struct PredictionError {
     pub insight: Option<String>,
     /// When this error was created.
     pub created_at: DateTime<Utc>,
-    /// Whether this error has been processed by the attention system.
+    /// Whether this error has been marked processed. Nothing marks errors
+    /// any more; tension ingest reads the unprocessed ones.
     pub processed: bool,
     /// Snapshot of the prediction's text, taken at resolve time.
     ///

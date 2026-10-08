@@ -645,10 +645,9 @@ pub fn ingest_prediction_errors(
         }
 
         // Self-contained content (§8 Q4): the thread must still make sense
-        // after predictions.json prunes the resolution it came from — which
-        // it will, because the prune target is max(cap, pending), so once
-        // pending reaches the cap every resolved prediction is evicted on
-        // the next prune.
+        // without the prediction it came from. The old writer's prune kept
+        // max(cap, pending) predictions, so resolved ones were evicted while
+        // their errors survived; stores written then still lack them.
         //
         // Read the snapshot the resolve step took first; fall back to the
         // live store only for error records written before that snapshot

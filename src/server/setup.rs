@@ -148,6 +148,9 @@ pub async fn awareness_then_system_prompt(
     super::prompt::build_system_prompt_async(root_dir.to_path_buf(), config.clone()).await
 }
 
+/// How long boot waits for the void-predictions migration.
+const VOID_MIGRATION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
 /// Void every open free-form prediction (PN-133 Phase 0). Runs whether or not
 /// `[prediction]` is enabled: the point is that no open free-form prediction
 /// is ever shown or counted again, and the file outlives the setting. Shed
@@ -158,15 +161,19 @@ pub async fn void_open_predictions(root_dir: &Path) {
         return;
     }
     let root = root_dir.to_path_buf();
-    match tokio::task::spawn_blocking(move || {
-        crate::prediction::store::void_open_predictions(&root)
-    })
-    .await
-    {
-        Ok(Ok(0)) => {}
-        Ok(Ok(n)) => tracing::info!("voided {n} open predictions"),
-        Ok(Err(e)) => tracing::error!("Failed to void open predictions: {e}"),
-        Err(e) => tracing::error!("Void-predictions migration panicked: {e}"),
+    let migration =
+        tokio::task::spawn_blocking(move || crate::prediction::store::void_open_predictions(&root));
+    // Boot always continues: a migration still running after this is left
+    // to finish (or not) on the blocking pool.
+    match tokio::time::timeout(VOID_MIGRATION_TIMEOUT, migration).await {
+        Ok(Ok(Ok(0))) => {}
+        Ok(Ok(Ok(n))) => tracing::info!("voided {n} open predictions"),
+        Ok(Ok(Err(e))) => tracing::error!("Failed to void open predictions: {e}"),
+        Ok(Err(e)) => tracing::error!("Void-predictions migration panicked: {e}"),
+        Err(_) => tracing::error!(
+            "Void-predictions migration still running after {}s — boot continues without it",
+            VOID_MIGRATION_TIMEOUT.as_secs()
+        ),
     }
 }
 

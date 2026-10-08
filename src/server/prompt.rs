@@ -602,11 +602,33 @@ fn enforce_budget_and_assemble(
 
     // Essential is never trimmed, so it is the one tier that can still push the
     // prompt past what a subprocess can carry. Verify it before shipping.
-    let essential_bytes: usize = components
+    let mut essential_bytes: usize = components
         .iter()
         .filter(|c| c.tier == PromptTier::Essential)
         .map(|c| c.content.len())
         .sum();
+    // The pulse writes its own rules; they never make a prompt unshippable.
+    // Over the ceiling, they go first — the operator's components keep the
+    // hard error below.
+    if essential_bytes > ESSENTIAL_MAX_BYTES {
+        if let Some(rules) = components
+            .iter_mut()
+            .find(|c| c.name == "pulse-rules" && !c.content.is_empty())
+        {
+            warn!(
+                "[system-prompt-budget] essential tier is {} bytes, over {} — dropping the \
+                 pulse's own rules ({} bytes)",
+                essential_bytes,
+                ESSENTIAL_MAX_BYTES,
+                rules.content.len()
+            );
+            essential_bytes -= rules.content.len();
+            dropped_components.push((rules.name.to_string(), rules.tokens));
+            rules.content.clear();
+            rules.tokens = 0;
+            was_trimmed = true;
+        }
+    }
     if essential_bytes > ESSENTIAL_MAX_BYTES {
         return Err(crate::errors::PromptError::EssentialTooLarge {
             bytes: essential_bytes,
@@ -757,10 +779,16 @@ fn awareness_component(
         return Ok(None);
     }
     let awareness_path = root_dir.join("AWARENESS.md");
-    if !awareness_path.exists() {
-        return Ok(None);
-    }
-    let content = std::fs::read_to_string(&awareness_path)?;
+    // Read on every prompt build, and the pulse can write it: bounded and
+    // regular-only. A symlink, FIFO or oversized file is skipped, not fatal.
+    let content = match crate::fs_safe::read_bounded(&awareness_path, MAX_AWARENESS_COMPARE_BYTES) {
+        Ok(Some(content)) => content,
+        Ok(None) => return Ok(None),
+        Err(e) => {
+            warn!("Skipping AWARENESS.md: {e}");
+            return Ok(None);
+        }
+    };
     if content.trim().is_empty() {
         return Ok(None);
     }
@@ -1149,34 +1177,66 @@ fn rules_components(root_dir: &Path, config: &Config) -> Vec<PromptComponent> {
             (Ok(a), Ok(b)) => a == b,
             _ => false,
         });
-    if !same_as_operator {
-        components.extend(rules_component(
-            &dir,
-            adapter.project_rules_exclude(),
-            RulesSource::Pulse,
-            config,
-        ));
+    if same_as_operator {
+        return components;
     }
+    if let Some(odd) = untrusted_rules_path(root_dir, &dir) {
+        warn!(
+            "Skipping pulse rules: {} is a symlink or not a directory",
+            odd.display()
+        );
+        return components;
+    }
+    components.extend(rules_component(
+        &dir,
+        adapter.project_rules_exclude(),
+        RulesSource::Pulse,
+        config,
+    ));
     components
 }
 
-/// One rules directory as an Essential component. Token-capped by
-/// `rules_cap` when the budget is on; the pulse's own rules are also held to
-/// [`PULSE_RULES_MAX_BYTES`] always, truncated with a marker and a warning.
+/// The first component of `dir`, below `root`, that is a symlink or not a
+/// directory — or `dir` itself when it is not under `root`. `None` when the
+/// path is sound (or simply does not exist yet).
+fn untrusted_rules_path(root: &Path, dir: &Path) -> Option<PathBuf> {
+    let Ok(below) = dir.strip_prefix(root) else {
+        return Some(dir.to_path_buf());
+    };
+    let mut current = root.to_path_buf();
+    for part in below.components() {
+        current.push(part);
+        match std::fs::symlink_metadata(&current) {
+            Ok(meta) if meta.file_type().is_symlink() || !meta.is_dir() => return Some(current),
+            Ok(_) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return None,
+            Err(_) => return Some(current),
+        }
+    }
+    None
+}
+
+/// One rules directory as an Essential component.
+///
+/// The operator's rules are token-capped by `rules_cap` when the budget is
+/// on, as before. The pulse's own rules are held to [`PULSE_RULES_MAX_BYTES`]
+/// (and `rules_cap`, when that is tighter) always, by whole files: trailing
+/// files that do not fit are left out with a marker and a warning, so no
+/// `<protocol>` element is ever cut in half.
 fn rules_component(
     dir: &Path,
     exclude: &[&str],
     source: RulesSource,
     config: &Config,
 ) -> Option<PromptComponent> {
-    let rules = match load_rule_files(dir, exclude) {
+    let rules = match load_rule_files(dir, exclude, source) {
         Ok(rules) => rules,
         Err(e) => {
             warn!("Failed to load rule files from '{}': {}", dir.display(), e);
             return None;
         }
     };
-    let text = rules
+    let elements: Vec<String> = rules
         .into_iter()
         .map(|(name, content)| match source {
             RulesSource::Operator => format!("<protocol name=\"{name}\">\n{content}\n</protocol>"),
@@ -1184,24 +1244,30 @@ fn rules_component(
                 format!("<protocol source=\"pulse-rules\" name=\"{name}\">\n{content}\n</protocol>")
             }
         })
-        .collect::<Vec<_>>()
-        .join("\n\n");
-    if text.is_empty() {
+        .collect();
+    if elements.is_empty() {
         return None;
     }
     let budget_cfg = &config.system_prompt_budget;
-    let mut content = if budget_cfg.enabled && budget_cfg.rules_cap > 0 {
-        truncate_to_token_cap(&text, budget_cfg.rules_cap)
-    } else {
-        text
+    let content = match source {
+        RulesSource::Operator => {
+            let text = elements.join("\n\n");
+            if budget_cfg.enabled && budget_cfg.rules_cap > 0 {
+                truncate_to_token_cap(&text, budget_cfg.rules_cap)
+            } else {
+                text
+            }
+        }
+        RulesSource::Pulse => {
+            let mut limit = PULSE_RULES_MAX_BYTES;
+            if budget_cfg.enabled && budget_cfg.rules_cap > 0 {
+                limit = limit.min(budget_cfg.rules_cap * CHARS_PER_TOKEN);
+            }
+            whole_files_within(elements, limit, dir)
+        }
     };
-    if source == RulesSource::Pulse && content.len() > PULSE_RULES_MAX_BYTES {
-        warn!(
-            "Pulse rules in {} exceed {} bytes — truncated",
-            dir.display(),
-            PULSE_RULES_MAX_BYTES
-        );
-        content = truncate_to_byte_cap(&content, PULSE_RULES_MAX_BYTES);
+    if content.is_empty() {
+        return None;
     }
     Some(PromptComponent {
         name: match source {
@@ -1213,6 +1279,39 @@ fn rules_component(
         tier: PromptTier::Essential,
         cap: budget_cfg.rules_cap,
     })
+}
+
+/// Room kept under the pulse-rules ceiling for the left-out marker.
+const PULSE_RULES_MARKER_RESERVE: usize = 128;
+
+/// Join `elements` while they fit in `limit` bytes; leave out the rest
+/// whole, with a marker saying how many.
+fn whole_files_within(elements: Vec<String>, limit: usize, dir: &Path) -> String {
+    let budget = limit.saturating_sub(PULSE_RULES_MARKER_RESERVE);
+    let mut kept: Vec<String> = Vec::new();
+    let mut used = 0;
+    let mut left_out = 0;
+    for element in elements {
+        let cost = element.len() + if kept.is_empty() { 0 } else { 2 };
+        if left_out == 0 && used + cost <= budget {
+            used += cost;
+            kept.push(element);
+        } else {
+            left_out += 1;
+        }
+    }
+    if left_out > 0 {
+        warn!(
+            "Pulse rules in {} exceed {} bytes — {} file(s) left out",
+            dir.display(),
+            limit,
+            left_out
+        );
+        kept.push(format!(
+            "[pulse rules: {left_out} more file(s) left out — over the {limit} byte ceiling]"
+        ));
+    }
+    kept.join("\n\n")
 }
 
 /// Load THOUGHT_STACK.md bounded by both line count and bytes, wrapped for the
@@ -1268,19 +1367,25 @@ pub async fn build_task_system_prompt_async(
     Ok(result)
 }
 
+/// Most pulse rule files read; the rest (by file name) are skipped.
+const MAX_PULSE_RULE_FILES: usize = 32;
+
 /// Load the `*.md` rule files in `dir`, sorted by file name, as
 /// (protocol name, content) pairs. Files named in `exclude` are skipped
-/// before they are read.
+/// before they are read, and so is a name outside `[A-Za-z0-9._-]` (it
+/// would be placed in a `name="…"` attribute).
 ///
-/// Rule files can be written by the pulse itself, so each is opened with
-/// `O_NOFOLLOW` (and non-blocking, so a FIFO cannot hang the open) and
-/// inspected through the handle: symlinks, FIFOs, devices and anything else
-/// that is not a regular file are skipped with a warning. At most
-/// [`MAX_RULE_FILE_BYTES`] of a file are read; a longer one is truncated
-/// with a marker.
+/// Rule files can be written by the pulse itself, so each is read through
+/// [`crate::fs_safe::open_regular`]: symlinks, FIFOs, devices and anything
+/// else that is not a regular file are skipped with a warning. At most
+/// [`MAX_RULE_FILE_BYTES`] of a file are read; a longer one is truncated with
+/// a marker. The pulse's own rules are also held to [`MAX_PULSE_RULE_FILES`]
+/// files, to [`PULSE_RULES_MAX_BYTES`] read in total, and to files with one
+/// link that the running user owns.
 fn load_rule_files(
     dir: &Path,
     exclude: &[&str],
+    source: RulesSource,
 ) -> Result<Vec<(String, String)>, crate::errors::PromptError> {
     if !dir.is_dir() {
         return Ok(Vec::new());
@@ -1298,17 +1403,45 @@ fn load_rule_files(
         })
         .collect();
     entries.sort_by_key(|e| e.file_name());
+    if source == RulesSource::Pulse && entries.len() > MAX_PULSE_RULE_FILES {
+        warn!(
+            "{} has {} rule files — reading the first {}",
+            dir.display(),
+            entries.len(),
+            MAX_PULSE_RULE_FILES
+        );
+        entries.truncate(MAX_PULSE_RULE_FILES);
+    }
 
     let mut rules = Vec::new();
     let mut total_bytes = 0;
     for entry in entries {
+        if source == RulesSource::Pulse && total_bytes >= PULSE_RULES_MAX_BYTES {
+            warn!(
+                "{}: {} bytes of pulse rules read — not reading more",
+                dir.display(),
+                total_bytes
+            );
+            break;
+        }
         let path = entry.path();
         let protocol_name = path
             .file_stem()
             .and_then(|s| s.to_str())
-            .unwrap_or("unknown")
+            .unwrap_or_default()
             .to_string();
-        match read_rule_file(&path) {
+        if protocol_name.is_empty()
+            || !protocol_name
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
+        {
+            warn!(
+                "Skipping rule file {}: name outside [A-Za-z0-9._-]",
+                path.display()
+            );
+            continue;
+        }
+        match read_rule_file(&path, source) {
             Ok(content) => {
                 total_bytes += content.len();
                 rules.push((protocol_name, content));
@@ -1327,20 +1460,22 @@ fn load_rule_files(
 }
 
 /// Read one rule file: a regular file only, at most [`MAX_RULE_FILE_BYTES`].
-fn read_rule_file(path: &Path) -> Result<String, String> {
+/// A pulse rule must also have a single link and belong to the running user.
+fn read_rule_file(path: &Path, source: RulesSource) -> Result<String, String> {
     use std::io::Read;
-    use std::os::unix::fs::OpenOptionsExt;
-    let file = std::fs::OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
-        .open(path)
-        .map_err(|e| match e.raw_os_error() {
-            Some(libc::ELOOP) => "is a symlink — refusing to follow it".to_string(),
-            _ => e.to_string(),
-        })?;
-    let meta = file.metadata().map_err(|e| e.to_string())?;
-    if !meta.is_file() {
-        return Err("not a regular file".into());
+    use std::os::unix::fs::MetadataExt;
+    let (file, meta) = crate::fs_safe::open_regular(path)
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| "vanished".to_string())?;
+    if source == RulesSource::Pulse {
+        if meta.nlink() != 1 {
+            return Err("has more than one link".into());
+        }
+        // SAFETY: geteuid has no preconditions and cannot fail.
+        let me = unsafe { libc::geteuid() };
+        if meta.uid() != me {
+            return Err("not owned by the running user".into());
+        }
     }
     let mut bytes = Vec::new();
     file.take(MAX_RULE_FILE_BYTES as u64 + 1)
@@ -1710,6 +1845,11 @@ fn awareness_without_stamp(doc: &str) -> &str {
     }
 }
 
+/// Largest AWARENESS.md read, for inlining or for the unchanged-content
+/// check. The runtime writes a few KB; a bigger file is skipped (inlining) or
+/// simply rewritten (regeneration).
+const MAX_AWARENESS_COMPARE_BYTES: u64 = 1024 * 1024;
+
 /// Write AWARENESS.md to the pulse's root directory.
 ///
 /// Called at startup and on plugin state changes (failure/recovery). Skips
@@ -1728,12 +1868,17 @@ pub fn write_awareness_file(
     // A rebuild that changes nothing but the stamp (a plugin flapping down
     // and back up) keeps the old bytes, so the prompt cache survives it. The
     // stamp then says when the content last changed.
-    if let Ok(existing) = std::fs::read_to_string(&awareness_path) {
+    // The pulse can write this file: compare against it read bounded and
+    // regular-only (anything odd is just rewritten), and replace it with a
+    // fresh file renamed into place, never by writing through a symlink.
+    if let Ok(Some(existing)) =
+        crate::fs_safe::read_bounded(&awareness_path, MAX_AWARENESS_COMPARE_BYTES)
+    {
         if awareness_without_stamp(&existing) == awareness_without_stamp(&content) {
             return Ok(());
         }
     }
-    std::fs::write(&awareness_path, &content)?;
+    crate::fs_safe::write_atomic(&awareness_path, content.as_bytes())?;
     info!(
         "Generated AWARENESS.md ({} bytes, mode: {})",
         content.len(),
@@ -2533,7 +2678,7 @@ mod tests {
             std::fs::write(rules.join(format!("z-{i}.md")), "z".repeat(15 * 1024)).unwrap();
         }
 
-        let loaded = load_rule_files(&rules, &[]).unwrap();
+        let loaded = load_rule_files(&rules, &[], RulesSource::Pulse).unwrap();
         let (_, huge) = loaded.iter().find(|(name, _)| name == "huge").unwrap();
         assert!(huge.len() <= MAX_RULE_FILE_BYTES);
         assert!(huge.contains("byte ceiling"));
@@ -2546,7 +2691,12 @@ mod tests {
             .find(|c| c.name == "pulse-rules")
             .unwrap();
         assert!(component.content.len() <= PULSE_RULES_MAX_BYTES);
-        assert!(component.content.contains("byte ceiling"));
+        assert!(component.content.contains("left out — over the"));
+        // Whole files only: every opened element is closed.
+        assert_eq!(
+            component.content.matches("<protocol ").count(),
+            component.content.matches("</protocol>").count()
+        );
 
         let chat = build_system_prompt(dir.path(), &config).unwrap();
         let task = build_task_system_prompt(dir.path(), &config).unwrap();
@@ -2560,9 +2710,96 @@ mod tests {
     fn excluded_rule_files_are_filtered_by_the_loader() {
         let dir = tempfile::tempdir().unwrap();
         let rules = seed_pulse_rules(dir.path());
-        let loaded = load_rule_files(&rules, &["recall-echo.md"]).unwrap();
+        let loaded = load_rule_files(&rules, &["recall-echo.md"], RulesSource::Pulse).unwrap();
         let names: Vec<&str> = loaded.iter().map(|(n, _)| n.as_str()).collect();
         assert_eq!(names, ["a-first", "self-work"]);
+    }
+
+    /// E3-2: a hardlink into the rules directory (two links), and a name
+    /// that does not fit a `name="…"` attribute, are skipped.
+    #[test]
+    fn hardlinked_and_oddly_named_rule_files_are_skipped() {
+        let dir = tempfile::tempdir().unwrap();
+        let rules = seed_pulse_rules(dir.path());
+        let outside = dir.path().join("outside.md");
+        std::fs::write(&outside, "HARDLINKED-SECRET").unwrap();
+        std::fs::hard_link(&outside, rules.join("hard.md")).unwrap();
+        std::fs::write(rules.join("bad name\".md"), "ODD-NAME").unwrap();
+
+        let loaded = load_rule_files(&rules, &[], RulesSource::Pulse).unwrap();
+        let names: Vec<&str> = loaded.iter().map(|(n, _)| n.as_str()).collect();
+        assert_eq!(names, ["a-first", "recall-echo", "self-work"]);
+    }
+
+    /// E3-2: when `.claude` or `.claude/rules` is itself a symlink, the
+    /// pulse rules are skipped altogether.
+    #[test]
+    fn a_symlinked_rules_dir_is_skipped() {
+        let mut config = cli_config("grok");
+        config.system_prompt_budget.enabled = false;
+
+        for linked in [".claude", ".claude/rules"] {
+            let dir = tempfile::tempdir().unwrap();
+            let elsewhere = dir.path().join("elsewhere");
+            std::fs::create_dir_all(elsewhere.join("rules")).unwrap();
+            std::fs::write(elsewhere.join("rules/self-work.md"), "SELF-WORK-RULE").unwrap();
+            if linked == ".claude" {
+                std::os::unix::fs::symlink(&elsewhere, dir.path().join(".claude")).unwrap();
+            } else {
+                std::fs::create_dir_all(dir.path().join(".claude")).unwrap();
+                std::os::unix::fs::symlink(
+                    elsewhere.join("rules"),
+                    dir.path().join(".claude/rules"),
+                )
+                .unwrap();
+            }
+            assert!(rules_components(dir.path(), &config).is_empty(), "{linked}");
+            let chat = build_system_prompt(dir.path(), &config).unwrap();
+            assert!(!chat.contains("SELF-WORK-RULE"), "{linked}");
+        }
+    }
+
+    #[test]
+    fn the_pulse_rule_file_count_is_capped() {
+        let dir = tempfile::tempdir().unwrap();
+        let rules = dir.path().join(".claude/rules");
+        std::fs::create_dir_all(&rules).unwrap();
+        for i in 0..(MAX_PULSE_RULE_FILES + 8) {
+            std::fs::write(rules.join(format!("r{i:03}.md")), "x").unwrap();
+        }
+        let loaded = load_rule_files(&rules, &[], RulesSource::Pulse).unwrap();
+        assert_eq!(loaded.len(), MAX_PULSE_RULE_FILES);
+    }
+
+    /// E3-2: the pulse-rules component never ends mid-element, and when the
+    /// Essential tier would overflow, the pulse's rules are dropped and the
+    /// prompt still builds.
+    #[test]
+    fn pulse_rules_never_make_the_essential_tier_overflow() {
+        let dir = tempfile::tempdir().unwrap();
+        let rules = seed_pulse_rules(dir.path());
+        for i in 0..2 {
+            std::fs::write(rules.join(format!("z-{i}.md")), "z".repeat(10 * 1024)).unwrap();
+        }
+        let mut config = cli_config("grok");
+        config.system_prompt_budget.enabled = false;
+
+        let component = rules_components(dir.path(), &config)
+            .into_iter()
+            .find(|c| c.name == "pulse-rules")
+            .unwrap();
+        assert!(component.content.ends_with("</protocol>"));
+        assert!(component.content.len() > 20 * 1024, "both z files fit");
+
+        // An instruction file that, with these rules, overflows Essential.
+        std::fs::write(dir.path().join("INSTRUCTIONS.md"), "i".repeat(58 * 1024)).unwrap();
+        let result = build_system_prompt_budgeted(dir.path(), &config).unwrap();
+        assert!(!result.prompt.contains("pulse-rules"));
+        assert!(result
+            .dropped_components
+            .iter()
+            .any(|(name, _)| name == "pulse-rules"));
+        assert!(build_task_system_prompt(dir.path(), &config).is_ok());
     }
 
     #[test]
