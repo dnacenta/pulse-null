@@ -327,7 +327,7 @@ mod tests {
         let fresh = std::fs::read_to_string(root.join("AWARENESS.md")).unwrap();
         let stamp = fresh
             .lines()
-            .find(|l| l.starts_with("Generated at "))
+            .find(|l| l.starts_with("Content last changed at "))
             .expect("regenerated AWARENESS.md is stamped");
         assert!(prompt.contains(stamp), "prompt carries this boot's file");
         assert!(prompt.contains("Test — Platform Awareness"));

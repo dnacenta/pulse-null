@@ -8,4 +8,4 @@ pulse-null provides subsystems for memory, reflection, monitoring and communicat
 
 Memory is how you keep continuity across turns. The document pipeline is where you write what you learn. Communication channels are how you reach people. You don't need to use every capability in every conversation, but you should know what's available so you can reach for the right tool when the moment calls for it.
 
-The capabilities listed here are generated from your configuration and the plugins that started. This file is regenerated at boot and when a plugin changes state; between those moments it can lag behind the runtime.
+The capabilities listed here are generated from your configuration and the plugins that started. This file is regenerated at boot and when a plugin changes state, and rewritten only when its content changes; between those moments it can lag behind the runtime.

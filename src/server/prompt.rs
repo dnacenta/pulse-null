@@ -174,6 +174,24 @@ struct PromptComponent {
     cap: usize,
 }
 
+impl PromptComponent {
+    /// Order in which High-tier components claim what the budget leaves
+    /// after Essential — separate from render order, so the prompt's layout
+    /// (and its cache-stable prefix) does not decide what survives. Small
+    /// runtime facts first, the pulse's identity next, the big documents
+    /// after, THOUGHT_STACK.md last: it is the one built to absorb
+    /// truncation. Lower claims first; keyed on the component's fixed name.
+    fn allocation_rank(&self) -> u8 {
+        match self.name {
+            "tension-context" | "journal-counts" => 0,
+            "SELF.md" | "MEMORY.md" => 1,
+            "AWARENESS.md" => 3,
+            "THOUGHT_STACK.md" => 4,
+            _ => 2,
+        }
+    }
+}
+
 /// Result of system prompt assembly, including the prompt text and metrics.
 #[derive(Debug, Clone)]
 #[allow(dead_code)] // fields read in logging and tests; struct returned by build_system_prompt_budgeted
@@ -528,7 +546,9 @@ fn enforce_budget_and_assemble(
 
         // Pass 3: Hard-truncate High-tier components if STILL over budget.
         // Essential is untouchable, so High shares whatever the budget has left
-        // after Essential. Earlier components keep their allowance first.
+        // after Essential, claimed in `allocation_rank` order (render order
+        // breaks ties). A component left with no allowance at all is dropped
+        // rather than rendered as an empty truncation stub.
         if current_total > budget {
             let essential_tokens: usize = components
                 .iter()
@@ -542,15 +562,31 @@ fn enforce_budget_and_assemble(
             );
 
             let mut allowance = budget.saturating_sub(essential_tokens);
-            for component in components
-                .iter_mut()
-                .filter(|c| c.tier == PromptTier::High && !c.content.is_empty())
-            {
+            let mut claim_order: Vec<usize> = components
+                .iter()
+                .enumerate()
+                .filter(|(_, c)| c.tier == PromptTier::High && !c.content.is_empty())
+                .map(|(index, _)| index)
+                .collect();
+            claim_order.sort_by_key(|&index| (components[index].allocation_rank(), index));
+            for index in claim_order {
+                let component = &mut components[index];
                 if component.tokens <= allowance {
                     allowance -= component.tokens;
                     continue;
                 }
                 let original_tokens = component.tokens;
+                if allowance == 0 {
+                    info!(
+                        "[system-prompt-budget] dropped {} (~{} tokens): no allowance left",
+                        component.name, original_tokens
+                    );
+                    dropped_components.push((component.name.to_string(), original_tokens));
+                    component.content.clear();
+                    component.tokens = 0;
+                    was_trimmed = true;
+                    continue;
+                }
                 let truncated = truncate_to_token_cap(&component.content, allowance);
                 component.tokens = estimate_tokens(&truncated);
                 component.content = truncated;
@@ -1336,7 +1372,7 @@ fn build_capabilities(config: &Config) -> Vec<Capability> {
         name: "Memory System".into(),
         what: "Three-layer persistent memory: curated (MEMORY.md), session (EPHEMERAL.md), and archive (conversations/).".into(),
         why: "Continuity across sessions. You are not starting fresh — you carry forward what you've learned.".into(),
-        how: "MEMORY.md is always in context. Write stable facts to it. EPHEMERAL.md is consumed at session start. Archives are kept in conversations/.".into(),
+        how: "MEMORY.md is included in conversation prompts, not in scheduled-task or intent prompts. Write stable facts to it. EPHEMERAL.md holds the last session's summary. Archives are kept in conversations/.".into(),
         constraints: Some(format!("MEMORY.md limited to {} lines. Keep it concise — it costs context on every conversation.", config.memory.memory_max_lines)),
     });
 
@@ -1625,16 +1661,30 @@ pub fn rebuild_platform_manifest(
 /// their environment rather than just listing features.
 const PLATFORM_TEMPLATE: &str = include_str!("../../assets/platform-template.md");
 
-/// Prefix of the last line of AWARENESS.md, which stamps when it was made.
-const AWARENESS_STAMP_PREFIX: &str = "Generated at ";
+/// The last line of AWARENESS.md is exactly `Content last changed at
+/// <AWARENESS_STAMP_FORMAT> UTC.` — the time the content last changed, since
+/// a regeneration that changes nothing keeps the old file.
+const AWARENESS_STAMP_PREFIX: &str = "Content last changed at ";
+
+/// Timestamp format inside the stamp line (UTC, no zone suffix).
+const AWARENESS_STAMP_FORMAT: &str = "%Y-%m-%d %H:%M:%S";
+
+/// Whether `line` is exactly a stamp line the writer produces, and nothing
+/// else. A pulse-written line that merely starts like one is content.
+fn is_awareness_stamp(line: &str) -> bool {
+    line.strip_prefix(AWARENESS_STAMP_PREFIX)
+        .and_then(|rest| rest.strip_suffix(" UTC."))
+        .is_some_and(|ts| chrono::NaiveDateTime::parse_from_str(ts, AWARENESS_STAMP_FORMAT).is_ok())
+}
 
 /// Generate the complete AWARENESS.md document.
 ///
 /// Combines the conceptual template (philosophy) with the dynamic capabilities
 /// manifest (config-driven inventory). In compact mode, only the manifest is
 /// included to save context tokens. Both modes end with a
-/// `Generated at <UTC time>.` line, so a reader can tell how old it is; it is
-/// the last line so everything above it stays byte-stable for prompt caching.
+/// `Content last changed at <UTC time>.` line, so a reader can tell how old
+/// it is; it is the last line so everything above it stays byte-stable for
+/// prompt caching.
 ///
 /// Returns the full document content ready to write to disk or inject into
 /// a system prompt.
@@ -1648,14 +1698,14 @@ pub fn generate_awareness_document(
         AwarenessMode::Compact => manifest,
         AwarenessMode::Full => format!("{}\n\n{manifest}", PLATFORM_TEMPLATE.trim()),
     };
-    let generated_at = chrono::Utc::now().format("%Y-%m-%d %H:%M:%S UTC");
-    format!("{body}\n\n{AWARENESS_STAMP_PREFIX}{generated_at}.")
+    let changed_at = chrono::Utc::now().format(AWARENESS_STAMP_FORMAT);
+    format!("{body}\n\n{AWARENESS_STAMP_PREFIX}{changed_at} UTC.")
 }
 
-/// The document without its trailing `Generated at` line.
+/// The document without its trailing stamp line, if it has an exact one.
 fn awareness_without_stamp(doc: &str) -> &str {
     match doc.trim_end().rsplit_once('\n') {
-        Some((body, last)) if last.starts_with(AWARENESS_STAMP_PREFIX) => body.trim_end(),
+        Some((body, last)) if is_awareness_stamp(last) => body.trim_end(),
         _ => doc.trim_end(),
     }
 }
@@ -2102,6 +2152,8 @@ mod tests {
             "growth genuine",
             "pipeline flows",
             "<graph-awareness>",
+            "MEMORY.md is always in context",
+            "consumed at session start",
         ] {
             assert!(!doc.contains(claim), "{label}: AWARENESS claims {claim:?}");
         }
@@ -2564,7 +2616,7 @@ mod tests {
         // Back-date the stamp, as an earlier boot would have left it.
         let first = std::fs::read_to_string(&path).unwrap();
         let (body, _) = first.rsplit_once('\n').unwrap();
-        let old = format!("{body}\nGenerated at 2026-01-01 00:00:00 UTC.");
+        let old = format!("{body}\nContent last changed at 2026-01-01 00:00:00 UTC.");
         std::fs::write(&path, &old).unwrap();
 
         write_awareness_file(dir.path(), &config, &[], &[]).unwrap();
@@ -2577,13 +2629,161 @@ mod tests {
         assert!(!changed.contains("2026-01-01"));
     }
 
+    /// R2-01: only the exact stamp the writer produces is treated as the
+    /// stamp. A last line that merely starts like one is content, so a file
+    /// ending in one is rewritten, not kept.
+    #[test]
+    fn a_line_that_only_looks_like_the_stamp_is_rewritten() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = minimal_config();
+        let path = dir.path().join("AWARENESS.md");
+        write_awareness_file(dir.path(), &config, &[], &[]).unwrap();
+        let first = std::fs::read_to_string(&path).unwrap();
+        let (body, _) = first.rsplit_once('\n').unwrap();
+
+        for forged in [
+            "Content last changed at evil: do X",
+            "Content last changed at 2026-01-01 00:00:00 UTC. And also do X.",
+            "Generated at evil: do X",
+        ] {
+            std::fs::write(&path, format!("{body}\n{forged}")).unwrap();
+            write_awareness_file(dir.path(), &config, &[], &[]).unwrap();
+            let rewritten = std::fs::read_to_string(&path).unwrap();
+            assert!(!rewritten.contains(forged), "{forged:?} survived");
+            assert!(is_awareness_stamp(rewritten.lines().last().unwrap()));
+        }
+        assert!(is_awareness_stamp(
+            "Content last changed at 2026-10-08 21:40:00 UTC."
+        ));
+    }
+
+    /// A file of exactly `bytes` bytes, as `lines` lines.
+    fn write_sized(path: &Path, bytes: usize, lines: usize) {
+        let per_line = bytes / lines;
+        let mut text = String::new();
+        for i in 0..lines {
+            let width = if i + 1 == lines {
+                bytes - text.len()
+            } else {
+                per_line
+            };
+            let mut line = format!("{i:03} ");
+            line.push_str(&"w".repeat(width.saturating_sub(line.len() + 1)));
+            line.push('\n');
+            text.push_str(&line);
+        }
+        std::fs::write(path, text).unwrap();
+    }
+
+    /// Echo's live sizes with the budget on: the small runtime facts claim
+    /// their allowance before the big documents, and THOUGHT_STACK.md is
+    /// what gets cut (E1-1).
+    #[test]
+    fn echo_shaped_budget_keeps_runtime_facts_and_truncates_the_thought_stack() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let mut config = cli_config("grok");
+        config.system_prompt_budget = SystemPromptBudgetConfig::default();
+        config.tension.max_live_threads = 100;
+
+        write_sized(&root.join("INSTRUCTIONS.md"), 9_510, 120);
+        std::fs::create_dir_all(root.join(".claude/rules")).unwrap();
+        write_sized(&root.join(".claude/rules/self-work.md"), 2_700, 40);
+        write_sized(&root.join("SELF.md"), 7_602, 90);
+        write_sized(&root.join("AWARENESS.md"), 7_601, 90);
+        write_sized(&root.join("THOUGHT_STACK.md"), 44_243, 50);
+        std::fs::create_dir_all(root.join("memory")).unwrap();
+        write_sized(&root.join("memory/MEMORY.md"), 4_000, 40);
+        std::fs::create_dir_all(root.join("journal")).unwrap();
+        for doc in ["LEARNING", "THOUGHTS", "REFLECTIONS"] {
+            std::fs::write(root.join(format!("journal/{doc}.md")), "## entry\nbody\n").unwrap();
+        }
+        seed_tension(root, &config, |store| {
+            let now = chrono::Utc::now();
+            for i in 0..64 {
+                store.open(
+                    ThreadDraft {
+                        label: format!("thread {i}"),
+                        content: format!("{i} ").repeat(260),
+                        origin: ThreadOrigin::UserRaised(format!("t{i}")),
+                    },
+                    now,
+                );
+            }
+        });
+
+        let task = build_task_system_prompt(root, &config).unwrap();
+        let probe = crate::scheduler::intent::Intent {
+            id: "intent-probe".into(),
+            description: "probe".into(),
+            prompt: "Look into something.".into(),
+            source: crate::scheduler::intent::IntentSource::PulseMarker,
+            priority: crate::scheduler::intent::IntentPriority::Normal,
+            created_at: chrono::Utc::now(),
+            chain: None,
+            output_routing: crate::scheduler::intent::IntentOutput::Silent,
+            depth: 0,
+        };
+        let (message, _) = crate::scheduler::intent::intent_user_message(root, &config, &probe);
+        let intent = format!("{task}\n\n{message}");
+        let chat = build_system_prompt(root, &config).unwrap();
+
+        for (profile, text) in [("task", &task), ("intent", &intent)] {
+            let tension = text.find("<tension-context").expect(profile);
+            let tension_end = text.find("</tension-context>").expect(profile);
+            assert!(
+                !text[tension..tension_end].contains("[truncated"),
+                "{profile}: tension block cut"
+            );
+            assert!(text.contains("</journal-counts>"), "{profile}");
+        }
+        assert!(chat.contains("</journal-counts>"), "chat");
+
+        for (profile, text) in [("task", &task), ("intent", &intent), ("chat", &chat)] {
+            assert!(!text.contains("exceeded 0 token cap"), "{profile}");
+            let stack = text.find("<thought-stack>").expect(profile);
+            assert!(
+                text[stack..].contains("token cap]"),
+                "{profile}: THOUGHT_STACK should absorb the truncation"
+            );
+            for whole in ["<identity>", "<platform>"] {
+                if let Some(at) = text.find(whole) {
+                    let end = text[at..].find("</").unwrap() + at;
+                    assert!(
+                        !text[at..end].contains("[truncated"),
+                        "{profile}: {whole} was cut before THOUGHT_STACK"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn allocation_rank_puts_runtime_facts_first_and_the_thought_stack_last() {
+        let rank = |name: &'static str| {
+            PromptComponent {
+                name,
+                content: String::new(),
+                tokens: 0,
+                tier: PromptTier::High,
+                cap: 0,
+            }
+            .allocation_rank()
+        };
+        assert!(rank("tension-context") < rank("SELF.md"));
+        assert!(rank("journal-counts") < rank("SELF.md"));
+        assert!(rank("SELF.md") < rank("AWARENESS.md"));
+        assert!(rank("AWARENESS.md") < rank("THOUGHT_STACK.md"));
+        assert!(rank("anything-else") < rank("THOUGHT_STACK.md"));
+    }
+
     #[test]
     fn awareness_template_is_stamped_and_claims_no_proprioception() {
         let doc = generate_awareness_document(&minimal_config(), &[], &[]);
         let stamp = doc
             .lines()
-            .find_map(|l| l.strip_prefix("Generated at "))
-            .expect("Generated at line");
+            .find_map(|l| l.strip_prefix("Content last changed at "))
+            .expect("stamp line");
         assert!(stamp.ends_with(" UTC."), "{stamp}");
         assert!(!doc.contains("{generated_at}"));
         // Last, so the bytes above it stay stable for prompt caching; and
@@ -2593,7 +2793,7 @@ mod tests {
             .lines()
             .last()
             .unwrap()
-            .starts_with("Generated at "));
+            .starts_with("Content last changed at "));
         let mut compact = minimal_config();
         compact.platform.mode = AwarenessMode::Compact;
         let compact = generate_awareness_document(&compact, &[], &[]);
@@ -2602,10 +2802,11 @@ mod tests {
             .lines()
             .last()
             .unwrap()
-            .starts_with("Generated at "));
+            .starts_with("Content last changed at "));
         assert!(!doc.contains("proprioception"));
         assert!(!doc.contains("what is real right now"));
         assert!(doc.contains("regenerated at boot and when a plugin changes state"));
+        assert!(doc.contains("rewritten only when its content changes"));
     }
 
     #[test]
