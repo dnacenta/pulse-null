@@ -297,6 +297,9 @@ async fn stream_one_round(
             StreamEvent::Refused { model, detail } => {
                 return Err(Box::new(crate::errors::RefusalError { model, detail }));
             }
+            StreamEvent::QuotaExhausted { model, detail } => {
+                return Err(Box::new(crate::errors::QuotaError { model, detail }));
+            }
             StreamEvent::Error(e) => return Err(e.into()),
         }
     }
@@ -726,6 +729,55 @@ mod streaming_tests {
             panic!("expected the streamed refusal to error")
         };
         assert!(err.downcast_ref::<crate::errors::RefusalError>().is_some());
+    }
+
+    struct QuotaSpent;
+    impl LmProvider for QuotaSpent {
+        fn invoke(
+            &self,
+            _s: &str,
+            _m: &[Message],
+            _t: u32,
+            _tools: Option<&[serde_json::Value]>,
+        ) -> std::pin::Pin<
+            Box<
+                dyn std::future::Future<
+                        Output = Result<LlmResponse, Box<dyn std::error::Error + Send + Sync>>,
+                    > + Send
+                    + '_,
+            >,
+        > {
+            Box::pin(async { Err("unused".into()) })
+        }
+        fn name(&self) -> &str {
+            "quota-spent"
+        }
+    }
+    impl StreamingProvider for QuotaSpent {
+        fn invoke_streaming(
+            &self,
+            _s: &str,
+            _m: &[Message],
+            _t: u32,
+            _tools: Option<&[serde_json::Value]>,
+        ) -> crate::streaming::StreamResult<'_> {
+            Box::pin(async_stream::stream! {
+                yield StreamEvent::QuotaExhausted { model: "m".into(), detail: "spent".into() };
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn streamed_quota_surfaces_as_typed_quota_error() {
+        let tools = ToolRegistry::new();
+        let (tx, _rx) = tokio::sync::mpsc::channel(8);
+        let mut m = vec![user("hi")];
+        let outcome =
+            invoke_with_tool_loop_streaming(&QuotaSpent, &tools, "sys", &mut m, 100, 5, &tx).await;
+        let Err(err) = outcome else {
+            panic!("expected the streamed quota failure to error")
+        };
+        assert!(err.downcast_ref::<crate::errors::QuotaError>().is_some());
     }
 
     #[tokio::test]

@@ -472,25 +472,60 @@ async fn is_error_refusal_document_is_a_typed_refusal() {
     assert!(refusal.detail.contains("Usage Policy"));
 }
 
-/// A spent quota reaches the caller as an error whose text classifies as
-/// quota, whether the CLI exits non-zero or exits 0 with `is_error`.
+/// Q-H4: quota is decided once, by the adapter, and reaches the caller
+/// typed. Unrelated noise on stderr (which wins the error text) no longer
+/// hides the quota the error document states, on either exit path.
 #[tokio::test]
-async fn spent_quota_is_an_error_that_classifies_as_quota() {
+async fn spent_quota_is_a_typed_quota_error_whatever_stderr_says() {
     for exit in ["exit 1", "exit 0"] {
         let mock = MockCli::new(&format!(
-            "printf '{{\"type\":\"result\",\"is_error\":true,\"result\":\"You are out of extra usage\",\"session_id\":\"s\"}}'; {exit}"
+            "echo 'warning: telemetry flag ignored' >&2; \
+             printf '{{\"type\":\"result\",\"is_error\":true,\"result\":\"You are out of extra usage\",\"session_id\":\"s\"}}'; {exit}"
         ));
         let err = mock
             .provider("m")
             .invoke("sys", &[user("x")], 10, None)
             .await
             .unwrap_err();
+        let quota = err
+            .downcast_ref::<crate::errors::QuotaError>()
+            .unwrap_or_else(|| panic!("{exit}: expected QuotaError, got {err}"));
+        assert_eq!(quota.model, "m");
+
+        let mut status = crate::provider_status::ProviderStatus::default();
+        status.record_failure(
+            &err.to_string(),
+            crate::provider_status::classify_failure(err.as_ref()),
+        );
         assert_eq!(
-            crate::provider_status::classify_error(&err.to_string()),
-            crate::provider_status::ErrorKind::QuotaExhausted,
-            "{exit}: {err}"
+            status.state,
+            crate::provider_status::ProviderState::Offline,
+            "{exit}"
+        );
+        assert_eq!(
+            status.error_kind,
+            Some(crate::provider_status::ErrorKind::QuotaExhausted),
+            "{exit}"
         );
     }
+}
+
+/// SEC-007: error text from a failing CLI is bounded.
+#[tokio::test]
+async fn failure_text_is_bounded() {
+    let mock = MockCli::new(
+        "printf '{\"type\":\"result\",\"is_error\":true,\"result\":\"%s\"}' \"$(head -c 5000 /dev/zero | tr '\\0' x)\"; exit 1",
+    );
+    let err = mock
+        .provider("m")
+        .invoke("sys", &[user("x")], 10, None)
+        .await
+        .unwrap_err();
+    assert!(
+        err.to_string().len() < 700,
+        "{} bytes",
+        err.to_string().len()
+    );
 }
 
 #[test]
@@ -523,6 +558,10 @@ fn stream_failure_with_policy_text_is_a_typed_refusal() {
     }
     assert!(matches!(
         classify_stream_failure(&Claude, "m", "You're out of extra usage".into()),
+        StreamEvent::QuotaExhausted { .. }
+    ));
+    assert!(matches!(
+        classify_stream_failure(&Claude, "m", "socket hang up".into()),
         StreamEvent::Error(_)
     ));
 }

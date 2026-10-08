@@ -164,11 +164,15 @@ impl CliAdapter for Codex {
     /// Codex has no known policy-refusal signature. A structured error line is
     /// flagged so a signature appearing in a later release is not swallowed.
     /// A spent quota, on stderr or in the error record, is its own class.
+    ///
+    /// Only what codex says about the failure is classified — stderr and the
+    /// error record's own message — never the model's words elsewhere in
+    /// the transcript.
     fn classify_exit(&self, stdout: &str, stderr: &str) -> ExitClass {
         if crate::provider_status::is_quota_exhausted(stderr) {
             ExitClass::QuotaExhausted
-        } else if has_error_record(stdout) {
-            self.classify_terminal(stdout)
+        } else if let Some(message) = error_record_message(stdout) {
+            self.classify_terminal(&message)
         } else {
             ExitClass::Plain
         }
@@ -259,12 +263,21 @@ fn agent_message_text(value: &Value) -> Option<&str> {
 }
 
 /// True when any line of stdout is a JSON object tagged as an error.
-fn has_error_record(stdout: &str) -> bool {
-    fn tagged_error(text: &str) -> bool {
-        serde_json::from_str::<Value>(text)
-            .is_ok_and(|value| value.get("type").and_then(Value::as_str) == Some("error"))
+/// The message of the first `{"type":"error"}` record in `stdout`, if any
+/// (empty when the record has none).
+fn error_record_message(stdout: &str) -> Option<String> {
+    fn tagged_error(text: &str) -> Option<String> {
+        let value = serde_json::from_str::<Value>(text).ok()?;
+        (value.get("type").and_then(Value::as_str) == Some("error")).then(|| {
+            value
+                .get("message")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string()
+        })
     }
-    tagged_error(stdout.trim()) || stdout.lines().any(|line| tagged_error(line.trim()))
+    tagged_error(stdout.trim())
+        .or_else(|| stdout.lines().find_map(|line| tagged_error(line.trim())))
 }
 
 #[cfg(test)]
@@ -403,6 +416,21 @@ mod tests {
         );
         let stdout = r#"{"type":"error","message":"Your credit balance is too low"}"#;
         assert_eq!(Codex.classify_exit(stdout, ""), ExitClass::QuotaExhausted);
+    }
+
+    /// SEC-008: the model's own words in the transcript are not a quota
+    /// signal; only stderr and the error record's message are classified.
+    #[test]
+    fn assistant_text_about_billing_is_not_quota() {
+        let stdout = concat!(
+            r#"{"type":"item.completed","item":{"type":"agent_message","text":"credit balance, payment required, 402"}}"#,
+            "\n",
+            r#"{"type":"error","message":"stream disconnected"}"#,
+        );
+        assert_eq!(
+            Codex.classify_exit(stdout, ""),
+            ExitClass::FlaggedButUnmatched
+        );
     }
 
     #[test]

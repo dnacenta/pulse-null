@@ -216,13 +216,25 @@ impl CliAdapter for Grok {
     /// structured `{"type":"error"}` line is still worth flagging, because a
     /// signature that appears in a later release should not pass unnoticed.
     /// A spent quota, on stderr or in the error record, is its own class.
+    ///
+    /// Only what grok says about the failure is classified — stderr and the
+    /// error record's own message — never the model's words elsewhere in
+    /// the transcript.
     fn classify_exit(&self, stdout: &str, stderr: &str) -> ExitClass {
-        if crate::provider_status::is_quota_exhausted(stderr) {
+        if quota_text(&stderr.to_lowercase()) {
             ExitClass::QuotaExhausted
-        } else if has_error_record(stdout) {
-            self.classify_terminal(stdout)
+        } else if let Some(message) = error_record_message(stdout) {
+            self.classify_terminal(&message)
         } else {
             ExitClass::Plain
+        }
+    }
+
+    fn classify_terminal(&self, text: &str) -> ExitClass {
+        if quota_text(&text.to_lowercase()) {
+            ExitClass::QuotaExhausted
+        } else {
+            ExitClass::FlaggedButUnmatched
         }
     }
 
@@ -388,12 +400,31 @@ fn compat_disabled(config: &Path) -> bool {
     })
 }
 
-fn has_error_record(stdout: &str) -> bool {
-    fn tagged_error(text: &str) -> bool {
-        serde_json::from_str::<Value>(text)
-            .is_ok_and(|value| value.get("type").and_then(Value::as_str) == Some("error"))
+/// Grok's wording for a spent usage balance, on top of the generic signals
+/// in `provider_status`.
+const QUOTA_PHRASES: &[&str] = &["usage balance exhausted"];
+
+/// Does this already-lowercased failure text say the quota is spent?
+fn quota_text(lower: &str) -> bool {
+    crate::provider_status::is_quota_exhausted_lower(lower)
+        || QUOTA_PHRASES.iter().any(|p| lower.contains(p))
+}
+
+/// The message of the first `{"type":"error"}` record in `stdout`, if any
+/// (empty when the record has none).
+fn error_record_message(stdout: &str) -> Option<String> {
+    fn tagged_error(text: &str) -> Option<String> {
+        let value = serde_json::from_str::<Value>(text).ok()?;
+        (value.get("type").and_then(Value::as_str) == Some("error")).then(|| {
+            value
+                .get("message")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string()
+        })
     }
-    tagged_error(stdout.trim()) || stdout.lines().any(|line| tagged_error(line.trim()))
+    tagged_error(stdout.trim())
+        .or_else(|| stdout.lines().find_map(|line| tagged_error(line.trim())))
 }
 
 #[cfg(test)]
@@ -596,6 +627,24 @@ mod tests {
             Grok.classify_terminal("Grok Build usage balance exhausted"),
             ExitClass::QuotaExhausted
         );
+    }
+
+    /// SEC-008: the model's own words in the transcript are not a quota
+    /// signal; only stderr and the error record's message are classified.
+    #[test]
+    fn assistant_text_about_billing_is_not_quota() {
+        let stdout = concat!(
+            r#"{"type":"stream_event","event":{"type":"content_block_delta","delta":{"type":"text_delta","text":"Your credit balance is low; payment required (402)."}}}"#,
+            "\n",
+            r#"{"type":"error","message":"Couldn't set model 'grok-nonexistent'"}"#,
+        );
+        assert_eq!(
+            Grok.classify_exit(stdout, ""),
+            ExitClass::FlaggedButUnmatched
+        );
+        assert!(!crate::provider_status::is_quota_exhausted(
+            "Grok Build usage balance exhausted"
+        ));
     }
 
     #[test]

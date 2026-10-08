@@ -30,6 +30,19 @@ const UNKNOWN_OPTION_MARKER: &str = "unknown option";
 const ISOLATION_DISALLOWED_TOOLS: &str =
     "Write,Edit,MultiEdit,NotebookEdit,Bash,WebFetch,WebSearch,Task";
 
+/// Claude Code's own wording for a spent plan or extra-usage allowance, on
+/// top of the generic signals in `provider_status`.
+const QUOTA_PHRASES: &[&str] = &["out of extra usage", "hit your limit"];
+
+/// Cap on error text this adapter hands back (SEC-007).
+const ERROR_TEXT_MAX: usize = 500;
+
+/// Does this already-lowercased failure text say the quota is spent?
+fn quota_text(lower: &str) -> bool {
+    crate::provider_status::is_quota_exhausted_lower(lower)
+        || QUOTA_PHRASES.iter().any(|p| lower.contains(p))
+}
+
 /// The tools Claude Code loads up front, measured on 2.1.282. Others load on
 /// demand through `ToolSearch`.
 const TOOL_SURFACE: &[&str] = &[
@@ -157,7 +170,7 @@ impl CliAdapter for Claude {
             return Err(if text.is_empty() {
                 "error result with no detail".into()
             } else {
-                text
+                crate::utils::safe_truncate(&text, ERROR_TEXT_MAX).to_string()
             });
         }
         if text.is_empty() {
@@ -205,13 +218,14 @@ impl CliAdapter for Claude {
         }
     }
 
-    /// A refusal is valid JSON with `is_error == true` **and** a `result`
-    /// body containing the Usage-Policy signature. A spent quota is
-    /// recognised in that `result` or on stderr. Anything else (non-JSON
-    /// stderr, `is_error` absent/false) is a generic error and must not
+    /// Only what the CLI says about the failure is classified: stderr, and
+    /// the error document's `result` (or `error`) field when `is_error` is
+    /// true. A refusal carries the Usage-Policy signature there; a spent
+    /// quota is recognised there or on stderr. Anything else (non-JSON
+    /// stdout, `is_error` absent/false) is a generic error and must not
     /// trigger fallback.
     fn classify_exit(&self, stdout: &str, stderr: &str) -> ExitClass {
-        if crate::provider_status::is_quota_exhausted(stderr) {
+        if quota_text(&stderr.to_lowercase()) {
             return ExitClass::QuotaExhausted;
         }
         let Ok(parsed) = serde_json::from_str::<serde_json::Value>(stdout.trim()) else {
@@ -220,7 +234,11 @@ impl CliAdapter for Claude {
         if parsed["is_error"].as_bool() != Some(true) {
             return ExitClass::Plain;
         }
-        self.classify_terminal(parsed["result"].as_str().unwrap_or(""))
+        let said = parsed["result"]
+            .as_str()
+            .or_else(|| parsed["error"].as_str())
+            .unwrap_or("");
+        self.classify_terminal(said)
     }
 
     fn tool_surface(&self, restricted: bool) -> &'static [&'static str] {
@@ -239,9 +257,10 @@ impl CliAdapter for Claude {
     /// The one place the AUP refusal signature lives: the buffered exit and
     /// the streamed terminal record both come through here.
     fn classify_terminal(&self, text: &str) -> ExitClass {
-        if text.to_lowercase().contains("usage policy") {
+        let lower = text.to_lowercase();
+        if lower.contains("usage policy") {
             ExitClass::Refusal(text.to_string())
-        } else if crate::provider_status::is_quota_exhausted(text) {
+        } else if quota_text(&lower) {
             ExitClass::QuotaExhausted
         } else {
             ExitClass::FlaggedButUnmatched
@@ -560,6 +579,37 @@ mod tests {
             Claude.classify_terminal("Usage Policy: no. Also out of extra usage."),
             ExitClass::Refusal(_)
         ));
+    }
+
+    /// Echo's live limit line is Claude Code's wording, matched here and not
+    /// in the generic classifier.
+    #[test]
+    fn claude_code_quota_wording_lives_in_the_adapter() {
+        let echo_limit =
+            r#"{"is_error":true,"result":"You've hit your limit · resets Aug 12, 6am (UTC)"}"#;
+        assert_eq!(
+            Claude.classify_exit(echo_limit, ""),
+            ExitClass::QuotaExhausted
+        );
+        assert!(!crate::provider_status::is_quota_exhausted(
+            "You've hit your limit · resets Aug 12, 6am (UTC)"
+        ));
+        assert!(!crate::provider_status::is_quota_exhausted(
+            "You're out of extra usage"
+        ));
+    }
+
+    /// Only the error document is classified, never a successful reply that
+    /// happens to talk about billing.
+    #[test]
+    fn a_reply_that_mentions_quota_is_not_quota() {
+        let reply = r#"{"is_error":false,"result":"Your credit balance and a 402 Payment Required are both explained in the docs."}"#;
+        assert_eq!(Claude.classify_exit(reply, ""), ExitClass::Plain);
+        let unrelated = r#"{"is_error":true,"result":"tool execution failed"}"#;
+        assert_eq!(
+            Claude.classify_exit(unrelated, ""),
+            ExitClass::FlaggedButUnmatched
+        );
     }
 
     #[test]

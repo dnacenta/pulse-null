@@ -430,7 +430,7 @@ async fn execute_task(
                     task.id,
                     error_msg
                 );
-                handle_provider_error(state, &task.id, &error_msg).await;
+                handle_provider_error(state, &task.id, e.as_ref()).await;
                 return TaskOutcome::Failure(error_msg);
             }
         }
@@ -475,7 +475,7 @@ async fn execute_task(
                     task.id,
                     error_msg
                 );
-                handle_provider_error(state, &task.id, &error_msg).await;
+                handle_provider_error(state, &task.id, e.as_ref()).await;
                 return TaskOutcome::Failure(error_msg);
             }
         }
@@ -867,19 +867,25 @@ fn resolve_provider_override(
 /// The operator-facing notification is not sent here — every failure path,
 /// including the ones that never reach the provider, is reported once from
 /// [`run_task_loop`] via [`diagnostics::report_failure`].
-pub(super) async fn handle_provider_error(state: &Arc<AppState>, task_id: &str, error_msg: &str) {
-    let kind = provider_status::classify_error(error_msg);
+pub(super) async fn handle_provider_error(
+    state: &Arc<AppState>,
+    task_id: &str,
+    error: &(dyn std::error::Error + Send + Sync + 'static),
+) {
+    // A typed quota error is classified by type; anything else by its text.
+    let kind = provider_status::classify_failure(error);
     let kind_str = kind.to_string();
+    let error_msg = error.to_string();
 
     // Update provider status
     {
         let mut ps = state.provider_status.write().await;
-        ps.record_failure(error_msg, kind);
+        ps.record_failure(&error_msg, kind);
     }
 
     // Emit event
     state.event_bus.emit(PulseEvent::ProviderError {
-        error: error_msg.to_string(),
+        error: error_msg,
         error_kind: kind_str,
         task_id: task_id.to_string(),
     });

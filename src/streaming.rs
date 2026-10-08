@@ -33,6 +33,10 @@ pub enum StreamEvent {
     /// distinct from `Error` so the chat handler's refusal fallback fires for
     /// streamed turns exactly as it does for buffered ones.
     Refused { model: String, detail: String },
+
+    /// The provider's usage quota is spent (PN-133). Typed so callers map
+    /// it to a quota status without re-reading the text.
+    QuotaExhausted { model: String, detail: String },
 }
 
 /// Stream type returned by streaming providers.
@@ -88,17 +92,21 @@ pub trait StreamingProvider: LmProvider {
                 // A typed AUP refusal must stay typed, or the chat handler's
                 // refusal fallback (PN-88) silently never fires for a provider
                 // that relies on this default.
-                Err(e) => match e.downcast_ref::<crate::errors::RefusalError>() {
-                    Some(r) => {
+                Err(e) => {
+                    if let Some(r) = e.downcast_ref::<crate::errors::RefusalError>() {
                         yield StreamEvent::Refused {
                             model: r.model.clone(),
                             detail: r.detail.clone(),
                         };
-                    }
-                    None => {
+                    } else if let Some(q) = e.downcast_ref::<crate::errors::QuotaError>() {
+                        yield StreamEvent::QuotaExhausted {
+                            model: q.model.clone(),
+                            detail: q.detail.clone(),
+                        };
+                    } else {
                         yield StreamEvent::Error(e.to_string());
                     }
-                },
+                }
             }
         })
     }

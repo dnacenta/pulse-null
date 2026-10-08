@@ -559,8 +559,9 @@ pub(crate) async fn run_turn(
         &correlation_id,
         sink.as_ref(),
     )
-    .await
-    .map_err(|e| {
+    .await;
+    record_provider_outcome(&state, &turn).await;
+    let turn = turn.map_err(|e| {
         // The turn failed even after any fallback — the helper has already
         // rolled the user turn (the trunk tail) and its deferred WAL/counter
         // commit back off (AC7, AC8). Note this is NOT a full pre-turn restore:
@@ -1171,6 +1172,32 @@ fn shed_isolation_quarantine(data: &mut crate::session_store::SessionData) -> us
             dropped
         }
         None => 0,
+    }
+}
+
+/// A chat turn's provider call feeds the same status as task and intent turns
+/// (PN-133), so `/health` sees the provider recover after, say, a spent
+/// quota. A refusal is the model answering, not the provider failing, so it
+/// leaves the status alone.
+async fn record_provider_outcome<T>(
+    state: &AppState,
+    outcome: &Result<T, Box<dyn std::error::Error + Send + Sync>>,
+) {
+    let mut status = state.provider_status.write().await;
+    match outcome {
+        Ok(_) => status.record_success(),
+        Err(e) if e.downcast_ref::<crate::errors::RefusalError>().is_some() => {}
+        Err(e) => match e.downcast_ref::<crate::errors::FallbackFailedError>() {
+            // Its message is deliberately generic; the detail says what failed.
+            Some(ff) => status.record_failure(
+                &ff.detail,
+                crate::provider_status::classify_error(&ff.detail),
+            ),
+            None => status.record_failure(
+                &e.to_string(),
+                crate::provider_status::classify_failure(e.as_ref()),
+            ),
+        },
     }
 }
 

@@ -1066,6 +1066,56 @@ async fn e2e_generic_error_rolls_back_user_turn() {
     );
 }
 
+/// PN-133: chat turns feed provider status like task and intent turns. A
+/// chat turn that succeeds after a quota failure brings the provider back to
+/// healthy, so `/health` does not stay 503 while every task is disabled.
+#[tokio::test]
+async fn a_successful_chat_turn_after_a_quota_failure_restores_provider_health() {
+    let state = build_state(
+        MockProvider::new(vec![mock_text("back again")]),
+        ToolRegistry::new(),
+    )
+    .await;
+    state.provider_status.write().await.record_failure(
+        "usage quota exhausted",
+        crate::provider_status::ErrorKind::QuotaExhausted,
+    );
+    assert_eq!(
+        state.provider_status.read().await.state,
+        crate::provider_status::ProviderState::Offline
+    );
+
+    let app = build_app(Arc::clone(&state));
+    let (status, _body) = post_chat(&app, "hello").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        state.provider_status.read().await.state,
+        crate::provider_status::ProviderState::Healthy
+    );
+}
+
+/// A failed chat turn is recorded too, classified like any provider failure.
+#[tokio::test]
+async fn a_failed_chat_turn_records_the_provider_failure() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = build_state_boxed_with_config(
+        dir.path().to_path_buf(),
+        Box::new(FailingProvider),
+        ToolRegistry::new(),
+        test_config(),
+    )
+    .await;
+    let app = build_app(Arc::clone(&state));
+    let (status, _body) = post_chat(&app, "hello").await;
+    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+    let ps = state.provider_status.read().await;
+    assert_eq!(ps.consecutive_failures, 1);
+    assert_eq!(
+        ps.error_kind,
+        Some(crate::provider_status::ErrorKind::NetworkError)
+    );
+}
+
 /// AC5: an AUP refusal with the fallback disabled (no `fallback_model`) takes
 /// the error path with the user turn rolled back — no opus call, no poison.
 #[tokio::test]
