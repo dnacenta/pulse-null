@@ -529,21 +529,22 @@ mod tests {
         let id = Schedule::load(dir.path()).unwrap().tasks[0].task.id.clone();
 
         let before = std::fs::read_to_string(dir.path().join("schedule.json")).unwrap();
-        let view = set_enabled(dir.path(), TZ, &id, false).unwrap().unwrap();
-        assert!(!view.enabled);
+        // Defaults start disabled, so the first toggle turns the task on.
+        let view = set_enabled(dir.path(), TZ, &id, true).unwrap().unwrap();
+        assert!(view.enabled);
 
         let after = std::fs::read_to_string(dir.path().join("schedule.json")).unwrap();
         assert_ne!(before, after, "schedule.json on disk did not change");
 
         let reloaded = Schedule::load(dir.path()).unwrap();
-        assert!(!reloaded.find_task(&id).unwrap().task.enabled);
+        assert!(reloaded.find_task(&id).unwrap().task.enabled);
 
         let listed = list_tasks(dir.path(), TZ).unwrap();
-        assert!(!find(&listed, &id).enabled);
+        assert!(find(&listed, &id).enabled);
 
-        set_enabled(dir.path(), TZ, &id, true).unwrap().unwrap();
+        set_enabled(dir.path(), TZ, &id, false).unwrap().unwrap();
         assert!(
-            Schedule::load(dir.path())
+            !Schedule::load(dir.path())
                 .unwrap()
                 .find_task(&id)
                 .unwrap()

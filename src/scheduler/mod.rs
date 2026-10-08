@@ -723,7 +723,7 @@ mod tests {
         assert!(dir.path().join("schedule.json").exists());
     }
 
-    /// AC12 fixture: an external edit ("CLI disabled a task while the
+    /// AC12 fixture: an external edit ("CLI enabled a task while the
     /// coordinator was down / mid-tenure") survives a marker-driven save,
     /// because save_delta re-reads disk instead of writing stale memory.
     #[test]
@@ -735,18 +735,18 @@ mod tests {
         let mut in_memory = Schedule::load_or_init(root).unwrap();
         assert!(!in_memory.tasks.is_empty());
         let existing_id = in_memory.tasks[0].task.id.clone();
-        assert!(in_memory.find_task(&existing_id).unwrap().task.enabled);
+        assert!(!in_memory.find_task(&existing_id).unwrap().task.enabled);
 
         // External edit while the holder of `in_memory` isn't looking:
-        // the CLI disables the task on disk.
+        // the CLI enables the task on disk.
         {
             let mut cli_copy = Schedule::load(root).unwrap();
-            cli_copy.find_task_mut(&existing_id).unwrap().task.enabled = false;
+            cli_copy.find_task_mut(&existing_id).unwrap().task.enabled = true;
             cli_copy.save(root).unwrap();
         }
 
         // Marker path fires: adds a new task via save_delta. The OLD code
-        // would have saved `in_memory` wholesale, resurrecting the task.
+        // would have saved `in_memory` wholesale, reverting the edit.
         let new_task = ScheduleEntry::from(ScheduledTask {
             id: "self-scheduled".into(),
             name: "Self Scheduled".into(),
@@ -760,10 +760,10 @@ mod tests {
         });
         in_memory = Schedule::save_delta(root, |s| s.add_task(new_task)).unwrap();
 
-        // Disk has both the external disable AND the new task; the refreshed
+        // Disk has both the external enable AND the new task; the refreshed
         // in-memory copy agrees with disk.
         let disk = Schedule::load(root).unwrap();
-        assert!(!disk.find_task(&existing_id).unwrap().task.enabled);
+        assert!(disk.find_task(&existing_id).unwrap().task.enabled);
         assert!(disk.find_task("self-scheduled").is_some());
         assert_eq!(
             serde_json::to_string(&disk).unwrap(),

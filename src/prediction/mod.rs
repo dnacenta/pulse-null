@@ -595,22 +595,6 @@ impl PredictionStack {
             self.errors.truncate(target);
         }
     }
-
-    /// Get the most recent prediction errors by `created_at`, regardless
-    /// of processed state. Returns at most `count` items, newest first.
-    ///
-    /// (M6: previously returned `&self.errors[len-count..]` — the tail of
-    /// the Vec — which was insertion-order until `prune` reordered the
-    /// processed errors. After a prune the tail wasn't necessarily the
-    /// time-newest entries. Now sorts by `created_at` descending and
-    /// borrows the chosen entries into a `Vec<&PredictionError>`.)
-    #[must_use]
-    pub fn recent_errors(&self, count: usize) -> Vec<&PredictionError> {
-        let mut by_recency: Vec<&PredictionError> = self.errors.iter().collect();
-        by_recency.sort_by_key(|e| std::cmp::Reverse(e.created_at));
-        by_recency.truncate(count);
-        by_recency
-    }
 }
 
 #[cfg(test)]
@@ -1116,34 +1100,6 @@ mod tests {
         assert_eq!(stack.errors.len(), 3);
         let unprocessed = stack.errors.iter().filter(|e| !e.processed).count();
         assert_eq!(unprocessed, 2);
-    }
-
-    #[test]
-    fn recent_errors_returns_tail() {
-        let mut stack = PredictionStack::new();
-
-        for i in 0..5 {
-            let id = stack
-                .add_prediction(Timescale::Cycle, format!("pred-{i}"), 0.5)
-                .id
-                .clone();
-            stack.resolve(
-                &id,
-                PredictionResolution {
-                    actual: format!("result-{i}"),
-                    surprise: 0.8,
-                    direction: ErrorDirection::Overconfident,
-                    insight: None,
-                },
-            );
-        }
-
-        let recent = stack.recent_errors(3);
-        assert_eq!(recent.len(), 3);
-
-        // Requesting more than exist returns all
-        let all = stack.recent_errors(100);
-        assert_eq!(all.len(), 5);
     }
 
     #[test]

@@ -1,7 +1,5 @@
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 
-use pulse_system_types::monitoring::{CognitiveMonitor, PipelineMonitor};
 use tracing::{info, warn};
 
 use super::capability::{self, Capability};
@@ -155,8 +153,8 @@ enum PromptTier {
     Essential = 0,
     /// High priority: SELF.md, MEMORY.md. Truncated only as last resort.
     High = 1,
-    /// Lower priority: EPHEMERAL.md, FINDINGS.md, pipeline health, cognitive
-    /// health, caliber. Progressively compressed or dropped when over budget.
+    /// Lower priority: EPHEMERAL.md, FINDINGS.md, graph awareness.
+    /// Progressively compressed or dropped when over budget.
     Low = 2,
 }
 
@@ -195,17 +193,9 @@ pub struct SystemPromptResult {
 pub async fn build_system_prompt_async(
     root_dir: PathBuf,
     config: Config,
-    pipeline_monitor: Option<Arc<dyn PipelineMonitor>>,
-    cognitive_monitor: Option<Arc<dyn CognitiveMonitor>>,
 ) -> Result<String, crate::errors::PromptError> {
     let result = tokio::task::spawn_blocking(move || {
-        build_system_prompt(
-            &root_dir,
-            &config,
-            pipeline_monitor.as_ref(),
-            cognitive_monitor.as_ref(),
-        )
-        .map_err(|e| e.to_string())
+        build_system_prompt(&root_dir, &config).map_err(|e| e.to_string())
     })
     .await
     .map_err(|e| crate::errors::PromptError::Assembly(e.to_string()))
@@ -223,11 +213,8 @@ pub async fn build_system_prompt_async(
 pub fn build_system_prompt(
     root_dir: &Path,
     config: &Config,
-    pipeline_monitor: Option<&Arc<dyn PipelineMonitor>>,
-    cognitive_monitor: Option<&Arc<dyn CognitiveMonitor>>,
 ) -> Result<String, crate::errors::PromptError> {
-    let result =
-        build_system_prompt_budgeted(root_dir, config, pipeline_monitor, cognitive_monitor)?;
+    let result = build_system_prompt_budgeted(root_dir, config)?;
     Ok(result.prompt)
 }
 
@@ -239,8 +226,6 @@ pub fn build_system_prompt(
 pub fn build_system_prompt_budgeted(
     root_dir: &Path,
     config: &Config,
-    pipeline_monitor: Option<&Arc<dyn PipelineMonitor>>,
-    cognitive_monitor: Option<&Arc<dyn CognitiveMonitor>>,
 ) -> Result<SystemPromptResult, crate::errors::PromptError> {
     let budget_cfg = &config.system_prompt_budget;
     let budget_enabled = budget_cfg.enabled;
@@ -383,19 +368,21 @@ pub fn build_system_prompt_budgeted(
 
     // --- Tier 0 (Essential): Memory curation instructions ---
     // Small, static, always included.
-    let memory_curation = "<memory-curation>\n\
-        You have a file_write tool. Use it to maintain your memory/MEMORY.md file.\n\
+    let memory_curation = format!(
+        "<memory-curation>\n\
+        Use {} to maintain your memory/MEMORY.md file.\n\
         When you learn something stable about D, their preferences, projects, or \
         recurring patterns — or when a conversation produces a decision worth \
-        remembering — write it to MEMORY.md using file_write.\n\n\
+        remembering — write it to MEMORY.md.\n\n\
         Rules:\n\
         - Only write confirmed, stable information. Not session-specific or speculative.\n\
         - Read MEMORY.md first to avoid duplicates. Update existing entries rather than adding new ones.\n\
         - Keep it concise. MEMORY.md is loaded into every conversation — bloat costs context.\n\
         - Do not write secrets, API keys, or credentials to MEMORY.md.\n\
         - You do not need to write memory on every conversation. Only when something genuinely worth remembering comes up.\n\
-        </memory-curation>"
-        .to_string();
+        </memory-curation>",
+        file_write_tool(config)
+    );
     let tokens = estimate_tokens(&memory_curation);
     components.push(PromptComponent {
         name: "memory-curation",
@@ -466,8 +453,9 @@ pub fn build_system_prompt_budgeted(
                 Between conversations, you did some research on your own. Here is what you found. \
                 Bring these findings up naturally in conversation when relevant — don't dump them \
                 all at once, but mention them when the topic connects. After you've shared a finding \
-                with the user, you can remove it from FINDINGS.md using file_write.\n\n\
+                with the user, you can remove it from FINDINGS.md with {}.\n\n\
                 {}\n</autonomous-findings>",
+                file_write_tool(config),
                 content
             );
             let capped = if budget_enabled && budget_cfg.findings_cap > 0 {
@@ -486,82 +474,10 @@ pub fn build_system_prompt_budgeted(
         }
     }
 
-    // --- Tier 2 (Low): Pipeline health ---
-    if let Some(monitor) = pipeline_monitor {
-        let thresholds = config.pipeline.to_thresholds();
-        let pipeline_state = monitor.load_state(root_dir);
-        let pipeline_health = monitor.calculate(root_dir, &thresholds);
-        let pipeline_text = monitor.render_for_prompt(
-            &pipeline_health,
-            pipeline_state.sessions_without_movement,
-            config.pipeline.freeze_threshold,
-        );
-        let wrapped = format!("<pipeline-health>\n{}\n</pipeline-health>", pipeline_text);
-        let capped = if budget_enabled && budget_cfg.pipeline_health_cap > 0 {
-            truncate_to_token_cap(&wrapped, budget_cfg.pipeline_health_cap)
-        } else {
-            wrapped
-        };
-        let tokens = estimate_tokens(&capped);
-        components.push(PromptComponent {
-            name: "pipeline-health",
-            content: capped,
-            tokens,
-            tier: PromptTier::Low,
-            cap: budget_cfg.pipeline_health_cap,
-        });
-    }
-
-    // --- Tier 2 (Low): Cognitive health ---
-    if let Some(monitor) = cognitive_monitor {
-        let cognitive_health = monitor.assess(
-            root_dir,
-            config.monitoring.window_size,
-            config.monitoring.min_samples,
-        );
-        let cognitive_text = monitor.render_for_prompt(&cognitive_health);
-        let wrapped = format!(
-            "<cognitive-health>\n{}\n</cognitive-health>",
-            cognitive_text
-        );
-        let capped = if budget_enabled && budget_cfg.cognitive_health_cap > 0 {
-            truncate_to_token_cap(&wrapped, budget_cfg.cognitive_health_cap)
-        } else {
-            wrapped
-        };
-        let tokens = estimate_tokens(&capped);
-        components.push(PromptComponent {
-            name: "cognitive-health",
-            content: capped,
-            tokens,
-            tier: PromptTier::Low,
-            cap: budget_cfg.cognitive_health_cap,
-        });
-    }
-
-    // --- Tier 2 (Low): Caliber ---
-    if config.caliber.enabled {
-        if let Some(caliber_text) = crate::caliber::runtime::render_for_prompt(root_dir) {
-            let wrapped = format!("<caliber>\n{}\n</caliber>", caliber_text);
-            let capped = if budget_enabled && budget_cfg.caliber_cap > 0 {
-                truncate_to_token_cap(&wrapped, budget_cfg.caliber_cap)
-            } else {
-                wrapped
-            };
-            let tokens = estimate_tokens(&capped);
-            components.push(PromptComponent {
-                name: "caliber",
-                content: capped,
-                tokens,
-                tier: PromptTier::Low,
-                cap: budget_cfg.caliber_cap,
-            });
-        }
-    }
-
     // --- Tier 2 (Low): Graph Awareness ---
     if config.graph.enabled {
-        if let Some(hint) = crate::graph_context::graph_awareness_hint(root_dir) {
+        let query_tool = registry_tools_callable(config);
+        if let Some(hint) = crate::graph_context::graph_awareness_hint(root_dir, query_tool) {
             let tokens = estimate_tokens(&hint);
             components.push(PromptComponent {
                 name: "graph-awareness",
@@ -569,54 +485,6 @@ pub fn build_system_prompt_budgeted(
                 tokens,
                 tier: PromptTier::Low,
                 cap: 200,
-            });
-        }
-    }
-
-    // --- Tier 2 (Low): Prediction Context ---
-    // Surfaces recent prediction errors and pending-prediction count so the
-    // pulse can RESOLVE its own predictions in this turn. See
-    // continuous-entity-process-spec.md Phase 2 (Hierarchical Predictive
-    // Self-Modeling). Only renders when there's something to surface.
-    if config.prediction.enabled {
-        // build_system_prompt_budgeted is sync and is called from inside the
-        // spawn_blocking issued by build_system_prompt_async, so sync IO here
-        // doesn't block the tokio worker pool. async callers use load_async.
-        let stack = crate::prediction::store::load(root_dir, config.prediction.clone());
-        let importance = stack.accumulated_importance();
-        let recent = stack.recent_errors(5);
-        if !recent.is_empty() {
-            use std::fmt::Write as _;
-            let mut block = String::new();
-            // String's Write impl is infallible — discard the unit Result.
-            let _ = write!(
-                &mut block,
-                "<prediction-context importance=\"{importance:.1}\">\nRecent prediction errors:\n"
-            );
-            for err in recent {
-                let _ = writeln!(
-                    &mut block,
-                    "- [{}] surprise {:.1}: {}",
-                    err.direction,
-                    err.surprise,
-                    err.insight.as_deref().unwrap_or("no insight recorded"),
-                );
-            }
-            let pending_count = stack.predictions.iter().filter(|p| p.is_pending()).count();
-            if pending_count > 0 {
-                let _ = writeln!(
-                    &mut block,
-                    "{pending_count} predictions awaiting resolution"
-                );
-            }
-            block.push_str("</prediction-context>");
-            let tokens = estimate_tokens(&block);
-            components.push(PromptComponent {
-                name: "prediction-context",
-                content: block,
-                tokens,
-                tier: PromptTier::Low,
-                cap: 300,
             });
         }
     }
@@ -649,7 +517,7 @@ fn enforce_budget_and_assemble(
 
     if budget_enabled && total_before > budget_cfg.token_budget {
         // Progressive trimming: drop Low-tier components from lowest priority
-        // (reverse order = caliber, cognitive, pipeline, findings, ephemeral).
+        // (reverse order = graph awareness, findings, ephemeral).
         // Within a tier, we drop in reverse insertion order (last added = least important).
         let budget = budget_cfg.token_budget;
         let mut current_total: usize = components.iter().map(|c| c.tokens).sum();
@@ -814,33 +682,6 @@ fn compress_to_one_liner(name: &str, content: &str) -> String {
                 finding_count
             )
         }
-        "pipeline-health" => {
-            // Extract key numbers if possible, otherwise generic status
-            if content.contains("healthy") || content.contains("Healthy") {
-                "<pipeline-health>[compressed] Pipeline healthy</pipeline-health>".to_string()
-            } else if content.contains("stale") || content.contains("frozen") {
-                "<pipeline-health>[compressed] Pipeline needs attention — stale or frozen documents</pipeline-health>".to_string()
-            } else {
-                "<pipeline-health>[compressed] Pipeline status available</pipeline-health>"
-                    .to_string()
-            }
-        }
-        "cognitive-health" => {
-            if content.contains("healthy")
-                || content.contains("Healthy")
-                || content.contains("stable")
-            {
-                "<cognitive-health>[compressed] Cognitive health stable</cognitive-health>"
-                    .to_string()
-            } else {
-                "<cognitive-health>[compressed] Cognitive health needs review</cognitive-health>"
-                    .to_string()
-            }
-        }
-        "caliber" => {
-            "<caliber>[compressed] Caliber data available — outcome history on file</caliber>"
-                .to_string()
-        }
         _ => {
             // Generic: first line of content
             let first_line = content.lines().next().unwrap_or("[content available]");
@@ -900,6 +741,22 @@ fn instruction_label(path: &Path) -> &'static str {
     }
 }
 
+/// Can the pulse call the in-process tool registry (`file_write`,
+/// `graph_query`, …)? Only providers handed its definitions can; an agent CLI
+/// runs its own tools, so text must not name registry tools to it.
+fn registry_tools_callable(config: &Config) -> bool {
+    provider_reports_tool_rounds(&config.llm.provider)
+}
+
+/// How prompt text refers to the pulse's file-writing tool.
+fn file_write_tool(config: &Config) -> &'static str {
+    if registry_tools_callable(config) {
+        "your file_write tool"
+    } else {
+        "your file tools"
+    }
+}
+
 /// The adapter for the agent CLI this config drives, if any.
 fn agent_cli(config: &Config) -> Option<Box<dyn crate::cli_provider::adapter::CliAdapter>> {
     config
@@ -916,10 +773,11 @@ fn awareness_via_import(config: &Config) -> bool {
 
 /// Build a minimal system prompt for scheduled tasks (Phase 5: Task Isolation).
 ///
-/// Includes only the identity core: the instruction file + rules + SELF.md.
-/// Excludes: MEMORY.md, EPHEMERAL.md, FINDINGS.md, pipeline health,
-/// cognitive health, and caliber data. This keeps the task's context
-/// small and focused, leaving more room for the task prompt and tool output.
+/// Includes only the identity core: the instruction file + rules + SELF.md,
+/// plus the thought stack and tension threads.
+/// Excludes: MEMORY.md, EPHEMERAL.md and FINDINGS.md. This keeps the task's
+/// context small and focused, leaving more room for the task prompt and tool
+/// output.
 pub fn build_task_system_prompt(
     root_dir: &Path,
     config: &Config,
@@ -1026,29 +884,6 @@ pub fn build_task_system_prompt_budgeted(
         });
     }
 
-    // --- Tier 2 (Low): Metacognitive context ---
-    // Vigil health + calibration data for autonomous goal generation.
-    let metacog = build_metacognitive_context(root_dir);
-    if !metacog.is_empty() {
-        let wrapped = format!(
-            "<metacognitive-state>\n\
-            This is your current cognitive health assessment. Use this to guide your \
-            autonomous thinking. If you notice patterns — declining signals, calibration \
-            surprises, persistent weaknesses — consider generating goals to address them.\n\n\
-            {}\n\
-            </metacognitive-state>",
-            metacog
-        );
-        let tokens = estimate_tokens(&wrapped);
-        components.push(PromptComponent {
-            name: "metacognitive-state",
-            content: wrapped,
-            tokens,
-            tier: PromptTier::Low,
-            cap: 0,
-        });
-    }
-
     // --- Tier 1 (High): Tension threads (PN-95 Layer 3) ---
     // What the pulse picks up is chosen by an accumulator it cannot edit in
     // prose, rather than by whatever survived the last fold. High rather
@@ -1077,8 +912,8 @@ pub fn build_task_system_prompt_budgeted(
         - Do NOT produce text formatted as [User]:, [Human]:, [Task]:, [Assistant]:, or any turn-taking marker.\n\
         - Do NOT claim work is completed unless you executed the corresponding tool calls.\n\
         - If tools fail or are unavailable, say so explicitly — do not narrate fake outcomes.\n\
-        - You have a minimal system prompt (identity + thought stack — no MEMORY.md, \
-        EPHEMERAL.md, or monitoring data). Focus on the task prompt. Do not reference \
+        - You have a minimal system prompt (identity, thought stack and tension threads — \
+        no MEMORY.md or EPHEMERAL.md). Focus on the task prompt. Do not reference \
         memory or session context that is not present in this context window.\n\
         </task-context>"
         .to_string();
@@ -1149,13 +984,13 @@ fn build_tension_context(root_dir: &Path, config: &Config) -> Option<String> {
         return None;
     }
     // Sync IO: this runs inside the spawn_blocking issued by
-    // `build_task_system_prompt_async`, same as the prediction context.
+    // `build_task_system_prompt_async`, same as the rest of the builder.
     let store = crate::tension::store::load(root_dir, config.tension.clone());
     let now = chrono::Utc::now();
     let top = store.top_k(config.tension.top_k_injected);
     let metrics = store.metrics(now);
 
-    if top.is_empty() && store.triage.is_none() {
+    if top.is_empty() && store.last_refusals.is_empty() {
         return None;
     }
 
@@ -1187,23 +1022,6 @@ fn build_tension_context(root_dir: &Path, config: &Config) -> Option<String> {
     // §3 metrics inline in the routine payload, not in a separate report —
     // a coverage denominator that ships separately does not get read.
     let _ = writeln!(&mut block, "[TENSION METRICS: {}]", metrics.summary());
-
-    if let Some(demand) = &store.triage {
-        let _ = write!(
-            &mut block,
-            "[TENSION TRIAGE: {} live threads against a cap of {}. Nothing was dropped — \
-             retire one this cycle with [THREAD-RESOLVE:]. Lowest-pressure candidates:",
-            demand.live_count, demand.cap
-        );
-        for candidate in &demand.candidates {
-            let _ = write!(
-                &mut block,
-                " {} ({:.2}: {});",
-                candidate.id, candidate.tension, candidate.label
-            );
-        }
-        block.push_str("]\n");
-    }
 
     // Refused markers are told to the pulse that emitted them, not only to
     // the owner's alert queue: the pulse is the only one who can re-emit.
@@ -1261,71 +1079,6 @@ fn load_thought_stack(
         "<thought-stack>\n{}\n</thought-stack>",
         bounded
     )))
-}
-
-/// Build metacognitive context for autonomous tasks — vigil health summary
-/// and calibration data so the pulse can generate goals from self-knowledge.
-fn build_metacognitive_context(root_dir: &Path) -> String {
-    let mut sections = Vec::new();
-
-    // Vigil analysis (cognitive health)
-    let analysis_path = root_dir.join(".claude").join("vigil").join("analysis.json"); // vendor-ok: vigil harness dir
-    if let Ok(content) = std::fs::read_to_string(&analysis_path) {
-        if let Ok(analysis) = serde_json::from_str::<serde_json::Value>(&content) {
-            let alert = analysis
-                .get("alert_level")
-                .and_then(|v| v.as_str())
-                .unwrap_or("unknown");
-            let mut summary = format!("Cognitive health: {alert}");
-
-            if let Some(messages) = analysis.get("watch_messages").and_then(|v| v.as_array()) {
-                for msg in messages {
-                    if let Some(s) = msg.as_str() {
-                        summary.push_str(&format!("\n  - {s}"));
-                    }
-                }
-            }
-            sections.push(summary);
-        }
-    }
-
-    // Calibration data (metacognitive accuracy)
-    let calibration_path = root_dir
-        .join(".claude") // vendor-ok: vigil harness dir
-        .join("vigil")
-        .join("calibration.json");
-    if let Ok(content) = std::fs::read_to_string(&calibration_path) {
-        if let Ok(cal) = serde_json::from_str::<serde_json::Value>(&content) {
-            if let Some(records) = cal.get("records").and_then(|v| v.as_array()) {
-                if !records.is_empty() {
-                    let last = &records[records.len() - 1];
-                    let surprise = last
-                        .get("mean_surprise")
-                        .and_then(|v| v.as_f64())
-                        .unwrap_or(0.0);
-                    let label = if surprise < 0.1 {
-                        "well-calibrated"
-                    } else if surprise < 0.2 {
-                        "moderately calibrated"
-                    } else {
-                        "poorly calibrated — your self-model needs updating"
-                    };
-                    sections.push(format!(
-                        "Self-model calibration: mean surprise {surprise:.3} ({label}), {} records total",
-                        records.len()
-                    ));
-                }
-            }
-
-            if cal.get("pending_prediction").is_some() && !cal["pending_prediction"].is_null() {
-                sections.push(
-                    "You have a pending calibration prediction — it will be resolved on next signal collection.".to_string()
-                );
-            }
-        }
-    }
-
-    sections.join("\n")
 }
 
 /// Async version of [`build_task_system_prompt`] — runs blocking file I/O
@@ -1419,7 +1172,7 @@ fn build_capabilities(config: &Config) -> Vec<Capability> {
     if config.graph.enabled {
         // graph_query is a registry tool: only providers that call the
         // registry can use it.
-        let query = if provider_reports_tool_rounds(&config.llm.provider) {
+        let query = if registry_tools_callable(config) {
             "Use the graph_query tool to search by semantic similarity or query relationships. "
         } else {
             ""
@@ -1457,7 +1210,7 @@ fn build_capabilities(config: &Config) -> Vec<Capability> {
             name: "Cognitive Monitoring (vigil)".into(),
             what: "Metacognitive monitoring that tracks vocabulary diversity, question generation, thought lifecycle, and evidence grounding.".into(),
             why: "Detects mechanical reflection. Keeps your growth genuine rather than performative.".into(),
-            how: "Vigil runs automatically. Its assessment appears in your context as cognitive health. Read it honestly — if it says you're declining, don't dismiss it.".into(),
+            how: "Vigil runs automatically and records its data for the owner. Nothing from it is injected into your context.".into(),
             constraints: Some(format!("Window size: {} samples, minimum {} before signals appear.", config.monitoring.window_size, config.monitoring.min_samples)),
         });
     }
@@ -1468,7 +1221,7 @@ fn build_capabilities(config: &Config) -> Vec<Capability> {
             name: "Pipeline Monitoring (praxis)".into(),
             what: "Enforces pipeline health — tracks document counts, staleness, and frozen pipeline alerts.".into(),
             why: "Ideas should move through stages, not stagnate. Praxis ensures the pipeline flows.".into(),
-            how: "Pipeline health appears in your context. When praxis flags stale thoughts or approaching thresholds, act on them — develop, dissolve, or archive.".into(),
+            how: "Praxis runs automatically and records its data for the owner. Nothing from it is injected into your context.".into(),
             constraints: Some(format!(
                 "Staleness: thoughts after {} days, curiosity after {} days. Freeze alert after {} sessions without movement.",
                 config.pipeline.thoughts_staleness_days,
@@ -1486,8 +1239,14 @@ fn build_capabilities(config: &Config) -> Vec<Capability> {
             why: "Self-initiation. You can research, reflect, and act on your own, not just when spoken to.".into(),
             how: "Scheduled tasks run on cron. Intents are queued for one-shot execution. During autonomous sessions you have tools and can produce output markers.".into(),
             constraints: Some(format!(
-                "Max {} tool rounds per session. Max {} intents/hour. Max queue size: {}. Max chain depth: {}.",
-                config.autonomy.max_tool_rounds,
+                "{}Max {} intents/hour. Max queue size: {}. Max chain depth: {}.",
+                // The tool-round cap bounds the in-process tool loop only; an
+                // agent CLI runs its own tools outside it.
+                if registry_tools_callable(config) {
+                    format!("Max {} tool rounds per session. ", config.autonomy.max_tool_rounds)
+                } else {
+                    String::new()
+                },
                 config.autonomy.max_intents_per_hour,
                 config.autonomy.max_queue_size,
                 config.autonomy.max_chain_depth,
@@ -1542,7 +1301,7 @@ fn build_tools_section(config: &Config, tool_names: &[String]) -> Option<String>
     if let Some(adapter) = agent_cli(config) {
         return build_cli_tools_section(adapter.as_ref());
     }
-    if !provider_reports_tool_rounds(&config.llm.provider) {
+    if !registry_tools_callable(config) {
         return None;
     }
     build_registry_tools_section(tool_names)
@@ -1746,17 +1505,26 @@ pub fn write_awareness_file(
 pub fn build_autonomy_context(root_dir: &Path, config: &Config) -> String {
     let mut sections = Vec::new();
 
-    // Tool documentation
-    sections.push(
-        "You have tools available for this autonomous session:\n\
-        - file_read: Read a file from your pulse directory\n\
-        - file_write: Write or update a file in your pulse directory\n\
-        - file_list: List files in a directory\n\
-        - grep: Search file contents with a pattern\n\
-        - web_fetch: Fetch and read a web page (HTTPS only)\n\n\
-        Use these tools to read your documents, write findings, and research on the web."
-            .to_string(),
-    );
+    // Tool documentation: the registry list only where the registry is
+    // callable; an agent CLI brings its own tools, listed in AWARENESS.md.
+    if registry_tools_callable(config) {
+        sections.push(
+            "You have tools available for this autonomous session:\n\
+            - file_read: Read a file from your pulse directory\n\
+            - file_write: Write or update a file in your pulse directory\n\
+            - file_list: List files in a directory\n\
+            - grep: Search file contents with a pattern\n\
+            - web_fetch: Fetch and read a web page (HTTPS only)\n\n\
+            Use these tools to read your documents, write findings, and research on the web."
+                .to_string(),
+        );
+    } else {
+        sections.push(
+            "Your agent CLI's own tools are available for this autonomous session. \
+            Use your file tools to read your documents and write findings."
+                .to_string(),
+        );
+    }
 
     // Output marker documentation
     sections.push(
@@ -2191,6 +1959,161 @@ mod tests {
         }
     }
 
+    /// Open-tag prefixes of the self-scored blocks Phase 0 removed.
+    const SELF_SCORED_BLOCKS: [&str; 6] = [
+        "<pipeline-health",
+        "<cognitive-health",
+        "<caliber",
+        "<prediction-context",
+        "<metacognitive-state",
+        "TENSION TRIAGE",
+    ];
+
+    /// Every in-process registry tool name.
+    const REGISTRY_TOOLS: [&str; 7] = [
+        "file_read",
+        "file_write",
+        "file_list",
+        "grep",
+        "web_fetch",
+        "graph_query",
+        "discord_post",
+    ];
+
+    /// A pulse root seeded with everything that used to produce a
+    /// self-scored block or name a registry tool.
+    fn seed_every_prompt_source(root: &Path, config: &Config) {
+        std::fs::write(root.join("INSTRUCTIONS.md"), "# Pulse\nBe useful.").unwrap();
+        std::fs::write(root.join("SELF.md"), "I am a test pulse.").unwrap();
+        std::fs::write(root.join("THOUGHT_STACK.md"), "- thinking").unwrap();
+        std::fs::write(root.join("FINDINGS.md"), "- a finding").unwrap();
+        std::fs::create_dir_all(root.join("memory/graph")).unwrap();
+        std::fs::write(root.join("memory/MEMORY.md"), "- a fact").unwrap();
+        std::fs::write(root.join("memory/EPHEMERAL.md"), "last session").unwrap();
+        std::fs::write(
+            root.join("memory/graph/stats-cache.json"),
+            r#"{"entity_count":3,"relationship_count":2,"episode_count":1}"#,
+        )
+        .unwrap();
+        std::fs::create_dir_all(root.join("journal")).unwrap();
+        for doc in ["LEARNING", "THOUGHTS", "REFLECTIONS", "CURIOSITY", "PRAXIS"] {
+            std::fs::write(root.join(format!("journal/{doc}.md")), "## entry\n").unwrap();
+        }
+        std::fs::create_dir_all(root.join(".claude/vigil")).unwrap();
+        std::fs::write(
+            root.join(".claude/vigil/analysis.json"),
+            r#"{"alert_level":"declining","watch_messages":["vocabulary narrowing"]}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            root.join(".claude/vigil/calibration.json"),
+            r#"{"records":[{"mean_surprise":0.4}],"pending_prediction":{}}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            crate::caliber::caliber_md(root),
+            "# Caliber\n\n## Capability Map\n\n| Domain | Confidence |\n|---|---|\n| research | 0.8 |\n",
+        )
+        .unwrap();
+        crate::prediction::store::save_delta(root, config.prediction.clone(), |stack| {
+            let id = stack
+                .add_prediction(crate::prediction::Timescale::Cycle, "p".into(), 0.9)
+                .id
+                .clone();
+            stack.resolve(
+                &id,
+                crate::prediction::PredictionResolution {
+                    actual: "not that".into(),
+                    surprise: 0.9,
+                    direction: crate::prediction::ErrorDirection::Overconfident,
+                    insight: Some("an insight".into()),
+                },
+            );
+            stack.add_prediction(crate::prediction::Timescale::Cycle, "q".into(), 0.5);
+        })
+        .unwrap();
+        seed_tension(root, config, |store| {
+            for label in ["one", "two"] {
+                store.open(
+                    ThreadDraft {
+                        label: label.to_string(),
+                        content: "something open".to_string(),
+                        origin: ThreadOrigin::UserRaised(label.to_string()),
+                    },
+                    chrono::Utc::now(),
+                );
+            }
+        });
+        let plugins = with_every_plugin(config.clone());
+        let descriptions =
+            crate::plugins::manager::PluginManager::new(&plugins).collect_platform_descriptions();
+        let tools: Vec<String> = REGISTRY_TOOLS.iter().map(|t| t.to_string()).collect();
+        write_awareness_file(root, config, &descriptions, &tools).unwrap();
+    }
+
+    /// Chat, task and intent prompts for one config, over a fully seeded root.
+    fn every_profile(config: &Config) -> [(&'static str, String); 3] {
+        let dir = tempfile::tempdir().unwrap();
+        seed_every_prompt_source(dir.path(), config);
+        let store = crate::tension::store::load(dir.path(), config.tension.clone());
+        assert!(store.triage.is_some(), "fixture must raise a triage demand");
+
+        let chat = build_system_prompt(dir.path(), config).unwrap();
+        let task = build_task_system_prompt(dir.path(), config).unwrap();
+        let intent = format!("{task}\n\n{}", build_autonomy_context(dir.path(), config));
+        [("chat", chat), ("task", task), ("intent", intent)]
+    }
+
+    fn unbudgeted(mut config: Config) -> Config {
+        config.system_prompt_budget.enabled = false;
+        config.tension.max_live_threads = 1;
+        config
+    }
+
+    #[test]
+    fn no_profile_carries_self_scored_blocks() {
+        let mut configs = vec![("ollama", unbudgeted(minimal_config()))];
+        for adapter in ["claude", "grok", "codex"] {
+            configs.push((adapter, unbudgeted(cli_config(adapter))));
+        }
+        for (label, config) in configs {
+            for (profile, text) in every_profile(&config) {
+                for block in SELF_SCORED_BLOCKS {
+                    assert!(
+                        !text.contains(block),
+                        "{label}/{profile} carries {block}:\n{text}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn cli_prompts_never_name_registry_tools() {
+        for adapter in ["claude", "grok", "codex"] {
+            let config = unbudgeted(cli_config(adapter));
+            // A CLI tool that shares a registry name (grok's own `grep`) is
+            // the CLI's, and honest to name.
+            let own = crate::cli_provider::adapters::by_name(adapter)
+                .unwrap()
+                .tool_surface(false);
+            for (profile, text) in every_profile(&config) {
+                for tool in REGISTRY_TOOLS.iter().filter(|t| !own.contains(t)) {
+                    assert!(
+                        !text.contains(tool),
+                        "{adapter}/{profile} names registry tool {tool}:\n{text}"
+                    );
+                }
+            }
+        }
+
+        // An API provider calls the registry, so its prompts may name it.
+        let [(_, chat), _, (_, intent)] = every_profile(&unbudgeted(minimal_config()));
+        assert!(chat.contains("file_write"));
+        assert!(chat.contains("graph_query"));
+        assert!(intent.contains("file_read"));
+    }
+
     #[test]
     fn awareness_template_is_stamped_and_claims_no_proprioception() {
         let doc = generate_awareness_document(&minimal_config(), &[], &[]);
@@ -2255,7 +2178,7 @@ mod tests {
         )
         .unwrap();
 
-        let result = build_system_prompt_budgeted(dir.path(), &config, None, None).unwrap();
+        let result = build_system_prompt_budgeted(dir.path(), &config).unwrap();
 
         assert!(result.prompt.contains("# Test Pulse"));
         assert!(result.estimated_tokens > 0);
@@ -2274,7 +2197,7 @@ mod tests {
         std::fs::create_dir_all(dir.path().join("memory")).unwrap();
         std::fs::write(dir.path().join("memory/MEMORY.md"), "y".repeat(30_000)).unwrap();
 
-        let result = build_system_prompt_budgeted(dir.path(), &config, None, None).unwrap();
+        let result = build_system_prompt_budgeted(dir.path(), &config).unwrap();
 
         // Everything loaded, no trimming — token caps are budgeting, and
         // budgeting is off.
@@ -2293,7 +2216,7 @@ mod tests {
         // Write a big CLAUDE.md (1000 chars ~ 250 tokens)
         std::fs::write(dir.path().join("CLAUDE.md"), "x".repeat(1000)).unwrap();
 
-        let result = build_system_prompt_budgeted(dir.path(), &config, None, None).unwrap();
+        let result = build_system_prompt_budgeted(dir.path(), &config).unwrap();
 
         // CLAUDE.md should be truncated to ~50 tokens
         // The prompt will contain the truncation marker
@@ -2326,7 +2249,7 @@ mod tests {
         )
         .unwrap();
 
-        let result = build_system_prompt_budgeted(dir.path(), &config, None, None).unwrap();
+        let result = build_system_prompt_budgeted(dir.path(), &config).unwrap();
 
         // Should have trimmed something
         assert!(result.was_trimmed);
@@ -2359,7 +2282,7 @@ mod tests {
         )
         .unwrap();
 
-        let result = build_system_prompt_budgeted(dir.path(), &config, None, None).unwrap();
+        let result = build_system_prompt_budgeted(dir.path(), &config).unwrap();
 
         // Low-priority components should be compressed or dropped
         assert!(result.was_trimmed);
@@ -2397,22 +2320,6 @@ mod tests {
     }
 
     #[test]
-    fn compress_to_one_liner_pipeline_healthy() {
-        let content = "<pipeline-health>\nPipeline: healthy\nAll documents within thresholds.\n</pipeline-health>";
-        let compressed = compress_to_one_liner("pipeline-health", content);
-        assert!(compressed.contains("[compressed]"));
-        assert!(compressed.contains("healthy"));
-    }
-
-    #[test]
-    fn compress_to_one_liner_caliber() {
-        let content = "<caliber>\nSuccess: 85%, Partial: 10%, Fail: 5%\n</caliber>";
-        let compressed = compress_to_one_liner("caliber", content);
-        assert!(compressed.contains("[compressed]"));
-        assert!(compressed.contains("Caliber data available"));
-    }
-
-    #[test]
     fn system_prompt_budget_config_defaults() {
         let cfg = SystemPromptBudgetConfig::default();
         assert!(cfg.enabled);
@@ -2422,9 +2329,6 @@ mod tests {
         assert_eq!(cfg.memory_cap, 4_000);
         assert_eq!(cfg.ephemeral_cap, 2_000);
         assert_eq!(cfg.findings_cap, 1_500);
-        assert_eq!(cfg.pipeline_health_cap, 500);
-        assert_eq!(cfg.cognitive_health_cap, 300);
-        assert_eq!(cfg.caliber_cap, 200);
         assert_eq!(cfg.thought_stack_max_bytes, 48 * 1024);
         assert_eq!(cfg.awareness_max_bytes, 16 * 1024);
         assert_eq!(cfg.memory_max_bytes, 32 * 1024);
@@ -2468,7 +2372,7 @@ mod tests {
         std::fs::write(dir.path().join("CLAUDE.md"), "# Pulse").unwrap();
         write_giant_line(&dir.path().join("THOUGHT_STACK.md"), 200_000);
 
-        let result = build_system_prompt_budgeted(dir.path(), &config, None, None).unwrap();
+        let result = build_system_prompt_budgeted(dir.path(), &config).unwrap();
 
         assert!(result.prompt.contains("<thought-stack>"));
         assert!(result.prompt.contains("byte ceiling"));
@@ -2519,7 +2423,7 @@ mod tests {
         std::fs::write(dir.path().join("THOUGHT_STACK.md"), "alpha\nbeta\n").unwrap();
         std::fs::write(dir.path().join("memory/MEMORY.md"), "one\ntwo\n").unwrap();
 
-        let result = build_system_prompt_budgeted(dir.path(), &config, None, None).unwrap();
+        let result = build_system_prompt_budgeted(dir.path(), &config).unwrap();
 
         assert!(result
             .prompt
@@ -2539,7 +2443,7 @@ mod tests {
         std::fs::create_dir_all(dir.path().join("memory")).unwrap();
         write_giant_line(&dir.path().join("memory/MEMORY.md"), 200_000);
 
-        let result = build_system_prompt_budgeted(dir.path(), &config, None, None).unwrap();
+        let result = build_system_prompt_budgeted(dir.path(), &config).unwrap();
 
         assert!(result.prompt.contains("<memory>"));
         assert!(result.prompt.contains("byte ceiling"));
@@ -2554,7 +2458,7 @@ mod tests {
 
         write_giant_line(&dir.path().join("AWARENESS.md"), 200_000);
 
-        let result = build_system_prompt_budgeted(dir.path(), &config, None, None).unwrap();
+        let result = build_system_prompt_budgeted(dir.path(), &config).unwrap();
 
         assert!(result.prompt.contains("<platform>"));
         assert!(result.prompt.contains("byte ceiling"));
@@ -2575,7 +2479,7 @@ mod tests {
         std::fs::create_dir_all(dir.path().join("memory")).unwrap();
         write_giant_line(&dir.path().join("memory/MEMORY.md"), 500_000);
 
-        let chat = build_system_prompt_budgeted(dir.path(), &config, None, None).unwrap();
+        let chat = build_system_prompt_budgeted(dir.path(), &config).unwrap();
         assert!(
             chat.prompt.len() < 128 * 1024,
             "chat prompt unbounded with budget disabled: {} bytes",
@@ -2607,7 +2511,7 @@ mod tests {
         assert!(stack.len() > 10 * 1024 * 1024);
         std::fs::write(dir.path().join("THOUGHT_STACK.md"), &stack).unwrap();
 
-        let result = build_system_prompt_budgeted(dir.path(), &config, None, None).unwrap();
+        let result = build_system_prompt_budgeted(dir.path(), &config).unwrap();
         assert!(
             result.prompt.len() < 64 * 1024,
             "assembled prompt was {} bytes",
@@ -2624,7 +2528,7 @@ mod tests {
 
         std::fs::write(dir.path().join("CLAUDE.md"), "c".repeat(70 * 1024)).unwrap();
 
-        let err = build_system_prompt_budgeted(dir.path(), &config, None, None).unwrap_err();
+        let err = build_system_prompt_budgeted(dir.path(), &config).unwrap_err();
         assert!(
             matches!(err, crate::errors::PromptError::EssentialTooLarge { .. }),
             "expected EssentialTooLarge, got: {err}"
@@ -2646,7 +2550,7 @@ mod tests {
         std::fs::write(dir.path().join("CLAUDE.md"), "# Pulse").unwrap();
         std::fs::write(dir.path().join("SELF.md"), "s".repeat(40_000)).unwrap();
 
-        let result = build_system_prompt_budgeted(dir.path(), &config, None, None).unwrap();
+        let result = build_system_prompt_budgeted(dir.path(), &config).unwrap();
 
         assert!(result.was_trimmed, "Pass 3 must trim, not just warn");
         assert!(result.prompt.contains("token cap"));
@@ -2724,7 +2628,7 @@ mod tests {
         let content = "x".repeat(400); // ~100 tokens
         std::fs::write(dir.path().join("CLAUDE.md"), &content).unwrap();
 
-        let result = build_system_prompt_budgeted(dir.path(), &config, None, None).unwrap();
+        let result = build_system_prompt_budgeted(dir.path(), &config).unwrap();
 
         // Token count should be reasonable (CLAUDE.md ~100 tokens + memory-curation ~100 tokens)
         assert!(result.estimated_tokens > 50);
@@ -2871,8 +2775,31 @@ mod tests {
         assert!(notice.ends_with("]\n"), "{notice}");
     }
 
+    /// A refusal is told to the pulse even when no thread is live and no
+    /// triage is pending: the notice is the only place it learns of it.
     #[test]
-    fn tension_context_surfaces_an_outstanding_triage_demand() {
+    fn tension_context_surfaces_refusals_with_no_live_threads() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = minimal_config();
+
+        seed_tension(dir.path(), &config, |store| {
+            store.last_refusals = vec![crate::tension::RefusalNotice {
+                marker: "THREAD-RESOLVE".to_string(),
+                thread_id: "t-gone".to_string(),
+                reason: "no such live thread".to_string(),
+            }];
+        });
+
+        let block = build_tension_context(dir.path(), &config).expect("refusals render");
+        assert!(block.contains("No live threads."), "{block}");
+        assert!(block.contains("[TENSION REFUSED"), "{block}");
+        assert!(block.contains("t-gone"), "{block}");
+    }
+
+    /// Triage demand stays in the store (owner alert, `status`) but is no
+    /// longer rendered into the pulse's prompt.
+    #[test]
+    fn tension_context_carries_no_triage_lines() {
         let dir = tempfile::tempdir().unwrap();
         let mut config = minimal_config();
         config.tension.max_live_threads = 1;
@@ -2891,9 +2818,14 @@ mod tests {
             }
         });
 
+        let store = crate::tension::store::load(dir.path(), config.tension.clone());
+        assert!(
+            store.triage.is_some(),
+            "the fixture must raise a triage demand"
+        );
         let block = build_tension_context(dir.path(), &config).expect("threads exist");
-        assert!(block.contains("[TENSION TRIAGE:"));
-        assert!(block.contains("Nothing was dropped"));
+        assert!(!block.contains("TENSION TRIAGE"), "{block}");
+        assert!(!block.contains("Nothing was dropped"), "{block}");
     }
 
     /// The block has to reach the prompt the cycle actually runs on — the

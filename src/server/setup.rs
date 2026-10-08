@@ -143,16 +143,9 @@ pub async fn awareness_then_system_prompt(
     config: &Config,
     plugin_manager: &PluginManager,
     tools: &ToolRegistry,
-    monitors: &Monitors,
 ) -> Result<String, crate::errors::PromptError> {
     generate_awareness(root_dir, config, plugin_manager, tools);
-    super::prompt::build_system_prompt_async(
-        root_dir.to_path_buf(),
-        config.clone(),
-        monitors.pipeline.clone(),
-        monitors.cognitive.clone(),
-    )
-    .await
+    super::prompt::build_system_prompt_async(root_dir.to_path_buf(), config.clone()).await
 }
 
 /// Run the startup pipeline health check and auto-archive bloated documents.
@@ -302,14 +295,12 @@ mod tests {
         let mut config = crate::config::test_support::minimal_config();
         // No agent CLI: AWARENESS.md is inlined into the chat prompt.
         config.llm.provider = "ollama".into();
-        let monitors = create_monitors(&config);
         let tools = register_builtin_tools(root, &config);
         let plugin_manager = PluginManager::new(&config);
 
-        let prompt =
-            awareness_then_system_prompt(root, &config, &plugin_manager, &tools, &monitors)
-                .await
-                .unwrap();
+        let prompt = awareness_then_system_prompt(root, &config, &plugin_manager, &tools)
+            .await
+            .unwrap();
 
         let fresh = std::fs::read_to_string(root.join("AWARENESS.md")).unwrap();
         let stamp = fresh

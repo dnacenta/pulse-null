@@ -363,7 +363,7 @@ async fn execute_task(
     } else {
         String::new()
     };
-    let mut user_message = format!(
+    let user_message = format!(
         "[Scheduled task: {} | Time: {} | Channel: {}]\n\n{}{}",
         task.name,
         now.format("%Y-%m-%d %H:%M UTC"),
@@ -371,21 +371,6 @@ async fn execute_task(
         task.prompt,
         autonomy_context,
     );
-
-    // Load the prediction stack pre-LLM for the spec-2c pressure check on
-    // reflection-window (Q-H3). Post-LLM marker processing re-loads under
-    // the store lock instead of reusing this snapshot (PN-86) — by then it
-    // is minutes stale and writing it back would erase concurrent updates.
-    let prediction_stack = if state.config.prediction.enabled {
-        Some(
-            crate::prediction::store::load_async(root_dir.clone(), state.config.prediction.clone())
-                .await,
-        )
-    } else {
-        None
-    };
-
-    inject_reflection_pressure_directive(task, state, &prediction_stack, &mut user_message);
 
     // Capture start time for accurate duration tracking in InteractionRecord
     let started_at = Utc::now();
@@ -719,12 +704,11 @@ async fn execute_task(
     }
 
     // Post-execution: extract prediction markers from task output. Applies
-    // against a fresh locked load of the store (PN-86) — the pre-LLM stack
-    // is minutes stale by now and only fed the pressure check. Parses the
-    // RAW response, not clean_content: the lazy SHARE/CALL regexes can
-    // swallow an embedded [RESOLVE:] span while stripping, silently
-    // destroying the resolution before prediction parsing ran (SEC-013).
-    let resolved_prediction_ids = if prediction_stack.is_some() {
+    // against a locked load of the store (PN-86). Parses the RAW response,
+    // not clean_content: the lazy SHARE/CALL regexes can swallow an embedded
+    // [RESOLVE:] span while stripping, silently destroying the resolution
+    // before prediction parsing ran (SEC-013).
+    let resolved_prediction_ids = if state.config.prediction.enabled {
         post_process_predictions(state, task, &root_dir, &response_text).await
     } else {
         Vec::new()
@@ -1056,72 +1040,14 @@ fn log_execution(root_dir: &std::path::Path, task: &ScheduledTask, summary: &str
     crate::logbook::write_entry(root_dir, "Task", &task.name, summary);
 }
 
-/// Spec 2c side-effects: when this task is the reflection-window task and
-/// the stack has crossed the importance threshold, append a
-/// `[PREDICTION PRESSURE: ...]` directive to the user message naming the
-/// highest-surprise prediction (so the LLM graduates the corresponding
-/// LEARNING item into THOUGHTS this cycle) and emit `PredictionPressure`
-/// for listeners. Caller is responsible for having already loaded the
-/// stack (it's borrowed immutably here). No-op if prediction is disabled
-/// or the task isn't reflection-window.
-///
-/// Extracted from `execute_task` (Q-H1) to keep that fn under the eye-roll
-/// length and let unit tests cover the directive shape independently.
-fn inject_reflection_pressure_directive(
-    task: &ScheduledTask,
-    state: &Arc<AppState>,
-    prediction_stack: &Option<crate::prediction::PredictionStack>,
-    user_message: &mut String,
-) {
-    if task.id != super::tasks::REFLECTION_WINDOW_TASK_ID {
-        return;
-    }
-    let Some(stack) = prediction_stack.as_ref() else {
-        return;
-    };
-    let Some(pressure) = super::evaluator::check_importance_pressure(stack) else {
-        return;
-    };
-
-    use std::fmt::Write as _;
-    let _ = write!(
-        user_message,
-        "\n\n[PREDICTION PRESSURE: accumulated_importance={:.2} ≥ threshold={:.2}. \
-         Top unprocessed prediction error: id `{}`, surprise={:.2}{}. \
-         Graduate the corresponding LEARNING.md item into THOUGHTS.md this cycle.]",
-        pressure.accumulated_importance,
-        stack.config.importance_threshold,
-        pressure.triggering_prediction_id,
-        pressure.triggering_surprise,
-        pressure
-            .triggering_insight
-            .as_ref()
-            .map(|s| format!(" (insight: {s})"))
-            .unwrap_or_default(),
-    );
-    tracing::info!(
-        accumulated_importance = pressure.accumulated_importance,
-        threshold = stack.config.importance_threshold,
-        triggering_prediction_id = %pressure.triggering_prediction_id,
-        "PredictionPressure fired — augmenting reflection-window user message"
-    );
-    state
-        .event_bus
-        .emit(crate::events::PulseEvent::PredictionPressure {
-            accumulated_importance: pressure.accumulated_importance,
-            triggering_prediction_id: pressure.triggering_prediction_id,
-            triggering_surprise: pressure.triggering_surprise,
-        });
-}
-
 /// Post-LLM phase of the prediction loop: parse `[PREDICT:...]` / `[RESOLVE:...]`
 /// markers from the task output, prune to configured caps, and persist.
 ///
 /// Runs as a locked load-apply-save against the store (PN-86) rather than
-/// writing back the stack captured pre-LLM: the provider call takes minutes,
-/// and an overlapping task fire or intent completion may have written the
-/// store since our load — saving the stale snapshot would erase their
-/// updates. The pre-LLM stack (Q-H3) remains read-only pressure input.
+/// writing back a stack loaded before the provider call: that call takes
+/// minutes, and an overlapping task fire or intent completion may have
+/// written the store meanwhile — saving a stale snapshot would erase their
+/// updates.
 ///
 /// Extracted from `execute_task` (Q-H1).
 ///

@@ -264,8 +264,7 @@ pub async fn start_in(
     // Generate AWARENESS.md, then the system prompt from the pulse's
     // documents (built last so it carries this boot's AWARENESS.md)
     let system_prompt =
-        setup::awareness_then_system_prompt(&root_dir, &config, &plugin_manager, &tools, &monitors)
-            .await?;
+        setup::awareness_then_system_prompt(&root_dir, &config, &plugin_manager, &tools).await?;
 
     // Create event bus
     let event_bus = Arc::new(EventBus::new(64));

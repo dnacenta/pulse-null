@@ -48,14 +48,9 @@ pub async fn boot_pulse(
 
     // Platform awareness, then the system prompt (built after tools/plugins
     // so it carries this boot's AWARENESS.md)
-    let system_prompt = super::setup::awareness_then_system_prompt(
-        &root_dir,
-        &config,
-        &plugin_manager,
-        &tools,
-        &monitors,
-    )
-    .await?;
+    let system_prompt =
+        super::setup::awareness_then_system_prompt(&root_dir, &config, &plugin_manager, &tools)
+            .await?;
 
     // Event bus
     let event_bus = Arc::new(EventBus::new(64));

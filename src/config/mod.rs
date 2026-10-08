@@ -1121,7 +1121,7 @@ impl Default for ChannelLimits {
 /// Priority tiers (highest to lowest):
 /// 1. The instruction file + rules/protocol files (essential — never trimmed)
 /// 2. SELF.md, MEMORY.md (high priority — trimmed only as last resort)
-/// 3. EPHEMERAL.md, FINDINGS.md, pipeline health, cognitive health, caliber (trimmable)
+/// 3. EPHEMERAL.md, FINDINGS.md, graph awareness (trimmable)
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct SystemPromptBudgetConfig {
@@ -1139,9 +1139,6 @@ pub struct SystemPromptBudgetConfig {
     pub memory_cap: usize,
     pub ephemeral_cap: usize,
     pub findings_cap: usize,
-    pub pipeline_health_cap: usize,
-    pub cognitive_health_cap: usize,
-    pub caliber_cap: usize,
     /// Hard byte ceiling for THOUGHT_STACK.md content.
     ///
     /// The `*_max_bytes` ceilings are safety limits, not budgeting: they are
@@ -1167,9 +1164,6 @@ impl Default for SystemPromptBudgetConfig {
             memory_cap: 4_000,
             ephemeral_cap: 2_000,
             findings_cap: 1_500,
-            pipeline_health_cap: 500,
-            cognitive_health_cap: 300,
-            caliber_cap: 200,
             thought_stack_max_bytes: 48 * 1024,
             awareness_max_bytes: 16 * 1024,
             memory_max_bytes: 32 * 1024,

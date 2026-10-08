@@ -551,7 +551,7 @@ mod tests {
         let intents = Arc::new(RwLock::new(IntentQueue::load(root)));
         let task_id = schedule.read().await.tasks[0].task.id.clone();
         assert!(
-            schedule
+            !schedule
                 .read()
                 .await
                 .find_task(&task_id)
@@ -560,10 +560,10 @@ mod tests {
                 .enabled
         );
 
-        // "CLI disabled the task while the coordinator was down."
+        // "CLI enabled the task while the coordinator was down."
         {
             let mut cli = Schedule::load(root).unwrap();
-            cli.find_task_mut(&task_id).unwrap().task.enabled = false;
+            cli.find_task_mut(&task_id).unwrap().task.enabled = true;
             cli.save(root).unwrap();
         }
 
@@ -571,7 +571,7 @@ mod tests {
             .await
             .unwrap();
         assert!(
-            !schedule
+            schedule
                 .read()
                 .await
                 .find_task(&task_id)
