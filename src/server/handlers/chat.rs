@@ -560,7 +560,7 @@ pub(crate) async fn run_turn(
         sink.as_ref(),
     )
     .await;
-    record_provider_outcome(&state, &turn).await;
+    record_provider_outcome(&state, &resolved_key, &turn).await;
     let turn = turn.map_err(|e| {
         // The turn failed even after any fallback — the helper has already
         // rolled the user turn (the trunk tail) and its deferred WAL/counter
@@ -1175,29 +1175,38 @@ fn shed_isolation_quarantine(data: &mut crate::session_store::SessionData) -> us
     }
 }
 
-/// A chat turn's provider call feeds the same status as task and intent turns
-/// (PN-133), so `/health` sees the provider recover after, say, a spent
-/// quota. A refusal is the model answering, not the provider failing, so it
-/// leaves the status alone.
+/// The empty-trunk guard's error: a caller's mistake, not the provider's.
+#[derive(Debug, thiserror::Error)]
+#[error("invoke_turn_with_refusal_fallback called with an empty trunk")]
+struct EmptyTrunk;
+
+/// An owner's chat turn feeds the same provider status as task and intent
+/// turns (PN-133), so `/health` sees the provider recover after, say, a
+/// spent quota. Only the owner's turns count — a guest or peer cannot move
+/// `/health` either way — and only the primary provider's own outcome: a
+/// refusal is the model answering, a failed fallback is another model, and
+/// the empty-trunk guard is a programming error. `/health` serves
+/// `last_error` unauthenticated, so a failure is recorded by kind only.
 async fn record_provider_outcome<T>(
     state: &AppState,
+    resolved_key: &str,
     outcome: &Result<T, Box<dyn std::error::Error + Send + Sync>>,
 ) {
+    if resolved_key != "owner" {
+        return;
+    }
     let mut status = state.provider_status.write().await;
     match outcome {
         Ok(_) => status.record_success(),
-        Err(e) if e.downcast_ref::<crate::errors::RefusalError>().is_some() => {}
-        Err(e) => match e.downcast_ref::<crate::errors::FallbackFailedError>() {
-            // Its message is deliberately generic; the detail says what failed.
-            Some(ff) => status.record_failure(
-                &ff.detail,
-                crate::provider_status::classify_error(&ff.detail),
-            ),
-            None => status.record_failure(
-                &e.to_string(),
-                crate::provider_status::classify_failure(e.as_ref()),
-            ),
-        },
+        Err(e)
+            if e.downcast_ref::<crate::errors::RefusalError>().is_some()
+                || e.downcast_ref::<crate::errors::FallbackFailedError>()
+                    .is_some()
+                || e.downcast_ref::<EmptyTrunk>().is_some() => {}
+        Err(e) => {
+            let kind = crate::provider_status::classify_failure(e.as_ref());
+            status.record_failure(&format!("chat turn failed ({kind})"), kind);
+        }
     }
 }
 
@@ -1236,7 +1245,7 @@ where
     // integer underflow panic / out-of-bounds index (SEC-005).
     let user_index = match data.messages.len().checked_sub(1) {
         Some(index) => index,
-        None => return Err("invoke_turn_with_refusal_fallback called with an empty trunk".into()),
+        None => return Err(Box::new(EmptyTrunk)),
     };
 
     let default_outcome = match sink {

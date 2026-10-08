@@ -25,8 +25,8 @@ use std::path::{Path, PathBuf};
 use serde_json::Value;
 
 use crate::cli_provider::adapter::{
-    AgentIntegration, CliAdapter, ExitClass, Invocation, OutputMode, PromptDelivery, Reply,
-    StreamLine, SystemPromptDelivery, Usage,
+    AgentIntegration, CliAdapter, Invocation, OutputMode, PromptDelivery, Reply, StreamLine,
+    SystemPromptDelivery, Usage,
 };
 use crate::init::agent_bootstrap::{ensure_config, BootstrapItem, ItemKind, ItemStatus};
 
@@ -161,21 +161,12 @@ impl CliAdapter for Codex {
         }
     }
 
-    /// Codex has no known policy-refusal signature. A structured error line is
-    /// flagged so a signature appearing in a later release is not swallowed.
-    /// A spent quota, on stderr or in the error record, is its own class.
-    ///
-    /// Only what codex says about the failure is classified — stderr and the
-    /// error record's own message — never the model's words elsewhere in
-    /// the transcript.
-    fn classify_exit(&self, stdout: &str, stderr: &str) -> ExitClass {
-        if crate::provider_status::is_quota_exhausted(stderr) {
-            ExitClass::QuotaExhausted
-        } else if let Some(message) = error_record_message(stdout) {
-            self.classify_terminal(&message)
-        } else {
-            ExitClass::Plain
-        }
+    /// Codex has no known policy-refusal signature, so the default
+    /// `classify_exit` / `classify_terminal` apply: a spent quota on stderr
+    /// or in the error record is its own class, any other error record is
+    /// flagged. Only what codex says about the failure is read.
+    fn error_record_message(&self, stdout: &str) -> Option<String> {
+        super::tagged_error_message(stdout)
     }
 
     /// No measured list: [`tool_surface`](CliAdapter::tool_surface) stays
@@ -263,26 +254,10 @@ fn agent_message_text(value: &Value) -> Option<&str> {
 }
 
 /// True when any line of stdout is a JSON object tagged as an error.
-/// The message of the first `{"type":"error"}` record in `stdout`, if any
-/// (empty when the record has none).
-fn error_record_message(stdout: &str) -> Option<String> {
-    fn tagged_error(text: &str) -> Option<String> {
-        let value = serde_json::from_str::<Value>(text).ok()?;
-        (value.get("type").and_then(Value::as_str) == Some("error")).then(|| {
-            value
-                .get("message")
-                .and_then(Value::as_str)
-                .unwrap_or_default()
-                .to_string()
-        })
-    }
-    tagged_error(stdout.trim())
-        .or_else(|| stdout.lines().find_map(|line| tagged_error(line.trim())))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::cli_provider::adapter::ExitClass;
 
     fn invocation(root: &Path) -> Invocation<'_> {
         Invocation {

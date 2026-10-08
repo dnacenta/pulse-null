@@ -30,19 +30,6 @@ const UNKNOWN_OPTION_MARKER: &str = "unknown option";
 const ISOLATION_DISALLOWED_TOOLS: &str =
     "Write,Edit,MultiEdit,NotebookEdit,Bash,WebFetch,WebSearch,Task";
 
-/// Claude Code's own wording for a spent plan or extra-usage allowance, on
-/// top of the generic signals in `provider_status`.
-const QUOTA_PHRASES: &[&str] = &["out of extra usage", "hit your limit"];
-
-/// Cap on error text this adapter hands back (SEC-007).
-const ERROR_TEXT_MAX: usize = 500;
-
-/// Does this already-lowercased failure text say the quota is spent?
-fn quota_text(lower: &str) -> bool {
-    crate::provider_status::is_quota_exhausted_lower(lower)
-        || QUOTA_PHRASES.iter().any(|p| lower.contains(p))
-}
-
 /// The tools Claude Code loads up front, measured on 2.1.282. Others load on
 /// demand through `ToolSearch`.
 const TOOL_SURFACE: &[&str] = &[
@@ -167,10 +154,11 @@ impl CliAdapter for Claude {
         // An exit-0 document flagged as an error (a spent quota, for one)
         // carries the error in `result`; it is not the reply.
         if parsed["is_error"].as_bool() == Some(true) {
+            // Returned whole: the provider classifies it, then bounds it.
             return Err(if text.is_empty() {
                 "error result with no detail".into()
             } else {
-                crate::utils::safe_truncate(&text, ERROR_TEXT_MAX).to_string()
+                text
             });
         }
         if text.is_empty() {
@@ -218,27 +206,27 @@ impl CliAdapter for Claude {
         }
     }
 
-    /// Only what the CLI says about the failure is classified: stderr, and
-    /// the error document's `result` (or `error`) field when `is_error` is
-    /// true. A refusal carries the Usage-Policy signature there; a spent
-    /// quota is recognised there or on stderr. Anything else (non-JSON
-    /// stdout, `is_error` absent/false) is a generic error and must not
-    /// trigger fallback.
-    fn classify_exit(&self, stdout: &str, stderr: &str) -> ExitClass {
-        if quota_text(&stderr.to_lowercase()) {
-            return ExitClass::QuotaExhausted;
-        }
-        let Ok(parsed) = serde_json::from_str::<serde_json::Value>(stdout.trim()) else {
-            return ExitClass::Plain;
-        };
+    /// The error document's `result` (or `error`) field, when `is_error` is
+    /// true. A successful reply is never read as a failure, whatever it
+    /// says about billing; the default `classify_exit` reads this and
+    /// stderr.
+    fn error_record_message(&self, stdout: &str) -> Option<String> {
+        let parsed = serde_json::from_str::<serde_json::Value>(stdout.trim()).ok()?;
         if parsed["is_error"].as_bool() != Some(true) {
-            return ExitClass::Plain;
+            return None;
         }
-        let said = parsed["result"]
-            .as_str()
-            .or_else(|| parsed["error"].as_str())
-            .unwrap_or("");
-        self.classify_terminal(said)
+        Some(
+            parsed["result"]
+                .as_str()
+                .or_else(|| parsed["error"].as_str())
+                .unwrap_or_default()
+                .to_string(),
+        )
+    }
+
+    /// Claude Code's own wording for a spent plan or extra-usage allowance.
+    fn quota_phrases(&self) -> &'static [&'static str] {
+        &["out of extra usage", "hit your limit"]
     }
 
     fn tool_surface(&self, restricted: bool) -> &'static [&'static str] {
@@ -260,7 +248,7 @@ impl CliAdapter for Claude {
         let lower = text.to_lowercase();
         if lower.contains("usage policy") {
             ExitClass::Refusal(text.to_string())
-        } else if quota_text(&lower) {
+        } else if self.is_quota_text(&lower) {
             ExitClass::QuotaExhausted
         } else {
             ExitClass::FlaggedButUnmatched
@@ -591,11 +579,11 @@ mod tests {
             Claude.classify_exit(echo_limit, ""),
             ExitClass::QuotaExhausted
         );
-        assert!(!crate::provider_status::is_quota_exhausted(
-            "You've hit your limit · resets Aug 12, 6am (UTC)"
+        assert!(!crate::provider_status::is_quota_exhausted_lower(
+            &"You've hit your limit · resets Aug 12, 6am (UTC)".to_lowercase()
         ));
-        assert!(!crate::provider_status::is_quota_exhausted(
-            "You're out of extra usage"
+        assert!(!crate::provider_status::is_quota_exhausted_lower(
+            &"You're out of extra usage".to_lowercase()
         ));
     }
 

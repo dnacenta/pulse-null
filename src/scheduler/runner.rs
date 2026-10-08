@@ -876,10 +876,11 @@ pub(super) async fn handle_provider_error(
     let kind_str = kind.to_string();
     let error_msg = error.to_string();
 
-    // Update provider status
+    // Update provider status. `/health` serves `last_error` unauthenticated,
+    // so it records the kind only; the full text goes to the event and log.
     {
         let mut ps = state.provider_status.write().await;
-        ps.record_failure(&error_msg, kind);
+        ps.record_failure(&format!("autonomous turn failed ({kind_str})"), kind);
     }
 
     // Emit event

@@ -189,17 +189,48 @@ pub trait CliAdapter: Send + Sync {
     /// Classify one [`OutputMode::Ndjson`] line.
     fn parse_stream_line(&self, line: &str) -> StreamLine;
 
-    /// Classify a non-zero exit from its stdout and stderr.
-    fn classify_exit(&self, stdout: &str, stderr: &str) -> ExitClass;
+    /// What the CLI itself said about a failure in its stdout: the message
+    /// of its error record or error document. `None` when stdout carries no
+    /// such record. Never the model's own words elsewhere in the output.
+    fn error_record_message(&self, _stdout: &str) -> Option<String> {
+        None
+    }
 
-    /// Classify the text of a streamed terminal record the CLI flagged as an
-    /// error. Quota exhaustion is recognised here for every CLI; anything
-    /// else is flagged without a known refusal signature by default, so a
-    /// signature appearing in a later release is logged rather than
-    /// swallowed. Adapters with a refusal signature override this and keep
-    /// the quota check.
+    /// This CLI's own wording for a spent usage quota, on top of the
+    /// generic signals in `provider_status`.
+    fn quota_phrases(&self) -> &'static [&'static str] {
+        &[]
+    }
+
+    /// Does this already-lowercased failure text say the quota is spent,
+    /// by the generic signals or this CLI's own wording?
+    fn is_quota_text(&self, lower: &str) -> bool {
+        crate::provider_status::is_quota_exhausted_lower(lower)
+            || self.quota_phrases().iter().any(|p| lower.contains(p))
+    }
+
+    /// Classify a non-zero exit. Only what the CLI says about the failure is
+    /// read: stderr, then its error record ([`error_record_message`]).
+    ///
+    /// [`error_record_message`]: Self::error_record_message
+    fn classify_exit(&self, stdout: &str, stderr: &str) -> ExitClass {
+        if self.is_quota_text(&stderr.to_lowercase()) {
+            return ExitClass::QuotaExhausted;
+        }
+        match self.error_record_message(stdout) {
+            Some(said) => self.classify_terminal(&said),
+            None => ExitClass::Plain,
+        }
+    }
+
+    /// Classify the text of a failure the CLI flagged (an error record, a
+    /// streamed terminal record). Quota exhaustion is recognised here for
+    /// every CLI; anything else is flagged without a known refusal signature
+    /// by default, so a signature appearing in a later release is logged
+    /// rather than swallowed. Adapters with a refusal signature override
+    /// this and keep the quota check.
     fn classify_terminal(&self, text: &str) -> ExitClass {
-        if crate::provider_status::is_quota_exhausted(text) {
+        if self.is_quota_text(&text.to_lowercase()) {
             ExitClass::QuotaExhausted
         } else {
             ExitClass::FlaggedButUnmatched

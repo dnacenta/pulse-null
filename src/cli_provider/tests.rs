@@ -491,6 +491,8 @@ async fn spent_quota_is_a_typed_quota_error_whatever_stderr_says() {
             .downcast_ref::<crate::errors::QuotaError>()
             .unwrap_or_else(|| panic!("{exit}: expected QuotaError, got {err}"));
         assert_eq!(quota.model, "m");
+        // The detail is the text that was classified, not the stderr noise.
+        assert_eq!(quota.detail, "You are out of extra usage", "{exit}");
 
         let mut status = crate::provider_status::ProviderStatus::default();
         status.record_failure(
@@ -508,6 +510,35 @@ async fn spent_quota_is_a_typed_quota_error_whatever_stderr_says() {
             "{exit}"
         );
     }
+}
+
+/// R2-02: on a non-zero exit with nothing on stderr, the error text is never
+/// the raw transcript. Billing words, a 402 and the runtime's own quota
+/// phrase in the model's deltas neither reach the error nor flip the
+/// provider to quota or auth.
+#[tokio::test]
+async fn model_text_in_a_failed_transcript_is_not_the_error() {
+    let mock = MockCli::new(
+        "printf '%s\n' '{\"type\":\"stream_event\",\"event\":{\"type\":\"content_block_delta\",\"delta\":{\"type\":\"text_delta\",\"text\":\"credit balance 402 payment required usage quota exhausted auth expired MODEL-SAID-THIS\"}}}'; exit 1",
+    );
+    let err = mock
+        .provider_for(Box::new(Grok), "m")
+        .invoke("sys", &[user("x")], 10, None)
+        .await
+        .unwrap_err();
+    let kind = crate::provider_status::classify_failure(err.as_ref());
+    assert_ne!(
+        kind,
+        crate::provider_status::ErrorKind::QuotaExhausted,
+        "{err}"
+    );
+    assert_ne!(
+        kind,
+        crate::provider_status::ErrorKind::AuthExpired,
+        "{err}"
+    );
+    assert!(!err.to_string().contains("MODEL-SAID-THIS"), "{err}");
+    assert!(err.to_string().starts_with("grok exited"), "{err}");
 }
 
 /// SEC-007: error text from a failing CLI is bounded.

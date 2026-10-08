@@ -104,15 +104,9 @@ pub const QUOTA_ERROR_MARKER: &str = "usage quota exhausted";
 /// CLI's own wording lives in its adapter.
 const QUOTA_PHRASES: [&str; 3] = ["payment required", "credit balance", QUOTA_ERROR_MARKER];
 
-/// Does this provider error text say the usage quota or credit is spent?
-/// Checked before every other class: a quota error often also carries
-/// words like "limit" or "expired" that would misfile it.
-#[must_use]
-pub fn is_quota_exhausted(text: &str) -> bool {
-    is_quota_exhausted_lower(&text.to_lowercase())
-}
-
-/// [`is_quota_exhausted`] for text the caller has already lowercased.
+/// Does this already-lowercased provider error text say the usage quota or
+/// credit is spent? Checked before every other class: a quota error often
+/// also carries words like "limit" or "expired" that would misfile it.
 #[must_use]
 pub fn is_quota_exhausted_lower(lower: &str) -> bool {
     has_status_token(lower, "402") || QUOTA_PHRASES.iter().any(|p| lower.contains(p))
@@ -243,7 +237,7 @@ mod tests {
             "Your credit balance is too low to access the API",
         ] {
             assert_eq!(classify_error(text), ErrorKind::QuotaExhausted, "{text}");
-            assert!(is_quota_exhausted(text), "{text}");
+            assert!(is_quota_exhausted_lower(&text.to_lowercase()), "{text}");
         }
         assert_eq!(ErrorKind::QuotaExhausted.to_string(), "quota");
     }
