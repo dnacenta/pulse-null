@@ -1097,8 +1097,8 @@ pub struct SystemPromptBudgetConfig {
     pub enabled: bool,
     /// Maximum estimated tokens for the entire system prompt.
     pub token_budget: usize,
-    /// Per-component token caps. Components exceeding their cap are truncated.
-    /// Set to 0 to use the default for that component.
+    /// Per-component token caps, applied while `enabled` is true. Components
+    /// exceeding their cap are truncated. 0 means no cap for that component.
     #[serde(alias = "claude_md_cap")] // vendor-ok: pre-PN-106 key
     pub instructions_cap: usize,
     pub rules_cap: usize,

@@ -486,8 +486,8 @@ fn salience_intent(parts: SalienceIntentParts<'_>) -> Intent {
             Requirements, all of them load-bearing:\n\
             1. Lead with the claim itself, not with the fact that you are reaching out. \
             No preamble, no 'I've been thinking about'.\n\
-            2. Carry the external referent through verbatim — the file and line, URL, \
-            prediction id or measured number. It is the part of this D can check, and \
+            2. Carry the external referent through verbatim — the file and line, URL \
+            or measured number. It is the part of this D can check, and \
             the part you did not author.\n\
             3. End with the cost line exactly as stated above: what you are asking for \
             is nothing, a read, or a decision.\n\
@@ -509,7 +509,7 @@ fn salience_intent(parts: SalienceIntentParts<'_>) -> Intent {
 mod breaker_tests {
     use super::*;
 
-    const EV: &str = "pipeline_alert_LEARNING";
+    const EV: &str = "outside_event_a";
 
     fn t0() -> DateTime<Utc> {
         DateTime::parse_from_rfc3339("2026-08-15T12:00:00Z")
@@ -663,9 +663,9 @@ mod breaker_tests {
     fn breakers_are_tracked_per_event_type() {
         let mut b = EventBreaker::default();
         trip(&mut b, t0());
-        let other = "pipeline_alert_PRAXIS";
+        let other = "outside_event_b";
 
-        // One dead channel must not silence a different document's alerts.
+        // One dead channel must not silence a different event type.
         assert_eq!(
             b.check(other, t0() + Duration::hours(3)),
             BreakerDecision::Pass

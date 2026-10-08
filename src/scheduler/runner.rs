@@ -717,10 +717,9 @@ async fn execute_task(
     crate::prediction::refusals::refuse_markers(&root_dir, &response_text);
     let resolved_prediction_ids: Vec<String> = Vec::new();
 
-    // Post-execution: the persistent cognition substrate (PN-95). Runs after
-    // prediction post-processing so that predictions resolved this cycle are
-    // available as discharge evidence and new prediction errors are visible
-    // to ingest.
+    // Post-execution: the persistent cognition substrate (PN-95). No
+    // prediction resolves in a cycle since PN-133, so the resolved list is
+    // empty; ingest still reads the errors already recorded.
     super::tension_cycle::close_cycle(
         state,
         &root_dir,

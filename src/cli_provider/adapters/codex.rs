@@ -20,7 +20,7 @@
 //! session sweep and pulse-null's own archiver, not from vendor hook plumbing.
 
 use std::ffi::OsString;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use serde_json::Value;
 
@@ -185,14 +185,14 @@ impl CliAdapter for Codex {
     }
 
     /// This CLI does not read `.claude/rules/`; the prompt builder inlines it.
-    fn project_rules_dir(&self, root: &Path) -> Option<std::path::PathBuf> {
-        Some(root.join(".claude/rules"))
+    fn project_rules_dir(&self, root: &Path) -> Option<PathBuf> {
+        Some(super::shared_rules_dir(root))
     }
 
     /// `recall-echo.md` is written by the claude integration and describes
     /// hooks only Claude Code runs.
     fn project_rules_exclude(&self) -> &'static [&'static str] {
-        &["recall-echo.md"]
+        super::CLAUDE_ONLY_RULES
     }
 
     fn integration(&self) -> &dyn AgentIntegration {
@@ -283,7 +283,6 @@ fn error_record_message(stdout: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::path::PathBuf;
 
     fn invocation(root: &Path) -> Invocation<'_> {
         Invocation {

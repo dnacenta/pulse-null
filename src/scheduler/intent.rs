@@ -663,6 +663,26 @@ fn intent_header(intent: &Intent) -> String {
     )
 }
 
+/// The user message of one intent turn: its header, its prompt and the
+/// autonomy context, with the refused-marker notice appended once (PN-133).
+/// Also returns the notice it showed, to acknowledge once the turn succeeds.
+pub fn intent_user_message(
+    root_dir: &Path,
+    config: &crate::config::Config,
+    intent: &Intent,
+) -> (String, Option<crate::prediction::refusals::ShownNotice>) {
+    let autonomy_context = prompt::build_autonomy_context(root_dir, config);
+    crate::prediction::refusals::with_notice(
+        root_dir,
+        format!(
+            "{}\n\n{}\n\n{}",
+            intent_header(intent),
+            intent.prompt,
+            autonomy_context
+        ),
+    )
+}
+
 /// Execute a single intent with tools.
 async fn execute_intent(
     intent: &Intent,
@@ -694,17 +714,7 @@ async fn execute_intent(
         }
     };
 
-    // Build user message with autonomy context
-    let autonomy_context = prompt::build_autonomy_context(&root_dir, &state.config);
-    let (user_message, refusal_notice) = crate::prediction::refusals::with_notice(
-        &root_dir,
-        format!(
-            "{}\n\n{}\n\n{}",
-            intent_header(intent),
-            intent.prompt,
-            autonomy_context
-        ),
-    );
+    let (user_message, refusal_notice) = intent_user_message(&root_dir, &state.config, intent);
 
     // Capture start time for accurate duration tracking
     let started_at = Utc::now();
@@ -763,9 +773,8 @@ async fn execute_intent(
     crate::prediction::refusals::refuse_markers(&root_dir, &result.response_text);
     let resolved_prediction_ids: Vec<String> = Vec::new();
 
-    // Persistent cognition substrate (PN-95) — same ordering as the task
-    // path: after prediction post-processing, so resolutions are available
-    // as discharge evidence and new errors are visible to ingest.
+    // Persistent cognition substrate (PN-95) — the same call as the task
+    // path; no prediction resolves in a cycle since PN-133.
     super::tension_cycle::close_cycle(
         state,
         &root_dir,

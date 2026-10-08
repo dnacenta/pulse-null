@@ -22,7 +22,7 @@
 //! plus pulse-null's own archiver — not from vendor hook plumbing.
 
 use std::ffi::OsString;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use serde_json::Value;
 
@@ -251,14 +251,14 @@ impl CliAdapter for Grok {
     }
 
     /// This CLI does not read `.claude/rules/`; the prompt builder inlines it.
-    fn project_rules_dir(&self, root: &Path) -> Option<std::path::PathBuf> {
-        Some(root.join(".claude/rules"))
+    fn project_rules_dir(&self, root: &Path) -> Option<PathBuf> {
+        Some(super::shared_rules_dir(root))
     }
 
     /// `recall-echo.md` is written by the claude integration and describes
     /// hooks only Claude Code runs.
     fn project_rules_exclude(&self) -> &'static [&'static str] {
-        &["recall-echo.md"]
+        super::CLAUDE_ONLY_RULES
     }
 
     fn integration(&self) -> &dyn AgentIntegration {
@@ -303,7 +303,7 @@ impl AgentIntegration for Grok {
         // the user's home — unless `[compat.*]` is off in ~/.grok/config.toml.
         // With it on, a hook in the user's home runs on every turn of every
         // pulse. Report drift; the file is the user's, never edited here.
-        if let Some(home) = std::env::var_os("HOME").map(std::path::PathBuf::from) {
+        if let Some(home) = std::env::var_os("HOME").map(PathBuf::from) {
             let config = home.join(".grok/config.toml");
             if !compat_disabled(&config) {
                 items.push(BootstrapItem {
@@ -320,7 +320,7 @@ impl AgentIntegration for Grok {
 
     /// Grok honours the same user-level hook file the claude adapter warns
     /// about, so the warning applies here too.
-    fn user_hooks_location(&self, home: &Path) -> Option<std::path::PathBuf> {
+    fn user_hooks_location(&self, home: &Path) -> Option<PathBuf> {
         super::claude::Claude
             .integration()
             .user_hooks_location(home)
@@ -430,7 +430,6 @@ fn error_record_message(stdout: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::path::PathBuf;
 
     fn invocation<'a>(prompt_file: &'a Path, root: &'a Path) -> Invocation<'a> {
         Invocation {

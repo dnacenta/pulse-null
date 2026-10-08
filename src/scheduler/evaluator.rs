@@ -1,8 +1,8 @@
-//! Scheduler Evaluator — structural precondition checks before firing events.
+//! Scheduler Evaluator — structural precondition checks before a scheduled
+//! task fires.
 //!
-//! Instead of blindly spawning LLM sessions for every event, the evaluator
-//! checks whether anything has actually changed since the last fire. If not,
-//! the task is suppressed — no tokens wasted, no redundant diagnosis.
+//! A task may name an evaluator; the runner asks it before spending a
+//! provider call, and skips the fire when it says nothing warrants one.
 //!
 //! Today the only gate is the salience rule for cognitive cycles. The
 //! pipeline_frozen, cognitive_decline, conversion-low and post-interaction
@@ -295,7 +295,7 @@ pub fn evaluate_salience(
 
 /// Whether vigil's latest analysis reports declining cognitive signals.
 ///
-/// Reads the same `analysis.json` the metacognitive prompt block reads. A
+/// Reads vigil's `analysis.json`; nothing from it reaches a prompt. A
 /// missing or unreadable analysis is **not** treated as declining: the gate
 /// has two other clauses, and inventing a decline from an absent file would
 /// make the whole rule fire unconditionally and quietly retire itself.

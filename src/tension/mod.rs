@@ -25,7 +25,7 @@
 //!      demands a [`WorkArtifact`] — a value that
 //!      [`ingest::WorkEvidence::verify`] will only mint against a file whose
 //!      mtime actually moved outside the journal, a prediction that actually
-//!      resolved, or a tool that actually ran.
+//!      resolved (none can since PN-133), or a tool that actually ran.
 //!    * [`TensionStore::note_mention`] — what a text mention does — touches
 //!      only an observational counter. It does not feed the update law, and
 //!      in particular it does not move `last_touched`, so a thread cannot be

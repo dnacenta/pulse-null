@@ -6,7 +6,19 @@ mod claude_hooks;
 pub mod codex;
 pub mod grok;
 
+use std::path::{Path, PathBuf};
+
 use super::adapter::CliAdapter;
+
+/// The pulse's `.claude/rules/` directory, which Claude Code loads by itself
+/// and other CLIs get inlined by the prompt builder.
+fn shared_rules_dir(root: &Path) -> PathBuf {
+    root.join(".claude/rules")
+}
+
+/// Files in [`shared_rules_dir`] written for Claude Code alone; another CLI
+/// inlining the directory skips them.
+const CLAUDE_ONLY_RULES: &[&str] = &[claude_hooks::RECALL_ECHO_RULES_FILE];
 
 /// Every adapter the crate ships: config name and constructor. One list, so
 /// validation, the wizards and construction cannot drift apart.

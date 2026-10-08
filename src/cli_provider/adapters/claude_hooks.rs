@@ -12,6 +12,10 @@ use crate::init::agent_bootstrap::{
     write_regular_file, BootstrapItem, ItemKind, ItemStatus,
 };
 
+/// The rules file this module writes into `.claude/rules/`. It describes
+/// Claude Code's hooks, so CLIs that inline the rules directory skip it.
+pub(super) const RECALL_ECHO_RULES_FILE: &str = "recall-echo.md";
+
 fn home_dir() -> Option<PathBuf> {
     std::env::var_os("HOME").map(PathBuf::from)
 }
@@ -334,7 +338,7 @@ pub(super) fn ensure_files(pulse_root: &Path, recall_bin: &str) -> Vec<Bootstrap
         ));
         if rules_ok {
             items.push(ensure_config(
-                &claude_dir.join("rules/recall-echo.md"),
+                &claude_dir.join("rules").join(RECALL_ECHO_RULES_FILE),
                 render_rules_md(),
                 &pulse_root,
             ));
@@ -376,7 +380,7 @@ pub(super) fn verify_files(pulse_root: &Path) -> Vec<BootstrapItem> {
         status,
     });
 
-    let rules = claude_dir.join("rules/recall-echo.md");
+    let rules = claude_dir.join("rules").join(RECALL_ECHO_RULES_FILE);
     items.push(BootstrapItem {
         status: if rules.exists() {
             ItemStatus::Exists

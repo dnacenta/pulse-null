@@ -133,7 +133,8 @@ pub struct EvidenceClaim {
     /// Pulse-relative path to a file changed this cycle, outside the journal.
     #[serde(default)]
     pub file: Option<String>,
-    /// Id of a prediction resolved this cycle.
+    /// Id of a prediction resolved this cycle. Kept for the grammar; since
+    /// PN-133 no prediction resolves, so this rung never passes.
     #[serde(default)]
     pub prediction: Option<String>,
     /// Name of a tool that executed this cycle.
@@ -253,7 +254,8 @@ impl std::fmt::Display for EvidenceRejection {
 ///
 /// Constructed by the caller from things the model does not author: the
 /// cycle's start time, the prediction ids that actually transitioned to
-/// resolved, and the executor's own tool-round count.
+/// resolved (always none since PN-133), and the executor's own tool-round
+/// count.
 pub struct WorkEvidence<'a> {
     root_dir: &'a Path,
     resolved_prediction_ids: &'a [String],
