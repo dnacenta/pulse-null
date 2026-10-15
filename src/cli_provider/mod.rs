@@ -23,7 +23,7 @@ use pulse_system_types::llm::{
 };
 use tracing::warn;
 
-use crate::errors::{CliError, RefusalError};
+use crate::errors::{CliError, QuotaError, RefusalError};
 use crate::session::strip_system_prefixes;
 use crate::streaming::{StreamEvent, StreamResult, StreamingProvider};
 
@@ -423,7 +423,7 @@ fn settle(
     match terminal {
         // Some CLIs report failures in the terminal record rather than by
         // exiting non-zero; quota exhaustion and policy refusals both arrive
-        // this way.
+        // this way. Returned whole: the caller classifies, then bounds it.
         Some((text, true, _)) => Err(text),
         Some((text, false, usage)) => {
             let has_terminal = !text.trim().is_empty();
@@ -564,13 +564,15 @@ impl LmProvider for CliProvider {
                 let stderr = String::from_utf8_lossy(&output.stderr);
 
                 // A policy refusal is a distinct, recoverable signal: the chat
-                // handler falls back to another model on it. Everything else
-                // (network, timeout, empty) stays a generic error.
-                match adapter.classify_exit(&stdout, &stderr) {
+                // handler falls back to another model on it. A spent quota is
+                // typed too, so callers never re-derive it from text.
+                // Everything else (network, timeout, empty) stays generic.
+                let class = adapter.classify_exit(&stdout, &stderr);
+                match &class {
                     ExitClass::Refusal(detail) => {
                         return Err(Box::new(RefusalError {
                             model: model.clone(),
-                            detail: truncate(&detail, 500).to_string(),
+                            detail: truncate(detail, ERROR_TEXT_MAX).to_string(),
                         }) as BoxError);
                     }
                     ExitClass::FlaggedButUnmatched => {
@@ -581,26 +583,28 @@ impl LmProvider for CliProvider {
                              the refusal signature — detection may have drifted"
                         );
                     }
+                    ExitClass::QuotaExhausted => {
+                        warn!(
+                            model = %model,
+                            adapter = name,
+                            "CLI exited non-zero: the provider's usage quota is exhausted"
+                        );
+                    }
                     ExitClass::Plain => {}
                 }
 
-                // Build the most informative error message possible. Some
-                // CLIs put errors in stdout (JSON) rather than stderr.
-                let detail = if !stderr.trim().is_empty() {
-                    truncate(&stderr, 500).to_string()
-                } else if !stdout.trim().is_empty() {
-                    if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&stdout) {
-                        parsed["error"]
-                            .as_str()
-                            .or_else(|| parsed["message"].as_str())
-                            .unwrap_or_else(|| truncate(&stdout, 500))
-                            .to_string()
-                    } else {
-                        truncate(&stdout, 500).to_string()
-                    }
-                } else {
-                    String::new()
-                };
+                // The detail is only what the CLI itself said about the
+                // failure — never raw stdout, which for a streaming CLI is the
+                // model's own transcript (R2-02).
+                let full = failure_text(adapter, &class, &stdout, &stderr);
+                let detail = truncate(&full, ERROR_TEXT_MAX).to_string();
+
+                if class == ExitClass::QuotaExhausted {
+                    return Err(Box::new(QuotaError {
+                        model: model.clone(),
+                        detail,
+                    }) as BoxError);
+                }
 
                 let msg = if detail.is_empty() {
                     format!("{name} exited {}", output.status)
@@ -610,11 +614,13 @@ impl LmProvider for CliProvider {
                 return Err(msg.into());
             }
 
+            // An exit-0 reply flagged as an error may be a policy refusal or a
+            // spent quota; type it like the exit-non-zero path does.
             let reply = match adapter.output_mode(false) {
                 OutputMode::SingleJson => adapter.parse_single(&stdout),
                 OutputMode::Ndjson => reply_from_ndjson(adapter, &stdout),
             }
-            .map_err(|e| -> BoxError { e.into() })?;
+            .map_err(|e| typed_failure(adapter, &model, e))?;
             Ok(response(reply, &model))
         })
     }
@@ -770,7 +776,7 @@ impl StreamingProvider for CliProvider {
                         None => match settle(adapter, assembled, terminal, usage_seen) {
                             Ok(reply) => Ok(reply),
                             Err(text) if flagged => Err(classify_stream_failure(adapter, &model, text)),
-                            Err(text) => Err(StreamEvent::Error(text)),
+                            Err(text) => Err(StreamEvent::Error(truncate(&text, ERROR_TEXT_MAX).to_string())),
                         },
                     };
                     if outcome.is_err() {
@@ -796,7 +802,17 @@ impl StreamingProvider for CliProvider {
                         Ok(reply) => yield StreamEvent::Done(response(reply, &model)),
                         Err(e) => {
                             log_stderr_tail(name, stderr_tail).await;
-                            yield StreamEvent::Error(e);
+                            yield match adapter.classify_terminal(&e) {
+                                ExitClass::Refusal(detail) => StreamEvent::Refused {
+                                    model: model.clone(),
+                                    detail: truncate(&detail, ERROR_TEXT_MAX).to_string(),
+                                },
+                                ExitClass::QuotaExhausted => StreamEvent::QuotaExhausted {
+                                    model: model.clone(),
+                                    detail: truncate(&e, ERROR_TEXT_MAX).to_string(),
+                                },
+                                _ => StreamEvent::Error(truncate(&e, ERROR_TEXT_MAX).to_string()),
+                            };
                         }
                     }
                 }
@@ -805,16 +821,64 @@ impl StreamingProvider for CliProvider {
     }
 }
 
+/// The text a non-zero exit's error carries: what the CLI said about the
+/// failure, never raw stdout. For a spent quota it is the text that was
+/// classified as one (stderr if that is where the quota was named, else the
+/// error record); otherwise stderr, then the error record, then a single
+/// JSON document's `error` field. Empty when the CLI said nothing.
+fn failure_text(adapter: &dyn CliAdapter, class: &ExitClass, stdout: &str, stderr: &str) -> String {
+    let stderr = stderr.trim();
+    let record = || {
+        adapter
+            .error_record_message(stdout)
+            .filter(|s| !s.trim().is_empty())
+    };
+    if *class == ExitClass::QuotaExhausted && !adapter.is_quota_text(&stderr.to_lowercase()) {
+        return record().unwrap_or_default();
+    }
+    if !stderr.is_empty() {
+        return stderr.to_string();
+    }
+    record()
+        .or_else(|| {
+            serde_json::from_str::<serde_json::Value>(stdout.trim())
+                .ok()
+                .and_then(|doc| doc["error"].as_str().map(str::to_string))
+        })
+        .unwrap_or_default()
+}
+
+/// The error a buffered reply's failure text amounts to: a typed
+/// [`RefusalError`] or [`QuotaError`] when the adapter recognises one, a
+/// plain (bounded) error otherwise.
+fn typed_failure(adapter: &dyn CliAdapter, model: &str, text: String) -> BoxError {
+    match adapter.classify_terminal(&text) {
+        ExitClass::Refusal(detail) => Box::new(RefusalError {
+            model: model.to_string(),
+            detail: truncate(&detail, ERROR_TEXT_MAX).to_string(),
+        }),
+        ExitClass::QuotaExhausted => Box::new(QuotaError {
+            model: model.to_string(),
+            detail: truncate(&text, ERROR_TEXT_MAX).to_string(),
+        }),
+        _ => truncate(&text, ERROR_TEXT_MAX).to_string().into(),
+    }
+}
+
 /// Map a streamed terminal record flagged as an error to the event the chat
 /// handler expects: a typed [`StreamEvent::Refused`] for a policy refusal
-/// (so the refusal fallback fires for streamed turns too), a plain
-/// [`StreamEvent::Error`] for everything else (quota, timeout, empty). The
-/// adapter owns the signature, so buffered and streamed turns agree.
+/// (so the refusal fallback fires for streamed turns too), a typed
+/// [`StreamEvent::QuotaExhausted`] for a spent quota, a plain
+/// [`StreamEvent::Error`] for everything else (timeout, empty). The adapter
+/// owns the signatures, so buffered and streamed turns agree.
 fn classify_stream_failure(adapter: &dyn CliAdapter, model: &str, text: String) -> StreamEvent {
-    match adapter.classify_terminal(&text) {
+    // Classify the whole text, then bound what is passed on.
+    let class = adapter.classify_terminal(&text);
+    let text = truncate(&text, ERROR_TEXT_MAX).to_string();
+    match class {
         ExitClass::Refusal(detail) => StreamEvent::Refused {
             model: model.to_string(),
-            detail: truncate(&detail, 500).to_string(),
+            detail: truncate(&detail, ERROR_TEXT_MAX).to_string(),
         },
         ExitClass::FlaggedButUnmatched => {
             warn!(
@@ -824,6 +888,17 @@ fn classify_stream_failure(adapter: &dyn CliAdapter, model: &str, text: String) 
                  refusal signature — detection may have drifted"
             );
             StreamEvent::Error(text)
+        }
+        ExitClass::QuotaExhausted => {
+            warn!(
+                model = %model,
+                adapter = adapter.name(),
+                "stream ended with an error: the provider's usage quota is exhausted"
+            );
+            StreamEvent::QuotaExhausted {
+                model: model.to_string(),
+                detail: text,
+            }
         }
         ExitClass::Plain => StreamEvent::Error(text),
     }
@@ -917,6 +992,9 @@ pub(crate) fn serialize_messages(messages: &[Message]) -> String {
 
     output
 }
+
+/// Cap on any error text this provider returns or logs (SEC-007).
+const ERROR_TEXT_MAX: usize = 500;
 
 fn truncate(s: &str, max: usize) -> &str {
     crate::utils::safe_truncate(s, max)

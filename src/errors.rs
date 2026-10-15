@@ -161,6 +161,23 @@ pub struct RefusalError {
     pub detail: String,
 }
 
+/// The provider's usage quota or credit is spent (PN-133).
+///
+/// Emitted by the CLI provider whenever the adapter classifies a failure as
+/// [`ExitClass::QuotaExhausted`](crate::cli_provider::adapter::ExitClass),
+/// on every path (non-zero exit, exit-0 error document, stream), so callers
+/// read one classification instead of re-deriving it from text. Its message
+/// carries [`QUOTA_ERROR_MARKER`](crate::provider_status::QUOTA_ERROR_MARKER)
+/// for consumers that only see the text.
+#[derive(Debug, Error)]
+#[error("model '{model}': usage quota exhausted: {detail}")]
+pub struct QuotaError {
+    /// The model whose quota is spent.
+    pub model: String,
+    /// What the CLI said, truncated.
+    pub detail: String,
+}
+
 /// The reactive refusal fallback itself failed — either the fallback provider
 /// could not be built or its invocation errored (PN-88, SEC-007).
 ///

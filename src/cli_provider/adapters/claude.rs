@@ -30,6 +30,23 @@ const UNKNOWN_OPTION_MARKER: &str = "unknown option";
 const ISOLATION_DISALLOWED_TOOLS: &str =
     "Write,Edit,MultiEdit,NotebookEdit,Bash,WebFetch,WebSearch,Task";
 
+/// The tools Claude Code loads up front, measured on 2.1.282. Others load on
+/// demand through `ToolSearch`.
+const TOOL_SURFACE: &[&str] = &[
+    "Bash",
+    "Read",
+    "Write",
+    "Edit",
+    "Agent",
+    "Skill",
+    "ToolSearch",
+];
+
+/// [`TOOL_SURFACE`] minus what [`ISOLATION_DISALLOWED_TOOLS`] removes. `Agent`
+/// goes too: the disallow list still names it by its pre-2.1.63 name `Task`,
+/// which Claude Code keeps matching. Tied to both lists by a test.
+const ISOLATED_TOOL_SURFACE: &[&str] = &["Read", "Skill", "ToolSearch"];
+
 impl CliAdapter for Claude {
     fn name(&self) -> &'static str {
         "claude"
@@ -134,6 +151,16 @@ impl CliAdapter for Claude {
         let parsed: serde_json::Value =
             serde_json::from_str(stdout).map_err(|e| format!("failed to parse JSON reply: {e}"))?;
         let text = parsed["result"].as_str().unwrap_or("").trim().to_string();
+        // An exit-0 document flagged as an error (a spent quota, for one)
+        // carries the error in `result`; it is not the reply.
+        if parsed["is_error"].as_bool() == Some(true) {
+            // Returned whole: the provider classifies it, then bounds it.
+            return Err(if text.is_empty() {
+                "error result with no detail".into()
+            } else {
+                text
+            });
+        }
         if text.is_empty() {
             return Err("empty result".into());
         }
@@ -179,25 +206,50 @@ impl CliAdapter for Claude {
         }
     }
 
-    /// A refusal is valid JSON with `is_error == true` **and** a `result`
-    /// body containing the Usage-Policy signature. Anything else (non-JSON
-    /// stderr, `is_error` absent/false) is a generic error and must not
-    /// trigger fallback.
-    fn classify_exit(&self, stdout: &str, _stderr: &str) -> ExitClass {
-        let Ok(parsed) = serde_json::from_str::<serde_json::Value>(stdout.trim()) else {
-            return ExitClass::Plain;
-        };
+    /// The error document's `result` (or `error`) field, when `is_error` is
+    /// true. A successful reply is never read as a failure, whatever it
+    /// says about billing; the default `classify_exit` reads this and
+    /// stderr.
+    fn error_record_message(&self, stdout: &str) -> Option<String> {
+        let parsed = serde_json::from_str::<serde_json::Value>(stdout.trim()).ok()?;
         if parsed["is_error"].as_bool() != Some(true) {
-            return ExitClass::Plain;
+            return None;
         }
-        self.classify_terminal(parsed["result"].as_str().unwrap_or(""))
+        Some(
+            parsed["result"]
+                .as_str()
+                .or_else(|| parsed["error"].as_str())
+                .unwrap_or_default()
+                .to_string(),
+        )
+    }
+
+    /// Claude Code's own wording for a spent plan or extra-usage allowance.
+    fn quota_phrases(&self) -> &'static [&'static str] {
+        &["out of extra usage", "hit your limit"]
+    }
+
+    fn tool_surface(&self, restricted: bool) -> &'static [&'static str] {
+        if restricted {
+            ISOLATED_TOOL_SURFACE
+        } else {
+            TOOL_SURFACE
+        }
+    }
+
+    fn tool_surface_note(&self) -> &'static str {
+        "Measured on Claude Code 2.1.282. More tools load on demand through ToolSearch and \
+         are not covered by this list; isolation removes the write and shell tools by name."
     }
 
     /// The one place the AUP refusal signature lives: the buffered exit and
     /// the streamed terminal record both come through here.
     fn classify_terminal(&self, text: &str) -> ExitClass {
-        if text.to_lowercase().contains("usage policy") {
+        let lower = text.to_lowercase();
+        if lower.contains("usage policy") {
             ExitClass::Refusal(text.to_string())
+        } else if self.is_quota_text(&lower) {
+            ExitClass::QuotaExhausted
         } else {
             ExitClass::FlaggedButUnmatched
         }
@@ -320,6 +372,42 @@ mod tests {
     fn normal_argv_is_unrestricted() {
         let args = Claude.invoke_args(&inv("opus", None, Path::new("/e")));
         assert!(!args.iter().any(|a| a == "--disallowedTools"));
+    }
+
+    #[test]
+    fn tool_surface_is_the_measured_list() {
+        assert_eq!(
+            Claude.tool_surface(false),
+            [
+                "Bash",
+                "Read",
+                "Write",
+                "Edit",
+                "Agent",
+                "Skill",
+                "ToolSearch"
+            ]
+        );
+        assert!(Claude.tool_surface_note().contains("2.1.282"));
+    }
+
+    #[test]
+    fn isolated_tool_surface_is_the_surface_minus_the_disallow_list() {
+        // `Agent` is disallowed under its pre-2.1.63 name.
+        let disallowed = |tool: &str| {
+            let name = if tool == "Agent" { "Task" } else { tool };
+            ISOLATION_DISALLOWED_TOOLS.split(',').any(|d| d == name)
+        };
+        let expected: Vec<&str> = Claude
+            .tool_surface(false)
+            .iter()
+            .copied()
+            .filter(|tool| !disallowed(tool))
+            .collect();
+        assert_eq!(Claude.tool_surface(true), expected.as_slice());
+        for gone in ["Bash", "Write", "Edit", "Agent"] {
+            assert!(!Claude.tool_surface(true).contains(&gone), "{gone}");
+        }
     }
 
     #[test]
@@ -448,9 +536,88 @@ mod tests {
     #[test]
     fn classify_flags_error_without_policy_text_for_drift() {
         assert_eq!(
-            Claude.classify_exit(r#"{"is_error":true,"result":"out of extra usage"}"#, ""),
+            Claude.classify_exit(r#"{"is_error":true,"result":"something unexpected"}"#, ""),
             ExitClass::FlaggedButUnmatched
         );
+    }
+
+    #[test]
+    fn classify_recognises_a_spent_quota() {
+        assert_eq!(
+            Claude.classify_exit(r#"{"is_error":true,"result":"out of extra usage"}"#, ""),
+            ExitClass::QuotaExhausted
+        );
+        assert_eq!(
+            Claude.classify_exit(
+                r#"{"is_error":true,"result":"You've hit your limit · resets Aug 12, 6am (UTC)"}"#,
+                ""
+            ),
+            ExitClass::QuotaExhausted
+        );
+        assert_eq!(
+            Claude.classify_exit("", "API error status=402 Payment Required"),
+            ExitClass::QuotaExhausted
+        );
+        assert_eq!(
+            Claude.classify_terminal("You're out of extra usage"),
+            ExitClass::QuotaExhausted
+        );
+        // The refusal signature still wins.
+        assert!(matches!(
+            Claude.classify_terminal("Usage Policy: no. Also out of extra usage."),
+            ExitClass::Refusal(_)
+        ));
+    }
+
+    /// Echo's live limit line is Claude Code's wording, matched here and not
+    /// in the generic classifier.
+    #[test]
+    fn claude_code_quota_wording_lives_in_the_adapter() {
+        let echo_limit =
+            r#"{"is_error":true,"result":"You've hit your limit · resets Aug 12, 6am (UTC)"}"#;
+        assert_eq!(
+            Claude.classify_exit(echo_limit, ""),
+            ExitClass::QuotaExhausted
+        );
+        assert!(!crate::provider_status::is_quota_exhausted_lower(
+            &"You've hit your limit · resets Aug 12, 6am (UTC)".to_lowercase()
+        ));
+        assert!(!crate::provider_status::is_quota_exhausted_lower(
+            &"You're out of extra usage".to_lowercase()
+        ));
+    }
+
+    /// Only the error document is classified, never a successful reply that
+    /// happens to talk about billing.
+    #[test]
+    fn a_reply_that_mentions_quota_is_not_quota() {
+        let reply = r#"{"is_error":false,"result":"Your credit balance and a 402 Payment Required are both explained in the docs."}"#;
+        assert_eq!(Claude.classify_exit(reply, ""), ExitClass::Plain);
+        let unrelated = r#"{"is_error":true,"result":"tool execution failed"}"#;
+        assert_eq!(
+            Claude.classify_exit(unrelated, ""),
+            ExitClass::FlaggedButUnmatched
+        );
+    }
+
+    #[test]
+    fn is_error_document_is_an_error_not_a_reply() {
+        let err = Claude
+            .parse_single(
+                r#"{"type":"result","is_error":true,"result":"You've hit your limit · resets Aug 12, 6am (UTC)"}"#,
+            )
+            .unwrap_err();
+        assert!(err.contains("hit your limit"), "{err}");
+        assert!(Claude.parse_single(r#"{"is_error":true}"#).is_err());
+        assert!(Claude
+            .parse_single(r#"{"is_error":false,"result":"fine"}"#)
+            .is_ok());
+    }
+
+    #[test]
+    fn claude_code_loads_its_own_rules() {
+        assert!(Claude.project_rules_dir(Path::new("/p")).is_none());
+        assert!(Claude.project_rules_exclude().is_empty());
     }
 
     #[test]

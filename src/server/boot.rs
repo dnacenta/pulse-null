@@ -46,17 +46,11 @@ pub async fn boot_pulse(
     let (plugin_manager, plugin_routes) =
         super::setup::init_and_start_plugins(&config, &root_dir, &mut tools).await?;
 
-    // Platform awareness — generate AWARENESS.md from config + runtime state
-    super::setup::generate_awareness(&root_dir, &config, &plugin_manager, &tools);
-
-    // System prompt (built after tools/plugins so awareness is available)
-    let system_prompt = super::prompt::build_system_prompt_async(
-        root_dir.clone(),
-        config.clone(),
-        monitors.pipeline.clone(),
-        monitors.cognitive.clone(),
-    )
-    .await?;
+    // Platform awareness, then the system prompt (built after tools/plugins
+    // so it carries this boot's AWARENESS.md)
+    let system_prompt =
+        super::setup::awareness_then_system_prompt(&root_dir, &config, &plugin_manager, &tools)
+            .await?;
 
     // Event bus
     let event_bus = Arc::new(EventBus::new(64));
@@ -117,6 +111,7 @@ pub async fn boot_pulse(
 
     // Pipeline health check
     super::setup::startup_pipeline_check(&root_dir, &config, &state.pipeline_monitor);
+    super::setup::void_open_predictions(&root_dir).await;
 
     // Scheduler — gated on control-plane leadership (fail-open: the pulse's
     // interactive surfaces never wait on the coordinator).

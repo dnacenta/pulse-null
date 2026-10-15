@@ -33,7 +33,10 @@ pub async fn cache_graph_stats(root_dir: &Path) {
 
 /// Read cached graph stats synchronously. Returns a formatted awareness hint
 /// for the system prompt, or None if stats aren't available.
-pub fn graph_awareness_hint(root_dir: &Path) -> Option<String> {
+///
+/// `query_tool` says whether the pulse can call the in-process `graph_query`
+/// tool; only then is it told to use it.
+pub fn graph_awareness_hint(root_dir: &Path, query_tool: bool) -> Option<String> {
     let cache_path = root_dir.join(STATS_CACHE_FILE);
     let content = std::fs::read_to_string(&cache_path).ok()?;
     let stats: serde_json::Value = serde_json::from_str(&content).ok()?;
@@ -46,10 +49,16 @@ pub fn graph_awareness_hint(root_dir: &Path) -> Option<String> {
         return None;
     }
 
+    let counts = format!(
+        "Your knowledge graph contains {entities} entities, {relationships} relationships, \
+        and {episodes} conversation episodes."
+    );
+    if !query_tool {
+        return Some(format!("<graph-awareness>\n{counts}\n</graph-awareness>"));
+    }
     Some(format!(
         "<graph-awareness>\n\
-        Your knowledge graph contains {entities} entities, {relationships} relationships, \
-        and {episodes} conversation episodes. Use the graph_query tool when:\n\
+        {counts} Use the graph_query tool when:\n\
         - You need to recall past conversations or decisions\n\
         - You want relationships between people, projects, or concepts\n\
         - You're looking for specific knowledge on a topic\n\

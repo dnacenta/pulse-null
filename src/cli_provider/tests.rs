@@ -453,6 +453,112 @@ async fn refusal_is_a_typed_error() {
     );
 }
 
+/// An exit-0 `is_error` document carrying the refusal signature is the same
+/// typed refusal as a non-zero exit, so the refusal fallback still fires.
+#[tokio::test]
+async fn is_error_refusal_document_is_a_typed_refusal() {
+    let mock = MockCli::new(
+        "printf '{\"type\":\"result\",\"is_error\":true,\"result\":\"This violates the Usage Policy\"}'; exit 0",
+    );
+    let err = mock
+        .provider("m")
+        .invoke("sys", &[user("x")], 10, None)
+        .await
+        .unwrap_err();
+    let refusal = err
+        .downcast_ref::<crate::errors::RefusalError>()
+        .unwrap_or_else(|| panic!("expected RefusalError, got {err}"));
+    assert_eq!(refusal.model, "m");
+    assert!(refusal.detail.contains("Usage Policy"));
+}
+
+/// Q-H4: quota is decided once, by the adapter, and reaches the caller
+/// typed. Unrelated noise on stderr (which wins the error text) no longer
+/// hides the quota the error document states, on either exit path.
+#[tokio::test]
+async fn spent_quota_is_a_typed_quota_error_whatever_stderr_says() {
+    for exit in ["exit 1", "exit 0"] {
+        let mock = MockCli::new(&format!(
+            "echo 'warning: telemetry flag ignored' >&2; \
+             printf '{{\"type\":\"result\",\"is_error\":true,\"result\":\"You are out of extra usage\",\"session_id\":\"s\"}}'; {exit}"
+        ));
+        let err = mock
+            .provider("m")
+            .invoke("sys", &[user("x")], 10, None)
+            .await
+            .unwrap_err();
+        let quota = err
+            .downcast_ref::<crate::errors::QuotaError>()
+            .unwrap_or_else(|| panic!("{exit}: expected QuotaError, got {err}"));
+        assert_eq!(quota.model, "m");
+        // The detail is the text that was classified, not the stderr noise.
+        assert_eq!(quota.detail, "You are out of extra usage", "{exit}");
+
+        let mut status = crate::provider_status::ProviderStatus::default();
+        status.record_failure(
+            &err.to_string(),
+            crate::provider_status::classify_failure(err.as_ref()),
+        );
+        assert_eq!(
+            status.state,
+            crate::provider_status::ProviderState::Offline,
+            "{exit}"
+        );
+        assert_eq!(
+            status.error_kind,
+            Some(crate::provider_status::ErrorKind::QuotaExhausted),
+            "{exit}"
+        );
+    }
+}
+
+/// R2-02: on a non-zero exit with nothing on stderr, the error text is never
+/// the raw transcript. Billing words, a 402 and the runtime's own quota
+/// phrase in the model's deltas neither reach the error nor flip the
+/// provider to quota or auth.
+#[tokio::test]
+async fn model_text_in_a_failed_transcript_is_not_the_error() {
+    let mock = MockCli::new(
+        "printf '%s\n' '{\"type\":\"stream_event\",\"event\":{\"type\":\"content_block_delta\",\"delta\":{\"type\":\"text_delta\",\"text\":\"credit balance 402 payment required usage quota exhausted auth expired MODEL-SAID-THIS\"}}}'; exit 1",
+    );
+    let err = mock
+        .provider_for(Box::new(Grok), "m")
+        .invoke("sys", &[user("x")], 10, None)
+        .await
+        .unwrap_err();
+    let kind = crate::provider_status::classify_failure(err.as_ref());
+    assert_ne!(
+        kind,
+        crate::provider_status::ErrorKind::QuotaExhausted,
+        "{err}"
+    );
+    assert_ne!(
+        kind,
+        crate::provider_status::ErrorKind::AuthExpired,
+        "{err}"
+    );
+    assert!(!err.to_string().contains("MODEL-SAID-THIS"), "{err}");
+    assert!(err.to_string().starts_with("grok exited"), "{err}");
+}
+
+/// SEC-007: error text from a failing CLI is bounded.
+#[tokio::test]
+async fn failure_text_is_bounded() {
+    let mock = MockCli::new(
+        "printf '{\"type\":\"result\",\"is_error\":true,\"result\":\"%s\"}' \"$(head -c 5000 /dev/zero | tr '\\0' x)\"; exit 1",
+    );
+    let err = mock
+        .provider("m")
+        .invoke("sys", &[user("x")], 10, None)
+        .await
+        .unwrap_err();
+    assert!(
+        err.to_string().len() < 700,
+        "{} bytes",
+        err.to_string().len()
+    );
+}
+
 #[test]
 fn env_set_reaches_the_child() {
     let root = tempfile::tempdir().unwrap();
@@ -483,6 +589,10 @@ fn stream_failure_with_policy_text_is_a_typed_refusal() {
     }
     assert!(matches!(
         classify_stream_failure(&Claude, "m", "You're out of extra usage".into()),
+        StreamEvent::QuotaExhausted { .. }
+    ));
+    assert!(matches!(
+        classify_stream_failure(&Claude, "m", "socket hang up".into()),
         StreamEvent::Error(_)
     ));
 }

@@ -6,7 +6,37 @@ mod claude_hooks;
 pub mod codex;
 pub mod grok;
 
+use std::path::{Path, PathBuf};
+
 use super::adapter::CliAdapter;
+
+/// The pulse's `.claude/rules/` directory, which Claude Code loads by itself
+/// and other CLIs get inlined by the prompt builder.
+fn shared_rules_dir(root: &Path) -> PathBuf {
+    root.join(".claude/rules")
+}
+
+/// Files in [`shared_rules_dir`] written for Claude Code alone; another CLI
+/// inlining the directory skips them.
+const CLAUDE_ONLY_RULES: &[&str] = &[claude_hooks::RECALL_ECHO_RULES_FILE];
+
+/// The `message` of the first `{"type":"error"}` record in an NDJSON
+/// stdout (empty when the record has none), for CLIs that report failures
+/// that way.
+fn tagged_error_message(stdout: &str) -> Option<String> {
+    fn tagged_error(text: &str) -> Option<String> {
+        let value = serde_json::from_str::<serde_json::Value>(text).ok()?;
+        (value.get("type").and_then(serde_json::Value::as_str) == Some("error")).then(|| {
+            value
+                .get("message")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default()
+                .to_string()
+        })
+    }
+    tagged_error(stdout.trim())
+        .or_else(|| stdout.lines().find_map(|line| tagged_error(line.trim())))
+}
 
 /// Every adapter the crate ships: config name and constructor. One list, so
 /// validation, the wizards and construction cannot drift apart.

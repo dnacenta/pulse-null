@@ -627,21 +627,16 @@ impl Default for AutonomyConfig {
     }
 }
 
-/// Which internal events auto-queue intents
+/// Event-driven behaviour under `[autonomy.events]`.
+///
+/// The five switches that let the pulse's own activity queue intents
+/// (`post_conversation`, `pipeline_alert`, `pipeline_frozen`,
+/// `cognitive_decline`, `pipeline_conversion_low`) were removed in PN-133:
+/// those events never become intents now. Old configs that still set them
+/// parse fine; unknown keys are ignored.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct EventsConfig {
-    /// Queue reflection intent after chat conversations end
-    pub post_conversation: bool,
-    /// Queue archiving intent when a document hits its hard limit
-    pub pipeline_alert: bool,
-    /// Queue investigation intent when pipeline has no movement
-    pub pipeline_frozen: bool,
-    /// Queue adjustment intent when cognitive health declines
-    pub cognitive_decline: bool,
-    /// Queue investigation when conversations archive but pipeline docs don't update
-    #[serde(default = "default_true")]
-    pub pipeline_conversion_low: bool,
     /// Send a `[task-error]` diagnostic when a scheduled task fails.
     ///
     /// The diagnostic is state-aware: one per failure streak plus one per
@@ -653,11 +648,6 @@ pub struct EventsConfig {
 impl Default for EventsConfig {
     fn default() -> Self {
         Self {
-            post_conversation: true,
-            pipeline_alert: true,
-            pipeline_frozen: true,
-            cognitive_decline: true,
-            pipeline_conversion_low: true,
             provider_error: true,
         }
     }
@@ -708,54 +698,31 @@ impl Default for GraphConfig {
     }
 }
 
-/// Configuration for the prediction engine (Hierarchical Predictive Self-Modeling).
-/// See `continuous-entity-process-spec.md` Phase 2.
+/// `[prediction]` — what is left of the prediction store (PN-133).
+///
+/// Free-form predictions were retired in Phase 0: nothing writes
+/// `predictions.json` except the boot migration that voids open ones, which
+/// runs regardless of this section. `enabled` now only decides whether the
+/// tension substrate reads the store's recorded prediction errors and opens
+/// threads for those above `surprise_threshold`. The other keys older
+/// configs carry (`cycle_predictions`, `session_predictions`,
+/// `weekly_predictions`, `importance_threshold`, `max_unresolved`,
+/// `max_errors`) are ignored.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct PredictionConfig {
-    /// Enable prediction generation, resolution, and prompt injection.
+    /// Let the tension substrate ingest recorded prediction errors.
     pub enabled: bool,
-    /// Generate Cycle-timescale predictions in the thinking loop.
-    pub cycle_predictions: bool,
-    /// Generate Session-timescale predictions in morning-orientation.
-    pub session_predictions: bool,
-    /// Generate Weekly-timescale predictions in weekly-synthesis.
-    pub weekly_predictions: bool,
-    /// INITIAL GUESS — calibration pending. Surprise score is the LLM's
-    /// self-assessed dissimilarity between prediction and actual on a 0.0
-    /// (matched) to 1.0 (completely wrong) scale. Resolutions with surprise
-    /// at or above this threshold create attention-demanding PredictionErrors.
-    /// Not cited from a source; revisit after collecting ≥30 resolved
-    /// predictions per timescale.
+    /// Surprise above which a recorded prediction error opens a tension
+    /// thread. Surprise is the LLM's own 0.0–1.0 self-assessment.
     pub surprise_threshold: f64,
-    /// INITIAL GUESS — calibration pending. Importance is the unweighted sum
-    /// of unprocessed-error surprise values. With surprise in [0,1], a 3.0
-    /// threshold corresponds to roughly three fully-surprising errors or six
-    /// half-surprising ones. Not a port of Park et al.'s 150 (which was
-    /// importance per memory on a 1-10 scale, not accumulated). Revisit
-    /// alongside surprise_threshold.
-    pub importance_threshold: f64,
-    /// Cap on the prediction stack size. Oldest resolved predictions are
-    /// pruned first; pending predictions are always kept.
-    pub max_unresolved: usize,
-    /// Cap on accumulated prediction errors before pruning. Unprocessed
-    /// errors are always kept; processed ones are pruned oldest-first when
-    /// the cap is exceeded. 50 keeps several reflection-window cycles of
-    /// history available for trend analysis without unbounded growth.
-    pub max_errors: usize,
 }
 
 impl Default for PredictionConfig {
     fn default() -> Self {
         Self {
             enabled: true,
-            cycle_predictions: true,
-            session_predictions: true,
-            weekly_predictions: true,
             surprise_threshold: 0.3,
-            importance_threshold: 3.0,
-            max_unresolved: 20,
-            max_errors: 50,
         }
     }
 }
@@ -1121,7 +1088,7 @@ impl Default for ChannelLimits {
 /// Priority tiers (highest to lowest):
 /// 1. The instruction file + rules/protocol files (essential — never trimmed)
 /// 2. SELF.md, MEMORY.md (high priority — trimmed only as last resort)
-/// 3. EPHEMERAL.md, FINDINGS.md, pipeline health, cognitive health, caliber (trimmable)
+/// 3. EPHEMERAL.md, FINDINGS.md, graph awareness (trimmable)
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct SystemPromptBudgetConfig {
@@ -1130,8 +1097,8 @@ pub struct SystemPromptBudgetConfig {
     pub enabled: bool,
     /// Maximum estimated tokens for the entire system prompt.
     pub token_budget: usize,
-    /// Per-component token caps. Components exceeding their cap are truncated.
-    /// Set to 0 to use the default for that component.
+    /// Per-component token caps, applied while `enabled` is true. Components
+    /// exceeding their cap are truncated. 0 means no cap for that component.
     #[serde(alias = "claude_md_cap")] // vendor-ok: pre-PN-106 key
     pub instructions_cap: usize,
     pub rules_cap: usize,
@@ -1139,9 +1106,6 @@ pub struct SystemPromptBudgetConfig {
     pub memory_cap: usize,
     pub ephemeral_cap: usize,
     pub findings_cap: usize,
-    pub pipeline_health_cap: usize,
-    pub cognitive_health_cap: usize,
-    pub caliber_cap: usize,
     /// Hard byte ceiling for THOUGHT_STACK.md content.
     ///
     /// The `*_max_bytes` ceilings are safety limits, not budgeting: they are
@@ -1167,9 +1131,6 @@ impl Default for SystemPromptBudgetConfig {
             memory_cap: 4_000,
             ephemeral_cap: 2_000,
             findings_cap: 1_500,
-            pipeline_health_cap: 500,
-            cognitive_health_cap: 300,
-            caliber_cap: 200,
             thought_stack_max_bytes: 48 * 1024,
             awareness_max_bytes: 16 * 1024,
             memory_max_bytes: 32 * 1024,
@@ -1518,6 +1479,36 @@ mod pulse_rename_tests {
 
     fn identity(section: &str) -> String {
         format!("[{section}]\nname = \"Echo\"\nowner_name = \"D\"\nowner_alias = \"D\"\n")
+    }
+
+    /// The five `[autonomy.events]` switches PN-133 removed still parse in a
+    /// live config; they are ignored, and the one switch left is honoured.
+    #[test]
+    fn removed_autonomy_event_keys_still_parse() {
+        let text = format!(
+            "{}{REST}[autonomy.events]\npost_conversation = true\npipeline_alert = true\n\
+             pipeline_frozen = false\ncognitive_decline = true\n\
+             pipeline_conversion_low = true\nprovider_error = false\n",
+            identity("pulse")
+        );
+        let cfg = Config::from_toml_str(&text).unwrap();
+        assert!(!cfg.autonomy.events.provider_error);
+    }
+
+    /// The `[prediction]` keys PN-133 retired still parse in a live config;
+    /// the two that remain are honoured.
+    #[test]
+    fn removed_prediction_keys_still_parse() {
+        let text = format!(
+            "{}{REST}[prediction]\nenabled = false\ncycle_predictions = true\n\
+             session_predictions = true\nweekly_predictions = true\n\
+             surprise_threshold = 0.5\nimportance_threshold = 3.0\n\
+             max_unresolved = 20\nmax_errors = 50\n",
+            identity("pulse")
+        );
+        let cfg = Config::from_toml_str(&text).unwrap();
+        assert!(!cfg.prediction.enabled);
+        assert!((cfg.prediction.surprise_threshold - 0.5).abs() < f64::EPSILON);
     }
 
     #[test]

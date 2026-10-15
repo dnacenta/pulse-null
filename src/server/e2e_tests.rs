@@ -1066,6 +1066,82 @@ async fn e2e_generic_error_rolls_back_user_turn() {
     );
 }
 
+/// PN-133: chat turns feed provider status like task and intent turns. A
+/// chat turn that succeeds after a quota failure brings the provider back to
+/// healthy, so `/health` does not stay 503 while every task is disabled.
+#[tokio::test]
+async fn a_successful_chat_turn_after_a_quota_failure_restores_provider_health() {
+    let state = build_state(
+        MockProvider::new(vec![mock_text("back again")]),
+        ToolRegistry::new(),
+    )
+    .await;
+    state.provider_status.write().await.record_failure(
+        "usage quota exhausted",
+        crate::provider_status::ErrorKind::QuotaExhausted,
+    );
+    assert_eq!(
+        state.provider_status.read().await.state,
+        crate::provider_status::ProviderState::Offline
+    );
+
+    let app = build_app(Arc::clone(&state));
+    // The `tui` channel is always the owner.
+    let (status, _body) = post_chat_on(&app, "tui", "hello").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        state.provider_status.read().await.state,
+        crate::provider_status::ProviderState::Healthy
+    );
+}
+
+/// An owner's failed chat turn is recorded too, classified like any provider
+/// failure — by kind only, since `/health` serves `last_error` to anyone.
+#[tokio::test]
+async fn a_failed_chat_turn_records_the_provider_failure() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = build_state_boxed_with_config(
+        dir.path().to_path_buf(),
+        Box::new(FailingProvider),
+        ToolRegistry::new(),
+        test_config(),
+    )
+    .await;
+    let app = build_app(Arc::clone(&state));
+    let (status, _body) = post_chat_on(&app, "tui", "hello").await;
+    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+    let ps = state.provider_status.read().await;
+    assert_eq!(ps.consecutive_failures, 1);
+    assert_eq!(
+        ps.error_kind,
+        Some(crate::provider_status::ErrorKind::NetworkError)
+    );
+    let last_error = ps.last_error.as_deref().unwrap();
+    assert_eq!(last_error, "chat turn failed (network_error)");
+    assert!(!last_error.contains("network drop while calling the model"));
+}
+
+/// A guest's (public-trust) turn does not move `/health`, either way.
+#[tokio::test]
+async fn a_public_chat_turn_does_not_change_provider_status() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = build_state_boxed_with_config(
+        dir.path().to_path_buf(),
+        Box::new(FailingProvider),
+        ToolRegistry::new(),
+        test_config(),
+    )
+    .await;
+    let app = build_app(Arc::clone(&state));
+    // The default `chat` channel with no known sender is a guest.
+    let (status, _body) = post_chat(&app, "hello").await;
+    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+    let ps = state.provider_status.read().await;
+    assert_eq!(ps.state, crate::provider_status::ProviderState::Healthy);
+    assert_eq!(ps.consecutive_failures, 0);
+    assert!(ps.last_error.is_none());
+}
+
 /// AC5: an AUP refusal with the fallback disabled (no `fallback_model`) takes
 /// the error path with the user turn rolled back — no opus call, no poison.
 #[tokio::test]

@@ -6,8 +6,7 @@
 //! "cognitive cycle" — a scheduled task fire (`runner::execute_task`) and an
 //! intent execution (`intent::execute_intent`). Both call the same two
 //! functions so the substrate cannot end up meaning different things on the
-//! two paths, which is how `[PREDICT:]`/`[RESOLVE:]` markers came to be
-//! silently dropped on the intent path until PN-86.
+//! two paths.
 //!
 //! Ordering within a cycle:
 //!
@@ -18,7 +17,8 @@
 //!             └─ close_cycle
 //!                  ├─ [THREAD:] / [THREAD-WORK:] / [THREAD-RESOLVE:] markers
 //!                  ├─ automatic discharge for predictions resolved this cycle
-//!                  └─ ingest of new prediction errors above threshold
+//!                  │    (none since PN-133: nothing resolves predictions)
+//!                  └─ ingest of recorded prediction errors above threshold
 //! ```
 //!
 //! The selection is recorded *before* the provider call because that is when
@@ -104,8 +104,8 @@ pub async fn close_cycle(state: &Arc<AppState>, root_dir: &Path, outcome: CycleO
     }
     let now = Utc::now();
 
-    // The prediction stack is re-read after the prediction post-processing
-    // has landed, so newly created errors are visible to ingest.
+    // Recorded prediction errors are read for ingest. The store is
+    // read-only since PN-133, so this sees what was already on disk.
     let stack = if state.config.prediction.enabled {
         Some(
             crate::prediction::store::load_async(
@@ -120,7 +120,7 @@ pub async fn close_cycle(state: &Arc<AppState>, root_dir: &Path, outcome: CycleO
 
     let root = root_dir.to_path_buf();
     let raw_output = outcome.raw_output.to_string();
-    let resolved: Vec<String> = outcome.resolved_prediction_ids.to_vec();
+    let resolved = ingest::evidential_resolutions(outcome.resolved_prediction_ids, stack.as_ref());
     let tool_rounds = outcome.tool_rounds;
     // Whether that count is a measurement or a structural zero, so a refusal
     // can say which side of the failure it is.

@@ -253,15 +253,6 @@ pub async fn start_in(
     // Construct monitoring trait objects
     let monitors = setup::create_monitors(&config);
 
-    // Build system prompt from SELF.md + CLAUDE.md + MEMORY.md
-    let system_prompt = prompt::build_system_prompt_async(
-        root_dir.clone(),
-        config.clone(),
-        monitors.pipeline.clone(),
-        monitors.cognitive.clone(),
-    )
-    .await?;
-
     // Register built-in tools
     let mut tools = setup::register_builtin_tools(&root_dir, &config);
     tracing::info!("Registered {} built-in tool(s)", tools.definitions().len());
@@ -270,8 +261,10 @@ pub async fn start_in(
     let (plugin_manager, plugin_routes) =
         setup::init_and_start_plugins(&config, &root_dir, &mut tools).await?;
 
-    // Generate AWARENESS.md
-    setup::generate_awareness(&root_dir, &config, &plugin_manager, &tools);
+    // Generate AWARENESS.md, then the system prompt from the pulse's
+    // documents (built last so it carries this boot's AWARENESS.md)
+    let system_prompt =
+        setup::awareness_then_system_prompt(&root_dir, &config, &plugin_manager, &tools).await?;
 
     // Create event bus
     let event_bus = Arc::new(EventBus::new(64));
@@ -362,6 +355,7 @@ pub async fn start_in(
 
     // Startup pipeline health check
     setup::startup_pipeline_check(&root_dir, &config, &state.pipeline_monitor);
+    setup::void_open_predictions(&root_dir).await;
 
     // Load schedule and intent queue; the coordinator gates the scheduler on
     // control-plane leadership (fail-open: chat/voice never wait on this).

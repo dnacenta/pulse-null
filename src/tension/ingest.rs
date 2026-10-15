@@ -133,7 +133,8 @@ pub struct EvidenceClaim {
     /// Pulse-relative path to a file changed this cycle, outside the journal.
     #[serde(default)]
     pub file: Option<String>,
-    /// Id of a prediction resolved this cycle.
+    /// Id of a prediction resolved this cycle. Kept for the grammar; since
+    /// PN-133 no prediction resolves, so this rung never passes.
     #[serde(default)]
     pub prediction: Option<String>,
     /// Name of a tool that executed this cycle.
@@ -216,7 +217,7 @@ impl std::fmt::Display for EvidenceRejection {
             Self::NoEvidence => write!(
                 f,
                 "claim: no artifact named — discharge needs a file changed outside the journal, \
-                 a resolved prediction id, or a tool that ran"
+                 or a tool that ran"
             ),
             Self::PathOutsidePulse(p) => {
                 write!(f, "claim: path '{p}' is not inside the pulse root")
@@ -243,7 +244,7 @@ impl std::fmt::Display for EvidenceRejection {
                 f,
                 "channel: '{t}' may have run, but this runtime's agent CLI runs its own tools \
                  and reports no tool rounds, so the tool rung cannot verify it — name the file \
-                 it changed or a resolved prediction"
+                 it changed"
             ),
         }
     }
@@ -253,7 +254,8 @@ impl std::fmt::Display for EvidenceRejection {
 ///
 /// Constructed by the caller from things the model does not author: the
 /// cycle's start time, the prediction ids that actually transitioned to
-/// resolved, and the executor's own tool-round count.
+/// resolved (always none since PN-133), and the executor's own tool-round
+/// count.
 pub struct WorkEvidence<'a> {
     root_dir: &'a Path,
     resolved_prediction_ids: &'a [String],
@@ -643,10 +645,9 @@ pub fn ingest_prediction_errors(
         }
 
         // Self-contained content (§8 Q4): the thread must still make sense
-        // after predictions.json prunes the resolution it came from — which
-        // it will, because the prune target is max(cap, pending), so once
-        // pending reaches the cap every resolved prediction is evicted on
-        // the next prune.
+        // without the prediction it came from. The old writer's prune kept
+        // max(cap, pending) predictions, so resolved ones were evicted while
+        // their errors survived; stores written then still lack them.
         //
         // Read the snapshot the resolve step took first; fall back to the
         // live store only for error records written before that snapshot
@@ -698,6 +699,24 @@ pub fn ingest_prediction_errors(
     }
 
     report
+}
+
+/// The resolved-prediction ids that count as discharge evidence: a voided
+/// prediction (PN-133) is closed, but nothing happened, so it never credits
+/// a thread or passes a `prediction` claim.
+#[must_use]
+pub fn evidential_resolutions(ids: &[String], stack: Option<&PredictionStack>) -> Vec<String> {
+    ids.iter()
+        .filter(|id| {
+            !stack.is_some_and(|stack| {
+                stack
+                    .predictions
+                    .iter()
+                    .any(|p| &p.id == *id && p.is_void())
+            })
+        })
+        .cloned()
+        .collect()
 }
 
 /// Discharge threads whose originating prediction resolved this cycle.
@@ -1033,7 +1052,7 @@ pub fn render_tombstone(thread: &Thread) -> String {
 mod tests {
     use super::*;
     use crate::config::{PredictionConfig, TensionConfig};
-    use crate::prediction::{ErrorDirection, PredictionResolution, Timescale};
+    use crate::prediction::fixtures;
     use crate::tension::{ThreadResolution, WorkOutcome};
     use chrono::Duration;
     use tempfile::TempDir;
@@ -1081,6 +1100,57 @@ mod tests {
     }
 
     // ----- marker parsing --------------------------------------------------
+
+    #[test]
+    fn void_predictions_are_not_outreach_or_tension_evidence() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let resolved = "p-resolved".to_string();
+        let voided = "p-free-form".to_string();
+        fixtures::write_store(
+            root,
+            &fixtures::document(
+                vec![
+                    fixtures::resolved(&resolved, "resolved", "it happened", 0.6, "misdirected"),
+                    fixtures::pending(&voided, "free-form"),
+                ],
+                vec![],
+            ),
+        );
+        assert_eq!(
+            crate::prediction::store::void_open_predictions(root).unwrap(),
+            1
+        );
+
+        // Outreach gate 2: only the genuinely resolved id is a referent.
+        let referents = crate::outreach::store::resolved_prediction_ids(root);
+        assert!(referents.contains(&resolved));
+        assert!(!referents.contains(&voided));
+
+        // Tension: a void id neither credits a thread nor passes a claim.
+        let stack = crate::prediction::store::load(root, PredictionConfig::default());
+        let ids = vec![voided.clone(), resolved.clone()];
+        assert_eq!(evidential_resolutions(&ids, Some(&stack)), vec![resolved]);
+
+        let mut store = TensionStore::with_config(TensionConfig::default());
+        let now = Utc::now();
+        store.open(
+            ThreadDraft {
+                label: "from a void prediction".into(),
+                content: "c".into(),
+                origin: ThreadOrigin::PredictionError(voided.clone()),
+            },
+            now,
+        );
+        let evidential = evidential_resolutions(std::slice::from_ref(&voided), Some(&stack));
+        assert!(credit_resolved_predictions(&mut store, &evidential, now).is_empty());
+        let evidence = WorkEvidence::new(root, &evidential, 0, true, now);
+        let claim = EvidenceClaim {
+            prediction: Some(voided),
+            ..EvidenceClaim::default()
+        };
+        assert!(evidence.verify(&claim).is_err());
+    }
 
     #[test]
     fn thread_marker_opens_a_thread() {
@@ -1636,25 +1706,30 @@ mod tests {
 
     // ----- prediction-error ingest ----------------------------------------
 
+    /// A store holding one resolved prediction and the error it recorded.
     fn stack_with_error(surprise: f64) -> PredictionStack {
-        let mut stack = PredictionStack::with_config(PredictionConfig {
-            surprise_threshold: 0.3,
-            ..PredictionConfig::default()
-        });
-        let id = stack
-            .add_prediction(Timescale::Cycle, "the pipeline will move".to_string(), 0.8)
-            .id
-            .clone();
-        stack.resolve(
-            &id,
-            PredictionResolution {
-                actual: "the pipeline froze".to_string(),
+        let doc = fixtures::document(
+            vec![fixtures::resolved(
+                "p-1",
+                "the pipeline will move",
+                "the pipeline froze",
                 surprise,
-                direction: ErrorDirection::Overconfident,
-                insight: Some("freeze detector is blind to soft limits".to_string()),
-            },
+                "overconfident",
+            )],
+            vec![fixtures::error(
+                "p-1",
+                "the pipeline will move",
+                "the pipeline froze",
+                surprise,
+            )],
         );
-        stack
+        fixtures::stack(
+            doc,
+            PredictionConfig {
+                surprise_threshold: 0.3,
+                ..PredictionConfig::default()
+            },
+        )
     }
 
     #[test]
@@ -1674,16 +1749,16 @@ mod tests {
         assert!(thread.content.contains("freeze detector is blind"));
     }
 
-    /// `prune` keeps `max(max_predictions, pending)` predictions, so once
-    /// pending reaches the cap every resolved prediction is evicted while its
-    /// error survives. A thread ingested after that point used to be born a
+    /// The old writer's prune kept `max(max_predictions, pending)`
+    /// predictions, so a resolved prediction could be evicted while its error
+    /// survived. A thread ingested after that point used to be born a
     /// husk ("no longer on record"). The text now rides on the error record.
     #[test]
     fn prediction_error_thread_survives_eviction_of_its_prediction() {
         let mut s = store();
         let mut stack = stack_with_error(0.9);
 
-        stack.prune(0, 50);
+        stack.predictions.clear(); // the old writer's prune evicted it
         assert!(
             stack.predictions.is_empty(),
             "precondition: the prediction must be gone"
@@ -1715,7 +1790,7 @@ mod tests {
         assert!(thread.content.contains("the pipeline froze"));
 
         let mut evicted = store();
-        stack.prune(0, 50);
+        stack.predictions.clear(); // the old writer's prune evicted it
         ingest_prediction_errors(&mut evicted, &stack, Utc::now());
         let thread = evicted.live().next().unwrap();
         assert!(thread

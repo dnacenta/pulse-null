@@ -135,6 +135,48 @@ pub fn generate_awareness(
     }
 }
 
+/// Regenerate AWARENESS.md, then build the chat system prompt. The prompt is a
+/// boot-time snapshot that inlines AWARENESS.md for adapters that do not
+/// import it, so it must be built from this boot's file, not the last one's.
+pub async fn awareness_then_system_prompt(
+    root_dir: &Path,
+    config: &Config,
+    plugin_manager: &PluginManager,
+    tools: &ToolRegistry,
+) -> Result<String, crate::errors::PromptError> {
+    generate_awareness(root_dir, config, plugin_manager, tools);
+    super::prompt::build_system_prompt_async(root_dir.to_path_buf(), config.clone()).await
+}
+
+/// How long boot waits for the void-predictions migration.
+const VOID_MIGRATION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Void every open free-form prediction (PN-133 Phase 0). Runs whether or not
+/// `[prediction]` is enabled: the point is that no open free-form prediction
+/// is ever shown or counted again, and the file outlives the setting. Shed
+/// while isolated (nothing that writes); the next boot runs it. The file IO
+/// and the bounded lock wait run on the blocking pool. Never aborts boot.
+pub async fn void_open_predictions(root_dir: &Path) {
+    if crate::server::isolation::is_active(root_dir) {
+        return;
+    }
+    let root = root_dir.to_path_buf();
+    let migration =
+        tokio::task::spawn_blocking(move || crate::prediction::store::void_open_predictions(&root));
+    // Boot always continues: a migration still running after this is left
+    // to finish (or not) on the blocking pool.
+    match tokio::time::timeout(VOID_MIGRATION_TIMEOUT, migration).await {
+        Ok(Ok(Ok(0))) => {}
+        Ok(Ok(Ok(n))) => tracing::info!("voided {n} open predictions"),
+        Ok(Ok(Err(e))) => tracing::error!("Failed to void open predictions: {e}"),
+        Ok(Err(e)) => tracing::error!("Void-predictions migration panicked: {e}"),
+        Err(_) => tracing::error!(
+            "Void-predictions migration still running after {}s — boot continues without it",
+            VOID_MIGRATION_TIMEOUT.as_secs()
+        ),
+    }
+}
+
 /// Run the startup pipeline health check and auto-archive bloated documents.
 pub fn startup_pipeline_check(
     root_dir: &Path,
@@ -263,5 +305,39 @@ pub fn spawn_session_cleanup(config: &Config, state: &Arc<super::AppState>) {
             }
         });
         tracing::info!("Session cleanup task started (every {}s)", cleanup_interval);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn chat_prompt_is_built_after_awareness_regeneration() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::write(
+            root.join("AWARENESS.md"),
+            "STALE AWARENESS FROM THE LAST BOOT",
+        )
+        .unwrap();
+        let mut config = crate::config::test_support::minimal_config();
+        // No agent CLI: AWARENESS.md is inlined into the chat prompt.
+        config.llm.provider = "ollama".into();
+        let tools = register_builtin_tools(root, &config);
+        let plugin_manager = PluginManager::new(&config);
+
+        let prompt = awareness_then_system_prompt(root, &config, &plugin_manager, &tools)
+            .await
+            .unwrap();
+
+        let fresh = std::fs::read_to_string(root.join("AWARENESS.md")).unwrap();
+        let stamp = fresh
+            .lines()
+            .find(|l| l.starts_with("Content last changed at "))
+            .expect("regenerated AWARENESS.md is stamped");
+        assert!(prompt.contains(stamp), "prompt carries this boot's file");
+        assert!(prompt.contains("Test — Platform Awareness"));
+        assert!(!prompt.contains("STALE AWARENESS"));
     }
 }

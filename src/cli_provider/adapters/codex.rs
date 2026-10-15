@@ -20,13 +20,13 @@
 //! session sweep and pulse-null's own archiver, not from vendor hook plumbing.
 
 use std::ffi::OsString;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use serde_json::Value;
 
 use crate::cli_provider::adapter::{
-    AgentIntegration, CliAdapter, ExitClass, Invocation, OutputMode, PromptDelivery, Reply,
-    StreamLine, SystemPromptDelivery, Usage,
+    AgentIntegration, CliAdapter, Invocation, OutputMode, PromptDelivery, Reply, StreamLine,
+    SystemPromptDelivery, Usage,
 };
 use crate::init::agent_bootstrap::{ensure_config, BootstrapItem, ItemKind, ItemStatus};
 
@@ -161,14 +161,29 @@ impl CliAdapter for Codex {
         }
     }
 
-    /// Codex has no known policy-refusal signature. A structured error line is
-    /// flagged so a signature appearing in a later release is not swallowed.
-    fn classify_exit(&self, stdout: &str, _stderr: &str) -> ExitClass {
-        if has_error_record(stdout) {
-            ExitClass::FlaggedButUnmatched
-        } else {
-            ExitClass::Plain
-        }
+    /// Codex has no known policy-refusal signature, so the default
+    /// `classify_exit` / `classify_terminal` apply: a spent quota on stderr
+    /// or in the error record is its own class, any other error record is
+    /// flagged. Only what codex says about the failure is read.
+    fn error_record_message(&self, stdout: &str) -> Option<String> {
+        super::tagged_error_message(stdout)
+    }
+
+    /// No measured list: [`tool_surface`](CliAdapter::tool_surface) stays
+    /// empty and AWARENESS names the CLI as the source instead.
+    fn tool_surface_note(&self) -> &'static str {
+        "Tools are provided by the codex CLI."
+    }
+
+    /// This CLI does not read `.claude/rules/`; the prompt builder inlines it.
+    fn project_rules_dir(&self, root: &Path) -> Option<PathBuf> {
+        Some(super::shared_rules_dir(root))
+    }
+
+    /// `recall-echo.md` is written by the claude integration and describes
+    /// hooks only Claude Code runs.
+    fn project_rules_exclude(&self) -> &'static [&'static str] {
+        super::CLAUDE_ONLY_RULES
     }
 
     fn integration(&self) -> &dyn AgentIntegration {
@@ -239,18 +254,10 @@ fn agent_message_text(value: &Value) -> Option<&str> {
 }
 
 /// True when any line of stdout is a JSON object tagged as an error.
-fn has_error_record(stdout: &str) -> bool {
-    fn tagged_error(text: &str) -> bool {
-        serde_json::from_str::<Value>(text)
-            .is_ok_and(|value| value.get("type").and_then(Value::as_str) == Some("error"))
-    }
-    tagged_error(stdout.trim()) || stdout.lines().any(|line| tagged_error(line.trim()))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::path::PathBuf;
+    use crate::cli_provider::adapter::ExitClass;
 
     fn invocation(root: &Path) -> Invocation<'_> {
         Invocation {
@@ -373,6 +380,50 @@ mod tests {
             ExitClass::FlaggedButUnmatched
         );
         assert_eq!(Codex.classify_exit("", "boom"), ExitClass::Plain);
+    }
+
+    #[test]
+    fn spent_quota_is_its_own_exit_class() {
+        assert_eq!(
+            Codex.classify_exit("", "HTTP 402 Payment Required"),
+            ExitClass::QuotaExhausted
+        );
+        let stdout = r#"{"type":"error","message":"Your credit balance is too low"}"#;
+        assert_eq!(Codex.classify_exit(stdout, ""), ExitClass::QuotaExhausted);
+    }
+
+    /// SEC-008: the model's own words in the transcript are not a quota
+    /// signal; only stderr and the error record's message are classified.
+    #[test]
+    fn assistant_text_about_billing_is_not_quota() {
+        let stdout = concat!(
+            r#"{"type":"item.completed","item":{"type":"agent_message","text":"credit balance, payment required, 402"}}"#,
+            "\n",
+            r#"{"type":"error","message":"stream disconnected"}"#,
+        );
+        assert_eq!(
+            Codex.classify_exit(stdout, ""),
+            ExitClass::FlaggedButUnmatched
+        );
+    }
+
+    #[test]
+    fn pulse_rules_are_inlined_without_the_claude_hook_file() {
+        assert_eq!(
+            Codex.project_rules_dir(Path::new("/p")),
+            Some(PathBuf::from("/p/.claude/rules"))
+        );
+        assert_eq!(Codex.project_rules_exclude(), ["recall-echo.md"]);
+    }
+
+    #[test]
+    fn tool_surface_is_unmeasured_and_the_note_names_the_cli() {
+        assert!(Codex.tool_surface(false).is_empty());
+        assert!(Codex.tool_surface(true).is_empty());
+        assert_eq!(
+            Codex.tool_surface_note(),
+            "Tools are provided by the codex CLI."
+        );
     }
 
     #[test]

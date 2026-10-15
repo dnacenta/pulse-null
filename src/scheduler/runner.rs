@@ -6,7 +6,9 @@ use cron::Schedule as CronSchedule;
 use tokio::sync::RwLock;
 
 use super::diagnostics;
-use super::evaluator::{resolve_docs_dir, resolve_task_evaluator, EvalDecision, SchedulerState};
+use super::evaluator::{
+    resolve_docs_dir, resolve_task_evaluator, EvalDecision, SchedulerState, UNGATED_EVALUATORS,
+};
 use super::executor::{self, ExecutionConfig};
 use super::intent::{self, IntentQueue, IntentSource};
 use super::liveness::{self, SharedTaskHealth, TaskOutcome};
@@ -57,7 +59,6 @@ pub async fn run_task_loop(
     let mut eval_state = tokio::task::spawn_blocking(move || SchedulerState::load(&rd))
         .await
         .unwrap_or_default();
-    let docs_dir = resolve_docs_dir(&root_dir);
 
     loop {
         // Calculate next fire time in the configured timezone
@@ -121,22 +122,20 @@ pub async fn run_task_loop(
                 .await
                 .unwrap_or_default();
 
-            let decision = match resolve_task_evaluator(
-                evaluator_type,
-                &root_dir,
-                &docs_dir,
-                &state.config.tension,
-            ) {
-                Some(eval) => eval.evaluate(&eval_state),
-                None => {
-                    tracing::warn!(
-                        "Unknown evaluator type '{}' for task '{}' — firing anyway",
-                        evaluator_type,
-                        task.id
-                    );
-                    EvalDecision::Fire
-                }
-            };
+            let decision =
+                match resolve_task_evaluator(evaluator_type, &root_dir, &state.config.tension) {
+                    Some(eval) => eval.evaluate(&eval_state),
+                    None => {
+                        if !UNGATED_EVALUATORS.contains(&evaluator_type.as_str()) {
+                            tracing::warn!(
+                                "Unknown evaluator type '{}' for task '{}' — firing anyway",
+                                evaluator_type,
+                                task.id
+                            );
+                        }
+                        EvalDecision::Fire
+                    }
+                };
 
             if decision == EvalDecision::Suppress {
                 tracing::debug!(
@@ -363,29 +362,17 @@ async fn execute_task(
     } else {
         String::new()
     };
-    let mut user_message = format!(
-        "[Scheduled task: {} | Time: {} | Channel: {}]\n\n{}{}",
-        task.name,
-        now.format("%Y-%m-%d %H:%M UTC"),
-        task.channel,
-        task.prompt,
-        autonomy_context,
+    let (user_message, refusal_notice) = crate::prediction::refusals::with_notice(
+        &root_dir,
+        format!(
+            "[Scheduled task: {} | Time: {} | Channel: {}]\n\n{}{}",
+            task.name,
+            now.format("%Y-%m-%d %H:%M UTC"),
+            task.channel,
+            task.prompt,
+            autonomy_context,
+        ),
     );
-
-    // Load the prediction stack pre-LLM for the spec-2c pressure check on
-    // reflection-window (Q-H3). Post-LLM marker processing re-loads under
-    // the store lock instead of reusing this snapshot (PN-86) — by then it
-    // is minutes stale and writing it back would erase concurrent updates.
-    let prediction_stack = if state.config.prediction.enabled {
-        Some(
-            crate::prediction::store::load_async(root_dir.clone(), state.config.prediction.clone())
-                .await,
-        )
-    } else {
-        None
-    };
-
-    inject_reflection_pressure_directive(task, state, &prediction_stack, &mut user_message);
 
     // Capture start time for accurate duration tracking in InteractionRecord
     let started_at = Utc::now();
@@ -443,7 +430,7 @@ async fn execute_task(
                     task.id,
                     error_msg
                 );
-                handle_provider_error(state, &task.id, &error_msg).await;
+                handle_provider_error(state, &task.id, e.as_ref()).await;
                 return TaskOutcome::Failure(error_msg);
             }
         }
@@ -488,7 +475,7 @@ async fn execute_task(
                     task.id,
                     error_msg
                 );
-                handle_provider_error(state, &task.id, &error_msg).await;
+                handle_provider_error(state, &task.id, e.as_ref()).await;
                 return TaskOutcome::Failure(error_msg);
             }
         }
@@ -498,6 +485,11 @@ async fn execute_task(
     {
         let mut ps = state.provider_status.write().await;
         ps.record_success();
+    }
+
+    // The turn that carried the refused-marker notice succeeded: clear it.
+    if let Some(ref notice) = refusal_notice {
+        crate::prediction::refusals::acknowledge(&root_dir, notice);
     }
 
     // Log hallucination guard events for autonomous tasks
@@ -718,22 +710,16 @@ async fn execute_task(
         .await;
     }
 
-    // Post-execution: extract prediction markers from task output. Applies
-    // against a fresh locked load of the store (PN-86) — the pre-LLM stack
-    // is minutes stale by now and only fed the pressure check. Parses the
-    // RAW response, not clean_content: the lazy SHARE/CALL regexes can
-    // swallow an embedded [RESOLVE:] span while stripping, silently
-    // destroying the resolution before prediction parsing ran (SEC-013).
-    let resolved_prediction_ids = if prediction_stack.is_some() {
-        post_process_predictions(state, task, &root_dir, &response_text).await
-    } else {
-        Vec::new()
-    };
+    // Prediction markers are refused, never applied (PN-133): the store is
+    // not written. The refusal is told to the pulse in its next prompt.
+    // Counted on the RAW response: the lazy SHARE/CALL regexes can swallow an
+    // embedded marker while stripping (SEC-013).
+    crate::prediction::refusals::refuse_markers(&root_dir, &response_text);
+    let resolved_prediction_ids: Vec<String> = Vec::new();
 
-    // Post-execution: the persistent cognition substrate (PN-95). Runs after
-    // prediction post-processing so that predictions resolved this cycle are
-    // available as discharge evidence and new prediction errors are visible
-    // to ingest.
+    // Post-execution: the persistent cognition substrate (PN-95). No
+    // prediction resolves in a cycle since PN-133, so the resolved list is
+    // empty; ingest still reads the errors already recorded.
     super::tension_cycle::close_cycle(
         state,
         &root_dir,
@@ -880,19 +866,26 @@ fn resolve_provider_override(
 /// The operator-facing notification is not sent here — every failure path,
 /// including the ones that never reach the provider, is reported once from
 /// [`run_task_loop`] via [`diagnostics::report_failure`].
-async fn handle_provider_error(state: &Arc<AppState>, task_id: &str, error_msg: &str) {
-    let kind = provider_status::classify_error(error_msg);
+pub(super) async fn handle_provider_error(
+    state: &Arc<AppState>,
+    task_id: &str,
+    error: &(dyn std::error::Error + Send + Sync + 'static),
+) {
+    // A typed quota error is classified by type; anything else by its text.
+    let kind = provider_status::classify_failure(error);
     let kind_str = kind.to_string();
+    let error_msg = error.to_string();
 
-    // Update provider status
+    // Update provider status. `/health` serves `last_error` unauthenticated,
+    // so it records the kind only; the full text goes to the event and log.
     {
         let mut ps = state.provider_status.write().await;
-        ps.record_failure(error_msg, kind);
+        ps.record_failure(&format!("autonomous turn failed ({kind_str})"), kind);
     }
 
     // Emit event
     state.event_bus.emit(PulseEvent::ProviderError {
-        error: error_msg.to_string(),
+        error: error_msg,
         error_kind: kind_str,
         task_id: task_id.to_string(),
     });
@@ -984,7 +977,7 @@ async fn route_output_markers(
                     let chain_prompt = chain.prompt.replace(
                         "{result}",
                         &crate::tension::ingest::strip_thread_markers(
-                            &crate::prediction::resolve::strip_prediction_markers(
+                            &crate::prediction::markers::strip_prediction_markers(
                                 &parsed.clean_content,
                             ),
                         ),
@@ -1054,130 +1047,6 @@ async fn route_output_markers(
 /// Append a task execution record to LOGBOOK.md using the unified format.
 fn log_execution(root_dir: &std::path::Path, task: &ScheduledTask, summary: &str) {
     crate::logbook::write_entry(root_dir, "Task", &task.name, summary);
-}
-
-/// Spec 2c side-effects: when this task is the reflection-window task and
-/// the stack has crossed the importance threshold, append a
-/// `[PREDICTION PRESSURE: ...]` directive to the user message naming the
-/// highest-surprise prediction (so the LLM graduates the corresponding
-/// LEARNING item into THOUGHTS this cycle) and emit `PredictionPressure`
-/// for listeners. Caller is responsible for having already loaded the
-/// stack (it's borrowed immutably here). No-op if prediction is disabled
-/// or the task isn't reflection-window.
-///
-/// Extracted from `execute_task` (Q-H1) to keep that fn under the eye-roll
-/// length and let unit tests cover the directive shape independently.
-fn inject_reflection_pressure_directive(
-    task: &ScheduledTask,
-    state: &Arc<AppState>,
-    prediction_stack: &Option<crate::prediction::PredictionStack>,
-    user_message: &mut String,
-) {
-    if task.id != super::tasks::REFLECTION_WINDOW_TASK_ID {
-        return;
-    }
-    let Some(stack) = prediction_stack.as_ref() else {
-        return;
-    };
-    let Some(pressure) = super::evaluator::check_importance_pressure(stack) else {
-        return;
-    };
-
-    use std::fmt::Write as _;
-    let _ = write!(
-        user_message,
-        "\n\n[PREDICTION PRESSURE: accumulated_importance={:.2} ≥ threshold={:.2}. \
-         Top unprocessed prediction error: id `{}`, surprise={:.2}{}. \
-         Graduate the corresponding LEARNING.md item into THOUGHTS.md this cycle.]",
-        pressure.accumulated_importance,
-        stack.config.importance_threshold,
-        pressure.triggering_prediction_id,
-        pressure.triggering_surprise,
-        pressure
-            .triggering_insight
-            .as_ref()
-            .map(|s| format!(" (insight: {s})"))
-            .unwrap_or_default(),
-    );
-    tracing::info!(
-        accumulated_importance = pressure.accumulated_importance,
-        threshold = stack.config.importance_threshold,
-        triggering_prediction_id = %pressure.triggering_prediction_id,
-        "PredictionPressure fired — augmenting reflection-window user message"
-    );
-    state
-        .event_bus
-        .emit(crate::events::PulseEvent::PredictionPressure {
-            accumulated_importance: pressure.accumulated_importance,
-            triggering_prediction_id: pressure.triggering_prediction_id,
-            triggering_surprise: pressure.triggering_surprise,
-        });
-}
-
-/// Post-LLM phase of the prediction loop: parse `[PREDICT:...]` / `[RESOLVE:...]`
-/// markers from the task output, prune to configured caps, and persist.
-///
-/// Runs as a locked load-apply-save against the store (PN-86) rather than
-/// writing back the stack captured pre-LLM: the provider call takes minutes,
-/// and an overlapping task fire or intent completion may have written the
-/// store since our load — saving the stale snapshot would erase their
-/// updates. The pre-LLM stack (Q-H3) remains read-only pressure input.
-///
-/// Extracted from `execute_task` (Q-H1).
-///
-/// Returns the ids of predictions that actually transitioned to resolved, so
-/// the tension substrate can credit the threads they opened (PN-95). An
-/// empty vec on the failure path is correct: no confirmed resolution, no
-/// discharge evidence.
-async fn post_process_predictions(
-    state: &Arc<AppState>,
-    task: &ScheduledTask,
-    root_dir: &std::path::Path,
-    raw_output: &str,
-) -> Vec<String> {
-    let task_id = task.id.clone();
-    let timescale = super::tasks::default_timescale_for(&task.id);
-    let content = raw_output.to_string();
-    let max_unresolved = state.config.prediction.max_unresolved;
-    let max_errors = state.config.prediction.max_errors;
-    let result = crate::prediction::store::save_delta_async(
-        root_dir.to_path_buf(),
-        state.config.prediction.clone(),
-        move |stack| {
-            let summary = crate::prediction::resolve::process_task_output(
-                stack, &content, &task_id, timescale,
-            );
-            stack.prune(max_unresolved, max_errors);
-            (summary, stack.accumulated_importance())
-        },
-    )
-    .await;
-    match result {
-        Ok((summary, importance)) => {
-            if summary.new_errors > 0 {
-                tracing::info!(
-                    "Prediction errors: {} new (accumulated importance: {importance:.2})",
-                    summary.new_errors,
-                );
-            }
-            if !summary.skipped_resolutions.is_empty() {
-                let alert = super::alerts::alert_from_skipped_resolutions(
-                    &task.name,
-                    &summary.skipped_resolutions,
-                );
-                state.alert_queue.lock().await.push(alert);
-            }
-            summary.resolved_prediction_ids
-        }
-        Err(e) => {
-            // Infrastructure failure loses the resolutions AND their skip
-            // report — the highest-impact drop, so it alerts too (SEC-012).
-            tracing::error!("Failed to save prediction stack: {e}");
-            let alert = super::alerts::alert_from_store_failure(&task.name, &e.to_string());
-            state.alert_queue.lock().await.push(alert);
-            Vec::new()
-        }
-    }
 }
 
 /// True while this tenure's holder still owns an unexpired control-plane

@@ -22,13 +22,13 @@
 //! plus pulse-null's own archiver — not from vendor hook plumbing.
 
 use std::ffi::OsString;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use serde_json::Value;
 
 use crate::cli_provider::adapter::{
-    AgentIntegration, CliAdapter, ExitClass, Invocation, OutputMode, PromptDelivery, Reply,
-    StreamLine, SystemPromptDelivery, Usage,
+    AgentIntegration, CliAdapter, Invocation, OutputMode, PromptDelivery, Reply, StreamLine,
+    SystemPromptDelivery, Usage,
 };
 use crate::init::agent_bootstrap::{ensure_config, BootstrapItem, ItemKind, ItemStatus};
 
@@ -40,7 +40,20 @@ use crate::init::agent_bootstrap::{ensure_config, BootstrapItem, ItemKind, ItemS
 /// writers; the two marketplace tools survive an allowlist and go through
 /// `--disallowed-tools`, and `--disable-web-search` covers the web pair.
 /// With all three, the session's tool list is exactly this.
-const ISOLATED_TOOLS: &str = "read_file,list_dir,grep,todo_write";
+const ISOLATED_TOOLS: &[&str] = &["read_file", "list_dir", "grep", "todo_write"];
+
+/// The built-in tools grok gives a session, by grok's identifiers, as
+/// observed in the pulse's grok sessions (2026-10).
+const TOOL_SURFACE: &[&str] = &[
+    "read_file",
+    "grep",
+    "search_replace",
+    "write",
+    "list_dir",
+    "run_terminal_command",
+    "web_fetch",
+    "todo_write",
+];
 
 /// Tools that survive a `--tools` allowlist and must be removed by name.
 const ISOLATED_REMOVE: &str = "search_tool,use_tool,workflow";
@@ -154,7 +167,7 @@ impl CliAdapter for Grok {
 
         if inv.restricted {
             args.push("--tools".into());
-            args.push(ISOLATED_TOOLS.into());
+            args.push(ISOLATED_TOOLS.join(",").into());
             args.push("--disallowed-tools".into());
             args.push(ISOLATED_REMOVE.into());
             args.push("--disable-web-search".into());
@@ -199,15 +212,40 @@ impl CliAdapter for Grok {
     }
 
     /// Grok has no known policy-refusal signature — nothing in the fixtures or
-    /// in nine months of Echo traffic looks like Claude's AUP wording. A
-    /// structured `{"type":"error"}` line is still worth flagging, because a
-    /// signature that appears in a later release should not pass unnoticed.
-    fn classify_exit(&self, stdout: &str, _stderr: &str) -> ExitClass {
-        if has_error_record(stdout) {
-            ExitClass::FlaggedButUnmatched
+    /// in nine months of Echo traffic looks like Claude's AUP wording — so
+    /// the default `classify_exit` / `classify_terminal` apply: a spent quota
+    /// on stderr or in the error record is its own class, any other error
+    /// record is flagged. Only what grok says about the failure is read.
+    fn error_record_message(&self, stdout: &str) -> Option<String> {
+        super::tagged_error_message(stdout)
+    }
+
+    /// Grok's wording for a spent usage balance.
+    fn quota_phrases(&self) -> &'static [&'static str] {
+        &["usage balance exhausted"]
+    }
+
+    fn tool_surface(&self, restricted: bool) -> &'static [&'static str] {
+        if restricted {
+            ISOLATED_TOOLS
         } else {
-            ExitClass::Plain
+            TOOL_SURFACE
         }
+    }
+
+    fn tool_surface_note(&self) -> &'static str {
+        "Observed in grok CLI sessions, 2026-10."
+    }
+
+    /// This CLI does not read `.claude/rules/`; the prompt builder inlines it.
+    fn project_rules_dir(&self, root: &Path) -> Option<PathBuf> {
+        Some(super::shared_rules_dir(root))
+    }
+
+    /// `recall-echo.md` is written by the claude integration and describes
+    /// hooks only Claude Code runs.
+    fn project_rules_exclude(&self) -> &'static [&'static str] {
+        super::CLAUDE_ONLY_RULES
     }
 
     fn integration(&self) -> &dyn AgentIntegration {
@@ -252,7 +290,7 @@ impl AgentIntegration for Grok {
         // the user's home — unless `[compat.*]` is off in ~/.grok/config.toml.
         // With it on, a hook in the user's home runs on every turn of every
         // pulse. Report drift; the file is the user's, never edited here.
-        if let Some(home) = std::env::var_os("HOME").map(std::path::PathBuf::from) {
+        if let Some(home) = std::env::var_os("HOME").map(PathBuf::from) {
             let config = home.join(".grok/config.toml");
             if !compat_disabled(&config) {
                 items.push(BootstrapItem {
@@ -269,7 +307,7 @@ impl AgentIntegration for Grok {
 
     /// Grok honours the same user-level hook file the claude adapter warns
     /// about, so the warning applies here too.
-    fn user_hooks_location(&self, home: &Path) -> Option<std::path::PathBuf> {
+    fn user_hooks_location(&self, home: &Path) -> Option<PathBuf> {
         super::claude::Claude
             .integration()
             .user_hooks_location(home)
@@ -349,18 +387,10 @@ fn compat_disabled(config: &Path) -> bool {
     })
 }
 
-fn has_error_record(stdout: &str) -> bool {
-    fn tagged_error(text: &str) -> bool {
-        serde_json::from_str::<Value>(text)
-            .is_ok_and(|value| value.get("type").and_then(Value::as_str) == Some("error"))
-    }
-    tagged_error(stdout.trim()) || stdout.lines().any(|line| tagged_error(line.trim()))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::path::PathBuf;
+    use crate::cli_provider::adapter::ExitClass;
 
     fn invocation<'a>(prompt_file: &'a Path, root: &'a Path) -> Invocation<'a> {
         Invocation {
@@ -453,7 +483,10 @@ mod tests {
         let guarded = strings(&Grok.invoke_args(&inv));
         // Isolation is an allowlist of grok's read-only tools (its names),
         // plus the two removals an allowlist does not cover and the web pair.
-        assert_eq!(value_of(&guarded, "--tools"), Some(ISOLATED_TOOLS));
+        assert_eq!(
+            value_of(&guarded, "--tools"),
+            Some(ISOLATED_TOOLS.join(",").as_str())
+        );
         assert_eq!(
             value_of(&guarded, "--disallowed-tools"),
             Some(ISOLATED_REMOVE)
@@ -461,13 +494,38 @@ mod tests {
         assert!(guarded.iter().any(|arg| arg == "--disable-web-search"));
         for shell_or_write in ["run_terminal_command", "write", "search_replace"] {
             assert!(
-                !ISOLATED_TOOLS.split(',').any(|t| t == shell_or_write),
+                !ISOLATED_TOOLS.contains(&shell_or_write),
                 "{shell_or_write} must not be allowed in isolation"
             );
         }
         assert!(guarded
             .iter()
             .any(|arg| arg == "--include-partial-messages"));
+    }
+
+    #[test]
+    fn tool_surface_is_observed_and_isolation_keeps_the_allowlist() {
+        assert_eq!(
+            Grok.tool_surface(false),
+            [
+                "read_file",
+                "grep",
+                "search_replace",
+                "write",
+                "list_dir",
+                "run_terminal_command",
+                "web_fetch",
+                "todo_write",
+            ]
+        );
+        assert_eq!(
+            Grok.tool_surface(true),
+            ["read_file", "list_dir", "grep", "todo_write"]
+        );
+        for tool in Grok.tool_surface(true) {
+            assert!(Grok.tool_surface(false).contains(tool), "{tool}");
+        }
+        assert!(!Grok.tool_surface_note().is_empty());
     }
 
     #[test]
@@ -516,6 +574,46 @@ mod tests {
             ExitClass::FlaggedButUnmatched
         );
         assert_eq!(Grok.classify_exit("", "boom"), ExitClass::Plain);
+    }
+
+    #[test]
+    fn spent_quota_is_its_own_exit_class() {
+        let stderr = "ERROR responses API error status=402 Payment Required \
+                      error_message=Grok Build usage balance exhausted";
+        assert_eq!(Grok.classify_exit("", stderr), ExitClass::QuotaExhausted);
+        let stdout = r#"{"type":"error","message":"usage balance exhausted"}"#;
+        assert_eq!(Grok.classify_exit(stdout, ""), ExitClass::QuotaExhausted);
+        assert_eq!(
+            Grok.classify_terminal("Grok Build usage balance exhausted"),
+            ExitClass::QuotaExhausted
+        );
+    }
+
+    /// SEC-008: the model's own words in the transcript are not a quota
+    /// signal; only stderr and the error record's message are classified.
+    #[test]
+    fn assistant_text_about_billing_is_not_quota() {
+        let stdout = concat!(
+            r#"{"type":"stream_event","event":{"type":"content_block_delta","delta":{"type":"text_delta","text":"Your credit balance is low; payment required (402)."}}}"#,
+            "\n",
+            r#"{"type":"error","message":"Couldn't set model 'grok-nonexistent'"}"#,
+        );
+        assert_eq!(
+            Grok.classify_exit(stdout, ""),
+            ExitClass::FlaggedButUnmatched
+        );
+        assert!(!crate::provider_status::is_quota_exhausted_lower(
+            &"Grok Build usage balance exhausted".to_lowercase()
+        ));
+    }
+
+    #[test]
+    fn pulse_rules_are_inlined_without_the_claude_hook_file() {
+        assert_eq!(
+            Grok.project_rules_dir(Path::new("/p")),
+            Some(PathBuf::from("/p/.claude/rules"))
+        );
+        assert_eq!(Grok.project_rules_exclude(), ["recall-echo.md"]);
     }
 
     #[test]

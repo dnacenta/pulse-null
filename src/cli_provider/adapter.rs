@@ -88,6 +88,9 @@ pub enum ExitClass {
     /// adapter's refusal signature — worth a warning, since a signature can
     /// drift between CLI releases.
     FlaggedButUnmatched,
+    /// The account's usage quota or credit is spent. Not recoverable by a
+    /// retry or a model fallback; the error text still carries the detail.
+    QuotaExhausted,
     /// An ordinary failure.
     Plain,
 }
@@ -186,15 +189,79 @@ pub trait CliAdapter: Send + Sync {
     /// Classify one [`OutputMode::Ndjson`] line.
     fn parse_stream_line(&self, line: &str) -> StreamLine;
 
-    /// Classify a non-zero exit from its stdout and stderr.
-    fn classify_exit(&self, stdout: &str, stderr: &str) -> ExitClass;
+    /// What the CLI itself said about a failure in its stdout: the message
+    /// of its error record or error document. `None` when stdout carries no
+    /// such record. Never the model's own words elsewhere in the output.
+    fn error_record_message(&self, _stdout: &str) -> Option<String> {
+        None
+    }
 
-    /// Classify the text of a streamed terminal record the CLI flagged as an
-    /// error. Flagged without a known refusal signature by default, so a
-    /// signature appearing in a later release is logged rather than
-    /// swallowed; adapters with a signature override this.
-    fn classify_terminal(&self, _text: &str) -> ExitClass {
-        ExitClass::FlaggedButUnmatched
+    /// This CLI's own wording for a spent usage quota, on top of the
+    /// generic signals in `provider_status`.
+    fn quota_phrases(&self) -> &'static [&'static str] {
+        &[]
+    }
+
+    /// Does this already-lowercased failure text say the quota is spent,
+    /// by the generic signals or this CLI's own wording?
+    fn is_quota_text(&self, lower: &str) -> bool {
+        crate::provider_status::is_quota_exhausted_lower(lower)
+            || self.quota_phrases().iter().any(|p| lower.contains(p))
+    }
+
+    /// Classify a non-zero exit. Only what the CLI says about the failure is
+    /// read: stderr, then its error record ([`error_record_message`]).
+    ///
+    /// [`error_record_message`]: Self::error_record_message
+    fn classify_exit(&self, stdout: &str, stderr: &str) -> ExitClass {
+        if self.is_quota_text(&stderr.to_lowercase()) {
+            return ExitClass::QuotaExhausted;
+        }
+        match self.error_record_message(stdout) {
+            Some(said) => self.classify_terminal(&said),
+            None => ExitClass::Plain,
+        }
+    }
+
+    /// Classify the text of a failure the CLI flagged (an error record, a
+    /// streamed terminal record). Quota exhaustion is recognised here for
+    /// every CLI; anything else is flagged without a known refusal signature
+    /// by default, so a signature appearing in a later release is logged
+    /// rather than swallowed. Adapters with a refusal signature override
+    /// this and keep the quota check.
+    fn classify_terminal(&self, text: &str) -> ExitClass {
+        if self.is_quota_text(&text.to_lowercase()) {
+            ExitClass::QuotaExhausted
+        } else {
+            ExitClass::FlaggedButUnmatched
+        }
+    }
+
+    /// The tools this CLI gives the pulse, by the CLI's own names, for
+    /// AWARENESS.md. `restricted` asks for the isolation-mode surface. Empty
+    /// means the adapter does not know the list; listing fewer tools than the
+    /// CLI has is honest, listing one it lacks is not.
+    fn tool_surface(&self, _restricted: bool) -> &'static [&'static str] {
+        &[]
+    }
+
+    /// One sentence on where [`tool_surface`](Self::tool_surface) comes from
+    /// (CLI version measured, tools that load on demand). Empty for none.
+    fn tool_surface_note(&self) -> &'static str {
+        ""
+    }
+
+    /// The pulse's own rules directory, when this CLI does not load it by
+    /// itself and the prompt builder must inline it. `None` when the CLI
+    /// reads the rules on its own (or the pulse has none to give it).
+    fn project_rules_dir(&self, _root: &Path) -> Option<PathBuf> {
+        None
+    }
+
+    /// File names in [`project_rules_dir`](Self::project_rules_dir) that are
+    /// not to be inlined, because what they say is false for this CLI.
+    fn project_rules_exclude(&self) -> &'static [&'static str] {
+        &[]
     }
 
     /// How this CLI's pulse directory is wired (instruction file, hooks,

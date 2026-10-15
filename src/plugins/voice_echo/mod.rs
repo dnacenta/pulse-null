@@ -124,9 +124,9 @@ impl Plugin for VoiceEchoPlugin {
     fn platform_description(&self) -> Option<String> {
         Some(
             "Phone call integration via Twilio. Handles inbound and \
-             outbound voice calls with speech-to-text (Groq Whisper) and \
-             text-to-speech (ElevenLabs). Voice input arrives as \
-             verified-trust with caller identification."
+             outbound voice calls with speech-to-text and text-to-speech. \
+             Voice input arrives as verified-trust with caller \
+             identification."
                 .to_string(),
         )
     }

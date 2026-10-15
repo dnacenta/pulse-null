@@ -277,18 +277,6 @@ pub fn project(event: &PulseEvent, id: u64, at: DateTime<Utc>) -> Option<LedgerR
             detail_ref: None,
         }),
 
-        PulseEvent::PredictionPressure {
-            accumulated_importance,
-            triggering_prediction_id,
-            ..
-        } => Some(alert_row(
-            id,
-            at,
-            &format!(
-                "prediction pressure {accumulated_importance:.1} ({triggering_prediction_id})"
-            ),
-        )),
-
         PulseEvent::Salience { kind, headline, .. } => {
             Some(alert_row(id, at, &format!("{kind}: {headline}")))
         }
@@ -693,6 +681,44 @@ mod tests {
         assert_eq!(row.name, "LEARNING.md at hard limit 42/40");
         assert_eq!(row.outcome, LedgerOutcome::None);
         assert_eq!(row.tokens, None);
+    }
+
+    /// The pulse's own events no longer queue intents (PN-133), but they are
+    /// still emitted and the ledger still records every one of them.
+    #[test]
+    fn self_events_still_project_to_ledger_rows() {
+        let events = [
+            interaction(
+                InteractionSource::Chat {
+                    channel: "discord".to_string(),
+                },
+                ConversationTrust::Owner,
+            ),
+            PulseEvent::PipelineAlert {
+                document: "LEARNING.md".to_string(),
+                count: 42,
+                hard_limit: 40,
+            },
+            PulseEvent::PipelineFrozen {
+                sessions_without_movement: 9,
+            },
+            PulseEvent::CognitiveHealthChanged {
+                previous: "HEALTHY".to_string(),
+                current: "ALERT".to_string(),
+                suggestions: Vec::new(),
+            },
+            PulseEvent::PipelineConversionLow {
+                conversations_7d: 12,
+                pipeline_updates_7d: 0,
+            },
+        ];
+        for (id, event) in events.iter().enumerate() {
+            assert!(
+                project(event, id as u64, Utc::now()).is_some(),
+                "{}",
+                event.event_type()
+            );
+        }
     }
 
     #[test]

@@ -289,9 +289,9 @@ impl Plugin for PraxisEchoPlugin {
     fn platform_description(&self) -> Option<String> {
         Some(
             "Pipeline enforcement engine. Monitors document counts, \
-             staleness, and frozen pipeline alerts. Injects pipeline health \
-             into your context at session start. Flags when thoughts go stale \
-             or documents approach capacity limits."
+             staleness, and frozen pipeline alerts. The entry counts appear \
+             in your prompt as the <journal-counts> line; the rest is \
+             recorded for the owner."
                 .to_string(),
         )
     }

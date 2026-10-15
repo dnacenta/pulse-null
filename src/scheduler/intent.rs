@@ -528,11 +528,6 @@ pub async fn drain_loop(
         let claimed = claim_next_intent(&leases, &holder, &candidates).await;
         let Some(intent) = claimed else { continue };
 
-        if premise_cleared(&intent, &state) {
-            commit_intent_completion(&state.root_dir, &queue, &leases, &holder, &intent.id).await;
-            continue;
-        }
-
         // Rate limit check — release the claim and re-check later; the
         // intent never left the queue, so there is nothing to re-queue.
         if !rate_tracker.record_and_check() {
@@ -578,40 +573,6 @@ pub async fn drain_loop(
         // re-runs — the at-least-once direction the queue already accepts.
         commit_intent_completion(&state.root_dir, &queue, &leases, &holder, &intent.id).await;
     }
-}
-
-/// A queued intent whose triggering condition has cleared since it was
-/// queued — run it and the pulse chases a problem that is gone.
-fn premise_cleared(intent: &Intent, state: &AppState) -> bool {
-    let cleared = pipeline_premise_cleared(
-        intent,
-        state.pipeline_monitor.as_deref(),
-        &state.root_dir,
-        state.config.pipeline.freeze_threshold,
-    );
-    if cleared {
-        tracing::info!(
-            "Intent '{}' dropped: the pipeline has moved since it was queued",
-            intent.id
-        );
-    }
-    cleared
-}
-
-/// [`premise_cleared`] without the `AppState`, so it can be tested against
-/// a real monitor reading a real `pipeline-state.json`.
-fn pipeline_premise_cleared(
-    intent: &Intent,
-    monitor: Option<&dyn pulse_system_types::monitoring::PipelineMonitor>,
-    root_dir: &Path,
-    freeze_threshold: u32,
-) -> bool {
-    let Some(monitor) = monitor else {
-        return false;
-    };
-    crate::events::listener::pipeline_freeze_cleared(intent, freeze_threshold, || {
-        monitor.load_state(root_dir).sessions_without_movement
-    })
 }
 
 /// Lease resource id for an intent claim.
@@ -702,6 +663,26 @@ fn intent_header(intent: &Intent) -> String {
     )
 }
 
+/// The user message of one intent turn: its header, its prompt and the
+/// autonomy context, with the refused-marker notice appended once (PN-133).
+/// Also returns the notice it showed, to acknowledge once the turn succeeds.
+pub(crate) fn intent_user_message(
+    root_dir: &Path,
+    config: &crate::config::Config,
+    intent: &Intent,
+) -> (String, Option<crate::prediction::refusals::ShownNotice>) {
+    let autonomy_context = prompt::build_autonomy_context(root_dir, config);
+    crate::prediction::refusals::with_notice(
+        root_dir,
+        format!(
+            "{}\n\n{}\n\n{}",
+            intent_header(intent),
+            intent.prompt,
+            autonomy_context
+        ),
+    )
+}
+
 /// Execute a single intent with tools.
 async fn execute_intent(
     intent: &Intent,
@@ -733,14 +714,7 @@ async fn execute_intent(
         }
     };
 
-    // Build user message with autonomy context
-    let autonomy_context = prompt::build_autonomy_context(&root_dir, &state.config);
-    let user_message = format!(
-        "{}\n\n{}\n\n{}",
-        intent_header(intent),
-        intent.prompt,
-        autonomy_context
-    );
+    let (user_message, refusal_notice) = intent_user_message(&root_dir, &state.config, intent);
 
     // Capture start time for accurate duration tracking
     let started_at = Utc::now();
@@ -770,9 +744,18 @@ async fn execute_intent(
         Ok(r) => r,
         Err(e) => {
             tracing::error!("LLM invocation failed for intent '{}': {}", intent.id, e);
+            // Same provider bookkeeping as a failed task: classify, update
+            // status, emit ProviderError. The intent is still dropped.
+            super::runner::handle_provider_error(state, &intent.id, e.as_ref()).await;
             return None;
         }
     };
+
+    // A success clears what a failure recorded, as on the task path.
+    state.provider_status.write().await.record_success();
+    if let Some(ref notice) = refusal_notice {
+        crate::prediction::refusals::acknowledge(&root_dir, notice);
+    }
 
     tracing::info!(
         "Intent '{}' completed ({} tokens in, {} tokens out, {} tool rounds)",
@@ -785,70 +768,13 @@ async fn execute_intent(
     // Parse output for markers
     let parsed = output::parse_output(&result.response_text);
 
-    // Handle [PREDICT:] / [RESOLVE:] markers (PN-86). Until now the intent
-    // path silently dropped them — process_task_output's only call site was
-    // the task path in runner.rs, so predictions and resolutions emitted
-    // during intent sessions never reached predictions.json. Applies via
-    // the store's locked load-apply-save, racing task fires safely.
-    let mut resolved_prediction_ids: Vec<String> = Vec::new();
-    if state.config.prediction.enabled {
-        let intent_id = intent.id.clone();
-        // Raw response, not clean_content: the lazy SHARE/CALL regexes can
-        // swallow an embedded [RESOLVE:] span while stripping (SEC-013).
-        let content = result.response_text.clone();
-        let max_unresolved = state.config.prediction.max_unresolved;
-        let max_errors = state.config.prediction.max_errors;
-        let processed = crate::prediction::store::save_delta_async(
-            root_dir.clone(),
-            state.config.prediction.clone(),
-            move |stack| {
-                let summary = crate::prediction::resolve::process_task_output(
-                    stack,
-                    &content,
-                    &intent_id,
-                    crate::prediction::Timescale::Cycle,
-                );
-                stack.prune(max_unresolved, max_errors);
-                summary
-            },
-        )
-        .await;
-        match processed {
-            Ok(summary) => {
-                if summary.new_errors > 0 {
-                    tracing::info!(
-                        "Intent '{}': {} new prediction errors",
-                        intent.id,
-                        summary.new_errors
-                    );
-                }
-                if !summary.skipped_resolutions.is_empty() {
-                    let alert = super::alerts::alert_from_skipped_resolutions(
-                        &intent.description,
-                        &summary.skipped_resolutions,
-                    );
-                    state.alert_queue.lock().await.push(alert);
-                }
-                resolved_prediction_ids = summary.resolved_prediction_ids;
-            }
-            Err(e) => {
-                // Infrastructure failure loses the resolutions AND their
-                // skip report — alert, don't just log (SEC-012).
-                tracing::error!(
-                    "Failed to process prediction markers for intent '{}': {}",
-                    intent.id,
-                    e
-                );
-                let alert =
-                    super::alerts::alert_from_store_failure(&intent.description, &e.to_string());
-                state.alert_queue.lock().await.push(alert);
-            }
-        }
-    }
+    // Prediction markers are refused, never applied (PN-133); same as the
+    // task path.
+    crate::prediction::refusals::refuse_markers(&root_dir, &result.response_text);
+    let resolved_prediction_ids: Vec<String> = Vec::new();
 
-    // Persistent cognition substrate (PN-95) — same ordering as the task
-    // path: after prediction post-processing, so resolutions are available
-    // as discharge evidence and new errors are visible to ingest.
+    // Persistent cognition substrate (PN-95) — the same call as the task
+    // path; no prediction resolves in a cycle since PN-133.
     super::tension_cycle::close_cycle(
         state,
         &root_dir,
@@ -942,7 +868,7 @@ async fn execute_intent(
                     // resolves (SEC-007).
                     let chain_prompt = chain.prompt.replace(
                         "{result}",
-                        &crate::prediction::resolve::strip_prediction_markers(
+                        &crate::prediction::markers::strip_prediction_markers(
                             &parsed.clean_content,
                         ),
                     );
@@ -980,7 +906,7 @@ async fn execute_intent(
             // Same marker-replay guard as the [CHAIN:] path above (SEC-007).
             let chain_prompt = chain.prompt.replace(
                 "{result}",
-                &crate::prediction::resolve::strip_prediction_markers(&parsed.clean_content),
+                &crate::prediction::markers::strip_prediction_markers(&parsed.clean_content),
             );
             let chain_intent = Intent {
                 id: format!(
@@ -1307,48 +1233,6 @@ fn log_intent_execution(root_dir: &Path, intent: &Intent, summary: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// End to end over the real monitor: a frozen intent is dropped once
-    /// `pipeline-state.json` shows movement, and kept while it does not.
-    #[test]
-    fn a_frozen_intent_is_dropped_once_pipeline_state_shows_movement() {
-        let dir = tempfile::tempdir().unwrap();
-        let monitor = crate::praxis::runtime::PraxisMonitor::new();
-        let mut intent = make_intent("frozen", IntentPriority::Normal);
-        intent.source = IntentSource::Event("pipeline_frozen".into());
-
-        let write_state = |sessions: u32| {
-            std::fs::write(
-                dir.path().join("pipeline-state.json"),
-                format!(
-                    r#"{{"last_updated": null, "session_count": 9,
-                        "sessions_without_movement": {sessions},
-                        "last_counts": {{"learning": 1, "thoughts": 1, "curiosity": 1,
-                                         "reflections": 1, "praxis": 1}}}}"#
-                ),
-            )
-            .unwrap();
-        };
-
-        write_state(5);
-        assert!(!pipeline_premise_cleared(
-            &intent,
-            Some(&monitor),
-            dir.path(),
-            3
-        ));
-        write_state(0);
-        assert!(pipeline_premise_cleared(
-            &intent,
-            Some(&monitor),
-            dir.path(),
-            3
-        ));
-        assert!(
-            !pipeline_premise_cleared(&intent, None, dir.path(), 3),
-            "no monitor, no evidence the premise cleared"
-        );
-    }
 
     fn make_intent(id: &str, priority: IntentPriority) -> Intent {
         Intent {

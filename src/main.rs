@@ -12,6 +12,7 @@ mod coordinator;
 mod discovery;
 mod errors;
 mod events;
+mod fs_safe;
 mod graph_context;
 mod graph_extract;
 mod graph_feedback;
