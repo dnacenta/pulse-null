@@ -42,9 +42,11 @@ pub async fn boot_pulse(
     // Tools
     let mut tools = super::setup::register_builtin_tools(&root_dir, &config);
 
-    // Plugins (init, start, collect tools + routes)
+    // Plugins (init, start, collect tools + routes); their turns wait on
+    // the runner until the state below binds it.
+    let turns = super::turns::TurnRunner::new();
     let (plugin_manager, plugin_routes) =
-        super::setup::init_and_start_plugins(&config, &root_dir, &mut tools).await?;
+        super::setup::init_and_start_plugins(&config, &root_dir, &mut tools, &turns).await?;
 
     // Platform awareness, then the system prompt (built after tools/plugins
     // so it carries this boot's AWARENESS.md)
@@ -107,7 +109,9 @@ pub async fn boot_pulse(
             crate::ledger::DEFAULT_RING_CAPACITY,
         )),
         graph_extractor: crate::graph_extract::GraphExtractor::for_pulse(&config, &root_dir),
+        turns,
     });
+    state.turns.bind(&state);
 
     // Pipeline health check
     super::setup::startup_pipeline_check(&root_dir, &config, &state.pipeline_monitor);

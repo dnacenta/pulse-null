@@ -14,19 +14,29 @@ use super::AppState;
 /// as the owner: the loopback deployment has always trusted the host, and
 /// this keeps that behaviour explicit rather than silent. A peer presenting
 /// its own secret is a peer, never the owner.
+///
+/// An in-process plugin is neither (PN-110): it runs turns through
+/// [`crate::server::turns::TurnRunner`] without any credential, bound to one
+/// non-reserved channel, and its senders resolve like any external sender's.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AuthIdentity {
     Owner,
     Peer(String),
+    Plugin { name: &'static str, channel: String },
 }
 
 impl AuthIdentity {
-    /// Refuse anyone but the owner. Peers get 403, never a silent success.
+    /// Refuse anyone but the owner. Peers and plugins get 403, never a
+    /// silent success.
     pub fn require_owner(&self) -> Result<(), StatusCode> {
         match self {
             Self::Owner => Ok(()),
             Self::Peer(name) => {
                 tracing::warn!("peer {name} asked for an owner-only endpoint");
+                Err(StatusCode::FORBIDDEN)
+            }
+            Self::Plugin { name, .. } => {
+                tracing::warn!("plugin {name} asked for an owner-only endpoint");
                 Err(StatusCode::FORBIDDEN)
             }
         }
@@ -238,6 +248,7 @@ mod tests {
             comms: crate::comms::Slot::new(),
             graph_extractor: None,
             ledger: Arc::new(crate::ledger::LedgerRing::new(16)),
+            turns: crate::server::turns::TurnRunner::new(),
         })
     }
 
@@ -423,6 +434,7 @@ mod tests {
             comms: crate::comms::Slot::new(),
             graph_extractor: None,
             ledger: Arc::new(crate::ledger::LedgerRing::new(16)),
+            turns: crate::server::turns::TurnRunner::new(),
         })
     }
 

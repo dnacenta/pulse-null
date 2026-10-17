@@ -98,13 +98,14 @@ pub async fn init_and_start_plugins(
     config: &Config,
     root_dir: &Path,
     tools: &mut ToolRegistry,
+    turns: &super::turns::TurnRunner,
 ) -> Result<(PluginManager, axum::Router), Box<dyn std::error::Error>> {
     let mut plugin_manager = PluginManager::new(config);
 
     if plugin_manager.count() > 0 {
         let plugin_provider = crate::providers::create_provider_arc(config, root_dir)?;
         plugin_manager
-            .init_all(config, root_dir, plugin_provider)
+            .init_all(config, root_dir, plugin_provider, turns.clone())
             .await?;
         plugin_manager.start_all().await?;
         tracing::info!("{} plugin(s) started", plugin_manager.count());

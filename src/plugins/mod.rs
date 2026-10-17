@@ -35,6 +35,10 @@ pub struct PluginContext {
     pub pulse_root: PathBuf,
     pub pulse_name: String,
     pub provider: Arc<Box<dyn LmProvider>>,
+    /// The daemon's in-process turn pipeline (PN-110). A plugin that answers
+    /// messages takes `turns.for_plugin(..)` at init instead of calling
+    /// `/chat` over HTTP.
+    pub turns: crate::server::turns::TurnRunner,
 }
 
 /// The Plugin trait — dyn-compatible, no async_trait dependency.

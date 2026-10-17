@@ -145,6 +145,43 @@ fn refuse_peer_on_owner_channel(
     Ok(())
 }
 
+/// The session key for a plugin's turn (PN-110). A plugin speaks only on
+/// the channel it was bound to, and never on a reserved one, so no plugin
+/// configuration can make its senders the owner by channel. Its senders then
+/// resolve like any external sender's, with one exception: on voice every
+/// caller is a guest, whatever name or number the transport reports, until
+/// a real owner proof exists (spec 0b-2).
+fn resolve_plugin_key(
+    plugin: &str,
+    bound_channel: &str,
+    req: &ChatRequest,
+    config: &crate::config::Config,
+) -> Result<String, (StatusCode, String)> {
+    if req.channel != bound_channel || crate::server::turns::is_reserved_channel(&req.channel) {
+        tracing::warn!(
+            "plugin {plugin} (bound to {bound_channel:?}) tried to speak on {:?}",
+            req.channel
+        );
+        return Err((
+            StatusCode::FORBIDDEN,
+            "a plugin may only speak on its own channel".to_string(),
+        ));
+    }
+    let sender = req.sender.as_deref();
+    if req
+        .channel
+        .eq_ignore_ascii_case(crate::server::turns::VOICE_CHANNEL)
+    {
+        return Ok(format!("guest:{}", sender.unwrap_or("anonymous")));
+    }
+    Ok(resolve_sender(
+        &req.channel,
+        sender,
+        &config.owner,
+        &config.peers,
+    ))
+}
+
 /// Run one conversation turn end to end: identity, isolation, context buffer,
 /// session limits, compaction, the provider call (with refusal fallback),
 /// guards, persistence, and the post-interaction event.
@@ -180,6 +217,9 @@ pub(crate) async fn run_turn(
         AuthIdentity::Peer(name) => {
             refuse_peer_on_owner_channel(&who, &req.channel)?;
             format!("peer:{name}")
+        }
+        AuthIdentity::Plugin { name, channel } => {
+            resolve_plugin_key(name, channel, &req, &state.config)?
         }
     };
 

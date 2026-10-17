@@ -297,6 +297,7 @@ async fn build_state_boxed_with_config(
         comms: crate::comms::Slot::new(),
         graph_extractor: None,
         ledger: Arc::new(crate::ledger::LedgerRing::new(64)),
+        turns: crate::server::turns::TurnRunner::new(),
     })
 }
 
@@ -2488,5 +2489,319 @@ async fn e2e_non_voice_request_gets_no_voice_guidance() {
             !prompt.contains("<voice-call>"),
             "{channel:?} must not receive voice guidance:\n{prompt}"
         );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// PN-110: plugins run turns in-process, as their own principal
+// ---------------------------------------------------------------------------
+
+mod plugin_turns_e2e {
+    use super::*;
+    use crate::server::auth::AuthIdentity;
+    use crate::server::turns::{PluginTurn, TurnError};
+
+    const SECRET: &str = "s3cret";
+
+    /// A state with `[security] secret` set and an owner with a Discord id
+    /// and a name, so attribution has something to match.
+    async fn secured_state(dir: &std::path::Path, provider: MockProvider) -> Arc<AppState> {
+        let mut config = test_config();
+        config.security.secret = Some(SECRET.to_string());
+        config.owner.discord_id = Some("1001".to_string());
+        config.owner.name = Some("D".to_string());
+        build_state_boxed_with_config(
+            dir.to_path_buf(),
+            Box::new(provider),
+            ToolRegistry::new(),
+            config,
+        )
+        .await
+    }
+
+    fn turn(message: &str, sender: &str) -> PluginTurn {
+        PluginTurn {
+            message: message.to_string(),
+            sender: Some(sender.to_string()),
+        }
+    }
+
+    async fn has_session(state: &Arc<AppState>, key: &str) -> bool {
+        state.session_store.get_existing_by_key(key).await.is_some()
+    }
+
+    #[tokio::test]
+    async fn a_plugin_turn_runs_with_the_secret_set() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = secured_state(dir.path(), MockProvider::new(vec![mock_text("pong")])).await;
+        state.turns.bind(&state);
+        let turns = state
+            .turns
+            .for_plugin("discord-text-echo", "discord")
+            .unwrap();
+
+        let reply = turns.run(turn("ping", "2002"), None).await.unwrap();
+        assert_eq!(reply.response, "pong");
+    }
+
+    #[tokio::test]
+    async fn discord_attribution_is_unchanged() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = secured_state(
+            dir.path(),
+            MockProvider::new(vec![mock_text("hi owner"), mock_text("hi guest")]),
+        )
+        .await;
+        state.turns.bind(&state);
+        let turns = state
+            .turns
+            .for_plugin("discord-text-echo", "discord")
+            .unwrap();
+
+        turns.run(turn("hello", "1001"), None).await.unwrap();
+        assert!(has_session(&state, "owner").await, "owner id → owner");
+
+        turns.run(turn("hello", "2002"), None).await.unwrap();
+        assert!(
+            has_session(&state, "guest:2002").await,
+            "unknown id → guest"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_voice_turn_is_a_guest_even_under_the_owner_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = secured_state(dir.path(), MockProvider::new(vec![mock_text("hello")])).await;
+        state.turns.bind(&state);
+        let turns = state.turns.for_plugin("voice-echo", "voice").unwrap();
+
+        // "D" is the configured owner name: on any other channel it would
+        // resolve to the owner. On voice it must not.
+        turns.run(turn("it's me", "D"), None).await.unwrap();
+        assert!(has_session(&state, "guest:D").await);
+        assert!(!has_session(&state, "owner").await);
+    }
+
+    #[tokio::test]
+    async fn run_turn_refuses_a_plugin_on_a_reserved_or_foreign_channel() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = secured_state(dir.path(), MockProvider::new(vec![])).await;
+        state.turns.bind(&state);
+
+        // Bound to a reserved channel behind for_plugin's back.
+        let tui = state.turns.unchecked_plugin("rogue", "tui");
+        match tui.run(turn("hi", "1001"), None).await {
+            Err(TurnError::Refused(status, _)) => assert_eq!(status, StatusCode::FORBIDDEN),
+            other => panic!("expected 403, got {:?}", other.map(|r| r.response)),
+        }
+
+        // A request on a channel other than the bound one.
+        let who = AuthIdentity::Plugin {
+            name: "discord-text-echo",
+            channel: "discord".to_string(),
+        };
+        let req = handlers::chat::ChatRequest {
+            message: "hi".to_string(),
+            channel: "voice".to_string(),
+            sender: Some("1001".to_string()),
+        };
+        let outcome = handlers::chat::run_turn(Arc::clone(&state), req, who, None).await;
+        assert_eq!(outcome.err().map(|(s, _)| s), Some(StatusCode::FORBIDDEN));
+        assert!(!has_session(&state, "owner").await);
+    }
+
+    #[tokio::test]
+    async fn a_plugin_principal_gets_403_on_every_owner_gate() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = secured_state(dir.path(), MockProvider::new(vec![])).await;
+        for channel in ["discord", "voice"] {
+            let who = AuthIdentity::Plugin {
+                name: "test-plugin",
+                channel: channel.to_string(),
+            };
+            assert_eq!(who.require_owner(), Err(StatusCode::FORBIDDEN));
+
+            // The real handlers, with the plugin principal where the auth
+            // middleware would have put the owner.
+            let app = Router::new()
+                .route("/api/session/{channel}", get(handlers::sessions::history))
+                .route("/api/ledger", get(handlers::events::ledger))
+                .route("/api/events", get(handlers::events::events))
+                .route(
+                    "/api/schedule/{id}/disable",
+                    post(handlers::schedule::disable),
+                )
+                .route(
+                    "/api/sessions/reset",
+                    post(handlers::sessions::reset_session),
+                )
+                .route("/api/alerts/drain", post(handlers::alerts::drain_alerts))
+                .layer(axum::Extension(who))
+                .with_state(Arc::clone(&state));
+            for (method, uri, body) in [
+                ("GET", "/api/session/tui", None),
+                ("GET", "/api/ledger", None),
+                ("GET", "/api/events", None),
+                ("POST", "/api/schedule/thinking-loop/disable", None),
+                (
+                    "POST",
+                    "/api/sessions/reset",
+                    Some(serde_json::json!({"session_key": "owner"})),
+                ),
+                ("POST", "/api/alerts/drain", None),
+            ] {
+                let mut req = Request::builder().method(method).uri(uri);
+                let body = match body {
+                    Some(json) => {
+                        req = req.header("content-type", "application/json");
+                        Body::from(json.to_string())
+                    }
+                    None => Body::empty(),
+                };
+                let r = app.clone().oneshot(req.body(body).unwrap()).await.unwrap();
+                assert_eq!(
+                    r.status(),
+                    StatusCode::FORBIDDEN,
+                    "{channel}: {method} {uri}"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn a_turn_before_the_bind_waits_for_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = secured_state(dir.path(), MockProvider::new(vec![mock_text("late")])).await;
+        let turns = state
+            .turns
+            .for_plugin("discord-text-echo", "discord")
+            .unwrap();
+
+        let pending = tokio::spawn(async move { turns.run(turn("early", "2002"), None).await });
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        assert!(!pending.is_finished(), "the turn must wait, not fail");
+
+        state.turns.bind(&state);
+        let reply = pending.await.unwrap().unwrap();
+        assert_eq!(reply.response, "late");
+    }
+
+    #[tokio::test]
+    async fn a_turn_after_close_is_shutting_down() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = secured_state(dir.path(), MockProvider::new(vec![mock_text("x")])).await;
+        state.turns.bind(&state);
+        let turns = state
+            .turns
+            .for_plugin("discord-text-echo", "discord")
+            .unwrap();
+
+        assert!(state.turns.close(std::time::Duration::from_secs(1)).await);
+        let outcome = turns.run(turn("hi", "2002"), None).await;
+        assert_eq!(outcome.err(), Some(TurnError::ShuttingDown));
+    }
+
+    #[tokio::test]
+    async fn close_drains_a_turn_in_flight() {
+        let dir = tempfile::tempdir().unwrap();
+        let delay = std::time::Duration::from_millis(300);
+        let state = secured_state(
+            dir.path(),
+            MockProvider::with_delay(vec![mock_text("finished")], delay),
+        )
+        .await;
+        state.turns.bind(&state);
+        let turns = state
+            .turns
+            .for_plugin("discord-text-echo", "discord")
+            .unwrap();
+
+        let in_flight = tokio::spawn(async move { turns.run(turn("slow", "2002"), None).await });
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        let started = std::time::Instant::now();
+        assert!(state.turns.close(std::time::Duration::from_secs(5)).await);
+        assert!(
+            started.elapsed() >= std::time::Duration::from_millis(150),
+            "close returned before the turn finished"
+        );
+        assert!(in_flight.is_finished());
+        assert_eq!(in_flight.await.unwrap().unwrap().response, "finished");
+    }
+
+    #[tokio::test]
+    async fn a_plugin_has_its_own_pool() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = secured_state(
+            dir.path(),
+            MockProvider::with_delay(vec![], std::time::Duration::from_millis(300)),
+        )
+        .await;
+        state.turns.bind(&state);
+        let turns = state
+            .turns
+            .for_plugin("discord-text-echo", "discord")
+            .unwrap();
+
+        let mut running = Vec::new();
+        for i in 0..crate::server::turns::PLUGIN_POOL_SIZE {
+            let t = turns.clone();
+            running.push(tokio::spawn(async move {
+                t.run(turn("hold", &format!("guest-{i}")), None).await
+            }));
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        let outcome = turns.run(turn("one more", "guest-x"), None).await;
+        assert_eq!(outcome.err(), Some(TurnError::Busy));
+
+        // Another plugin is not starved by the first one's burst.
+        let voice = state.turns.for_plugin("voice-echo", "voice").unwrap();
+        assert!(voice.run(turn("hello", "caller"), None).await.is_ok());
+        for r in running {
+            assert!(r.await.unwrap().is_ok());
+        }
+    }
+
+    /// The real router with the secret set: `/chat` and plugin routes need
+    /// the credential, `/health` does not (AC3).
+    #[tokio::test]
+    async fn plugin_routes_sit_inside_the_auth_layer() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = secured_state(dir.path(), MockProvider::new(vec![])).await;
+        let plugin_routes = Router::new().route("/plugins/test/ping", get(|| async { "pong" }));
+        let app = crate::server::build_router(Arc::clone(&state), plugin_routes);
+
+        let get_req = |uri: &str, secret: Option<&str>| {
+            let mut req = Request::builder().method("GET").uri(uri);
+            if let Some(s) = secret {
+                req = req.header("X-Echo-Secret", s);
+            }
+            req.body(Body::empty()).unwrap()
+        };
+        let status = |r: axum::response::Response| r.status();
+
+        let r = app
+            .clone()
+            .oneshot(get_req("/plugins/test/ping", None))
+            .await
+            .unwrap();
+        assert_eq!(status(r), StatusCode::UNAUTHORIZED);
+        let r = app
+            .clone()
+            .oneshot(get_req("/plugins/test/ping", Some(SECRET)))
+            .await
+            .unwrap();
+        assert_eq!(status(r), StatusCode::OK);
+        let r = app.clone().oneshot(get_req("/health", None)).await.unwrap();
+        assert_eq!(status(r), StatusCode::OK);
+
+        let chat = Request::builder()
+            .method("POST")
+            .uri("/chat")
+            .header("content-type", "application/json")
+            .body(Body::from(r#"{"message":"hi"}"#))
+            .unwrap();
+        let r = app.clone().oneshot(chat).await.unwrap();
+        assert_eq!(status(r), StatusCode::UNAUTHORIZED);
     }
 }

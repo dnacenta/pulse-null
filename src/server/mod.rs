@@ -10,6 +10,7 @@ pub mod prompt;
 pub mod rate_limit;
 pub mod setup;
 pub mod trust;
+pub mod turns;
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -74,6 +75,9 @@ pub struct AppState {
     /// Background entity extraction for freshly ingested archives; `None`
     /// when `[graph]` turns it off.
     pub graph_extractor: Option<crate::graph_extract::GraphExtractor>,
+    /// In-process turns for plugins (PN-110), bound to this state once it
+    /// exists. Plugins hold clones; shutdown closes and drains it.
+    pub turns: turns::TurnRunner,
 }
 
 /// Concurrent `/api/events` connections before a 503.
@@ -257,9 +261,11 @@ pub async fn start_in(
     let mut tools = setup::register_builtin_tools(&root_dir, &config);
     tracing::info!("Registered {} built-in tool(s)", tools.definitions().len());
 
-    // Initialize and start plugins, collecting contributed tools
+    // Initialize and start plugins, collecting contributed tools. Their
+    // turns wait on the runner until the state below binds it.
+    let turns = turns::TurnRunner::new();
     let (plugin_manager, plugin_routes) =
-        setup::init_and_start_plugins(&config, &root_dir, &mut tools).await?;
+        setup::init_and_start_plugins(&config, &root_dir, &mut tools, &turns).await?;
 
     // Generate AWARENESS.md, then the system prompt from the pulse's
     // documents (built last so it carries this boot's AWARENESS.md)
@@ -351,7 +357,9 @@ pub async fn start_in(
         comms: crate::comms::Slot::new(),
         ledger,
         graph_extractor: crate::graph_extract::GraphExtractor::for_pulse(&config, &root_dir),
+        turns,
     });
+    state.turns.bind(&state);
 
     // Startup pipeline health check
     setup::startup_pipeline_check(&root_dir, &config, &state.pipeline_monitor);
@@ -476,12 +484,21 @@ pub async fn start_in(
     // 2. Stop plugins (Discord bot, etc.) so they stop generating new requests.
     state.plugin_manager.lock().await.stop_all().await;
 
-    // 3. Give axum up to 30s to drain remaining in-flight requests.
-    match tokio::time::timeout(std::time::Duration::from_secs(30), server_handle).await {
+    // 3. Give axum and the plugins' in-process turns up to 30s to drain
+    //    what is in flight; no new plugin turn starts from here on.
+    let drain = std::time::Duration::from_secs(30);
+    let (served, turns_drained) = tokio::join!(
+        tokio::time::timeout(drain, server_handle),
+        state.turns.close(drain)
+    );
+    match served {
         Ok(Ok(Ok(()))) => tracing::info!("Server drained cleanly"),
         Ok(Ok(Err(e))) => tracing::warn!("Server error during drain: {}", e),
         Ok(Err(e)) => tracing::warn!("Server task panicked: {}", e),
         Err(_) => tracing::warn!("Server drain timed out after 30s, proceeding with shutdown"),
+    }
+    if !turns_drained {
+        tracing::warn!("Plugin turns still in flight after 30s, proceeding with shutdown");
     }
 
     // 4. Flush any in-flight persistence tasks before archiving
@@ -571,6 +588,10 @@ pub async fn start_in(
 }
 
 /// Build the Axum router from AppState and optional plugin routes.
+///
+/// Plugin routes sit inside the same auth and rate-limit layers as the
+/// daemon's own (PN-110): nothing on the port is reachable without the
+/// credential when `[security] secret` is set, `/health` aside.
 pub fn build_router(state: Arc<AppState>, plugin_routes: Router<()>) -> Router {
     let limiter = rate_limit::default_limiter();
 
@@ -611,16 +632,16 @@ pub fn build_router(state: Arc<AppState>, plugin_routes: Router<()>) -> Router {
         )
         .route("/api/alerts/drain", post(handlers::alerts::drain_alerts))
         .route("/api/alerts/peek", get(handlers::alerts::peek_alerts))
+        .with_state(Arc::clone(&state))
+        .merge(plugin_routes)
         .route_layer(middleware::from_fn_with_state(
             Arc::clone(&state),
             auth::require_auth,
         ))
-        .with_state(Arc::clone(&state))
         .layer(middleware::from_fn_with_state(
             limiter,
             rate_limit::rate_limit,
         ))
-        .merge(plugin_routes)
 }
 
 /// Ensure all required directories and seed files exist.

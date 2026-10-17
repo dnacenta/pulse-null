@@ -84,11 +84,13 @@ impl PluginManager {
         config: &Config,
         pulse_root: &Path,
         provider: Arc<Box<dyn LmProvider>>,
+        turns: crate::server::turns::TurnRunner,
     ) -> Result<(), crate::errors::PluginError> {
         let ctx = PluginContext {
             pulse_root: pulse_root.to_path_buf(),
             pulse_name: config.pulse.name.clone(),
             provider,
+            turns,
         };
 
         for entry in &mut self.entries {
