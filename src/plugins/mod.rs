@@ -8,6 +8,8 @@ pub mod recall_echo;
 #[cfg(feature = "discord-text")]
 pub mod discord_echo;
 #[cfg(feature = "discord-text")]
+pub(crate) mod discord_forwarder;
+#[cfg(feature = "discord-text")]
 pub mod discord_text_echo;
 #[cfg(feature = "voice")]
 pub mod voice_echo;

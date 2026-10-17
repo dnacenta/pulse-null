@@ -2805,3 +2805,142 @@ mod plugin_turns_e2e {
         assert_eq!(status(r), StatusCode::UNAUTHORIZED);
     }
 }
+
+// ---------------------------------------------------------------------------
+// PN-110: the Discord text forwarder runs turns in-process
+// ---------------------------------------------------------------------------
+
+#[cfg(feature = "discord-text")]
+mod discord_forwarder_e2e {
+    use super::*;
+    use crate::plugins::discord_forwarder::{Forwarder, Handled, ReplyPoster};
+    use discord_echo::dedup::DedupState;
+    use discord_echo::types::IncomingMessage;
+    use std::future::Future;
+    use std::pin::Pin;
+
+    /// Records every post instead of calling Discord.
+    #[derive(Default)]
+    struct FakePoster {
+        posts: std::sync::Mutex<Vec<(String, String)>>,
+    }
+
+    impl ReplyPoster for FakePoster {
+        fn post<'a>(
+            &'a self,
+            channel_id: &'a str,
+            text: &'a str,
+        ) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + 'a>> {
+            self.posts
+                .lock()
+                .unwrap()
+                .push((channel_id.to_string(), text.to_string()));
+            Box::pin(async { Ok(()) })
+        }
+    }
+
+    async fn forwarder_with(
+        dir: &std::path::Path,
+        replies: Vec<LlmResponse>,
+    ) -> (Arc<AppState>, Forwarder<FakePoster>, Arc<FakePoster>) {
+        let mut config = test_config();
+        config.security.secret = Some("s3cret".to_string());
+        config.owner.discord_id = Some("1001".to_string());
+        let state = build_state_boxed_with_config(
+            dir.to_path_buf(),
+            Box::new(MockProvider::new(replies)),
+            ToolRegistry::new(),
+            config,
+        )
+        .await;
+        state.turns.bind(&state);
+        let turns = state
+            .turns
+            .for_plugin("discord-text-echo", "discord")
+            .unwrap();
+        let poster = Arc::new(FakePoster::default());
+        let dedup = Arc::new(tokio::sync::Mutex::new(DedupState::new()));
+        let forwarder = Forwarder::new(turns, Arc::clone(&poster), dedup);
+        (state, forwarder, poster)
+    }
+
+    fn message(id: &str, author: &str, content: &str) -> IncomingMessage {
+        IncomingMessage {
+            message_id: id.to_string(),
+            channel_id: "chan-1".to_string(),
+            channel_name: Some("echo".to_string()),
+            author_id: author.to_string(),
+            author_name: "someone".to_string(),
+            content: content.to_string(),
+            timestamp: chrono::Utc::now(),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_reply_is_posted_with_the_secret_set() {
+        let dir = tempfile::tempdir().unwrap();
+        let (state, forwarder, poster) =
+            forwarder_with(dir.path(), vec![mock_text("hello there")]).await;
+
+        let handled = forwarder.handle(message("m1", "1001", "hi")).await;
+        assert_eq!(handled, Handled::Posted);
+        assert_eq!(
+            *poster.posts.lock().unwrap(),
+            vec![("chan-1".to_string(), "hello there".to_string())]
+        );
+        // The owner's Discord id still lands in the owner session.
+        assert!(state
+            .session_store
+            .get_existing_by_key("owner")
+            .await
+            .is_some());
+    }
+
+    #[tokio::test]
+    async fn a_silent_reply_is_not_posted() {
+        let dir = tempfile::tempdir().unwrap();
+        let (_state, forwarder, poster) = forwarder_with(
+            dir.path(),
+            vec![mock_text("[SILENT] nothing to add"), mock_text("   ")],
+        )
+        .await;
+
+        assert_eq!(
+            forwarder.handle(message("m1", "2002", "hi")).await,
+            Handled::Silent
+        );
+        assert_eq!(
+            forwarder.handle(message("m2", "2002", "hi")).await,
+            Handled::Silent
+        );
+        assert!(poster.posts.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_duplicate_event_is_skipped_before_the_turn() {
+        let dir = tempfile::tempdir().unwrap();
+        let (_state, forwarder, poster) =
+            forwarder_with(dir.path(), vec![mock_text("once"), mock_text("twice")]).await;
+
+        assert_eq!(
+            forwarder.handle(message("m1", "2002", "hi")).await,
+            Handled::Posted
+        );
+        assert_eq!(
+            forwarder.handle(message("m1", "2002", "hi")).await,
+            Handled::Duplicate
+        );
+        assert_eq!(poster.posts.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_stale_event_is_dropped() {
+        let dir = tempfile::tempdir().unwrap();
+        let (_state, forwarder, poster) = forwarder_with(dir.path(), vec![mock_text("x")]).await;
+
+        let mut old = message("m1", "2002", "hi");
+        old.timestamp = chrono::Utc::now() - chrono::Duration::seconds(120);
+        assert_eq!(forwarder.handle(old).await, Handled::Stale);
+        assert!(poster.posts.lock().unwrap().is_empty());
+    }
+}

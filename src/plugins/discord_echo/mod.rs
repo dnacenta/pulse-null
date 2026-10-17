@@ -3,28 +3,27 @@ pub mod config;
 use std::future::Future;
 use std::pin::Pin;
 
+use super::discord_forwarder::DiscordText;
 use super::{Plugin, PluginContext, PluginHealth, PluginMeta, PluginResult, SetupPrompt};
-use pulse_system_types::plugin::Plugin as PstPlugin;
 
-/// Adapter wrapping the discord-echo crate's `DiscordEcho` struct.
+const NAME: &str = "discord-echo";
+
+/// The discord-echo plugin: discord-echo's gateway and REST client, with
+/// each message answered in-process (PN-110).
 pub struct DiscordEchoPlugin {
-    inner: Option<discord_echo::DiscordEcho>,
-    started: bool,
+    inner: Option<DiscordText>,
 }
 
 impl DiscordEchoPlugin {
     pub fn new() -> Self {
-        Self {
-            inner: None,
-            started: false,
-        }
+        Self { inner: None }
     }
 }
 
 impl Plugin for DiscordEchoPlugin {
     fn meta(&self) -> PluginMeta {
         PluginMeta {
-            name: "discord-echo".to_string(),
+            name: NAME.to_string(),
             version: env!("CARGO_PKG_VERSION").to_string(),
             description: "Discord bot presence and voice channels".to_string(),
         }
@@ -33,12 +32,12 @@ impl Plugin for DiscordEchoPlugin {
     fn init<'a>(
         &'a mut self,
         toml_config: &'a toml::Value,
-        _ctx: &'a PluginContext,
+        ctx: &'a PluginContext,
     ) -> PluginResult<'a> {
         Box::pin(async move {
             let config = config::from_toml(toml_config)?;
-            tracing::info!("discord-echo: configured for guild {}", config.guild_id);
-            self.inner = Some(discord_echo::DiscordEcho::new(config));
+            tracing::info!("{NAME}: configured for guild {}", config.guild_id);
+            self.inner = Some(DiscordText::new(NAME, config, toml_config, ctx)?);
             Ok(())
         })
     }
@@ -46,25 +45,18 @@ impl Plugin for DiscordEchoPlugin {
     fn start(&mut self) -> PluginResult<'_> {
         Box::pin(async move {
             let inner = self.inner.as_mut().ok_or("discord-echo: not initialized")?;
-            PstPlugin::start(inner).await.map_err(
-                |e| -> Box<dyn std::error::Error + Send + Sync> {
+            inner
+                .start()
+                .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> {
                     format!("discord-echo start failed: {e}").into()
-                },
-            )?;
-            self.started = true;
-            Ok(())
+                })
         })
     }
 
     fn stop(&mut self) -> PluginResult<'_> {
         Box::pin(async move {
             if let Some(inner) = self.inner.as_mut() {
-                PstPlugin::stop(inner).await.map_err(
-                    |e| -> Box<dyn std::error::Error + Send + Sync> {
-                        format!("discord-echo stop failed: {e}").into()
-                    },
-                )?;
-                self.started = false;
+                inner.stop().await;
             }
             Ok(())
         })
@@ -73,32 +65,14 @@ impl Plugin for DiscordEchoPlugin {
     fn health(&self) -> Pin<Box<dyn Future<Output = PluginHealth> + Send + '_>> {
         Box::pin(async move {
             match &self.inner {
-                Some(inner) => PstPlugin::health(inner).await,
+                Some(inner) => inner.health(),
                 None => PluginHealth::Down("not initialized".to_string()),
             }
         })
     }
 
     fn setup_prompts(&self) -> Vec<SetupPrompt> {
-        match &self.inner {
-            Some(inner) => PstPlugin::setup_prompts(inner),
-            None => vec![
-                SetupPrompt {
-                    key: "bot_token".to_string(),
-                    question: "Discord bot token:".to_string(),
-                    default: None,
-                    required: true,
-                    secret: true,
-                },
-                SetupPrompt {
-                    key: "guild_id".to_string(),
-                    question: "Discord server (guild) ID:".to_string(),
-                    default: None,
-                    required: true,
-                    secret: false,
-                },
-            ],
-        }
+        super::discord_forwarder::setup_prompts()
     }
 
     fn platform_description(&self) -> Option<String> {
