@@ -51,6 +51,7 @@ pulse-null up --headless     # or run it as a daemon (systemd)
 - [Commands](docs/commands.md) · [Configuration](docs/configuration.md)
 - [Terminal UI](docs/tui.md) · [HTTP API](docs/http-api.md): routes, security, plugins
 - [Troubleshooting](docs/troubleshooting.md)
+- [Lifecycle stance](docs/pulse-lifecycle-stance.md): how pulses are paused, swapped, kept and told
 
 ## Contributing
 
