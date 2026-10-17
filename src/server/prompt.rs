@@ -83,11 +83,9 @@ const THOUGHT_STACK_SOFT_BUDGET_BYTES: usize = 45_000;
 /// the byte cap are applied. A post-trim count would understate the problem in
 /// exactly the case where the line cap has already dropped content silently.
 ///
-/// It is logged, not rendered into the prompt. The chat prompt already runs
-/// over its token budget — every Low-tier block is dropped and THOUGHT_STACK.md
-/// is truncated to fit — so each token added to a High-tier block comes
-/// straight out of the thought stack's tail. The report must not cost the
-/// content it measures.
+/// It is logged, not rendered into the prompt. Under budget pressure each
+/// token added to a High-tier block comes straight out of the thought stack's
+/// tail, so the report must not cost the content it measures.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct Utilisation {
     label: &'static str,
@@ -151,9 +149,11 @@ enum PromptTier {
     /// Essential: the instruction file, rules/protocol files, memory curation instructions.
     /// Never trimmed.
     Essential = 0,
-    /// High priority: SELF.md, MEMORY.md. Truncated only as last resort.
+    /// High priority: SELF.md, MEMORY.md, EPHEMERAL.md, AWARENESS.md,
+    /// THOUGHT_STACK.md. Truncated only as last resort, in `allocation_rank`
+    /// order.
     High = 1,
-    /// Lower priority: EPHEMERAL.md, FINDINGS.md, graph awareness.
+    /// Lower priority: FINDINGS.md, graph awareness.
     /// Progressively compressed or dropped when over budget.
     Low = 2,
 }
@@ -184,7 +184,7 @@ impl PromptComponent {
     fn allocation_rank(&self) -> u8 {
         match self.name {
             "tension-context" | "journal-counts" => 0,
-            "SELF.md" | "MEMORY.md" => 1,
+            "SELF.md" | "MEMORY.md" | "EPHEMERAL.md" => 1,
             "AWARENESS.md" => 3,
             "THOUGHT_STACK.md" => 4,
             _ => 2,
@@ -376,8 +376,12 @@ pub fn build_system_prompt_budgeted(
         cap: 0,
     });
 
-    // --- Tier 1 (High): THOUGHT_STACK.md ---
-    if let Some(wrapped) = load_thought_stack(root_dir, budget_cfg.thought_stack_max_bytes)? {
+    // --- Tier 1 (High): THOUGHT_STACK.md, held to its chat cap ---
+    let chat_cap = (budget_enabled && budget_cfg.thought_stack_chat_cap > 0)
+        .then_some(budget_cfg.thought_stack_chat_cap);
+    if let Some(wrapped) =
+        load_thought_stack(root_dir, budget_cfg.thought_stack_max_bytes, chat_cap)?
+    {
         let tokens = estimate_tokens(&wrapped);
         components.push(PromptComponent {
             name: "THOUGHT_STACK.md",
@@ -391,7 +395,10 @@ pub fn build_system_prompt_budgeted(
     // --- Tier 1 (High): journal counts (a runtime fact, Amendment C) ---
     components.extend(journal_counts_component(root_dir, config));
 
-    // --- Tier 2 (Low): EPHEMERAL.md ---
+    // --- Tier 1 (High): EPHEMERAL.md ---
+    // The last session's summary is the conversation's only continuity
+    // besides MEMORY.md, and it is small and capped. As a Low block it was
+    // the first thing dropped to pay for a big document's overflow.
     let ephemeral_path = root_dir.join("memory/EPHEMERAL.md");
     if ephemeral_path.exists() {
         let content = std::fs::read_to_string(&ephemeral_path)?;
@@ -407,7 +414,7 @@ pub fn build_system_prompt_budgeted(
                 name: "EPHEMERAL.md",
                 content: capped,
                 tokens,
-                tier: PromptTier::Low,
+                tier: PromptTier::High,
                 cap: budget_cfg.ephemeral_cap,
             });
         }
@@ -482,6 +489,7 @@ fn enforce_budget_and_assemble(
 ) -> Result<SystemPromptResult, crate::errors::PromptError> {
     let budget_enabled = budget_cfg.enabled;
     let total_before: usize = components.iter().map(|c| c.tokens).sum();
+    let tokens_before: Vec<usize> = components.iter().map(|c| c.tokens).collect();
     let mut was_trimmed = false;
     let mut dropped_components = Vec::new();
 
@@ -656,6 +664,11 @@ fn enforce_budget_and_assemble(
         was_trimmed,
         dropped_components.len()
     );
+    info!(
+        "[system-prompt-budget] {} components (~tokens): {}",
+        profile,
+        component_breakdown(&components, &tokens_before)
+    );
 
     Ok(SystemPromptResult {
         prompt,
@@ -665,25 +678,29 @@ fn enforce_budget_and_assemble(
     })
 }
 
+/// `name=tokens` per component in render order, `name=before→after` for one
+/// the budget passes changed. The assembled total alone does not say which
+/// block is crowding the rest out.
+fn component_breakdown(components: &[PromptComponent], tokens_before: &[usize]) -> String {
+    components
+        .iter()
+        .zip(tokens_before)
+        .map(|(component, &before)| {
+            if component.tokens == before {
+                format!("{}={}", component.name, before)
+            } else {
+                format!("{}={}→{}", component.name, before, component.tokens)
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
 /// Compress a system prompt component to a single-line status summary.
 /// Used when the system prompt is over budget and low-priority components
 /// need to shrink before being dropped entirely.
 fn compress_to_one_liner(name: &str, content: &str) -> String {
     match name {
-        "EPHEMERAL.md" => {
-            // Extract just the first meaningful line from the session summary
-            let first_line = content
-                .lines()
-                .find(|l| {
-                    let trimmed = l.trim();
-                    !trimmed.is_empty() && !trimmed.starts_with('<') && !trimmed.starts_with("##")
-                })
-                .unwrap_or("[session summary available]");
-            format!(
-                "<last-session>[compressed] {}</last-session>",
-                first_line.trim()
-            )
-        }
         "FINDINGS.md" => {
             // Count findings and emit a one-liner
             let finding_count = content.matches("- ").count().max(1);
@@ -892,8 +909,8 @@ pub fn build_task_system_prompt_budgeted(
         components.push(component);
     }
 
-    // --- Tier 1 (High): THOUGHT_STACK.md — working memory ---
-    if let Some(wrapped) = load_thought_stack(root_dir, budget_cfg.thought_stack_max_bytes)? {
+    // --- Tier 1 (High): THOUGHT_STACK.md — working memory, whole ---
+    if let Some(wrapped) = load_thought_stack(root_dir, budget_cfg.thought_stack_max_bytes, None)? {
         let tokens = estimate_tokens(&wrapped);
         components.push(PromptComponent {
             name: "THOUGHT_STACK.md",
@@ -1320,9 +1337,13 @@ fn whole_files_within(elements: Vec<String>, limit: usize, dir: &Path) -> String
 /// The line cap is the pulse-facing rule (it is instructed to stay under 50);
 /// the byte ceiling is the safety net, because 60 lines say nothing about size.
 /// Every load logs a [`Utilisation`] report against both.
+///
+/// `token_cap`, when set, holds the content to that many tokens inside the
+/// wrapper, keeping the head (the chat profile's `thought_stack_chat_cap`).
 fn load_thought_stack(
     root_dir: &Path,
     max_bytes: usize,
+    token_cap: Option<usize>,
 ) -> Result<Option<String>, crate::errors::PromptError> {
     let path = root_dir.join("THOUGHT_STACK.md");
     if !path.exists() {
@@ -1345,7 +1366,10 @@ fn load_thought_stack(
         .take(THOUGHT_STACK_MAX_LINES)
         .collect::<Vec<_>>()
         .join("\n");
-    let bounded = truncate_to_byte_cap(&limited, max_bytes);
+    let mut bounded = truncate_to_byte_cap(&limited, max_bytes);
+    if let Some(cap) = token_cap {
+        bounded = truncate_to_token_cap(&bounded, cap);
+    }
     Ok(Some(format!(
         "<thought-stack>\n{}\n</thought-stack>",
         bounded
@@ -2995,6 +3019,144 @@ mod tests {
         }
     }
 
+    /// Echo's live chat files on 2026-10-17 (grok adapter): the prompt ran at
+    /// 17,016 / 17,000 with EPHEMERAL.md dropped. With the chat cap the stack
+    /// is held to its head and nothing else is lost (PN-140).
+    fn echo_shaped_root(root: &Path) {
+        write_sized(&root.join("INSTRUCTIONS.md"), 9_510, 120);
+        std::fs::create_dir_all(root.join(".claude/rules")).unwrap();
+        write_sized(&root.join(".claude/rules/self-work.md"), 2_721, 40);
+        write_sized(&root.join("SELF.md"), 7_602, 90);
+        write_sized(&root.join("AWARENESS.md"), 7_039, 90);
+        write_sized(&root.join("THOUGHT_STACK.md"), 44_243, 55);
+        std::fs::create_dir_all(root.join("memory")).unwrap();
+        write_sized(&root.join("memory/MEMORY.md"), 5_618, 48);
+        std::fs::write(
+            root.join("memory/EPHEMERAL.md"),
+            "## Chat Session — 2026-10-17\nTalked about monetising pulse-null.\n",
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn echo_shaped_chat_prompt_keeps_the_last_session_and_caps_the_stack() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = cli_config("grok");
+        config.system_prompt_budget = SystemPromptBudgetConfig::default();
+        echo_shaped_root(dir.path());
+
+        let result = build_system_prompt_budgeted(dir.path(), &config).unwrap();
+
+        assert!(
+            result.dropped_components.is_empty(),
+            "{:?}",
+            result.dropped_components
+        );
+        assert!(result.prompt.contains("monetising pulse-null"));
+        assert!(result.prompt.contains("exceeded 4000 token cap"));
+        assert!(
+            result.prompt.contains("</thought-stack>"),
+            "the cap cuts inside the wrapper"
+        );
+        assert!(
+            result.estimated_tokens < 14_000,
+            "chat prompt is {} tokens",
+            result.estimated_tokens
+        );
+    }
+
+    #[test]
+    fn chat_caps_the_thought_stack_and_tasks_do_not() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = minimal_config();
+        config.system_prompt_budget = SystemPromptBudgetConfig::default();
+        config.system_prompt_budget.thought_stack_chat_cap = 1_000;
+        std::fs::write(dir.path().join("CLAUDE.md"), "# Pulse").unwrap();
+        write_sized(&dir.path().join("THOUGHT_STACK.md"), 12_000, 30);
+
+        let chat = build_system_prompt(dir.path(), &config).unwrap();
+        let task = build_task_system_prompt(dir.path(), &config).unwrap();
+
+        assert!(chat.contains("exceeded 1000 token cap"));
+        assert!(chat.contains("000 w"), "the head of the stack survives");
+        assert!(!chat.contains("029 w"), "the tail is cut");
+        assert!(
+            !task.contains("[truncated"),
+            "a task carries the whole stack"
+        );
+        assert!(task.contains("029 w"));
+    }
+
+    #[test]
+    fn thought_stack_chat_cap_zero_or_budget_off_leaves_the_stack_whole() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("CLAUDE.md"), "# Pulse").unwrap();
+        write_sized(&dir.path().join("THOUGHT_STACK.md"), 12_000, 30);
+
+        let mut uncapped = minimal_config();
+        uncapped.system_prompt_budget = SystemPromptBudgetConfig::default();
+        uncapped.system_prompt_budget.thought_stack_chat_cap = 0;
+        let mut disabled = minimal_config();
+        disabled.system_prompt_budget = SystemPromptBudgetConfig::default();
+        disabled.system_prompt_budget.enabled = false;
+        disabled.system_prompt_budget.thought_stack_chat_cap = 1_000;
+
+        for config in [uncapped, disabled] {
+            let chat = build_system_prompt(dir.path(), &config).unwrap();
+            assert!(!chat.contains("[truncated"));
+            assert!(chat.contains("029 w"));
+        }
+    }
+
+    /// Under pressure only Pass 3 can help, and the session summary claims
+    /// its allowance before the thought stack does: it is truncated last,
+    /// never dropped to pay for the stack.
+    #[test]
+    fn last_session_outlasts_the_thought_stack_under_pressure() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = minimal_config();
+        config.system_prompt_budget = SystemPromptBudgetConfig::default();
+        config.system_prompt_budget.token_budget = 1_500;
+        config.system_prompt_budget.thought_stack_chat_cap = 0;
+        std::fs::write(dir.path().join("CLAUDE.md"), "# Pulse").unwrap();
+        write_sized(&dir.path().join("THOUGHT_STACK.md"), 20_000, 40);
+        std::fs::create_dir_all(dir.path().join("memory")).unwrap();
+        std::fs::write(
+            dir.path().join("memory/EPHEMERAL.md"),
+            "We decided to ship the cap.\n",
+        )
+        .unwrap();
+
+        let result = build_system_prompt_budgeted(dir.path(), &config).unwrap();
+
+        assert!(
+            result.dropped_components.is_empty(),
+            "{:?}",
+            result.dropped_components
+        );
+        assert!(result
+            .prompt
+            .contains("<last-session>\nWe decided to ship the cap."));
+        let stack = result.prompt.find("<thought-stack>").unwrap();
+        assert!(result.prompt[stack..].contains("token cap]"));
+    }
+
+    #[test]
+    fn component_breakdown_names_every_component_and_what_changed() {
+        let component = |name: &'static str, tokens: usize| PromptComponent {
+            name,
+            content: "x".repeat(tokens * CHARS_PER_TOKEN),
+            tokens,
+            tier: PromptTier::High,
+            cap: 0,
+        };
+        let components = [component("SELF.md", 10), component("THOUGHT_STACK.md", 40)];
+        assert_eq!(
+            component_breakdown(&components, &[10, 90]),
+            "SELF.md=10, THOUGHT_STACK.md=90→40"
+        );
+    }
+
     #[test]
     fn allocation_rank_puts_runtime_facts_first_and_the_thought_stack_last() {
         let rank = |name: &'static str| {
@@ -3010,6 +3172,7 @@ mod tests {
         assert!(rank("tension-context") < rank("SELF.md"));
         assert!(rank("journal-counts") < rank("SELF.md"));
         assert!(rank("SELF.md") < rank("AWARENESS.md"));
+        assert_eq!(rank("EPHEMERAL.md"), rank("MEMORY.md"));
         assert!(rank("AWARENESS.md") < rank("THOUGHT_STACK.md"));
         assert!(rank("anything-else") < rank("THOUGHT_STACK.md"));
     }
@@ -3210,25 +3373,6 @@ mod tests {
     }
 
     #[test]
-    fn compress_to_one_liner_ephemeral() {
-        let content = "<last-session>\n\
-            ## Task Digest — 2026-04-04 04:02 UTC\n\
-            Nova completed 5 task(s)\n\
-            ### Key outputs\n\
-            - Research Session: Good session with lots of detail about the work done.\n\
-            - Weekly Synthesis: Weekly synthesis complete with summary.\n\
-            - Health Check: All systems operational.\n\
-            - Reflection Window: The piece is written and worth sharing.\n\
-            - Night Reflection: The reflection is done.\n\
-            </last-session>";
-        let compressed = compress_to_one_liner("EPHEMERAL.md", content);
-        assert!(compressed.contains("[compressed]"));
-        // Should extract the first non-tag, non-header line
-        assert!(compressed.contains("Nova completed 5 task(s)"));
-        assert!(compressed.len() < content.len());
-    }
-
-    #[test]
     fn compress_to_one_liner_findings() {
         let content =
             "<autonomous-findings>\n- Finding 1\n- Finding 2\n- Finding 3\n</autonomous-findings>";
@@ -3247,6 +3391,7 @@ mod tests {
         assert_eq!(cfg.memory_cap, 4_000);
         assert_eq!(cfg.ephemeral_cap, 2_000);
         assert_eq!(cfg.findings_cap, 1_500);
+        assert_eq!(cfg.thought_stack_chat_cap, 4_000);
         assert_eq!(cfg.thought_stack_max_bytes, 48 * 1024);
         assert_eq!(cfg.awareness_max_bytes, 16 * 1024);
         assert_eq!(cfg.memory_max_bytes, 32 * 1024);
@@ -3285,7 +3430,9 @@ mod tests {
     #[test]
     fn thought_stack_enforces_byte_ceiling() {
         let dir = tempfile::tempdir().unwrap();
-        let config = minimal_config();
+        let mut config = minimal_config();
+        // The chat cap would cut first; this is about the safety ceiling.
+        config.system_prompt_budget.thought_stack_chat_cap = 0;
 
         std::fs::write(dir.path().join("CLAUDE.md"), "# Pulse").unwrap();
         write_giant_line(&dir.path().join("THOUGHT_STACK.md"), 200_000);
