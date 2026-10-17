@@ -1087,8 +1087,9 @@ impl Default for ChannelLimits {
 ///
 /// Priority tiers (highest to lowest):
 /// 1. The instruction file + rules/protocol files (essential — never trimmed)
-/// 2. SELF.md, MEMORY.md (high priority — trimmed only as last resort)
-/// 3. EPHEMERAL.md, FINDINGS.md, graph awareness (trimmable)
+/// 2. SELF.md, MEMORY.md, EPHEMERAL.md, AWARENESS.md, THOUGHT_STACK.md
+///    (high priority — truncated only as last resort, THOUGHT_STACK.md first)
+/// 3. FINDINGS.md, graph awareness (trimmable)
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct SystemPromptBudgetConfig {
@@ -1106,6 +1107,16 @@ pub struct SystemPromptBudgetConfig {
     pub memory_cap: usize,
     pub ephemeral_cap: usize,
     pub findings_cap: usize,
+    /// Token cap for THOUGHT_STACK.md in the **chat** prompt only.
+    ///
+    /// The stack is the autonomous loop's working memory: scheduled tasks
+    /// and intents carry it whole (bounded by `thought_stack_max_bytes`),
+    /// because there it is the work. In a conversation it is background,
+    /// and without its own cap it is the one High-tier block that can grow
+    /// to the byte ceiling (~12K tokens) and crowd everything else out of
+    /// the budget. The head is kept: the stack is written kernel-first,
+    /// newest-first.
+    pub thought_stack_chat_cap: usize,
     /// Hard byte ceiling for THOUGHT_STACK.md content.
     ///
     /// The `*_max_bytes` ceilings are safety limits, not budgeting: they are
@@ -1131,6 +1142,7 @@ impl Default for SystemPromptBudgetConfig {
             memory_cap: 4_000,
             ephemeral_cap: 2_000,
             findings_cap: 1_500,
+            thought_stack_chat_cap: 4_000,
             thought_stack_max_bytes: 48 * 1024,
             awareness_max_bytes: 16 * 1024,
             memory_max_bytes: 32 * 1024,
