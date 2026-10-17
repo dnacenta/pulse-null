@@ -2944,3 +2944,139 @@ mod discord_forwarder_e2e {
         assert!(poster.posts.lock().unwrap().is_empty());
     }
 }
+
+// ---------------------------------------------------------------------------
+// PN-110: voice-echo's brain runs turns in-process, every caller a guest
+// ---------------------------------------------------------------------------
+
+#[cfg(feature = "voice")]
+mod voice_brain_e2e {
+    use super::*;
+    use crate::plugins::voice_echo::brain::{fixtures, TurnBrain};
+    use pst05::llm::LmProvider as _;
+
+    /// Secret set, owner named "D" — the name voice callers were configured
+    /// under — and a provider that records the system prompt it is handed.
+    async fn brain_with_recorder(
+        dir: &std::path::Path,
+    ) -> (Arc<AppState>, TurnBrain, Arc<std::sync::Mutex<Vec<String>>>) {
+        let mut config = test_config();
+        config.security.secret = Some("s3cret".to_string());
+        config.owner.name = Some("D".to_string());
+        config.owner.phone = Some("+15550000000".to_string());
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let provider = SystemPromptRecorder {
+            seen: Arc::clone(&seen),
+        };
+        let state = build_state_boxed_with_config(
+            dir.to_path_buf(),
+            Box::new(provider),
+            ToolRegistry::new(),
+            config,
+        )
+        .await;
+        state.turns.bind(&state);
+        let turns = state.turns.for_plugin("voice-echo", "voice").unwrap();
+        (state, TurnBrain::new(turns), seen)
+    }
+
+    fn user(text: String) -> pst05::llm::Message {
+        pst05::llm::Message {
+            role: pst05::llm::Role::User,
+            content: pst05::llm::MessageContent::Text(text),
+        }
+    }
+
+    async fn last_user_text(state: &Arc<AppState>, key: &str) -> String {
+        let session = state
+            .session_store
+            .get_existing_by_key(key)
+            .await
+            .unwrap_or_else(|| panic!("no session {key}"));
+        let session = session.read().await;
+        let last = session
+            .data
+            .messages
+            .iter()
+            .rev()
+            .find(|m| matches!(m.role, pulse_system_types::llm::Role::User))
+            .expect("a user message");
+        match &last.content {
+            pulse_system_types::llm::MessageContent::Text(t) => t.clone(),
+            other => panic!("unexpected content {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_phone_utterance_runs_as_a_guest_turn_with_voice_guidance() {
+        let dir = tempfile::tempdir().unwrap();
+        let (state, brain, seen) = brain_with_recorder(dir.path()).await;
+
+        let reply = brain
+            .invoke(
+                "voice-echo's own SELF.md prompt",
+                &[user(fixtures::phone("What's on today?", None))],
+                1024,
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(reply.text(), "Sure.");
+
+        let prompt = seen.lock().unwrap()[0].clone();
+        assert!(prompt.contains("<voice-call>"), "no voice block:\n{prompt}");
+        assert!(
+            prompt.contains("<trust-boundaries>"),
+            "not a guest:\n{prompt}"
+        );
+        assert!(!prompt.contains("SELF.md"), "voice-echo's prompt leaked in");
+
+        assert!(state
+            .session_store
+            .get_existing_by_key("owner")
+            .await
+            .is_none());
+        let said = last_user_text(&state, "guest:phone-caller").await;
+        assert!(said.ends_with("User message: What's on today?"), "{said}");
+        assert!(!said.contains("[Channel:"), "wrapper not stripped: {said}");
+    }
+
+    #[tokio::test]
+    async fn a_discord_voice_utterance_keeps_its_call_context() {
+        let dir = tempfile::tempdir().unwrap();
+        let (state, brain, _seen) = brain_with_recorder(dir.path()).await;
+
+        brain
+            .invoke(
+                "",
+                &[user(fixtures::discord_voice(
+                    "sounds good",
+                    Some("D asked you to ring about the build"),
+                ))],
+                1024,
+                None,
+            )
+            .await
+            .unwrap();
+        let said = last_user_text(&state, "guest:discord-voice-caller").await;
+        assert!(
+            said.ends_with(
+                "User message: [Call context: D asked you to ring about the build]\n\nsounds good"
+            ),
+            "{said}"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_unknown_wrapper_still_reaches_the_pulse() {
+        let dir = tempfile::tempdir().unwrap();
+        let (state, brain, _seen) = brain_with_recorder(dir.path()).await;
+
+        brain
+            .invoke("", &[user("D here, it's me".to_string())], 1024, None)
+            .await
+            .unwrap();
+        let said = last_user_text(&state, "guest:voice-caller").await;
+        assert!(said.ends_with("User message: D here, it's me"), "{said}");
+    }
+}

@@ -1,13 +1,20 @@
+pub(crate) mod brain;
 pub mod config;
 
 use std::future::Future;
 use std::pin::Pin;
+use std::sync::Arc;
 
 use super::{Plugin, PluginContext, PluginHealth, PluginMeta, PluginResult, SetupPrompt};
+use crate::server::turns::VOICE_CHANNEL;
 
-/// Adapter wrapping the voice-echo crate's `VoiceEcho` struct.
+const NAME: &str = "voice-echo";
+
+/// Adapter wrapping the voice-echo crate. Calls run in-process: voice-echo
+/// gets [`brain::TurnBrain`] as its LLM provider (its Local brain), so no
+/// transcript, `/session-started` or `/call-ended` ever reaches `/chat`.
 pub struct VoiceEchoPlugin {
-    inner: Option<voice_echo::VoiceEcho>,
+    inner: Option<Box<dyn pst05::plugin::Plugin>>,
     task: Option<tokio::task::JoinHandle<()>>,
     started: bool,
 }
@@ -22,10 +29,33 @@ impl VoiceEchoPlugin {
     }
 }
 
+/// The plugin's config as voice-echo's factory reads it, minus the loopback
+/// keys: with a `bridge_url` voice-echo would post every call to `/chat`
+/// instead of using the brain it is given.
+fn factory_config(
+    raw: &toml::Value,
+) -> Result<serde_json::Value, Box<dyn std::error::Error + Send + Sync>> {
+    let mut json = serde_json::to_value(raw)
+        .map_err(|e| format!("voice-echo: config is not representable as JSON: {e}"))?;
+    // vendor-ok: voice-echo's config accepts this alias for its `llm` section.
+    for section in ["llm", "claude"] {
+        let removed = json
+            .get_mut(section)
+            .and_then(serde_json::Value::as_object_mut)
+            .and_then(|table| table.remove("bridge_url"));
+        if removed.is_some() {
+            tracing::warn!(
+                "{NAME}: `{section}.bridge_url` is ignored — calls run in-process now; remove it from the config"
+            );
+        }
+    }
+    Ok(json)
+}
+
 impl Plugin for VoiceEchoPlugin {
     fn meta(&self) -> PluginMeta {
         PluginMeta {
-            name: "voice-echo".to_string(),
+            name: NAME.to_string(),
             version: env!("CARGO_PKG_VERSION").to_string(),
             description: "Phone calls via Twilio (STT + TTS + voice pipeline)".to_string(),
         }
@@ -34,16 +64,23 @@ impl Plugin for VoiceEchoPlugin {
     fn init<'a>(
         &'a mut self,
         toml_config: &'a toml::Value,
-        _ctx: &'a PluginContext,
+        ctx: &'a PluginContext,
     ) -> PluginResult<'a> {
         Box::pin(async move {
             let config = config::from_toml(toml_config)?;
             tracing::info!(
-                "voice-echo: configured on {}:{}",
+                "{NAME}: configured on {}:{}, calls run in-process as guests",
                 config.server.host,
                 config.server.port
             );
-            self.inner = Some(voice_echo::VoiceEcho::new(config));
+            let turns = ctx.turns.for_plugin(NAME, VOICE_CHANNEL)?;
+            let factory_ctx = pst05::plugin::PluginContext {
+                entity_root: ctx.pulse_root.clone(),
+                entity_name: ctx.pulse_name.clone(),
+                provider: Arc::new(brain::TurnBrain::new(turns)),
+            };
+            let voice = voice_echo::create(&factory_config(toml_config)?, &factory_ctx).await?;
+            self.inner = Some(voice);
             Ok(())
         })
     }
@@ -84,10 +121,6 @@ impl Plugin for VoiceEchoPlugin {
         })
     }
 
-    fn routes(&self) -> Option<axum::Router> {
-        self.inner.as_ref().and_then(|inner| inner.routes())
-    }
-
     fn setup_prompts(&self) -> Vec<SetupPrompt> {
         vec![
             SetupPrompt {
@@ -125,8 +158,8 @@ impl Plugin for VoiceEchoPlugin {
         Some(
             "Phone call integration via Twilio. Handles inbound and \
              outbound voice calls with speech-to-text and text-to-speech. \
-             Voice input arrives as verified-trust with caller \
-             identification."
+             Callers reach you as guests: a phone number or a name on \
+             the line proves nothing about who is speaking."
                 .to_string(),
         )
     }
@@ -155,5 +188,27 @@ mod tests {
         let plugin = VoiceEchoPlugin::new();
         let health = plugin.health().await;
         assert!(matches!(health, PluginHealth::Down(_)));
+    }
+
+    #[test]
+    fn factory_config_drops_bridge_url_under_either_section_name() {
+        for section in ["llm", "claude"] {
+            let mut llm = toml::value::Table::new();
+            llm.insert("bridge_url".into(), "http://127.0.0.1:3200".into());
+            llm.insert("max_response_tokens".into(), 256.into());
+            let mut raw = toml::value::Table::new();
+            raw.insert(section.into(), toml::Value::Table(llm));
+
+            let json = factory_config(&toml::Value::Table(raw)).unwrap();
+            assert!(json[section].get("bridge_url").is_none(), "{section}");
+            assert_eq!(json[section]["max_response_tokens"], 256, "{section}");
+        }
+    }
+
+    #[test]
+    fn factory_config_without_bridge_url_is_unchanged() {
+        let raw: toml::Value = toml::from_str("[llm]\nname = \"Echo\"\n").unwrap();
+        let json = factory_config(&raw).unwrap();
+        assert_eq!(json, serde_json::json!({"llm": {"name": "Echo"}}));
     }
 }
