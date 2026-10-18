@@ -42,6 +42,7 @@ mod surrealdb_manager;
 mod task_context;
 mod tension;
 mod tool_loop;
+mod tool_surface;
 mod tools;
 mod tui;
 mod utils;

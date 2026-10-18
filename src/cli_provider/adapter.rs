@@ -117,8 +117,8 @@ pub struct Invocation<'a> {
     pub system_prompt: &'a str,
     /// The staged user prompt, when [`PromptDelivery::File`] is in use.
     pub prompt_file: Option<&'a Path>,
-    /// The pulse is in isolation: deny tools that write, execute or leave
-    /// the machine.
+    /// Deny tools that write, execute or leave the machine: the pulse is in
+    /// isolation, or the turn is not the owner's.
     pub restricted: bool,
     /// Token-level streaming was requested.
     pub streaming: bool,

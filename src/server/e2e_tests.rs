@@ -2807,6 +2807,130 @@ mod plugin_turns_e2e {
 }
 
 // ---------------------------------------------------------------------------
+// PN-110 audit P1: only the owner's turns get the CLI's full tool surface
+// ---------------------------------------------------------------------------
+
+mod tool_surface_e2e {
+    use super::*;
+    // vendor-ok: the test drives a fake CLI through one real adapter's argv.
+    use crate::cli_provider::adapters::claude::Claude;
+    use crate::cli_provider::CliProvider;
+    use crate::server::auth::AuthIdentity;
+    use crate::server::turns::PluginTurn;
+
+    /// A stand-in agent CLI that records the argv of its last invocation.
+    fn fake_cli(dir: &std::path::Path) -> (std::path::PathBuf, std::path::PathBuf) {
+        let bin = dir.join("fake-cli");
+        let argv_log = dir.join("argv.log");
+        let script = format!(
+            "#!/usr/bin/env bash\nprintf '%s\\n' \"$@\" > '{}'\ncat > /dev/null\n\
+             printf '{{\"result\":\"ok\"}}'\n",
+            argv_log.display()
+        );
+        std::fs::write(&bin, script).unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+        (bin, argv_log)
+    }
+
+    fn restricted(argv_log: &std::path::Path) -> bool {
+        std::fs::read_to_string(argv_log)
+            .unwrap()
+            .lines()
+            .any(|arg| arg == "--disallowedTools")
+    }
+
+    async fn cli_state(root: &std::path::Path, bin: &std::path::Path) -> Arc<AppState> {
+        let mut config = test_config();
+        config.security.secret = Some("s3cret".to_string());
+        config.owner.discord_id = Some("1001".to_string());
+        let provider = CliProvider::new(
+            // vendor-ok: its isolation flag is what the test reads back.
+            Box::new(Claude),
+            Some(bin.display().to_string()),
+            "m".to_string(),
+            root.to_path_buf(),
+        );
+        let state = build_state_boxed_with_config(
+            root.to_path_buf(),
+            Box::new(provider),
+            ToolRegistry::new(),
+            config,
+        )
+        .await;
+        state.turns.bind(&state);
+        state
+    }
+
+    fn turn(sender: &str) -> PluginTurn {
+        PluginTurn {
+            message: "hello".to_string(),
+            sender: Some(sender.to_string()),
+        }
+    }
+
+    #[tokio::test]
+    async fn guests_and_peers_get_the_restricted_surface_and_the_owner_does_not() {
+        let root = tempfile::tempdir().unwrap();
+        let cli = tempfile::tempdir().unwrap();
+        let (bin, argv_log) = fake_cli(cli.path());
+        let state = cli_state(root.path(), &bin).await;
+        let discord = state
+            .turns
+            .for_plugin("discord-text-echo", "discord")
+            .unwrap();
+        let voice = state.turns.for_plugin("voice-echo", "voice").unwrap();
+
+        discord.run(turn("1001"), None).await.unwrap();
+        assert!(!restricted(&argv_log), "the owner keeps the full surface");
+
+        discord.run(turn("2002"), None).await.unwrap();
+        assert!(restricted(&argv_log), "a Discord guest is restricted");
+
+        voice.run(turn("phone-caller"), None).await.unwrap();
+        assert!(restricted(&argv_log), "a voice caller is restricted");
+
+        let peer = handlers::chat::ChatRequest {
+            message: "hello".to_string(),
+            channel: "chat".to_string(),
+            sender: None,
+        };
+        handlers::chat::run_turn(
+            Arc::clone(&state),
+            peer,
+            AuthIdentity::Peer("Synth".to_string()),
+            None,
+        )
+        .await
+        .unwrap();
+        assert!(restricted(&argv_log), "a peer is restricted");
+
+        // Back to the owner: the surface is per turn, not sticky.
+        discord.run(turn("1001"), None).await.unwrap();
+        assert!(
+            !restricted(&argv_log),
+            "the owner again keeps the full surface"
+        );
+    }
+
+    #[tokio::test]
+    async fn isolation_still_restricts_the_owner() {
+        let root = tempfile::tempdir().unwrap();
+        let cli = tempfile::tempdir().unwrap();
+        let (bin, argv_log) = fake_cli(cli.path());
+        let state = cli_state(root.path(), &bin).await;
+        let discord = state
+            .turns
+            .for_plugin("discord-text-echo", "discord")
+            .unwrap();
+
+        crate::server::isolation::enter(root.path(), "test", None).unwrap();
+        discord.run(turn("1001"), None).await.unwrap();
+        assert!(restricted(&argv_log), "isolation restricts every turn");
+    }
+}
+
+// ---------------------------------------------------------------------------
 // PN-110: the Discord text forwarder runs turns in-process
 // ---------------------------------------------------------------------------
 

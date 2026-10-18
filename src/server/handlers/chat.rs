@@ -206,7 +206,6 @@ pub(crate) async fn run_turn(
     // can never become the owner through the body: the owner channels are
     // refused, and the session key comes from the credential, not from
     // `sender` or `channel`.
-    let sender_label = req.sender.as_deref().unwrap_or("unknown");
     let resolved_key = match &who {
         AuthIdentity::Owner => resolve_sender(
             &req.channel,
@@ -222,6 +221,23 @@ pub(crate) async fn run_turn(
             resolve_plugin_key(name, channel, &req, &state.config)?
         }
     };
+
+    // Only the owner's turns reach the agent CLI with its full tool surface;
+    // a guest or peer runs on the restricted one, whatever the isolation
+    // state (PN-110 audit P1). Everything below — compaction, the provider
+    // call, the refusal fallback — runs inside this scope.
+    let surface = crate::tool_surface::ToolSurface::for_principal(&resolved_key);
+    crate::tool_surface::scope(surface, run_resolved_turn(state, req, resolved_key, sink)).await
+}
+
+/// The turn after its principal is resolved to `resolved_key`.
+async fn run_resolved_turn(
+    state: Arc<AppState>,
+    req: ChatRequest,
+    resolved_key: String,
+    sink: Option<TurnSink>,
+) -> Result<ChatResponse, (StatusCode, String)> {
+    let sender_label = req.sender.as_deref().unwrap_or("unknown");
 
     // Isolation commands are handled before ANYTHING else touches the turn —
     // including the provider, which may itself be the suspect. Owned by the

@@ -82,7 +82,8 @@ pub struct CliProvider {
     /// the user's home. It is also consulted per invocation for the
     /// isolation marker: while isolated, the spawned CLI is restricted to
     /// read-only tools, because the in-process tool registry swap cannot
-    /// reach a subprocess that brings its own tools.
+    /// reach a subprocess that brings its own tools. A non-owner turn is
+    /// restricted the same way (see [`CliProvider::restricted`]).
     pulse_root: PathBuf,
 }
 
@@ -112,6 +113,15 @@ impl CliProvider {
     pub fn with_reasoning_effort(mut self, effort: Option<String>) -> Self {
         self.reasoning_effort = effort;
         self
+    }
+
+    /// Whether this invocation gets the CLI's restricted tool surface: while
+    /// the pulse is isolated, and for every turn that is not the owner's
+    /// ([`crate::tool_surface`]). Read when the invocation is built, on the
+    /// turn's own task.
+    fn restricted(&self) -> bool {
+        crate::server::isolation::is_active(&self.pulse_root)
+            || crate::tool_surface::current_is_restricted()
     }
 
     /// The adapter's config name.
@@ -494,7 +504,7 @@ impl LmProvider for CliProvider {
         let bin = self.bin.clone();
         let pulse_root = self.pulse_root.clone();
         let reasoning_effort = self.reasoning_effort.clone();
-        let restricted = crate::server::isolation::is_active(&self.pulse_root);
+        let restricted = self.restricted();
         let adapter: &dyn CliAdapter = self.adapter.as_ref();
 
         Box::pin(async move {
@@ -652,7 +662,7 @@ impl StreamingProvider for CliProvider {
         let bin = self.bin.clone();
         let pulse_root = self.pulse_root.clone();
         let reasoning_effort = self.reasoning_effort.clone();
-        let restricted = crate::server::isolation::is_active(&self.pulse_root);
+        let restricted = self.restricted();
         let adapter: &dyn CliAdapter = self.adapter.as_ref();
 
         Box::pin(async_stream::stream! {

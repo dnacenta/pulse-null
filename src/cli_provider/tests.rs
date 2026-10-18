@@ -596,3 +596,45 @@ fn stream_failure_with_policy_text_is_a_typed_refusal() {
         StreamEvent::Error(_)
     ));
 }
+
+/// PN-110 audit P1: a turn's tool surface reaches the argv, on both the
+/// buffered and the streaming path, and isolation still restricts a turn
+/// that asked for the full surface.
+#[tokio::test]
+async fn the_turn_tool_surface_reaches_the_argv_and_isolation_still_restricts() {
+    use crate::tool_surface::{scope, ToolSurface};
+
+    let mock = MockCli::succeeding();
+    let provider = mock.provider("m");
+    let restricted = |argv: &[String]| argv.iter().any(|a| a == "--disallowedTools");
+    let invoke = |surface| {
+        let provider = &provider;
+        scope(surface, async move {
+            provider
+                .invoke("sys", &[user("hi")], 10, None)
+                .await
+                .unwrap()
+        })
+    };
+
+    provider
+        .invoke("sys", &[user("hi")], 10, None)
+        .await
+        .unwrap();
+    assert!(!restricted(&mock.argv()), "no turn scope: unrestricted");
+    invoke(ToolSurface::Full).await;
+    assert!(!restricted(&mock.argv()), "owner turn: unrestricted");
+    invoke(ToolSurface::Restricted).await;
+    assert!(restricted(&mock.argv()), "guest turn: restricted");
+
+    scope(ToolSurface::Restricted, async {
+        let mut stream = provider.invoke_streaming("sys", &[user("hi")], 10, None);
+        while stream.next().await.is_some() {}
+    })
+    .await;
+    assert!(restricted(&mock.argv()), "streamed guest turn: restricted");
+
+    crate::server::isolation::enter(mock._dir.path(), "test", None).unwrap();
+    invoke(ToolSurface::Full).await;
+    assert!(restricted(&mock.argv()), "isolation restricts the owner");
+}
