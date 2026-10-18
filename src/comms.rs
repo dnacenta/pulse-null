@@ -21,6 +21,7 @@ use crate::interaction::InteractionRecord;
 use crate::peer::PeerClient;
 use crate::server::AppState;
 use crate::tool_loop;
+use crate::tool_surface::ToolSurface;
 use crate::wire::{CommsEvent, CommsStatus};
 
 /// Turn cap when the request names none, and the most a request may ask for.
@@ -367,13 +368,20 @@ pub fn start(state: &Arc<AppState>, req: StartRequest) -> Result<String, StartEr
         dialogue: Arc::clone(&dialogue),
         trust: trust.clone(),
     };
-    let task = tokio::spawn(run(
-        Arc::clone(state),
-        Arc::clone(&dialogue),
-        peers,
-        trust,
-        pause_rx,
-        guard,
+    // A sibling's replies drive this pulse's tool loop: every provider call
+    // of the dialogue runs as that peer, on the peer surface (no tools),
+    // whatever the configured trust (PN-110 audit R2-3).
+    let surface = ToolSurface::for_principal(&format!("peer:{}", req.peer));
+    let task = tokio::spawn(crate::tool_surface::scope(
+        surface,
+        run(
+            Arc::clone(state),
+            Arc::clone(&dialogue),
+            peers,
+            trust,
+            pause_rx,
+            guard,
+        ),
     ));
     dialogue.lock().abort = Some(task.abort_handle());
     let id = dialogue.id.clone();

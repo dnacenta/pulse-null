@@ -2001,6 +2001,63 @@ mod comms_e2e {
         }
     }
 
+    /// Answers "ok" and records the tool surface each call ran under.
+    struct SurfaceRecorder(Arc<std::sync::Mutex<Vec<Option<crate::tool_surface::ToolSurface>>>>);
+
+    impl crate::streaming::StreamingProvider for SurfaceRecorder {}
+
+    impl LmProvider for SurfaceRecorder {
+        fn invoke(
+            &self,
+            _system_prompt: &str,
+            _messages: &[Message],
+            _max_tokens: u32,
+            _tools: Option<&[serde_json::Value]>,
+        ) -> LlmResult<'_> {
+            self.0.lock().unwrap().push(crate::tool_surface::current());
+            Box::pin(async { Ok(mock_text("ok")) })
+        }
+
+        fn name(&self) -> &str {
+            "surface-recorder"
+        }
+
+        fn supports_tools(&self) -> bool {
+            false
+        }
+    }
+
+    /// R2-3: a sibling's replies drive the local provider, so every local
+    /// turn of a dialogue runs on the peer surface: no tools.
+    #[tokio::test]
+    async fn e2e_comms_local_turns_run_with_no_tools() {
+        let dir = tempfile::tempdir().unwrap();
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let state = build_state_boxed_with_config(
+            dir.path().to_path_buf(),
+            Box::new(SurfaceRecorder(Arc::clone(&seen))),
+            ToolRegistry::new(),
+            test_config(),
+        )
+        .await;
+        let app = build_app(Arc::clone(&state));
+        let (port, _calls) = fake_peer(false, 0).await;
+
+        let (status, body) = post_json(&app, "/api/comms", start_body(port, 3)).await;
+        assert_eq!(status, StatusCode::ACCEPTED, "{body}");
+        let id = body["id"].as_str().unwrap().to_string();
+        let (_, text) = get_text(&app, &format!("/api/comms/{id}/stream")).await;
+        assert_eq!(frames(&text).last().unwrap().0, "done", "{text}");
+
+        let seen = seen.lock().unwrap().clone();
+        assert_eq!(seen.len(), 2, "the local pulse spoke twice: {seen:?}");
+        assert!(
+            seen.iter()
+                .all(|s| *s == Some(crate::tool_surface::ToolSurface::None)),
+            "{seen:?}"
+        );
+    }
+
     #[tokio::test]
     async fn e2e_comms_refuses_a_second_dialogue_then_stop_archives() {
         let dir = tempfile::tempdir().unwrap();
