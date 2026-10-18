@@ -115,7 +115,7 @@ pub enum Intercept {
 pub fn intercept_command(
     root_dir: &Path,
     message: &str,
-    resolved_key: &str,
+    resolved_key: &crate::session_key::SessionKey,
     sender_label: &str,
 ) -> Intercept {
     let trimmed = message.trim();
@@ -128,7 +128,7 @@ pub fn intercept_command(
 
     // Owner only — not guests, not peers (a sibling pulse must not be able
     // to /resume this one mid-diagnosis). The refusal conceals the posture.
-    if resolved_key != "owner" {
+    if !resolved_key.is_owner() {
         return Intercept::Handled {
             response: "Isolation commands are restricted to the owner.".to_string(),
             isolated: false,
@@ -193,6 +193,7 @@ fn sanitize_field(input: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::session_key::SessionKey;
 
     #[test]
     fn marker_lifecycle_enter_status_exit() {
@@ -225,7 +226,12 @@ mod tests {
     #[test]
     fn guest_cannot_flip_isolation() {
         let dir = tempfile::tempdir().unwrap();
-        let result = intercept_command(dir.path(), "/isolate", "guest:stranger", "stranger");
+        let result = intercept_command(
+            dir.path(),
+            "/isolate",
+            &SessionKey::guest("stranger"),
+            "stranger",
+        );
         match result {
             Intercept::Handled { response, isolated } => {
                 assert!(response.contains("restricted"));
@@ -239,7 +245,12 @@ mod tests {
     #[test]
     fn trusted_sender_enters_and_exits_with_explicit_signals() {
         let dir = tempfile::tempdir().unwrap();
-        match intercept_command(dir.path(), "/isolate suspect graph", "owner", "D") {
+        match intercept_command(
+            dir.path(),
+            "/isolate suspect graph",
+            &SessionKey::owner(),
+            "D",
+        ) {
             Intercept::Handled { response, isolated } => {
                 assert!(isolated);
                 assert!(response.starts_with(BANNER));
@@ -252,7 +263,7 @@ mod tests {
             Some("suspect graph")
         );
 
-        match intercept_command(dir.path(), "/resume", "owner", "D") {
+        match intercept_command(dir.path(), "/resume", &SessionKey::owner(), "D") {
             Intercept::Handled { response, isolated } => {
                 assert!(!isolated);
                 assert_eq!(response, BACK_TO_NORMAL);
@@ -275,8 +286,8 @@ mod tests {
     fn commands_are_owner_only_and_conceal_posture() {
         let dir = tempfile::tempdir().unwrap();
         enter(dir.path(), "D", None).unwrap();
-        for key in ["guest:x", "peer:echo2"] {
-            match intercept_command(dir.path(), "/resume", key, "x") {
+        for key in [SessionKey::guest("x"), SessionKey::peer("echo2")] {
+            match intercept_command(dir.path(), "/resume", &key, "x") {
                 Intercept::Handled { response, isolated } => {
                     assert!(response.contains("owner"));
                     assert!(!isolated, "posture leaked to {key}");
@@ -293,7 +304,7 @@ mod tests {
         match intercept_command(
             dir.path(),
             "  /ISOLATE   graph acting weird  ",
-            "owner",
+            &SessionKey::owner(),
             "D",
         ) {
             Intercept::Handled { isolated, .. } => assert!(isolated),
@@ -303,7 +314,7 @@ mod tests {
             status(dir.path()).unwrap().reason.as_deref(),
             Some("graph acting weird")
         );
-        match intercept_command(dir.path(), "/Resume", "owner", "D") {
+        match intercept_command(dir.path(), "/Resume", &SessionKey::owner(), "D") {
             Intercept::Handled { isolated, .. } => assert!(!isolated),
             Intercept::None => panic!("should intercept"),
         }
@@ -315,7 +326,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let long_reason = "x".repeat(5000);
         let msg = format!("/isolate \u{1b}[31mred\u{1b}[0m {long_reason}");
-        match intercept_command(dir.path(), &msg, "owner", "evil\u{7}bell") {
+        match intercept_command(dir.path(), &msg, &SessionKey::owner(), "evil\u{7}bell") {
             Intercept::Handled { isolated, .. } => assert!(isolated),
             Intercept::None => panic!("should intercept"),
         }
@@ -329,11 +340,16 @@ mod tests {
     fn ordinary_messages_pass_through() {
         let dir = tempfile::tempdir().unwrap();
         assert!(matches!(
-            intercept_command(dir.path(), "tell me about /isolate", "owner", "D"),
+            intercept_command(
+                dir.path(),
+                "tell me about /isolate",
+                &SessionKey::owner(),
+                "D"
+            ),
             Intercept::None
         ));
         assert!(matches!(
-            intercept_command(dir.path(), "hello", "owner", "D"),
+            intercept_command(dir.path(), "hello", &SessionKey::owner(), "D"),
             Intercept::None
         ));
     }

@@ -371,7 +371,7 @@ pub fn start(state: &Arc<AppState>, req: StartRequest) -> Result<String, StartEr
     // A sibling's replies drive this pulse's tool loop: every provider call
     // of the dialogue runs as that peer, on the peer surface (no tools),
     // whatever the configured trust (PN-110 audit R2-3).
-    let surface = ToolSurface::for_principal(&format!("peer:{}", req.peer));
+    let surface = ToolSurface::for_principal(&crate::session_key::SessionKey::peer(&req.peer));
     let task = tokio::spawn(crate::tool_surface::scope(
         surface,
         run(

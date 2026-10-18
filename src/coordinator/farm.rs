@@ -490,11 +490,18 @@ pub async fn run_farm_from_marker(
                 content: pulse_system_types::llm::MessageContent::Text(sub.prompt),
                 source: None,
             }];
-            let response = state
-                .provider
-                .invoke(&system_prompt, &messages, max_tokens, None)
-                .await
-                .map_err(|e| e.to_string())?;
+            // Subtasks run on spawned tasks, outside the caller's scope: a
+            // farm is the owner's work, so each asks for the full surface.
+            // The call sits inside the scope: a provider reads the surface
+            // when `invoke` is called, not when its future is polled.
+            let response = crate::tool_surface::owner_work(async {
+                state
+                    .provider
+                    .invoke(&system_prompt, &messages, max_tokens, None)
+                    .await
+            })
+            .await
+            .map_err(|e| e.to_string())?;
             Ok(response_text(&response))
         }
     };
@@ -532,10 +539,13 @@ pub async fn run_farm_from_marker(
                 content: pulse_system_types::llm::MessageContent::Text(prompt),
                 source: None,
             }];
-            match state
-                .provider
-                .invoke(&system_prompt, &messages, max_tokens, None)
-                .await
+            match crate::tool_surface::owner_work(async {
+                state
+                    .provider
+                    .invoke(&system_prompt, &messages, max_tokens, None)
+                    .await
+            })
+            .await
             {
                 Ok(response) => response_text(&response),
                 Err(e) => {

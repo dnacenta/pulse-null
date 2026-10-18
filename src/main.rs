@@ -36,6 +36,7 @@ mod scheduler;
 mod server;
 mod session;
 mod session_health;
+mod session_key;
 mod session_store;
 mod streaming;
 mod surrealdb_manager;

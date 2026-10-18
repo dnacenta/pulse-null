@@ -11,6 +11,7 @@ use super::adapters::claude::Claude;
 use super::adapters::codex::Codex;
 use super::adapters::grok::Grok;
 use super::*;
+use crate::session_key::SessionKey;
 use crate::streaming::{StreamEvent, StreamingProvider};
 use tokio_stream::StreamExt;
 
@@ -600,8 +601,7 @@ fn stream_failure_with_policy_text_is_a_typed_refusal() {
 /// PN-110 audit P1, R2-1, R2-2: every principal × isolation reaches the
 /// argv of a real adapter as the right surface, on the buffered and the
 /// streaming path. Owner: full, or the read-only allowlist while isolated.
-/// Guests and peers: no tools, isolated or not. No turn scope (background
-/// work): governed by isolation alone.
+/// Guests and peers: no tools, isolated or not. No scope at all: no tools.
 #[tokio::test]
 async fn every_principal_and_isolation_state_reaches_the_argv() {
     use crate::tool_surface::{scope, ToolSurface};
@@ -623,59 +623,69 @@ async fn every_principal_and_isolation_state_reaches_the_argv() {
     let cases = [
         Case {
             principal: "owner",
-            turn: Some(ToolSurface::for_principal("owner")),
+            turn: Some(ToolSurface::for_principal(&SessionKey::owner())),
             isolated: false,
             claude: None,
             grok: None,
         },
         Case {
             principal: "owner",
-            turn: Some(ToolSurface::for_principal("owner")),
+            turn: Some(ToolSurface::for_principal(&SessionKey::owner())),
             isolated: true,
             claude: Some("Read,Grep,Glob"),
             grok: Some(RESTRICTED_GROK),
         },
         Case {
             principal: "guest",
-            turn: Some(ToolSurface::for_principal("guest:2002")),
+            turn: Some(ToolSurface::for_principal(&SessionKey::guest("2002"))),
             isolated: false,
             claude: Some(""),
             grok: Some("todo_write"),
         },
         Case {
             principal: "guest",
-            turn: Some(ToolSurface::for_principal("guest:2002")),
+            turn: Some(ToolSurface::for_principal(&SessionKey::guest("2002"))),
             isolated: true,
             claude: Some(""),
             grok: Some("todo_write"),
         },
         Case {
             principal: "peer",
-            turn: Some(ToolSurface::for_principal("peer:Synth")),
+            turn: Some(ToolSurface::for_principal(&SessionKey::peer("Synth"))),
             isolated: false,
             claude: Some(""),
             grok: Some("todo_write"),
         },
         Case {
             principal: "peer",
-            turn: Some(ToolSurface::for_principal("peer:Synth")),
+            turn: Some(ToolSurface::for_principal(&SessionKey::peer("Synth"))),
             isolated: true,
+            claude: Some(""),
+            grok: Some("todo_write"),
+        },
+        // Fails closed (R2-11): a call outside any scope gets no tools.
+        Case {
+            principal: "unscoped",
+            turn: None,
+            isolated: false,
             claude: Some(""),
             grok: Some("todo_write"),
         },
         Case {
             principal: "unscoped",
             turn: None,
+            isolated: true,
+            claude: Some(""),
+            grok: Some("todo_write"),
+        },
+        // Owner work outside a turn (scheduler, intents, farms) asks for
+        // the full surface explicitly.
+        Case {
+            principal: "owner work",
+            turn: Some(ToolSurface::Full),
             isolated: false,
             claude: None,
             grok: None,
-        },
-        Case {
-            principal: "unscoped",
-            turn: None,
-            isolated: true,
-            claude: Some("Read,Grep,Glob"),
-            grok: Some(RESTRICTED_GROK),
         },
     ];
 

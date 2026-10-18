@@ -12,6 +12,7 @@
 //!   principal          normal      isolated
 //!   owner              Full        Restricted
 //!   guest:* / peer:*   None        None
+//!   no scope           None        None
 //! ```
 //!
 //! [`ToolSurface::Restricted`] is the isolation surface (a read-only
@@ -20,8 +21,13 @@
 //! by the isolation marker ([`effective`]).
 //!
 //! The value is task-local, so concurrent turns never see each other's
-//! surface. Work outside any turn (scheduler, intents, thinking) carries no
-//! scope and is governed by isolation alone, as before.
+//! surface. It fails closed (audit R2-11): a provider call outside any scope
+//! gets no tools. Work the owner configured — scheduled tasks (the thinking
+//! loop among them), intents, farms — asks for [`ToolSurface::Full`]
+//! explicitly with [`owner_work`]; graph extraction spawns its CLI through
+//! recall-echo, not through this provider, and is not affected.
+
+use crate::session_key::SessionKey;
 
 /// The tools an agent CLI may use for one invocation, narrowest first (the
 /// order is what [`effective`] narrows by).
@@ -35,15 +41,12 @@ pub enum ToolSurface {
     Full,
 }
 
-/// The session key `resolve_sender` gives the owner.
-const OWNER_KEY: &str = "owner";
-
 impl ToolSurface {
     /// The surface for a turn whose resolved session key is `resolved_key`:
     /// full for the owner, none for anyone else.
     #[must_use]
-    pub fn for_principal(resolved_key: &str) -> Self {
-        if resolved_key == OWNER_KEY {
+    pub fn for_principal(resolved_key: &SessionKey) -> Self {
+        if resolved_key.is_owner() {
             Self::Full
         } else {
             Self::None
@@ -51,13 +54,13 @@ impl ToolSurface {
     }
 }
 
-/// The surface one invocation runs with: the turn's (`turn`, or full
-/// outside any turn), narrowed to at most [`ToolSurface::Restricted`] while
+/// The surface one invocation runs with: the turn's (`turn`, or none
+/// outside any scope), narrowed to at most [`ToolSurface::Restricted`] while
 /// the pulse is isolated. Isolation never widens a surface: an isolated
 /// guest still gets none.
 #[must_use]
 pub fn effective(turn: Option<ToolSurface>, isolated: bool) -> ToolSurface {
-    let surface = turn.unwrap_or(ToolSurface::Full);
+    let surface = turn.unwrap_or(ToolSurface::None);
     if isolated {
         surface.min(ToolSurface::Restricted)
     } else {
@@ -78,6 +81,20 @@ where
     TOOL_SURFACE.scope(surface, fut).await
 }
 
+/// Run `fut` — work the owner configured, not anyone's message — on the
+/// full surface. Isolation still narrows it per invocation.
+///
+/// The provider call must happen inside `fut`: a CLI provider reads the
+/// surface when `invoke` is called, so `owner_work(provider.invoke(..))`
+/// would read it outside the scope. Pass an `async fn`'s future or an
+/// `async` block.
+pub async fn owner_work<F, R>(fut: F) -> R
+where
+    F: std::future::Future<Output = R>,
+{
+    scope(ToolSurface::Full, fut).await
+}
+
 /// The surface the current turn asked for, or `None` outside any turn.
 #[must_use]
 pub fn current() -> Option<ToolSurface> {
@@ -90,19 +107,17 @@ mod tests {
 
     #[test]
     fn only_the_owner_gets_tools() {
-        assert_eq!(ToolSurface::for_principal("owner"), ToolSurface::Full);
+        assert_eq!(
+            ToolSurface::for_principal(&SessionKey::owner()),
+            ToolSurface::Full
+        );
         for key in [
-            "guest:2002",
-            "guest:phone-caller-0123456789abcdef",
-            "peer:Synth",
-            "",
-            "Owner",
+            SessionKey::guest("2002"),
+            SessionKey::guest("phone-caller-0123456789abcdef"),
+            SessionKey::guest("owner"),
+            SessionKey::peer("Synth"),
         ] {
-            assert_eq!(
-                ToolSurface::for_principal(key),
-                ToolSurface::None,
-                "{key:?}"
-            );
+            assert_eq!(ToolSurface::for_principal(&key), ToolSurface::None, "{key}");
         }
     }
 
@@ -116,8 +131,8 @@ mod tests {
             (Some(Restricted), true, Restricted),
             (Some(NoTools), false, NoTools),
             (Some(NoTools), true, NoTools),
-            (Option::None, false, Full),
-            (Option::None, true, Restricted),
+            (Option::None, false, NoTools),
+            (Option::None, true, NoTools),
         ];
         for (turn, isolated, expected) in cases {
             assert_eq!(effective(turn, isolated), expected, "{turn:?} {isolated}");

@@ -10,6 +10,7 @@ use tokio::sync::RwLock;
 
 use crate::config::OwnerConfig;
 use crate::persist::PersistCoordinator;
+use crate::session_key::SessionKey;
 
 /// A recently accessed file tracked for post-compaction re-injection.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -425,7 +426,7 @@ pub fn reset_session(data: &mut SessionData, root_dir: &Path, pulse_name: &str) 
 /// Identity classes determine session boundaries, trust levels, and resource
 /// limits. The channel is treated as metadata, not as a session boundary.
 ///
-/// Returns one of:
+/// Returns a [`SessionKey`], one of:
 /// - `"owner"` — the pulse's creator/owner
 /// - `"peer:{name}"` — a known sibling pulse in the network
 /// - `"guest:{sender}"` — an unknown or unrecognized sender
@@ -434,38 +435,38 @@ pub fn resolve_sender(
     sender: Option<&str>,
     owner: &OwnerConfig,
     peers: &HashMap<String, crate::config::PeerConfig>,
-) -> String {
+) -> SessionKey {
     let sender = sender.unwrap_or("anonymous");
 
     // TUI/system/reflection channels are always owner
     if channel == "tui" || channel == "system" || channel == "reflection" {
-        return "owner".into();
+        return SessionKey::owner();
     }
 
     // Check known owner identities
     if let Some(ref discord_id) = owner.discord_id {
         if sender == discord_id {
-            return "owner".into();
+            return SessionKey::owner();
         }
     }
     if let Some(ref phone) = owner.phone {
         if sender == phone {
-            return "owner".into();
+            return SessionKey::owner();
         }
     }
     if let Some(ref name) = owner.name {
         if sender.eq_ignore_ascii_case(name) {
-            return "owner".into();
+            return SessionKey::owner();
         }
     }
 
     // Known peer pulses
     if channel == "comms" && peers.contains_key(sender) {
-        return format!("peer:{}", sender);
+        return SessionKey::peer(sender);
     }
 
     // Unknown sender
-    format!("guest:{}", sender)
+    SessionKey::guest(sender)
 }
 
 /// Check if a session key uses the old `channel:sender` format.
@@ -649,7 +650,7 @@ impl SessionStore {
                                 new_key,
                                 path.display(),
                             );
-                            data.key = new_key;
+                            data.key = new_key.into();
                             migrated += 1;
 
                             // Remove old file — will be persisted with new key

@@ -554,7 +554,11 @@ pub async fn drain_loop(
             leases: Arc::clone(&leases),
             holder: holder.clone(),
         };
-        let result = execute_intent(&intent, &state, &queue, &schedule, config, &tenure).await;
+        // An intent is the pulse's own work, on the full tool surface.
+        let result = crate::tool_surface::owner_work(execute_intent(
+            &intent, &state, &queue, &schedule, config, &tenure,
+        ))
+        .await;
 
         match result {
             Some(output) if output.trim().is_empty() => {

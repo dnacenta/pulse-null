@@ -1,5 +1,7 @@
 use std::sync::Arc;
 
+use crate::session_key::{Principal, SessionKey};
+
 use axum::extract::State;
 use axum::http::StatusCode;
 use axum::Json;
@@ -156,7 +158,7 @@ fn resolve_plugin_key(
     bound_channel: &str,
     req: &ChatRequest,
     config: &crate::config::Config,
-) -> Result<String, (StatusCode, String)> {
+) -> Result<SessionKey, (StatusCode, String)> {
     if req.channel != bound_channel || crate::server::turns::is_reserved_channel(&req.channel) {
         tracing::warn!(
             "plugin {plugin} (bound to {bound_channel:?}) tried to speak on {:?}",
@@ -172,7 +174,7 @@ fn resolve_plugin_key(
         .channel
         .eq_ignore_ascii_case(crate::server::turns::VOICE_CHANNEL)
     {
-        return Ok(format!("guest:{}", sender.unwrap_or("anonymous")));
+        return Ok(SessionKey::guest(sender.unwrap_or("anonymous")));
     }
     Ok(resolve_sender(
         &req.channel,
@@ -215,7 +217,7 @@ pub(crate) async fn run_turn(
         ),
         AuthIdentity::Peer(name) => {
             refuse_peer_on_owner_channel(&who, &req.channel)?;
-            format!("peer:{name}")
+            SessionKey::peer(name)
         }
         AuthIdentity::Plugin { name, channel } => {
             resolve_plugin_key(name, channel, &req, &state.config)?
@@ -234,7 +236,7 @@ pub(crate) async fn run_turn(
 async fn run_resolved_turn(
     state: Arc<AppState>,
     req: ChatRequest,
-    resolved_key: String,
+    resolved_key: SessionKey,
     sink: Option<TurnSink>,
 ) -> Result<ChatResponse, (StatusCode, String)> {
     let sender_label = req.sender.as_deref().unwrap_or("unknown");
@@ -266,7 +268,7 @@ async fn run_resolved_turn(
     let mut user_message = String::new();
 
     // Injection detection: only for guests
-    if resolved_key.starts_with("guest:")
+    if resolved_key.is_guest()
         && state.config.security.injection_detection
         && injection::scan(&req.message)
     {
@@ -287,7 +289,10 @@ async fn run_resolved_turn(
         // We only need the session if it already exists — if it doesn't,
         // there's nothing to deduplicate against.
         let session_texts = {
-            let existing = state.session_store.get_existing_by_key(&resolved_key).await;
+            let existing = state
+                .session_store
+                .get_existing_by_key(resolved_key.as_str())
+                .await;
             match existing {
                 Some(arc) => {
                     let sess = arc.read().await;
@@ -334,10 +339,10 @@ async fn run_resolved_turn(
     }
 
     // Get or create session keyed by resolved identity (Phase 1: Unified Session)
-    let session_key = resolved_key.clone();
+    let session_key = resolved_key.to_string();
     let session_arc = state
         .session_store
-        .get_or_create_by_key(&resolved_key, &req.channel, sender_label)
+        .get_or_create_by_key(resolved_key.as_str(), &req.channel, sender_label)
         .await;
 
     // Lock the session for this request. The guard also owns the rollback:
@@ -419,7 +424,7 @@ async fn run_resolved_turn(
         content: user_content.clone(),
         source: Some(MessageSource::Human {
             channel: req.channel.clone(),
-            sender: resolved_key.clone(),
+            sender: resolved_key.to_string(),
         }),
     });
     // PN-102: a dropped future (streaming client disconnected) rolls the user
@@ -972,7 +977,7 @@ async fn run_resolved_turn(
 
     // Sticky banner for trusted consumers; concealed from guests (the
     // operating posture is not their business).
-    let reveal = isolated && !resolved_key.starts_with("guest:");
+    let reveal = isolated && !resolved_key.is_guest();
     Ok(ChatResponse {
         response: if reveal {
             crate::server::isolation::banner_wrap(text)
@@ -1217,8 +1222,13 @@ impl std::fmt::Debug for TurnResult {
 ///
 /// Otherwise the builder is dropped unbuilt and a refusal takes the ordinary
 /// rollback + error path.
-fn gated_fallback<F>(resolved_key: &str, isolated: bool, under_cap: bool, build: F) -> Option<F> {
-    (!isolated && resolved_key == "owner" && under_cap).then_some(build)
+fn gated_fallback<F>(
+    resolved_key: &SessionKey,
+    isolated: bool,
+    under_cap: bool,
+    build: F,
+) -> Option<F> {
+    (!isolated && resolved_key.is_owner() && under_cap).then_some(build)
 }
 
 /// Shed the quarantine entries added during an isolation window, truncating the
@@ -1250,10 +1260,10 @@ struct EmptyTrunk;
 /// `last_error` unauthenticated, so a failure is recorded by kind only.
 async fn record_provider_outcome<T>(
     state: &AppState,
-    resolved_key: &str,
+    resolved_key: &SessionKey,
     outcome: &Result<T, Box<dyn std::error::Error + Send + Sync>>,
 ) {
-    if resolved_key != "owner" {
+    if !resolved_key.is_owner() {
         return;
     }
     let mut status = state.provider_status.write().await;
@@ -1440,13 +1450,11 @@ where
 }
 
 /// Map a resolved identity key to the event system's ConversationTrust.
-fn conversation_trust_from_identity(resolved_key: &str) -> crate::events::ConversationTrust {
-    if resolved_key == "owner" {
-        crate::events::ConversationTrust::Owner
-    } else if resolved_key.starts_with("peer:") {
-        crate::events::ConversationTrust::LocalPeer
-    } else {
-        crate::events::ConversationTrust::Public
+fn conversation_trust_from_identity(resolved_key: &SessionKey) -> crate::events::ConversationTrust {
+    match resolved_key.principal() {
+        Principal::Owner => crate::events::ConversationTrust::Owner,
+        Principal::Peer(_) => crate::events::ConversationTrust::LocalPeer,
+        Principal::Guest(_) => crate::events::ConversationTrust::Public,
     }
 }
 
@@ -1496,10 +1504,10 @@ fn apply_channel_style(prompt: String, channel: &str) -> String {
 /// - Owner: No modification (full access).
 /// - Peer: Append peer conversation context — collaborative tone, scoped actions.
 /// - Guest: Append strict restrictions — conversation only, no system access.
-fn build_identity_system_prompt(base: &str, resolved_key: &str, sender: &str) -> String {
-    if resolved_key == "owner" {
+fn build_identity_system_prompt(base: &str, resolved_key: &SessionKey, sender: &str) -> String {
+    if resolved_key.is_owner() {
         base.to_string()
-    } else if let Some(peer_name) = resolved_key.strip_prefix("peer:") {
+    } else if let Principal::Peer(peer_name) = resolved_key.principal() {
         format!(
             "{}\n\n<peer-conversation-context>\n\
              You are having a direct conversation with {}.\n\
@@ -1689,14 +1697,14 @@ mod tests {
     #[test]
     fn owner_prompt_unchanged() {
         let base = "You are Echo.";
-        let result = build_identity_system_prompt(base, "owner", "D");
+        let result = build_identity_system_prompt(base, &SessionKey::owner(), "D");
         assert_eq!(result, base);
     }
 
     #[test]
     fn peer_prompt_appends_context() {
         let base = "You are Echo.";
-        let result = build_identity_system_prompt(base, "peer:Nova", "Nova");
+        let result = build_identity_system_prompt(base, &SessionKey::peer("Nova"), "Nova");
         assert!(result.starts_with(base));
         assert!(result.contains("peer-conversation-context"));
         assert!(result.contains("Nova"));
@@ -1706,7 +1714,7 @@ mod tests {
     #[test]
     fn guest_prompt_appends_restrictions() {
         let base = "You are Echo.";
-        let result = build_identity_system_prompt(base, "guest:stranger", "stranger");
+        let result = build_identity_system_prompt(base, &SessionKey::guest("stranger"), "stranger");
         assert!(result.starts_with(base));
         assert!(result.contains("trust-boundaries"));
         assert!(result.contains("UNTRUSTED"));
@@ -1715,29 +1723,29 @@ mod tests {
 
     #[test]
     fn peer_prompt_includes_peer_name() {
-        let result = build_identity_system_prompt("base", "peer:Synth", "Synth");
+        let result = build_identity_system_prompt("base", &SessionKey::peer("Synth"), "Synth");
         // Peer name should appear multiple times (intro + boundaries)
         assert!(result.matches("Synth").count() >= 2);
     }
 
     #[test]
     fn guest_prompt_includes_sender_label() {
-        let result = build_identity_system_prompt("base", "guest:someone", "someone");
+        let result = build_identity_system_prompt("base", &SessionKey::guest("someone"), "someone");
         assert!(result.contains("someone"));
     }
 
     #[test]
     fn conversation_trust_maps_correctly() {
         assert!(matches!(
-            conversation_trust_from_identity("owner"),
+            conversation_trust_from_identity(&SessionKey::owner()),
             crate::events::ConversationTrust::Owner
         ));
         assert!(matches!(
-            conversation_trust_from_identity("peer:Nova"),
+            conversation_trust_from_identity(&SessionKey::peer("Nova")),
             crate::events::ConversationTrust::LocalPeer
         ));
         assert!(matches!(
-            conversation_trust_from_identity("guest:someone"),
+            conversation_trust_from_identity(&SessionKey::guest("someone")),
             crate::events::ConversationTrust::Public
         ));
     }
@@ -2154,14 +2162,14 @@ mod tests {
     #[test]
     fn fallback_gate_is_owner_only_and_capped() {
         // Owner, not isolated, under cap → armed.
-        assert!(gated_fallback("owner", false, true, dummy_build).is_some());
+        assert!(gated_fallback(&SessionKey::owner(), false, true, dummy_build).is_some());
         // Guests and peers never arm the fallback.
-        assert!(gated_fallback("guest:stranger", false, true, dummy_build).is_none());
-        assert!(gated_fallback("peer:Nova", false, true, dummy_build).is_none());
+        assert!(gated_fallback(&SessionKey::guest("stranger"), false, true, dummy_build).is_none());
+        assert!(gated_fallback(&SessionKey::peer("Nova"), false, true, dummy_build).is_none());
         // Even the owner is shed while isolated (the provider is the suspect).
-        assert!(gated_fallback("owner", true, true, dummy_build).is_none());
+        assert!(gated_fallback(&SessionKey::owner(), true, true, dummy_build).is_none());
         // SEC-002: even the owner is shed once over the cap.
-        assert!(gated_fallback("owner", false, false, dummy_build).is_none());
+        assert!(gated_fallback(&SessionKey::owner(), false, false, dummy_build).is_none());
     }
 
     /// SEC-002: the (N+1)th refusal in a session does not build the fallback —
@@ -2182,7 +2190,7 @@ mod tests {
             }) as Box<dyn LmProvider>)
         };
         // Owner, not isolated, but OVER the cap (under_cap = false).
-        let gated = gated_fallback("owner", false, false, build);
+        let gated = gated_fallback(&SessionKey::owner(), false, false, build);
 
         let err = invoke_turn_with_refusal_fallback(
             &mut data,
@@ -2225,7 +2233,7 @@ mod tests {
             }) as Box<dyn LmProvider>)
         };
         // The owner-only gate drops the builder for a guest.
-        let gated = gated_fallback("guest:stranger", false, true, build);
+        let gated = gated_fallback(&SessionKey::guest("stranger"), false, true, build);
 
         let err = invoke_turn_with_refusal_fallback(
             &mut data,
@@ -2265,7 +2273,7 @@ mod tests {
                 seen: Arc::new(Mutex::new(Vec::new())),
             }) as Box<dyn LmProvider>)
         };
-        let gated = gated_fallback("peer:Nova", false, true, build);
+        let gated = gated_fallback(&SessionKey::peer("Nova"), false, true, build);
 
         let err = invoke_turn_with_refusal_fallback(
             &mut data,

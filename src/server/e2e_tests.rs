@@ -240,6 +240,32 @@ impl LmProvider for GatedProvider {
     }
 }
 
+/// Answers "ok" and records the tool surface each call ran under.
+struct SurfaceRecorder(Arc<std::sync::Mutex<Vec<Option<crate::tool_surface::ToolSurface>>>>);
+
+impl crate::streaming::StreamingProvider for SurfaceRecorder {}
+
+impl LmProvider for SurfaceRecorder {
+    fn invoke(
+        &self,
+        _system_prompt: &str,
+        _messages: &[Message],
+        _max_tokens: u32,
+        _tools: Option<&[serde_json::Value]>,
+    ) -> LlmResult<'_> {
+        self.0.lock().unwrap().push(crate::tool_surface::current());
+        Box::pin(async { Ok(mock_text("ok")) })
+    }
+
+    fn name(&self) -> &str {
+        "surface-recorder"
+    }
+
+    fn supports_tools(&self) -> bool {
+        false
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
@@ -1998,32 +2024,6 @@ mod comms_e2e {
                 );
             }
             other => panic!("expected PostInteraction, got {other:?}"),
-        }
-    }
-
-    /// Answers "ok" and records the tool surface each call ran under.
-    struct SurfaceRecorder(Arc<std::sync::Mutex<Vec<Option<crate::tool_surface::ToolSurface>>>>);
-
-    impl crate::streaming::StreamingProvider for SurfaceRecorder {}
-
-    impl LmProvider for SurfaceRecorder {
-        fn invoke(
-            &self,
-            _system_prompt: &str,
-            _messages: &[Message],
-            _max_tokens: u32,
-            _tools: Option<&[serde_json::Value]>,
-        ) -> LlmResult<'_> {
-            self.0.lock().unwrap().push(crate::tool_surface::current());
-            Box::pin(async { Ok(mock_text("ok")) })
-        }
-
-        fn name(&self) -> &str {
-            "surface-recorder"
-        }
-
-        fn supports_tools(&self) -> bool {
-            false
         }
     }
 
@@ -3841,5 +3841,99 @@ mod voice_brain_e2e {
             .unwrap();
         let said = last_user_text(&state, "guest:2002").await;
         assert!(said.contains("[Recent channel activity]"), "{said}");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// PN-110 audit R2-11: the tool surface fails closed; owner work asks for Full
+// ---------------------------------------------------------------------------
+
+mod owner_work_surface_e2e {
+    use super::*;
+    use crate::tool_surface::ToolSurface;
+
+    type Seen = Arc<std::sync::Mutex<Vec<Option<ToolSurface>>>>;
+
+    async fn recording_state(dir: &std::path::Path) -> (Arc<AppState>, Seen) {
+        let seen: Seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let state = build_state_boxed_with_config(
+            dir.to_path_buf(),
+            Box::new(SurfaceRecorder(Arc::clone(&seen))),
+            ToolRegistry::new(),
+            test_config(),
+        )
+        .await;
+        (state, seen)
+    }
+
+    #[tokio::test]
+    async fn an_unscoped_provider_call_gets_no_tools() {
+        assert_eq!(crate::tool_surface::current(), None);
+        assert_eq!(
+            crate::tool_surface::effective(crate::tool_surface::current(), false),
+            ToolSurface::None
+        );
+    }
+
+    #[tokio::test]
+    async fn a_scheduled_task_runs_on_the_full_surface() {
+        let dir = tempfile::tempdir().unwrap();
+        let (state, seen) = recording_state(dir.path()).await;
+        let entry: crate::scheduler::ScheduleEntry = serde_json::from_value(serde_json::json!({
+            "id": "surface-probe",
+            "name": "Surface probe",
+            "cron": "0 0 * * * *",
+            "channel": "system",
+            "prompt": "Say ok.",
+        }))
+        .unwrap();
+        let schedule = Arc::new(RwLock::new(
+            crate::scheduler::Schedule::load_or_init(dir.path()).unwrap(),
+        ));
+        let queue = Arc::new(RwLock::new(crate::scheduler::intent::IntentQueue::load(
+            dir.path(),
+        )));
+        let mut eval_state = crate::scheduler::evaluator::SchedulerState::default();
+        let tenure = crate::coordinator::control::TenureLeases {
+            leases: Arc::new(tokio::sync::Mutex::new(
+                crate::coordinator::durable::DurableLeaseTable::open(
+                    &dir.path().join("coordinator"),
+                )
+                .unwrap(),
+            )),
+            holder: "test-holder".to_string(),
+        };
+
+        crate::scheduler::runner::execute_task_as_owner(
+            &entry,
+            &state,
+            &schedule,
+            &queue,
+            &mut eval_state,
+            &tenure,
+        )
+        .await;
+        let seen = seen.lock().unwrap().clone();
+        assert!(!seen.is_empty(), "the task never reached the provider");
+        assert!(
+            seen.iter().all(|s| *s == Some(ToolSurface::Full)),
+            "{seen:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_owner_chat_turn_runs_on_the_full_surface() {
+        let dir = tempfile::tempdir().unwrap();
+        let (state, seen) = recording_state(dir.path()).await;
+        let app = build_app(Arc::clone(&state));
+        let (status, body) = post_chat_on(&app, "tui", "hello").await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let (status, body) = post_chat(&app, "hello").await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(
+            *seen.lock().unwrap(),
+            [Some(ToolSurface::Full), Some(ToolSurface::None)],
+            "tui (owner) then the default channel with no sender (a guest)"
+        );
     }
 }

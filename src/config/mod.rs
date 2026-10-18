@@ -913,32 +913,22 @@ impl SessionConfig {
     /// Get session limits based on resolved identity class.
     ///
     /// Identity classes:
-    /// - `"owner"` → generous limits (200 msgs / 8h)
-    /// - `"peer:*"` → moderate limits (30 msgs / 1h)
-    /// - `"guest:*"` → tight limits (20 msgs / 30min)
-    /// - fallback → default channel limits
-    pub fn get_identity_limits(&self, resolved_key: &str) -> ChannelLimits {
-        if resolved_key == "owner" {
-            ChannelLimits {
-                message_cap: self.owner_message_cap,
-                time_cap_seconds: self.owner_time_cap_seconds,
-            }
-        } else if resolved_key.starts_with("peer:") {
-            ChannelLimits {
-                message_cap: self.peer_message_cap,
-                time_cap_seconds: self.peer_time_cap_seconds,
-            }
-        } else if resolved_key.starts_with("guest:") {
-            ChannelLimits {
-                message_cap: self.guest_message_cap,
-                time_cap_seconds: self.guest_time_cap_seconds,
-            }
-        } else {
-            // Fallback for unexpected key formats
-            ChannelLimits {
-                message_cap: self.default_message_cap,
-                time_cap_seconds: self.default_time_cap_seconds,
-            }
+    /// - owner → generous limits (200 msgs / 8h)
+    /// - `peer:*` → moderate limits (30 msgs / 1h)
+    /// - `guest:*` → tight limits (20 msgs / 30min)
+    pub fn get_identity_limits(
+        &self,
+        resolved_key: &crate::session_key::SessionKey,
+    ) -> ChannelLimits {
+        use crate::session_key::Principal;
+        let (message_cap, time_cap_seconds) = match resolved_key.principal() {
+            Principal::Owner => (self.owner_message_cap, self.owner_time_cap_seconds),
+            Principal::Peer(_) => (self.peer_message_cap, self.peer_time_cap_seconds),
+            Principal::Guest(_) => (self.guest_message_cap, self.guest_time_cap_seconds),
+        };
+        ChannelLimits {
+            message_cap,
+            time_cap_seconds,
         }
     }
 

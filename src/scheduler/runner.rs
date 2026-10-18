@@ -211,7 +211,7 @@ pub async fn run_task_loop(
             continue;
         }
 
-        let outcome = execute_task(
+        let outcome = execute_task_as_owner(
             &entry,
             &state,
             &schedule,
@@ -290,6 +290,28 @@ async fn run_builtin_handler(
         }
         _ => false,
     }
+}
+
+/// One fire of a scheduled task, as the owner's own work: its provider calls
+/// get the full tool surface, which no longer comes by default (PN-110
+/// audit R2-11). The thinking loop is one of these tasks.
+pub(crate) async fn execute_task_as_owner(
+    entry: &ScheduleEntry,
+    state: &Arc<AppState>,
+    schedule: &Arc<RwLock<Schedule>>,
+    intent_queue: &Arc<RwLock<IntentQueue>>,
+    eval_state: &mut SchedulerState,
+    tenure: &crate::coordinator::control::TenureLeases,
+) -> TaskOutcome {
+    crate::tool_surface::owner_work(execute_task(
+        entry,
+        state,
+        schedule,
+        intent_queue,
+        eval_state,
+        tenure,
+    ))
+    .await
 }
 
 /// Execute a scheduled task: build prompt, call LLM (with tools if autonomy enabled), route output.
