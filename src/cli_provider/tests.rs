@@ -597,44 +597,126 @@ fn stream_failure_with_policy_text_is_a_typed_refusal() {
     ));
 }
 
-/// PN-110 audit P1: a turn's tool surface reaches the argv, on both the
-/// buffered and the streaming path, and isolation still restricts a turn
-/// that asked for the full surface.
+/// PN-110 audit P1, R2-1, R2-2: every principal × isolation reaches the
+/// argv of a real adapter as the right surface, on the buffered and the
+/// streaming path. Owner: full, or the read-only allowlist while isolated.
+/// Guests and peers: no tools, isolated or not. No turn scope (background
+/// work): governed by isolation alone.
 #[tokio::test]
-async fn the_turn_tool_surface_reaches_the_argv_and_isolation_still_restricts() {
+async fn every_principal_and_isolation_state_reaches_the_argv() {
     use crate::tool_surface::{scope, ToolSurface};
 
-    let mock = MockCli::succeeding();
-    let provider = mock.provider("m");
-    let restricted = |argv: &[String]| argv.iter().any(|a| a == "--disallowedTools");
-    let invoke = |surface| {
-        let provider = &provider;
-        scope(surface, async move {
-            provider
-                .invoke("sys", &[user("hi")], 10, None)
-                .await
-                .unwrap()
-        })
-    };
+    /// What the argv says about the surface.
+    fn tools_arg(argv: &[String]) -> Option<String> {
+        let pos = argv.iter().position(|a| a == "--tools")?;
+        Some(argv[pos + 1].clone())
+    }
 
-    provider
-        .invoke("sys", &[user("hi")], 10, None)
-        .await
-        .unwrap();
-    assert!(!restricted(&mock.argv()), "no turn scope: unrestricted");
-    invoke(ToolSurface::Full).await;
-    assert!(!restricted(&mock.argv()), "owner turn: unrestricted");
-    invoke(ToolSurface::Restricted).await;
-    assert!(restricted(&mock.argv()), "guest turn: restricted");
+    struct Case {
+        principal: &'static str,
+        turn: Option<ToolSurface>,
+        isolated: bool,
+        claude: Option<&'static str>,
+        grok: Option<&'static str>,
+    }
+    const RESTRICTED_GROK: &str = "read_file,list_dir,grep,todo_write";
+    let cases = [
+        Case {
+            principal: "owner",
+            turn: Some(ToolSurface::for_principal("owner")),
+            isolated: false,
+            claude: None,
+            grok: None,
+        },
+        Case {
+            principal: "owner",
+            turn: Some(ToolSurface::for_principal("owner")),
+            isolated: true,
+            claude: Some("Read,Grep,Glob"),
+            grok: Some(RESTRICTED_GROK),
+        },
+        Case {
+            principal: "guest",
+            turn: Some(ToolSurface::for_principal("guest:2002")),
+            isolated: false,
+            claude: Some(""),
+            grok: Some("todo_write"),
+        },
+        Case {
+            principal: "guest",
+            turn: Some(ToolSurface::for_principal("guest:2002")),
+            isolated: true,
+            claude: Some(""),
+            grok: Some("todo_write"),
+        },
+        Case {
+            principal: "peer",
+            turn: Some(ToolSurface::for_principal("peer:Synth")),
+            isolated: false,
+            claude: Some(""),
+            grok: Some("todo_write"),
+        },
+        Case {
+            principal: "peer",
+            turn: Some(ToolSurface::for_principal("peer:Synth")),
+            isolated: true,
+            claude: Some(""),
+            grok: Some("todo_write"),
+        },
+        Case {
+            principal: "unscoped",
+            turn: None,
+            isolated: false,
+            claude: None,
+            grok: None,
+        },
+        Case {
+            principal: "unscoped",
+            turn: None,
+            isolated: true,
+            claude: Some("Read,Grep,Glob"),
+            grok: Some(RESTRICTED_GROK),
+        },
+    ];
 
-    scope(ToolSurface::Restricted, async {
-        let mut stream = provider.invoke_streaming("sys", &[user("hi")], 10, None);
-        while stream.next().await.is_some() {}
-    })
-    .await;
-    assert!(restricted(&mock.argv()), "streamed guest turn: restricted");
+    for adapter in ["claude", "grok"] {
+        for case in &cases {
+            let mock = MockCli::succeeding();
+            let provider = match adapter {
+                "claude" => mock.provider("m"),
+                _ => mock.provider_for(Box::new(Grok), "m"),
+            };
+            if case.isolated {
+                crate::server::isolation::enter(mock._dir.path(), "test", None).unwrap();
+            }
+            let expected = match adapter {
+                "claude" => case.claude,
+                _ => case.grok,
+            };
+            let label = format!("{adapter}, {}, isolated={}", case.principal, case.isolated);
 
-    crate::server::isolation::enter(mock._dir.path(), "test", None).unwrap();
-    invoke(ToolSurface::Full).await;
-    assert!(restricted(&mock.argv()), "isolation restricts the owner");
+            let invoke = async {
+                let _ = provider.invoke("sys", &[user("hi")], 10, None).await;
+            };
+            match case.turn {
+                Some(surface) => scope(surface, invoke).await,
+                None => invoke.await,
+            }
+            assert_eq!(tools_arg(&mock.argv()).as_deref(), expected, "{label}");
+
+            let stream = async {
+                let mut stream = provider.invoke_streaming("sys", &[user("hi")], 10, None);
+                while stream.next().await.is_some() {}
+            };
+            match case.turn {
+                Some(surface) => scope(surface, stream).await,
+                None => stream.await,
+            }
+            assert_eq!(
+                tools_arg(&mock.argv()).as_deref(),
+                expected,
+                "{label}, streamed"
+            );
+        }
+    }
 }

@@ -40,7 +40,7 @@ const DISCORD_ECHO: Flavor = Flavor {
     platform_description: "Discord text channel integration (text only, no voice). Each \
          message in a configured channel runs as a turn. The owner is recognised by their \
          Discord user id; everyone else reaches you as a guest, untrusted, and your agent CLI \
-         runs with its read-only tools for their turns. The runtime posts your reply back to \
+         runs with no tools for their turns. The runtime posts your reply back to \
          the channel.",
     post_tool: PostTool::Withheld,
 };
@@ -50,7 +50,7 @@ const DISCORD_TEXT_ECHO: Flavor = Flavor {
     description: "Discord text channels (read + write)",
     platform_description: "Discord text channel integration. Each message in a configured \
          channel runs as a turn. The owner is recognised by their Discord user id; everyone \
-         else reaches you as a guest, untrusted, and your agent CLI runs with its read-only \
+         else reaches you as a guest, untrusted, and your agent CLI runs with no \
          tools for their turns. The runtime posts your reply back to the channel; the Discord \
          post tool lets you write to a configured channel yourself.",
     post_tool: PostTool::Offered,

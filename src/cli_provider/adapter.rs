@@ -117,9 +117,9 @@ pub struct Invocation<'a> {
     pub system_prompt: &'a str,
     /// The staged user prompt, when [`PromptDelivery::File`] is in use.
     pub prompt_file: Option<&'a Path>,
-    /// Deny tools that write, execute or leave the machine: the pulse is in
-    /// isolation, or the turn is not the owner's.
-    pub restricted: bool,
+    /// Which tools the CLI may use: everything (the owner), a read-only
+    /// allowlist (isolation), or none (guests and peers).
+    pub surface: crate::tool_surface::ToolSurface,
     /// Token-level streaming was requested.
     pub streaming: bool,
     pub pulse_root: &'a Path,
@@ -237,11 +237,11 @@ pub trait CliAdapter: Send + Sync {
         }
     }
 
-    /// The tools this CLI gives the pulse, by the CLI's own names, for
-    /// AWARENESS.md. `restricted` asks for the isolation-mode surface. Empty
-    /// means the adapter does not know the list; listing fewer tools than the
-    /// CLI has is honest, listing one it lacks is not.
-    fn tool_surface(&self, _restricted: bool) -> &'static [&'static str] {
+    /// The tools this CLI gives the pulse on `surface`, by the CLI's own
+    /// names, for AWARENESS.md. Empty means none, or that the adapter does
+    /// not know the list; listing fewer tools than the CLI has is honest,
+    /// listing one it lacks is not.
+    fn tool_surface(&self, _surface: crate::tool_surface::ToolSurface) -> &'static [&'static str] {
         &[]
     }
 

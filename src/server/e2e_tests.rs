@@ -3008,12 +3008,19 @@ mod tool_surface_e2e {
         (bin, argv_log)
     }
 
-    fn restricted(argv_log: &std::path::Path) -> bool {
-        std::fs::read_to_string(argv_log)
+    /// The `--tools` allowlist of the last invocation; `None` = full surface.
+    fn tools(argv_log: &std::path::Path) -> Option<String> {
+        let argv: Vec<String> = std::fs::read_to_string(argv_log)
             .unwrap()
             .lines()
-            .any(|arg| arg == "--disallowedTools")
+            .map(str::to_string)
+            .collect();
+        let pos = argv.iter().position(|arg| arg == "--tools")?;
+        Some(argv[pos + 1].clone())
     }
+
+    const NO_TOOLS: Option<&str> = Some("");
+    const READ_ONLY: Option<&str> = Some("Read,Grep,Glob");
 
     async fn cli_state(root: &std::path::Path, bin: &std::path::Path) -> Arc<AppState> {
         let mut config = test_config();
@@ -3045,7 +3052,7 @@ mod tool_surface_e2e {
     }
 
     #[tokio::test]
-    async fn guests_and_peers_get_the_restricted_surface_and_the_owner_does_not() {
+    async fn guests_and_peers_get_no_tools_and_the_owner_gets_all() {
         let root = tempfile::tempdir().unwrap();
         let cli = tempfile::tempdir().unwrap();
         let (bin, argv_log) = fake_cli(cli.path());
@@ -3057,13 +3064,21 @@ mod tool_surface_e2e {
         let voice = state.turns.for_plugin("voice-echo", "voice").unwrap();
 
         discord.run(turn("1001"), None).await.unwrap();
-        assert!(!restricted(&argv_log), "the owner keeps the full surface");
+        assert_eq!(tools(&argv_log), None, "the owner keeps the full surface");
 
         discord.run(turn("2002"), None).await.unwrap();
-        assert!(restricted(&argv_log), "a Discord guest is restricted");
+        assert_eq!(
+            tools(&argv_log).as_deref(),
+            NO_TOOLS,
+            "a Discord guest gets no tools"
+        );
 
         voice.run(turn("phone-caller"), None).await.unwrap();
-        assert!(restricted(&argv_log), "a voice caller is restricted");
+        assert_eq!(
+            tools(&argv_log).as_deref(),
+            NO_TOOLS,
+            "a voice caller gets no tools"
+        );
 
         let peer = handlers::chat::ChatRequest {
             message: "hello".to_string(),
@@ -3078,18 +3093,23 @@ mod tool_surface_e2e {
         )
         .await
         .unwrap();
-        assert!(restricted(&argv_log), "a peer is restricted");
+        assert_eq!(
+            tools(&argv_log).as_deref(),
+            NO_TOOLS,
+            "a peer gets no tools"
+        );
 
         // Back to the owner: the surface is per turn, not sticky.
         discord.run(turn("1001"), None).await.unwrap();
-        assert!(
-            !restricted(&argv_log),
+        assert_eq!(
+            tools(&argv_log),
+            None,
             "the owner again keeps the full surface"
         );
     }
 
     #[tokio::test]
-    async fn isolation_still_restricts_the_owner() {
+    async fn isolation_restricts_the_owner_and_leaves_guests_with_none() {
         let root = tempfile::tempdir().unwrap();
         let cli = tempfile::tempdir().unwrap();
         let (bin, argv_log) = fake_cli(cli.path());
@@ -3101,7 +3121,17 @@ mod tool_surface_e2e {
 
         crate::server::isolation::enter(root.path(), "test", None).unwrap();
         discord.run(turn("1001"), None).await.unwrap();
-        assert!(restricted(&argv_log), "isolation restricts every turn");
+        assert_eq!(
+            tools(&argv_log).as_deref(),
+            READ_ONLY,
+            "isolated owner: read-only"
+        );
+        discord.run(turn("2002"), None).await.unwrap();
+        assert_eq!(
+            tools(&argv_log).as_deref(),
+            NO_TOOLS,
+            "isolated guest: still none"
+        );
     }
 }
 
