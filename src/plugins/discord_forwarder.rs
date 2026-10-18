@@ -6,6 +6,7 @@
 //! message runs as a turn through [`PluginTurns`], as the plugin's own
 //! principal, and the reply is posted back to the channel it came from.
 
+use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -15,10 +16,10 @@ use discord_echo::client::DiscordClient;
 use discord_echo::config::Config;
 use discord_echo::dedup::DedupState;
 use discord_echo::types::IncomingMessage;
-use tokio::sync::{mpsc, Mutex, Notify};
-use tokio::task::JoinHandle;
+use tokio::sync::{mpsc, watch, Mutex, Notify};
+use tokio::task::{JoinHandle, JoinSet};
 
-use crate::server::turns::{PluginTurn, PluginTurns};
+use crate::server::turns::{PluginTurn, PluginTurns, SlotWait, DRAIN_WINDOW};
 use pulse_system_types::SetupPrompt;
 
 /// Replies that start with one of these are the pulse choosing to stay
@@ -28,8 +29,8 @@ const SILENT_MARKERS: &[&str] = &["[SILENT]", "[NO_RESPONSE]", "No response requ
 /// Config keys the in-process forwarder no longer reads.
 const IGNORED_KEYS: &[&str] = &["chat_endpoint", "chat_secret"];
 
-/// How long `stop` waits for each task before aborting it.
-const STOP_GRACE: Duration = Duration::from_secs(5);
+/// How long `stop` waits for the gateway before aborting it.
+const GATEWAY_GRACE: Duration = Duration::from_secs(5);
 
 /// Gateway → forwarder queue depth, as in discord-echo.
 const QUEUE_DEPTH: usize = 64;
@@ -116,6 +117,10 @@ pub(crate) enum Handled {
 }
 
 /// Runs each incoming message as a turn and posts the reply.
+///
+/// Messages are checked (stale, duplicate) the moment they arrive, then
+/// queued per Discord channel: one channel's replies keep their order, and
+/// different channels run concurrently, up to the plugin's pool.
 pub(crate) struct Forwarder<P: ReplyPoster> {
     turns: PluginTurns,
     poster: Arc<P>,
@@ -123,28 +128,43 @@ pub(crate) struct Forwarder<P: ReplyPoster> {
 }
 
 impl<P: ReplyPoster> Forwarder<P> {
+    /// The pool bounds how many turns run at once; a message queued behind
+    /// a full pool waits for a slot rather than being dropped.
     pub(crate) fn new(turns: PluginTurns, poster: Arc<P>, dedup: Arc<Mutex<DedupState>>) -> Self {
         Self {
-            turns,
+            turns: turns.waiting_for_a_slot(SlotWait::Forever),
             poster,
             dedup,
         }
     }
 
-    /// Handle one message end to end.
+    /// Handle one message end to end: [`admit`](Self::admit), then
+    /// [`answer`](Self::answer).
+    #[cfg(test)]
     pub(crate) async fn handle(&self, msg: IncomingMessage) -> Handled {
-        {
-            let mut dedup = self.dedup.lock().await;
-            if dedup.is_stale(&msg.timestamp) {
-                tracing::debug!("discord: ignoring stale message {}", msg.message_id);
-                return Handled::Stale;
-            }
-            if dedup.check_and_record_seen(&msg.message_id) {
-                tracing::debug!("discord: skipping duplicate message {}", msg.message_id);
-                return Handled::Duplicate;
-            }
+        match self.admit(&msg).await {
+            Some(refused) => refused,
+            None => self.answer(msg).await,
         }
+    }
 
+    /// The receive-time checks. `Some` names why the message is dropped;
+    /// `None` admits it, and records it as seen.
+    pub(crate) async fn admit(&self, msg: &IncomingMessage) -> Option<Handled> {
+        let mut dedup = self.dedup.lock().await;
+        if dedup.is_stale(&msg.timestamp) {
+            tracing::debug!("discord: ignoring stale message {}", msg.message_id);
+            return Some(Handled::Stale);
+        }
+        if dedup.check_and_record_seen(&msg.message_id) {
+            tracing::debug!("discord: skipping duplicate message {}", msg.message_id);
+            return Some(Handled::Duplicate);
+        }
+        None
+    }
+
+    /// Run an admitted message as a turn and post the reply.
+    pub(crate) async fn answer(&self, msg: IncomingMessage) -> Handled {
         let channel_label = msg.channel_name.as_deref().unwrap_or("discord");
         tracing::info!(
             "discord: message from {} in #{} runs in-process on channel {:?}",
@@ -188,28 +208,90 @@ impl<P: ReplyPoster> Forwarder<P> {
             }
         }
     }
+}
 
-    /// Handle messages until the gateway goes away or `shutdown` fires.
-    async fn run(self, mut rx: mpsc::Receiver<IncomingMessage>, shutdown: Arc<Notify>) {
+impl<P: ReplyPoster + 'static> Forwarder<P> {
+    /// Take messages off `rx` until the gateway goes away or `stop` is set,
+    /// admitting each the moment it arrives and queueing it on its
+    /// channel's lane. Then let the lanes finish the turns they have in
+    /// flight, for up to `grace`, starting no new one.
+    pub(crate) async fn run(
+        self: Arc<Self>,
+        mut rx: mpsc::Receiver<IncomingMessage>,
+        mut stop: watch::Receiver<bool>,
+        grace: Duration,
+    ) {
+        let mut lanes: HashMap<String, mpsc::UnboundedSender<IncomingMessage>> = HashMap::new();
+        let mut workers = JoinSet::new();
         loop {
-            tokio::select! {
+            let msg = tokio::select! {
+                biased;
+                _ = stop.wait_for(|stopped| *stopped) => break,
                 msg = rx.recv() => match msg {
-                    Some(msg) => {
-                        self.handle(msg).await;
-                    }
-                    None => return,
+                    Some(msg) => msg,
+                    None => break,
                 },
-                () = shutdown.notified() => return,
+            };
+            if self.admit(&msg).await.is_some() {
+                continue;
             }
+            let channel = msg.channel_id.clone();
+            let msg = match lanes.get(&channel) {
+                Some(lane) => match lane.send(msg) {
+                    Ok(()) => continue,
+                    // The lane's worker is gone (it panicked); start another.
+                    Err(mpsc::error::SendError(msg)) => msg,
+                },
+                None => msg,
+            };
+            let (lane, queue) = mpsc::unbounded_channel();
+            workers.spawn(Arc::clone(&self).lane(queue, stop.clone()));
+            // A fresh lane's receiver is alive, so this send cannot fail.
+            let _ = lane.send(msg);
+            lanes.insert(channel, lane);
+        }
+
+        drop(lanes);
+        let finished = tokio::time::timeout(grace, async {
+            while workers.join_next().await.is_some() {}
+        })
+        .await;
+        if finished.is_err() {
+            tracing::warn!(
+                "discord: turns still in flight after {grace:?}; abandoning them unanswered"
+            );
+            workers.abort_all();
+        }
+    }
+
+    /// One channel's messages, in order. Once `stop` is set no further
+    /// message starts a turn; the one in flight runs to the end.
+    async fn lane(
+        self: Arc<Self>,
+        mut queue: mpsc::UnboundedReceiver<IncomingMessage>,
+        stop: watch::Receiver<bool>,
+    ) {
+        while let Some(msg) = queue.recv().await {
+            if *stop.borrow() {
+                tracing::info!(
+                    "discord: stopping; message {} left unanswered",
+                    msg.message_id
+                );
+                return;
+            }
+            self.answer(msg).await;
         }
     }
 }
 
 /// A running gateway plus its in-process forwarder.
 pub(crate) struct DiscordLink {
-    shutdown: Arc<Notify>,
-    gateway: JoinHandle<()>,
+    gateway_shutdown: Arc<Notify>,
+    stop: watch::Sender<bool>,
+    gateway: Option<JoinHandle<()>>,
     forwarder: JoinHandle<()>,
+    /// How long the forwarder's in-flight turns get once stopped.
+    grace: Duration,
 }
 
 impl DiscordLink {
@@ -221,33 +303,65 @@ impl DiscordLink {
         turns: PluginTurns,
         dedup: Arc<Mutex<DedupState>>,
     ) -> Self {
-        let shutdown = Arc::new(Notify::new());
+        let gateway_shutdown = Arc::new(Notify::new());
         let (tx, rx) = mpsc::channel::<IncomingMessage>(QUEUE_DEPTH);
-
         let gateway = tokio::spawn(discord_echo::gateway::run_gateway(
             config,
             tx,
-            Arc::clone(&shutdown),
+            Arc::clone(&gateway_shutdown),
         ));
-        let forwarder = Forwarder::new(turns, client, dedup);
-        let forwarder = tokio::spawn(forwarder.run(rx, Arc::clone(&shutdown)));
+        let mut link = Self::forwarding(rx, Forwarder::new(turns, client, dedup), DRAIN_WINDOW);
+        link.gateway_shutdown = gateway_shutdown;
+        link.gateway = Some(gateway);
         tracing::info!("discord: gateway started, messages run in-process");
+        link
+    }
+
+    /// The forwarder half alone, fed by `rx` — what [`start`](Self::start)
+    /// builds on, and what tests drive without a gateway.
+    pub(crate) fn forwarding<P: ReplyPoster + 'static>(
+        rx: mpsc::Receiver<IncomingMessage>,
+        forwarder: Forwarder<P>,
+        grace: Duration,
+    ) -> Self {
+        let (stop, stopped) = watch::channel(false);
+        let forwarder = tokio::spawn(Arc::new(forwarder).run(rx, stopped, grace));
         Self {
-            shutdown,
-            gateway,
+            gateway_shutdown: Arc::new(Notify::new()),
+            stop,
+            gateway: None,
             forwarder,
+            grace,
         }
     }
 
-    /// Signal both tasks, give each a grace period, then abort what is left.
-    /// An aborted turn is rolled back by the turn pipeline.
+    /// Stop taking messages, let the turns in flight finish and post (for
+    /// up to the drain window), then return. Queued messages that have not
+    /// started are left unanswered. The stop is level-triggered: a stop
+    /// that lands while a turn runs is still seen when it ends.
     pub(crate) async fn stop(self) {
-        self.shutdown.notify_waiters();
-        for (name, mut task) in [("gateway", self.gateway), ("forwarder", self.forwarder)] {
-            if tokio::time::timeout(STOP_GRACE, &mut task).await.is_err() {
-                tracing::warn!("discord: {name} did not stop within {STOP_GRACE:?}; aborting");
-                task.abort();
+        self.stop.send_replace(true);
+        // `notify_waiters` wakes the gateway's current waiters; the stored
+        // permit catches a loop that was between two waits.
+        self.gateway_shutdown.notify_waiters();
+        self.gateway_shutdown.notify_one();
+        if let Some(mut gateway) = self.gateway {
+            if tokio::time::timeout(GATEWAY_GRACE, &mut gateway)
+                .await
+                .is_err()
+            {
+                tracing::warn!("discord: gateway did not stop within {GATEWAY_GRACE:?}; aborting");
+                gateway.abort();
             }
+        }
+        // The forwarder bounds its own wait by `grace`; this is a backstop.
+        let mut forwarder = self.forwarder;
+        if tokio::time::timeout(self.grace + GATEWAY_GRACE, &mut forwarder)
+            .await
+            .is_err()
+        {
+            tracing::warn!("discord: forwarder did not stop; aborting");
+            forwarder.abort();
         }
         tracing::info!("discord: stopped");
     }

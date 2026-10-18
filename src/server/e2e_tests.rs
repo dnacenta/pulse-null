@@ -9,7 +9,7 @@ use axum::http::{Request, StatusCode};
 use axum::middleware;
 use axum::routing::{get, post};
 use axum::Router;
-use tokio::sync::RwLock;
+use tokio::sync::{Notify, RwLock};
 use tower::ServiceExt;
 
 use crate::config::{
@@ -151,6 +151,88 @@ impl LmProvider for RefusingProvider {
 
     fn name(&self) -> &str {
         "refusing"
+    }
+
+    fn supports_tools(&self) -> bool {
+        false
+    }
+}
+
+/// Answers "re: <message>" — at once, unless the message says "hold":
+/// then it reports the turn started and waits until released.
+#[derive(Default)]
+struct Gate {
+    /// Turns currently held at the gate.
+    holding: AtomicUsize,
+    started: Notify,
+    release: Notify,
+    calls: AtomicUsize,
+}
+
+impl Gate {
+    /// Wait until at least `n` turns are held at the gate.
+    async fn wait_holding(&self, n: usize) {
+        loop {
+            let started = self.started.notified();
+            tokio::pin!(started);
+            started.as_mut().enable();
+            if self.holding.load(Ordering::SeqCst) >= n {
+                return;
+            }
+            started.await;
+        }
+    }
+
+    /// Let every held turn finish, and any later "hold" turn pass at once.
+    fn open(&self) {
+        self.release.notify_waiters();
+    }
+}
+
+struct GatedProvider(Arc<Gate>);
+
+impl crate::streaming::StreamingProvider for GatedProvider {}
+
+impl LmProvider for GatedProvider {
+    fn invoke(
+        &self,
+        _system_prompt: &str,
+        messages: &[Message],
+        _max_tokens: u32,
+        _tools: Option<&[serde_json::Value]>,
+    ) -> LlmResult<'_> {
+        self.0.calls.fetch_add(1, Ordering::SeqCst);
+        let said = messages
+            .iter()
+            .rev()
+            .find(|m| matches!(m.role, pulse_system_types::llm::Role::User))
+            .map(|m| match &m.content {
+                pulse_system_types::llm::MessageContent::Text(t) => t.clone(),
+                _ => String::new(),
+            })
+            .unwrap_or_default();
+        let said = said
+            .rsplit("User message: ")
+            .next()
+            .unwrap_or_default()
+            .to_string();
+        let gate = Arc::clone(&self.0);
+        Box::pin(async move {
+            if said.contains("hold") {
+                let released = gate.release.notified();
+                tokio::pin!(released);
+                released.as_mut().enable();
+                gate.holding.fetch_add(1, Ordering::SeqCst);
+                gate.started.notify_waiters();
+                released.await;
+                gate.holding.fetch_sub(1, Ordering::SeqCst);
+            }
+            Ok(mock_text(&format!("re: {said}")))
+        })
+    }
+
+    fn name(&self) -> &str {
+        "gated"
     }
 
     fn supports_tools(&self) -> bool {
@@ -2762,6 +2844,56 @@ mod plugin_turns_e2e {
         }
     }
 
+    async fn gated_state(dir: &std::path::Path) -> (Arc<AppState>, Arc<Gate>) {
+        let gate = Arc::new(Gate::default());
+        let mut config = test_config();
+        config.security.secret = Some(SECRET.to_string());
+        let state = build_state_boxed_with_config(
+            dir.to_path_buf(),
+            Box::new(GatedProvider(Arc::clone(&gate))),
+            ToolRegistry::new(),
+            config,
+        )
+        .await;
+        state.turns.bind(&state);
+        (state, gate)
+    }
+
+    /// Shutdown order (audit #1): refusing new turns leaves the ones in
+    /// flight running, and a turn still waiting for a slot never starts.
+    #[tokio::test]
+    async fn refuse_new_keeps_turns_in_flight_and_starts_no_waiting_one() {
+        use crate::server::turns::{SlotWait, PLUGIN_POOL_SIZE};
+        let dir = tempfile::tempdir().unwrap();
+        let (state, gate) = gated_state(dir.path()).await;
+        let turns = state
+            .turns
+            .for_plugin("discord-text-echo", "discord")
+            .unwrap()
+            .waiting_for_a_slot(SlotWait::Forever);
+
+        let mut held = Vec::new();
+        for i in 0..PLUGIN_POOL_SIZE {
+            let t = turns.clone();
+            held.push(tokio::spawn(async move {
+                t.run(turn("hold", &format!("guest-{i}")), None).await
+            }));
+        }
+        gate.wait_holding(PLUGIN_POOL_SIZE).await;
+        let t = turns.clone();
+        let waiting = tokio::spawn(async move { t.run(turn("queued", "guest-q"), None).await });
+        tokio::task::yield_now().await;
+
+        state.turns.refuse_new();
+        gate.open();
+        assert!(state.turns.drain(std::time::Duration::from_secs(30)).await);
+        for h in held {
+            assert_eq!(h.await.unwrap().unwrap().response, "re: hold");
+        }
+        assert_eq!(waiting.await.unwrap().err(), Some(TurnError::ShuttingDown));
+        assert_eq!(gate.calls.load(Ordering::SeqCst), PLUGIN_POOL_SIZE);
+    }
+
     /// The real router with the secret set: `/chat` and plugin routes need
     /// the credential, `/health` does not (AC3).
     #[tokio::test]
@@ -2937,16 +3069,36 @@ mod tool_surface_e2e {
 #[cfg(feature = "discord-text")]
 mod discord_forwarder_e2e {
     use super::*;
-    use crate::plugins::discord_forwarder::{Forwarder, Handled, ReplyPoster};
+    use crate::plugins::discord_forwarder::{DiscordLink, Forwarder, Handled, ReplyPoster};
     use discord_echo::dedup::DedupState;
     use discord_echo::types::IncomingMessage;
     use std::future::Future;
     use std::pin::Pin;
-
     /// Records every post instead of calling Discord.
     #[derive(Default)]
     struct FakePoster {
         posts: std::sync::Mutex<Vec<(String, String)>>,
+        posted: Notify,
+    }
+
+    impl FakePoster {
+        fn texts(&self) -> Vec<String> {
+            let posts = self.posts.lock().unwrap();
+            posts.iter().map(|(_, text)| text.clone()).collect()
+        }
+
+        /// Wait until at least `n` replies were posted.
+        async fn wait_for(&self, n: usize) {
+            loop {
+                let posted = self.posted.notified();
+                tokio::pin!(posted);
+                posted.as_mut().enable();
+                if self.posts.lock().unwrap().len() >= n {
+                    return;
+                }
+                posted.await;
+            }
+        }
     }
 
     impl ReplyPoster for FakePoster {
@@ -2959,7 +3111,53 @@ mod discord_forwarder_e2e {
                 .lock()
                 .unwrap()
                 .push((channel_id.to_string(), text.to_string()));
+            self.posted.notify_waiters();
             Box::pin(async { Ok(()) })
+        }
+    }
+
+    async fn gated_forwarder(
+        dir: &std::path::Path,
+    ) -> (
+        Arc<AppState>,
+        Forwarder<FakePoster>,
+        Arc<FakePoster>,
+        Arc<Gate>,
+    ) {
+        let gate = Arc::new(Gate::default());
+        let mut config = test_config();
+        config.security.secret = Some("s3cret".to_string());
+        let state = build_state_boxed_with_config(
+            dir.to_path_buf(),
+            Box::new(GatedProvider(Arc::clone(&gate))),
+            ToolRegistry::new(),
+            config,
+        )
+        .await;
+        state.turns.bind(&state);
+        let turns = state
+            .turns
+            .for_plugin("discord-text-echo", "discord")
+            .unwrap();
+        let poster = Arc::new(FakePoster::default());
+        let dedup = Arc::new(tokio::sync::Mutex::new(DedupState::new()));
+        let forwarder = Forwarder::new(turns, Arc::clone(&poster), dedup);
+        (state, forwarder, poster, gate)
+    }
+
+    fn in_channel(id: &str, channel: &str, author: &str, content: &str) -> IncomingMessage {
+        IncomingMessage {
+            channel_id: channel.to_string(),
+            ..message(id, author, content)
+        }
+    }
+
+    /// Poll `fut` once; it must still be pending.
+    async fn assert_pending<F: Future + Unpin>(fut: &mut F) {
+        tokio::select! {
+            biased;
+            _ = fut => panic!("finished early"),
+            () = std::future::ready(()) => {}
         }
     }
 
@@ -3055,6 +3253,132 @@ mod discord_forwarder_e2e {
             Handled::Duplicate
         );
         assert_eq!(poster.posts.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn stop_lets_the_turn_in_flight_finish_and_post() {
+        let dir = tempfile::tempdir().unwrap();
+        let (_state, forwarder, poster, gate) = gated_forwarder(dir.path()).await;
+        let (tx, rx) = tokio::sync::mpsc::channel(8);
+        let link = DiscordLink::forwarding(rx, forwarder, std::time::Duration::from_secs(30));
+
+        tx.send(in_channel("m1", "a", "2002", "hold on"))
+            .await
+            .unwrap();
+        gate.wait_holding(1).await;
+
+        let mut stopping = Box::pin(link.stop());
+        assert_pending(&mut stopping).await;
+        gate.open();
+        stopping.await;
+        assert_eq!(poster.texts(), ["re: hold on"]);
+    }
+
+    #[tokio::test]
+    async fn a_stop_during_a_turn_starts_no_new_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let (_state, forwarder, poster, gate) = gated_forwarder(dir.path()).await;
+        let (tx, rx) = tokio::sync::mpsc::channel(8);
+        let link = DiscordLink::forwarding(rx, forwarder, std::time::Duration::from_secs(30));
+
+        tx.send(in_channel("m1", "a", "2002", "hold on"))
+            .await
+            .unwrap();
+        gate.wait_holding(1).await;
+        tx.send(in_channel("m2", "a", "2002", "next"))
+            .await
+            .unwrap();
+
+        // The stop lands while m1's turn runs, before anyone waits on it.
+        let mut stopping = Box::pin(link.stop());
+        assert_pending(&mut stopping).await;
+        gate.open();
+        stopping.await;
+        assert_eq!(gate.calls.load(Ordering::SeqCst), 1, "m2 must not start");
+        assert_eq!(poster.texts(), ["re: hold on"]);
+    }
+
+    #[tokio::test]
+    async fn admission_happens_on_receipt_so_a_long_wait_is_not_staleness() {
+        let dir = tempfile::tempdir().unwrap();
+        let (_state, forwarder, poster, _gate) = gated_forwarder(dir.path()).await;
+
+        // A message admitted on receipt is answered however long it then
+        // waited behind another turn: answering never re-checks the age.
+        let mut waited = in_channel("m1", "a", "2002", "still there?");
+        waited.timestamp = chrono::Utc::now() - chrono::Duration::seconds(40);
+        assert_eq!(forwarder.answer(waited).await, Handled::Posted);
+        assert_eq!(poster.texts(), ["re: still there?"]);
+    }
+
+    #[tokio::test]
+    async fn a_message_queued_behind_a_long_turn_is_admitted_at_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let (_state, forwarder, poster, gate) = gated_forwarder(dir.path()).await;
+        let (tx, rx) = tokio::sync::mpsc::channel(8);
+        let link = DiscordLink::forwarding(rx, forwarder, std::time::Duration::from_secs(30));
+
+        tx.send(in_channel("m1", "a", "2002", "hold on"))
+            .await
+            .unwrap();
+        gate.wait_holding(1).await;
+        tx.send(in_channel("m2", "a", "2002", "and this"))
+            .await
+            .unwrap();
+        tx.send(in_channel("m2", "a", "2002", "and this"))
+            .await
+            .unwrap();
+        tx.send(in_channel("m3", "b", "3003", "marker"))
+            .await
+            .unwrap();
+        // The relay takes messages in order: once m3 (another channel) is
+        // answered, m2 and its replay were checked — while m1 still runs.
+        poster.wait_for(1).await;
+        assert_eq!(poster.texts(), ["re: marker"]);
+
+        gate.open();
+        poster.wait_for(3).await;
+        assert_eq!(
+            poster.texts(),
+            ["re: marker", "re: hold on", "re: and this"],
+            "m2 answered once, after m1"
+        );
+        link.stop().await;
+    }
+
+    #[tokio::test]
+    async fn two_channels_run_concurrently_and_one_channel_keeps_its_order() {
+        let dir = tempfile::tempdir().unwrap();
+        let (_state, forwarder, poster, gate) = gated_forwarder(dir.path()).await;
+        let (tx, rx) = tokio::sync::mpsc::channel(8);
+        let link = DiscordLink::forwarding(rx, forwarder, std::time::Duration::from_secs(30));
+
+        // Author X holds channel a; author Y in channel b is answered meanwhile.
+        tx.send(in_channel("m1", "a", "2002", "hold on"))
+            .await
+            .unwrap();
+        gate.wait_holding(1).await;
+        tx.send(in_channel("m2", "a", "2002", "second in a"))
+            .await
+            .unwrap();
+        tx.send(in_channel("m3", "b", "3003", "hello from b"))
+            .await
+            .unwrap();
+        poster.wait_for(1).await;
+        assert_eq!(poster.texts(), ["re: hello from b"]);
+
+        // Channel a: m2 waited for m1, then followed it.
+        gate.open();
+        poster.wait_for(3).await;
+        let posts = poster.posts.lock().unwrap().clone();
+        let in_a: Vec<_> = posts
+            .iter()
+            .filter(|(channel, _)| channel == "a")
+            .map(|(_, text)| text.as_str())
+            .collect();
+        assert_eq!(in_a, ["re: hold on", "re: second in a"]);
+        drop(posts);
+        link.stop().await;
     }
 
     #[tokio::test]

@@ -473,6 +473,10 @@ pub async fn start_in(
     // === Post-signal sequence ===
     // These run immediately after SIGTERM, while axum is still draining.
 
+    // 0. No new plugin turn starts from here on; the ones in flight run on
+    //    and are drained in step 3.
+    state.turns.refuse_new();
+
     // 1. Stop the coordinator — aborts scheduler tasks (they call the provider
     //    directly and may hold long-running LLM requests) and releases the
     //    control-plane lease so a successor need not wait out the ttl.
@@ -481,15 +485,20 @@ pub async fn start_in(
     // its ending archive (or shed, when isolated) before the drain.
     state.comms.shutdown().await;
 
-    // 2. Stop plugins (Discord bot, etc.) so they stop generating new requests.
+    // 2. Stop plugins (Discord bot, etc.) so they stop taking new messages.
+    //    The Discord forwarder lets the turns it has in flight finish and
+    //    post their replies, within the drain window.
+    let drain = turns::DRAIN_WINDOW;
+    let drain_deadline = tokio::time::Instant::now() + drain;
     state.plugin_manager.lock().await.stop_all().await;
 
-    // 3. Give axum and the plugins' in-process turns up to 30s to drain
-    //    what is in flight; no new plugin turn starts from here on.
-    let drain = std::time::Duration::from_secs(30);
+    // 3. Give axum and the plugins' in-process turns what is left of the
+    //    drain window to finish what is in flight.
     let (served, turns_drained) = tokio::join!(
-        tokio::time::timeout(drain, server_handle),
-        state.turns.close(drain)
+        tokio::time::timeout_at(drain_deadline, server_handle),
+        state
+            .turns
+            .drain(drain_deadline.saturating_duration_since(tokio::time::Instant::now()))
     );
     match served {
         Ok(Ok(Ok(()))) => tracing::info!("Server drained cleanly"),

@@ -24,7 +24,7 @@ use std::sync::{Arc, OnceLock, Weak};
 use std::time::Duration;
 
 use axum::http::StatusCode;
-use tokio::sync::{Notify, Semaphore};
+use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore};
 use tokio::time::Instant;
 
 use super::auth::AuthIdentity;
@@ -35,10 +35,26 @@ use crate::tool_loop::TurnSink;
 /// How long a turn waits for the runner to be bound before giving up.
 pub const READY_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// Concurrent turns per plugin before [`TurnError::Busy`]. Each plugin has
-/// its own pool, so a Discord burst never eats a voice call's budget, and
-/// neither touches the HTTP stream pool the TUI uses.
+/// Concurrent turns per plugin. Each plugin has its own pool, so a Discord
+/// burst never eats a voice call's budget, and neither touches the HTTP
+/// stream pool the TUI uses. What a turn does when the pool is full is the
+/// plugin's [`SlotWait`].
 pub const PLUGIN_POOL_SIZE: usize = 4;
+
+/// How long shutdown waits for the plugin turns already in flight. A plugin
+/// that stops before the drain (the Discord forwarder) waits this long for
+/// its own in-flight turns before it gives up on them.
+pub const DRAIN_WINDOW: Duration = Duration::from_secs(30);
+
+/// What a plugin turn does when its plugin's pool is full.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SlotWait {
+    /// Fail at once with [`TurnError::Busy`].
+    Never,
+    /// Wait as long as it takes. For a caller that bounds its own
+    /// concurrency and must not drop what it queued.
+    Forever,
+}
 
 /// The channel every voice transport speaks on. Callers on it are guests.
 pub const VOICE_CHANNEL: &str = "voice";
@@ -66,7 +82,8 @@ pub enum TurnError {
     /// Shutdown has started; no new turns run.
     #[error("the pulse is shutting down")]
     ShuttingDown,
-    /// The plugin already has [`PLUGIN_POOL_SIZE`] turns in flight.
+    /// The plugin already has [`PLUGIN_POOL_SIZE`] turns in flight, and no
+    /// slot freed up within its [`SlotWait`].
     #[error("too many turns in flight for this plugin")]
     Busy,
     /// The turn itself refused or failed, with the status `/chat` would
@@ -154,14 +171,23 @@ impl TurnRunner {
             name,
             channel: channel.to_string(),
             pool: Arc::new(Semaphore::new(PLUGIN_POOL_SIZE)),
+            slot_wait: SlotWait::Never,
         })
     }
 
-    /// Refuse new turns and wait up to `within` for the in-flight ones to
-    /// finish. Returns whether they all did.
-    pub(crate) async fn close(&self, within: Duration) -> bool {
+    /// Refuse every turn from now on, and wake the ones waiting for the
+    /// bind so they fail instead of waiting. The turns already in flight
+    /// keep running; [`drain`] waits for them.
+    ///
+    /// [`drain`]: TurnRunner::drain
+    pub(crate) fn refuse_new(&self) {
         self.shared.closed.store(true, Ordering::SeqCst);
         self.shared.changed.notify_waiters();
+    }
+
+    /// Wait up to `within` for the turns in flight to finish. Returns
+    /// whether they all did.
+    pub(crate) async fn drain(&self, within: Duration) -> bool {
         let deadline = Instant::now() + within;
         loop {
             let drained = self.shared.drained.notified();
@@ -174,6 +200,20 @@ impl TurnRunner {
                 return self.shared.in_flight.load(Ordering::SeqCst) == 0;
             }
         }
+    }
+
+    /// [`refuse_new`], then [`drain`] for up to `within`.
+    ///
+    /// [`refuse_new`]: TurnRunner::refuse_new
+    /// [`drain`]: TurnRunner::drain
+    #[cfg(test)]
+    pub(crate) async fn close(&self, within: Duration) -> bool {
+        self.refuse_new();
+        self.drain(within).await
+    }
+
+    fn is_closed(&self) -> bool {
+        self.shared.closed.load(Ordering::SeqCst)
     }
 
     /// Count a turn as in flight, unless shutdown has started. The count is
@@ -238,9 +278,17 @@ pub struct PluginTurns {
     name: &'static str,
     channel: String,
     pool: Arc<Semaphore>,
+    slot_wait: SlotWait,
 }
 
 impl PluginTurns {
+    /// This handle's turns wait for a pool slot as `wait` says.
+    #[must_use]
+    pub fn waiting_for_a_slot(mut self, wait: SlotWait) -> Self {
+        self.slot_wait = wait;
+        self
+    }
+
     /// The channel this plugin's turns run on.
     #[must_use]
     pub fn channel(&self) -> &str {
@@ -254,10 +302,14 @@ impl PluginTurns {
         turn: PluginTurn,
         sink: Option<TurnSink>,
     ) -> Result<ChatResponse, TurnError> {
+        if self.runner.is_closed() {
+            return Err(TurnError::ShuttingDown);
+        }
+        // Slot first, then the flight: a turn still waiting for a slot is
+        // not in flight, and one that gets its slot after shutdown started
+        // is refused here instead of starting.
+        let _permit = self.slot().await?;
         let _flight = self.runner.enter()?;
-        let _permit = Arc::clone(&self.pool)
-            .try_acquire_owned()
-            .map_err(|_| TurnError::Busy)?;
         let state = self.runner.state().await?;
         let request = ChatRequest {
             message: turn.message,
@@ -271,6 +323,17 @@ impl PluginTurns {
         run_turn(state, request, who, sink)
             .await
             .map_err(|(status, message)| TurnError::Refused(status, message))
+    }
+
+    /// A slot in the plugin's pool, waiting as [`SlotWait`] allows.
+    async fn slot(&self) -> Result<OwnedSemaphorePermit, TurnError> {
+        let pool = Arc::clone(&self.pool);
+        let acquired = match self.slot_wait {
+            SlotWait::Never => return pool.try_acquire_owned().map_err(|_| TurnError::Busy),
+            SlotWait::Forever => pool.acquire_owned().await,
+        };
+        // The pool is never closed; a closed one would mean shutdown.
+        acquired.map_err(|_| TurnError::ShuttingDown)
     }
 }
 
@@ -289,6 +352,7 @@ impl TurnRunner {
             name,
             channel: channel.to_string(),
             pool: Arc::new(Semaphore::new(PLUGIN_POOL_SIZE)),
+            slot_wait: SlotWait::Never,
         }
     }
 }
