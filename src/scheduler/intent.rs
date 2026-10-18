@@ -554,11 +554,8 @@ pub async fn drain_loop(
             leases: Arc::clone(&leases),
             holder: holder.clone(),
         };
-        // An intent is the pulse's own work, on the full tool surface.
-        let result = crate::tool_surface::owner_work(execute_intent(
-            &intent, &state, &queue, &schedule, config, &tenure,
-        ))
-        .await;
+        let result =
+            execute_intent_as_owner(&intent, &state, &queue, &schedule, config, &tenure).await;
 
         match result {
             Some(output) if output.trim().is_empty() => {
@@ -688,6 +685,22 @@ pub(crate) fn intent_user_message(
 }
 
 /// Execute a single intent with tools.
+/// Execute one intent as the pulse's own work: its provider calls get the
+/// full tool surface, which no longer comes by default (PN-110 audit R2-11).
+pub(crate) async fn execute_intent_as_owner(
+    intent: &Intent,
+    state: &Arc<AppState>,
+    queue: &Arc<RwLock<IntentQueue>>,
+    schedule: &Arc<RwLock<Schedule>>,
+    config: &AutonomyConfig,
+    tenure: &crate::coordinator::control::TenureLeases,
+) -> Option<String> {
+    crate::tool_surface::owner_work(execute_intent(
+        intent, state, queue, schedule, config, tenure,
+    ))
+    .await
+}
+
 async fn execute_intent(
     intent: &Intent,
     state: &Arc<AppState>,

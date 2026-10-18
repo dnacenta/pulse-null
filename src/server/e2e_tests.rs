@@ -3894,15 +3894,7 @@ mod owner_work_surface_e2e {
             dir.path(),
         )));
         let mut eval_state = crate::scheduler::evaluator::SchedulerState::default();
-        let tenure = crate::coordinator::control::TenureLeases {
-            leases: Arc::new(tokio::sync::Mutex::new(
-                crate::coordinator::durable::DurableLeaseTable::open(
-                    &dir.path().join("coordinator"),
-                )
-                .unwrap(),
-            )),
-            holder: "test-holder".to_string(),
-        };
+        let tenure = tenure_in(dir.path());
 
         crate::scheduler::runner::execute_task_as_owner(
             &entry,
@@ -3915,6 +3907,85 @@ mod owner_work_surface_e2e {
         .await;
         let seen = seen.lock().unwrap().clone();
         assert!(!seen.is_empty(), "the task never reached the provider");
+        assert!(
+            seen.iter().all(|s| *s == Some(ToolSurface::Full)),
+            "{seen:?}"
+        );
+    }
+
+    fn tenure_in(dir: &std::path::Path) -> crate::coordinator::control::TenureLeases {
+        crate::coordinator::control::TenureLeases {
+            leases: Arc::new(tokio::sync::Mutex::new(
+                crate::coordinator::durable::DurableLeaseTable::open(&dir.join("coordinator"))
+                    .unwrap(),
+            )),
+            holder: "test-holder".to_string(),
+        }
+    }
+
+    #[tokio::test]
+    async fn an_intent_runs_on_the_full_surface() {
+        use crate::scheduler::intent::{Intent, IntentOutput, IntentPriority, IntentSource};
+        let dir = tempfile::tempdir().unwrap();
+        let (state, seen) = recording_state(dir.path()).await;
+        let intent = Intent {
+            id: "intent-surface-probe".into(),
+            description: "Surface probe".into(),
+            prompt: "Say ok.".into(),
+            source: IntentSource::UserCli,
+            priority: IntentPriority::Normal,
+            created_at: chrono::Utc::now(),
+            chain: None,
+            output_routing: IntentOutput::Silent,
+            depth: 0,
+        };
+        let queue = Arc::new(RwLock::new(crate::scheduler::intent::IntentQueue::load(
+            dir.path(),
+        )));
+        let schedule = Arc::new(RwLock::new(
+            crate::scheduler::Schedule::load_or_init(dir.path()).unwrap(),
+        ));
+
+        crate::scheduler::intent::execute_intent_as_owner(
+            &intent,
+            &state,
+            &queue,
+            &schedule,
+            &state.config.autonomy,
+            &tenure_in(dir.path()),
+        )
+        .await;
+        let seen = seen.lock().unwrap().clone();
+        assert!(!seen.is_empty(), "the intent never reached the provider");
+        assert!(
+            seen.iter().all(|s| *s == Some(ToolSurface::Full)),
+            "{seen:?}"
+        );
+    }
+
+    /// Subtasks run on spawned tasks and the synthesis on the caller's:
+    /// called from outside any scope, every one must still ask for Full.
+    #[tokio::test]
+    async fn a_farm_runs_its_subtasks_and_synthesis_on_the_full_surface() {
+        let dir = tempfile::tempdir().unwrap();
+        let (state, seen) = recording_state(dir.path()).await;
+        let farm = serde_json::json!({
+            "id": "surface-farm",
+            "subtasks": [
+                {"id": "a", "prompt": "Say ok."},
+                {"id": "b", "prompt": "Say ok."}
+            ],
+            "synthesis": "Combine: {results}"
+        })
+        .to_string();
+
+        let composed =
+            crate::coordinator::farm::run_farm_from_marker(&farm, &state, &tenure_in(dir.path()))
+                .await
+                .unwrap();
+        assert_eq!(composed, "ok", "the synthesis answered");
+        let seen = seen.lock().unwrap().clone();
+        assert_eq!(seen.len(), 3, "two subtasks and a synthesis: {seen:?}");
         assert!(
             seen.iter().all(|s| *s == Some(ToolSurface::Full)),
             "{seen:?}"
