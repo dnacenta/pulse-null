@@ -611,10 +611,15 @@ impl TurnRunner {
 
     /// Wait until `n` turns are in flight — a turn counts once it is past
     /// its slot and waiting for the bind or running.
+    /// Panics after 10 s, so a regression fails instead of hanging.
     pub(crate) async fn wait_in_flight(&self, n: usize) {
-        while self.in_flight() < n {
-            tokio::task::yield_now().await;
-        }
+        let waited = tokio::time::timeout(Duration::from_secs(10), async {
+            while self.in_flight() < n {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await;
+        assert!(waited.is_ok(), "{n} turn(s) never came in flight");
     }
 
     /// An unbound runner with a short readiness wait, for tests.

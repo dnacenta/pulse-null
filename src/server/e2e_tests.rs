@@ -158,6 +158,18 @@ impl LmProvider for RefusingProvider {
     }
 }
 
+/// The longest a test waits for something it expects to happen.
+const TEST_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Run `fut` to completion, or fail the test after [`TEST_WAIT`] naming
+/// what never happened.
+async fn within_test_wait<F: std::future::Future>(what: &str, fut: F) -> F::Output {
+    match tokio::time::timeout(TEST_WAIT, fut).await {
+        Ok(out) => out,
+        Err(_) => panic!("gave up after {TEST_WAIT:?} waiting for: {what}"),
+    }
+}
+
 /// Answers "re: <message>" — at once, unless the message says "hold":
 /// then it reports the turn started and waits until released.
 #[derive(Default)]
@@ -171,16 +183,20 @@ struct Gate {
 
 impl Gate {
     /// Wait until at least `n` turns are held at the gate.
+    /// Panics after [`TEST_WAIT`], so a regression fails instead of hanging.
     async fn wait_holding(&self, n: usize) {
-        loop {
-            let started = self.started.notified();
-            tokio::pin!(started);
-            started.as_mut().enable();
-            if self.holding.load(Ordering::SeqCst) >= n {
-                return;
+        within_test_wait(&format!("{n} turn(s) held at the gate"), async {
+            loop {
+                let started = self.started.notified();
+                tokio::pin!(started);
+                started.as_mut().enable();
+                if self.holding.load(Ordering::SeqCst) >= n {
+                    return;
+                }
+                started.await;
             }
-            started.await;
-        }
+        })
+        .await;
     }
 
     /// Let every held turn finish, and any later "hold" turn pass at once.
@@ -3466,16 +3482,21 @@ mod discord_forwarder_e2e {
         }
 
         /// Wait until at least `n` replies were posted.
+        /// Panics after [`TEST_WAIT`], so a regression fails instead of
+        /// hanging.
         async fn wait_for(&self, n: usize) {
-            loop {
-                let posted = self.posted.notified();
-                tokio::pin!(posted);
-                posted.as_mut().enable();
-                if self.posts.lock().unwrap().len() >= n {
-                    return;
+            within_test_wait(&format!("{n} reply(ies) posted"), async {
+                loop {
+                    let posted = self.posted.notified();
+                    tokio::pin!(posted);
+                    posted.as_mut().enable();
+                    if self.posts.lock().unwrap().len() >= n {
+                        return;
+                    }
+                    posted.await;
                 }
-                posted.await;
-            }
+            })
+            .await;
         }
     }
 
@@ -3650,7 +3671,7 @@ mod discord_forwarder_e2e {
         let mut stopping = Box::pin(link.stop());
         assert_pending(&mut stopping).await;
         gate.open();
-        stopping.await;
+        within_test_wait("the link to stop", stopping).await;
         assert_eq!(poster.texts(), ["re: hold on"]);
     }
 
@@ -3668,14 +3689,25 @@ mod discord_forwarder_e2e {
         tx.send(in_channel("m2", "a", "2002", "next"))
             .await
             .unwrap();
+        // A marker on another channel: once it is answered, the relay has
+        // queued m2 on channel a's lane. Only the lane's stop check can now
+        // keep m2 from starting.
+        tx.send(in_channel("mk", "b", "3003", "marker"))
+            .await
+            .unwrap();
+        poster.wait_for(1).await;
 
         // The stop lands while m1's turn runs, before anyone waits on it.
         let mut stopping = Box::pin(link.stop());
         assert_pending(&mut stopping).await;
         gate.open();
-        stopping.await;
-        assert_eq!(gate.calls.load(Ordering::SeqCst), 1, "m2 must not start");
-        assert_eq!(poster.texts(), ["re: hold on"]);
+        within_test_wait("the link to stop", stopping).await;
+        assert_eq!(
+            gate.calls.load(Ordering::SeqCst),
+            2,
+            "m1 and the marker; m2 must not start"
+        );
+        assert_eq!(poster.texts(), ["re: marker", "re: hold on"]);
     }
 
     #[tokio::test]

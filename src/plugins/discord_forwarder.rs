@@ -428,6 +428,14 @@ impl DiscordLink {
     }
 }
 
+/// Why the Discord link did not start.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub(crate) enum StartError {
+    /// `start` was called on a link that is already running.
+    #[error("already running")]
+    AlreadyRunning,
+}
+
 /// What both Discord adapters run: the crate's config and REST client, the
 /// plugin's turn handle, and the link while started.
 pub(crate) struct DiscordText {
@@ -465,9 +473,9 @@ impl DiscordText {
         Arc::clone(&self.client)
     }
 
-    pub(crate) fn start(&mut self) -> Result<(), String> {
+    pub(crate) fn start(&mut self) -> Result<(), StartError> {
         if self.link.is_some() {
-            return Err("already running".to_string());
+            return Err(StartError::AlreadyRunning);
         }
         self.link = Some(DiscordLink::start(
             Arc::clone(&self.config),
