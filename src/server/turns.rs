@@ -11,13 +11,11 @@
 //! and bound to the state once it is built. A turn that arrives before the
 //! bind waits for it; one that arrives after shutdown starts is refused, and
 //! shutdown drains the turns already in flight.
-
-// The plugin-facing half of this module only has callers when a plugin
-// feature is compiled in; the gate lints `--features all-plugins` too.
-#![cfg_attr(
-    not(any(feature = "voice", feature = "discord-text")),
-    allow(dead_code)
-)]
+//!
+//! The plugin-facing half (`for_plugin`, [`PluginTurns`] and what it uses)
+//! has callers only when a plugin feature is compiled in; those items alone
+//! carry `allow(dead_code)` in a build without one. The gate lints each
+//! plugin feature on its own and together.
 
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock, Weak};
@@ -40,15 +38,27 @@ pub const READY_TIMEOUT: Duration = Duration::from_secs(30);
 /// burst never eats a voice call's budget, and neither touches the HTTP
 /// stream pool the TUI uses. What a turn does when the pool is full is the
 /// plugin's [`SlotWait`].
+#[cfg_attr(
+    not(any(feature = "voice", feature = "discord-text")),
+    allow(dead_code)
+)]
 pub const PLUGIN_POOL_SIZE: usize = 4;
 
 /// Turns a plugin may start in a burst before its rate limit applies — the
 /// same bucket `/chat` has over HTTP. In-process turns skip the HTTP layer,
 /// so without it a plugin fed from outside (a phone line, a Discord guild)
 /// could start paid turns without bound.
+#[cfg_attr(
+    not(any(feature = "voice", feature = "discord-text")),
+    allow(dead_code)
+)]
 pub const PLUGIN_RATE_BURST: u32 = 10;
 
 /// A plugin's sustained turn rate once its burst is spent.
+#[cfg_attr(
+    not(any(feature = "voice", feature = "discord-text")),
+    allow(dead_code)
+)]
 pub const PLUGIN_RATE_PER_SECOND: f64 = 2.0;
 
 /// How long shutdown waits for the plugin turns already in flight. A plugin
@@ -58,13 +68,19 @@ pub const DRAIN_WINDOW: Duration = Duration::from_secs(30);
 
 /// What a plugin turn does when its plugin's pool is full.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(
+    not(any(feature = "voice", feature = "discord-text")),
+    allow(dead_code)
+)]
 pub enum SlotWait {
     /// Fail at once with [`TurnError::Busy`].
     Never,
-    /// Wait up to this long for a slot, then [`TurnError::Busy`].
+    /// Wait up to this long for a slot, then [`TurnError::Busy`]. Voice.
+    #[cfg_attr(not(feature = "voice"), allow(dead_code))]
     Up(Duration),
     /// Wait as long as it takes. For a caller that bounds its own
-    /// concurrency and must not drop what it queued.
+    /// concurrency and must not drop what it queued: the Discord forwarder.
+    #[cfg_attr(not(feature = "discord-text"), allow(dead_code))]
     Forever,
 }
 
@@ -75,6 +91,10 @@ pub const VOICE_CHANNEL: &str = "voice";
 /// peer channel whose senders resolve to sibling pulses.
 pub const RESERVED_CHANNELS: &[&str] = &["tui", "system", "reflection", "comms"];
 
+#[cfg_attr(
+    not(any(feature = "voice", feature = "discord-text")),
+    allow(dead_code)
+)]
 const MAX_CHANNEL_LEN: usize = 64;
 
 /// Whether `channel` is reserved (case-insensitive, so `"TUI"` is too).
@@ -87,6 +107,10 @@ pub fn is_reserved_channel(channel: &str) -> bool {
 
 /// Why a plugin turn did not run.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[cfg_attr(
+    not(any(feature = "voice", feature = "discord-text")),
+    allow(dead_code)
+)]
 pub enum TurnError {
     /// The runner was not bound within [`READY_TIMEOUT`].
     #[error("the pulse is not ready to take turns yet")]
@@ -116,6 +140,10 @@ struct Shared {
     in_flight: AtomicUsize,
     /// Woken when the last in-flight turn finishes.
     drained: Notify,
+    #[cfg_attr(
+        not(any(feature = "voice", feature = "discord-text")),
+        allow(dead_code)
+    )]
     ready_timeout: Duration,
 }
 
@@ -164,34 +192,6 @@ impl TurnRunner {
         self.shared.changed.notify_waiters();
     }
 
-    /// A plugin's handle for running turns on `channel`, as
-    /// `AuthIdentity::Plugin { name, channel }`. Refuses a reserved, empty
-    /// or malformed channel, so a misconfigured plugin fails at init rather
-    /// than speaking as the owner.
-    pub fn for_plugin(&self, name: &'static str, channel: &str) -> Result<PluginTurns, String> {
-        if channel.is_empty()
-            || channel.len() > MAX_CHANNEL_LEN
-            || channel.contains("..")
-            || channel.contains('/')
-        {
-            return Err(format!("plugin {name}: invalid channel name {channel:?}"));
-        }
-        if is_reserved_channel(channel) {
-            return Err(format!(
-                "plugin {name}: channel {channel:?} is reserved ({}); pick another",
-                RESERVED_CHANNELS.join(", ")
-            ));
-        }
-        Ok(PluginTurns {
-            runner: self.clone(),
-            name,
-            channel: channel.to_string(),
-            pool: Arc::new(Semaphore::new(PLUGIN_POOL_SIZE)),
-            slot_wait: SlotWait::Never,
-            rate: Arc::new(RateLimiter::new(PLUGIN_RATE_BURST, PLUGIN_RATE_PER_SECOND)),
-        })
-    }
-
     /// Refuse every turn from now on, and wake the ones waiting for the
     /// bind so they fail instead of waiting. The turns already in flight
     /// keep running; [`drain`] waits for them.
@@ -228,16 +228,52 @@ impl TurnRunner {
         self.refuse_new();
         self.drain(within).await
     }
+}
+
+/// The plugin-facing half of the runner.
+#[cfg_attr(
+    not(any(feature = "voice", feature = "discord-text")),
+    allow(dead_code)
+)]
+impl TurnRunner {
+    /// A plugin's handle for running turns on `channel`, as
+    /// `AuthIdentity::Plugin { name, channel }`. Refuses a reserved, empty
+    /// or malformed channel, so a misconfigured plugin fails at init rather
+    /// than speaking as the owner.
+    pub fn for_plugin(&self, name: &'static str, channel: &str) -> Result<PluginTurns, String> {
+        if channel.is_empty()
+            || channel.len() > MAX_CHANNEL_LEN
+            || channel.contains("..")
+            || channel.contains('/')
+        {
+            return Err(format!("plugin {name}: invalid channel name {channel:?}"));
+        }
+        if is_reserved_channel(channel) {
+            return Err(format!(
+                "plugin {name}: channel {channel:?} is reserved ({}); pick another",
+                RESERVED_CHANNELS.join(", ")
+            ));
+        }
+        Ok(PluginTurns {
+            runner: self.clone(),
+            name,
+            channel: channel.to_string(),
+            pool: Arc::new(Semaphore::new(PLUGIN_POOL_SIZE)),
+            slot_wait: SlotWait::Never,
+            rate: Arc::new(RateLimiter::new(PLUGIN_RATE_BURST, PLUGIN_RATE_PER_SECOND)),
+        })
+    }
 
     fn is_closed(&self) -> bool {
         self.shared.closed.load(Ordering::SeqCst)
     }
 
     /// Count a turn as in flight, unless shutdown has started. The count is
-    /// taken before the closed check so [`close`] either sees this turn or
-    /// this turn sees the close.
+    /// taken before the closed check so [`drain`] either sees this turn or
+    /// this turn sees [`refuse_new`].
     ///
-    /// [`close`]: TurnRunner::close
+    /// [`drain`]: TurnRunner::drain
+    /// [`refuse_new`]: TurnRunner::refuse_new
     fn enter(&self) -> Result<Flight, TurnError> {
         self.shared.in_flight.fetch_add(1, Ordering::SeqCst);
         let flight = Flight(Arc::clone(&self.shared));
@@ -268,6 +304,10 @@ impl TurnRunner {
 }
 
 /// One in-flight turn; dropping it releases the count.
+#[cfg_attr(
+    not(any(feature = "voice", feature = "discord-text")),
+    allow(dead_code)
+)]
 struct Flight(Arc<Shared>);
 
 impl Drop for Flight {
@@ -280,6 +320,10 @@ impl Drop for Flight {
 
 /// A message a plugin wants answered.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(
+    not(any(feature = "voice", feature = "discord-text")),
+    allow(dead_code)
+)]
 pub struct PluginTurn {
     pub message: String,
     /// The transport's id for whoever spoke (a Discord user id, a fixed
@@ -290,6 +334,10 @@ pub struct PluginTurn {
 /// One plugin's way into the turn pipeline: its principal, its channel, its
 /// own concurrency pool.
 #[derive(Clone)]
+#[cfg_attr(
+    not(any(feature = "voice", feature = "discord-text")),
+    allow(dead_code)
+)]
 pub struct PluginTurns {
     runner: TurnRunner,
     name: &'static str,
@@ -299,6 +347,10 @@ pub struct PluginTurns {
     rate: Arc<RateLimiter>,
 }
 
+#[cfg_attr(
+    not(any(feature = "voice", feature = "discord-text")),
+    allow(dead_code)
+)]
 impl PluginTurns {
     /// This handle's turns wait for a pool slot as `wait` says.
     #[must_use]
@@ -309,6 +361,7 @@ impl PluginTurns {
 
     /// The channel this plugin's turns run on.
     #[must_use]
+    #[cfg_attr(not(feature = "discord-text"), allow(dead_code))]
     pub fn channel(&self) -> &str {
         &self.channel
     }
