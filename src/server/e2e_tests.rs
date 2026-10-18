@@ -387,9 +387,12 @@ async fn build_state_with_buffer(
 ) -> Arc<AppState> {
     let wal =
         crate::wal::WalWriter::new(&root_dir.join("sessions"), crate::wal::WalFsync::None).ok();
-    let session_store =
+    let mut session_store =
         crate::session_store::SessionStore::new(&root_dir, &config.sessions, &config.pulse.name)
             .await;
+    // Tracked writes, as in production: a test can flush and then look.
+    let persist_coordinator = Arc::new(PersistCoordinator::new());
+    session_store.set_coordinator(Arc::clone(&persist_coordinator));
     let plugin_manager = crate::plugins::manager::PluginManager::new(&config);
     let alert_queue = crate::scheduler::alerts::AlertQueue::load(&root_dir);
     Arc::new(AppState {
@@ -404,7 +407,7 @@ async fn build_state_with_buffer(
         cognitive_monitor: None,
         outcome_tracker: None,
         context_buffer,
-        persist_coordinator: Arc::new(PersistCoordinator::new()),
+        persist_coordinator,
         plugin_manager: tokio::sync::Mutex::new(plugin_manager),
         wal,
         alert_queue: tokio::sync::Mutex::new(alert_queue),
@@ -3564,7 +3567,12 @@ mod voice_brain_e2e {
         )
         .await;
         state.turns.bind(&state);
-        let turns = state.turns.for_plugin("voice-echo", "voice").unwrap();
+        // These tests are about calls, not the plugin's rate limit.
+        let turns = state
+            .turns
+            .for_plugin("voice-echo", "voice")
+            .unwrap()
+            .with_rate_limit(1_000, 1_000.0);
         (state, TurnBrain::new(turns), seen)
     }
 
@@ -3755,6 +3763,115 @@ mod voice_brain_e2e {
         assert_eq!(said.len(), 2, "{said:?}");
         assert!(said[0].ends_with("Hi, it's about the delivery"));
         assert!(said[1].ends_with("It's at the door"));
+    }
+
+    // --- audit R2-6: voice session hygiene ---
+
+    /// Every file under `dir`, recursively, by path.
+    fn files_under(dir: &std::path::Path) -> Vec<String> {
+        let mut out = Vec::new();
+        let mut stack = vec![dir.to_path_buf()];
+        while let Some(d) = stack.pop() {
+            for entry in std::fs::read_dir(&d).into_iter().flatten().flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    stack.push(path);
+                } else {
+                    out.push(path.display().to_string());
+                }
+            }
+        }
+        out
+    }
+
+    #[tokio::test]
+    async fn a_call_writes_no_session_file_and_no_wal() {
+        let dir = tempfile::tempdir().unwrap();
+        let (state, brain, _seen) = brain_with_recorder(dir.path()).await;
+        brain
+            .invoke("", &[user(fixtures::phone("Hello?", None))], 1024, None)
+            .await
+            .unwrap();
+        assert!(
+            state
+                .persist_coordinator
+                .flush(std::time::Duration::from_secs(10))
+                .await
+        );
+        let call = only_call(&state, "phone-caller").await;
+        let on_disk = call.replace(':', "--");
+        let leaked: Vec<String> = files_under(&dir.path().join("sessions"))
+            .into_iter()
+            .filter(|f| f.contains(&on_disk) || f.contains("phone-caller"))
+            .collect();
+        assert!(leaked.is_empty(), "a call reached disk: {leaked:?}");
+    }
+
+    #[tokio::test]
+    async fn a_long_call_keeps_one_unbroken_session() {
+        let dir = tempfile::tempdir().unwrap();
+        let (state, brain, _seen) = brain_with_recorder(dir.path()).await;
+        let mut history = Vec::new();
+        // 12 exchanges = 24 messages: past a guest's 20-message reset.
+        for i in 0..12 {
+            history.push(user(fixtures::phone(&format!("line {i}"), None)));
+            let reply = brain.invoke("", &history, 1024, None).await.unwrap();
+            history.push(assistant(&reply.text()));
+        }
+        let call = only_call(&state, "phone-caller").await;
+        let said = user_texts(&state, &call).await;
+        assert_eq!(said.len(), 12, "the call reset mid-way: {said:?}");
+        assert!(said[0].ends_with("line 0"));
+        assert!(!said.iter().any(|t| t.contains("Session handoff")));
+    }
+
+    #[tokio::test]
+    async fn the_sweep_archives_an_idle_call_without_ephemeral() {
+        let dir = tempfile::tempdir().unwrap();
+        let (state, brain, _seen) = brain_with_recorder(dir.path()).await;
+        brain
+            .invoke(
+                "",
+                &[user(fixtures::phone("about the parcel", None))],
+                1024,
+                None,
+            )
+            .await
+            .unwrap();
+        let call = only_call(&state, "phone-caller").await;
+        let idle = crate::session_store::CALL_IDLE.as_secs() as i64 + 60;
+        state
+            .session_store
+            .get_existing_by_key(&call)
+            .await
+            .unwrap()
+            .write()
+            .await
+            .data
+            .last_active = chrono::Utc::now() - chrono::Duration::seconds(idle);
+
+        crate::server::setup::sweep_calls(&state).await;
+        assert!(state
+            .session_store
+            .get_existing_by_key(&call)
+            .await
+            .is_none());
+
+        // The archive is written on the blocking pool, off this task.
+        assert!(
+            state
+                .persist_coordinator
+                .flush(std::time::Duration::from_secs(10))
+                .await
+        );
+        let conversations = dir.path().join("archives").join("conversations");
+        let archived = files_under(&conversations)
+            .into_iter()
+            .filter(|f| f.contains("conversation-"))
+            .find_map(|f| std::fs::read_to_string(f).ok())
+            .filter(|text| text.contains("about the parcel"));
+        assert!(archived.is_some(), "the idle call was not archived");
+        assert!(!dir.path().join("memory").join("EPHEMERAL.md").exists());
     }
 
     /// Answers "Sure.", but fails any turn whose message says "drop".

@@ -39,6 +39,28 @@ pub const MAX_MESSAGES_PER_SESSION: usize = 200;
 /// exceeded, the oldest quarantined messages are drained.
 pub const MAX_QUARANTINE_MESSAGES: usize = 50;
 
+/// Voice calls live apart from every other session (PN-110 audit R2-6):
+/// each call is its own guest session, and a run of calls must never evict
+/// the owner's or a Discord user's session. At most this many are live; a
+/// new call past it ends the longest-idle one.
+pub const MAX_LIVE_CALLS: usize = 32;
+
+/// Ended calls waiting for the background sweep to archive them. Past this,
+/// the oldest is dropped unarchived (and said so in the log).
+pub const MAX_ENDED_CALLS: usize = 64;
+
+/// A call with no utterance for this long has ended. voice-echo 0.8.0 tells
+/// the brain nothing when a caller hangs up, so idleness is the end signal.
+pub const CALL_IDLE: std::time::Duration = std::time::Duration::from_secs(10 * 60);
+
+/// A call's session limits: the hard message cap, no time cap. A long call
+/// does not reset after the guest's 20 messages / 30 minutes; it ends when
+/// it goes idle.
+pub const CALL_LIMITS: crate::config::ChannelLimits = crate::config::ChannelLimits {
+    message_cap: MAX_MESSAGES_PER_SESSION,
+    time_cap_seconds: 0,
+};
+
 /// WAL (write-ahead log) tracking state for a session.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WalState {
@@ -361,15 +383,7 @@ impl SessionData {
 /// and inserts a handoff summary as the first message of the new session.
 /// Returns the archive path if archiving succeeded.
 pub fn reset_session(data: &mut SessionData, root_dir: &Path, pulse_name: &str) -> Option<PathBuf> {
-    if data.messages.is_empty() && data.quarantine.is_empty() {
-        return None;
-    }
-
-    // Build handoff before clearing
-    let handoff = data.build_handoff();
-
-    let msg_count = data.messages.len();
-    let compactions = data.compaction.compaction_count;
+    let ended = begin_fresh(data)?;
 
     // Archive the CLEAN TRUNK through the full pipeline (archive + EPHEMERAL +
     // LOGBOOK + later graph ingestion). The quarantine lane is policy-refused
@@ -380,18 +394,32 @@ pub fn reset_session(data: &mut SessionData, root_dir: &Path, pulse_name: &str) 
     let archive_path = crate::session::end_session(
         root_dir,
         pulse_name,
-        &data.messages,
-        &data.channel,
+        &ended.messages,
+        &ended.channel,
         "session-reset",
-        Some(&data.key),
+        Some(&ended.key),
     );
-    crate::session::archive_quarantine(root_dir, pulse_name, &data.key, &data.quarantine);
+    crate::session::archive_quarantine(root_dir, pulse_name, &ended.key, &ended.quarantine);
+    archive_path
+}
+
+/// Clear `data` into a fresh session that opens with a handoff of the old
+/// one, and return the old one for the caller to archive. `None` when there
+/// was nothing to end.
+pub fn begin_fresh(data: &mut SessionData) -> Option<SessionData> {
+    if data.messages.is_empty() && data.quarantine.is_empty() {
+        return None;
+    }
+    let ended = data.clone();
+
+    // Build handoff before clearing
+    let handoff = data.build_handoff();
 
     tracing::info!(
         "[session-reset] key={} msgs={} compactions={} hallucinations={} → fresh session",
         data.key,
-        msg_count,
-        compactions,
+        data.messages.len(),
+        data.compaction.compaction_count,
         data.health.hallucination_count,
     );
 
@@ -418,7 +446,29 @@ pub fn reset_session(data: &mut SessionData, root_dir: &Path, pulse_name: &str) 
         data.messages.push(msg);
     }
 
-    archive_path
+    Some(ended)
+}
+
+/// Archive one ended call. Only what may reach disk: a turn taken while
+/// isolated left a watermark, and nothing past it is written.
+fn archive_call(root_dir: &Path, pulse_name: &str, data: &SessionData, trigger: &str) {
+    let messages = match data.isolation_ephemeral_from {
+        Some(watermark) => &data.messages[..watermark.min(data.messages.len())],
+        None => &data.messages[..],
+    };
+    let quarantine = match data.isolation_quarantine_from {
+        Some(watermark) => &data.quarantine[..watermark.min(data.quarantine.len())],
+        None => &data.quarantine[..],
+    };
+    crate::session::end_call(
+        root_dir,
+        pulse_name,
+        messages,
+        &data.channel,
+        trigger,
+        &data.key,
+    );
+    crate::session::archive_quarantine(root_dir, pulse_name, &data.key, quarantine);
 }
 
 /// Resolve a raw channel+sender pair into an identity class.
@@ -544,6 +594,10 @@ impl Session {
 /// Manages multiple independent sessions keyed by identity class.
 pub struct SessionStore {
     sessions: RwLock<HashMap<String, std::sync::Arc<RwLock<Session>>>>,
+    /// Live voice calls, bounded by [`MAX_LIVE_CALLS`]. Never persisted.
+    calls: RwLock<HashMap<String, std::sync::Arc<RwLock<Session>>>>,
+    /// Ended calls the background sweep has yet to archive.
+    ended_calls: std::sync::Mutex<std::collections::VecDeque<SessionData>>,
     sessions_dir: PathBuf,
     root_dir: PathBuf,
     pulse_name: String,
@@ -597,6 +651,8 @@ impl SessionStore {
 
         let store = Self {
             sessions: RwLock::new(HashMap::new()),
+            calls: RwLock::new(HashMap::new()),
+            ended_calls: std::sync::Mutex::new(std::collections::VecDeque::new()),
             sessions_dir: sessions_dir.clone(),
             root_dir: root_dir.to_path_buf(),
             pulse_name: pulse_name.to_string(),
@@ -818,8 +874,130 @@ impl SessionStore {
     /// Returns None if no session exists for this key. Unlike `get_existing`,
     /// this takes the resolved identity key directly (e.g. "owner", "peer:Nova").
     pub async fn get_existing_by_key(&self, key: &str) -> Option<Arc<RwLock<Session>>> {
-        let sessions = self.sessions.read().await;
-        sessions.get(key).map(Arc::clone)
+        if let Some(session) = self.sessions.read().await.get(key) {
+            return Some(Arc::clone(session));
+        }
+        self.calls.read().await.get(key).map(Arc::clone)
+    }
+
+    /// Get or create a voice call's session, in the call set: bounded by
+    /// [`MAX_LIVE_CALLS`], never persisted, and never evicting anything but
+    /// another call.
+    pub async fn get_or_create_call(
+        &self,
+        key: &str,
+        channel: &str,
+        sender: &str,
+    ) -> Arc<RwLock<Session>> {
+        if let Some(session) = self.calls.read().await.get(key) {
+            return Arc::clone(session);
+        }
+        let mut calls = self.calls.write().await;
+        if let Some(session) = calls.get(key) {
+            return Arc::clone(session);
+        }
+        if calls.len() >= MAX_LIVE_CALLS {
+            self.end_longest_idle_call(&mut calls);
+        }
+        let session = Session::new(key.to_string(), channel.to_string(), sender.to_string());
+        let arc = Arc::new(RwLock::new(session));
+        calls.insert(key.to_string(), Arc::clone(&arc));
+        arc
+    }
+
+    /// Make room for a call: end the one idle the longest, skipping any
+    /// whose turn is in flight (its lock is held).
+    fn end_longest_idle_call(&self, calls: &mut HashMap<String, Arc<RwLock<Session>>>) {
+        let oldest = calls
+            .iter()
+            .filter_map(|(key, arc)| {
+                arc.try_read()
+                    .ok()
+                    .map(|session| (key.clone(), session.data.last_active))
+            })
+            .min_by_key(|(_, last_active)| *last_active)
+            .map(|(key, _)| key);
+        let Some(key) = oldest else {
+            tracing::warn!(
+                "voice: {} calls live and all mid-turn; admitting one more",
+                calls.len()
+            );
+            return;
+        };
+        if let Some(arc) = calls.remove(&key) {
+            if let Ok(session) = arc.try_read() {
+                tracing::info!("voice: call {key} ended to make room for a new one");
+                self.queue_ended_call(session.data.clone());
+            }
+        }
+    }
+
+    /// Hand an ended call to the background sweep for archiving.
+    pub fn queue_ended_call(&self, data: SessionData) {
+        let mut ended = self.ended_calls.lock().unwrap_or_else(|e| e.into_inner());
+        ended.push_back(data);
+        while ended.len() > MAX_ENDED_CALLS {
+            if let Some(dropped) = ended.pop_front() {
+                tracing::warn!(
+                    "voice: archive queue full; call {} not archived",
+                    dropped.key
+                );
+            }
+        }
+    }
+
+    /// End every call idle for at least `idle`, queueing it for archiving.
+    /// Returns how many ended.
+    pub async fn end_idle_calls(&self, idle: std::time::Duration) -> usize {
+        let mut calls = self.calls.write().await;
+        let idle_keys: Vec<String> = calls
+            .iter()
+            .filter(|(_, arc)| {
+                arc.try_read()
+                    .is_ok_and(|session| session.is_expired(idle.as_secs()))
+            })
+            .map(|(key, _)| key.clone())
+            .collect();
+        for key in &idle_keys {
+            if let Some(arc) = calls.remove(key) {
+                if let Ok(session) = arc.try_read() {
+                    self.queue_ended_call(session.data.clone());
+                }
+            }
+        }
+        idle_keys.len()
+    }
+
+    /// Archive the ended calls off the request path: each on the blocking
+    /// pool (tracked by the persist coordinator when there is one), with no
+    /// EPHEMERAL summary and no graph ingestion
+    /// ([`crate::session::end_call`]). Returns how many were handed off.
+    pub fn archive_ended_calls(&self) -> usize {
+        let ended: Vec<SessionData> = self
+            .ended_calls
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .drain(..)
+            .collect();
+        let count = ended.len();
+        for data in ended {
+            let root_dir = self.root_dir.clone();
+            let pulse_name = self.pulse_name.clone();
+            let archive = move || archive_call(&root_dir, &pulse_name, &data, "call-ended");
+            match self.coordinator {
+                Some(ref coordinator) => coordinator.track(archive),
+                None => {
+                    #[allow(clippy::let_underscore_future)]
+                    let _ = tokio::task::spawn_blocking(archive);
+                }
+            }
+        }
+        count
+    }
+
+    /// Whether `key` is a live voice call.
+    pub async fn is_live_call(&self, key: &str) -> bool {
+        self.calls.read().await.contains_key(key)
     }
 
     /// Get or create a session keyed by resolved identity.
@@ -1060,6 +1238,26 @@ impl SessionStore {
             crate::session::archive_quarantine(root_dir, pulse_name, key, &session.data.quarantine);
         }
 
+        // Voice calls end with the process: archived here, in line (the
+        // process is exiting), the same way the sweep archives them.
+        let live: Vec<SessionData> = {
+            let mut calls = self.calls.write().await;
+            let mut live = Vec::with_capacity(calls.len());
+            for (_, arc) in calls.drain() {
+                live.push(arc.read().await.data.clone());
+            }
+            live
+        };
+        let queued: Vec<SessionData> = self
+            .ended_calls
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .drain(..)
+            .collect();
+        for data in live.iter().chain(queued.iter()) {
+            archive_call(root_dir, pulse_name, data, "server-shutdown");
+        }
+
         // Persist all to disk so they can be restored on restart
         drop(sessions); // Release read lock
         self.persist_all().await;
@@ -1140,13 +1338,21 @@ impl SessionStore {
 
     /// Check if a session exists (for WAL orphan detection).
     pub async fn has_session(&self, key: &str) -> bool {
-        self.sessions.read().await.contains_key(key)
+        self.sessions.read().await.contains_key(key) || self.is_live_call(key).await
     }
 
     /// Get a read-only snapshot of the sessions map (for API endpoints that need
     /// to look up a session by key).
     pub async fn sessions_map(&self) -> HashMap<String, std::sync::Arc<RwLock<Session>>> {
-        self.sessions.read().await.clone()
+        let mut all = self.sessions.read().await.clone();
+        all.extend(
+            self.calls
+                .read()
+                .await
+                .iter()
+                .map(|(key, arc)| (key.clone(), Arc::clone(arc))),
+        );
+        all
     }
 }
 
@@ -1639,6 +1845,228 @@ mod tests {
         assert!(
             q_dump.contains("QUARANTINED_SPICY_SECRET"),
             "quarantine record was not written to archives/quarantine/"
+        );
+    }
+}
+
+/// PN-110 audit R2-6: voice calls live in their own bounded set.
+#[cfg(test)]
+mod call_set_tests {
+    use super::*;
+    use std::time::Duration;
+
+    async fn store(root: &Path, max_sessions: usize) -> (SessionStore, Arc<PersistCoordinator>) {
+        let config = crate::config::SessionConfig {
+            max_sessions,
+            ..crate::config::SessionConfig::default()
+        };
+        let mut store = SessionStore::new(root, &config, "TestPulse").await;
+        let coordinator = Arc::new(PersistCoordinator::new());
+        store.set_coordinator(Arc::clone(&coordinator));
+        (store, coordinator)
+    }
+
+    fn said(text: &str) -> Message {
+        Message {
+            role: Role::User,
+            content: MessageContent::Text(text.to_string()),
+            source: None,
+        }
+    }
+
+    async fn call_with(store: &SessionStore, key: &str, texts: &[&str]) {
+        let arc = store.get_or_create_call(key, "voice", "phone-caller").await;
+        let mut session = arc.write().await;
+        session.data.messages.extend(texts.iter().map(|t| said(t)));
+    }
+
+    fn archives(root: &Path) -> Vec<String> {
+        let dir = crate::session::conversations_dir(root);
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return Vec::new();
+        };
+        entries
+            .flatten()
+            .filter(|e| e.file_name().to_string_lossy().starts_with("conversation-"))
+            .map(|e| std::fs::read_to_string(e.path()).unwrap())
+            .collect()
+    }
+
+    fn ephemeral_written(root: &Path) -> bool {
+        root.join("memory").join("EPHEMERAL.md").exists()
+    }
+
+    #[tokio::test]
+    async fn calls_never_evict_the_owner_or_a_discord_user() {
+        let dir = tempfile::tempdir().unwrap();
+        let (store, _) = store(dir.path(), 2).await;
+        store.get_or_create_by_key("owner", "tui", "D").await;
+        store
+            .get_or_create_by_key("guest:2002", "discord", "2002")
+            .await;
+
+        for i in 0..MAX_LIVE_CALLS + 5 {
+            call_with(&store, &format!("guest:phone-caller-{i:016}"), &["hi"]).await;
+        }
+        assert!(store.get_existing_by_key("owner").await.is_some());
+        assert!(store.get_existing_by_key("guest:2002").await.is_some());
+        let calls = store
+            .sessions_map()
+            .await
+            .into_keys()
+            .filter(|k| k.starts_with("guest:phone-caller-"))
+            .count();
+        assert_eq!(calls, MAX_LIVE_CALLS);
+        assert_eq!(
+            store.ended_calls.lock().unwrap().len(),
+            5,
+            "the oldest ended"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_call_is_never_persisted() {
+        let dir = tempfile::tempdir().unwrap();
+        let (store, coordinator) = store(dir.path(), 8).await;
+        call_with(&store, "guest:phone-caller-0000000000000001", &["hi"]).await;
+        let arc = store
+            .get_existing_by_key("guest:phone-caller-0000000000000001")
+            .await
+            .unwrap();
+        arc.write().await.mark_dirty();
+        store.persist_all().await;
+        store.persist("guest:phone-caller-0000000000000001").await;
+        assert!(coordinator.flush(Duration::from_secs(5)).await);
+        let files: Vec<_> = std::fs::read_dir(dir.path().join("sessions"))
+            .unwrap()
+            .flatten()
+            .collect();
+        assert!(files.is_empty(), "a call reached sessions/: {files:?}");
+    }
+
+    #[tokio::test]
+    async fn an_idle_call_is_archived_in_the_background_without_ephemeral() {
+        let dir = tempfile::tempdir().unwrap();
+        let (store, coordinator) = store(dir.path(), 8).await;
+        call_with(
+            &store,
+            "guest:phone-caller-0000000000000002",
+            &["the parcel"],
+        )
+        .await;
+        call_with(
+            &store,
+            "guest:phone-caller-0000000000000003",
+            &["still talking"],
+        )
+        .await;
+        let idle = store
+            .get_existing_by_key("guest:phone-caller-0000000000000002")
+            .await
+            .unwrap();
+        idle.write().await.data.last_active =
+            Utc::now() - chrono::Duration::seconds(CALL_IDLE.as_secs() as i64 + 60);
+
+        assert_eq!(store.end_idle_calls(CALL_IDLE).await, 1);
+        assert!(store
+            .get_existing_by_key("guest:phone-caller-0000000000000002")
+            .await
+            .is_none());
+        assert!(store
+            .get_existing_by_key("guest:phone-caller-0000000000000003")
+            .await
+            .is_some());
+        assert!(
+            archives(dir.path()).is_empty(),
+            "archived on the caller's path"
+        );
+
+        assert_eq!(store.archive_ended_calls(), 1);
+        assert!(coordinator.flush(Duration::from_secs(5)).await);
+        let written = archives(dir.path());
+        assert_eq!(written.len(), 1);
+        assert!(written[0].contains("the parcel"));
+        assert!(!ephemeral_written(dir.path()), "a call wrote EPHEMERAL");
+    }
+
+    #[tokio::test]
+    async fn an_isolated_tail_never_reaches_the_archive() {
+        let dir = tempfile::tempdir().unwrap();
+        let (store, coordinator) = store(dir.path(), 8).await;
+        call_with(
+            &store,
+            "guest:phone-caller-0000000000000004",
+            &["before isolation", "during isolation"],
+        )
+        .await;
+        let arc = store
+            .get_existing_by_key("guest:phone-caller-0000000000000004")
+            .await
+            .unwrap();
+        let mut data = arc.read().await.data.clone();
+        data.isolation_ephemeral_from = Some(1);
+        store.queue_ended_call(data);
+        store.archive_ended_calls();
+        assert!(coordinator.flush(Duration::from_secs(5)).await);
+        let written = archives(dir.path());
+        assert_eq!(written.len(), 1);
+        assert!(written[0].contains("before isolation"));
+        assert!(!written[0].contains("during isolation"));
+    }
+
+    #[tokio::test]
+    async fn shutdown_archives_live_calls_without_ephemeral() {
+        let dir = tempfile::tempdir().unwrap();
+        let (store, _) = store(dir.path(), 8).await;
+        call_with(&store, "guest:phone-caller-0000000000000005", &["goodbye"]).await;
+        store.archive_all(dir.path(), "TestPulse").await;
+        let written = archives(dir.path());
+        assert_eq!(written.len(), 1);
+        assert!(written[0].contains("goodbye"));
+        assert!(!ephemeral_written(dir.path()));
+        assert!(
+            !store
+                .has_session("guest:phone-caller-0000000000000005")
+                .await
+        );
+    }
+
+    #[test]
+    fn a_long_call_does_not_reset_where_a_guest_would() {
+        let mut session = Session::new(
+            "guest:phone-caller-0000000000000006".into(),
+            "voice".into(),
+            "phone-caller".into(),
+        );
+        session
+            .data
+            .messages
+            .extend((0..40).map(|i| said(&format!("line {i}"))));
+        session.data.created_at = Utc::now() - chrono::Duration::hours(1);
+        let guest = crate::config::SessionConfig::default()
+            .get_identity_limits(&crate::session_key::SessionKey::guest("phone-caller"));
+        assert!(
+            session.data.should_reset(&guest),
+            "a guest would reset here"
+        );
+        assert!(!session.data.should_reset(&CALL_LIMITS), "a call does not");
+    }
+
+    #[test]
+    fn the_ended_queue_is_bounded() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let (store, _) = rt.block_on(store(dir.path(), 8));
+        for i in 0..MAX_ENDED_CALLS + 3 {
+            let session = Session::new(format!("guest:c-{i}"), "voice".into(), "c".into());
+            store.queue_ended_call(session.data);
+        }
+        let ended = store.ended_calls.lock().unwrap();
+        assert_eq!(ended.len(), MAX_ENDED_CALLS);
+        assert_eq!(
+            ended.front().unwrap().key,
+            "guest:c-3",
+            "the oldest went first"
         );
     }
 }

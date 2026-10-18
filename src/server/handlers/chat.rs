@@ -339,11 +339,23 @@ async fn run_resolved_turn(
     }
 
     // Get or create session keyed by resolved identity (Phase 1: Unified Session)
+    // A voice caller's call is its own guest session, in the store's call
+    // set: never persisted, never evicting another kind of session (audit
+    // R2-6). A non-guest on the voice channel (an owner client over HTTP)
+    // keeps an ordinary session.
+    let is_call = is_voice && resolved_key.is_guest();
     let session_key = resolved_key.to_string();
-    let session_arc = state
-        .session_store
-        .get_or_create_by_key(resolved_key.as_str(), &req.channel, sender_label)
-        .await;
+    let session_arc = if is_call {
+        state
+            .session_store
+            .get_or_create_call(resolved_key.as_str(), &req.channel, sender_label)
+            .await
+    } else {
+        state
+            .session_store
+            .get_or_create_by_key(resolved_key.as_str(), &req.channel, sender_label)
+            .await
+    };
 
     // Lock the session for this request. The guard also owns the rollback:
     // if this future is dropped after the user message is pushed and before
@@ -388,7 +400,11 @@ async fn run_resolved_turn(
     // with a structured handoff and start fresh before processing this message.
     let pre_turn_len = session.data.messages.len();
     let pre_turn_quarantine_len = session.data.quarantine.len();
-    let limits = state.config.sessions.get_identity_limits(&resolved_key);
+    let limits = if is_call {
+        crate::session_store::CALL_LIMITS
+    } else {
+        state.config.sessions.get_identity_limits(&resolved_key)
+    };
     // Session resets archive to disk — shed in isolation (the in-memory
     // session simply keeps growing for the duration of the diagnosis).
     if !isolated && session.data.should_reset(&limits) {
@@ -402,11 +418,18 @@ async fn run_resolved_turn(
                 .num_seconds(),
             limits.time_cap_seconds,
         );
-        crate::session_store::reset_session(
-            &mut session.data,
-            &state.root_dir,
-            &state.config.pulse.name,
-        );
+        if is_call {
+            // Archived by the background sweep, off the caller's line.
+            if let Some(ended) = crate::session_store::begin_fresh(&mut session.data) {
+                state.session_store.queue_ended_call(ended);
+            }
+        } else {
+            crate::session_store::reset_session(
+                &mut session.data,
+                &state.root_dir,
+                &state.config.pulse.name,
+            );
+        }
     }
 
     // Build user message content
@@ -731,7 +754,8 @@ async fn run_resolved_turn(
     // quarantined turn carries the quarantine lane marker so replay
     // reconstructs the split and never poisons the trunk. User first, then
     // assistant. (Shed in isolation.)
-    if let Some(wal) = state.wal.as_ref().filter(|_| !isolated) {
+    // A voice call is not persisted, so it has no WAL either.
+    if let Some(wal) = state.wal.as_ref().filter(|_| !isolated && !is_call) {
         let lane = if committed_to_quarantine {
             crate::wal::WalLane::Quarantine
         } else {
@@ -889,8 +913,9 @@ async fn run_resolved_turn(
         .await;
     }
 
-    // Incremental checkpoint (if conditions met; shed in isolation)
-    if !isolated {
+    // Incremental checkpoint (if conditions met; shed in isolation, and
+    // never for a voice call, which is not persisted)
+    if !isolated && !is_call {
         maybe_checkpoint(&state, &session_key, &mut session.data, &channel).await;
     }
 
@@ -913,8 +938,10 @@ async fn run_resolved_turn(
         result.output_tokens,
     );
 
-    // Mark session dirty and persist asynchronously
-    if !isolated {
+    // Mark session dirty and persist asynchronously (a voice call is never
+    // persisted: it is archived when it ends)
+    let persisted = !isolated && !is_call;
+    if persisted {
         session.mark_dirty();
     }
     let persist_key = session_key.clone();
@@ -927,8 +954,8 @@ async fn run_resolved_turn(
     );
     // Drop the session lock before persisting to avoid deadlock
     drop(session);
-    if isolated {
-        tracing::debug!("[chat] session persist shed (isolation)");
+    if !persisted {
+        tracing::debug!("[chat] session persist shed (isolation or voice call)");
     } else {
         persist_store.persist(&persist_key).await;
         tracing::debug!("[chat] persist call returned for key={}", persist_key);

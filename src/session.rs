@@ -276,6 +276,43 @@ pub fn end_session(
     archive_path
 }
 
+/// The end of a voice call: archive the conversation and log it, but write
+/// no EPHEMERAL summary (PN-110 audit R2-6). Every call is its own guest
+/// session; summarising each one into the rolling EPHEMERAL window would let
+/// a run of short calls push the owner's own sessions out of it. Not
+/// returned for graph ingestion either: a caller's words are a guest's.
+pub fn end_call(
+    root_dir: &Path,
+    pulse_name: &str,
+    conversation: &[Message],
+    channel: &str,
+    trigger: &str,
+    session_key: &str,
+) {
+    if conversation.is_empty() {
+        return;
+    }
+    let meta = ArchiveMeta {
+        trigger: trigger.to_string(),
+        channel: channel.to_string(),
+        pulse_name: pulse_name.to_string(),
+        session_key: Some(session_key.to_string()),
+    };
+    let archive_path = match archive_conversation(root_dir, conversation, &meta) {
+        Ok(path) => Some(path),
+        Err(e) => {
+            tracing::warn!("Failed to archive voice call {session_key}: {e}");
+            None
+        }
+    };
+    crate::logbook::log_session_end(
+        root_dir,
+        channel,
+        conversation.len(),
+        archive_path.as_deref(),
+    );
+}
+
 /// Persist a session's quarantine lane (policy-refused turns re-run on the
 /// fallback model) to a standalone dead-end file under `archives/quarantine/`.
 ///

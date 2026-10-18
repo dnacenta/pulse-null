@@ -91,6 +91,39 @@ pub fn register_readonly_tools(root_dir: &Path, config: &Config) -> ToolRegistry
     tools
 }
 
+/// How often the voice-call sweep looks for idle calls.
+const CALL_SWEEP_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// End idle voice calls and archive the ended ones in the background
+/// (PN-110 audit R2-6), whether or not sessions are persisted. Shed while
+/// isolated, like every other archive write.
+fn spawn_call_sweep(state: &Arc<super::AppState>) {
+    let state = Arc::clone(state);
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(CALL_SWEEP_INTERVAL);
+        interval.tick().await;
+        loop {
+            interval.tick().await;
+            sweep_calls(&state).await;
+        }
+    });
+}
+
+/// One pass of the call sweep.
+pub(crate) async fn sweep_calls(state: &super::AppState) {
+    if crate::server::isolation::is_active(&state.root_dir) {
+        return;
+    }
+    let ended = state
+        .session_store
+        .end_idle_calls(crate::session_store::CALL_IDLE)
+        .await;
+    if ended > 0 {
+        tracing::info!("voice: {ended} idle call(s) ended");
+    }
+    state.session_store.archive_ended_calls();
+}
+
 /// Initialize and start plugins, collecting their tools into the registry.
 ///
 /// Returns the plugin manager and any plugin-contributed routes.
@@ -256,6 +289,7 @@ pub fn spawn_event_listener(
 /// When sessions expire, they are archived and then ingested into the knowledge
 /// graph (if enabled), ensuring server-side conversations flow into recall.
 pub fn spawn_session_cleanup(config: &Config, state: &Arc<super::AppState>) {
+    spawn_call_sweep(state);
     if config.sessions.persist {
         let cleanup_state = Arc::clone(state);
         let cleanup_interval = config.sessions.cleanup_interval_seconds;
