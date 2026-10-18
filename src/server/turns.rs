@@ -29,6 +29,7 @@ use tokio::time::Instant;
 
 use super::auth::AuthIdentity;
 use super::handlers::chat::{run_turn, ChatRequest, ChatResponse};
+use super::rate_limit::RateLimiter;
 use super::AppState;
 use crate::tool_loop::TurnSink;
 
@@ -40,6 +41,15 @@ pub const READY_TIMEOUT: Duration = Duration::from_secs(30);
 /// stream pool the TUI uses. What a turn does when the pool is full is the
 /// plugin's [`SlotWait`].
 pub const PLUGIN_POOL_SIZE: usize = 4;
+
+/// Turns a plugin may start in a burst before its rate limit applies — the
+/// same bucket `/chat` has over HTTP. In-process turns skip the HTTP layer,
+/// so without it a plugin fed from outside (a phone line, a Discord guild)
+/// could start paid turns without bound.
+pub const PLUGIN_RATE_BURST: u32 = 10;
+
+/// A plugin's sustained turn rate once its burst is spent.
+pub const PLUGIN_RATE_PER_SECOND: f64 = 2.0;
 
 /// How long shutdown waits for the plugin turns already in flight. A plugin
 /// that stops before the drain (the Discord forwarder) waits this long for
@@ -88,6 +98,10 @@ pub enum TurnError {
     /// slot freed up within its [`SlotWait`].
     #[error("too many turns in flight for this plugin")]
     Busy,
+    /// The plugin is starting turns faster than its rate limit
+    /// ([`PLUGIN_RATE_BURST`], then [`PLUGIN_RATE_PER_SECOND`]).
+    #[error("this plugin is over its turn rate limit")]
+    RateLimited,
     /// The turn itself refused or failed, with the status `/chat` would
     /// have answered.
     #[error("turn refused ({0}): {1}")]
@@ -174,6 +188,7 @@ impl TurnRunner {
             channel: channel.to_string(),
             pool: Arc::new(Semaphore::new(PLUGIN_POOL_SIZE)),
             slot_wait: SlotWait::Never,
+            rate: Arc::new(RateLimiter::new(PLUGIN_RATE_BURST, PLUGIN_RATE_PER_SECOND)),
         })
     }
 
@@ -281,6 +296,7 @@ pub struct PluginTurns {
     channel: String,
     pool: Arc<Semaphore>,
     slot_wait: SlotWait,
+    rate: Arc<RateLimiter>,
 }
 
 impl PluginTurns {
@@ -306,6 +322,10 @@ impl PluginTurns {
     ) -> Result<ChatResponse, TurnError> {
         if self.runner.is_closed() {
             return Err(TurnError::ShuttingDown);
+        }
+        if !self.rate.try_acquire().await {
+            tracing::warn!("plugin {}: turn refused, over its rate limit", self.name);
+            return Err(TurnError::RateLimited);
         }
         // Slot first, then the flight: a turn still waiting for a slot is
         // not in flight, and one that gets its slot after shutdown started
@@ -358,7 +378,17 @@ impl TurnRunner {
             channel: channel.to_string(),
             pool: Arc::new(Semaphore::new(PLUGIN_POOL_SIZE)),
             slot_wait: SlotWait::Never,
+            rate: Arc::new(RateLimiter::new(PLUGIN_RATE_BURST, PLUGIN_RATE_PER_SECOND)),
         }
+    }
+}
+
+#[cfg(test)]
+impl PluginTurns {
+    /// This handle with its own rate limit, for tests.
+    pub(crate) fn with_rate_limit(mut self, burst: u32, per_second: f64) -> Self {
+        self.rate = Arc::new(RateLimiter::new(burst, per_second));
+        self
     }
 }
 

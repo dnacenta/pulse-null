@@ -2905,6 +2905,28 @@ mod plugin_turns_e2e {
         assert_eq!(gate.calls.load(Ordering::SeqCst), PLUGIN_POOL_SIZE);
     }
 
+    /// Audit #4: in-process turns have a rate limit of their own.
+    #[tokio::test]
+    async fn a_plugin_over_its_rate_limit_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = secured_state(dir.path(), MockProvider::new(vec![])).await;
+        state.turns.bind(&state);
+        let turns = state
+            .turns
+            .for_plugin("voice-echo", "voice")
+            .unwrap()
+            .with_rate_limit(2, 0.0);
+
+        assert!(turns.run(turn("one", "caller"), None).await.is_ok());
+        assert!(turns.run(turn("two", "caller"), None).await.is_ok());
+        let refused = turns.run(turn("three", "caller"), None).await;
+        assert_eq!(refused.err(), Some(TurnError::RateLimited));
+        assert_eq!(
+            TurnError::RateLimited.to_string(),
+            "this plugin is over its turn rate limit"
+        );
+    }
+
     /// The real router with the secret set: `/chat` and plugin routes need
     /// the credential, `/health` does not (AC3).
     #[tokio::test]

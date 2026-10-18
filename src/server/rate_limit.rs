@@ -29,7 +29,8 @@ impl RateLimiter {
         }
     }
 
-    async fn try_acquire(&self) -> bool {
+    /// Take one token if there is one.
+    pub(crate) async fn try_acquire(&self) -> bool {
         let mut state = self.state.lock().await;
         let (ref mut tokens, ref mut last_refill) = *state;
 
