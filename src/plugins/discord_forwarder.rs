@@ -211,6 +211,14 @@ impl<P: ReplyPoster> Forwarder<P> {
         };
         let reply = match self.turns.run(turn, None).await {
             Ok(reply) => reply.response,
+            // Expected while the pulse stops: not worth a warning each.
+            Err(TurnError::ShuttingDown) => {
+                tracing::debug!(
+                    "discord: message {} not answered, shutting down",
+                    msg.message_id
+                );
+                return Handled::TurnFailed(TurnError::ShuttingDown);
+            }
             Err(e) => {
                 tracing::warn!("discord: turn for message {} failed: {e}", msg.message_id);
                 return Handled::TurnFailed(e);
@@ -290,6 +298,9 @@ impl<P: ReplyPoster + 'static> Forwarder<P> {
             lanes.insert(channel, lane);
         }
 
+        // Close the gateway's queue now, so a gateway still sending sees it
+        // gone and returns, rather than being aborted at its grace.
+        drop(rx);
         drop(lanes);
         let finished = tokio::time::timeout(grace, async {
             while workers.join_next().await.is_some() {}
@@ -312,7 +323,9 @@ impl<P: ReplyPoster + 'static> Forwarder<P> {
         stop: watch::Receiver<bool>,
     ) {
         while let Some(msg) = queue.recv().await {
-            if *stop.borrow() {
+            // The forwarder's own stop, or the whole pulse refusing turns
+            // (shutdown started before this plugin was stopped).
+            if *stop.borrow() || self.turns.is_shutting_down() {
                 tracing::info!(
                     "discord: stopping; message {} left unanswered",
                     msg.message_id

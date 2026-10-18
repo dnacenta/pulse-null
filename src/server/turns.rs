@@ -464,6 +464,13 @@ pub struct PluginTurns {
     allow(dead_code)
 )]
 impl PluginTurns {
+    /// Whether shutdown has started: no new turn will run.
+    #[cfg_attr(not(feature = "discord-text"), allow(dead_code))]
+    #[must_use]
+    pub fn is_shutting_down(&self) -> bool {
+        self.runner.is_closed()
+    }
+
     /// This handle's turns wait for a pool slot as `wait` says.
     #[must_use]
     pub fn waiting_for_a_slot(mut self, wait: SlotWait) -> Self {

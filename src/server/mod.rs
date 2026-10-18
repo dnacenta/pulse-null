@@ -505,10 +505,14 @@ pub async fn start_in(
         Ok(Ok(Ok(()))) => tracing::info!("Server drained cleanly"),
         Ok(Ok(Err(e))) => tracing::warn!("Server error during drain: {}", e),
         Ok(Err(e)) => tracing::warn!("Server task panicked: {}", e),
-        Err(_) => tracing::warn!("Server drain timed out after 30s, proceeding with shutdown"),
+        Err(_) => tracing::warn!(
+            "Server drain did not finish within the {drain:?} shutdown window, proceeding with shutdown"
+        ),
     }
     if !turns_drained {
-        tracing::warn!("Plugin turns still in flight after 30s, proceeding with shutdown");
+        tracing::warn!(
+            "Plugin turns still in flight at the end of the {drain:?} shutdown window, proceeding with shutdown"
+        );
     }
 
     // 4. Flush any in-flight persistence tasks before archiving

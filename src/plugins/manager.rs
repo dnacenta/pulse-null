@@ -138,16 +138,32 @@ impl PluginManager {
         Ok(())
     }
 
-    /// Stop all plugins (in reverse order)
+    /// Stop all plugins, concurrently (audit R2-10): a Discord plugin's stop
+    /// waits for its turns in flight, up to the drain window, and two of
+    /// them one after the other would spend that window twice. Plugins stay
+    /// in their order; one whose stop panicked is dropped, with an error.
     pub async fn stop_all(&mut self) {
-        for entry in self.entries.iter_mut().rev() {
-            let meta = entry.plugin.meta();
-            tracing::info!("Stopping plugin: {}", meta.name);
-            if let Err(e) = entry.plugin.stop().await {
-                tracing::error!("Error stopping plugin '{}': {}", meta.name, e);
-            }
-            entry.state = PluginState::Stopped;
+        let mut stopping = tokio::task::JoinSet::new();
+        for (index, mut entry) in std::mem::take(&mut self.entries).into_iter().enumerate() {
+            stopping.spawn(async move {
+                let name = entry.plugin.meta().name;
+                tracing::info!("Stopping plugin: {name}");
+                if let Err(e) = entry.plugin.stop().await {
+                    tracing::error!("Error stopping plugin '{name}': {e}");
+                }
+                entry.state = PluginState::Stopped;
+                (index, entry)
+            });
         }
+        let mut stopped = Vec::with_capacity(stopping.len());
+        while let Some(joined) = stopping.join_next().await {
+            match joined {
+                Ok(done) => stopped.push(done),
+                Err(e) => tracing::error!("A plugin's stop panicked: {e}"),
+            }
+        }
+        stopped.sort_by_key(|(index, _)| *index);
+        self.entries = stopped.into_iter().map(|(_, entry)| entry).collect();
         self.started = false;
     }
 
@@ -373,6 +389,79 @@ mod tests {
             tui: crate::config::TuiConfig::default(),
             plugin_turns: crate::config::PluginTurnsConfig::default(),
         }
+    }
+
+    /// A plugin whose stop finishes only once every plugin's stop started.
+    struct WaitsForOthers {
+        name: &'static str,
+        barrier: Arc<tokio::sync::Barrier>,
+    }
+
+    impl Plugin for WaitsForOthers {
+        fn meta(&self) -> PluginMeta {
+            PluginMeta {
+                name: self.name.to_string(),
+                version: "0".to_string(),
+                description: String::new(),
+            }
+        }
+
+        fn init<'a>(
+            &'a mut self,
+            _config: &'a toml::Value,
+            _ctx: &'a PluginContext,
+        ) -> super::super::PluginResult<'a> {
+            Box::pin(async { Ok(()) })
+        }
+
+        fn start(&mut self) -> super::super::PluginResult<'_> {
+            Box::pin(async { Ok(()) })
+        }
+
+        fn stop(&mut self) -> super::super::PluginResult<'_> {
+            let barrier = Arc::clone(&self.barrier);
+            Box::pin(async move {
+                barrier.wait().await;
+                Ok(())
+            })
+        }
+
+        fn health(
+            &self,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = PluginHealth> + Send + '_>>
+        {
+            Box::pin(async { PluginHealth::Healthy })
+        }
+    }
+
+    /// R2-10: stops run concurrently. One after the other, the first stop
+    /// would wait at the barrier for a second that never starts.
+    #[tokio::test]
+    async fn plugins_stop_concurrently_and_keep_their_order() {
+        let barrier = Arc::new(tokio::sync::Barrier::new(2));
+        let mut manager = PluginManager::new(&test_config());
+        for name in ["discord-echo", "discord-text-echo"] {
+            manager.entries.push(PluginEntry {
+                plugin: Box::new(WaitsForOthers {
+                    name,
+                    barrier: Arc::clone(&barrier),
+                }),
+                state: PluginState::Running,
+            });
+        }
+        tokio::time::timeout(std::time::Duration::from_secs(10), manager.stop_all())
+            .await
+            .expect("the stops ran one after the other");
+        let names: Vec<String> = manager
+            .entries
+            .iter()
+            .map(|e| e.plugin.meta().name)
+            .collect();
+        assert_eq!(names, ["discord-echo", "discord-text-echo"]);
+        assert!(manager
+            .entries
+            .iter()
+            .all(|e| matches!(e.state, PluginState::Stopped)));
     }
 
     #[test]
