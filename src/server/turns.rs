@@ -64,6 +64,11 @@ pub const PLUGIN_RATE_BURST: u32 = 10;
 )]
 pub const PLUGIN_RATE_PER_SECOND: f64 = 2.0;
 
+/// The longest a [`SlotWait::Forever`] turn sleeps before it looks at the
+/// rate bucket again.
+#[cfg_attr(not(feature = "discord-text"), allow(dead_code))]
+const MAX_RATE_WAIT: Duration = Duration::from_secs(5);
+
 /// How long shutdown waits for the plugin turns already in flight. A plugin
 /// that stops before the drain (the Discord forwarder) waits this long for
 /// its own in-flight turns before it gives up on them.
@@ -483,10 +488,7 @@ impl PluginTurns {
         if self.runner.is_closed() {
             return Err(TurnError::ShuttingDown);
         }
-        if !self.budget.rate.try_acquire().await {
-            tracing::warn!("plugin {}: turn refused, over its rate limit", self.name);
-            return Err(TurnError::RateLimited);
-        }
+        self.rate_token().await?;
         // Slot first, then the flight: a turn still waiting for a slot is
         // not in flight, and one that gets its slot after shutdown started
         // is refused here instead of starting.
@@ -548,6 +550,34 @@ impl PluginTurns {
                 GuestRefusal::SenderRateLimited => TurnError::SenderRateLimited,
             }
         })
+    }
+
+    /// A token from the plugin's rate bucket. With [`SlotWait::Forever`] the
+    /// caller has queued work it must not drop, so it waits for one (and
+    /// gives up only when shutdown starts) instead of failing (audit R2-9);
+    /// any other handle fails at once with [`TurnError::RateLimited`].
+    async fn rate_token(&self) -> Result<(), TurnError> {
+        loop {
+            let changed = self.runner.shared.changed.notified();
+            tokio::pin!(changed);
+            changed.as_mut().enable();
+            if self.runner.is_closed() {
+                return Err(TurnError::ShuttingDown);
+            }
+            let wait = match self.budget.rate.try_acquire_or_wait().await {
+                Ok(()) => return Ok(()),
+                Err(wait) => wait,
+            };
+            if self.slot_wait != SlotWait::Forever {
+                tracing::warn!("plugin {}: turn refused, over its rate limit", self.name);
+                return Err(TurnError::RateLimited);
+            }
+            let wait = wait.unwrap_or(MAX_RATE_WAIT).min(MAX_RATE_WAIT);
+            tokio::select! {
+                () = tokio::time::sleep(wait) => {}
+                () = changed => {}
+            }
+        }
     }
 
     /// A slot in the plugin's pool, waiting as [`SlotWait`] allows.

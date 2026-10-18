@@ -29,23 +29,30 @@ impl RateLimiter {
         }
     }
 
-    /// Take one token if there is one.
-    pub(crate) async fn try_acquire(&self) -> bool {
+    /// Take one token if there is one; otherwise say how long until the
+    /// next one (`None` when the bucket never refills).
+    pub(crate) async fn try_acquire_or_wait(&self) -> Result<(), Option<std::time::Duration>> {
         let mut state = self.state.lock().await;
         let (ref mut tokens, ref mut last_refill) = *state;
-
-        // Refill tokens based on elapsed time
         let now = Instant::now();
         let elapsed = now.duration_since(*last_refill);
         *tokens = (*tokens + elapsed.as_secs_f64() * self.refill_rate).min(self.max_tokens);
         *last_refill = now;
-
         if *tokens >= 1.0 {
             *tokens -= 1.0;
-            true
-        } else {
-            false
+            return Ok(());
         }
+        if self.refill_rate <= 0.0 {
+            return Err(None);
+        }
+        Err(Some(std::time::Duration::from_secs_f64(
+            (1.0 - *tokens) / self.refill_rate,
+        )))
+    }
+
+    /// Take one token if there is one.
+    async fn try_acquire(&self) -> bool {
+        self.try_acquire_or_wait().await.is_ok()
     }
 }
 
@@ -92,6 +99,20 @@ mod tests {
         assert!(limiter.try_acquire().await);
         assert!(limiter.try_acquire().await);
         assert!(!limiter.try_acquire().await);
+    }
+
+    #[tokio::test]
+    async fn an_empty_bucket_says_how_long_to_wait() {
+        let limiter = RateLimiter::new(1, 4.0);
+        assert_eq!(limiter.try_acquire_or_wait().await, Ok(()));
+        let wait = limiter.try_acquire_or_wait().await.unwrap_err().unwrap();
+        assert!(
+            wait <= Duration::from_millis(250) && wait > Duration::ZERO,
+            "{wait:?}"
+        );
+        let never = RateLimiter::new(1, 0.0);
+        assert_eq!(never.try_acquire_or_wait().await, Ok(()));
+        assert_eq!(never.try_acquire_or_wait().await, Err(None));
     }
 
     #[tokio::test]

@@ -35,6 +35,15 @@ const GATEWAY_GRACE: Duration = Duration::from_secs(5);
 /// Gateway → forwarder queue depth, as in discord-echo.
 const QUEUE_DEPTH: usize = 64;
 
+/// Messages one Discord channel may have queued behind its turn in flight.
+/// Past this, new messages on the channel are dropped and said so in the
+/// log (audit R2-8): a spammer cannot queue hours of paid turns.
+pub(crate) const LANE_DEPTH: usize = 16;
+
+/// A queued message older than this when its turn comes is dropped: the
+/// conversation has moved on, and an answer this late is noise (audit R2-8).
+const MAX_QUEUED_AGE: Duration = Duration::from_secs(5 * 60);
+
 /// Whether `reply` is the pulse choosing not to answer.
 #[must_use]
 fn is_silent(reply: &str) -> bool {
@@ -130,6 +139,8 @@ pub(crate) struct Forwarder<P: ReplyPoster> {
     turns: PluginTurns,
     poster: Arc<P>,
     dedup: Arc<Mutex<DedupState>>,
+    /// See [`MAX_QUEUED_AGE`]; tests shorten it.
+    max_queued_age: Duration,
 }
 
 impl<P: ReplyPoster> Forwarder<P> {
@@ -140,7 +151,21 @@ impl<P: ReplyPoster> Forwarder<P> {
             turns: turns.waiting_for_a_slot(SlotWait::Forever),
             poster,
             dedup,
+            max_queued_age: MAX_QUEUED_AGE,
         }
+    }
+
+    /// This forwarder with a different queued-message age limit, for tests.
+    #[cfg(test)]
+    pub(crate) fn with_max_queued_age(mut self, age: Duration) -> Self {
+        self.max_queued_age = age;
+        self
+    }
+
+    /// Whether `msg`, about to be answered, waited past the age limit.
+    fn too_old(&self, msg: &IncomingMessage) -> bool {
+        let age = chrono::Utc::now().signed_duration_since(msg.timestamp);
+        age.to_std().is_ok_and(|age| age > self.max_queued_age)
     }
 
     /// Handle one message end to end: [`admit`](Self::admit), then
@@ -226,7 +251,7 @@ impl<P: ReplyPoster + 'static> Forwarder<P> {
         mut stop: watch::Receiver<bool>,
         grace: Duration,
     ) {
-        let mut lanes: HashMap<String, mpsc::UnboundedSender<IncomingMessage>> = HashMap::new();
+        let mut lanes: HashMap<String, mpsc::Sender<IncomingMessage>> = HashMap::new();
         let mut workers = JoinSet::new();
         loop {
             let msg = tokio::select! {
@@ -242,17 +267,26 @@ impl<P: ReplyPoster + 'static> Forwarder<P> {
             }
             let channel = msg.channel_id.clone();
             let msg = match lanes.get(&channel) {
-                Some(lane) => match lane.send(msg) {
+                Some(lane) => match lane.try_send(msg) {
                     Ok(()) => continue,
+                    Err(mpsc::error::TrySendError::Full(msg)) => {
+                        tracing::warn!(
+                            "discord: {LANE_DEPTH} messages already queued in channel {channel}; \
+                             message {} from {} dropped unanswered",
+                            msg.message_id,
+                            msg.author_id
+                        );
+                        continue;
+                    }
                     // The lane's worker is gone (it panicked); start another.
-                    Err(mpsc::error::SendError(msg)) => msg,
+                    Err(mpsc::error::TrySendError::Closed(msg)) => msg,
                 },
                 None => msg,
             };
-            let (lane, queue) = mpsc::unbounded_channel();
+            let (lane, queue) = mpsc::channel(LANE_DEPTH);
             workers.spawn(Arc::clone(&self).lane(queue, stop.clone()));
-            // A fresh lane's receiver is alive, so this send cannot fail.
-            let _ = lane.send(msg);
+            // A fresh lane is empty and its receiver alive: this cannot fail.
+            let _ = lane.try_send(msg);
             lanes.insert(channel, lane);
         }
 
@@ -270,10 +304,11 @@ impl<P: ReplyPoster + 'static> Forwarder<P> {
     }
 
     /// One channel's messages, in order. Once `stop` is set no further
-    /// message starts a turn; the one in flight runs to the end.
+    /// message starts a turn; the one in flight runs to the end. A message
+    /// that waited past the age limit is dropped when its turn comes.
     async fn lane(
         self: Arc<Self>,
-        mut queue: mpsc::UnboundedReceiver<IncomingMessage>,
+        mut queue: mpsc::Receiver<IncomingMessage>,
         stop: watch::Receiver<bool>,
     ) {
         while let Some(msg) = queue.recv().await {
@@ -283,6 +318,14 @@ impl<P: ReplyPoster + 'static> Forwarder<P> {
                     msg.message_id
                 );
                 return;
+            }
+            if self.too_old(&msg) {
+                tracing::info!(
+                    "discord: message {} waited past {:?} in the queue; dropped unanswered",
+                    msg.message_id,
+                    self.max_queued_age
+                );
+                continue;
             }
             self.answer(msg).await;
         }

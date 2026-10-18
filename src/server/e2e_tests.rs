@@ -3176,6 +3176,70 @@ mod plugin_turns_e2e {
         assert!(voice.run(turn("hi", "phone-caller-1"), None).await.is_ok());
     }
 
+    /// Poll `fut` once; it must still be pending.
+    async fn still_pending<F: std::future::Future + Unpin>(fut: &mut F) {
+        tokio::select! {
+            biased;
+            _ = fut => panic!("finished early"),
+            () = std::future::ready(()) => {}
+        }
+    }
+
+    /// R2-9: a handle that must not drop queued work waits for a rate
+    /// token; any other handle fails at once.
+    #[tokio::test]
+    async fn a_forever_handle_waits_for_a_rate_token() {
+        use crate::server::turns::SlotWait;
+        let dir = tempfile::tempdir().unwrap();
+        let state = secured_state(dir.path(), MockProvider::new(vec![])).await;
+        state.turns.bind(&state);
+
+        let failing = state
+            .turns
+            .for_plugin("voice-echo", "voice")
+            .unwrap()
+            .with_rate_limit(1, 50.0);
+        assert!(failing.run(turn("one", "c-1"), None).await.is_ok());
+        assert_eq!(
+            failing.run(turn("two", "c-2"), None).await.err(),
+            Some(TurnError::RateLimited)
+        );
+
+        let waiting = state
+            .turns
+            .for_plugin("discord-text-echo", "discord")
+            .unwrap()
+            .waiting_for_a_slot(SlotWait::Forever)
+            .with_rate_limit(1, 50.0);
+        for i in 0..3 {
+            let author = format!("{}", 2000 + i);
+            assert!(
+                waiting.run(turn("hi", &author), None).await.is_ok(),
+                "turn {i}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn shutdown_ends_a_wait_for_a_rate_token() {
+        use crate::server::turns::SlotWait;
+        let dir = tempfile::tempdir().unwrap();
+        let state = secured_state(dir.path(), MockProvider::new(vec![])).await;
+        state.turns.bind(&state);
+        let waiting = state
+            .turns
+            .for_plugin("discord-text-echo", "discord")
+            .unwrap()
+            .waiting_for_a_slot(SlotWait::Forever)
+            .with_rate_limit(1, 0.0);
+        assert!(waiting.run(turn("first", "2002"), None).await.is_ok());
+
+        let mut second = Box::pin(waiting.run(turn("second", "3003"), None));
+        still_pending(&mut second).await;
+        state.turns.refuse_new();
+        assert_eq!(second.await.err(), Some(TurnError::ShuttingDown));
+    }
+
     /// The real router with the secret set: `/chat` and plugin routes need
     /// the credential, `/health` does not (AC3).
     #[tokio::test]
@@ -3449,10 +3513,12 @@ mod discord_forwarder_e2e {
         )
         .await;
         state.turns.bind(&state);
+        // These tests are about queueing, not the plugin's rate bucket.
         let turns = state
             .turns
             .for_plugin("discord-text-echo", "discord")
-            .unwrap();
+            .unwrap()
+            .with_rate_limit(1_000, 1_000.0);
         let poster = Arc::new(FakePoster::default());
         let dedup = Arc::new(tokio::sync::Mutex::new(DedupState::new()));
         let forwarder = Forwarder::new(turns, Arc::clone(&poster), dedup);
@@ -3693,6 +3759,82 @@ mod discord_forwarder_e2e {
         assert_eq!(in_a, ["re: hold on", "re: second in a"]);
         drop(posts);
         link.stop().await;
+    }
+
+    /// R2-8: a channel queues at most `LANE_DEPTH` messages behind its turn
+    /// in flight; the rest are dropped on arrival.
+    #[tokio::test]
+    async fn a_full_channel_queue_drops_new_messages() {
+        use crate::plugins::discord_forwarder::LANE_DEPTH;
+        let dir = tempfile::tempdir().unwrap();
+        let (_state, forwarder, poster, gate) = gated_forwarder(dir.path()).await;
+        let (tx, rx) = tokio::sync::mpsc::channel(64);
+        let link = DiscordLink::forwarding(rx, forwarder, std::time::Duration::from_secs(30));
+
+        tx.send(in_channel("m0", "a", "2000", "hold on"))
+            .await
+            .unwrap();
+        gate.wait_holding(1).await;
+        // Distinct authors: the per-guest bucket is not what is tested.
+        for i in 0..LANE_DEPTH + 2 {
+            let author = format!("{}", 3000 + i);
+            tx.send(in_channel(&format!("q{i}"), "a", &author, &format!("q{i}")))
+                .await
+                .unwrap();
+        }
+        // The relay takes messages in order: once the marker on another
+        // channel is answered, every queued one was accepted or dropped.
+        tx.send(in_channel("mk", "b", "9999", "marker"))
+            .await
+            .unwrap();
+        poster.wait_for(1).await;
+
+        gate.open();
+        poster.wait_for(2 + LANE_DEPTH).await;
+        link.stop().await;
+        let texts = poster.texts();
+        assert_eq!(texts.len(), 2 + LANE_DEPTH, "{texts:?}");
+        for i in 0..LANE_DEPTH {
+            assert!(
+                texts.contains(&format!("re: q{i}")),
+                "q{i} queued: {texts:?}"
+            );
+        }
+        for i in LANE_DEPTH..LANE_DEPTH + 2 {
+            assert!(
+                !texts.contains(&format!("re: q{i}")),
+                "q{i} dropped: {texts:?}"
+            );
+        }
+    }
+
+    /// R2-8: a message that waited past the age limit is dropped when its
+    /// turn comes; the fresh one behind it is still answered.
+    #[tokio::test]
+    async fn a_message_that_waited_too_long_is_dropped_at_the_front() {
+        let dir = tempfile::tempdir().unwrap();
+        let (_state, forwarder, poster, gate) = gated_forwarder(dir.path()).await;
+        let forwarder = forwarder.with_max_queued_age(std::time::Duration::from_secs(5));
+        let (tx, rx) = tokio::sync::mpsc::channel(8);
+        let link = DiscordLink::forwarding(rx, forwarder, std::time::Duration::from_secs(30));
+
+        tx.send(in_channel("m1", "a", "2002", "hold on"))
+            .await
+            .unwrap();
+        gate.wait_holding(1).await;
+        // Admitted (younger than the 30 s replay window), but already older
+        // than the queue's 5 s limit by the time m1 finishes.
+        let mut old = in_channel("m2", "a", "3003", "old news");
+        old.timestamp = chrono::Utc::now() - chrono::Duration::seconds(10);
+        tx.send(old).await.unwrap();
+        tx.send(in_channel("m3", "a", "4004", "fresh"))
+            .await
+            .unwrap();
+
+        gate.open();
+        poster.wait_for(2).await;
+        link.stop().await;
+        assert_eq!(poster.texts(), ["re: hold on", "re: fresh"]);
     }
 
     #[tokio::test]
