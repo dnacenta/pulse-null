@@ -3757,6 +3757,82 @@ mod voice_brain_e2e {
         assert!(said[1].ends_with("It's at the door"));
     }
 
+    /// Answers "Sure.", but fails any turn whose message says "drop".
+    struct FailsOnDrop;
+
+    impl crate::streaming::StreamingProvider for FailsOnDrop {}
+
+    impl LmProvider for FailsOnDrop {
+        fn invoke(
+            &self,
+            _system_prompt: &str,
+            messages: &[Message],
+            _max_tokens: u32,
+            _tools: Option<&[serde_json::Value]>,
+        ) -> LlmResult<'_> {
+            let drop_it = messages.last().is_some_and(|m| {
+                matches!(&m.content, pulse_system_types::llm::MessageContent::Text(t) if t.contains("drop"))
+            });
+            Box::pin(async move {
+                if drop_it {
+                    Err("the line dropped".into())
+                } else {
+                    Ok(mock_text("Sure."))
+                }
+            })
+        }
+
+        fn name(&self) -> &str {
+            "fails-on-drop"
+        }
+
+        fn supports_tools(&self) -> bool {
+            false
+        }
+    }
+
+    /// R2-4: an utterance whose turn fails stays in voice-echo's history
+    /// with no reply; the next one must still land in the call's session.
+    #[tokio::test]
+    async fn a_failed_utterance_does_not_lose_the_call() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = test_config();
+        config.security.secret = Some("s3cret".to_string());
+        let state = build_state_boxed_with_config(
+            dir.path().to_path_buf(),
+            Box::new(FailsOnDrop),
+            ToolRegistry::new(),
+            config,
+        )
+        .await;
+        state.turns.bind(&state);
+        let brain = TurnBrain::new(state.turns.for_plugin("voice-echo", "voice").unwrap());
+
+        let first = user(fixtures::phone("Hi, it's about the delivery", None));
+        let reply = brain
+            .invoke("", std::slice::from_ref(&first), 1024, None)
+            .await
+            .unwrap();
+        let failed = user(fixtures::phone("please drop this", None));
+        let history = [first, assistant(&reply.text()), failed];
+        assert!(brain.invoke("", &history, 1024, None).await.is_err());
+
+        // voice-echo sends the failed utterance back with no reply after it.
+        let mut history = history.to_vec();
+        history.push(user(fixtures::phone("It's at the door", None)));
+        brain.invoke("", &history, 1024, None).await.unwrap();
+
+        let call = only_call(&state, "phone-caller").await;
+        let said = user_texts(&state, &call).await;
+        assert_eq!(
+            said.len(),
+            2,
+            "the failed turn rolled back, the call kept: {said:?}"
+        );
+        assert!(said[0].ends_with("Hi, it's about the delivery"), "{said:?}");
+        assert!(said[1].ends_with("It's at the door"), "{said:?}");
+    }
+
     #[tokio::test]
     async fn a_caller_never_sees_another_callers_turns() {
         let dir = tempfile::tempdir().unwrap();

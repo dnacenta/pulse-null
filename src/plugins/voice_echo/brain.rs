@@ -244,7 +244,21 @@ impl CallSessions {
     /// `call` answered the last message of `heard` with `reply`: its
     /// conversation is now `heard` followed by `reply`.
     pub(crate) fn answered(&self, heard: &[Message], reply: &str, call: &str) {
-        let next = self.key_of(heard, Some(reply));
+        self.advance(heard, Some(reply), call);
+    }
+
+    /// `call`'s turn for the last message of `heard` failed (busy, rate
+    /// limited, provider error, refusal). voice-echo keeps the utterance in
+    /// its history with no reply after it, so the next utterance arrives
+    /// with `heard` in front of it: remember that as this call too, or the
+    /// caller lands in a fresh, empty session (audit R2-4).
+    pub(crate) fn unanswered(&self, heard: &[Message], call: &str) {
+        self.advance(heard, None, call);
+    }
+
+    /// `call`'s conversation is now `heard`, then `reply` if there was one.
+    fn advance(&self, heard: &[Message], reply: Option<&str>, call: &str) {
+        let next = self.key_of(heard, reply);
         let previous = match heard.split_last() {
             Some((_, before)) if !before.is_empty() => Some(self.key_of(before, None)),
             _ => None,
@@ -333,9 +347,14 @@ impl LmProvider for TurnBrain {
                 message: voice_transcript(&wrapped),
                 sender: Some(format!("{}-{call}", transport.caller())),
             };
-            let reply = self.turns.run(turn, None).await?;
-            self.calls
-                .answered(&messages[..=heard], &reply.response, &call);
+            let outcome = self.turns.run(turn, None).await;
+            match &outcome {
+                Ok(reply) => self
+                    .calls
+                    .answered(&messages[..=heard], &reply.response, &call),
+                Err(_) => self.calls.unanswered(&messages[..=heard], &call),
+            }
+            let reply = outcome?;
             Ok(LlmResponse {
                 content: vec![ContentBlock::Text {
                     text: reply.response,
@@ -502,6 +521,39 @@ mod tests {
         let mut before = heard.to_vec();
         before.push(said(Role::Assistant, "well"));
         assert_eq!(calls.call_for(&before), first);
+    }
+
+    #[test]
+    fn a_failed_utterance_keeps_the_call() {
+        let calls = CallSessions::default();
+        let call = calls.call_for(&[]);
+        calls.answered(&[said(Role::User, "hello")], "hi", &call);
+
+        // The second utterance fails: voice-echo keeps it with no reply.
+        let heard = [
+            said(Role::User, "hello"),
+            said(Role::Assistant, "hi"),
+            said(Role::User, "are you there"),
+        ];
+        assert_eq!(calls.call_for(&heard[..2]), call);
+        calls.unanswered(&heard, &call);
+
+        // The third arrives behind the unanswered one: same call.
+        assert_eq!(calls.call_for(&heard), call);
+    }
+
+    #[test]
+    fn a_failed_first_utterance_keeps_the_call() {
+        let calls = CallSessions::default();
+        let call = calls.call_for(&[]);
+        let heard = [said(Role::User, "hello")];
+        calls.unanswered(&heard, &call);
+        assert_eq!(calls.call_for(&heard), call);
+
+        // Two failures in a row still lead to the same call.
+        let heard = [said(Role::User, "hello"), said(Role::User, "hello?")];
+        calls.unanswered(&heard, &call);
+        assert_eq!(calls.call_for(&heard), call);
     }
 
     #[test]
