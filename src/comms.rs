@@ -661,9 +661,17 @@ async fn run(
         conversation: &mut Vec<Message>,
         max_tokens: u32,
     ) -> Result<String, String> {
+        // The registry follows the dialogue's surface (the peer's: none),
+        // as the CLI does (audit R2-7).
+        let surface = crate::tool_surface::effective(
+            crate::tool_surface::current(),
+            crate::server::isolation::is_active(&state.root_dir),
+        );
+        let narrowed =
+            crate::server::setup::narrowed_tools(&state.root_dir, &state.config, surface);
         tool_loop::invoke_with_tool_loop(
             provider,
-            &state.tools,
+            narrowed.as_ref().unwrap_or(&state.tools),
             system_prompt,
             conversation,
             max_tokens,

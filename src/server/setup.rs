@@ -124,6 +124,23 @@ pub(crate) async fn sweep_calls(state: &super::AppState) {
     state.session_store.archive_ended_calls();
 }
 
+/// The in-process tools a provider call may use on `surface` (PN-110 audit
+/// R2-7). `None` means the full registry, shared; otherwise the narrower
+/// one to use instead: the read-only introspection set, or no tools.
+#[must_use]
+pub fn narrowed_tools(
+    root_dir: &Path,
+    config: &Config,
+    surface: crate::tool_surface::ToolSurface,
+) -> Option<ToolRegistry> {
+    use crate::tool_surface::ToolSurface;
+    match surface {
+        ToolSurface::Full => None,
+        ToolSurface::Restricted => Some(register_readonly_tools(root_dir, config)),
+        ToolSurface::None => Some(ToolRegistry::new()),
+    }
+}
+
 /// Initialize and start plugins, collecting their tools into the registry.
 ///
 /// Returns the plugin manager and any plugin-contributed routes.

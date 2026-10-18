@@ -266,6 +266,50 @@ impl LmProvider for SurfaceRecorder {
     }
 }
 
+/// Answers "ok" and records the names of the in-process tools each call was
+/// offered (empty when none).
+struct ToolsOffered(Arc<std::sync::Mutex<Vec<Vec<String>>>>);
+
+impl crate::streaming::StreamingProvider for ToolsOffered {}
+
+impl LmProvider for ToolsOffered {
+    fn invoke(
+        &self,
+        _system_prompt: &str,
+        _messages: &[Message],
+        _max_tokens: u32,
+        tools: Option<&[serde_json::Value]>,
+    ) -> LlmResult<'_> {
+        let names = tools
+            .unwrap_or_default()
+            .iter()
+            .filter_map(|t| t["name"].as_str().map(str::to_string))
+            .collect();
+        self.0.lock().unwrap().push(names);
+        Box::pin(async { Ok(mock_text("ok")) })
+    }
+
+    fn name(&self) -> &str {
+        "tools-offered"
+    }
+
+    fn supports_tools(&self) -> bool {
+        true
+    }
+}
+
+/// A registry with a reader and a writer rooted at `root`.
+fn read_write_tools(root: &std::path::Path) -> ToolRegistry {
+    let mut tools = ToolRegistry::new();
+    tools.register(Box::new(crate::tools::file_read::FileReadTool::new(
+        root.to_path_buf(),
+    )));
+    tools.register(Box::new(crate::tools::file_write::FileWriteTool::new(
+        root.to_path_buf(),
+    )));
+    tools
+}
+
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
@@ -525,7 +569,7 @@ async fn e2e_chat_file_read_tool() {
     let state = build_state(provider, tools).await;
     let app = build_app(state);
 
-    let (status, body) = post_chat(&app, "Read hello.txt").await;
+    let (status, body) = post_chat_on(&app, "tui", "Read hello.txt").await;
     assert_eq!(status, StatusCode::OK);
 
     let json: serde_json::Value = serde_json::from_str(&body).unwrap();
@@ -575,7 +619,7 @@ async fn e2e_chat_grep_tool() {
     let state = build_state(provider, tools).await;
     let app = build_app(state);
 
-    let (status, body) = post_chat(&app, "Search for 'find me'").await;
+    let (status, body) = post_chat_on(&app, "tui", "Search for 'find me'").await;
     assert_eq!(status, StatusCode::OK);
 
     let json: serde_json::Value = serde_json::from_str(&body).unwrap();
@@ -620,7 +664,7 @@ async fn e2e_chat_file_write_tool() {
     let state = build_state(provider, tools).await;
     let app = build_app(state);
 
-    let (status, body) = post_chat(&app, "Write a file").await;
+    let (status, body) = post_chat_on(&app, "tui", "Write a file").await;
     assert_eq!(status, StatusCode::OK);
 
     let json: serde_json::Value = serde_json::from_str(&body).unwrap();
@@ -669,7 +713,7 @@ async fn e2e_chat_file_list_tool() {
     let state = build_state(provider, tools).await;
     let app = build_app(state);
 
-    let (status, _body) = post_chat(&app, "List my files").await;
+    let (status, _body) = post_chat_on(&app, "tui", "List my files").await;
     assert_eq!(status, StatusCode::OK);
 }
 
@@ -766,7 +810,7 @@ async fn e2e_chat_multi_tool_chain() {
     let state = build_state(provider, tools).await;
     let app = build_app(state);
 
-    let (status, body) = post_chat(&app, "Write then read").await;
+    let (status, body) = post_chat_on(&app, "tui", "Write then read").await;
     assert_eq!(status, StatusCode::OK);
 
     let json: serde_json::Value = serde_json::from_str(&body).unwrap();
@@ -816,7 +860,7 @@ async fn e2e_token_accumulation_across_rounds() {
     let state = build_state(provider, tools).await;
     let app = build_app(state);
 
-    let (status, body) = post_chat(&app, "Read a.txt").await;
+    let (status, body) = post_chat_on(&app, "tui", "Read a.txt").await;
     assert_eq!(status, StatusCode::OK);
 
     let json: serde_json::Value = serde_json::from_str(&body).unwrap();
@@ -2060,6 +2104,32 @@ mod comms_e2e {
                 .all(|s| *s == Some(crate::tool_surface::ToolSurface::None)),
             "{seen:?}"
         );
+    }
+
+    /// R2-7: the dialogue's in-process tool loop is offered no tools.
+    #[tokio::test]
+    async fn e2e_comms_local_turns_are_offered_no_in_process_tools() {
+        let dir = tempfile::tempdir().unwrap();
+        let offered = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let state = build_state_boxed_with_config(
+            dir.path().to_path_buf(),
+            Box::new(ToolsOffered(Arc::clone(&offered))),
+            read_write_tools(dir.path()),
+            test_config(),
+        )
+        .await;
+        let app = build_app(Arc::clone(&state));
+        let (port, _calls) = fake_peer(false, 0).await;
+
+        let (status, body) = post_json(&app, "/api/comms", start_body(port, 3)).await;
+        assert_eq!(status, StatusCode::ACCEPTED, "{body}");
+        let id = body["id"].as_str().unwrap().to_string();
+        let (_, text) = get_text(&app, &format!("/api/comms/{id}/stream")).await;
+        assert_eq!(frames(&text).last().unwrap().0, "done", "{text}");
+
+        let offered = offered.lock().unwrap().clone();
+        assert_eq!(offered.len(), 2, "{offered:?}");
+        assert!(offered.iter().all(Vec::is_empty), "{offered:?}");
     }
 
     #[tokio::test]
@@ -4308,5 +4378,112 @@ mod owner_work_surface_e2e {
             [Some(ToolSurface::Full), Some(ToolSurface::None)],
             "tui (owner) then the default channel with no sender (a guest)"
         );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// PN-110 audit R2-7: the in-process tool registry follows the tool surface
+// ---------------------------------------------------------------------------
+
+mod in_process_tools_e2e {
+    use super::*;
+
+    type Offered = Arc<std::sync::Mutex<Vec<Vec<String>>>>;
+
+    async fn offering_state(dir: &std::path::Path) -> (Arc<AppState>, Offered) {
+        let offered: Offered = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let state = build_state_boxed_with_config(
+            dir.to_path_buf(),
+            Box::new(ToolsOffered(Arc::clone(&offered))),
+            read_write_tools(dir),
+            test_config(),
+        )
+        .await;
+        (state, offered)
+    }
+
+    fn last(offered: &Offered) -> Vec<String> {
+        offered.lock().unwrap().last().cloned().unwrap_or_default()
+    }
+
+    #[tokio::test]
+    async fn only_the_owner_is_offered_the_registry() {
+        let dir = tempfile::tempdir().unwrap();
+        let (state, offered) = offering_state(dir.path()).await;
+        let app = build_app(Arc::clone(&state));
+
+        let (status, body) = post_chat_on(&app, "tui", "hi").await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(last(&offered), ["file_read", "file_write"], "the owner");
+
+        let (status, body) = post_chat(&app, "hi").await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert!(last(&offered).is_empty(), "a guest: {:?}", last(&offered));
+
+        let peer = handlers::chat::ChatRequest {
+            message: "hi".to_string(),
+            channel: "chat".to_string(),
+            sender: None,
+        };
+        handlers::chat::run_turn(
+            Arc::clone(&state),
+            peer,
+            crate::server::auth::AuthIdentity::Peer("Synth".to_string()),
+            None,
+        )
+        .await
+        .unwrap();
+        assert!(last(&offered).is_empty(), "a peer: {:?}", last(&offered));
+    }
+
+    #[tokio::test]
+    async fn an_isolated_owner_is_offered_only_the_read_only_set() {
+        let dir = tempfile::tempdir().unwrap();
+        let (state, offered) = offering_state(dir.path()).await;
+        let app = build_app(Arc::clone(&state));
+        crate::server::isolation::enter(dir.path(), "test", None).unwrap();
+
+        let (status, body) = post_chat_on(&app, "tui", "hi").await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let names = last(&offered);
+        assert!(names.contains(&"file_read".to_string()), "{names:?}");
+        assert!(!names.contains(&"file_write".to_string()), "{names:?}");
+
+        let (status, body) = post_chat(&app, "hi").await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert!(
+            last(&offered).is_empty(),
+            "an isolated guest still gets none"
+        );
+    }
+
+    /// A guest whose model asks for a tool anyway gets nothing run.
+    #[tokio::test]
+    async fn a_guest_tool_call_runs_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let provider = MockProvider::new(vec![
+            LlmResponse {
+                content: vec![ContentBlock::ToolUse {
+                    id: "tu_1".to_string(),
+                    name: "file_write".to_string(),
+                    input: serde_json::json!({"path": "guest.txt", "content": "pwned"}),
+                }],
+                stop_reason: StopReason::ToolUse,
+                model: "mock-model".to_string(),
+                input_tokens: Some(1),
+                output_tokens: Some(1),
+            },
+            mock_text("done"),
+        ]);
+        let state = build_state_in(
+            dir.path().to_path_buf(),
+            provider,
+            read_write_tools(dir.path()),
+        )
+        .await;
+        let app = build_app(state);
+        let (status, body) = post_chat(&app, "write a file").await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert!(!dir.path().join("guest.txt").exists(), "a guest's tool ran");
     }
 }

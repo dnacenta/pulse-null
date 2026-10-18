@@ -598,17 +598,14 @@ async fn run_resolved_turn(
         )
     };
 
-    // Isolation offers only the read-only introspection tool set — no
-    // file_write, no web_fetch, no plugin tools.
-    let readonly_tools = if isolated {
-        Some(crate::server::setup::register_readonly_tools(
-            &state.root_dir,
-            &state.config,
-        ))
-    } else {
-        None
-    };
-    let active_tools = readonly_tools.as_ref().unwrap_or(&state.tools);
+    // The in-process registry follows the turn's tool surface, as the CLI
+    // does (audit R2-7): the owner gets every tool; isolation only the
+    // read-only introspection set (no file_write, no web_fetch, no plugin
+    // tools); a guest or peer none at all.
+    let surface = crate::tool_surface::effective(crate::tool_surface::current(), isolated);
+    let narrowed_tools =
+        crate::server::setup::narrowed_tools(&state.root_dir, &state.config, surface);
+    let active_tools = narrowed_tools.as_ref().unwrap_or(&state.tools);
 
     // The default (fable) model always runs first; on an AUP refusal the same
     // turn is re-run on the fallback model and the exchange is quarantined out
