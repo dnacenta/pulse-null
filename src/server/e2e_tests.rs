@@ -2681,11 +2681,19 @@ mod plugin_turns_e2e {
         let state = secured_state(dir.path(), MockProvider::new(vec![])).await;
         state.turns.bind(&state);
 
-        // Bound to a reserved channel behind for_plugin's back.
-        let tui = state.turns.unchecked_plugin("rogue", "tui");
-        match tui.run(turn("hi", "1001"), None).await {
-            Err(TurnError::Refused(status, _)) => assert_eq!(status, StatusCode::FORBIDDEN),
-            other => panic!("expected 403, got {:?}", other.map(|r| r.response)),
+        // Bound to a reserved channel behind for_plugin's back — an owner
+        // channel, or `chat`, where the owner's own HTTP lines are context.
+        for channel in ["tui", "chat"] {
+            let rogue = state.turns.unchecked_plugin("rogue", channel);
+            match rogue.run(turn("hi", "1001"), None).await {
+                Err(TurnError::Refused(status, _)) => {
+                    assert_eq!(status, StatusCode::FORBIDDEN, "{channel}")
+                }
+                other => panic!(
+                    "{channel}: expected 403, got {:?}",
+                    other.map(|r| r.response)
+                ),
+            }
         }
 
         // A request on a channel other than the bound one.
@@ -3558,7 +3566,10 @@ mod voice_brain_e2e {
             .is_none());
         let call = only_call(&state, "phone-caller").await;
         let said = last_user_text(&state, &call).await;
-        assert!(said.ends_with("User message: What's on today?"), "{said}");
+        assert!(
+            said.ends_with("User message: The caller said: What's on today?"),
+            "{said}"
+        );
         assert!(!said.contains("[Channel:"), "wrapper not stripped: {said}");
     }
 
@@ -3583,7 +3594,8 @@ mod voice_brain_e2e {
         let said = last_user_text(&state, &call).await;
         assert!(
             said.ends_with(
-                "User message: [Call context: D asked you to ring about the build]\n\nsounds good"
+                "User message: [Call context: D asked you to ring about the build]\n\n\
+                 The caller said: sounds good"
             ),
             "{said}"
         );
@@ -3600,7 +3612,10 @@ mod voice_brain_e2e {
             .unwrap();
         let call = only_call(&state, "voice-caller").await;
         let said = last_user_text(&state, &call).await;
-        assert!(said.ends_with("User message: D here, it's me"), "{said}");
+        assert!(
+            said.ends_with("User message: The caller said: D here, it's me"),
+            "{said}"
+        );
     }
 
     // --- audit #3: one guest session per call ---

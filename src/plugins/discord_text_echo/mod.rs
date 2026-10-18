@@ -203,7 +203,7 @@ mod tests {
 
     #[tokio::test]
     async fn init_refuses_a_reserved_channel() {
-        for channel in ["tui", "system", "reflection", "comms"] {
+        for channel in ["tui", "system", "reflection", "comms", "chat", "tui-chat"] {
             let mut plugin = DiscordTextEchoPlugin::new();
             let err = plugin.init(&raw_config(channel), &ctx()).await;
             assert!(err.is_err(), "{channel:?} must be refused");

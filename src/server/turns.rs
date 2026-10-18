@@ -87,9 +87,13 @@ pub enum SlotWait {
 /// The channel every voice transport speaks on. Callers on it are guests.
 pub const VOICE_CHANNEL: &str = "voice";
 
-/// Channels no plugin may be bound to: the owner's own channels, and the
-/// peer channel whose senders resolve to sibling pulses.
-pub const RESERVED_CHANNELS: &[&str] = &["tui", "system", "reflection", "comms"];
+/// Channels no plugin may be bound to: the owner's own channels, the peer
+/// channel whose senders resolve to sibling pulses, and the HTTP clients'
+/// channels (`chat`, the `/chat` default, and the legacy `tui-chat`), whose
+/// recent activity — the owner's own lines — must not reach a plugin's
+/// guests as channel context (audit #9).
+pub const RESERVED_CHANNELS: &[&str] =
+    &["tui", "system", "reflection", "comms", "chat", "tui-chat"];
 
 #[cfg_attr(
     not(any(feature = "voice", feature = "discord-text")),
@@ -452,7 +456,17 @@ mod tests {
     #[test]
     fn reserved_channels_are_refused_case_insensitively() {
         let runner = TurnRunner::new();
-        for channel in ["tui", "system", "reflection", "comms", "TUI", "Comms"] {
+        for channel in [
+            "tui",
+            "system",
+            "reflection",
+            "comms",
+            "chat",
+            "tui-chat",
+            "TUI",
+            "Comms",
+            "Chat",
+        ] {
             assert!(
                 runner.for_plugin("test", channel).is_err(),
                 "{channel:?} must be refused"
