@@ -4750,3 +4750,434 @@ mod turn_steps {
         assert!(crate::caliber::runtime::load_outcomes(dir.path()).is_empty());
     }
 }
+
+// ---------------------------------------------------------------------------
+// Scheduler loops: one task loop and the intent drain, end to end
+// ---------------------------------------------------------------------------
+
+mod scheduler_loops_e2e {
+    use super::*;
+    use crate::coordinator::control::{TenureLeases, CONTROL_PLANE_RESOURCE};
+    use crate::scheduler::intent::{
+        Intent, IntentOutput, IntentPriority, IntentQueue, IntentSource,
+    };
+    use crate::scheduler::{Schedule, ScheduleEntry};
+    use std::time::Duration;
+
+    const EVERY_SECOND: &str = "* * * * * *";
+    const DEADLINE: Duration = Duration::from_secs(20);
+
+    fn tenure_in(dir: &std::path::Path) -> TenureLeases {
+        TenureLeases {
+            leases: Arc::new(tokio::sync::Mutex::new(
+                crate::coordinator::durable::DurableLeaseTable::open(&dir.join("coordinator"))
+                    .unwrap(),
+            )),
+            holder: "test-holder".to_string(),
+        }
+    }
+
+    async fn lead(tenure: &TenureLeases) {
+        tenure
+            .leases
+            .lock()
+            .await
+            .acquire(
+                CONTROL_PLANE_RESOURCE,
+                &tenure.holder,
+                Duration::from_secs(300),
+                chrono::Utc::now(),
+            )
+            .unwrap();
+    }
+
+    async fn leading_tenure(dir: &std::path::Path) -> TenureLeases {
+        let tenure = tenure_in(dir);
+        lead(&tenure).await;
+        tenure
+    }
+
+    fn entry(id: &str, enabled: bool) -> ScheduleEntry {
+        serde_json::from_value(serde_json::json!({
+            "id": id,
+            "name": format!("Task {id}"),
+            "cron": EVERY_SECOND,
+            "channel": "system",
+            "prompt": "Say ok.",
+            "enabled": enabled,
+        }))
+        .unwrap()
+    }
+
+    /// Write the schedule to disk, as the CLI would.
+    fn save_schedule(dir: &std::path::Path, entry: ScheduleEntry) {
+        Schedule { tasks: vec![entry] }.save(dir).unwrap();
+    }
+
+    /// A running task loop and the handles a test watches it through.
+    struct TaskLoop {
+        handle: tokio::task::JoinHandle<()>,
+        health: crate::scheduler::liveness::SharedTaskHealth,
+        tenure: TenureLeases,
+    }
+
+    async fn start_task_loop(
+        state: &Arc<AppState>,
+        dir: &std::path::Path,
+        running: ScheduleEntry,
+        on_disk: ScheduleEntry,
+        tenure: TenureLeases,
+    ) -> TaskLoop {
+        save_schedule(dir, on_disk);
+        let health: crate::scheduler::liveness::SharedTaskHealth = Arc::new(RwLock::new(
+            crate::scheduler::health::TaskHealthStore::load(dir),
+        ));
+        let handle = tokio::spawn(crate::scheduler::runner::run_task_loop(
+            running,
+            Arc::clone(state),
+            Arc::new(RwLock::new(Schedule::load(dir).unwrap())),
+            Arc::new(RwLock::new(IntentQueue::load(dir))),
+            Arc::clone(&health),
+            chrono_tz::UTC,
+            TenureLeases {
+                leases: Arc::clone(&tenure.leases),
+                holder: tenure.holder.clone(),
+            },
+        ));
+        TaskLoop {
+            handle,
+            health,
+            tenure,
+        }
+    }
+
+    async fn ends(handle: tokio::task::JoinHandle<()>) {
+        tokio::time::timeout(DEADLINE, handle)
+            .await
+            .expect("the loop ended")
+            .unwrap();
+    }
+
+    /// Wait until the task has an outcome of the wanted kind.
+    async fn wait_for_outcome(
+        health: &crate::scheduler::liveness::SharedTaskHealth,
+        id: &str,
+        failed: bool,
+    ) {
+        for _ in 0..200 {
+            if let Some(h) = health.read().await.get(id) {
+                if (failed && h.last_failure.is_some()) || (!failed && h.last_success.is_some()) {
+                    return;
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        panic!("task '{id}' never recorded the outcome");
+    }
+
+    async fn mock_state(dir: &std::path::Path) -> Arc<AppState> {
+        build_state_in(
+            dir.to_path_buf(),
+            MockProvider::new(vec![mock_text("ok")]),
+            ToolRegistry::new(),
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn a_task_disabled_on_disk_ends_its_loop_at_the_next_fire() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = mock_state(dir.path()).await;
+        let running = start_task_loop(
+            &state,
+            dir.path(),
+            entry("probe", true),
+            entry("probe", false),
+            leading_tenure(dir.path()).await,
+        )
+        .await;
+        ends(running.handle).await;
+        assert!(
+            running.health.read().await.get("probe").is_none(),
+            "it fired"
+        );
+    }
+
+    #[tokio::test]
+    async fn isolation_ends_a_task_loop_before_it_fires() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = mock_state(dir.path()).await;
+        crate::server::isolation::enter(dir.path(), "test", None).unwrap();
+        let running = start_task_loop(
+            &state,
+            dir.path(),
+            entry("probe", true),
+            entry("probe", true),
+            leading_tenure(dir.path()).await,
+        )
+        .await;
+        ends(running.handle).await;
+        assert!(
+            running.health.read().await.get("probe").is_none(),
+            "it fired"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_tenure_that_lost_the_lead_ends_its_loop_before_it_fires() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = mock_state(dir.path()).await;
+        let running = start_task_loop(
+            &state,
+            dir.path(),
+            entry("probe", true),
+            entry("probe", true),
+            tenure_in(dir.path()),
+        )
+        .await;
+        ends(running.handle).await;
+        assert!(
+            running.health.read().await.get("probe").is_none(),
+            "it fired"
+        );
+    }
+
+    /// The built-in handler fires, the outcome is recorded and the lease
+    /// released, and the loop runs on until the task is disabled.
+    #[tokio::test]
+    async fn a_builtin_task_fires_and_its_loop_runs_on_until_disabled() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = mock_state(dir.path()).await;
+        let id = "trajectory-mining";
+        let running = start_task_loop(
+            &state,
+            dir.path(),
+            entry(id, true),
+            entry(id, true),
+            leading_tenure(dir.path()).await,
+        )
+        .await;
+
+        wait_for_outcome(&running.health, id, false).await;
+        assert!(
+            !running.handle.is_finished(),
+            "the loop ends only on a stop"
+        );
+        save_schedule(dir.path(), entry(id, false));
+        ends(running.handle).await;
+        let free = running.tenure.leases.lock().await.acquire(
+            "task-trajectory-mining",
+            "someone-else",
+            Duration::from_secs(60),
+            chrono::Utc::now(),
+        );
+        assert!(free.is_ok(), "the run lease was released: {free:?}");
+    }
+
+    /// A failed LLM fire is reported and recorded as a failure.
+    #[tokio::test]
+    async fn a_failed_fire_is_recorded_as_a_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = build_state_boxed_with_config(
+            dir.path().to_path_buf(),
+            Box::new(FailingProvider),
+            ToolRegistry::new(),
+            test_config(),
+        )
+        .await;
+        let running = start_task_loop(
+            &state,
+            dir.path(),
+            entry("probe", true),
+            entry("probe", true),
+            leading_tenure(dir.path()).await,
+        )
+        .await;
+        wait_for_outcome(&running.health, "probe", true).await;
+        save_schedule(dir.path(), entry("probe", false));
+        ends(running.handle).await;
+    }
+
+    /// A run lease another holder still holds skips the fire.
+    #[tokio::test]
+    async fn a_held_run_lease_skips_the_fire() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = mock_state(dir.path()).await;
+        let id = "trajectory-mining";
+        let tenure = leading_tenure(dir.path()).await;
+        tenure
+            .leases
+            .lock()
+            .await
+            .acquire(
+                "task-trajectory-mining",
+                "a-wedged-run",
+                Duration::from_secs(300),
+                chrono::Utc::now(),
+            )
+            .unwrap();
+        let running =
+            start_task_loop(&state, dir.path(), entry(id, true), entry(id, true), tenure).await;
+
+        tokio::time::sleep(Duration::from_millis(2500)).await;
+        assert!(running.health.read().await.get(id).is_none(), "it fired");
+        save_schedule(dir.path(), entry(id, false));
+        ends(running.handle).await;
+    }
+
+    // ---- the intent drain ---------------------------------------------------
+
+    fn intent(id: &str) -> Intent {
+        Intent {
+            id: id.into(),
+            description: format!("Intent {id}"),
+            prompt: "Say ok.".into(),
+            source: IntentSource::UserCli,
+            priority: IntentPriority::Normal,
+            created_at: chrono::Utc::now(),
+            chain: None,
+            output_routing: IntentOutput::Silent,
+            depth: 0,
+        }
+    }
+
+    /// A state whose drain polls continuously (interval 0).
+    async fn drain_state(
+        dir: &std::path::Path,
+        max_per_hour: u32,
+    ) -> (Arc<AppState>, Arc<AtomicUsize>) {
+        let mut config = test_config();
+        config.autonomy.enabled = true;
+        config.autonomy.intent_poll_interval = 0;
+        config.autonomy.max_intents_per_hour = max_per_hour;
+        let provider = MockProvider::new(vec![mock_text("did it")]);
+        let calls = Arc::new(AtomicUsize::new(0));
+        let counting = CountingProvider {
+            inner: provider,
+            calls: Arc::clone(&calls),
+        };
+        let state = build_state_boxed_with_config(
+            dir.to_path_buf(),
+            Box::new(counting),
+            ToolRegistry::new(),
+            config,
+        )
+        .await;
+        (state, calls)
+    }
+
+    /// Counts the calls that reach the model.
+    struct CountingProvider {
+        inner: MockProvider,
+        calls: Arc<AtomicUsize>,
+    }
+
+    impl crate::streaming::StreamingProvider for CountingProvider {}
+    impl LmProvider for CountingProvider {
+        fn invoke(
+            &self,
+            system_prompt: &str,
+            messages: &[Message],
+            max_tokens: u32,
+            tools: Option<&[serde_json::Value]>,
+        ) -> LlmResult<'_> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            self.inner
+                .invoke(system_prompt, messages, max_tokens, tools)
+        }
+        fn name(&self) -> &str {
+            "counting"
+        }
+        fn supports_tools(&self) -> bool {
+            false
+        }
+    }
+
+    fn start_drain(
+        state: &Arc<AppState>,
+        dir: &std::path::Path,
+        queue: &Arc<RwLock<IntentQueue>>,
+        tenure: &TenureLeases,
+    ) -> tokio::task::JoinHandle<()> {
+        tokio::spawn(crate::scheduler::intent::drain_loop(
+            Arc::clone(state),
+            Arc::clone(queue),
+            Arc::new(RwLock::new(Schedule::load_or_init(dir).unwrap())),
+            Arc::clone(&tenure.leases),
+            tenure.holder.clone(),
+        ))
+    }
+
+    #[tokio::test]
+    async fn the_drain_runs_a_queued_intent_and_stops_on_isolation() {
+        let dir = tempfile::tempdir().unwrap();
+        let (state, calls) = drain_state(dir.path(), 10).await;
+        let queue = Arc::new(RwLock::new(IntentQueue::load(dir.path())));
+        queue.write().await.push(intent("i-1"), 20);
+        let tenure = tenure_in(dir.path());
+        lead(&tenure).await;
+        let drain = start_drain(&state, dir.path(), &queue, &tenure);
+
+        for _ in 0..200 {
+            if queue.read().await.is_empty() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert!(
+            queue.read().await.is_empty(),
+            "the intent was never completed"
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+        crate::server::isolation::enter(dir.path(), "test", None).unwrap();
+        ends(drain).await;
+    }
+
+    #[tokio::test]
+    async fn a_rate_limited_intent_stays_queued_and_unrun() {
+        let dir = tempfile::tempdir().unwrap();
+        let (state, calls) = drain_state(dir.path(), 0).await;
+        let queue = Arc::new(RwLock::new(IntentQueue::load(dir.path())));
+        queue.write().await.push(intent("i-1"), 20);
+        let tenure = tenure_in(dir.path());
+        lead(&tenure).await;
+        let drain = start_drain(&state, dir.path(), &queue, &tenure);
+
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert_eq!(queue.read().await.len(), 1);
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+
+        crate::server::isolation::enter(dir.path(), "test", None).unwrap();
+        ends(drain).await;
+    }
+
+    #[tokio::test]
+    async fn the_drain_stops_when_its_tenure_does_not_lead() {
+        let dir = tempfile::tempdir().unwrap();
+        let (state, _) = drain_state(dir.path(), 10).await;
+        let queue = Arc::new(RwLock::new(IntentQueue::load(dir.path())));
+        let drain = start_drain(&state, dir.path(), &queue, &tenure_in(dir.path()));
+        ends(drain).await;
+    }
+
+    #[tokio::test]
+    async fn the_drain_does_not_start_without_autonomy() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = test_config();
+        config.autonomy.enabled = false;
+        let state = build_state_boxed_with_config(
+            dir.path().to_path_buf(),
+            Box::new(MockProvider::new(vec![])),
+            ToolRegistry::new(),
+            config,
+        )
+        .await;
+        let queue = Arc::new(RwLock::new(IntentQueue::load(dir.path())));
+        queue.write().await.push(intent("i-1"), 20);
+        let tenure = tenure_in(dir.path());
+        lead(&tenure).await;
+        ends(start_drain(&state, dir.path(), &queue, &tenure)).await;
+        assert_eq!(queue.read().await.len(), 1, "nothing was drained");
+    }
+}

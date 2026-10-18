@@ -36,16 +36,9 @@ pub async fn run_task_loop(
     tenure: crate::coordinator::control::TenureLeases,
 ) {
     let task = &entry.task;
-    let lease_resource = format!("task-{}", crate::coordinator::control::lease_safe(&task.id));
-    let normalized_cron = super::normalize_cron(&task.cron);
-    let cron_expr = match CronSchedule::from_str(&normalized_cron) {
-        Ok(c) => c,
-        Err(e) => {
-            tracing::error!("Invalid cron for task '{}': {} — {}", task.id, task.cron, e);
-            return;
-        }
+    let Some(cron_expr) = parse_task_cron(task) else {
+        return;
     };
-
     tracing::info!(
         model = %entry.effective_model(&state.config.llm.model),
         "Scheduled task '{}' ({})",
@@ -53,183 +46,303 @@ pub async fn run_task_loop(
         task.cron
     );
 
+    let fire = TaskFire {
+        entry: &entry,
+        state: &state,
+        schedule: &schedule,
+        intent_queue: &intent_queue,
+        health: &health,
+        tenure: &tenure,
+        lease_resource: format!("task-{}", crate::coordinator::control::lease_safe(&task.id)),
+    };
     // Use cached root_dir from AppState (avoids re-walking filesystem every task execution)
-    let root_dir = state.root_dir.clone();
-    let rd = root_dir.clone();
-    let mut eval_state = tokio::task::spawn_blocking(move || SchedulerState::load(&rd))
-        .await
-        .unwrap_or_default();
+    let mut eval_state = load_eval_state(&state.root_dir).await;
 
     loop {
-        // Calculate next fire time in the configured timezone
-        let now_tz = Utc::now().with_timezone(&tz);
-        let next = match cron_expr.after(&now_tz).next() {
-            Some(t) => t,
-            None => {
-                tracing::warn!("No future fire time for task '{}'", task.id);
-                return;
-            }
+        let Some(wait) = until_next_fire(&cron_expr, tz, &task.id) else {
+            return;
         };
-
-        let duration = (next - now_tz)
-            .to_std()
-            .unwrap_or(std::time::Duration::from_secs(60));
-        tracing::debug!("Task '{}' next fire: {} (in {:?})", task.id, next, duration);
-
-        tokio::time::sleep(duration).await;
-
-        // Check if still enabled — against DISK, so a `pulse-null schedule
-        // disable` from the CLI takes effect at the next fire without a
-        // service restart (the in-memory copy can't see external edits).
-        // Falls back to the shared copy if the file is transiently unreadable.
-        {
-            let rd = root_dir.clone();
-            let disk = tokio::task::spawn_blocking(move || Schedule::load(&rd)).await;
-            let entry_enabled = match disk {
-                Ok(Ok(fresh)) => {
-                    let enabled = fresh.find_task(&task.id).map(|t| t.task.enabled);
-                    *schedule.write().await = fresh;
-                    enabled
-                }
-                _ => {
-                    tracing::warn!(
-                        "Task '{}': schedule.json unreadable for enabled-check; using shared copy",
-                        task.id
-                    );
-                    let sched = schedule.read().await;
-                    sched.find_task(&task.id).map(|t| t.task.enabled)
-                }
-            };
-            match entry_enabled {
-                Some(true) => {}
-                Some(false) => {
-                    tracing::info!("Task '{}' disabled, stopping loop", task.id);
-                    return;
-                }
-                None => {
-                    tracing::info!("Task '{}' removed, stopping loop", task.id);
-                    return;
-                }
-            }
+        tokio::time::sleep(wait).await;
+        match fire.gate(&mut eval_state).await {
+            FireGate::Fire => fire.run(&mut eval_state).await,
+            FireGate::Skip => {}
+            FireGate::Stop => return,
         }
+    }
+}
 
-        // Evaluator precondition check — suppress if nothing has changed.
-        // Uses trait-based evaluators resolved from the task's evaluator type string.
-        if let Some(ref evaluator_type) = task.evaluator {
-            // Reload state from disk in case another task updated it
-            let rd = root_dir.clone();
-            eval_state = tokio::task::spawn_blocking(move || SchedulerState::load(&rd))
-                .await
-                .unwrap_or_default();
+/// The task's cron, normalized; `None` (logged) when it does not parse.
+fn parse_task_cron(task: &ScheduledTask) -> Option<CronSchedule> {
+    CronSchedule::from_str(&super::normalize_cron(&task.cron))
+        .inspect_err(|e| {
+            tracing::error!("Invalid cron for task '{}': {} — {}", task.id, task.cron, e);
+        })
+        .ok()
+}
 
-            let decision =
-                match resolve_task_evaluator(evaluator_type, &root_dir, &state.config.tension) {
-                    Some(eval) => eval.evaluate(&eval_state),
-                    None => {
-                        if !UNGATED_EVALUATORS.contains(&evaluator_type.as_str()) {
-                            tracing::warn!(
-                                "Unknown evaluator type '{}' for task '{}' — firing anyway",
-                                evaluator_type,
-                                task.id
-                            );
-                        }
-                        EvalDecision::Fire
-                    }
-                };
+/// How long until the next fire time in the configured timezone; `None`
+/// (logged) when the cron has no future fire time.
+fn until_next_fire(
+    cron_expr: &CronSchedule,
+    tz: chrono_tz::Tz,
+    task_id: &str,
+) -> Option<std::time::Duration> {
+    let now_tz = Utc::now().with_timezone(&tz);
+    let Some(next) = cron_expr.after(&now_tz).next() else {
+        tracing::warn!("No future fire time for task '{}'", task_id);
+        return None;
+    };
+    let duration = (next - now_tz)
+        .to_std()
+        .unwrap_or(std::time::Duration::from_secs(60));
+    tracing::debug!("Task '{}' next fire: {} (in {:?})", task_id, next, duration);
+    Some(duration)
+}
 
-            if decision == EvalDecision::Suppress {
-                tracing::debug!(
-                    "Evaluator suppressed task '{}': preconditions not met",
-                    task.id
-                );
-                eval_state.record_suppression(&task.id);
-                let state_clone = eval_state.clone();
-                let rd = root_dir.clone();
-                drop(tokio::task::spawn_blocking(move || {
-                    if let Err(e) = state_clone.save(&rd) {
-                        tracing::error!("Failed to persist evaluator state: {}", e);
-                    }
-                }));
-                continue;
-            }
+async fn load_eval_state(root_dir: &std::path::Path) -> SchedulerState {
+    let root_dir = root_dir.to_path_buf();
+    tokio::task::spawn_blocking(move || SchedulerState::load(&root_dir))
+        .await
+        .unwrap_or_default()
+}
+
+/// What one tick of the task loop does.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FireGate {
+    Fire,
+    /// Not this time; wait for the next fire.
+    Skip,
+    /// The loop ends.
+    Stop,
+}
+
+/// One task's loop context: everything a fire needs.
+struct TaskFire<'a> {
+    entry: &'a ScheduleEntry,
+    state: &'a Arc<AppState>,
+    schedule: &'a Arc<RwLock<Schedule>>,
+    intent_queue: &'a Arc<RwLock<IntentQueue>>,
+    health: &'a SharedTaskHealth,
+    tenure: &'a crate::coordinator::control::TenureLeases,
+    lease_resource: String,
+}
+
+impl TaskFire<'_> {
+    fn task(&self) -> &ScheduledTask {
+        &self.entry.task
+    }
+
+    /// The checks before a fire, in order: still enabled, not suppressed by
+    /// its evaluator, not isolated, still the leading tenure, and holding the
+    /// per-run lease.
+    async fn gate(&self, eval_state: &mut SchedulerState) -> FireGate {
+        let task = self.task();
+        let root_dir = &self.state.root_dir;
+        let enabled = task_enabled_on_disk(root_dir, self.schedule, &task.id).await;
+        if !still_enabled(enabled, &task.id) {
+            return FireGate::Stop;
         }
-
+        if evaluator_suppresses(task, root_dir, &self.state.config.tension, eval_state).await {
+            return FireGate::Skip;
+        }
         // Isolation backstop: independent of the coordinator loop (which may
         // itself be wedged — the very case isolation exists for), every task
         // checks the marker before firing.
-        if crate::server::isolation::is_active(&root_dir) {
+        if crate::server::isolation::is_active(root_dir) {
             tracing::warn!("Task '{}': ISOLATION active — stopping loop", task.id);
-            return;
+            return FireGate::Stop;
         }
-
         // Tenure liveness: if our tenure no longer holds the control plane
         // (the leadership loop died without aborting us — a wedge), stop
         // rather than keep acting as a stale tenure.
-        if !tenure_still_leads(&tenure.leases, &tenure.holder).await {
+        if !tenure_still_leads(&self.tenure.leases, &self.tenure.holder).await {
             tracing::warn!(
                 "Task '{}': tenure '{}' no longer leads; stopping loop",
                 task.id,
-                tenure.holder
+                self.tenure.holder
             );
-            return;
+            return FireGate::Stop;
         }
-
-        // Claim the per-run lease before any side effect. A refusal means a
-        // prior run of this task is still inside its side-effect window (or
-        // wedged short of its ttl) — skip this fire rather than double-run.
-        // Error level: a skipped fire on a daily cron is a lost day.
-        let claim = {
-            tenure.leases.lock().await.acquire(
-                &lease_resource,
-                &tenure.holder,
-                TASK_LEASE_TTL,
-                chrono::Utc::now(),
-            )
-        };
-        if let Err(e) = claim {
-            tracing::error!("Task '{}' fire SKIPPED — lease not available: {e}", task.id);
-            continue;
+        if !self.claim_lease().await {
+            return FireGate::Skip;
         }
+        FireGate::Fire
+    }
 
-        {
-            // Log the model the fire will ACTUALLY use: the override is read
-            // live from the shared schedule (refreshed above), not from the
-            // entry captured at spawn.
-            let sched = schedule.read().await;
-            let live = sched.find_task(&task.id).map_or_else(
-                || entry.effective_model(&state.config.llm.model).to_string(),
-                |f| f.effective_model(&state.config.llm.model).to_string(),
-            );
-            tracing::info!(model = %live, "Executing scheduled task: {}", task.name);
-        }
+    /// Claim the per-run lease before any side effect. A refusal means a
+    /// prior run of this task is still inside its side-effect window (or
+    /// wedged short of its ttl) — skip this fire rather than double-run.
+    /// Error level: a skipped fire on a daily cron is a lost day.
+    async fn claim_lease(&self) -> bool {
+        let claim = self.tenure.leases.lock().await.acquire(
+            &self.lease_resource,
+            &self.tenure.holder,
+            TASK_LEASE_TTL,
+            chrono::Utc::now(),
+        );
+        claim
+            .inspect_err(|e| {
+                tracing::error!(
+                    "Task '{}' fire SKIPPED — lease not available: {e}",
+                    self.task().id
+                );
+            })
+            .is_ok()
+    }
 
-        // Check for built-in deterministic handlers first
-        if run_builtin_handler(task, &state, &root_dir).await {
-            liveness::record_outcome(&health, &state, &task.id, &task.name, TaskOutcome::Success)
-                .await;
-            release_task_lease(&tenure.leases, &lease_resource, &tenure.holder, &task.id).await;
-            continue;
-        }
-
-        let outcome = execute_task_as_owner(
-            &entry,
-            &state,
-            &schedule,
-            &intent_queue,
-            &mut eval_state,
-            &tenure,
-        )
-        .await;
+    /// Fire: execute, report a failure, record the outcome, release the
+    /// lease.
+    async fn run(&self, eval_state: &mut SchedulerState) {
+        let task = self.task();
+        self.log_live_model().await;
+        let outcome = self.execute(eval_state).await;
         // Diagnostics before the outcome is recorded: the store must still
         // describe the previous cycle for "is this failure news?" to mean
         // anything. Every failure path converges here, so a failure that never
         // reached the provider is reported like any other.
         if let TaskOutcome::Failure(ref error) = outcome {
-            diagnostics::report_failure(&health, &state, &entry, error).await;
+            diagnostics::report_failure(self.health, self.state, self.entry, error).await;
         }
-        liveness::record_outcome(&health, &state, &task.id, &task.name, outcome).await;
-        release_task_lease(&tenure.leases, &lease_resource, &tenure.holder, &task.id).await;
+        liveness::record_outcome(self.health, self.state, &task.id, &task.name, outcome).await;
+        release_task_lease(
+            &self.tenure.leases,
+            &self.lease_resource,
+            &self.tenure.holder,
+            &task.id,
+        )
+        .await;
     }
+
+    /// Log the model the fire will ACTUALLY use: the override is read live
+    /// from the shared schedule (refreshed by the gate), not from the entry
+    /// captured at spawn.
+    async fn log_live_model(&self) {
+        let default_model = &self.state.config.llm.model;
+        let sched = self.schedule.read().await;
+        let live = sched.find_task(&self.task().id).map_or_else(
+            || self.entry.effective_model(default_model).to_string(),
+            |f| f.effective_model(default_model).to_string(),
+        );
+        tracing::info!(model = %live, "Executing scheduled task: {}", self.task().name);
+    }
+
+    /// A built-in deterministic handler when the task has one, the LLM path
+    /// otherwise.
+    async fn execute(&self, eval_state: &mut SchedulerState) -> TaskOutcome {
+        if run_builtin_handler(self.task(), self.state, &self.state.root_dir).await {
+            return TaskOutcome::Success;
+        }
+        execute_task_as_owner(
+            self.entry,
+            self.state,
+            self.schedule,
+            self.intent_queue,
+            eval_state,
+            self.tenure,
+        )
+        .await
+    }
+}
+
+/// Whether the task is enabled — against DISK, so a `pulse-null schedule
+/// disable` from the CLI takes effect at the next fire without a service
+/// restart (the in-memory copy can't see external edits). A fresh read
+/// replaces the shared copy; when the file is transiently unreadable, the
+/// shared copy answers. `None`: the task is gone.
+async fn task_enabled_on_disk(
+    root_dir: &std::path::Path,
+    schedule: &RwLock<Schedule>,
+    task_id: &str,
+) -> Option<bool> {
+    let rd = root_dir.to_path_buf();
+    match tokio::task::spawn_blocking(move || Schedule::load(&rd)).await {
+        Ok(Ok(fresh)) => {
+            let enabled = fresh.find_task(task_id).map(|t| t.task.enabled);
+            *schedule.write().await = fresh;
+            enabled
+        }
+        _ => {
+            tracing::warn!(
+                "Task '{}': schedule.json unreadable for enabled-check; using shared copy",
+                task_id
+            );
+            let sched = schedule.read().await;
+            sched.find_task(task_id).map(|t| t.task.enabled)
+        }
+    }
+}
+
+/// An enabled task fires; a disabled or removed one ends its loop.
+fn still_enabled(enabled: Option<bool>, task_id: &str) -> bool {
+    match enabled {
+        Some(true) => true,
+        Some(false) => {
+            tracing::info!("Task '{}' disabled, stopping loop", task_id);
+            false
+        }
+        None => {
+            tracing::info!("Task '{}' removed, stopping loop", task_id);
+            false
+        }
+    }
+}
+
+/// Evaluator precondition check — suppress if nothing has changed. Uses
+/// trait-based evaluators resolved from the task's evaluator type string; a
+/// suppression is recorded and persisted.
+async fn evaluator_suppresses(
+    task: &ScheduledTask,
+    root_dir: &std::path::Path,
+    tension: &crate::config::TensionConfig,
+    eval_state: &mut SchedulerState,
+) -> bool {
+    let Some(evaluator_type) = &task.evaluator else {
+        return false;
+    };
+    // Reload state from disk in case another task updated it
+    *eval_state = load_eval_state(root_dir).await;
+    let evaluator = resolve_task_evaluator(evaluator_type, root_dir, tension);
+    if evaluator_decision(evaluator, evaluator_type, &task.id, eval_state) == EvalDecision::Fire {
+        return false;
+    }
+    tracing::debug!(
+        "Evaluator suppressed task '{}': preconditions not met",
+        task.id
+    );
+    eval_state.record_suppression(&task.id);
+    persist_eval_state(eval_state.clone(), root_dir.to_path_buf());
+    true
+}
+
+/// The evaluator's decision; a task with no evaluator to resolve fires
+/// (warned unless its type is deliberately ungated).
+fn evaluator_decision(
+    evaluator: Option<Box<dyn super::evaluator::Evaluator>>,
+    evaluator_type: &str,
+    task_id: &str,
+    eval_state: &SchedulerState,
+) -> EvalDecision {
+    match evaluator {
+        Some(eval) => eval.evaluate(eval_state),
+        None => {
+            if !UNGATED_EVALUATORS.contains(&evaluator_type) {
+                tracing::warn!(
+                    "Unknown evaluator type '{}' for task '{}' — firing anyway",
+                    evaluator_type,
+                    task_id
+                );
+            }
+            EvalDecision::Fire
+        }
+    }
+}
+
+fn persist_eval_state(eval_state: SchedulerState, root_dir: std::path::PathBuf) {
+    drop(tokio::task::spawn_blocking(move || {
+        if let Err(e) = eval_state.save(&root_dir) {
+            tracing::error!("Failed to persist evaluator state: {}", e);
+        }
+    }));
 }
 
 /// Release the per-run lease after the outcome is recorded. A failure here is
@@ -1074,7 +1187,7 @@ fn log_execution(root_dir: &std::path::Path, task: &ScheduledTask, summary: &str
 /// True while this tenure's holder still owns an unexpired control-plane
 /// lease. Task loops check it before each fire so a wedged coordinator's
 /// orphans stop themselves instead of acting as a stale tenure.
-async fn tenure_still_leads(
+pub(super) async fn tenure_still_leads(
     leases: &crate::coordinator::control::SharedLeases,
     tenure_holder: &str,
 ) -> bool {
@@ -1082,4 +1195,134 @@ async fn tenure_still_leads(
     table
         .get(crate::coordinator::control::CONTROL_PLANE_RESOURCE)
         .is_some_and(|l| l.holder_id == tenure_holder && !l.is_expired(chrono::Utc::now()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn task(cron: &str, evaluator: Option<&str>) -> ScheduledTask {
+        let mut value = serde_json::json!({
+            "id": "probe",
+            "name": "Probe",
+            "cron": cron,
+            "channel": "system",
+            "prompt": "Say ok.",
+        });
+        if let Some(evaluator) = evaluator {
+            value["evaluator"] = evaluator.into();
+        }
+        serde_json::from_value(value).unwrap()
+    }
+
+    /// An evaluator that always gives the same answer.
+    struct Fixed(EvalDecision);
+    impl super::super::evaluator::Evaluator for Fixed {
+        fn evaluate(&self, _state: &SchedulerState) -> EvalDecision {
+            self.0
+        }
+        fn event_key(&self) -> &str {
+            "fixed"
+        }
+    }
+
+    #[test]
+    fn a_task_cron_parses_after_normalizing_or_not_at_all() {
+        assert!(parse_task_cron(&task("0 0 * * * *", None)).is_some());
+        // Sunday as 0 is normalized to the cron crate's 7.
+        assert!(parse_task_cron(&task("0 0 9 * * 0", None)).is_some());
+        assert!(parse_task_cron(&task("not a cron", None)).is_none());
+    }
+
+    #[test]
+    fn the_next_fire_is_ahead_and_a_spent_cron_has_none() {
+        let every_second = parse_task_cron(&task("* * * * * *", None)).unwrap();
+        let wait = until_next_fire(&every_second, chrono_tz::UTC, "probe").unwrap();
+        assert!(wait <= std::time::Duration::from_secs(1), "{wait:?}");
+
+        let spent = parse_task_cron(&task("0 0 0 1 1 * 2000", None)).unwrap();
+        assert_eq!(until_next_fire(&spent, chrono_tz::UTC, "probe"), None);
+    }
+
+    #[test]
+    fn only_an_enabled_task_keeps_firing() {
+        assert!(still_enabled(Some(true), "probe"));
+        assert!(!still_enabled(Some(false), "probe"));
+        assert!(!still_enabled(None, "probe"));
+    }
+
+    #[test]
+    fn a_task_without_a_resolvable_evaluator_fires() {
+        let state = SchedulerState::default();
+        assert_eq!(
+            evaluator_decision(None, "pipeline", "probe", &state),
+            EvalDecision::Fire
+        );
+        assert_eq!(
+            evaluator_decision(None, "no-such-evaluator", "probe", &state),
+            EvalDecision::Fire
+        );
+        let suppressing = Box::new(Fixed(EvalDecision::Suppress));
+        assert_eq!(
+            evaluator_decision(Some(suppressing), "fixed", "probe", &state),
+            EvalDecision::Suppress
+        );
+    }
+
+    #[tokio::test]
+    async fn only_a_quiet_salience_gate_suppresses_a_fire() {
+        let dir = tempfile::tempdir().unwrap();
+        let tension = crate::config::TensionConfig {
+            enabled: true,
+            ..Default::default()
+        };
+        let mut eval_state = SchedulerState::default();
+        let ungated = task("0 0 * * * *", None);
+        assert!(!evaluator_suppresses(&ungated, dir.path(), &tension, &mut eval_state).await);
+
+        let salience = task("0 0 * * * *", Some("salience"));
+        // No cycle recorded yet: the gate never suppresses on no evidence.
+        assert!(!evaluator_suppresses(&salience, dir.path(), &tension, &mut eval_state).await);
+
+        crate::tension::store::save_delta(dir.path(), tension.clone(), |s| {
+            s.record_cycle(Utc::now());
+        })
+        .unwrap();
+        assert!(evaluator_suppresses(&salience, dir.path(), &tension, &mut eval_state).await);
+    }
+
+    #[tokio::test]
+    async fn the_enabled_check_reads_disk_and_falls_back_to_the_shared_copy() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut on_disk = Schedule { tasks: Vec::new() };
+        let mut disabled = task("0 0 * * * *", None);
+        disabled.enabled = false;
+        on_disk.add_task(disabled);
+        on_disk.save(dir.path()).unwrap();
+
+        let mut shared_copy = Schedule { tasks: Vec::new() };
+        shared_copy.add_task(task("0 0 * * * *", None));
+        let shared = RwLock::new(shared_copy);
+        assert_eq!(
+            task_enabled_on_disk(dir.path(), &shared, "probe").await,
+            Some(false)
+        );
+        assert!(
+            !shared.read().await.find_task("probe").unwrap().task.enabled,
+            "the fresh read replaces the shared copy"
+        );
+        assert_eq!(
+            task_enabled_on_disk(dir.path(), &shared, "gone").await,
+            None
+        );
+
+        let unreadable = tempfile::tempdir().unwrap();
+        *shared.write().await = Schedule {
+            tasks: vec![task("0 0 * * * *", None).into()],
+        };
+        assert_eq!(
+            task_enabled_on_disk(unreadable.path(), &shared, "probe").await,
+            Some(true)
+        );
+    }
 }
