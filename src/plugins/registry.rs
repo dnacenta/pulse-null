@@ -20,7 +20,7 @@ pub fn known_plugins() -> Vec<RegistryEntry> {
         },
         RegistryEntry {
             name: "discord-echo".to_string(),
-            description: "Discord bot presence and voice channels".to_string(),
+            description: "Discord text channels: messages in, replies out".to_string(),
             version: "0.1.0".to_string(),
             available: cfg!(feature = "discord-text"),
         },

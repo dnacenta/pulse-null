@@ -96,9 +96,13 @@ impl Plugin for DiscordTextEchoPlugin {
 
     fn platform_description(&self) -> Option<String> {
         Some(
-            "Discord text channel integration. Messages from configured \
-             channels reach you as verified-trust input, and the runtime \
-             posts your reply back to the channel."
+            "Discord text channel integration. Each message in a configured \
+             channel runs as a turn. The owner is recognised by their \
+             Discord user id; everyone else reaches you as a guest, \
+             untrusted, and your agent CLI runs with its read-only tools for \
+             their turns. The runtime posts your reply back to the channel; \
+             the Discord post tool lets you write to a configured channel \
+             yourself."
                 .to_string(),
         )
     }
@@ -154,6 +158,14 @@ mod tests {
         let plugin = DiscordTextEchoPlugin::new();
         let prompts = plugin.setup_prompts();
         assert!(prompts.is_empty());
+    }
+
+    #[test]
+    fn the_description_tells_the_truth() {
+        let platform = DiscordTextEchoPlugin::new().platform_description().unwrap();
+        assert!(platform.contains("guest"), "{platform}");
+        assert!(platform.contains("Discord user id"), "{platform}");
+        assert!(!platform.contains("verified"), "{platform}");
     }
 
     #[tokio::test]

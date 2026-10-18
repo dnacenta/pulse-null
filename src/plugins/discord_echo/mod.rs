@@ -25,7 +25,7 @@ impl Plugin for DiscordEchoPlugin {
         PluginMeta {
             name: NAME.to_string(),
             version: env!("CARGO_PKG_VERSION").to_string(),
-            description: "Discord bot presence and voice channels".to_string(),
+            description: "Discord text channels: messages in, replies out".to_string(),
         }
     }
 
@@ -77,9 +77,12 @@ impl Plugin for DiscordEchoPlugin {
 
     fn platform_description(&self) -> Option<String> {
         Some(
-            "Discord voice channel integration. Enables real-time voice \
-             conversations through Discord with speech-to-text and \
-             text-to-speech processing."
+            "Discord text channel integration (text only, no voice). Each \
+             message in a configured channel runs as a turn. The owner is \
+             recognised by their Discord user id; everyone else reaches you \
+             as a guest, untrusted, and your agent CLI runs with its \
+             read-only tools for their turns. The runtime posts your reply \
+             back to the channel."
                 .to_string(),
         )
     }
@@ -101,6 +104,16 @@ mod tests {
         let plugin = DiscordEchoPlugin::new();
         let prompts = plugin.setup_prompts();
         assert!(!prompts.is_empty());
+    }
+
+    #[test]
+    fn the_descriptions_tell_the_truth() {
+        let plugin = DiscordEchoPlugin::new();
+        let platform = plugin.platform_description().unwrap();
+        assert!(platform.contains("guest"), "{platform}");
+        assert!(platform.contains("Discord user id"), "{platform}");
+        assert!(!platform.contains("speech"), "{platform}");
+        assert!(!plugin.meta().description.contains("voice"));
     }
 
     #[tokio::test]
