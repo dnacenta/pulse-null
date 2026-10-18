@@ -27,6 +27,7 @@ use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore};
 use tokio::time::Instant;
 
 use super::auth::AuthIdentity;
+use super::guest_budget::{GuestKind, GuestLedger, GuestRefusal};
 use super::handlers::chat::{run_turn, ChatRequest, ChatResponse};
 use super::rate_limit::RateLimiter;
 use super::AppState;
@@ -145,6 +146,8 @@ pub enum BindError {
 struct Budget {
     pool: Arc<Semaphore>,
     rate: Arc<RateLimiter>,
+    /// What the plugin's guests have cost so far (`[plugin_turns]`).
+    guests: Arc<Mutex<GuestLedger>>,
 }
 
 #[cfg_attr(
@@ -156,6 +159,7 @@ impl Budget {
         Self {
             pool: Arc::new(Semaphore::new(PLUGIN_POOL_SIZE)),
             rate: Arc::new(RateLimiter::new(PLUGIN_RATE_BURST, PLUGIN_RATE_PER_SECOND)),
+            guests: Arc::new(Mutex::new(GuestLedger::default())),
         }
     }
 }
@@ -181,6 +185,15 @@ pub enum TurnError {
     /// ([`PLUGIN_RATE_BURST`], then [`PLUGIN_RATE_PER_SECOND`]).
     #[error("this plugin is over its turn rate limit")]
     RateLimited,
+    /// The plugin ran its `[plugin_turns] daily_turns` guest turns today.
+    #[error("this plugin has run its guest turns for today")]
+    DailyBudgetSpent,
+    /// This voice call took its `[plugin_turns] voice_turns_per_call`.
+    #[error("this call has used all its turns")]
+    CallTurnsSpent,
+    /// This guest sender is over its `[plugin_turns] guest_burst` bucket.
+    #[error("this sender is posting too fast")]
+    SenderRateLimited,
     /// The turn itself refused or failed, with the status `/chat` would
     /// have answered.
     #[error("turn refused ({0}): {1}")]
@@ -485,6 +498,7 @@ impl PluginTurns {
             channel: self.channel.clone(),
             sender: turn.sender,
         };
+        self.admit_guest(&state, &request)?;
         let who = AuthIdentity::Plugin {
             name: self.name,
             channel: self.channel.clone(),
@@ -492,6 +506,48 @@ impl PluginTurns {
         run_turn(state, request, who, sink)
             .await
             .map_err(|(status, message)| TurnError::Refused(status, message))
+    }
+
+    /// The `[plugin_turns]` caps, for a guest's turn; the owner's are never
+    /// counted. A request that would not resolve is left for the turn
+    /// pipeline to refuse.
+    fn admit_guest(&self, state: &AppState, request: &ChatRequest) -> Result<(), TurnError> {
+        let Ok(key) = crate::server::handlers::chat::resolve_plugin_key(
+            self.name,
+            &self.channel,
+            request,
+            &state.config,
+        ) else {
+            return Ok(());
+        };
+        if !key.is_guest() {
+            return Ok(());
+        }
+        let kind = if self.channel.eq_ignore_ascii_case(VOICE_CHANNEL) {
+            GuestKind::Call
+        } else {
+            GuestKind::Sender
+        };
+        let admitted = self
+            .budget
+            .guests
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .admit(
+                key.as_str(),
+                kind,
+                &state.config.plugin_turns,
+                Instant::now().into_std(),
+                chrono::Utc::now().date_naive(),
+            );
+        admitted.map_err(|refusal| {
+            tracing::warn!("plugin {}: turn for {key} refused: {refusal:?}", self.name);
+            match refusal {
+                GuestRefusal::DailyBudgetSpent => TurnError::DailyBudgetSpent,
+                GuestRefusal::CallTurnsSpent => TurnError::CallTurnsSpent,
+                GuestRefusal::SenderRateLimited => TurnError::SenderRateLimited,
+            }
+        })
     }
 
     /// A slot in the plugin's pool, waiting as [`SlotWait`] allows.

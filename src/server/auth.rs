@@ -212,6 +212,7 @@ mod tests {
             peers: std::collections::HashMap::new(),
             plugins: std::collections::HashMap::new(),
             tui: crate::config::TuiConfig::default(),
+            plugin_turns: crate::config::PluginTurnsConfig::default(),
         };
         let session_store = crate::session_store::SessionStore::new(
             &root_dir,
@@ -398,6 +399,7 @@ mod tests {
             peers,
             plugins: std::collections::HashMap::new(),
             tui: crate::config::TuiConfig::default(),
+            plugin_turns: crate::config::PluginTurnsConfig::default(),
         };
         let session_store = crate::session_store::SessionStore::new(
             &root_dir,

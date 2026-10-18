@@ -3,6 +3,7 @@ pub mod boot;
 pub mod capability;
 #[cfg(test)]
 mod e2e_tests;
+pub mod guest_budget;
 mod handlers;
 pub mod injection;
 pub mod isolation;

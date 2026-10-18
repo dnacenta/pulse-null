@@ -316,6 +316,7 @@ fn test_config() -> Config {
         peers: HashMap::new(),
         plugins: HashMap::new(),
         tui: crate::config::TuiConfig::default(),
+        plugin_turns: crate::config::PluginTurnsConfig::default(),
     }
 }
 
@@ -2995,6 +2996,114 @@ mod plugin_turns_e2e {
             TurnError::RateLimited.to_string(),
             "this plugin is over its turn rate limit"
         );
+    }
+
+    // --- audit R2-5: what a plugin's guests may cost ---
+
+    /// Owner Discord id "1001", the given `[plugin_turns]`, replies "ok".
+    async fn capped_state(
+        dir: &std::path::Path,
+        caps: crate::config::PluginTurnsConfig,
+    ) -> Arc<AppState> {
+        let mut config = test_config();
+        config.security.secret = Some(SECRET.to_string());
+        config.owner.discord_id = Some("1001".to_string());
+        config.plugin_turns = caps;
+        let state = build_state_boxed_with_config(
+            dir.to_path_buf(),
+            Box::new(MockProvider::new(vec![])),
+            ToolRegistry::new(),
+            config,
+        )
+        .await;
+        state.turns.bind(&state);
+        state
+    }
+
+    fn caps(daily: u32, per_call: u32, burst: u32) -> crate::config::PluginTurnsConfig {
+        crate::config::PluginTurnsConfig {
+            daily_turns: daily,
+            voice_turns_per_call: per_call,
+            guest_burst: burst,
+            guest_per_minute: 0.0,
+        }
+    }
+
+    #[tokio::test]
+    async fn each_discord_guest_has_a_bucket_and_the_owner_none() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = capped_state(dir.path(), caps(0, 0, 2)).await;
+        let discord = state
+            .turns
+            .for_plugin("discord-text-echo", "discord")
+            .unwrap()
+            .with_rate_limit(1_000, 1_000.0);
+
+        assert!(discord.run(turn("one", "2002"), None).await.is_ok());
+        assert!(discord.run(turn("two", "2002"), None).await.is_ok());
+        assert_eq!(
+            discord.run(turn("three", "2002"), None).await.err(),
+            Some(TurnError::SenderRateLimited)
+        );
+        assert!(
+            discord.run(turn("hi", "3003"), None).await.is_ok(),
+            "another author"
+        );
+        for _ in 0..5 {
+            assert!(
+                discord.run(turn("owner", "1001"), None).await.is_ok(),
+                "the owner"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_voice_call_has_a_turn_cap() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = capped_state(dir.path(), caps(0, 2, 0)).await;
+        let voice = state
+            .turns
+            .for_plugin("voice-echo", "voice")
+            .unwrap()
+            .with_rate_limit(1_000, 1_000.0);
+
+        let call_a = "phone-caller-00000000000000aa";
+        assert!(voice.run(turn("one", call_a), None).await.is_ok());
+        assert!(voice.run(turn("two", call_a), None).await.is_ok());
+        assert_eq!(
+            voice.run(turn("three", call_a), None).await.err(),
+            Some(TurnError::CallTurnsSpent)
+        );
+        let call_b = "phone-caller-00000000000000bb";
+        assert!(
+            voice.run(turn("hello", call_b), None).await.is_ok(),
+            "another call"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_plugin_has_a_daily_guest_budget_the_owner_is_outside() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = capped_state(dir.path(), caps(2, 0, 0)).await;
+        let discord = state
+            .turns
+            .for_plugin("discord-text-echo", "discord")
+            .unwrap()
+            .with_rate_limit(1_000, 1_000.0);
+        let voice = state.turns.for_plugin("voice-echo", "voice").unwrap();
+
+        assert!(discord.run(turn("a", "2002"), None).await.is_ok());
+        assert!(discord.run(turn("b", "3003"), None).await.is_ok());
+        assert_eq!(
+            discord.run(turn("c", "4004"), None).await.err(),
+            Some(TurnError::DailyBudgetSpent)
+        );
+        assert!(
+            discord.run(turn("owner", "1001"), None).await.is_ok(),
+            "the owner"
+        );
+        // Each plugin has its own day.
+        assert!(voice.run(turn("hi", "phone-caller-1"), None).await.is_ok());
     }
 
     /// The real router with the secret set: `/chat` and plugin routes need

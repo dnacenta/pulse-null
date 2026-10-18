@@ -153,7 +153,7 @@ fn refuse_peer_on_owner_channel(
 /// resolve like any external sender's, with one exception: on voice every
 /// caller is a guest, whatever name or number the transport reports, until
 /// a real owner proof exists (spec 0b-2).
-fn resolve_plugin_key(
+pub(crate) fn resolve_plugin_key(
     plugin: &str,
     bound_channel: &str,
     req: &ChatRequest,
