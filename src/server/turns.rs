@@ -223,6 +223,23 @@ impl TurnRunner {
         }
     }
 
+    /// Refuse new turns on every runner first, then drain them all within
+    /// one shared `within`. Returns whether every in-flight turn finished.
+    /// For a process that hosts several pulses: none of them starts a turn
+    /// while another is still draining.
+    pub(crate) async fn quiesce_all(runners: &[TurnRunner], within: Duration) -> bool {
+        for runner in runners {
+            runner.refuse_new();
+        }
+        let deadline = Instant::now() + within;
+        let mut drained = true;
+        for runner in runners {
+            let left = deadline.saturating_duration_since(Instant::now());
+            drained &= runner.drain(left).await;
+        }
+        drained
+    }
+
     /// [`refuse_new`], then [`drain`] for up to `within`.
     ///
     /// [`refuse_new`]: TurnRunner::refuse_new
@@ -512,6 +529,26 @@ mod tests {
             )
             .await;
         assert_eq!(outcome.err(), Some(TurnError::ShuttingDown));
+    }
+
+    #[tokio::test]
+    async fn quiesce_all_refuses_everywhere_then_drains_everything() {
+        let (a, b) = (TurnRunner::new(), TurnRunner::new());
+        let in_flight_on_b = b.enter().unwrap();
+
+        let runners = [a.clone(), b.clone()];
+        let quiescing = tokio::spawn(async move {
+            TurnRunner::quiesce_all(&runners, Duration::from_secs(30)).await
+        });
+        while !a.is_closed() || !b.is_closed() {
+            tokio::task::yield_now().await;
+        }
+        assert!(matches!(a.enter(), Err(TurnError::ShuttingDown)));
+        assert!(matches!(b.enter(), Err(TurnError::ShuttingDown)));
+        assert!(!quiescing.is_finished(), "b's turn is still in flight");
+
+        drop(in_flight_on_b);
+        assert!(quiescing.await.unwrap());
     }
 
     #[tokio::test]

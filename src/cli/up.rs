@@ -81,6 +81,7 @@ async fn run_multi_pulse(
                         coordinator: booted.coordinator,
                         event_bus: booted.event_bus,
                         persist_coordinator: booted.persist_coordinator,
+                        turns: booted.turns,
                     });
             }
             Err(e) => {

@@ -20,6 +20,8 @@ pub struct BootedPulse {
     pub event_bus: Arc<EventBus>,
     pub actual_port: u16,
     pub persist_coordinator: Arc<PersistCoordinator>,
+    /// The pulse's plugin turn runner, refused and drained at shutdown.
+    pub turns: super::turns::TurnRunner,
 }
 
 /// Boot a pulse's HTTP server and scheduler as background tasks.
@@ -176,6 +178,7 @@ pub async fn boot_pulse(
         event_bus,
         actual_port,
         persist_coordinator: Arc::clone(&state.persist_coordinator),
+        turns: state.turns.clone(),
     })
 }
 

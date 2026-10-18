@@ -22,6 +22,8 @@ pub struct RunningPulse {
     #[allow(dead_code)]
     pub event_bus: Arc<EventBus>,
     pub persist_coordinator: Arc<PersistCoordinator>,
+    /// The pulse's plugin turn runner.
+    pub turns: crate::server::turns::TurnRunner,
 }
 
 /// In-memory registry of all running pulses.
@@ -62,9 +64,18 @@ impl PulseRegistry {
 
     /// Gracefully shut down all pulses.
     ///
-    /// Flushes in-flight persistence tasks before aborting server/scheduler
-    /// handles so no writes are lost on shutdown.
+    /// No pulse starts a plugin turn from the first step on; the turns in
+    /// flight get the drain window. Then flushes in-flight persistence tasks
+    /// before aborting server/scheduler handles so no writes are lost.
     pub async fn shutdown_all(&mut self) {
+        use crate::server::turns::{TurnRunner, DRAIN_WINDOW};
+        let runners: Vec<TurnRunner> = self.pulses.values().map(|p| p.turns.clone()).collect();
+        if !TurnRunner::quiesce_all(&runners, DRAIN_WINDOW).await {
+            tracing::warn!(
+                "plugin turns still in flight after {DRAIN_WINDOW:?}, proceeding with shutdown"
+            );
+        }
+
         for (name, pulse) in self.pulses.drain() {
             tracing::info!("Shutting down pulse: {}", name);
 
