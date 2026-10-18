@@ -14,13 +14,14 @@ use axum::response::sse::{Event, KeepAlive, Sse};
 use futures_core::Stream;
 use tokio::sync::mpsc;
 
-use crate::interaction::InteractionRecord;
 use crate::server::auth::AuthIdentity;
-use crate::server::{injection, AppState};
+use crate::server::AppState;
 use crate::session_store::{resolve_sender, Session};
 use crate::streaming::StreamingProvider;
 use crate::tool_loop::{self, TurnEvent, TurnSink, TurnStatus};
 use pulse_system_types::llm::{Message, MessageContent, MessageSource, Role};
+
+mod steps;
 
 #[derive(Deserialize)]
 #[allow(dead_code)]
@@ -232,7 +233,9 @@ pub(crate) async fn run_turn(
     crate::tool_surface::scope(surface, run_resolved_turn(state, req, resolved_key, sink)).await
 }
 
-/// The turn after its principal is resolved to `resolved_key`.
+/// The turn after its principal is resolved to `resolved_key`: the steps of
+/// [`steps`], in order. Everything before the provider call prepares the
+/// session under the turn guard; [`steps::commit_turn`] commits a success.
 async fn run_resolved_turn(
     state: Arc<AppState>,
     req: ChatRequest,
@@ -240,780 +243,86 @@ async fn run_resolved_turn(
     sink: Option<TurnSink>,
 ) -> Result<ChatResponse, (StatusCode, String)> {
     let sender_label = req.sender.as_deref().unwrap_or("unknown");
-
-    // Isolation commands are handled before ANYTHING else touches the turn —
-    // including the provider, which may itself be the suspect. Owned by the
-    // channel holder (spec decision 5): works with the coordinator wedged.
-    match crate::server::isolation::intercept_command(
-        &state.root_dir,
-        &req.message,
-        &resolved_key,
-        sender_label,
-    ) {
-        crate::server::isolation::Intercept::Handled { response, isolated } => {
-            return Ok(ChatResponse {
-                response,
-                model: "isolation-control".to_string(),
-                input_tokens: None,
-                output_tokens: None,
-                isolation: isolated,
-                truncated: false,
-            });
-        }
-        crate::server::isolation::Intercept::None => {}
-    }
-    let isolated = crate::server::isolation::is_active(&state.root_dir);
-
-    // Build the user message
-    let mut user_message = String::new();
-
-    // Injection detection: only for guests
-    if resolved_key.is_guest()
-        && state.config.security.injection_detection
-        && injection::scan(&req.message)
+    if let Some(reply) =
+        steps::isolation_command_reply(&state.root_dir, &req, &resolved_key, sender_label)
     {
-        user_message.push_str(injection::INJECTION_WARNING);
-        user_message.push('\n');
+        return Ok(reply);
     }
+    let mut turn = steps::TurnScope::new(&state, &req, &resolved_key, sender_label);
 
-    // Inject channel context buffer (recent activity on this channel)
-    // Phase 4: use filtered retrieval — time decay, pulse filtering,
-    // deduplication against session history, entry/token caps.
-    // Not on voice: every call is its own guest, and one caller's words
-    // are not another caller's context (PN-110 audit #3).
-    let is_voice = req
-        .channel
-        .eq_ignore_ascii_case(crate::server::turns::VOICE_CHANNEL);
-    if let Some(cb) = state.context_buffer.as_ref().filter(|_| !is_voice) {
-        // Extract recent session message texts for deduplication.
-        // We only need the session if it already exists — if it doesn't,
-        // there's nothing to deduplicate against.
-        let session_texts = {
-            let existing = state
-                .session_store
-                .get_existing_by_key(resolved_key.as_str())
-                .await;
-            match existing {
-                Some(arc) => {
-                    let sess = arc.read().await;
-                    extract_recent_session_texts(&sess.data.messages, 10)
-                }
-                None => Vec::new(),
-            }
-        };
-
-        // Human senders: the owner alias and the current sender
-        let mut human_senders: Vec<&str> = vec![&state.config.pulse.owner_alias];
-        if let Some(ref s) = req.sender {
-            // If sender differs from owner_alias, include both
-            if !s.eq_ignore_ascii_case(&state.config.pulse.owner_alias) {
-                human_senders.push(s.as_str());
-            }
-        }
-
-        if let Some(channel_context) = cb
-            .get_context_filtered(
-                &req.channel,
-                &state.config.pulse.name,
-                &human_senders,
-                &session_texts,
-                &state.config.context_buffer,
-            )
-            .await
-        {
-            user_message.push_str("\n[Recent channel activity]\n");
-            user_message.push_str(&channel_context);
-            user_message.push_str("\n[End channel activity]\n");
-        }
-    }
-
-    user_message.push_str("\nUser message: ");
-    user_message.push_str(&req.message);
-
-    // Record incoming message to context buffer (shed in isolation)
-    if !isolated {
-        if let Some(ref cb) = state.context_buffer {
-            cb.record(&req.channel, sender_label, "user", &req.message)
-                .await;
-        }
-    }
-
-    // Get or create session keyed by resolved identity (Phase 1: Unified Session)
-    // A voice caller's call is its own guest session, in the store's call
-    // set: never persisted, never evicting another kind of session (audit
-    // R2-6). A non-guest on the voice channel (an owner client over HTTP)
-    // keeps an ordinary session.
-    let is_call = is_voice && resolved_key.is_guest();
-    let session_key = resolved_key.to_string();
-    let session_arc = if is_call {
-        state
-            .session_store
-            .get_or_create_call(resolved_key.as_str(), &req.channel, sender_label)
-            .await
-    } else {
-        state
-            .session_store
-            .get_or_create_by_key(resolved_key.as_str(), &req.channel, sender_label)
-            .await
+    let user_message = steps::compose_user_message(&turn).await;
+    let incoming = steps::ChannelLine {
+        sender: sender_label,
+        role: "user",
+        text: &req.message,
     };
+    steps::record_channel_line(&turn, incoming).await;
 
     // Lock the session for this request. The guard also owns the rollback:
     // if this future is dropped after the user message is pushed and before
     // the turn succeeds, the guard truncates while it still holds the lock.
+    let session_arc = steps::open_session(&turn).await;
     let mut session = TurnGuard::new(session_arc.write().await);
     session.touch();
+    steps::track_isolation_window(&mut session.data, turn.isolated);
+    let before = steps::PreTurnMarks::of(&session.data);
+    steps::maybe_reset_session(&turn, &mut session.data);
 
-    // Ephemeral isolation tail (spec Stage 2: "nothing that writes"): while
-    // isolated, remember where the in-memory conversation stood; the first
-    // normal turn truncates back to it so the isolated exchange never
-    // reaches disk through persist, checkpoint, archive, or eviction.
-    if isolated {
-        if session.data.isolation_ephemeral_from.is_none() {
-            session.data.isolation_ephemeral_from = Some(session.data.messages.len());
-        }
-        // SEC-004: track the quarantine lane the same way, so a fallback tangent
-        // created during this isolation window is shed on return to normal.
-        if session.data.isolation_quarantine_from.is_none() {
-            session.data.isolation_quarantine_from = Some(session.data.quarantine.len());
-        }
-    } else {
-        if let Some(watermark) = session.data.isolation_ephemeral_from.take() {
-            let dropped = session.data.messages.len().saturating_sub(watermark);
-            session.data.messages.truncate(watermark);
-            session.data.compaction.estimated_tokens =
-                crate::context::estimate_conversation_tokens(&session.data.messages);
-            tracing::info!(
-                "[chat] dropped {dropped} ephemeral isolation message(s) on return to normal"
-            );
-        }
-        let dropped_q = shed_isolation_quarantine(&mut session.data);
-        if dropped_q > 0 {
-            tracing::info!(
-                "[chat] dropped {dropped_q} ephemeral isolation quarantine entry(ies) on return to normal"
-            );
-        }
-    }
-
-    // === Session limit check ===
-    // Check if the session has exceeded its channel-specific limits (message cap,
-    // time cap, or hallucination threshold). If so, archive the current conversation
-    // with a structured handoff and start fresh before processing this message.
-    let pre_turn_len = session.data.messages.len();
-    let pre_turn_quarantine_len = session.data.quarantine.len();
-    let limits = if is_call {
-        crate::session_store::CALL_LIMITS
-    } else {
-        state.config.sessions.get_identity_limits(&resolved_key)
-    };
-    // Session resets archive to disk — shed in isolation (the in-memory
-    // session simply keeps growing for the duration of the diagnosis).
-    if !isolated && session.data.should_reset(&limits) {
-        tracing::info!(
-            "[session-reset] auto-reset triggered for {} (msgs={}, cap={}, age_s={}, time_cap={})",
-            session_key,
-            session.data.messages.len(),
-            limits.message_cap,
-            Utc::now()
-                .signed_duration_since(session.data.created_at)
-                .num_seconds(),
-            limits.time_cap_seconds,
-        );
-        if is_call {
-            // Archived by the background sweep, off the caller's line.
-            if let Some(ended) = crate::session_store::begin_fresh(&mut session.data) {
-                state.session_store.queue_ended_call(ended);
-            }
-        } else {
-            crate::session_store::reset_session(
-                &mut session.data,
-                &state.root_dir,
-                &state.config.pulse.name,
-            );
-        }
-    }
-
-    // Build user message content
     let user_content = MessageContent::Text(user_message);
-
-    // Push the user message onto the in-memory trunk so compaction and the
-    // provider call see it, but DEFER every commit (WAL entry, counters) until
-    // the turn actually succeeds. A failed or refused turn is rolled back to
-    // this point so it can never poison later turns — the 2026-08-09
-    // session-poisoning bug, where a refused turn left a half-appended user
-    // message that made fable re-trip on every subsequent benign turn.
-    let trunk_len_before_push = session.data.messages.len();
-    session.data.messages.push(Message {
-        role: Role::User,
-        content: user_content.clone(),
-        source: Some(MessageSource::Human {
-            channel: req.channel.clone(),
-            sender: resolved_key.to_string(),
-        }),
-    });
-    // PN-102: a dropped future (streaming client disconnected) rolls the user
-    // message back the same way a failed turn does. Disarmed the moment the
-    // provider call succeeds.
-    session.arm(trunk_len_before_push);
-
-    // A real human message just arrived — reset the autonomous round counter
-    // now, pre-turn, so that even a turn that later refuses or errors still
-    // counts as human input for the autonomy / hallucination gates. (Resetting
-    // only on success would let a run of failed human turns keep climbing.)
-    session.data.health.rounds_since_human_input = 0;
-
-    // MicroCompact (Tier 1): cheap mechanical compaction before checking
-    // whether expensive LLM-based summarization is needed.
-    let mc_result = crate::context::micro_compact(&mut session.data.messages);
-    if mc_result.tokens_saved > 0 {
-        session.data.compaction.micro_compact_savings += mc_result.tokens_saved;
-        // Update token estimate after micro-compaction
-        session.data.compaction.estimated_tokens =
-            crate::context::estimate_conversation_tokens(&session.data.messages);
-    }
-
-    // Tier-2 compaction is shed in isolation: it calls the provider and
-    // writes archives — both belong to the subsystems under suspicion.
-    // It can rewrite the trunk under the rollback watermark, so the guard is
-    // re-anchored right after it (see `TurnGuard::rearm_at_last_user`).
-    if !isolated {
-        // Compact conversation if approaching context budget (Tier 2 — Structured AutoCompact)
-        // Extract values before the call to avoid borrow conflicts with &mut messages
-        let recent_files_snapshot = session.data.compaction.recently_accessed_files.clone();
-        let current_compaction_failures = session.data.compaction.compaction_failures;
-        let active_plan_snapshot = session.data.compaction.active_plan.clone();
-        let compaction_result = crate::context::compact_if_needed(
-            &mut session.data.messages,
-            state.provider.as_ref(),
-            state.config.llm.context_budget,
-            state.config.llm.max_tokens,
-            &state.root_dir,
-            &state.config.pulse.name,
-            &req.channel,
-            Some(&session_key),
-            current_compaction_failures,
-            &recent_files_snapshot,
-            active_plan_snapshot.as_deref(),
-        )
-        .await;
-        // Write back updated compaction failures from result
-        session.data.compaction.compaction_failures = compaction_result.compaction_failures;
-        if compaction_result.compacted {
-            session.data.compaction.compaction_count += 1;
-            let tokens_recovered = compaction_result
-                .tokens_before
-                .saturating_sub(compaction_result.tokens_after);
-            session.data.compaction.total_tokens_recovered_compact += tokens_recovered;
-            session.data.compaction.last_compaction_at = Some(Utc::now());
-            // Update token estimate after compaction
-            session.data.compaction.estimated_tokens =
-                crate::context::estimate_conversation_tokens(&session.data.messages);
-
-            // Record compaction signal for vigil-pulse trend analysis.
-            // Non-blocking — failures are logged but don't affect the chat flow.
-            let compaction_signal = crate::vigil::compaction_signals::CompactionSignalFrame {
-                timestamp: Utc::now().to_rfc3339(),
-                session_key: session_key.clone(),
-                tier: if compaction_result.circuit_breaker_fired {
-                    3
-                } else {
-                    2
-                },
-                tokens_before: compaction_result.tokens_before,
-                tokens_after: compaction_result.tokens_after,
-                quality_score: session.data.compaction.context_quality_score,
-                circuit_breaker_fired: compaction_result.circuit_breaker_fired,
-                files_reinjected: compaction_result.files_reinjected,
-                had_active_plan: active_plan_snapshot.is_some(),
-            };
-            let root_for_signal = state.root_dir.clone();
-            tokio::task::spawn_blocking(move || {
-                if let Err(e) =
-                    crate::vigil::compaction_signals::record(&root_for_signal, compaction_signal)
-                {
-                    tracing::warn!("Failed to record compaction signal: {}", e);
-                }
-            });
-
-            // Structured compaction log for debugging and analysis
-            tracing::info!(
-                "[COMPACTION] tier={} session={} before={}T after={}T recovered={}T \
-                 quality={:.2} files_reinjected={} circuit_breaker={} active_plan={}",
-                if compaction_result.circuit_breaker_fired {
-                    3
-                } else {
-                    2
-                },
-                session_key,
-                compaction_result.tokens_before,
-                compaction_result.tokens_after,
-                tokens_recovered,
-                session.data.compaction.context_quality_score,
-                compaction_result.files_reinjected,
-                compaction_result.circuit_breaker_fired,
-                active_plan_snapshot.is_some(),
-            );
-
-            if compaction_result.circuit_breaker_fired {
-                tracing::error!(
-                    session_key = %session_key,
-                    "Compaction circuit breaker fired — session compaction frozen"
-                );
-            }
-        }
-    }
+    steps::push_user_turn(&mut session, &turn, &user_content);
+    steps::compact_context(&turn, &mut session.data).await;
     session.rearm_at_last_user();
 
-    // Invoke LLM with tool loop
-    let channel = req.channel.clone();
-    // Clone the system prompt and release the read guard immediately —
-    // holding it across the LLM call would block system prompt refreshes.
-    let system_prompt = {
-        let base = state.system_prompt.read().await;
-        let identity = build_identity_system_prompt(&base, &resolved_key, sender_label);
-        apply_channel_style(identity, &channel)
-    };
-
-    // Phase 6: Track system prompt token count on the session.
-    // Uses the same chars/4 + overhead estimate as context.rs.
+    let system_prompt = steps::turn_system_prompt(&turn).await;
+    // Phase 6: track the system prompt's token count on the session (the
+    // same chars/4 estimate as context.rs).
     session.data.compaction.system_prompt_tokens = system_prompt.len() / 4;
-
-    // Per-turn correlation ID for the utility feedback loop. Chat sessions
-    // have no task_id, so we synthesize one per turn. The format is
-    // `chat-<short-hash-of-key>-<uuid>` so that:
-    //   - the resolved_key is not stored in plaintext in the manifest
-    //     (avoids embedding caller IDs in learning artifacts), but
-    //   - turns from the same caller still share a stable hash prefix
-    //     for log greppability, and
-    //   - the UUID nonce eliminates same-millisecond collisions even
-    //     when two callers happen to share a hash bucket.
-    // See utility-feedback-loop-spec.md.
-    let correlation_id = {
-        use std::hash::{Hash, Hasher};
-        let mut hasher = std::collections::hash_map::DefaultHasher::new();
-        resolved_key.hash(&mut hasher);
-        format!(
-            "chat-{:016x}-{}",
-            hasher.finish(),
-            uuid::Uuid::new_v4().simple()
-        )
-    };
 
     // The in-process registry follows the turn's tool surface, as the CLI
     // does (audit R2-7): the owner gets every tool; isolation only the
     // read-only introspection set (no file_write, no web_fetch, no plugin
     // tools); a guest or peer none at all.
-    let surface = crate::tool_surface::effective(crate::tool_surface::current(), isolated);
+    let surface = crate::tool_surface::effective(crate::tool_surface::current(), turn.isolated);
     let narrowed_tools =
         crate::server::setup::narrowed_tools(&state.root_dir, &state.config, surface);
     let active_tools = narrowed_tools.as_ref().unwrap_or(&state.tools);
 
     // The default (fable) model always runs first; on an AUP refusal the same
     // turn is re-run on the fallback model and the exchange is quarantined out
-    // of the default model's context. The fallback provider is built lazily
-    // (`create_provider_with_model`), only when a refusal actually fires.
+    // of the default model's context.
     //
     // SEC-001: the fallback is OWNER-ONLY. Re-running a refused turn on the more
     // permissive opus model must not be reachable by an untrusted caller, or
     // fable-5's AUP classifier becomes bypassable by anyone who can hit /chat.
     // `resolve_sender` maps the owner's configured phone/discord-id/name and the
     // tui/system/reflection channels to "owner", so D's voice calls still get
-    // the fallback while guests and peers never do. `gated_fallback` enforces
-    // the owner gate, the isolation shed, and the per-session invocation cap
-    // (SEC-002), dropping the builder unbuilt otherwise.
-    let fallback_capped =
-        session.data.health.fallback_count_this_session >= MAX_FALLBACKS_PER_SESSION;
-    let config_for_fallback = &state.config;
-    let root_for_fallback = &state.root_dir;
-    let build_fallback = state.config.llm.fallback_target().and_then(|model| {
-        let model = model.to_string();
-        gated_fallback(&resolved_key, isolated, !fallback_capped, move || {
-            crate::providers::create_provider_with_model(
-                config_for_fallback,
-                root_for_fallback,
-                &model,
-            )
-        })
-    });
-
-    let turn = invoke_turn_with_refusal_fallback(
+    // the fallback while guests and peers never do.
+    let fallback_capped = steps::fallback_cap_reached(&session.data.health);
+    let build_fallback = steps::fallback_builder(&turn, !fallback_capped);
+    let outcome = invoke_turn_with_refusal_fallback(
         &mut session.data,
         state.provider.as_ref(),
         build_fallback,
         active_tools,
         &system_prompt,
         state.config.llm.max_tokens,
-        &correlation_id,
+        &turn.correlation_id,
         sink.as_ref(),
     )
     .await;
-    record_provider_outcome(&state, &resolved_key, &turn).await;
-    let turn = turn.map_err(|e| {
-        // The turn failed even after any fallback — the helper has already
-        // rolled the user turn (the trunk tail) and its deferred WAL/counter
-        // commit back off (AC7, AC8). Note this is NOT a full pre-turn restore:
-        // compaction ran before the helper, and its side-effects (summarized
-        // older messages, compaction counters, the compaction signal/archive)
-        // are intentionally retained.
-        //
-        // SEC-007: on the fallback-also-failed path the full detail is logged
-        // here at ERROR, but the client body (`e.to_string()`, below) is the
-        // generic "upstream model error" — provider internals never leak out.
-        if let Some(ff) = e.downcast_ref::<crate::errors::FallbackFailedError>() {
-            tracing::error!("refusal fallback failed: {}", ff.detail);
-        } else {
-            tracing::error!("LLM turn failed: {}", e);
-        }
-        // SEC-002: a refusal that was denied the fallback because the session
-        // hit the invocation cap took this error path deliberately — surface it
-        // so the cap is visible in the logs.
-        if fallback_capped && e.downcast_ref::<crate::errors::RefusalError>().is_some() {
-            tracing::warn!(
-                session_key = %session_key,
-                cap = MAX_FALLBACKS_PER_SESSION,
-                "refusal fallback cap reached — refusal took the error path without invoking the fallback model"
-            );
-        }
-        // Keep the banner sticky even on the failure path — while isolated
-        // the provider is precisely the suspect.
-        // SEC-007 applies to every provider failure, not only the fallback
-        // path: the detail is in the log above; the client gets a generic
-        // body (and the isolation banner when relevant).
-        let public = if e.downcast_ref::<crate::errors::RefusalError>().is_some() {
-            "the model declined this request"
-        } else {
-            "upstream model error"
-        };
-        let msg = if crate::server::isolation::is_active(&state.root_dir) {
-            format!("{} {}", crate::server::isolation::BANNER, public)
-        } else {
-            public.to_string()
-        };
-        (StatusCode::INTERNAL_SERVER_ERROR, msg)
-    })?;
+    record_provider_outcome(&state, &resolved_key, &outcome).await;
+    let outcome = outcome.map_err(|e| steps::turn_failure(&turn, fallback_capped, e.as_ref()))?;
 
-    let committed_to_quarantine = turn.quarantined;
-    let result = turn.result;
     // The turn succeeded: from here on the messages are committed and a
     // dropped future must not undo them.
     session.disarm();
-
-    // Re-sample: a turn admitted just before the marker appeared must not
-    // write after it. OR of the two samples drives every gate below.
-    let isolated = isolated || crate::server::isolation::is_active(&state.root_dir);
-    if isolated {
-        if session.data.isolation_ephemeral_from.is_none() {
-            session.data.isolation_ephemeral_from = Some(pre_turn_len);
-        }
-        // SEC-004: a turn that flipped to isolated mid-flight must not commit its
-        // fallback tangent to the quarantine lane. Anchor the watermark at this
-        // turn's pre-turn quarantine length (if not already anchored earlier in
-        // the isolation window) and drop anything the fallback just pushed —
-        // don't wait for the next normal turn to shed it.
-        if session.data.isolation_quarantine_from.is_none() {
-            session.data.isolation_quarantine_from = Some(pre_turn_quarantine_len);
-        }
-        if committed_to_quarantine {
-            let from = session
-                .data
-                .isolation_quarantine_from
-                .unwrap_or(pre_turn_quarantine_len);
-            session.data.quarantine.truncate(from);
-        }
-    }
-
-    let text = result.text.clone();
-
-    // The turn succeeded — commit the counters that were deferred from the
-    // user-message push (so a rolled-back turn leaves them untouched).
-    session.data.message_count += 1;
-    if !isolated {
-        session.data.wal.messages_since_checkpoint += 1;
-    }
-    // SEC-002: count a fallback invocation once it actually committed to
-    // quarantine, so the per-session cap bounds real opus tool-loops.
-    if committed_to_quarantine {
-        session.data.health.fallback_count_this_session += 1;
-    }
-
-    // Track recently accessed files from tool use (for post-compaction re-injection).
-    // Scan all messages (the tool loop may have added tool-use/tool-result pairs).
-    if result.tool_rounds > 0 {
-        let file_accesses = crate::context::extract_file_accesses(&session.data.messages);
-        for (path, content) in file_accesses {
-            session.data.record_file_access(&path, &content);
-        }
-    }
-
-    // Commit the turn to the WAL now that it succeeded. Write-ahead is deferred
-    // until success (see the user-message push above) so a refused or failed
-    // turn leaves no entry — "user-message-not-committed-until-success"
-    // ordering keeps WAL replay consistent with the in-memory lanes. A
-    // quarantined turn carries the quarantine lane marker so replay
-    // reconstructs the split and never poisons the trunk. User first, then
-    // assistant. (Shed in isolation.)
-    // A voice call is not persisted, so it has no WAL either.
-    if let Some(wal) = state.wal.as_ref().filter(|_| !isolated && !is_call) {
-        let lane = if committed_to_quarantine {
-            crate::wal::WalLane::Quarantine
-        } else {
-            crate::wal::WalLane::Trunk
-        };
-        let user_seq = session.data.wal.wal_seq + 1;
-        match wal.append_with_lane(
-            &session_key,
-            user_seq,
-            Role::User,
-            &user_content,
-            Some(crate::wal::WalMeta {
-                channel: Some(req.channel.clone()),
-                sender: req.sender.clone(),
-            }),
-            lane,
-        ) {
-            Ok(()) => session.data.wal.wal_seq = user_seq,
-            Err(e) => tracing::warn!("WAL append failed for user message: {}", e),
-        }
-        let asst_seq = session.data.wal.wal_seq + 1;
-        match wal.append_with_lane(
-            &session_key,
-            asst_seq,
-            Role::Assistant,
-            &MessageContent::Text(text.clone()),
-            None,
-            lane,
-        ) {
-            Ok(()) => session.data.wal.wal_seq = asst_seq,
-            Err(e) => tracing::warn!("WAL append failed for assistant message: {}", e),
-        }
-    }
-
-    // Track hallucination guard metrics on the session
-    session.data.health.rounds_since_human_input += 1;
-    if result.was_truncated {
-        session.data.health.hallucination_count += 1;
-        tracing::warn!(
-            session_key = %session_key,
-            hallucination_count = session.data.health.hallucination_count,
-            "Hallucination guard: response was truncated (session total: {})",
-            session.data.health.hallucination_count
-        );
-    }
-    if result.circuit_breaker_fired {
-        session.data.health.circuit_breaker_count += 1;
-        tracing::warn!(
-            session_key = %session_key,
-            tool_rounds = result.tool_rounds,
-            circuit_breaker_count = session.data.health.circuit_breaker_count,
-            "Hallucination guard: circuit breaker fired in chat session (session total: {})",
-            session.data.health.circuit_breaker_count
-        );
-    }
-    if !result.action_claim_warnings.is_empty() {
-        session.data.health.action_claim_count += result.action_claim_warnings.len() as u32;
-        tracing::warn!(
-            session_key = %session_key,
-            count = result.action_claim_warnings.len(),
-            session_total = session.data.health.action_claim_count,
-            "Action hallucination: {} unmatched action claim(s) in chat response (session total: {})",
-            result.action_claim_warnings.len(),
-            session.data.health.action_claim_count
-        );
-    }
-    if result.tool_degraded {
-        tracing::warn!(
-            session_key = %session_key,
-            "Hallucination guard: tool degraded state active — consecutive tool failures exceeded threshold"
-        );
-    }
-
-    // Session health check — warn on degradation
-    if state.config.session_health.enabled {
-        let health =
-            crate::session_health::assess_session(&session.data, &state.config.session_health);
-        match health.status {
-            crate::session_health::SessionHealthStatus::Degraded => {
-                tracing::warn!(
-                    session_key = %session_key,
-                    status = %health.status,
-                    risk_factors = ?health.risk_factors,
-                    "Session health DEGRADED"
-                );
-            }
-            crate::session_health::SessionHealthStatus::Critical => {
-                tracing::error!(
-                    session_key = %session_key,
-                    status = %health.status,
-                    risk_factors = ?health.risk_factors,
-                    "Session health CRITICAL — consider restarting session"
-                );
-            }
-            _ => {}
-        }
-    }
-
-    // Update token estimate for the full conversation
-    session.data.compaction.estimated_tokens =
-        crate::context::estimate_conversation_tokens(&session.data.messages);
-
-    // Compute context quality score:
-    //   (recent_window_tokens + system_prompt_tokens) / total_tokens
-    // Higher = more of the context is high-quality fresh content.
-    let total_tokens = session.data.compaction.estimated_tokens;
-    if total_tokens > 0 {
-        let sys_tokens = session.data.compaction.system_prompt_tokens;
-        // Estimate recent window as last 10 messages (or all if fewer)
-        let recent_window_tokens = {
-            let msgs = &session.data.messages;
-            let recent_count = msgs.len().min(10);
-            let start = msgs.len().saturating_sub(recent_count);
-            crate::context::estimate_conversation_tokens(&msgs[start..])
-        };
-        session.data.compaction.context_quality_score =
-            (recent_window_tokens + sys_tokens) as f64 / total_tokens as f64;
-        // Clamp to [0, 1] — can exceed 1 if context is mostly recent + system prompt
-        if session.data.compaction.context_quality_score > 1.0 {
-            session.data.compaction.context_quality_score = 1.0;
-        }
-    } else {
-        session.data.compaction.context_quality_score = 1.0;
-    }
-
-    // Enforce hard cap on stored messages (safety backstop — session caps should fire first)
-    session.data.enforce_message_cap();
-
-    // Record conversation outcome for caliber-echo (shed in isolation)
-    if let Some(_tracker) = state.outcome_tracker.as_ref().filter(|_| !isolated) {
-        let conv_outcome = crate::caliber::runtime::build_conversation_outcome(
-            &session_key,
-            &channel,
-            session.data.messages.len() as u32,
-            session.data.health.hallucination_count,
-            session.data.health.circuit_breaker_count,
-            result.input_tokens,
-            result.output_tokens,
-        );
-        let outcome_str = conv_outcome.outcome.to_string();
-        if let Err(e) = crate::caliber::runtime::record_outcome(
-            &state.root_dir,
-            conv_outcome,
-            state.config.caliber.max_outcomes,
-        ) {
-            tracing::warn!("Failed to record conversation outcome: {}", e);
-        }
-        // Best-effort utility feedback to recall-echo. See utility-feedback-loop-spec.md.
-        crate::graph_feedback::bridge_feedback(
-            &state.root_dir,
-            &correlation_id,
-            &outcome_str,
-            &text,
-        )
-        .await;
-    }
-
-    // Incremental checkpoint (if conditions met; shed in isolation, and
-    // never for a voice call, which is not persisted)
-    if !isolated && !is_call {
-        maybe_checkpoint(&state, &session_key, &mut session.data, &channel).await;
-    }
-
-    // Record pulse response to context buffer (shed in isolation)
-    if !isolated {
-        if let Some(ref cb) = state.context_buffer {
-            cb.record(&channel, &state.config.pulse.name, "assistant", &text)
-                .await;
-        }
-    }
-
-    // Build InteractionRecord from the session before dropping the lock.
-    // This captures the full session state including health metrics.
-    let conversation_trust = conversation_trust_from_identity(&resolved_key);
-    let interaction = InteractionRecord::from_session(
-        &session.data,
-        &state.config.pulse.name,
-        conversation_trust,
-        result.input_tokens,
-        result.output_tokens,
-    );
-
-    // Mark session dirty and persist asynchronously (a voice call is never
-    // persisted: it is archived when it ends)
-    let persisted = !isolated && !is_call;
-    if persisted {
-        session.mark_dirty();
-    }
-    let persist_key = session_key.clone();
-    let persist_store = &state.session_store;
-    tracing::debug!(
-        "[chat] persisting session key={} channel={} sender={:?}",
-        persist_key,
-        channel,
-        req.sender
-    );
-    // Drop the session lock before persisting to avoid deadlock
-    drop(session);
-    if !persisted {
-        tracing::debug!("[chat] session persist shed (isolation or voice call)");
-    } else {
-        persist_store.persist(&persist_key).await;
-        tracing::debug!("[chat] persist call returned for key={}", persist_key);
-    }
-
-    // Emit PostInteraction event from the InteractionRecord
-    // Chat sessions are persisted separately (session store), so we emit
-    // on every request for real-time assessment. Only assessable interactions
-    // are worth emitting — trivial health-checks get skipped.
-    if isolated {
-        // Shed in isolation: the event listener downstream writes intent and
-        // evaluator state, and the audit log is itself a write.
-        tracing::debug!("[chat] event emission and intake audit shed (isolation)");
-    } else if interaction.is_assessable() {
-        let receivers = state.event_bus.emit(interaction.to_event());
-        tracing::debug!(
-            "[chat] PostInteraction emitted to {} receivers (source={})",
-            receivers,
-            interaction.source_label()
-        );
-
-        // Audit: event emitted for chat interaction
-        crate::intake_audit::log(
-            &state.root_dir,
-            &crate::intake_audit::entry(
-                &interaction.id,
-                &interaction.source_label(),
-                interaction.trust_label(),
-                crate::intake_audit::AuditStage::EventEmitted,
-                Some(format!("{} receivers", receivers)),
-            ),
-        );
-    } else {
-        // Audit: event skipped (not assessable)
-        crate::intake_audit::log(
-            &state.root_dir,
-            &crate::intake_audit::entry(
-                &interaction.id,
-                &interaction.source_label(),
-                interaction.trust_label(),
-                crate::intake_audit::AuditStage::EventSkipped,
-                Some("not assessable".to_string()),
-            ),
-        );
-    }
-
-    // Sticky banner for trusted consumers; concealed from guests (the
-    // operating posture is not their business).
-    let reveal = isolated && !resolved_key.is_guest();
-    Ok(ChatResponse {
-        response: if reveal {
-            crate::server::isolation::banner_wrap(text)
-        } else {
-            text
-        },
-        model: result.model,
-        input_tokens: Some(result.input_tokens),
-        output_tokens: Some(result.output_tokens),
-        isolation: reveal,
-        truncated: result.was_truncated,
-    })
+    turn.resample_isolation();
+    let finished = steps::FinishedTurn {
+        user_content,
+        before,
+        outcome,
+    };
+    Ok(steps::commit_turn(&turn, session, finished).await)
 }
 
 /// The session write guard for one turn, plus the rollback watermark.

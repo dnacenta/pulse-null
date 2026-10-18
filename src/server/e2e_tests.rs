@@ -4659,3 +4659,94 @@ mod in_process_tools_e2e {
         assert!(!dir.path().join("guest.txt").exists(), "a guest's tool ran");
     }
 }
+
+// ---------------------------------------------------------------------------
+// Turn steps: session reset and the conversation outcome
+// ---------------------------------------------------------------------------
+
+mod turn_steps {
+    use super::*;
+
+    fn message_texts(messages: &[Message]) -> Vec<String> {
+        messages
+            .iter()
+            .map(|m| match &m.content {
+                pulse_system_types::llm::MessageContent::Text(t) => t.clone(),
+                pulse_system_types::llm::MessageContent::Blocks(blocks) => blocks
+                    .iter()
+                    .filter_map(|b| match b {
+                        ContentBlock::Text { text } => Some(text.as_str()),
+                        _ => None,
+                    })
+                    .collect(),
+            })
+            .collect()
+    }
+
+    /// A session at its message cap is archived with a handoff, and the new
+    /// message opens the fresh session.
+    #[tokio::test]
+    async fn a_session_at_its_cap_starts_fresh_before_the_turn() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = test_config();
+        config.sessions.guest_message_cap = 2;
+        let provider = MockProvider::new(vec![mock_text("first reply"), mock_text("second reply")]);
+        let state = build_state_boxed_with_config(
+            dir.path().to_path_buf(),
+            Box::new(provider),
+            ToolRegistry::new(),
+            config,
+        )
+        .await;
+        let app = build_app(Arc::clone(&state));
+        assert_eq!(post_chat(&app, "first question").await.0, StatusCode::OK);
+        assert_eq!(post_chat(&app, "second question").await.0, StatusCode::OK);
+
+        let session = state
+            .session_store
+            .get_existing_by_key("guest:anonymous")
+            .await
+            .unwrap();
+        let session = session.read().await;
+        assert_eq!(
+            session.data.message_count, 1,
+            "the counters restart with the fresh session"
+        );
+        let texts = message_texts(&session.data.messages);
+        assert!(
+            !texts.iter().any(|t| t == "first reply"),
+            "the capped exchange left the trunk: {texts:?}"
+        );
+        assert_eq!(texts.last().map(String::as_str), Some("second reply"));
+        assert!(texts
+            .iter()
+            .any(|t| t.ends_with("User message: second question")));
+    }
+
+    /// A state with caliber-echo's outcome tracker on.
+    async fn tracked_state(dir: &std::path::Path) -> Arc<AppState> {
+        let provider = MockProvider::new(vec![mock_text("a reply")]);
+        let mut state = build_state_in(dir.to_path_buf(), provider, ToolRegistry::new()).await;
+        Arc::get_mut(&mut state)
+            .expect("a fresh state has one owner")
+            .outcome_tracker = Some(Arc::new(crate::caliber::runtime::CaliberTracker::new()));
+        state
+    }
+
+    #[tokio::test]
+    async fn a_turn_records_its_conversation_outcome() {
+        let dir = tempfile::tempdir().unwrap();
+        let app = build_app(tracked_state(dir.path()).await);
+        assert_eq!(post_chat(&app, "hello").await.0, StatusCode::OK);
+        assert_eq!(crate::caliber::runtime::load_outcomes(dir.path()).len(), 1);
+    }
+
+    #[tokio::test]
+    async fn an_isolated_turn_records_no_outcome() {
+        let dir = tempfile::tempdir().unwrap();
+        let app = build_app(tracked_state(dir.path()).await);
+        crate::server::isolation::enter(dir.path(), "test", None).unwrap();
+        assert_eq!(post_chat(&app, "hello").await.0, StatusCode::OK);
+        assert!(crate::caliber::runtime::load_outcomes(dir.path()).is_empty());
+    }
+}
