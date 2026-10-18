@@ -277,7 +277,12 @@ async fn run_resolved_turn(
     // Inject channel context buffer (recent activity on this channel)
     // Phase 4: use filtered retrieval — time decay, pulse filtering,
     // deduplication against session history, entry/token caps.
-    if let Some(ref cb) = state.context_buffer {
+    // Not on voice: every call is its own guest, and one caller's words
+    // are not another caller's context (PN-110 audit #3).
+    let is_voice = req
+        .channel
+        .eq_ignore_ascii_case(crate::server::turns::VOICE_CHANNEL);
+    if let Some(cb) = state.context_buffer.as_ref().filter(|_| !is_voice) {
         // Extract recent session message texts for deduplication.
         // We only need the session if it already exists — if it doesn't,
         // there's nothing to deduplicate against.

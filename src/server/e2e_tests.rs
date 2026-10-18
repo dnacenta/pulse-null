@@ -348,6 +348,17 @@ async fn build_state_boxed_with_config(
     tools: ToolRegistry,
     config: Config,
 ) -> Arc<AppState> {
+    build_state_with_buffer(root_dir, provider, tools, config, None).await
+}
+
+/// [`build_state_boxed_with_config`] with a channel context buffer.
+async fn build_state_with_buffer(
+    root_dir: std::path::PathBuf,
+    provider: Box<dyn crate::streaming::StreamingProvider>,
+    tools: ToolRegistry,
+    config: Config,
+    context_buffer: Option<crate::context_buffer::ContextBufferStore>,
+) -> Arc<AppState> {
     let wal =
         crate::wal::WalWriter::new(&root_dir.join("sessions"), crate::wal::WalFsync::None).ok();
     let session_store =
@@ -366,7 +377,7 @@ async fn build_state_boxed_with_config(
         pipeline_monitor: None,
         cognitive_monitor: None,
         outcome_tracker: None,
-        context_buffer: None,
+        context_buffer,
         persist_coordinator: Arc::new(PersistCoordinator::new()),
         plugin_manager: tokio::sync::Mutex::new(plugin_manager),
         wal,
@@ -3408,6 +3419,13 @@ mod voice_brain_e2e {
     async fn brain_with_recorder(
         dir: &std::path::Path,
     ) -> (Arc<AppState>, TurnBrain, Arc<std::sync::Mutex<Vec<String>>>) {
+        brain_on(dir, None).await
+    }
+
+    async fn brain_on(
+        dir: &std::path::Path,
+        context_buffer: Option<crate::context_buffer::ContextBufferStore>,
+    ) -> (Arc<AppState>, TurnBrain, Arc<std::sync::Mutex<Vec<String>>>) {
         let mut config = test_config();
         config.security.secret = Some("s3cret".to_string());
         config.owner.name = Some("D".to_string());
@@ -3416,11 +3434,12 @@ mod voice_brain_e2e {
         let provider = SystemPromptRecorder {
             seen: Arc::clone(&seen),
         };
-        let state = build_state_boxed_with_config(
+        let state = build_state_with_buffer(
             dir.to_path_buf(),
             Box::new(provider),
             ToolRegistry::new(),
             config,
+            context_buffer,
         )
         .await;
         state.turns.bind(&state);
@@ -3435,24 +3454,55 @@ mod voice_brain_e2e {
         }
     }
 
-    async fn last_user_text(state: &Arc<AppState>, key: &str) -> String {
+    fn assistant(text: &str) -> pst05::llm::Message {
+        pst05::llm::Message {
+            role: pst05::llm::Role::Assistant,
+            content: pst05::llm::MessageContent::Text(text.to_string()),
+        }
+    }
+
+    /// The session keys of every call on a transport (`guest:<caller>-<nonce>`).
+    async fn calls(state: &Arc<AppState>, caller: &str) -> Vec<String> {
+        let prefix = format!("guest:{caller}-");
+        let mut keys: Vec<String> = state
+            .session_store
+            .sessions_map()
+            .await
+            .into_keys()
+            .filter(|key| key.starts_with(&prefix))
+            .collect();
+        keys.sort();
+        keys
+    }
+
+    /// The one call on `caller`'s transport.
+    async fn only_call(state: &Arc<AppState>, caller: &str) -> String {
+        let keys = calls(state, caller).await;
+        assert_eq!(keys.len(), 1, "{keys:?}");
+        keys[0].clone()
+    }
+
+    async fn user_texts(state: &Arc<AppState>, key: &str) -> Vec<String> {
         let session = state
             .session_store
             .get_existing_by_key(key)
             .await
             .unwrap_or_else(|| panic!("no session {key}"));
         let session = session.read().await;
-        let last = session
+        session
             .data
             .messages
             .iter()
-            .rev()
-            .find(|m| matches!(m.role, pulse_system_types::llm::Role::User))
-            .expect("a user message");
-        match &last.content {
-            pulse_system_types::llm::MessageContent::Text(t) => t.clone(),
-            other => panic!("unexpected content {other:?}"),
-        }
+            .filter(|m| matches!(m.role, pulse_system_types::llm::Role::User))
+            .map(|m| match &m.content {
+                pulse_system_types::llm::MessageContent::Text(t) => t.clone(),
+                other => panic!("unexpected content {other:?}"),
+            })
+            .collect()
+    }
+
+    async fn last_user_text(state: &Arc<AppState>, key: &str) -> String {
+        user_texts(state, key).await.pop().expect("a user message")
     }
 
     #[tokio::test]
@@ -3484,7 +3534,8 @@ mod voice_brain_e2e {
             .get_existing_by_key("owner")
             .await
             .is_none());
-        let said = last_user_text(&state, "guest:phone-caller").await;
+        let call = only_call(&state, "phone-caller").await;
+        let said = last_user_text(&state, &call).await;
         assert!(said.ends_with("User message: What's on today?"), "{said}");
         assert!(!said.contains("[Channel:"), "wrapper not stripped: {said}");
     }
@@ -3506,7 +3557,8 @@ mod voice_brain_e2e {
             )
             .await
             .unwrap();
-        let said = last_user_text(&state, "guest:discord-voice-caller").await;
+        let call = only_call(&state, "discord-voice-caller").await;
+        let said = last_user_text(&state, &call).await;
         assert!(
             said.ends_with(
                 "User message: [Call context: D asked you to ring about the build]\n\nsounds good"
@@ -3524,7 +3576,142 @@ mod voice_brain_e2e {
             .invoke("", &[user("D here, it's me".to_string())], 1024, None)
             .await
             .unwrap();
-        let said = last_user_text(&state, "guest:voice-caller").await;
+        let call = only_call(&state, "voice-caller").await;
+        let said = last_user_text(&state, &call).await;
         assert!(said.ends_with("User message: D here, it's me"), "{said}");
+    }
+
+    // --- audit #3: one guest session per call ---
+
+    #[tokio::test]
+    async fn two_concurrent_calls_with_the_same_first_words_get_different_sessions() {
+        let dir = tempfile::tempdir().unwrap();
+        let (state, brain, _seen) = brain_with_recorder(dir.path()).await;
+        let hello = [user(fixtures::phone("Hello?", None))];
+
+        let (a, b) = tokio::join!(
+            brain.invoke("", &hello, 1024, None),
+            brain.invoke("", &hello, 1024, None)
+        );
+        a.unwrap();
+        b.unwrap();
+        assert_eq!(calls(&state, "phone-caller").await.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn the_second_utterance_of_a_call_lands_in_the_first_ones_session() {
+        let dir = tempfile::tempdir().unwrap();
+        let (state, brain, _seen) = brain_with_recorder(dir.path()).await;
+        let first = user(fixtures::phone("Hi, it's about the delivery", None));
+
+        let reply = brain
+            .invoke("", std::slice::from_ref(&first), 1024, None)
+            .await
+            .unwrap();
+        brain
+            .invoke(
+                "",
+                &[
+                    first,
+                    assistant(&reply.text()),
+                    user(fixtures::phone("It's at the door", None)),
+                ],
+                1024,
+                None,
+            )
+            .await
+            .unwrap();
+
+        let call = only_call(&state, "phone-caller").await;
+        let said = user_texts(&state, &call).await;
+        assert_eq!(said.len(), 2, "{said:?}");
+        assert!(said[0].ends_with("Hi, it's about the delivery"));
+        assert!(said[1].ends_with("It's at the door"));
+    }
+
+    #[tokio::test]
+    async fn a_caller_never_sees_another_callers_turns() {
+        let dir = tempfile::tempdir().unwrap();
+        let (state, brain, _seen) = brain_with_recorder(dir.path()).await;
+        let hello = user(fixtures::phone("Hello?", None));
+
+        // Two calls open with the same words and get the same reply, so
+        // their histories are identical: neither may continue the other.
+        brain
+            .invoke("", std::slice::from_ref(&hello), 1024, None)
+            .await
+            .unwrap();
+        brain
+            .invoke("", std::slice::from_ref(&hello), 1024, None)
+            .await
+            .unwrap();
+        let openers = calls(&state, "phone-caller").await;
+        assert_eq!(openers.len(), 2);
+
+        // Caller A goes on to say something private.
+        brain
+            .invoke(
+                "",
+                &[
+                    hello.clone(),
+                    assistant("Sure."),
+                    user(fixtures::phone("my PIN is 4321", None)),
+                ],
+                1024,
+                None,
+            )
+            .await
+            .unwrap();
+        for key in calls(&state, "phone-caller").await {
+            let said = user_texts(&state, &key).await;
+            if said.iter().any(|t| t.contains("4321")) {
+                assert_eq!(said.len(), 1, "A's words joined an opener's session: {key}");
+                assert!(!openers.contains(&key));
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn voice_guests_get_no_channel_activity() {
+        let dir = tempfile::tempdir().unwrap();
+        let buffer = crate::context_buffer::ContextBufferStore::new(
+            dir.path(),
+            &crate::context_buffer::ContextBufferConfig::default(),
+        )
+        .await;
+        let (state, brain, _seen) = brain_on(dir.path(), Some(buffer)).await;
+        let cb = state.context_buffer.as_ref().unwrap();
+        // The pulse's own line to an earlier caller, on voice and on Discord.
+        for channel in ["voice", "discord"] {
+            cb.record(channel, "TestPulse", "assistant", "your PIN is 1234")
+                .await;
+        }
+
+        brain
+            .invoke("", &[user(fixtures::phone("Hello?", None))], 1024, None)
+            .await
+            .unwrap();
+        let call = only_call(&state, "phone-caller").await;
+        let said = last_user_text(&state, &call).await;
+        assert!(!said.contains("[Recent channel activity]"), "{said}");
+        assert!(!said.contains("1234"), "{said}");
+
+        // Control: the same buffer still reaches a Discord turn.
+        let discord = state
+            .turns
+            .for_plugin("discord-text-echo", "discord")
+            .unwrap();
+        discord
+            .run(
+                crate::server::turns::PluginTurn {
+                    message: "hi".to_string(),
+                    sender: Some("2002".to_string()),
+                },
+                None,
+            )
+            .await
+            .unwrap();
+        let said = last_user_text(&state, "guest:2002").await;
+        assert!(said.contains("[Recent channel activity]"), "{said}");
     }
 }

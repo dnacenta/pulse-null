@@ -6,9 +6,14 @@ use std::pin::Pin;
 use std::sync::Arc;
 
 use super::{Plugin, PluginContext, PluginHealth, PluginMeta, PluginResult, SetupPrompt};
-use crate::server::turns::VOICE_CHANNEL;
+use crate::server::turns::{SlotWait, VOICE_CHANNEL};
 
 const NAME: &str = "voice-echo";
+
+/// How long an utterance waits for a free turn slot before the caller is
+/// told the pulse is busy: long enough to ride out a burst, short enough
+/// that the line does not go silent.
+const SLOT_WAIT: std::time::Duration = std::time::Duration::from_secs(2);
 
 /// Adapter wrapping the voice-echo crate. Calls run in-process: voice-echo
 /// gets [`brain::TurnBrain`] as its LLM provider (its Local brain), so no
@@ -73,7 +78,10 @@ impl Plugin for VoiceEchoPlugin {
                 config.server.host,
                 config.server.port
             );
-            let turns = ctx.turns.for_plugin(NAME, VOICE_CHANNEL)?;
+            let turns = ctx
+                .turns
+                .for_plugin(NAME, VOICE_CHANNEL)?
+                .waiting_for_a_slot(SlotWait::Up(SLOT_WAIT));
             let factory_ctx = pst05::plugin::PluginContext {
                 entity_root: ctx.pulse_root.clone(),
                 entity_name: ctx.pulse_name.clone(),

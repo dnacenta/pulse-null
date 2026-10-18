@@ -51,6 +51,8 @@ pub const DRAIN_WINDOW: Duration = Duration::from_secs(30);
 pub enum SlotWait {
     /// Fail at once with [`TurnError::Busy`].
     Never,
+    /// Wait up to this long for a slot, then [`TurnError::Busy`].
+    Up(Duration),
     /// Wait as long as it takes. For a caller that bounds its own
     /// concurrency and must not drop what it queued.
     Forever,
@@ -330,6 +332,9 @@ impl PluginTurns {
         let pool = Arc::clone(&self.pool);
         let acquired = match self.slot_wait {
             SlotWait::Never => return pool.try_acquire_owned().map_err(|_| TurnError::Busy),
+            SlotWait::Up(limit) => tokio::time::timeout(limit, pool.acquire_owned())
+                .await
+                .map_err(|_| TurnError::Busy)?,
             SlotWait::Forever => pool.acquire_owned().await,
         };
         // The pool is never closed; a closed one would mean shutdown.
