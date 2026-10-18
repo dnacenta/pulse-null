@@ -1013,4 +1013,6 @@ fn truncate(s: &str, max: usize) -> &str {
 }
 
 #[cfg(test)]
+pub(crate) mod fake_cli;
+#[cfg(test)]
 mod tests;

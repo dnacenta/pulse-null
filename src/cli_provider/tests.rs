@@ -253,17 +253,12 @@ impl MockCli {
         let argv_log = dir.path().join("argv.log");
         let prompt_copy = dir.path().join("prompt.txt");
         let script = format!(
-            "#!/usr/bin/env bash\nprintf '%s\\n' \"$@\" > '{}'\ncat > '{}'\n{}\n",
+            "printf '%s\\n' \"$@\" > '{}'\ncat > '{}'\n{}",
             argv_log.display(),
             prompt_copy.display(),
             reply_cmd
         );
-        std::fs::write(&bin, script).unwrap();
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
-        }
+        super::fake_cli::write_script(&bin, &script);
         Self {
             _dir: dir,
             bin,
@@ -691,7 +686,10 @@ async fn every_principal_and_isolation_state_reaches_the_argv() {
 
     for adapter in ["claude", "grok"] {
         for case in &cases {
-            let mock = MockCli::succeeding();
+            // One reply every adapter and both paths read as a result.
+            let mock = MockCli::new(
+                "printf '{\"type\":\"result\",\"result\":\"mock ok\",\"is_error\":false}'",
+            );
             let provider = match adapter {
                 "claude" => mock.provider("m"),
                 _ => mock.provider_for(Box::new(Grok), "m"),
@@ -705,8 +703,14 @@ async fn every_principal_and_isolation_state_reaches_the_argv() {
             };
             let label = format!("{adapter}, {}, isolated={}", case.principal, case.isolated);
 
+            // Every call must succeed: a failed spawn would otherwise leave
+            // no argv log, and the assertion below would fail on that
+            // instead of on the real cause.
             let invoke = async {
-                let _ = provider.invoke("sys", &[user("hi")], 10, None).await;
+                provider
+                    .invoke("sys", &[user("hi")], 10, None)
+                    .await
+                    .unwrap_or_else(|e| panic!("{label}: {e}"));
             };
             match case.turn {
                 Some(surface) => scope(surface, invoke).await,
@@ -716,7 +720,15 @@ async fn every_principal_and_isolation_state_reaches_the_argv() {
 
             let stream = async {
                 let mut stream = provider.invoke_streaming("sys", &[user("hi")], 10, None);
-                while stream.next().await.is_some() {}
+                let mut done = false;
+                while let Some(event) = stream.next().await {
+                    match event {
+                        StreamEvent::Error(e) => panic!("{label}, streamed: {e}"),
+                        StreamEvent::Done(_) => done = true,
+                        _ => {}
+                    }
+                }
+                assert!(done, "{label}, streamed: no result");
             };
             match case.turn {
                 Some(surface) => scope(surface, stream).await,

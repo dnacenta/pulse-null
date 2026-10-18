@@ -3317,13 +3317,11 @@ mod tool_surface_e2e {
         let bin = dir.join("fake-cli");
         let argv_log = dir.join("argv.log");
         let script = format!(
-            "#!/usr/bin/env bash\nprintf '%s\\n' \"$@\" > '{}'\ncat > /dev/null\n\
-             printf '{{\"result\":\"ok\"}}'\n",
+            "printf '%s\\n' \"$@\" > '{}'\ncat > /dev/null\n\
+             printf '{{\"result\":\"ok\"}}'",
             argv_log.display()
         );
-        std::fs::write(&bin, script).unwrap();
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+        crate::cli_provider::fake_cli::write_script(&bin, &script);
         (bin, argv_log)
     }
 
