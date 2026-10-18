@@ -5181,3 +5181,65 @@ mod scheduler_loops_e2e {
         assert_eq!(queue.read().await.len(), 1, "nothing was drained");
     }
 }
+
+// ---------------------------------------------------------------------------
+// Session cleanup: one pass of the background task
+// ---------------------------------------------------------------------------
+
+mod session_cleanup_e2e {
+    use super::*;
+
+    /// A guest session idle well past the session ttl, with one message.
+    async fn stale_session(state: &Arc<AppState>) {
+        let session = state
+            .session_store
+            .get_or_create_by_key("guest:stale", "chat", "stale")
+            .await;
+        let mut session = session.write().await;
+        session.data.messages.push(Message {
+            role: pulse_system_types::llm::Role::User,
+            content: pulse_system_types::llm::MessageContent::Text("hello".into()),
+            source: None,
+        });
+        session.data.last_active = chrono::Utc::now() - chrono::Duration::days(30);
+    }
+
+    #[tokio::test]
+    async fn a_cleanup_pass_archives_and_drops_an_expired_session() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = build_state_in(
+            dir.path().to_path_buf(),
+            MockProvider::new(vec![]),
+            ToolRegistry::new(),
+        )
+        .await;
+        stale_session(&state).await;
+
+        crate::server::setup::cleanup_sessions(&state, false).await;
+        assert!(state
+            .session_store
+            .get_existing_by_key("guest:stale")
+            .await
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn an_isolated_cleanup_pass_writes_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = build_state_in(
+            dir.path().to_path_buf(),
+            MockProvider::new(vec![]),
+            ToolRegistry::new(),
+        )
+        .await;
+        stale_session(&state).await;
+        crate::server::isolation::enter(dir.path(), "test", None).unwrap();
+
+        crate::server::setup::cleanup_sessions(&state, true).await;
+        assert!(state
+            .session_store
+            .get_existing_by_key("guest:stale")
+            .await
+            .is_some());
+    }
+}

@@ -3,7 +3,7 @@
 //! Eliminates duplication of monitor creation, tool registration, and plugin
 //! initialization between the standalone server and multi-pulse boot paths.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use crate::config::Config;
@@ -151,23 +151,36 @@ pub async fn init_and_start_plugins(
     turns: &super::turns::TurnRunner,
 ) -> Result<(PluginManager, axum::Router), Box<dyn std::error::Error>> {
     let mut plugin_manager = PluginManager::new(config);
-
     if plugin_manager.count() > 0 {
-        let plugin_provider = crate::providers::create_provider_arc(config, root_dir)?;
-        plugin_manager
-            .init_all(config, root_dir, plugin_provider, turns.clone())
-            .await?;
-        plugin_manager.start_all().await?;
-        tracing::info!("{} plugin(s) started", plugin_manager.count());
-
-        for tool in plugin_manager.collect_tools() {
-            tracing::info!("Registered plugin tool: {}", tool.name());
-            tools.register(tool);
-        }
+        start_plugins(&mut plugin_manager, config, root_dir, turns).await?;
+        register_plugin_tools(&plugin_manager, tools);
     }
-
     let plugin_routes = plugin_manager.collect_routes();
     Ok((plugin_manager, plugin_routes))
+}
+
+/// Init every plugin (a bad config is fatal), then start them (a failed
+/// start is not).
+async fn start_plugins(
+    plugin_manager: &mut PluginManager,
+    config: &Config,
+    root_dir: &Path,
+    turns: &super::turns::TurnRunner,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let plugin_provider = crate::providers::create_provider_arc(config, root_dir)?;
+    plugin_manager
+        .init_all(config, root_dir, plugin_provider, turns.clone())
+        .await?;
+    plugin_manager.start_all().await?;
+    tracing::info!("{} plugin(s) started", plugin_manager.count());
+    Ok(())
+}
+
+fn register_plugin_tools(plugin_manager: &PluginManager, tools: &mut ToolRegistry) {
+    for tool in plugin_manager.collect_tools() {
+        tracing::info!("Registered plugin tool: {}", tool.name());
+        tools.register(tool);
+    }
 }
 
 /// Generate AWARENESS.md from the current config, plugins, and tools.
@@ -307,57 +320,65 @@ pub fn spawn_event_listener(
 /// graph (if enabled), ensuring server-side conversations flow into recall.
 pub fn spawn_session_cleanup(config: &Config, state: &Arc<super::AppState>) {
     spawn_call_sweep(state);
-    if config.sessions.persist {
-        let cleanup_state = Arc::clone(state);
-        let cleanup_interval = config.sessions.cleanup_interval_seconds;
-        let graph_enabled = config.graph.enabled && config.graph.auto_ingest;
-        tokio::spawn(async move {
-            let mut interval =
-                tokio::time::interval(std::time::Duration::from_secs(cleanup_interval));
-            interval.tick().await; // Skip first immediate tick
-            loop {
-                interval.tick().await;
-                // Shed while isolated: cleanup archives, persists, and graph-
-                // ingests — all writes (coordinator spec, Stage 2).
-                if crate::server::isolation::is_active(&cleanup_state.root_dir) {
-                    continue;
-                }
-                let archived_paths = cleanup_state
-                    .session_store
-                    .cleanup_expired(&cleanup_state.root_dir, &cleanup_state.config.pulse.name)
-                    .await;
-                cleanup_state.session_store.persist_all().await;
+    if !config.sessions.persist {
+        return;
+    }
+    let cleanup_state = Arc::clone(state);
+    let cleanup_interval = config.sessions.cleanup_interval_seconds;
+    let ingest = config.graph.enabled && config.graph.auto_ingest;
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(cleanup_interval));
+        interval.tick().await; // Skip first immediate tick
+        loop {
+            interval.tick().await;
+            cleanup_sessions(&cleanup_state, ingest).await;
+        }
+    });
+    tracing::info!("Session cleanup task started (every {}s)", cleanup_interval);
+}
 
-                // Ingest expired session archives into the knowledge graph
-                // Uses spawn_blocking + dedicated runtime because SurrealDB
-                // types are not Send.
-                if graph_enabled && !archived_paths.is_empty() {
-                    let state_for_graph = Arc::clone(&cleanup_state);
-                    let _ = tokio::task::spawn_blocking(move || {
-                        let rt = match tokio::runtime::Runtime::new() {
-                            Ok(rt) => rt,
-                            Err(e) => {
-                                tracing::warn!("graph ingest: failed to create runtime: {}", e);
-                                return;
-                            }
-                        };
-                        rt.block_on(async {
-                            for path in &archived_paths {
-                                crate::session::graph_ingest_archive(
-                                    &state_for_graph.root_dir,
-                                    path,
-                                    state_for_graph.graph_extractor.as_ref(),
-                                )
-                                .await;
-                            }
-                        });
-                    })
-                    .await;
-                }
+/// One cleanup pass: archive the expired sessions, persist the rest, and
+/// ingest the archives into the knowledge graph when `ingest` is on. Shed
+/// while isolated: cleanup archives, persists, and graph-ingests — all
+/// writes (coordinator spec, Stage 2).
+pub(crate) async fn cleanup_sessions(state: &Arc<super::AppState>, ingest: bool) {
+    if crate::server::isolation::is_active(&state.root_dir) {
+        return;
+    }
+    let archived_paths = state
+        .session_store
+        .cleanup_expired(&state.root_dir, &state.config.pulse.name)
+        .await;
+    state.session_store.persist_all().await;
+    if ingest && !archived_paths.is_empty() {
+        ingest_expired_archives(state, archived_paths).await;
+    }
+}
+
+/// Ingest expired session archives into the knowledge graph. Uses
+/// spawn_blocking + a dedicated runtime because SurrealDB types are not Send.
+async fn ingest_expired_archives(state: &Arc<super::AppState>, archived_paths: Vec<PathBuf>) {
+    let state_for_graph = Arc::clone(state);
+    let _ = tokio::task::spawn_blocking(move || {
+        let rt = match tokio::runtime::Runtime::new() {
+            Ok(rt) => rt,
+            Err(e) => {
+                tracing::warn!("graph ingest: failed to create runtime: {}", e);
+                return;
+            }
+        };
+        rt.block_on(async {
+            for path in &archived_paths {
+                crate::session::graph_ingest_archive(
+                    &state_for_graph.root_dir,
+                    path,
+                    state_for_graph.graph_extractor.as_ref(),
+                )
+                .await;
             }
         });
-        tracing::info!("Session cleanup task started (every {}s)", cleanup_interval);
-    }
+    })
+    .await;
 }
 
 #[cfg(test)]
@@ -391,5 +412,65 @@ mod tests {
         assert!(prompt.contains(stamp), "prompt carries this boot's file");
         assert!(prompt.contains("Test — Platform Awareness"));
         assert!(!prompt.contains("STALE AWARENESS"));
+    }
+
+    fn with_plugin(name: &str) -> Config {
+        let mut config = crate::config::test_support::offline_config();
+        config.plugins.insert(
+            name.to_string(),
+            toml::Value::Table(toml::value::Table::new()),
+        );
+        config
+    }
+
+    #[tokio::test]
+    async fn configured_plugins_are_initialized_and_started() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = with_plugin("caliber-echo");
+        let mut tools = ToolRegistry::new();
+        let (manager, _routes) = init_and_start_plugins(
+            &config,
+            dir.path(),
+            &mut tools,
+            &super::super::turns::TurnRunner::new(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(manager.count(), 1);
+        assert_eq!(manager.running_count(), 1);
+        assert!(manager.is_started());
+    }
+
+    #[tokio::test]
+    async fn no_plugins_means_nothing_to_start() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = crate::config::test_support::offline_config();
+        let mut tools = ToolRegistry::new();
+        let (manager, _routes) = init_and_start_plugins(
+            &config,
+            dir.path(),
+            &mut tools,
+            &super::super::turns::TurnRunner::new(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(manager.count(), 0);
+        assert!(!manager.is_started());
+    }
+
+    #[tokio::test]
+    async fn plugins_without_a_provider_do_not_start() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = with_plugin("caliber-echo");
+        config.llm.provider = "no-such-provider".to_string();
+        let mut tools = ToolRegistry::new();
+        let outcome = init_and_start_plugins(
+            &config,
+            dir.path(),
+            &mut tools,
+            &super::super::turns::TurnRunner::new(),
+        )
+        .await;
+        assert!(outcome.is_err());
     }
 }

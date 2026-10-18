@@ -8,7 +8,6 @@ use crate::config::Config;
 use crate::events::EventBus;
 use crate::persist::PersistCoordinator;
 use crate::scheduler::intent::IntentQueue;
-use crate::scheduler::Schedule;
 use crate::session_store::SessionStore;
 
 use super::AppState;
@@ -34,14 +33,37 @@ pub async fn boot_pulse(
     fallback_port: u16,
 ) -> Result<BootedPulse, Box<dyn std::error::Error>> {
     super::ensure_infrastructure(&root_dir);
-
-    // Create LLM provider
     let provider = crate::providers::create_streaming_provider(&config, &root_dir)?;
+    let (state, plugin_routes) = assemble_pulse_state(config, root_dir, provider).await?;
 
-    // Monitoring
+    // Scheduler — gated on control-plane leadership (fail-open: the pulse's
+    // interactive surfaces never wait on the coordinator).
+    let (coordinator, intent_queue) = super::daemon::start_control_plane(&state).await?;
+    spawn_pulse_tasks(&state, &intent_queue).await;
+
+    // Build router (plugin_routes collected before AppState construction)
+    let app = super::build_router(Arc::clone(&state), plugin_routes);
+    let (listener, actual_port) = bind_pulse_listener(&state.config, fallback_port).await?;
+    let server_handle = serve_pulse(state.config.pulse.name.clone(), listener, app);
+
+    Ok(BootedPulse {
+        server_handle,
+        coordinator,
+        event_bus: Arc::clone(&state.event_bus),
+        actual_port,
+        persist_coordinator: Arc::clone(&state.persist_coordinator),
+        turns: state.turns.clone(),
+    })
+}
+
+/// Monitoring, tools, plugins, the system prompt and the stores, assembled
+/// into the state the plugin turn runner is bound to.
+async fn assemble_pulse_state(
+    config: Config,
+    root_dir: PathBuf,
+    provider: Box<dyn crate::streaming::StreamingProvider>,
+) -> Result<(Arc<AppState>, axum::Router<()>), Box<dyn std::error::Error>> {
     let monitors = super::setup::create_monitors(&config);
-
-    // Tools
     let mut tools = super::setup::register_builtin_tools(&root_dir, &config);
 
     // Plugins (init, start, collect tools + routes); their turns wait on
@@ -56,10 +78,7 @@ pub async fn boot_pulse(
         super::setup::awareness_then_system_prompt(&root_dir, &config, &plugin_manager, &tools)
             .await?;
 
-    // Event bus
     let event_bus = Arc::new(EventBus::new(64));
-
-    // Persist coordinator
     let persist_coordinator = Arc::new(PersistCoordinator::new());
 
     // Session store (with identity for migration support)
@@ -72,17 +91,7 @@ pub async fn boot_pulse(
     )
     .await;
     session_store.set_coordinator(Arc::clone(&persist_coordinator));
-
-    // Context buffer
-    let context_buffer = if config.context_buffer.enabled {
-        let mut cb =
-            crate::context_buffer::ContextBufferStore::new(&root_dir, &config.context_buffer).await;
-        cb.set_coordinator(Arc::clone(&persist_coordinator));
-        Some(cb)
-    } else {
-        None
-    };
-
+    let context_buffer = pulse_context_buffer(&config, &root_dir, &persist_coordinator).await;
     let alert_queue = crate::scheduler::alerts::AlertQueue::load(&root_dir);
 
     let state = Arc::new(AppState {
@@ -91,7 +100,7 @@ pub async fn boot_pulse(
         session_store,
         system_prompt: RwLock::new(system_prompt),
         tools,
-        event_bus: Arc::clone(&event_bus),
+        event_bus,
         root_dir: root_dir.clone(),
         pipeline_monitor: monitors.pipeline,
         cognitive_monitor: monitors.cognitive,
@@ -114,42 +123,48 @@ pub async fn boot_pulse(
         turns,
     });
     state.turns.bind(&state);
+    Ok((state, plugin_routes))
+}
 
-    // Pipeline health check
-    super::setup::startup_pipeline_check(&root_dir, &config, &state.pipeline_monitor);
-    super::setup::void_open_predictions(&root_dir).await;
-
-    // Scheduler — gated on control-plane leadership (fail-open: the pulse's
-    // interactive surfaces never wait on the coordinator).
-    let schedule = Schedule::load_or_init(&root_dir)?;
-    let schedule = Arc::new(RwLock::new(schedule));
-    let intent_queue = IntentQueue::load(&root_dir);
-    let intent_queue = Arc::new(RwLock::new(intent_queue));
-    let coordinator = crate::coordinator::control::Coordinator::start(
-        Arc::clone(&state),
-        Arc::clone(&schedule),
-        Arc::clone(&intent_queue),
-    );
-
-    // Give the plugin manager access to the event bus for runtime state-change events
-    {
-        let mut pm = state.plugin_manager.lock().await;
-        pm.set_event_bus(Arc::clone(&event_bus));
+/// The channel context buffer, when enabled.
+async fn pulse_context_buffer(
+    config: &Config,
+    root_dir: &std::path::Path,
+    persist_coordinator: &Arc<PersistCoordinator>,
+) -> Option<crate::context_buffer::ContextBufferStore> {
+    if !config.context_buffer.enabled {
+        return None;
     }
+    let mut buffer =
+        crate::context_buffer::ContextBufferStore::new(root_dir, &config.context_buffer).await;
+    buffer.set_coordinator(Arc::clone(persist_coordinator));
+    Some(buffer)
+}
 
-    // Spawn background tasks
-    super::setup::spawn_event_listener(&config, &event_bus, &intent_queue, &root_dir);
-    super::setup::spawn_session_cleanup(&config, &state);
-    super::setup::spawn_awareness_listener(&event_bus, &state);
-    super::setup::spawn_health_monitor(&config, &state);
+/// The plugin manager learns the event bus for runtime state-change events;
+/// then the background tasks.
+async fn spawn_pulse_tasks(state: &Arc<AppState>, intent_queue: &Arc<RwLock<IntentQueue>>) {
+    state
+        .plugin_manager
+        .lock()
+        .await
+        .set_event_bus(Arc::clone(&state.event_bus));
+    let config = &state.config;
+    super::setup::spawn_event_listener(config, &state.event_bus, intent_queue, &state.root_dir);
+    super::setup::spawn_session_cleanup(config, state);
+    super::setup::spawn_awareness_listener(&state.event_bus, state);
+    super::setup::spawn_health_monitor(config, state);
+}
 
-    // Build router (plugin_routes collected before AppState construction)
-    let app = super::build_router(Arc::clone(&state), plugin_routes);
-
-    // The pulse's own host:port when the port is free; the registry's
-    // fallback otherwise, said out loud (PN-104).
-    let pulse_name = config.pulse.name.clone();
-    let (host, host_note) = bind_host(&config.server.host, has_usable_secret(&config));
+/// The pulse's own host:port when the port is free; the registry's fallback
+/// otherwise, said out loud (PN-104). Returns the listener and the port it
+/// actually bound.
+async fn bind_pulse_listener(
+    config: &Config,
+    fallback_port: u16,
+) -> Result<(tokio::net::TcpListener, u16), Box<dyn std::error::Error>> {
+    let pulse_name = &config.pulse.name;
+    let (host, host_note) = bind_host(&config.server.host, has_usable_secret(config));
     if let Some(note) = host_note {
         tracing::warn!("Pulse \"{}\": {}", pulse_name, note);
     }
@@ -159,26 +174,22 @@ pub async fn boot_pulse(
     if let Some(note) = fallback_note {
         tracing::warn!("Pulse \"{}\": {}", pulse_name, note);
     }
-    let addr = format!("{host}:{port}");
-    let listener = tokio::net::TcpListener::bind(&addr).await?;
+    let listener = tokio::net::TcpListener::bind(format!("{host}:{port}")).await?;
     let actual_port = listener.local_addr()?.port();
-
     tracing::info!("Pulse \"{}\" listening on :{}", pulse_name, actual_port);
+    Ok((listener, actual_port))
+}
 
-    // Spawn server as background task (non-blocking)
-    let server_handle = tokio::spawn(async move {
+/// Serve as a background task (non-blocking).
+fn serve_pulse(
+    pulse_name: String,
+    listener: tokio::net::TcpListener,
+    app: axum::Router,
+) -> JoinHandle<()> {
+    tokio::spawn(async move {
         if let Err(e) = axum::serve(listener, app).await {
             tracing::error!("Pulse \"{}\" server error: {}", pulse_name, e);
         }
-    });
-
-    Ok(BootedPulse {
-        server_handle,
-        coordinator,
-        event_bus,
-        actual_port,
-        persist_coordinator: Arc::clone(&state.persist_coordinator),
-        turns: state.turns.clone(),
     })
 }
 
@@ -264,5 +275,85 @@ mod tests {
     #[test]
     fn choose_port_skips_the_probe_when_config_is_the_fallback() {
         assert_eq!(choose_port(3201, 3201, |_| false), (3201, None));
+    }
+
+    use super::{bind_pulse_listener, boot_pulse};
+    use crate::config::test_support::offline_config;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    /// The status line of `GET /health` on a local port.
+    async fn health_status(port: u16) -> std::io::Result<String> {
+        let mut stream = tokio::net::TcpStream::connect(("127.0.0.1", port)).await?;
+        stream
+            .write_all(b"GET /health HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+            .await?;
+        let mut response = String::new();
+        stream.read_to_string(&mut response).await?;
+        Ok(response.lines().next().unwrap_or_default().to_string())
+    }
+
+    /// The pulse serves in the background; the registry's shutdown flushes
+    /// it and stops its server and coordinator.
+    #[tokio::test]
+    async fn a_pulse_serves_in_the_background_until_the_registry_shuts_it_down() {
+        let dir = tempfile::tempdir().unwrap();
+        let booted = boot_pulse(offline_config(), dir.path().to_path_buf(), 0)
+            .await
+            .unwrap();
+        let port = booted.actual_port;
+        assert_ne!(port, 0);
+        assert!(
+            dir.path().join("memory/MEMORY.md").exists(),
+            "infrastructure"
+        );
+        assert_eq!(health_status(port).await.unwrap(), "HTTP/1.1 200 OK");
+
+        let mut registry = crate::registry::PulseRegistry::new(0);
+        registry.register(crate::registry::RunningPulse {
+            name: "Test".into(),
+            dir: dir.path().to_path_buf(),
+            config: offline_config(),
+            port,
+            server_handle: booted.server_handle,
+            coordinator: booted.coordinator,
+            event_bus: booted.event_bus,
+            persist_coordinator: booted.persist_coordinator,
+            turns: booted.turns,
+        });
+        registry.shutdown_all().await;
+        assert_eq!(registry.count(), 0);
+
+        let mut closed = false;
+        for _ in 0..50 {
+            if health_status(port).await.is_err() {
+                closed = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        assert!(closed, "the server still answers after shutdown");
+    }
+
+    #[tokio::test]
+    async fn a_pulse_whose_provider_cannot_be_built_does_not_boot() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = offline_config();
+        config.llm.provider = "no-such-provider".to_string();
+        assert!(boot_pulse(config, dir.path().to_path_buf(), 0)
+            .await
+            .is_err());
+    }
+
+    #[tokio::test]
+    async fn a_taken_configured_port_falls_back_and_a_public_host_stays_on_loopback() {
+        let taken = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let mut config = offline_config();
+        config.server.host = "0.0.0.0".to_string();
+        config.server.port = taken.local_addr().unwrap().port();
+
+        let (listener, port) = bind_pulse_listener(&config, 0).await.unwrap();
+        assert_ne!(port, config.server.port);
+        assert_eq!(listener.local_addr().unwrap().port(), port);
+        assert!(listener.local_addr().unwrap().ip().is_loopback());
     }
 }

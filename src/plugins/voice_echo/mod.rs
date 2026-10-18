@@ -222,4 +222,68 @@ mod tests {
         let json = factory_config(&raw).unwrap();
         assert_eq!(json, serde_json::json!({"llm": {"name": "Echo"}}));
     }
+
+    fn context(dir: &std::path::Path) -> PluginContext {
+        PluginContext {
+            pulse_root: dir.to_path_buf(),
+            pulse_name: "Test".into(),
+            provider: Arc::new(Box::new(crate::ollama_provider::OllamaProvider::new(
+                "test".into(),
+                Some("http://127.0.0.1:9".into()),
+            ))),
+            turns: crate::server::turns::TurnRunner::new(),
+        }
+    }
+
+    fn voice_config() -> toml::Value {
+        toml::Value::Table(toml::toml! {
+            [server]
+            host = "127.0.0.1"
+            port = 0
+            external_url = "https://example.com"
+
+            [twilio]
+            account_sid = "ACtest"
+            auth_token = "token"
+            phone_number = "+15551234567"
+
+            [groq]
+            api_key = "gsk_test"
+
+            [inworld]
+            api_key = "iw_test"
+
+            [claude]
+            bridge_url = "http://127.0.0.1:3200"
+
+            [vad]
+        })
+    }
+
+    /// Init builds the voice server in-process without starting it.
+    #[tokio::test]
+    async fn init_builds_the_voice_server_without_starting_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = context(dir.path());
+        let mut plugin = VoiceEchoPlugin::new();
+        plugin.init(&voice_config(), &ctx).await.unwrap();
+        assert!(matches!(plugin.health().await, PluginHealth::Degraded(_)));
+    }
+
+    #[tokio::test]
+    async fn init_refuses_an_incomplete_config() {
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = context(dir.path());
+        let mut plugin = VoiceEchoPlugin::new();
+        let incomplete = toml::Value::Table(toml::toml! {
+            [server]
+            host = "127.0.0.1"
+        });
+        let err = plugin.init(&incomplete, &ctx).await.unwrap_err();
+        assert!(
+            err.to_string().contains("invalid voice-echo config"),
+            "{err}"
+        );
+        assert!(matches!(plugin.health().await, PluginHealth::Down(_)));
+    }
 }

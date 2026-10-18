@@ -1318,6 +1318,21 @@ pub mod test_support {
             plugin_turns: PluginTurnsConfig::default(),
         }
     }
+
+    /// A pulse that boots without the network: an Ollama provider on a
+    /// closed local port that nothing calls, no graph, no autonomy, no
+    /// scheduler, and an ephemeral loopback port.
+    pub fn offline_config() -> Config {
+        let mut config = minimal_config();
+        config.llm.provider = "ollama".to_string();
+        config.llm.base_url = Some("http://127.0.0.1:9".to_string());
+        config.graph.enabled = false;
+        config.autonomy.enabled = false;
+        config.scheduler.enabled = false;
+        config.server.host = "127.0.0.1".to_string();
+        config.server.port = 0;
+        config
+    }
 }
 
 #[cfg(test)]

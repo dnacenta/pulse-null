@@ -294,28 +294,36 @@ fn open_wal(config: &Config, root_dir: &Path) -> Option<crate::wal::WalWriter> {
     }
 }
 
-/// The startup checks, the control plane, WAL recovery and the background
-/// tasks; returns the coordinator and the router.
+/// The startup checks and the control plane, WAL recovery and the
+/// background tasks; returns the coordinator and the router.
 async fn start_services(
     state: &Arc<AppState>,
     plugin_routes: Router<()>,
 ) -> Result<(Coordinator, Router), BoxError> {
-    // Startup pipeline health check
-    setup::startup_pipeline_check(&state.root_dir, &state.config, &state.pipeline_monitor);
-    setup::void_open_predictions(&state.root_dir).await;
-
-    // Load schedule and intent queue; the coordinator gates the scheduler on
-    // control-plane leadership (fail-open: chat/voice never wait on this).
-    let schedule = Arc::new(RwLock::new(Schedule::load_or_init(&state.root_dir)?));
-    let intent_queue = Arc::new(RwLock::new(IntentQueue::load(&state.root_dir)));
-    let coordinator = Coordinator::start(Arc::clone(state), schedule, Arc::clone(&intent_queue));
-
+    let (coordinator, intent_queue) = start_control_plane(state).await?;
     recover_wal_orphans(state).await;
     spawn_background_tasks(state, &intent_queue).await;
     Ok((
         coordinator,
         super::build_router(Arc::clone(state), plugin_routes),
     ))
+}
+
+/// The startup checks, then the control plane: the schedule and intent
+/// queue, and the coordinator that gates the scheduler on control-plane
+/// leadership (fail-open: chat/voice never wait on this). Shared by the
+/// single-pulse daemon and multi-pulse boot.
+pub(super) async fn start_control_plane(
+    state: &Arc<AppState>,
+) -> Result<(Coordinator, Arc<RwLock<IntentQueue>>), BoxError> {
+    // Startup pipeline health check
+    setup::startup_pipeline_check(&state.root_dir, &state.config, &state.pipeline_monitor);
+    setup::void_open_predictions(&state.root_dir).await;
+
+    let schedule = Arc::new(RwLock::new(Schedule::load_or_init(&state.root_dir)?));
+    let intent_queue = Arc::new(RwLock::new(IntentQueue::load(&state.root_dir)));
+    let coordinator = Coordinator::start(Arc::clone(state), schedule, Arc::clone(&intent_queue));
+    Ok((coordinator, intent_queue))
 }
 
 /// Recover orphaned conversations from the WAL (post-init: provider and
@@ -600,23 +608,9 @@ async fn stop_graph_server(config: &Config) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::test_support::offline_config;
     use crate::init::agent_bootstrap::{BootstrapItem, ItemKind, ItemStatus};
     use std::time::Duration;
-
-    /// A pulse that boots without the network: an Ollama provider on a closed
-    /// local port that nothing calls, no graph, no autonomy, no scheduler,
-    /// and an ephemeral loopback port.
-    fn offline_config() -> Config {
-        let mut config = crate::config::test_support::minimal_config();
-        config.llm.provider = "ollama".to_string();
-        config.llm.base_url = Some("http://127.0.0.1:9".to_string());
-        config.graph.enabled = false;
-        config.autonomy.enabled = false;
-        config.scheduler.enabled = false;
-        config.server.host = "127.0.0.1".to_string();
-        config.server.port = 0;
-        config
-    }
 
     /// A short wait that must NOT see `future` complete.
     async fn stays_pending(future: impl Future<Output = ()>) -> bool {

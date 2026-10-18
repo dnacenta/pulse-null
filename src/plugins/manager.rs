@@ -514,4 +514,137 @@ mod tests {
         manager.set_event_bus(bus);
         // Should not panic — just verifying it accepts the bus
     }
+
+    type SeenConfigs = Arc<std::sync::Mutex<Vec<toml::Value>>>;
+
+    /// Records the config each init receives; refuses when told to.
+    struct RecordsInit {
+        name: &'static str,
+        seen: SeenConfigs,
+        refuse: bool,
+    }
+
+    impl Plugin for RecordsInit {
+        fn meta(&self) -> PluginMeta {
+            PluginMeta {
+                name: self.name.to_string(),
+                version: "0".to_string(),
+                description: String::new(),
+            }
+        }
+
+        fn init<'a>(
+            &'a mut self,
+            config: &'a toml::Value,
+            _ctx: &'a PluginContext,
+        ) -> super::super::PluginResult<'a> {
+            self.seen.lock().unwrap().push(config.clone());
+            let refuse = self.refuse;
+            Box::pin(async move {
+                if refuse {
+                    Err("bad token".into())
+                } else {
+                    Ok(())
+                }
+            })
+        }
+
+        fn start(&mut self) -> super::super::PluginResult<'_> {
+            Box::pin(async { Ok(()) })
+        }
+
+        fn stop(&mut self) -> super::super::PluginResult<'_> {
+            Box::pin(async { Ok(()) })
+        }
+
+        fn health(
+            &self,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = PluginHealth> + Send + '_>>
+        {
+            Box::pin(async { PluginHealth::Healthy })
+        }
+    }
+
+    fn manager_with(plugins: Vec<RecordsInit>) -> PluginManager {
+        let mut manager = PluginManager::new(&test_config());
+        for plugin in plugins {
+            manager.entries.push(PluginEntry {
+                plugin: Box::new(plugin),
+                state: PluginState::Loaded,
+            });
+        }
+        manager
+    }
+
+    fn provider() -> Arc<Box<dyn LmProvider>> {
+        Arc::new(Box::new(crate::ollama_provider::OllamaProvider::new(
+            "test".into(),
+            Some("http://127.0.0.1:9".into()),
+        )))
+    }
+
+    #[tokio::test]
+    async fn each_plugin_is_initialized_with_its_own_table_or_an_empty_one() {
+        let seen: SeenConfigs = Arc::default();
+        let mut manager = manager_with(vec![
+            RecordsInit {
+                name: "configured",
+                seen: Arc::clone(&seen),
+                refuse: false,
+            },
+            RecordsInit {
+                name: "unconfigured",
+                seen: Arc::clone(&seen),
+                refuse: false,
+            },
+        ]);
+        let mut config = test_config();
+        let own: toml::Value = toml::from_str("token = \"t\"").unwrap();
+        config.plugins.insert("configured".into(), own.clone());
+        let dir = tempfile::tempdir().unwrap();
+
+        manager
+            .init_all(
+                &config,
+                dir.path(),
+                provider(),
+                crate::server::turns::TurnRunner::new(),
+            )
+            .await
+            .unwrap();
+        let seen = seen.lock().unwrap().clone();
+        assert_eq!(
+            seen,
+            vec![own, toml::Value::Table(toml::value::Table::new())]
+        );
+    }
+
+    #[tokio::test]
+    async fn the_first_failed_init_stops_the_boot_and_names_the_plugin() {
+        let seen: SeenConfigs = Arc::default();
+        let mut manager = manager_with(vec![
+            RecordsInit {
+                name: "broken",
+                seen: Arc::clone(&seen),
+                refuse: true,
+            },
+            RecordsInit {
+                name: "after",
+                seen: Arc::clone(&seen),
+                refuse: false,
+            },
+        ]);
+        let dir = tempfile::tempdir().unwrap();
+        let err = manager
+            .init_all(
+                &test_config(),
+                dir.path(),
+                provider(),
+                crate::server::turns::TurnRunner::new(),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(err.to_string(), "plugin 'broken' failed: bad token");
+        assert_eq!(seen.lock().unwrap().len(), 1, "no init after the failure");
+    }
 }

@@ -68,6 +68,13 @@ impl PulseRegistry {
     /// flight get the drain window. Then flushes in-flight persistence tasks
     /// before aborting server/scheduler handles so no writes are lost.
     pub async fn shutdown_all(&mut self) {
+        self.quiesce_plugin_turns().await;
+        for (name, pulse) in self.pulses.drain() {
+            shut_down_pulse(&name, pulse).await;
+        }
+    }
+
+    async fn quiesce_plugin_turns(&self) {
         use crate::server::turns::{TurnRunner, DRAIN_WINDOW};
         let runners: Vec<TurnRunner> = self.pulses.values().map(|p| p.turns.clone()).collect();
         if !TurnRunner::quiesce_all(&runners, DRAIN_WINDOW).await {
@@ -75,38 +82,41 @@ impl PulseRegistry {
                 "plugin turns still in flight after {DRAIN_WINDOW:?}, proceeding with shutdown"
             );
         }
-
-        for (name, pulse) in self.pulses.drain() {
-            tracing::info!("Shutting down pulse: {}", name);
-
-            // Flush any in-flight persistence tasks (5s timeout per pulse)
-            let in_flight = pulse.persist_coordinator.in_flight_count();
-            if in_flight > 0 {
-                tracing::info!(
-                    "{}: flushing {} in-flight persistence task(s)",
-                    name,
-                    in_flight
-                );
-            }
-            let flushed = pulse
-                .persist_coordinator
-                .flush(std::time::Duration::from_secs(5))
-                .await;
-            if !flushed {
-                tracing::warn!(
-                    "{}: some persistence tasks did not complete before shutdown",
-                    name
-                );
-            }
-
-            pulse.server_handle.abort();
-            pulse.coordinator.shutdown().await;
-        }
     }
 
     /// Number of running pulses.
     pub fn count(&self) -> usize {
         self.pulses.len()
+    }
+}
+
+/// Flush the pulse's in-flight persistence, then stop its server and its
+/// coordinator.
+async fn shut_down_pulse(name: &str, pulse: RunningPulse) {
+    tracing::info!("Shutting down pulse: {}", name);
+    flush_persistence(name, &pulse.persist_coordinator).await;
+    pulse.server_handle.abort();
+    pulse.coordinator.shutdown().await;
+}
+
+/// Flush any in-flight persistence tasks (5s timeout per pulse).
+async fn flush_persistence(name: &str, persist_coordinator: &PersistCoordinator) {
+    let in_flight = persist_coordinator.in_flight_count();
+    if in_flight > 0 {
+        tracing::info!(
+            "{}: flushing {} in-flight persistence task(s)",
+            name,
+            in_flight
+        );
+    }
+    let flushed = persist_coordinator
+        .flush(std::time::Duration::from_secs(5))
+        .await;
+    if !flushed {
+        tracing::warn!(
+            "{}: some persistence tasks did not complete before shutdown",
+            name
+        );
     }
 }
 
