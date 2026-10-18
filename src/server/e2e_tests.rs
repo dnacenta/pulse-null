@@ -2779,7 +2779,7 @@ mod plugin_turns_e2e {
             .unwrap();
 
         let pending = tokio::spawn(async move { turns.run(turn("early", "2002"), None).await });
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        state.turns.wait_in_flight(1).await;
         assert!(!pending.is_finished(), "the turn must wait, not fail");
 
         state.turns.bind(&state);
@@ -2805,40 +2805,32 @@ mod plugin_turns_e2e {
     #[tokio::test]
     async fn close_drains_a_turn_in_flight() {
         let dir = tempfile::tempdir().unwrap();
-        let delay = std::time::Duration::from_millis(300);
-        let state = secured_state(
-            dir.path(),
-            MockProvider::with_delay(vec![mock_text("finished")], delay),
-        )
-        .await;
-        state.turns.bind(&state);
+        let (state, gate) = gated_state(dir.path()).await;
         let turns = state
             .turns
             .for_plugin("discord-text-echo", "discord")
             .unwrap();
 
-        let in_flight = tokio::spawn(async move { turns.run(turn("slow", "2002"), None).await });
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        let in_flight = tokio::spawn(async move { turns.run(turn("hold", "2002"), None).await });
+        gate.wait_holding(1).await;
 
-        let started = std::time::Instant::now();
-        assert!(state.turns.close(std::time::Duration::from_secs(5)).await);
+        let runner = state.turns.clone();
+        let closing =
+            tokio::spawn(async move { runner.close(std::time::Duration::from_secs(30)).await });
+        tokio::task::yield_now().await;
         assert!(
-            started.elapsed() >= std::time::Duration::from_millis(150),
+            !closing.is_finished(),
             "close returned before the turn finished"
         );
-        assert!(in_flight.is_finished());
-        assert_eq!(in_flight.await.unwrap().unwrap().response, "finished");
+        gate.open();
+        assert!(closing.await.unwrap());
+        assert_eq!(in_flight.await.unwrap().unwrap().response, "re: hold");
     }
 
     #[tokio::test]
-    async fn a_plugin_has_its_own_pool() {
+    async fn a_plugin_has_its_own_pool_shared_by_its_handles() {
         let dir = tempfile::tempdir().unwrap();
-        let state = secured_state(
-            dir.path(),
-            MockProvider::with_delay(vec![], std::time::Duration::from_millis(300)),
-        )
-        .await;
-        state.turns.bind(&state);
+        let (state, gate) = gated_state(dir.path()).await;
         let turns = state
             .turns
             .for_plugin("discord-text-echo", "discord")
@@ -2851,13 +2843,23 @@ mod plugin_turns_e2e {
                 t.run(turn("hold", &format!("guest-{i}")), None).await
             }));
         }
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        gate.wait_holding(crate::server::turns::PLUGIN_POOL_SIZE)
+            .await;
         let outcome = turns.run(turn("one more", "guest-x"), None).await;
+        assert_eq!(outcome.err(), Some(TurnError::Busy));
+
+        // A second handle for the same plugin is the same pool (audit #11).
+        let again = state
+            .turns
+            .for_plugin("discord-text-echo", "discord")
+            .unwrap();
+        let outcome = again.run(turn("and another", "guest-y"), None).await;
         assert_eq!(outcome.err(), Some(TurnError::Busy));
 
         // Another plugin is not starved by the first one's burst.
         let voice = state.turns.for_plugin("voice-echo", "voice").unwrap();
         assert!(voice.run(turn("hello", "caller"), None).await.is_ok());
+        gate.open();
         for r in running {
             assert!(r.await.unwrap().is_ok());
         }
@@ -3110,7 +3112,9 @@ mod tool_surface_e2e {
 #[cfg(feature = "discord-text")]
 mod discord_forwarder_e2e {
     use super::*;
-    use crate::plugins::discord_forwarder::{DiscordLink, Forwarder, Handled, ReplyPoster};
+    use crate::plugins::discord_forwarder::{
+        DiscordLink, Forwarder, Handled, PostError, ReplyPoster,
+    };
     use discord_echo::dedup::DedupState;
     use discord_echo::types::IncomingMessage;
     use std::future::Future;
@@ -3147,7 +3151,7 @@ mod discord_forwarder_e2e {
             &'a self,
             channel_id: &'a str,
             text: &'a str,
-        ) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + 'a>> {
+        ) -> Pin<Box<dyn Future<Output = Result<(), PostError>> + Send + 'a>> {
             self.posts
                 .lock()
                 .unwrap()

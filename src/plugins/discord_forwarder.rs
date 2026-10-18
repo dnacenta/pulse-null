@@ -19,7 +19,7 @@ use discord_echo::types::IncomingMessage;
 use tokio::sync::{mpsc, watch, Mutex, Notify};
 use tokio::task::{JoinHandle, JoinSet};
 
-use crate::server::turns::{PluginTurn, PluginTurns, SlotWait, DRAIN_WINDOW};
+use crate::server::turns::{PluginTurn, PluginTurns, SlotWait, TurnError, DRAIN_WINDOW};
 use pulse_system_types::SetupPrompt;
 
 /// Replies that start with one of these are the pulse choosing to stay
@@ -76,13 +76,18 @@ pub(crate) fn setup_prompts() -> Vec<SetupPrompt> {
     ]
 }
 
+/// Discord refused a reply, with what its client said.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error("discord refused the reply: {0}")]
+pub(crate) struct PostError(pub(crate) String);
+
 /// Where replies go. The real one is Discord's REST API; tests use a fake.
 pub(crate) trait ReplyPoster: Send + Sync {
     fn post<'a>(
         &'a self,
         channel_id: &'a str,
         text: &'a str,
-    ) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + 'a>>;
+    ) -> Pin<Box<dyn Future<Output = Result<(), PostError>> + Send + 'a>>;
 }
 
 impl ReplyPoster for DiscordClient {
@@ -90,11 +95,11 @@ impl ReplyPoster for DiscordClient {
         &'a self,
         channel_id: &'a str,
         text: &'a str,
-    ) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + 'a>> {
+    ) -> Pin<Box<dyn Future<Output = Result<(), PostError>> + Send + 'a>> {
         Box::pin(async move {
             self.send_message_by_id(channel_id, text)
                 .await
-                .map_err(|e| e.to_string())
+                .map_err(|e| PostError(e.to_string()))
         })
     }
 }
@@ -111,9 +116,9 @@ pub(crate) enum Handled {
     /// The pulse chose silence, or said nothing.
     Silent,
     /// The turn did not run or failed.
-    TurnFailed(String),
+    TurnFailed(TurnError),
     /// The turn ran but Discord refused the reply.
-    PostFailed(String),
+    PostFailed(PostError),
 }
 
 /// Runs each incoming message as a turn and posts the reply.
@@ -183,7 +188,7 @@ impl<P: ReplyPoster> Forwarder<P> {
             Ok(reply) => reply.response,
             Err(e) => {
                 tracing::warn!("discord: turn for message {} failed: {e}", msg.message_id);
-                return Handled::TurnFailed(e.to_string());
+                return Handled::TurnFailed(e);
             }
         };
 

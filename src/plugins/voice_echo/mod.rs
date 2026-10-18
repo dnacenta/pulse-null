@@ -16,8 +16,11 @@ const NAME: &str = "voice-echo";
 const SLOT_WAIT: std::time::Duration = std::time::Duration::from_secs(2);
 
 /// Adapter wrapping the voice-echo crate. Calls run in-process: voice-echo
-/// gets [`brain::TurnBrain`] as its LLM provider (its Local brain), so no
-/// transcript, `/session-started` or `/call-ended` ever reaches `/chat`.
+/// gets [`brain::TurnBrain`] as its LLM provider (its Local brain). With no
+/// `bridge_url` it posts nothing to the daemon over HTTP — no transcript to
+/// `/chat`, no `/session-started` or `/call-ended` notice — since every
+/// such post in voice-echo 0.8.0 is gated on `llm.bridge_url`, which
+/// [`factory_config`] strips.
 pub struct VoiceEchoPlugin {
     inner: Option<Box<dyn pst05::plugin::Plugin>>,
     task: Option<tokio::task::JoinHandle<()>>,

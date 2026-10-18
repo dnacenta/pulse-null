@@ -17,8 +17,9 @@
 //! carry `allow(dead_code)` in a build without one. The gate lints each
 //! plugin feature on its own and together.
 
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Arc, OnceLock, Weak};
+use std::sync::{Arc, Mutex, OnceLock, Weak};
 use std::time::Duration;
 
 use axum::http::StatusCode;
@@ -34,10 +35,11 @@ use crate::tool_loop::TurnSink;
 /// How long a turn waits for the runner to be bound before giving up.
 pub const READY_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// Concurrent turns per plugin. Each plugin has its own pool, so a Discord
-/// burst never eats a voice call's budget, and neither touches the HTTP
-/// stream pool the TUI uses. What a turn does when the pool is full is the
-/// plugin's [`SlotWait`].
+/// Concurrent turns per plugin. The pool belongs to the plugin's name, so
+/// every handle the plugin takes shares it; a Discord burst never eats a
+/// voice call's budget, and neither touches the HTTP stream pool the TUI
+/// uses. What a turn does when the pool is full is the handle's
+/// [`SlotWait`].
 #[cfg_attr(
     not(any(feature = "voice", feature = "discord-text")),
     allow(dead_code)
@@ -109,6 +111,55 @@ pub fn is_reserved_channel(channel: &str) -> bool {
         .any(|reserved| reserved.eq_ignore_ascii_case(channel))
 }
 
+/// Why a plugin could not be bound to a channel.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[cfg_attr(
+    not(any(feature = "voice", feature = "discord-text")),
+    allow(dead_code)
+)]
+pub enum BindError {
+    /// Empty, too long, or with path characters in it.
+    #[error("plugin {plugin}: invalid channel name {channel:?}")]
+    InvalidChannel {
+        plugin: &'static str,
+        channel: String,
+    },
+    /// One of [`RESERVED_CHANNELS`].
+    #[error(
+        "plugin {plugin}: channel {channel:?} is reserved ({}); pick another",
+        RESERVED_CHANNELS.join(", ")
+    )]
+    ReservedChannel {
+        plugin: &'static str,
+        channel: String,
+    },
+}
+
+/// One plugin's turn budget: its pool and its rate bucket. Shared by every
+/// handle the plugin takes (cloning shares).
+#[derive(Clone)]
+#[cfg_attr(
+    not(any(feature = "voice", feature = "discord-text")),
+    allow(dead_code)
+)]
+struct Budget {
+    pool: Arc<Semaphore>,
+    rate: Arc<RateLimiter>,
+}
+
+#[cfg_attr(
+    not(any(feature = "voice", feature = "discord-text")),
+    allow(dead_code)
+)]
+impl Budget {
+    fn new() -> Self {
+        Self {
+            pool: Arc::new(Semaphore::new(PLUGIN_POOL_SIZE)),
+            rate: Arc::new(RateLimiter::new(PLUGIN_RATE_BURST, PLUGIN_RATE_PER_SECOND)),
+        }
+    }
+}
+
 /// Why a plugin turn did not run.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 #[cfg_attr(
@@ -144,6 +195,12 @@ struct Shared {
     in_flight: AtomicUsize,
     /// Woken when the last in-flight turn finishes.
     drained: Notify,
+    /// Each plugin's pool and rate bucket, by plugin name.
+    #[cfg_attr(
+        not(any(feature = "voice", feature = "discord-text")),
+        allow(dead_code)
+    )]
+    budgets: Mutex<HashMap<&'static str, Budget>>,
     #[cfg_attr(
         not(any(feature = "voice", feature = "discord-text")),
         allow(dead_code)
@@ -181,6 +238,7 @@ impl TurnRunner {
                 changed: Notify::new(),
                 in_flight: AtomicUsize::new(0),
                 drained: Notify::new(),
+                budgets: Mutex::new(HashMap::new()),
                 ready_timeout,
             }),
         }
@@ -260,29 +318,45 @@ impl TurnRunner {
     /// A plugin's handle for running turns on `channel`, as
     /// `AuthIdentity::Plugin { name, channel }`. Refuses a reserved, empty
     /// or malformed channel, so a misconfigured plugin fails at init rather
-    /// than speaking as the owner.
-    pub fn for_plugin(&self, name: &'static str, channel: &str) -> Result<PluginTurns, String> {
+    /// than speaking as the owner. Every handle for the same `name` shares
+    /// one pool and one rate bucket.
+    pub fn for_plugin(&self, name: &'static str, channel: &str) -> Result<PluginTurns, BindError> {
         if channel.is_empty()
             || channel.len() > MAX_CHANNEL_LEN
             || channel.contains("..")
             || channel.contains('/')
         {
-            return Err(format!("plugin {name}: invalid channel name {channel:?}"));
+            return Err(BindError::InvalidChannel {
+                plugin: name,
+                channel: channel.to_string(),
+            });
         }
         if is_reserved_channel(channel) {
-            return Err(format!(
-                "plugin {name}: channel {channel:?} is reserved ({}); pick another",
-                RESERVED_CHANNELS.join(", ")
-            ));
+            return Err(BindError::ReservedChannel {
+                plugin: name,
+                channel: channel.to_string(),
+            });
         }
-        Ok(PluginTurns {
+        Ok(self.handle(name, channel))
+    }
+
+    /// A handle for `name` on `channel`, with the plugin's shared budget.
+    fn handle(&self, name: &'static str, channel: &str) -> PluginTurns {
+        let budget = self
+            .shared
+            .budgets
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .entry(name)
+            .or_insert_with(Budget::new)
+            .clone();
+        PluginTurns {
             runner: self.clone(),
             name,
             channel: channel.to_string(),
-            pool: Arc::new(Semaphore::new(PLUGIN_POOL_SIZE)),
+            budget,
             slot_wait: SlotWait::Never,
-            rate: Arc::new(RateLimiter::new(PLUGIN_RATE_BURST, PLUGIN_RATE_PER_SECOND)),
-        })
+        }
     }
 
     fn is_closed(&self) -> bool {
@@ -352,8 +426,8 @@ pub struct PluginTurn {
     pub sender: Option<String>,
 }
 
-/// One plugin's way into the turn pipeline: its principal, its channel, its
-/// own concurrency pool.
+/// One plugin's way into the turn pipeline: its principal, its channel, and
+/// the plugin's shared pool and rate bucket.
 #[derive(Clone)]
 #[cfg_attr(
     not(any(feature = "voice", feature = "discord-text")),
@@ -363,9 +437,8 @@ pub struct PluginTurns {
     runner: TurnRunner,
     name: &'static str,
     channel: String,
-    pool: Arc<Semaphore>,
+    budget: Budget,
     slot_wait: SlotWait,
-    rate: Arc<RateLimiter>,
 }
 
 #[cfg_attr(
@@ -397,7 +470,7 @@ impl PluginTurns {
         if self.runner.is_closed() {
             return Err(TurnError::ShuttingDown);
         }
-        if !self.rate.try_acquire().await {
+        if !self.budget.rate.try_acquire().await {
             tracing::warn!("plugin {}: turn refused, over its rate limit", self.name);
             return Err(TurnError::RateLimited);
         }
@@ -423,7 +496,7 @@ impl PluginTurns {
 
     /// A slot in the plugin's pool, waiting as [`SlotWait`] allows.
     async fn slot(&self) -> Result<OwnedSemaphorePermit, TurnError> {
-        let pool = Arc::clone(&self.pool);
+        let pool = Arc::clone(&self.budget.pool);
         let acquired = match self.slot_wait {
             SlotWait::Never => return pool.try_acquire_owned().map_err(|_| TurnError::Busy),
             SlotWait::Up(limit) => tokio::time::timeout(limit, pool.acquire_owned())
@@ -438,6 +511,19 @@ impl PluginTurns {
 
 #[cfg(test)]
 impl TurnRunner {
+    /// How many turns are in flight (entered, not yet finished).
+    pub(crate) fn in_flight(&self) -> usize {
+        self.shared.in_flight.load(Ordering::SeqCst)
+    }
+
+    /// Wait until `n` turns are in flight — a turn counts once it is past
+    /// its slot and waiting for the bind or running.
+    pub(crate) async fn wait_in_flight(&self, n: usize) {
+        while self.in_flight() < n {
+            tokio::task::yield_now().await;
+        }
+    }
+
     /// An unbound runner with a short readiness wait, for tests.
     pub(crate) fn with_test_timeout(ready_timeout: Duration) -> Self {
         Self::with_ready_timeout(ready_timeout)
@@ -446,22 +532,15 @@ impl TurnRunner {
     /// The principal a plugin's turns would carry, bypassing `for_plugin`'s
     /// checks — lets a test prove `run_turn` refuses on its own.
     pub(crate) fn unchecked_plugin(&self, name: &'static str, channel: &str) -> PluginTurns {
-        PluginTurns {
-            runner: self.clone(),
-            name,
-            channel: channel.to_string(),
-            pool: Arc::new(Semaphore::new(PLUGIN_POOL_SIZE)),
-            slot_wait: SlotWait::Never,
-            rate: Arc::new(RateLimiter::new(PLUGIN_RATE_BURST, PLUGIN_RATE_PER_SECOND)),
-        }
+        self.handle(name, channel)
     }
 }
 
 #[cfg(test)]
 impl PluginTurns {
-    /// This handle with its own rate limit, for tests.
+    /// This handle with a rate bucket of its own, for tests.
     pub(crate) fn with_rate_limit(mut self, burst: u32, per_second: f64) -> Self {
-        self.rate = Arc::new(RateLimiter::new(burst, per_second));
+        self.budget.rate = Arc::new(RateLimiter::new(burst, per_second));
         self
     }
 }
@@ -490,8 +569,21 @@ mod tests {
             );
         }
         for channel in ["", "a/b", "..", &"x".repeat(65)] {
-            assert!(runner.for_plugin("test", channel).is_err(), "{channel:?}");
+            assert!(
+                matches!(
+                    runner.for_plugin("test", channel),
+                    Err(BindError::InvalidChannel { .. })
+                ),
+                "{channel:?}"
+            );
         }
+        assert_eq!(
+            runner.for_plugin("test", "tui").err(),
+            Some(BindError::ReservedChannel {
+                plugin: "test",
+                channel: "tui".to_string()
+            })
+        );
         let turns = runner
             .for_plugin("test", "discord")
             .expect("discord is fine");
@@ -566,7 +658,12 @@ mod tests {
                 )
                 .await
         });
-        tokio::time::sleep(Duration::from_millis(20)).await;
+        // The turn is in flight and parked on the bind before the close.
+        runner.wait_in_flight(1).await;
+        assert!(
+            !waiting.is_finished(),
+            "the turn must be waiting for the bind"
+        );
         assert!(runner.close(Duration::from_secs(5)).await);
         let outcome = waiting.await.unwrap();
         assert_eq!(outcome.err(), Some(TurnError::ShuttingDown));
