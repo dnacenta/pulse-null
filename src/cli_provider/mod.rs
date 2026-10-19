@@ -26,6 +26,7 @@ use tracing::warn;
 use crate::errors::{CliError, QuotaError, RefusalError};
 use crate::session::strip_system_prefixes;
 use crate::streaming::{StreamEvent, StreamResult, StreamingProvider};
+use crate::tool_surface::ToolSurface;
 
 use adapter::{
     CliAdapter, ExitClass, Invocation, OutputMode, PromptDelivery, Reply, StreamLine,
@@ -82,7 +83,8 @@ pub struct CliProvider {
     /// the user's home. It is also consulted per invocation for the
     /// isolation marker: while isolated, the spawned CLI is restricted to
     /// read-only tools, because the in-process tool registry swap cannot
-    /// reach a subprocess that brings its own tools.
+    /// reach a subprocess that brings its own tools. A non-owner turn gets
+    /// no tools at all (see [`CliProvider::surface`]).
     pulse_root: PathBuf,
 }
 
@@ -112,6 +114,16 @@ impl CliProvider {
     pub fn with_reasoning_effort(mut self, effort: Option<String>) -> Self {
         self.reasoning_effort = effort;
         self
+    }
+
+    /// The tool surface this invocation gets: the turn's own
+    /// ([`crate::tool_surface`]), narrowed while the pulse is isolated. Read
+    /// when the invocation is built, on the turn's own task.
+    fn surface(&self) -> ToolSurface {
+        crate::tool_surface::effective(
+            crate::tool_surface::current(),
+            crate::server::isolation::is_active(&self.pulse_root),
+        )
     }
 
     /// The adapter's config name.
@@ -488,141 +500,17 @@ impl LmProvider for CliProvider {
         _max_tokens: u32,
         _tools: Option<&[serde_json::Value]>,
     ) -> LlmResult<'_> {
-        let system_prompt = system_prompt.to_string();
-        let messages = messages.to_vec();
-        let model = self.model.clone();
-        let bin = self.bin.clone();
-        let pulse_root = self.pulse_root.clone();
-        let reasoning_effort = self.reasoning_effort.clone();
-        let restricted = crate::server::isolation::is_active(&self.pulse_root);
-        let adapter: &dyn CliAdapter = self.adapter.as_ref();
-
-        Box::pin(async move {
-            let prompt = serialize_messages(&messages);
-            let name = adapter.name();
-
-            ensure_capability(adapter, &bin, &pulse_root).await?;
-            // Dropped on every exit from this future — success, error, timeout
-            // and cancellation — which unlinks the staged prompts.
-            let staged = stage(adapter, &system_prompt, &prompt)?;
-
-            let args = adapter.invoke_args(&Invocation {
-                model: &model,
-                system_prompt_file: staged.system_prompt_file.as_ref().map(StagedFile::path),
-                system_prompt: &system_prompt,
-                prompt_file: staged.prompt_file.as_ref().map(StagedFile::path),
-                restricted,
-                streaming: false,
-                pulse_root: &pulse_root,
-                reasoning_effort: reasoning_effort.as_deref(),
-            });
-
-            let mut cmd = pulse_command(&bin, &pulse_root, adapter);
-            cmd.args(&args)
-                .stdin(if staged.stdin_text.is_some() {
-                    Stdio::piped()
-                } else {
-                    Stdio::null()
-                })
-                .stdout(Stdio::piped())
-                .stderr(Stdio::piped());
-            // Ensure the subprocess is killed if the timeout fires and drops the future.
-            cmd.kill_on_drop(true);
-
-            let mut child = cmd.spawn().map_err(|e| {
-                Box::new(std::io::Error::new(
-                    e.kind(),
-                    format!("failed to spawn {name} ({bin}): {e}"),
-                )) as BoxError
-            })?;
-
-            if let (Some(text), Some(mut stdin)) = (&staged.stdin_text, child.stdin.take()) {
-                use tokio::io::AsyncWriteExt;
-                stdin.write_all(text.as_bytes()).await.map_err(|e| {
-                    Box::new(std::io::Error::new(
-                        e.kind(),
-                        format!("failed to write to {name} stdin: {e}"),
-                    )) as BoxError
-                })?;
-                // Drop stdin to close it and signal EOF
-            }
-
-            let output = tokio::time::timeout(subprocess_timeout(), child.wait_with_output())
-                .await
-                .map_err(|_| -> BoxError {
-                    format!("{name} timed out after {}s", subprocess_timeout().as_secs()).into()
-                })?
-                .map_err(|e| {
-                    Box::new(std::io::Error::new(
-                        e.kind(),
-                        format!("failed to wait for {name}: {e}"),
-                    )) as BoxError
-                })?;
-
-            let stdout = String::from_utf8_lossy(&output.stdout).to_string();
-            if !output.status.success() {
-                let stderr = String::from_utf8_lossy(&output.stderr);
-
-                // A policy refusal is a distinct, recoverable signal: the chat
-                // handler falls back to another model on it. A spent quota is
-                // typed too, so callers never re-derive it from text.
-                // Everything else (network, timeout, empty) stays generic.
-                let class = adapter.classify_exit(&stdout, &stderr);
-                match &class {
-                    ExitClass::Refusal(detail) => {
-                        return Err(Box::new(RefusalError {
-                            model: model.clone(),
-                            detail: truncate(detail, ERROR_TEXT_MAX).to_string(),
-                        }) as BoxError);
-                    }
-                    ExitClass::FlaggedButUnmatched => {
-                        warn!(
-                            model = %model,
-                            adapter = name,
-                            "CLI exited non-zero with a structured error that did not match \
-                             the refusal signature — detection may have drifted"
-                        );
-                    }
-                    ExitClass::QuotaExhausted => {
-                        warn!(
-                            model = %model,
-                            adapter = name,
-                            "CLI exited non-zero: the provider's usage quota is exhausted"
-                        );
-                    }
-                    ExitClass::Plain => {}
-                }
-
-                // The detail is only what the CLI itself said about the
-                // failure — never raw stdout, which for a streaming CLI is the
-                // model's own transcript (R2-02).
-                let full = failure_text(adapter, &class, &stdout, &stderr);
-                let detail = truncate(&full, ERROR_TEXT_MAX).to_string();
-
-                if class == ExitClass::QuotaExhausted {
-                    return Err(Box::new(QuotaError {
-                        model: model.clone(),
-                        detail,
-                    }) as BoxError);
-                }
-
-                let msg = if detail.is_empty() {
-                    format!("{name} exited {}", output.status)
-                } else {
-                    format!("{name} exited {}: {detail}", output.status)
-                };
-                return Err(msg.into());
-            }
-
-            // An exit-0 reply flagged as an error may be a policy refusal or a
-            // spent quota; type it like the exit-non-zero path does.
-            let reply = match adapter.output_mode(false) {
-                OutputMode::SingleJson => adapter.parse_single(&stdout),
-                OutputMode::Ndjson => reply_from_ndjson(adapter, &stdout),
-            }
-            .map_err(|e| typed_failure(adapter, &model, e))?;
-            Ok(response(reply, &model))
-        })
+        let call = CliCall {
+            adapter: self.adapter.as_ref(),
+            model: self.model.clone(),
+            bin: self.bin.clone(),
+            pulse_root: self.pulse_root.clone(),
+            reasoning_effort: self.reasoning_effort.clone(),
+            surface: self.surface(),
+            system_prompt: system_prompt.to_string(),
+            messages: messages.to_vec(),
+        };
+        Box::pin(call.run())
     }
 
     fn name(&self) -> &str {
@@ -631,6 +519,187 @@ impl LmProvider for CliProvider {
 
     fn supports_tools(&self) -> bool {
         false
+    }
+}
+
+/// One buffered (non-streaming) invocation of the agent CLI, with
+/// everything it needs owned: the surface is read when the call is built,
+/// on the turn's own task.
+struct CliCall<'a> {
+    adapter: &'a dyn CliAdapter,
+    model: String,
+    bin: String,
+    pulse_root: PathBuf,
+    reasoning_effort: Option<String>,
+    surface: ToolSurface,
+    system_prompt: String,
+    messages: Vec<Message>,
+}
+
+impl CliCall<'_> {
+    async fn run(self) -> Result<LlmResponse, BoxError> {
+        let prompt = serialize_messages(&self.messages);
+        ensure_capability(self.adapter, &self.bin, &self.pulse_root).await?;
+        // Dropped on every exit from this future — success, error, timeout
+        // and cancellation — which unlinks the staged prompts.
+        let staged = stage(self.adapter, &self.system_prompt, &prompt)?;
+        let output = self.execute(&staged).await?;
+        let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+        if !output.status.success() {
+            return Err(self.exit_failure(&output, &stdout));
+        }
+        // An exit-0 reply flagged as an error may be a policy refusal or a
+        // spent quota; type it like the exit-non-zero path does.
+        let reply = self
+            .parse_reply(&stdout)
+            .map_err(|e| typed_failure(self.adapter, &self.model, e))?;
+        Ok(response(reply, &self.model))
+    }
+
+    /// Spawn the CLI, hand it the prompt on stdin when the adapter takes it
+    /// there, and collect its output.
+    async fn execute(&self, staged: &Staged) -> Result<std::process::Output, BoxError> {
+        let name = self.adapter.name();
+        let mut child = self.spawn(staged)?;
+        if let (Some(text), Some(stdin)) = (&staged.stdin_text, child.stdin.take()) {
+            write_prompt(name, stdin, text).await?;
+        }
+        wait_for_output(name, child).await
+    }
+
+    fn spawn(&self, staged: &Staged) -> Result<tokio::process::Child, BoxError> {
+        let args = self.adapter.invoke_args(&Invocation {
+            model: &self.model,
+            system_prompt_file: staged.system_prompt_file.as_ref().map(StagedFile::path),
+            system_prompt: &self.system_prompt,
+            prompt_file: staged.prompt_file.as_ref().map(StagedFile::path),
+            surface: self.surface,
+            streaming: false,
+            pulse_root: &self.pulse_root,
+            reasoning_effort: self.reasoning_effort.as_deref(),
+        });
+        let mut cmd = pulse_command(&self.bin, &self.pulse_root, self.adapter);
+        cmd.args(&args)
+            .stdin(if staged.stdin_text.is_some() {
+                Stdio::piped()
+            } else {
+                Stdio::null()
+            })
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        // Ensure the subprocess is killed if the timeout fires and drops the future.
+        cmd.kill_on_drop(true);
+        cmd.spawn().map_err(|e| {
+            Box::new(std::io::Error::new(
+                e.kind(),
+                format!(
+                    "failed to spawn {} ({}): {e}",
+                    self.adapter.name(),
+                    self.bin
+                ),
+            )) as BoxError
+        })
+    }
+
+    /// A non-zero exit, typed. A policy refusal is a distinct, recoverable
+    /// signal: the chat handler falls back to another model on it. A spent
+    /// quota is typed too, so callers never re-derive it from text.
+    /// Everything else (network, timeout, empty) stays generic.
+    fn exit_failure(&self, output: &std::process::Output, stdout: &str) -> BoxError {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let class = self.adapter.classify_exit(stdout, &stderr);
+        if let ExitClass::Refusal(detail) = &class {
+            return Box::new(RefusalError {
+                model: self.model.clone(),
+                detail: truncate(detail, ERROR_TEXT_MAX).to_string(),
+            });
+        }
+        self.warn_on_exit_class(&class);
+        // The detail is only what the CLI itself said about the failure —
+        // never raw stdout, which for a streaming CLI is the model's own
+        // transcript (R2-02).
+        let full = failure_text(self.adapter, &class, stdout, &stderr);
+        let detail = truncate(&full, ERROR_TEXT_MAX).to_string();
+        if class == ExitClass::QuotaExhausted {
+            return Box::new(QuotaError {
+                model: self.model.clone(),
+                detail,
+            });
+        }
+        exited(self.adapter.name(), output.status, &detail).into()
+    }
+
+    fn warn_on_exit_class(&self, class: &ExitClass) {
+        let name = self.adapter.name();
+        match class {
+            ExitClass::FlaggedButUnmatched => {
+                warn!(
+                    model = %self.model,
+                    adapter = name,
+                    "CLI exited non-zero with a structured error that did not match \
+                     the refusal signature — detection may have drifted"
+                );
+            }
+            ExitClass::QuotaExhausted => {
+                warn!(
+                    model = %self.model,
+                    adapter = name,
+                    "CLI exited non-zero: the provider's usage quota is exhausted"
+                );
+            }
+            _ => {}
+        }
+    }
+
+    /// The reply, in the adapter's buffered output mode.
+    fn parse_reply(&self, stdout: &str) -> Result<Reply, String> {
+        match self.adapter.output_mode(false) {
+            OutputMode::SingleJson => self.adapter.parse_single(stdout),
+            OutputMode::Ndjson => reply_from_ndjson(self.adapter, stdout),
+        }
+    }
+}
+
+/// Write the prompt to the CLI's stdin; dropping `stdin` closes it, which
+/// signals EOF.
+async fn write_prompt(
+    name: &str,
+    mut stdin: tokio::process::ChildStdin,
+    text: &str,
+) -> Result<(), BoxError> {
+    use tokio::io::AsyncWriteExt;
+    stdin.write_all(text.as_bytes()).await.map_err(|e| {
+        Box::new(std::io::Error::new(
+            e.kind(),
+            format!("failed to write to {name} stdin: {e}"),
+        )) as BoxError
+    })
+}
+
+/// The CLI's output, within [`subprocess_timeout`].
+async fn wait_for_output(
+    name: &str,
+    child: tokio::process::Child,
+) -> Result<std::process::Output, BoxError> {
+    tokio::time::timeout(subprocess_timeout(), child.wait_with_output())
+        .await
+        .map_err(|_| -> BoxError {
+            format!("{name} timed out after {}s", subprocess_timeout().as_secs()).into()
+        })?
+        .map_err(|e| {
+            Box::new(std::io::Error::new(
+                e.kind(),
+                format!("failed to wait for {name}: {e}"),
+            )) as BoxError
+        })
+}
+
+/// The generic failure for a non-zero exit, with the CLI's own detail.
+fn exited(name: &str, status: std::process::ExitStatus, detail: &str) -> String {
+    if detail.is_empty() {
+        format!("{name} exited {status}")
+    } else {
+        format!("{name} exited {status}: {detail}")
     }
 }
 
@@ -652,7 +721,7 @@ impl StreamingProvider for CliProvider {
         let bin = self.bin.clone();
         let pulse_root = self.pulse_root.clone();
         let reasoning_effort = self.reasoning_effort.clone();
-        let restricted = crate::server::isolation::is_active(&self.pulse_root);
+        let surface = self.surface();
         let adapter: &dyn CliAdapter = self.adapter.as_ref();
 
         Box::pin(async_stream::stream! {
@@ -678,7 +747,7 @@ impl StreamingProvider for CliProvider {
                 system_prompt_file: staged.system_prompt_file.as_ref().map(StagedFile::path),
                 system_prompt: &system_prompt,
                 prompt_file: staged.prompt_file.as_ref().map(StagedFile::path),
-                restricted,
+                surface,
                 streaming: true,
                 pulse_root: &pulse_root,
                 reasoning_effort: reasoning_effort.as_deref(),
@@ -1000,5 +1069,7 @@ fn truncate(s: &str, max: usize) -> &str {
     crate::utils::safe_truncate(s, max)
 }
 
+#[cfg(test)]
+pub(crate) mod fake_cli;
 #[cfg(test)]
 mod tests;

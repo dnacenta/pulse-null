@@ -1680,8 +1680,8 @@ fn build_tools_section(config: &Config, tool_names: &[String]) -> Option<String>
 fn build_cli_tools_section(
     adapter: &dyn crate::cli_provider::adapter::CliAdapter,
 ) -> Option<String> {
-    let surface = adapter.tool_surface(false);
-    let isolated = adapter.tool_surface(true);
+    let surface = adapter.tool_surface(crate::tool_surface::ToolSurface::Full);
+    let isolated = adapter.tool_surface(crate::tool_surface::ToolSurface::Restricted);
     let mut parts = Vec::new();
     if !surface.is_empty() {
         let list: Vec<String> = surface.iter().map(|t| format!("- {t}")).collect();
@@ -2082,6 +2082,7 @@ mod tests {
             peers: std::collections::HashMap::new(),
             plugins: std::collections::HashMap::new(),
             tui: crate::config::TuiConfig::default(),
+            plugin_turns: crate::config::PluginTurnsConfig::default(),
         }
     }
 
@@ -2336,14 +2337,18 @@ mod tests {
         let adapter = |name: &str| crate::cli_provider::adapters::by_name(name).unwrap();
         let known: Vec<&str> = ADAPTERS
             .iter()
-            .flat_map(|name| adapter(name).tool_surface(false).to_vec())
+            .flat_map(|name| {
+                adapter(name)
+                    .tool_surface(crate::tool_surface::ToolSurface::Full)
+                    .to_vec()
+            })
             .chain(REGISTRY_ONLY_TOOLS)
             .chain(["grep", "web_fetch"])
             .collect();
 
         for name in ADAPTERS {
             let cli = adapter(name);
-            let surface = cli.tool_surface(false);
+            let surface = cli.tool_surface(crate::tool_surface::ToolSurface::Full);
             let doc = awareness_for(&cli_config(name));
 
             for registry_tool in REGISTRY_ONLY_TOOLS {
@@ -2376,8 +2381,14 @@ mod tests {
             assert_no_false_capability_claims(&doc, name);
         }
 
-        assert!(awareness_for(&cli_config("claude"))
-            .contains("Isolation mode removes, from this list: Bash, Write, Edit, Agent."));
+        let claude = awareness_for(&cli_config("claude"));
+        assert!(
+            claude.contains(
+                "Isolation mode removes, from this list: Bash, Write, Edit, Agent, Skill, ToolSearch."
+            ),
+            "{claude}"
+        );
+        assert!(claude.contains("guests' and peers' turns run with no tools"));
         assert!(!awareness_for(&cli_config("codex")).contains("Isolation mode"));
 
         // An API provider is handed the registry, so it is listed.
@@ -2538,7 +2549,7 @@ mod tests {
             // the CLI's, and honest to name.
             let own = crate::cli_provider::adapters::by_name(adapter)
                 .unwrap()
-                .tool_surface(false);
+                .tool_surface(crate::tool_surface::ToolSurface::Full);
             for (profile, text) in every_profile(&config) {
                 for tool in REGISTRY_TOOLS.iter().filter(|t| !own.contains(t)) {
                     assert!(

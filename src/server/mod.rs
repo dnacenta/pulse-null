@@ -1,8 +1,10 @@
 pub mod auth;
 pub mod boot;
 pub mod capability;
+mod daemon;
 #[cfg(test)]
 mod e2e_tests;
+pub mod guest_budget;
 mod handlers;
 pub mod injection;
 pub mod isolation;
@@ -10,6 +12,7 @@ pub mod prompt;
 pub mod rate_limit;
 pub mod setup;
 pub mod trust;
+pub mod turns;
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -22,11 +25,8 @@ use tokio::sync::RwLock;
 use crate::config::Config;
 use crate::events::EventBus;
 use crate::persist::PersistCoordinator;
-use crate::pidfile;
 use crate::plugins::manager::PluginManager;
 use crate::provider_status::SharedProviderStatus;
-use crate::scheduler::intent::IntentQueue;
-use crate::scheduler::Schedule;
 use crate::session_store::SessionStore;
 use crate::streaming::StreamingProvider;
 use crate::tools::ToolRegistry;
@@ -74,6 +74,9 @@ pub struct AppState {
     /// Background entity extraction for freshly ingested archives; `None`
     /// when `[graph]` turns it off.
     pub graph_extractor: Option<crate::graph_extract::GraphExtractor>,
+    /// In-process turns for plugins (PN-110), bound to this state once it
+    /// exists. Plugins hold clones; shutdown closes and drains it.
+    pub turns: turns::TurnRunner,
 }
 
 /// Concurrent `/api/events` connections before a 503.
@@ -183,394 +186,14 @@ pub async fn start_in(
     root_dir: PathBuf,
     stop: Option<tokio::sync::watch::Receiver<bool>>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    // The provider runs from inside the pulse (PN-104).
-    let provider = crate::providers::create_streaming_provider(&config, &root_dir)?;
-
-    if !boot::has_usable_secret(&config) {
-        tracing::warn!(
-            "[security] secret is not set: every request on {}:{} is admitted as the owner",
-            config.server.host,
-            config.server.port
-        );
-    }
-
-    // Ensure required directories and files exist
-    ensure_infrastructure(&root_dir);
-
-    // Start SurrealDB server and provision the pulse database (if graph enabled in server mode)
-    if config.graph.enabled && config.graph.mode == "server" {
-        let data_dir = config
-            .graph
-            .data_dir
-            .as_ref()
-            .map(std::path::PathBuf::from)
-            .unwrap_or_else(|| std::path::PathBuf::from("/opt/pulse-null"));
-
-        if let Err(e) = crate::surrealdb_manager::ensure_running(&data_dir).await {
-            tracing::error!("SurrealDB startup failed: {e}");
-            return Err(e);
-        }
-
-        if let Err(e) =
-            crate::surrealdb_manager::provision_pulse(&data_dir, &config.pulse.name, &root_dir)
-                .await
-        {
-            tracing::error!("SurrealDB provisioning failed: {e}");
-            return Err(e);
-        }
-
-        // Cache graph stats for the prompt builder (which runs in sync context)
-        crate::graph_context::cache_graph_stats(&root_dir).await;
-    }
-
-    // Verify this pulse's agent-CLI integration if applicable
-    if let Some(adapter) = config
-        .llm
-        .cli_adapter()
-        .and_then(crate::cli_provider::adapters::by_name)
-    {
-        let mut items = crate::init::agent_bootstrap::verify_common(
-            &root_dir,
-            adapter.integration().recall_echo_provider(),
-        );
-        items.extend(adapter.integration().verify(&root_dir));
-        for item in &items {
-            match &item.status {
-                crate::init::agent_bootstrap::ItemStatus::Missing => {
-                    tracing::warn!(
-                        "agent integration: {} missing — run 'pulse-null repair' to fix",
-                        item.path.display()
-                    );
-                }
-                crate::init::agent_bootstrap::ItemStatus::Wrong(reason) => {
-                    tracing::warn!("agent integration: {} — {}", item.path.display(), reason);
-                }
-                _ => {}
-            }
-        }
-    }
-
-    // Construct monitoring trait objects
-    let monitors = setup::create_monitors(&config);
-
-    // Register built-in tools
-    let mut tools = setup::register_builtin_tools(&root_dir, &config);
-    tracing::info!("Registered {} built-in tool(s)", tools.definitions().len());
-
-    // Initialize and start plugins, collecting contributed tools
-    let (plugin_manager, plugin_routes) =
-        setup::init_and_start_plugins(&config, &root_dir, &mut tools).await?;
-
-    // Generate AWARENESS.md, then the system prompt from the pulse's
-    // documents (built last so it carries this boot's AWARENESS.md)
-    let system_prompt =
-        setup::awareness_then_system_prompt(&root_dir, &config, &plugin_manager, &tools).await?;
-
-    // Create event bus
-    let event_bus = Arc::new(EventBus::new(64));
-
-    // Ledger ring: projects bus events into rows for /api/events replay.
-    let ledger = Arc::new(crate::ledger::LedgerRing::new(
-        crate::ledger::DEFAULT_RING_CAPACITY,
-    ));
-    crate::ledger::spawn_projector(event_bus.subscribe(), Arc::clone(&ledger));
-
-    // Create the persist coordinator (tracks fire-and-forget writes for graceful shutdown)
-    let persist_coordinator = Arc::new(PersistCoordinator::new());
-
-    // Initialize session store (loads persisted sessions from disk, with migration support)
-    let mut session_store = SessionStore::with_identity(
-        &root_dir,
-        &config.sessions,
-        &config.pulse.name,
-        &config.owner,
-        &config.peers,
-    )
-    .await;
-    session_store.set_coordinator(Arc::clone(&persist_coordinator));
-    let loaded_count = session_store.count().await;
-    if loaded_count > 0 {
-        tracing::info!("{} session(s) restored from disk", loaded_count);
-    }
-
-    // Initialize context buffer (loads persisted buffers from disk)
-    let context_buffer = if config.context_buffer.enabled {
-        let mut cb =
-            crate::context_buffer::ContextBufferStore::new(&root_dir, &config.context_buffer).await;
-        cb.set_coordinator(Arc::clone(&persist_coordinator));
-        tracing::info!(
-            "Context buffer enabled (max {} messages per channel)",
-            config.context_buffer.max_messages
-        );
-        Some(cb)
-    } else {
-        None
-    };
-
-    // Initialize WAL for crash-resilient conversation persistence
-    let wal = if config.sessions.wal_enabled {
-        let sessions_dir = root_dir.join("sessions");
-        match crate::wal::WalWriter::new(&sessions_dir, config.sessions.wal_fsync) {
-            Ok(w) => {
-                tracing::info!("WAL enabled (fsync: {:?})", config.sessions.wal_fsync);
-                Some(w)
-            }
-            Err(e) => {
-                tracing::warn!("Failed to initialize WAL: {} (continuing without WAL)", e);
-                None
-            }
-        }
-    } else {
-        None
-    };
-
-    // Initialize alert queue (Phase 5: Task Isolation)
-    let alert_queue = crate::scheduler::alerts::AlertQueue::load(&root_dir);
-
-    let state = Arc::new(AppState {
-        config: config.clone(),
-        provider,
-        session_store,
-        system_prompt: RwLock::new(system_prompt),
-        tools,
-        event_bus: Arc::clone(&event_bus),
-        root_dir: root_dir.clone(),
-        pipeline_monitor: monitors.pipeline,
-        cognitive_monitor: monitors.cognitive,
-        outcome_tracker: monitors.outcome,
-        context_buffer,
-        persist_coordinator,
-        plugin_manager: tokio::sync::Mutex::new(plugin_manager),
-        wal,
-        alert_queue: tokio::sync::Mutex::new(alert_queue),
-        provider_status: crate::provider_status::new_shared(),
-        leadership: std::sync::atomic::AtomicBool::new(false),
-        event_permits: crate::server::stream_pools().0,
-        comms_permits: crate::server::comms_pool(),
-        chat_permits: crate::server::stream_pools().1,
-        comms: crate::comms::Slot::new(),
-        ledger,
-        graph_extractor: crate::graph_extract::GraphExtractor::for_pulse(&config, &root_dir),
-    });
-
-    // Startup pipeline health check
-    setup::startup_pipeline_check(&root_dir, &config, &state.pipeline_monitor);
-    setup::void_open_predictions(&root_dir).await;
-
-    // Load schedule and intent queue; the coordinator gates the scheduler on
-    // control-plane leadership (fail-open: chat/voice never wait on this).
-    let schedule = Schedule::load_or_init(&root_dir)?;
-    let schedule = Arc::new(RwLock::new(schedule));
-    let intent_queue = IntentQueue::load(&root_dir);
-    let intent_queue = Arc::new(RwLock::new(intent_queue));
-    let coordinator = crate::coordinator::control::Coordinator::start(
-        Arc::clone(&state),
-        Arc::clone(&schedule),
-        Arc::clone(&intent_queue),
-    );
-
-    // Recover orphaned conversations from WAL (post-init: provider + plugins ready)
-    if let Some(ref wal) = state.wal {
-        crate::wal::recover_orphans(
-            wal,
-            &state.session_store,
-            &state.root_dir,
-            &config.pulse.name,
-        )
-        .await;
-    }
-
-    // Spawn background tasks
-    setup::spawn_event_listener(&config, &event_bus, &intent_queue, &root_dir);
-    setup::spawn_session_cleanup(&config, &state);
-
-    // Give the plugin manager access to the event bus for runtime state-change events
-    {
-        let mut pm = state.plugin_manager.lock().await;
-        pm.set_event_bus(Arc::clone(&event_bus));
-    }
-
-    // Awareness refresh listener and plugin health monitor
-    setup::spawn_awareness_listener(&event_bus, &state);
-    setup::spawn_health_monitor(&config, &state);
-
-    let app = build_router(Arc::clone(&state), plugin_routes);
-
-    // Same rule as multi-pulse boot: a pulse with no usable secret stays
-    // on loopback whatever its config says (PN-104 audit SEC-001).
-    let (host, host_note) = boot::bind_host(&config.server.host, boot::has_usable_secret(&config));
-    if let Some(note) = host_note {
-        tracing::warn!("{}", note);
-    }
-    let addr = format!("{}:{}", host, config.server.port);
-    let listener = tokio::net::TcpListener::bind(&addr).await?;
-
-    // Write PID file so `pulse-null down` can find us
-    pidfile::write(&root_dir)?;
-    tracing::info!("Listening on {}", addr);
-
-    // === Graceful shutdown ===
-    //
-    // Architecture: use a watch channel so we can react to SIGTERM in multiple places.
-    // When the signal fires, we immediately abort scheduler tasks and stop plugins
-    // (which may be generating in-flight HTTP requests), THEN let axum drain with
-    // a timeout, THEN archive sessions.
-    let (shutdown_tx, _) = tokio::sync::watch::channel(false);
-    let mut shutdown_rx_axum = shutdown_tx.subscribe();
-    let mut shutdown_rx_main = shutdown_tx.subscribe();
-
-    // Signal handler: fires once on SIGTERM, SIGINT, or the external stop.
-    tokio::spawn(async move {
-        let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
-            .expect("failed to install SIGTERM handler");
-        // An owned daemon (Home started it) stops on its owner's flag, not
-        // on a Ctrl+c the terminal delivers to the whole process group.
-        let owned = stop.is_some();
-        let sigint = async {
-            if owned {
-                std::future::pending::<()>().await;
-            } else {
-                let _ = tokio::signal::ctrl_c().await;
-            }
-        };
-        let external = async {
-            match stop {
-                Some(mut rx) => {
-                    // A closed sender counts as a stop: the owner is gone.
-                    while rx.changed().await.is_ok() && !*rx.borrow() {}
-                }
-                None => std::future::pending().await,
-            }
-        };
-        tokio::select! {
-            _ = sigterm.recv() => tracing::info!("Received SIGTERM"),
-            () = sigint => tracing::info!("Received SIGINT"),
-            () = external => tracing::info!("Stop requested by the owning process"),
-        }
-        let _ = shutdown_tx.send(true);
-    });
-
-    // Spawn the server as a task so we can control its lifetime
-    let server_handle = tokio::spawn(async move {
-        axum::serve(listener, app)
-            .with_graceful_shutdown(async move {
-                let _ = shutdown_rx_axum.changed().await;
-            })
-            .await
-    });
-
-    // Wait for the shutdown signal
-    let _ = shutdown_rx_main.changed().await;
-
-    // === Post-signal sequence ===
-    // These run immediately after SIGTERM, while axum is still draining.
-
-    // 1. Stop the coordinator — aborts scheduler tasks (they call the provider
-    //    directly and may hold long-running LLM requests) and releases the
-    //    control-plane lease so a successor need not wait out the ttl.
-    coordinator.shutdown().await;
-    // The peer dialogue is the other long-running caller: stop it and let
-    // its ending archive (or shed, when isolated) before the drain.
-    state.comms.shutdown().await;
-
-    // 2. Stop plugins (Discord bot, etc.) so they stop generating new requests.
-    state.plugin_manager.lock().await.stop_all().await;
-
-    // 3. Give axum up to 30s to drain remaining in-flight requests.
-    match tokio::time::timeout(std::time::Duration::from_secs(30), server_handle).await {
-        Ok(Ok(Ok(()))) => tracing::info!("Server drained cleanly"),
-        Ok(Ok(Err(e))) => tracing::warn!("Server error during drain: {}", e),
-        Ok(Err(e)) => tracing::warn!("Server task panicked: {}", e),
-        Err(_) => tracing::warn!("Server drain timed out after 30s, proceeding with shutdown"),
-    }
-
-    // 4. Flush any in-flight persistence tasks before archiving
-    let flushed = state
-        .persist_coordinator
-        .flush(std::time::Duration::from_secs(5))
-        .await;
-    if !flushed {
-        tracing::warn!("Some persistence tasks did not complete before shutdown");
-    }
-
-    // 5. Archive all sessions on shutdown and persist to disk. Shed while
-    // isolated: sessions may carry the ephemeral isolation tail, which must
-    // never reach disk (spec Stage 2 — nothing that writes).
-    let archived_paths = if crate::server::isolation::is_active(&root_dir) {
-        tracing::warn!("shutdown during ISOLATION — session archive/persist shed");
-        Vec::new()
-    } else {
-        state
-            .session_store
-            .archive_all(&root_dir, &config.pulse.name)
-            .await
-    };
-
-    // 6. Clean up WAL and checkpoint files for archived sessions
-    if let Some(ref wal) = state.wal {
-        match wal.list_active() {
-            Ok(keys) => {
-                for key in &keys {
-                    if let Err(e) = wal.remove(key) {
-                        tracing::warn!("Failed to remove WAL for {}: {}", key, e);
-                    }
-                    if let Err(e) = wal.remove_checkpoint(key) {
-                        tracing::warn!("Failed to remove checkpoint for {}: {}", key, e);
-                    }
-                }
-                if !keys.is_empty() {
-                    tracing::info!("Cleaned up {} WAL file(s) on shutdown", keys.len());
-                }
-            }
-            Err(e) => tracing::warn!("Failed to list WAL files: {}", e),
-        }
-    }
-
-    // 7. Ingest shutdown archives into the knowledge graph
-    // Uses spawn_blocking + dedicated runtime because SurrealDB types are not Send.
-    if config.graph.enabled && config.graph.auto_ingest && !archived_paths.is_empty() {
-        let state_for_graph = Arc::clone(&state);
-        let _ = tokio::task::spawn_blocking(move || {
-            let rt = match tokio::runtime::Runtime::new() {
-                Ok(rt) => rt,
-                Err(e) => {
-                    tracing::warn!("graph ingest: failed to create runtime: {}", e);
-                    return;
-                }
-            };
-            rt.block_on(async {
-                // No extraction on the way out: the process is exiting and
-                // would kill it mid-archive. These stay pending for later.
-                for path in &archived_paths {
-                    crate::session::graph_ingest_archive(&state_for_graph.root_dir, path, None)
-                        .await;
-                }
-            });
-        })
-        .await;
-    }
-
-    // Shut down SurrealDB server if we own it
-    if config.graph.enabled && config.graph.mode == "server" {
-        let data_dir = config
-            .graph
-            .data_dir
-            .as_ref()
-            .map(std::path::PathBuf::from)
-            .unwrap_or_else(|| std::path::PathBuf::from("/opt/pulse-null"));
-        if let Err(e) = crate::surrealdb_manager::shutdown_if_owner(&data_dir).await {
-            tracing::warn!("SurrealDB shutdown: {e}");
-        }
-    }
-
-    // Remove PID file
-    pidfile::remove(&root_dir);
-    tracing::info!("Shutdown complete");
-
-    Ok(())
+    daemon::run(config, root_dir, daemon::shutdown_signal(stop)).await
 }
 
 /// Build the Axum router from AppState and optional plugin routes.
+///
+/// Plugin routes sit inside the same auth and rate-limit layers as the
+/// daemon's own (PN-110): nothing on the port is reachable without the
+/// credential when `[security] secret` is set, `/health` aside.
 pub fn build_router(state: Arc<AppState>, plugin_routes: Router<()>) -> Router {
     let limiter = rate_limit::default_limiter();
 
@@ -611,16 +234,16 @@ pub fn build_router(state: Arc<AppState>, plugin_routes: Router<()>) -> Router {
         )
         .route("/api/alerts/drain", post(handlers::alerts::drain_alerts))
         .route("/api/alerts/peek", get(handlers::alerts::peek_alerts))
+        .with_state(Arc::clone(&state))
+        .merge(plugin_routes)
         .route_layer(middleware::from_fn_with_state(
             Arc::clone(&state),
             auth::require_auth,
         ))
-        .with_state(Arc::clone(&state))
         .layer(middleware::from_fn_with_state(
             limiter,
             rate_limit::rate_limit,
         ))
-        .merge(plugin_routes)
 }
 
 /// Ensure all required directories and seed files exist.

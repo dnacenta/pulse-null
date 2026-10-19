@@ -6,9 +6,9 @@ pub mod recall_echo;
 
 // Optional plugins (feature-gated)
 #[cfg(feature = "discord-text")]
-pub mod discord_echo;
+pub mod discord;
 #[cfg(feature = "discord-text")]
-pub mod discord_text_echo;
+pub(crate) mod discord_forwarder;
 #[cfg(feature = "voice")]
 pub mod voice_echo;
 
@@ -35,6 +35,10 @@ pub struct PluginContext {
     pub pulse_root: PathBuf,
     pub pulse_name: String,
     pub provider: Arc<Box<dyn LmProvider>>,
+    /// The daemon's in-process turn pipeline (PN-110). A plugin that answers
+    /// messages takes `turns.for_plugin(..)` at init instead of calling
+    /// `/chat` over HTTP.
+    pub turns: crate::server::turns::TurnRunner,
 }
 
 /// The Plugin trait — dyn-compatible, no async_trait dependency.

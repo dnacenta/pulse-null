@@ -29,6 +29,7 @@ use crate::cli_provider::adapter::{
     SystemPromptDelivery, Usage,
 };
 use crate::init::agent_bootstrap::{ensure_config, BootstrapItem, ItemKind, ItemStatus};
+use crate::tool_surface::ToolSurface;
 
 /// Codex CLI.
 pub struct Codex;
@@ -84,19 +85,14 @@ impl CliAdapter for Codex {
 
         // Codex's own sandbox is the containment: writes stay inside the
         // pulse (`-C`), network stays on so research tasks work. Isolation
-        // drops to read-only and offline. `--dangerously-bypass-approvals-
+        // drops to read-only and offline; so does a guest's or peer's turn,
+        // the narrowest codex offers (it has no tool-free mode). `--dangerously-bypass-approvals-
         // and-sandbox` would rely on an outer sandbox pulse-null does not
         // provide; `codex exec` has no approval prompts to hang on.
         args.push("--sandbox".into());
-        args.push(
-            if inv.restricted {
-                "read-only"
-            } else {
-                "workspace-write"
-            }
-            .into(),
-        );
-        if !inv.restricted {
+        let full = inv.surface == ToolSurface::Full;
+        args.push(if full { "workspace-write" } else { "read-only" }.into());
+        if full {
             args.push("-c".into());
             args.push("sandbox_workspace_write.network_access=true".into());
         }
@@ -265,7 +261,7 @@ mod tests {
             system_prompt_file: None,
             system_prompt: "You are Echo.",
             prompt_file: None,
-            restricted: false,
+            surface: ToolSurface::Full,
             streaming: false,
             pulse_root: root,
             reasoning_effort: None,
@@ -318,10 +314,12 @@ mod tests {
         assert!(!open.iter().any(|arg| arg.contains("dangerously-bypass")));
 
         let mut inv = invocation(&root);
-        inv.restricted = true;
-        let isolated = strings(&Codex.invoke_args(&inv));
-        assert_eq!(value_of(&isolated, "--sandbox"), Some("read-only"));
-        assert!(!isolated.iter().any(|a| a.contains("network_access")));
+        for surface in [ToolSurface::Restricted, ToolSurface::None] {
+            inv.surface = surface;
+            let isolated = strings(&Codex.invoke_args(&inv));
+            assert_eq!(value_of(&isolated, "--sandbox"), Some("read-only"));
+            assert!(!isolated.iter().any(|a| a.contains("network_access")));
+        }
     }
 
     #[test]
@@ -418,8 +416,13 @@ mod tests {
 
     #[test]
     fn tool_surface_is_unmeasured_and_the_note_names_the_cli() {
-        assert!(Codex.tool_surface(false).is_empty());
-        assert!(Codex.tool_surface(true).is_empty());
+        for surface in [
+            ToolSurface::Full,
+            ToolSurface::Restricted,
+            ToolSurface::None,
+        ] {
+            assert!(Codex.tool_surface(surface).is_empty());
+        }
         assert_eq!(
             Codex.tool_surface_note(),
             "Tools are provided by the codex CLI."

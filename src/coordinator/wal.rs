@@ -98,6 +98,15 @@ pub struct LeaseWal {
     poisoned: AtomicBool,
 }
 
+impl Drop for LeaseWal {
+    /// Release the lock explicitly: closing alone keeps it held while any
+    /// copy of the descriptor lives, and a child forked by another thread
+    /// holds one until it execs (PN-144 audit #18; also hit the PN-110 gate).
+    fn drop(&mut self) {
+        let _ = self.file.unlock();
+    }
+}
+
 impl LeaseWal {
     /// Open (creating if needed) the lease WAL under `dir`, take the
     /// exclusive lock, and repair any torn tail. Fails if another process

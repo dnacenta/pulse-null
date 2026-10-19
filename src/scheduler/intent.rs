@@ -482,6 +482,7 @@ pub async fn drain_loop(
     let poll_interval = Duration::from_secs(config.intent_poll_interval);
     let mut rate_tracker = RateTracker::new(config.max_intents_per_hour);
     let mut consecutive_empty = 0u32;
+    let tenure = crate::coordinator::control::TenureLeases { leases, holder };
 
     tracing::info!(
         "Intent drain loop started (poll: {}s, rate: {}/hr, queue cap: {})",
@@ -491,54 +492,15 @@ pub async fn drain_loop(
     );
 
     loop {
-        // Adaptive polling: back off if consecutive empty results
-        let sleep_duration = if consecutive_empty > 3 {
-            poll_interval * consecutive_empty.min(10)
-        } else {
-            poll_interval
-        };
-        tokio::time::sleep(sleep_duration).await;
-
-        // Isolation backstop, independent of the coordinator loop.
-        if crate::server::isolation::is_active(&state.root_dir) {
-            tracing::warn!("Intent drain: ISOLATION active — stopping");
+        tokio::time::sleep(poll_delay(poll_interval, consecutive_empty)).await;
+        if !drain_may_continue(&state.root_dir, &tenure).await {
             return;
         }
-
-        // Tenure liveness: stop if our tenure lost the control plane and
-        // nothing aborted us (wedged leadership loop).
-        {
-            let table = leases.lock().await;
-            let leads = table
-                .get(crate::coordinator::control::CONTROL_PLANE_RESOURCE)
-                .is_some_and(|l| l.holder_id == holder && !l.is_expired(Utc::now()));
-            if !leads {
-                tracing::warn!("Intent drain: tenure '{holder}' no longer leads; stopping");
-                return;
-            }
-        }
-
-        // Claim the next processable intent via a lease, leaving it in the
-        // queue. A crash between claim and completion loses nothing: the
-        // intent is still queued and the claim expires on its ttl.
-        let candidates = { queue.read().await.sorted_candidates() };
-        if candidates.is_empty() {
+        let Some(intent) = claim_from_queue(&queue, &tenure).await else {
             continue;
-        }
-        let claimed = claim_next_intent(&leases, &holder, &candidates).await;
-        let Some(intent) = claimed else { continue };
-
-        // Rate limit check — release the claim and re-check later; the
-        // intent never left the queue, so there is nothing to re-queue.
+        };
         if !rate_tracker.record_and_check() {
-            tracing::info!(
-                "Intent rate limit reached ({}/hr), deferring: {}",
-                config.max_intents_per_hour,
-                intent.description
-            );
-            let resource = intent_resource(&intent.id);
-            let _ = { leases.lock().await.release(&resource, &holder, Utc::now()) };
-            tokio::time::sleep(poll_interval).await;
+            defer_intent(&intent, &tenure, config).await;
             continue;
         }
 
@@ -548,31 +510,100 @@ pub async fn drain_loop(
             intent.priority,
             intent.depth
         );
-
-        // Execute the intent
-        let tenure = crate::coordinator::control::TenureLeases {
-            leases: Arc::clone(&leases),
-            holder: holder.clone(),
-        };
-        let result = execute_intent(&intent, &state, &queue, &schedule, config, &tenure).await;
-
-        match result {
-            Some(output) if output.trim().is_empty() => {
-                consecutive_empty += 1;
-            }
-            Some(_) => {
-                consecutive_empty = 0;
-            }
-            None => {
-                consecutive_empty += 1;
-            }
-        }
+        let result =
+            execute_intent_as_owner(&intent, &state, &queue, &schedule, config, &tenure).await;
+        consecutive_empty = empty_streak(consecutive_empty, result.as_deref());
 
         // Fenced completion: only the current claim holder may remove the
         // intent. A stale executor's completion is refused and its intent
         // re-runs — the at-least-once direction the queue already accepts.
-        commit_intent_completion(&state.root_dir, &queue, &leases, &holder, &intent.id).await;
+        commit_intent_completion(
+            &state.root_dir,
+            &queue,
+            &tenure.leases,
+            &tenure.holder,
+            &intent.id,
+        )
+        .await;
     }
+}
+
+/// Adaptive polling: back off after more than three empty results in a row,
+/// up to ten poll intervals.
+fn poll_delay(poll_interval: Duration, consecutive_empty: u32) -> Duration {
+    if consecutive_empty > 3 {
+        poll_interval * consecutive_empty.min(10)
+    } else {
+        poll_interval
+    }
+}
+
+/// The empty-result streak after one execution: an empty or missing output
+/// extends it, a real one resets it.
+fn empty_streak(previous: u32, output: Option<&str>) -> u32 {
+    match output {
+        Some(output) if output.trim().is_empty() => previous + 1,
+        Some(_) => 0,
+        None => previous + 1,
+    }
+}
+
+/// The isolation backstop, independent of the coordinator loop, and tenure
+/// liveness: stop if our tenure lost the control plane and nothing aborted
+/// us (wedged leadership loop).
+async fn drain_may_continue(
+    root_dir: &Path,
+    tenure: &crate::coordinator::control::TenureLeases,
+) -> bool {
+    if crate::server::isolation::is_active(root_dir) {
+        tracing::warn!("Intent drain: ISOLATION active — stopping");
+        return false;
+    }
+    if !super::runner::tenure_still_leads(&tenure.leases, &tenure.holder).await {
+        tracing::warn!(
+            "Intent drain: tenure '{}' no longer leads; stopping",
+            tenure.holder
+        );
+        return false;
+    }
+    true
+}
+
+/// Claim the next processable intent via a lease, leaving it in the queue.
+/// A crash between claim and completion loses nothing: the intent is still
+/// queued and the claim expires on its ttl.
+async fn claim_from_queue(
+    queue: &RwLock<IntentQueue>,
+    tenure: &crate::coordinator::control::TenureLeases,
+) -> Option<Intent> {
+    let candidates = { queue.read().await.sorted_candidates() };
+    if candidates.is_empty() {
+        return None;
+    }
+    claim_next_intent(&tenure.leases, &tenure.holder, &candidates).await
+}
+
+/// Rate limit reached: release the claim and re-check later; the intent
+/// never left the queue, so there is nothing to re-queue.
+async fn defer_intent(
+    intent: &Intent,
+    tenure: &crate::coordinator::control::TenureLeases,
+    config: &AutonomyConfig,
+) {
+    tracing::info!(
+        "Intent rate limit reached ({}/hr), deferring: {}",
+        config.max_intents_per_hour,
+        intent.description
+    );
+    let resource = intent_resource(&intent.id);
+    let _ = {
+        tenure
+            .leases
+            .lock()
+            .await
+            .release(&resource, &tenure.holder, Utc::now())
+    };
+    tokio::time::sleep(Duration::from_secs(config.intent_poll_interval)).await;
 }
 
 /// Lease resource id for an intent claim.
@@ -684,6 +715,22 @@ pub(crate) fn intent_user_message(
 }
 
 /// Execute a single intent with tools.
+/// Execute one intent as the pulse's own work: its provider calls get the
+/// full tool surface, which no longer comes by default (PN-110 audit R2-11).
+pub(crate) async fn execute_intent_as_owner(
+    intent: &Intent,
+    state: &Arc<AppState>,
+    queue: &Arc<RwLock<IntentQueue>>,
+    schedule: &Arc<RwLock<Schedule>>,
+    config: &AutonomyConfig,
+    tenure: &crate::coordinator::control::TenureLeases,
+) -> Option<String> {
+    crate::tool_surface::owner_work(execute_intent(
+        intent, state, queue, schedule, config, tenure,
+    ))
+    .await
+}
+
 async fn execute_intent(
     intent: &Intent,
     state: &Arc<AppState>,
@@ -1701,5 +1748,108 @@ mod tests {
         assert!(tracker.record_and_check());
         // Third should be rejected
         assert!(!tracker.record_and_check());
+    }
+
+    fn tenure(dir: &Path) -> crate::coordinator::control::TenureLeases {
+        crate::coordinator::control::TenureLeases {
+            leases: shared_leases(dir),
+            holder: "me-1".to_string(),
+        }
+    }
+
+    async fn lead(tenure: &crate::coordinator::control::TenureLeases) {
+        tenure
+            .leases
+            .lock()
+            .await
+            .acquire(
+                crate::coordinator::control::CONTROL_PLANE_RESOURCE,
+                &tenure.holder,
+                Duration::from_secs(90),
+                Utc::now(),
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn polling_backs_off_after_three_empty_results_up_to_ten_intervals() {
+        let poll = Duration::from_secs(60);
+        assert_eq!(poll_delay(poll, 0), poll);
+        assert_eq!(poll_delay(poll, 3), poll);
+        assert_eq!(poll_delay(poll, 4), poll * 4);
+        assert_eq!(poll_delay(poll, 25), poll * 10);
+    }
+
+    #[test]
+    fn an_empty_or_missing_output_extends_the_streak() {
+        assert_eq!(empty_streak(2, Some("  \n")), 3);
+        assert_eq!(empty_streak(2, None), 3);
+        assert_eq!(empty_streak(2, Some("done")), 0);
+    }
+
+    #[tokio::test]
+    async fn the_drain_runs_only_for_the_leading_tenure_outside_isolation() {
+        let dir = tempfile::tempdir().unwrap();
+        let tenure = tenure(dir.path());
+        assert!(
+            !drain_may_continue(dir.path(), &tenure).await,
+            "not leading"
+        );
+
+        lead(&tenure).await;
+        assert!(drain_may_continue(dir.path(), &tenure).await);
+
+        crate::server::isolation::enter(dir.path(), "test", None).unwrap();
+        assert!(!drain_may_continue(dir.path(), &tenure).await, "isolated");
+    }
+
+    #[tokio::test]
+    async fn an_empty_queue_claims_nothing_and_a_queued_intent_is_claimed_in_place() {
+        let dir = tempfile::tempdir().unwrap();
+        let tenure = tenure(dir.path());
+        let queue = RwLock::new(IntentQueue::load(dir.path()));
+        assert!(claim_from_queue(&queue, &tenure).await.is_none());
+
+        queue
+            .write()
+            .await
+            .push(make_intent("i-1", IntentPriority::Normal), 20);
+        let claimed = claim_from_queue(&queue, &tenure).await.unwrap();
+        assert_eq!(claimed.id, "i-1");
+        assert_eq!(queue.read().await.len(), 1, "the intent stays queued");
+        let held = tenure.leases.lock().await.acquire(
+            &intent_resource("i-1"),
+            "other-1",
+            INTENT_LEASE_TTL,
+            Utc::now(),
+        );
+        assert!(held.is_err(), "the claim holds the lease");
+    }
+
+    #[tokio::test]
+    async fn a_deferred_intent_gives_its_claim_back() {
+        let dir = tempfile::tempdir().unwrap();
+        let tenure = tenure(dir.path());
+        let intent = make_intent("i-1", IntentPriority::Normal);
+        claim_next_intent(
+            &tenure.leases,
+            &tenure.holder,
+            std::slice::from_ref(&intent),
+        )
+        .await
+        .unwrap();
+        let config = AutonomyConfig {
+            intent_poll_interval: 0,
+            ..AutonomyConfig::default()
+        };
+
+        defer_intent(&intent, &tenure, &config).await;
+        let reclaimed = tenure.leases.lock().await.acquire(
+            &intent_resource("i-1"),
+            "other-1",
+            INTENT_LEASE_TTL,
+            Utc::now(),
+        );
+        assert!(reclaimed.is_ok(), "{reclaimed:?}");
     }
 }

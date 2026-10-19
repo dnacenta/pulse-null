@@ -455,49 +455,20 @@ pub async fn run_farm_from_marker(
     state: &Arc<crate::server::AppState>,
     tenure: &super::control::TenureLeases,
 ) -> Result<String, String> {
-    let spec: FarmSpec =
-        serde_json::from_str(farm_json).map_err(|e| format!("invalid [FARM:] json: {e}"))?;
-    if spec.subtasks.is_empty() {
-        return Err("farm has no subtasks".to_string());
-    }
-    if spec.subtasks.len() > MAX_SUBTASKS {
-        return Err(format!(
-            "farm has {} subtasks (max {MAX_SUBTASKS})",
-            spec.subtasks.len()
-        ));
-    }
-
+    let spec = parse_farm_marker(farm_json)?;
     let system_prompt = crate::server::prompt::build_task_system_prompt_async(
         state.root_dir.clone(),
         state.config.clone(),
     )
     .await
     .map_err(|e| format!("cannot build farm system prompt: {e}"))?;
-
+    let farm = FarmModel {
+        state: Arc::clone(state),
+        system_prompt: Arc::from(system_prompt),
+    };
     let synthesis = spec.synthesis.clone();
     let description = spec.description.clone();
     let farm_label = spec.id.clone();
-    let max_tokens = state.config.llm.max_tokens;
-
-    let exec_state = Arc::clone(state);
-    let exec_prompt = system_prompt.clone();
-    let executor = move |sub: SubtaskSpec| {
-        let state = Arc::clone(&exec_state);
-        let system_prompt = exec_prompt.clone();
-        async move {
-            let messages = vec![pulse_system_types::llm::Message {
-                role: pulse_system_types::llm::Role::User,
-                content: pulse_system_types::llm::MessageContent::Text(sub.prompt),
-                source: None,
-            }];
-            let response = state
-                .provider
-                .invoke(&system_prompt, &messages, max_tokens, None)
-                .await
-                .map_err(|e| e.to_string())?;
-            Ok(response_text(&response))
-        }
-    };
 
     let outcome = run_farm(
         Arc::clone(&tenure.leases),
@@ -505,49 +476,11 @@ pub async fn run_farm_from_marker(
         state.root_dir.clone(),
         spec,
         FarmCaps::default(),
-        executor,
+        farm.executor(),
     )
     .await;
-
-    if outcome.results.is_empty() {
-        return Err(format!(
-            "farm '{farm_label}' produced no results (failed: {:?})",
-            outcome.failed
-        ));
-    }
-
-    let mut composed = String::new();
-    for r in &outcome.results {
-        composed.push_str(&format!("## {}\n{}\n\n", r.sub_id, r.text));
-    }
-    if !outcome.failed.is_empty() {
-        composed.push_str(&format!("(failed subtasks: {:?})\n", outcome.failed));
-    }
-
-    let final_text = match synthesis {
-        Some(template) => {
-            let prompt = template.replace("{results}", &composed);
-            let messages = vec![pulse_system_types::llm::Message {
-                role: pulse_system_types::llm::Role::User,
-                content: pulse_system_types::llm::MessageContent::Text(prompt),
-                source: None,
-            }];
-            match state
-                .provider
-                .invoke(&system_prompt, &messages, max_tokens, None)
-                .await
-            {
-                Ok(response) => response_text(&response),
-                Err(e) => {
-                    tracing::warn!(
-                        "farm '{farm_label}': synthesis failed ({e}); using raw results"
-                    );
-                    composed
-                }
-            }
-        }
-        None => composed,
-    };
+    let composed = compose_results(&farm_label, &outcome)?;
+    let final_text = farm.synthesize(&farm_label, synthesis, composed).await;
 
     crate::logbook::write_entry(
         &state.root_dir,
@@ -560,8 +493,113 @@ pub async fn run_farm_from_marker(
             outcome.late_fenced
         ),
     );
-
     Ok(final_text)
+}
+
+/// The marker's spec, with between one and [`MAX_SUBTASKS`] subtasks.
+fn parse_farm_marker(farm_json: &str) -> Result<FarmSpec, String> {
+    let spec: FarmSpec =
+        serde_json::from_str(farm_json).map_err(|e| format!("invalid [FARM:] json: {e}"))?;
+    if spec.subtasks.is_empty() {
+        return Err("farm has no subtasks".to_string());
+    }
+    if spec.subtasks.len() > MAX_SUBTASKS {
+        return Err(format!(
+            "farm has {} subtasks (max {MAX_SUBTASKS})",
+            spec.subtasks.len()
+        ));
+    }
+    Ok(spec)
+}
+
+/// Every result under its subtask's heading, then the failed subtasks; an
+/// error when nothing came back.
+fn compose_results(farm_label: &str, outcome: &FarmOutcome) -> Result<String, String> {
+    if outcome.results.is_empty() {
+        return Err(format!(
+            "farm '{farm_label}' produced no results (failed: {:?})",
+            outcome.failed
+        ));
+    }
+    let mut composed = String::new();
+    for r in &outcome.results {
+        composed.push_str(&format!("## {}\n{}\n\n", r.sub_id, r.text));
+    }
+    if !outcome.failed.is_empty() {
+        composed.push_str(&format!("(failed subtasks: {:?})\n", outcome.failed));
+    }
+    Ok(composed)
+}
+
+/// The pulse's model, asked one prompt at a time under the farm's system
+/// prompt, without tools.
+#[derive(Clone)]
+struct FarmModel {
+    state: Arc<crate::server::AppState>,
+    system_prompt: Arc<str>,
+}
+
+impl FarmModel {
+    /// One prompt, one reply. A farm is the owner's work, so the call asks
+    /// for the full surface; it sits inside the scope because a provider
+    /// reads the surface when `invoke` is called, not when its future is
+    /// polled.
+    async fn ask(
+        &self,
+        prompt: String,
+    ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+        let messages = vec![pulse_system_types::llm::Message {
+            role: pulse_system_types::llm::Role::User,
+            content: pulse_system_types::llm::MessageContent::Text(prompt),
+            source: None,
+        }];
+        let max_tokens = self.state.config.llm.max_tokens;
+        let response = crate::tool_surface::owner_work(async {
+            self.state
+                .provider
+                .invoke(&self.system_prompt, &messages, max_tokens, None)
+                .await
+        })
+        .await?;
+        Ok(response_text(&response))
+    }
+
+    /// The farm's children: each subtask's prompt, asked on its own spawned
+    /// task, outside the caller's scope.
+    fn executor(
+        &self,
+    ) -> impl Fn(
+        SubtaskSpec,
+    )
+        -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<String, String>> + Send>>
+           + Send
+           + Sync
+           + Clone
+           + 'static {
+        let model = self.clone();
+        move |sub: SubtaskSpec| {
+            let model = model.clone();
+            Box::pin(async move { model.ask(sub.prompt).await.map_err(|e| e.to_string()) })
+        }
+    }
+
+    /// Run the synthesis template over the composed results, when the spec
+    /// has one; on a failed synthesis the raw results stand.
+    async fn synthesize(
+        &self,
+        farm_label: &str,
+        template: Option<String>,
+        composed: String,
+    ) -> String {
+        let Some(template) = template else {
+            return composed;
+        };
+        let prompt = template.replace("{results}", &composed);
+        self.ask(prompt).await.unwrap_or_else(|e| {
+            tracing::warn!("farm '{farm_label}': synthesis failed ({e}); using raw results");
+            composed
+        })
+    }
 }
 
 fn response_text(response: &pulse_system_types::llm::LlmResponse) -> String {
@@ -793,5 +831,64 @@ mod tests {
         assert_eq!(outcome.results.len(), 1);
         assert_eq!(outcome.results[0].text, "done:p1");
         assert_eq!(outcome.failed, vec!["a".to_string()]);
+    }
+
+    #[test]
+    fn a_farm_marker_needs_valid_json_and_one_to_eight_subtasks() {
+        assert!(parse_farm_marker("{ nope")
+            .unwrap_err()
+            .starts_with("invalid [FARM:] json: "));
+        let empty = r#"{"id": "f", "subtasks": []}"#;
+        assert_eq!(
+            parse_farm_marker(empty).unwrap_err(),
+            "farm has no subtasks"
+        );
+        let subtasks: Vec<_> = (0..=MAX_SUBTASKS)
+            .map(|i| serde_json::json!({"id": format!("s{i}"), "prompt": "p"}))
+            .collect();
+        let too_many = serde_json::json!({"id": "f", "subtasks": subtasks}).to_string();
+        assert_eq!(
+            parse_farm_marker(&too_many).unwrap_err(),
+            format!(
+                "farm has {} subtasks (max {MAX_SUBTASKS})",
+                MAX_SUBTASKS + 1
+            )
+        );
+        let one = r#"{"id": "f", "subtasks": [{"id": "a", "prompt": "p"}], "synthesis": "s"}"#;
+        let spec = parse_farm_marker(one).unwrap();
+        assert_eq!(spec.subtasks.len(), 1);
+        assert_eq!(spec.synthesis.as_deref(), Some("s"));
+    }
+
+    fn outcome(results: &[(&str, &str)], failed: &[&str]) -> FarmOutcome {
+        FarmOutcome {
+            results: results
+                .iter()
+                .map(|(id, text)| SubtaskResult {
+                    sub_id: id.to_string(),
+                    text: text.to_string(),
+                    attempts: 1,
+                })
+                .collect(),
+            failed: failed.iter().map(|f| f.to_string()).collect(),
+            late_fenced: 0,
+            reclaims: 0,
+        }
+    }
+
+    #[test]
+    fn results_are_composed_under_their_headings_with_the_failures_named() {
+        assert_eq!(
+            compose_results("f", &outcome(&[("a", "one"), ("b", "two")], &[])).unwrap(),
+            "## a\none\n\n## b\ntwo\n\n"
+        );
+        assert_eq!(
+            compose_results("f", &outcome(&[("a", "one")], &["b"])).unwrap(),
+            "## a\none\n\n(failed subtasks: [\"b\"])\n"
+        );
+        assert_eq!(
+            compose_results("f", &outcome(&[], &["a"])).unwrap_err(),
+            "farm 'f' produced no results (failed: [\"a\"])"
+        );
     }
 }

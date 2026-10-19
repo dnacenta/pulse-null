@@ -17,6 +17,7 @@ use crate::cli_provider::adapter::{
     StreamLine, SystemPromptDelivery, Usage,
 };
 use crate::init::agent_bootstrap::BootstrapItem;
+use crate::tool_surface::ToolSurface;
 
 /// The adapter. Stateless: all per-pulse state is on the provider.
 pub struct Claude;
@@ -24,11 +25,22 @@ pub struct Claude;
 /// What a CLI without the flag prints when it parses `--system-prompt-file`.
 const UNKNOWN_OPTION_MARKER: &str = "unknown option";
 
-/// Tools denied to the CLI subprocess while isolated: everything that writes,
-/// executes, or leaves the box. Camel-case flag per the Claude Code CLI. If a
-/// future CLI rejects the flag the invocation fails — closed, not open.
-const ISOLATION_DISALLOWED_TOOLS: &str =
-    "Write,Edit,MultiEdit,NotebookEdit,Bash,WebFetch,WebSearch,Task";
+/// The only built-in tools an isolated pulse keeps, as an allowlist through
+/// `--tools`: read, search, list. Anything not named — the shell, the file
+/// writers, the web, agents, tools loadable on demand — is not there to
+/// load. Measured on 2.1.282 with the stream's `init` record (no model
+/// call): `--tools Read,Grep,Glob` gives exactly these three.
+const RESTRICTED_TOOLS: &str = "Read,Grep,Glob";
+
+/// `--tools ""` is Claude Code's documented "no tools"; measured on 2.1.282
+/// the `init` record lists `"tools":[]`.
+const NO_TOOLS: &str = "";
+
+/// With an allowlist, also no MCP server (`--strict-mcp-config` with no
+/// `--mcp-config` loads none) and no skills or slash commands: nothing
+/// outside the list can be reached. Measured: `mcp_servers`, `skills` and
+/// `slash_commands` are empty in `init`.
+const CLOSED_EXTENSIONS: &[&str] = &["--strict-mcp-config", "--disable-slash-commands"];
 
 /// The tools Claude Code loads up front, measured on 2.1.282. Others load on
 /// demand through `ToolSearch`.
@@ -42,10 +54,8 @@ const TOOL_SURFACE: &[&str] = &[
     "ToolSearch",
 ];
 
-/// [`TOOL_SURFACE`] minus what [`ISOLATION_DISALLOWED_TOOLS`] removes. `Agent`
-/// goes too: the disallow list still names it by its pre-2.1.63 name `Task`,
-/// which Claude Code keeps matching. Tied to both lists by a test.
-const ISOLATED_TOOL_SURFACE: &[&str] = &["Read", "Skill", "ToolSearch"];
+/// [`RESTRICTED_TOOLS`] as a list, for AWARENESS. Tied to it by a test.
+const RESTRICTED_TOOL_SURFACE: &[&str] = &["Read", "Grep", "Glob"];
 
 impl CliAdapter for Claude {
     fn name(&self) -> &'static str {
@@ -138,9 +148,17 @@ impl CliAdapter for Claude {
             "--no-session-persistence".into(),
             "--dangerously-skip-permissions".into(),
         ]);
-        if inv.restricted {
-            args.push("--disallowedTools".into());
-            args.push(ISOLATION_DISALLOWED_TOOLS.into());
+        let allowlist = match inv.surface {
+            ToolSurface::Full => None,
+            ToolSurface::Restricted => Some(RESTRICTED_TOOLS),
+            ToolSurface::None => Some(NO_TOOLS),
+        };
+        if let Some(tools) = allowlist {
+            // `--tools` takes several values: it stays last, after every
+            // flag that has a value of its own.
+            args.extend(CLOSED_EXTENSIONS.iter().map(|flag| (*flag).into()));
+            args.push("--tools".into());
+            args.push(tools.into());
         }
         args
     }
@@ -229,17 +247,18 @@ impl CliAdapter for Claude {
         &["out of extra usage", "hit your limit"]
     }
 
-    fn tool_surface(&self, restricted: bool) -> &'static [&'static str] {
-        if restricted {
-            ISOLATED_TOOL_SURFACE
-        } else {
-            TOOL_SURFACE
+    fn tool_surface(&self, surface: ToolSurface) -> &'static [&'static str] {
+        match surface {
+            ToolSurface::Full => TOOL_SURFACE,
+            ToolSurface::Restricted => RESTRICTED_TOOL_SURFACE,
+            ToolSurface::None => &[],
         }
     }
 
     fn tool_surface_note(&self) -> &'static str {
         "Measured on Claude Code 2.1.282. More tools load on demand through ToolSearch and \
-         are not covered by this list; isolation removes the write and shell tools by name."
+         are not covered by this list; isolation keeps only Read, Grep and Glob, and guests' \
+         and peers' turns run with no tools."
     }
 
     /// The one place the AUP refusal signature lives: the buffered exit and
@@ -319,7 +338,7 @@ mod tests {
             system_prompt_file: sp,
             system_prompt: "sys",
             prompt_file: None,
-            restricted: false,
+            surface: ToolSurface::Full,
             streaming: false,
             pulse_root: root,
             reasoning_effort: None,
@@ -351,33 +370,56 @@ mod tests {
         );
     }
 
-    #[test]
-    fn isolated_argv_denies_writing_tools() {
+    fn argv(surface: ToolSurface, streaming: bool) -> Vec<String> {
         let mut i = inv("opus", None, Path::new("/e"));
-        i.restricted = true;
-        let args = Claude.invoke_args(&i);
-        let joined: Vec<String> = args
+        i.surface = surface;
+        i.streaming = streaming;
+        Claude
+            .invoke_args(&i)
             .iter()
             .map(|a| a.to_string_lossy().into_owned())
-            .collect();
-        let pos = joined
-            .iter()
-            .position(|a| a == "--disallowedTools")
-            .expect("flag present");
-        assert_eq!(joined[pos + 1], ISOLATION_DISALLOWED_TOOLS);
-        assert!(joined.contains(&"--dangerously-skip-permissions".to_string()));
+            .collect()
+    }
+
+    /// The value of `--tools`, which must be the last flag.
+    fn tools_value(argv: &[String]) -> Option<&str> {
+        let pos = argv.iter().position(|a| a == "--tools")?;
+        assert_eq!(pos + 2, argv.len(), "--tools must come last: {argv:?}");
+        Some(argv[pos + 1].as_str())
     }
 
     #[test]
-    fn normal_argv_is_unrestricted() {
-        let args = Claude.invoke_args(&inv("opus", None, Path::new("/e")));
-        assert!(!args.iter().any(|a| a == "--disallowedTools"));
+    fn restricted_argv_is_a_read_only_allowlist_with_extensions_closed() {
+        for streaming in [false, true] {
+            let joined = argv(ToolSurface::Restricted, streaming);
+            assert_eq!(tools_value(&joined), Some("Read,Grep,Glob"));
+            assert!(joined.contains(&"--strict-mcp-config".to_string()));
+            assert!(joined.contains(&"--disable-slash-commands".to_string()));
+            assert!(joined.contains(&"--dangerously-skip-permissions".to_string()));
+        }
+    }
+
+    #[test]
+    fn no_tools_argv_passes_an_empty_allowlist() {
+        for streaming in [false, true] {
+            let joined = argv(ToolSurface::None, streaming);
+            assert_eq!(tools_value(&joined), Some(""));
+            assert!(joined.contains(&"--strict-mcp-config".to_string()));
+            assert!(joined.contains(&"--disable-slash-commands".to_string()));
+        }
+    }
+
+    #[test]
+    fn full_argv_has_no_allowlist() {
+        let joined = argv(ToolSurface::Full, false);
+        assert_eq!(tools_value(&joined), None);
+        assert!(!joined.contains(&"--strict-mcp-config".to_string()));
     }
 
     #[test]
     fn tool_surface_is_the_measured_list() {
         assert_eq!(
-            Claude.tool_surface(false),
+            Claude.tool_surface(ToolSurface::Full),
             [
                 "Bash",
                 "Read",
@@ -392,22 +434,27 @@ mod tests {
     }
 
     #[test]
-    fn isolated_tool_surface_is_the_surface_minus_the_disallow_list() {
-        // `Agent` is disallowed under its pre-2.1.63 name.
-        let disallowed = |tool: &str| {
-            let name = if tool == "Agent" { "Task" } else { tool };
-            ISOLATION_DISALLOWED_TOOLS.split(',').any(|d| d == name)
-        };
-        let expected: Vec<&str> = Claude
-            .tool_surface(false)
-            .iter()
-            .copied()
-            .filter(|tool| !disallowed(tool))
-            .collect();
-        assert_eq!(Claude.tool_surface(true), expected.as_slice());
-        for gone in ["Bash", "Write", "Edit", "Agent"] {
-            assert!(!Claude.tool_surface(true).contains(&gone), "{gone}");
+    fn the_restricted_surface_is_the_allowlist_and_none_is_empty() {
+        let allowlist: Vec<&str> = RESTRICTED_TOOLS.split(',').collect();
+        assert_eq!(
+            Claude.tool_surface(ToolSurface::Restricted),
+            allowlist.as_slice()
+        );
+        for gone in [
+            "Bash",
+            "Write",
+            "Edit",
+            "Agent",
+            "Skill",
+            "ToolSearch",
+            "WebFetch",
+        ] {
+            assert!(
+                !Claude.tool_surface(ToolSurface::Restricted).contains(&gone),
+                "{gone}"
+            );
         }
+        assert!(Claude.tool_surface(ToolSurface::None).is_empty());
     }
 
     #[test]
@@ -423,17 +470,6 @@ mod tests {
         assert_eq!(joined[fmt + 1], "stream-json");
         assert!(joined.contains(&"--include-partial-messages".to_string()));
         assert!(joined.contains(&"--verbose".to_string()));
-    }
-
-    #[test]
-    fn streaming_argv_keeps_isolation_restrictions() {
-        let mut i = inv("opus", None, Path::new("/e"));
-        i.streaming = true;
-        i.restricted = true;
-        assert!(Claude
-            .invoke_args(&i)
-            .iter()
-            .any(|a| a == "--disallowedTools"));
     }
 
     #[test]

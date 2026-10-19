@@ -20,7 +20,7 @@ pub fn known_plugins() -> Vec<RegistryEntry> {
         },
         RegistryEntry {
             name: "discord-echo".to_string(),
-            description: "Discord bot presence and voice channels".to_string(),
+            description: "Discord text channels: messages in, replies out".to_string(),
             version: "0.1.0".to_string(),
             available: cfg!(feature = "discord-text"),
         },
@@ -75,11 +75,9 @@ pub fn create_plugin(name: &str) -> Option<Box<dyn Plugin>> {
         #[cfg(feature = "voice")]
         "voice-echo" => Some(Box::new(super::voice_echo::VoiceEchoPlugin::new())),
         #[cfg(feature = "discord-text")]
-        "discord-echo" => Some(Box::new(super::discord_echo::DiscordEchoPlugin::new())),
+        "discord-echo" => Some(Box::new(super::discord::DiscordPlugin::discord_echo())),
         #[cfg(feature = "discord-text")]
-        "discord-text-echo" => Some(Box::new(
-            super::discord_text_echo::DiscordTextEchoPlugin::new(),
-        )),
+        "discord-text-echo" => Some(Box::new(super::discord::DiscordPlugin::discord_text_echo())),
         _ => {
             tracing::debug!("Plugin '{name}' is not available");
             None
@@ -128,6 +126,17 @@ mod tests {
     fn test_create_unknown_plugin() {
         let plugin = create_plugin("totally-unknown");
         assert!(plugin.is_none());
+    }
+
+    /// Both Discord names still create their plugin, from one adapter.
+    #[cfg(feature = "discord-text")]
+    #[test]
+    fn both_discord_names_create_their_plugin() {
+        for name in ["discord-echo", "discord-text-echo"] {
+            let plugin = create_plugin(name).expect(name);
+            assert_eq!(plugin.meta().name, name);
+            assert!(find_plugin(name).unwrap().available);
+        }
     }
 
     #[test]

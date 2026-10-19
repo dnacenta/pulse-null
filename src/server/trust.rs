@@ -130,6 +130,7 @@ mod tests {
             peers: std::collections::HashMap::new(),
             plugins: std::collections::HashMap::new(),
             tui: crate::config::TuiConfig::default(),
+            plugin_turns: crate::config::PluginTurnsConfig::default(),
         }
     }
 

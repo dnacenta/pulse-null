@@ -11,6 +11,10 @@
 #   2. scripts/vendor-lint.sh   — no vendor names in generic code
 #   3. cargo clippy -D warnings — no warnings, all targets
 #   4. cargo test               — full test suite
+#   5. clippy + test again with --features all-plugins — the plugin code
+#      (Discord text, voice) is optional, so a default build never sees it
+#   6. clippy with each plugin feature alone — code shared by the plugins
+#      must be clean when only one of them is compiled in
 #
 # Usage: scripts/gate.sh
 # Exit codes: 0 = gate passed, non-zero = first failing check's code.
@@ -44,5 +48,9 @@ run "fmt"    cargo fmt --all -- --check
 run "vendor-lint" scripts/vendor-lint.sh
 run "clippy" cargo clippy --all-targets -- -D warnings
 run "test"   cargo test
+run "clippy (all-plugins)" cargo clippy --all-targets --features all-plugins -- -D warnings
+run "test (all-plugins)"   cargo test --features all-plugins
+run "clippy (voice)"        cargo clippy --all-targets --features voice -- -D warnings
+run "clippy (discord-text)" cargo clippy --all-targets --features discord-text -- -D warnings
 
 echo "==> gate: PASSED"

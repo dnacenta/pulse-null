@@ -4206,6 +4206,7 @@ dependencies = [
  "libc",
  "owo-colors",
  "proptest",
+ "pulse-system-types 0.5.0",
  "pulse-system-types 0.7.0",
  "ratatui",
  "recall-echo",

@@ -56,6 +56,41 @@ pub struct Config {
     pub peers: HashMap<String, PeerConfig>,
     #[serde(default)]
     pub plugins: HashMap<String, toml::Value>,
+    /// Caps on the turns plugins run for guests (PN-110 audit R2-5).
+    #[serde(default)]
+    pub plugin_turns: PluginTurnsConfig,
+}
+
+/// `[plugin_turns]`: what a plugin's guests may cost (PN-110 audit R2-5).
+///
+/// A plugin fed from outside — a phone line, a Discord guild — runs paid
+/// turns for anyone who reaches it. On top of the per-plugin pool and rate
+/// bucket, these cap the guests; the owner's turns are never counted. `0`
+/// turns a cap off.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct PluginTurnsConfig {
+    /// Guest turns one plugin may run per UTC day. Counted in memory: a
+    /// restart starts the day's count again.
+    pub daily_turns: u32,
+    /// Turns one voice call may take.
+    pub voice_turns_per_call: u32,
+    /// Turns one guest sender on a text channel (a Discord user) may take
+    /// in a burst...
+    pub guest_burst: u32,
+    /// ...and then per minute.
+    pub guest_per_minute: f64,
+}
+
+impl Default for PluginTurnsConfig {
+    fn default() -> Self {
+        Self {
+            daily_turns: 500,
+            voice_turns_per_call: 60,
+            guest_burst: 5,
+            guest_per_minute: 6.0,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -913,32 +948,22 @@ impl SessionConfig {
     /// Get session limits based on resolved identity class.
     ///
     /// Identity classes:
-    /// - `"owner"` → generous limits (200 msgs / 8h)
-    /// - `"peer:*"` → moderate limits (30 msgs / 1h)
-    /// - `"guest:*"` → tight limits (20 msgs / 30min)
-    /// - fallback → default channel limits
-    pub fn get_identity_limits(&self, resolved_key: &str) -> ChannelLimits {
-        if resolved_key == "owner" {
-            ChannelLimits {
-                message_cap: self.owner_message_cap,
-                time_cap_seconds: self.owner_time_cap_seconds,
-            }
-        } else if resolved_key.starts_with("peer:") {
-            ChannelLimits {
-                message_cap: self.peer_message_cap,
-                time_cap_seconds: self.peer_time_cap_seconds,
-            }
-        } else if resolved_key.starts_with("guest:") {
-            ChannelLimits {
-                message_cap: self.guest_message_cap,
-                time_cap_seconds: self.guest_time_cap_seconds,
-            }
-        } else {
-            // Fallback for unexpected key formats
-            ChannelLimits {
-                message_cap: self.default_message_cap,
-                time_cap_seconds: self.default_time_cap_seconds,
-            }
+    /// - owner → generous limits (200 msgs / 8h)
+    /// - `peer:*` → moderate limits (30 msgs / 1h)
+    /// - `guest:*` → tight limits (20 msgs / 30min)
+    pub fn get_identity_limits(
+        &self,
+        resolved_key: &crate::session_key::SessionKey,
+    ) -> ChannelLimits {
+        use crate::session_key::Principal;
+        let (message_cap, time_cap_seconds) = match resolved_key.principal() {
+            Principal::Owner => (self.owner_message_cap, self.owner_time_cap_seconds),
+            Principal::Peer(_) => (self.peer_message_cap, self.peer_time_cap_seconds),
+            Principal::Guest(_) => (self.guest_message_cap, self.guest_time_cap_seconds),
+        };
+        ChannelLimits {
+            message_cap,
+            time_cap_seconds,
         }
     }
 
@@ -1290,7 +1315,23 @@ pub mod test_support {
             peers: HashMap::new(),
             plugins: HashMap::new(),
             tui: TuiConfig::default(),
+            plugin_turns: PluginTurnsConfig::default(),
         }
+    }
+
+    /// A pulse that boots without the network: an Ollama provider on a
+    /// closed local port that nothing calls, no graph, no autonomy, no
+    /// scheduler, and an ephemeral loopback port.
+    pub fn offline_config() -> Config {
+        let mut config = minimal_config();
+        config.llm.provider = "ollama".to_string();
+        config.llm.base_url = Some("http://127.0.0.1:9".to_string());
+        config.graph.enabled = false;
+        config.autonomy.enabled = false;
+        config.scheduler.enabled = false;
+        config.server.host = "127.0.0.1".to_string();
+        config.server.port = 0;
+        config
     }
 }
 
@@ -1592,5 +1633,36 @@ mod pulse_rename_tests {
         assert!(text.contains("[caliber]"), "{text}");
         assert!(!text.contains("[entity]"), "{text}");
         assert!(text.contains("pulse_filter"), "{text}");
+    }
+}
+
+#[cfg(test)]
+mod plugin_turns_config_tests {
+    use super::*;
+
+    #[test]
+    fn a_missing_section_takes_the_defaults() {
+        let cfg: PluginTurnsConfig = toml::from_str("").unwrap();
+        assert_eq!(cfg, PluginTurnsConfig::default());
+        assert_eq!(cfg.daily_turns, 500);
+        assert_eq!(cfg.voice_turns_per_call, 60);
+        assert_eq!(cfg.guest_burst, 5);
+        assert!((cfg.guest_per_minute - 6.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn one_key_overrides_and_the_rest_default() {
+        let cfg: PluginTurnsConfig = toml::from_str("daily_turns = 0\n").unwrap();
+        assert_eq!(cfg.daily_turns, 0);
+        assert_eq!(cfg.voice_turns_per_call, 60);
+    }
+
+    #[test]
+    fn the_section_parses_in_a_full_config() {
+        let mut config = test_support::minimal_config();
+        assert_eq!(config.plugin_turns, PluginTurnsConfig::default());
+        let table: toml::Value = toml::from_str("voice_turns_per_call = 12\n").unwrap();
+        config.plugin_turns = table.try_into().unwrap();
+        assert_eq!(config.plugin_turns.voice_turns_per_call, 12);
     }
 }

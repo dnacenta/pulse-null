@@ -66,6 +66,9 @@ Every key:
 | `graph` | `extract_daily_token_budget` | init: `2000000` | Extraction token cap per UTC day (`0` = none) |
 | `context_buffer` | `pulse_filter` | `true` | On shared channels, drop other pulses' messages from context |
 | `tui` | `theme`, `motion`, `nerd_font` | `gruvbox`, `full`, `auto` | See [tui.md](tui.md) |
+| `plugin_turns` | `daily_turns` | `500` | Guest turns one plugin (Discord, voice) may run per UTC day; the owner's turns don't count; in memory, so a restart starts the day again (`0` = no cap) |
+| `plugin_turns` | `voice_turns_per_call` | `60` | Turns one voice call may take (`0` = no cap) |
+| `plugin_turns` | `guest_burst`, `guest_per_minute` | `5`, `6` | Per-sender token bucket for guests on a text channel such as Discord (`guest_burst = 0` = no bucket) |
 
 Also present, with defaults: `[owner]`, `[prediction]`, `[tension]`, `[outreach]`,
 `[sessions]`, `[session_health]`, `[platform]`, `[system_prompt_budget]`, `[peers]`,

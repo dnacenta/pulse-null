@@ -31,6 +31,7 @@ use crate::cli_provider::adapter::{
     SystemPromptDelivery, Usage,
 };
 use crate::init::agent_bootstrap::{ensure_config, BootstrapItem, ItemKind, ItemStatus};
+use crate::tool_surface::ToolSurface;
 
 /// The tools an isolated pulse keeps: grok's read-only built-ins, by grok's
 /// own identifiers. Measured on grok 1.0.0 (2026-09-25): `--disallowed-tools`
@@ -57,6 +58,15 @@ const TOOL_SURFACE: &[&str] = &[
 
 /// Tools that survive a `--tools` allowlist and must be removed by name.
 const ISOLATED_REMOVE: &str = "search_tool,use_tool,workflow";
+
+/// The narrowest allowlist grok takes for a guest's or peer's turn: its
+/// session todo list, which reads no file, runs nothing and reaches no
+/// network. grok has no documented "no tools": `--tools ""` raises no
+/// warning but what it then allows could not be observed without a signed-in
+/// model call (unverified, 1.0.62), and a list naming no known tool is
+/// ignored — grok warns "names no tool, so other tools stay available" —
+/// which fails open. `todo_write` is a name 1.0.62 recognises (no warning).
+const NO_TOOLS_ALLOWLIST: &[&str] = &["todo_write"];
 
 /// Hidden thinking is billed and unbounded: `high` measured at ~20s per chat
 /// turn against ~5s for `low` on the same prompt, with no visible quality gain
@@ -165,9 +175,14 @@ impl CliAdapter for Grok {
         // pulse directory is never in its trust store on a fresh host.
         args.push("--trust".into());
 
-        if inv.restricted {
+        let allowlist = match inv.surface {
+            ToolSurface::Full => None,
+            ToolSurface::Restricted => Some(ISOLATED_TOOLS),
+            ToolSurface::None => Some(NO_TOOLS_ALLOWLIST),
+        };
+        if let Some(tools) = allowlist {
             args.push("--tools".into());
-            args.push(ISOLATED_TOOLS.join(",").into());
+            args.push(tools.join(",").into());
             args.push("--disallowed-tools".into());
             args.push(ISOLATED_REMOVE.into());
             args.push("--disable-web-search".into());
@@ -225,11 +240,11 @@ impl CliAdapter for Grok {
         &["usage balance exhausted"]
     }
 
-    fn tool_surface(&self, restricted: bool) -> &'static [&'static str] {
-        if restricted {
-            ISOLATED_TOOLS
-        } else {
-            TOOL_SURFACE
+    fn tool_surface(&self, surface: ToolSurface) -> &'static [&'static str] {
+        match surface {
+            ToolSurface::Full => TOOL_SURFACE,
+            ToolSurface::Restricted => ISOLATED_TOOLS,
+            ToolSurface::None => NO_TOOLS_ALLOWLIST,
         }
     }
 
@@ -398,7 +413,7 @@ mod tests {
             system_prompt_file: None,
             system_prompt: "You are Echo.",
             prompt_file: Some(prompt_file),
-            restricted: false,
+            surface: ToolSurface::Full,
             streaming: false,
             pulse_root: root,
             reasoning_effort: None,
@@ -478,7 +493,7 @@ mod tests {
         assert!(!plain.iter().any(|arg| arg == "--include-partial-messages"));
 
         let mut inv = invocation(&prompt, &root);
-        inv.restricted = true;
+        inv.surface = ToolSurface::Restricted;
         inv.streaming = true;
         let guarded = strings(&Grok.invoke_args(&inv));
         // Isolation is an allowlist of grok's read-only tools (its names),
@@ -504,9 +519,30 @@ mod tests {
     }
 
     #[test]
+    fn a_no_tools_turn_gets_the_narrowest_allowlist_and_every_removal() {
+        let prompt = PathBuf::from("/tmp/prompt.txt");
+        let root = PathBuf::from("/home/pulse/pulse-null/echo");
+        let mut inv = invocation(&prompt, &root);
+        inv.surface = ToolSurface::None;
+        let args = strings(&Grok.invoke_args(&inv));
+        assert_eq!(value_of(&args, "--tools"), Some("todo_write"));
+        assert_eq!(value_of(&args, "--disallowed-tools"), Some(ISOLATED_REMOVE));
+        assert!(args.iter().any(|arg| arg == "--disable-web-search"));
+        for tool in [
+            "read_file",
+            "grep",
+            "list_dir",
+            "run_terminal_command",
+            "web_fetch",
+        ] {
+            assert!(!NO_TOOLS_ALLOWLIST.contains(&tool), "{tool}");
+        }
+    }
+
+    #[test]
     fn tool_surface_is_observed_and_isolation_keeps_the_allowlist() {
         assert_eq!(
-            Grok.tool_surface(false),
+            Grok.tool_surface(ToolSurface::Full),
             [
                 "read_file",
                 "grep",
@@ -519,11 +555,17 @@ mod tests {
             ]
         );
         assert_eq!(
-            Grok.tool_surface(true),
+            Grok.tool_surface(ToolSurface::Restricted),
             ["read_file", "list_dir", "grep", "todo_write"]
         );
-        for tool in Grok.tool_surface(true) {
-            assert!(Grok.tool_surface(false).contains(tool), "{tool}");
+        assert_eq!(Grok.tool_surface(ToolSurface::None), ["todo_write"]);
+        for surface in [ToolSurface::Restricted, ToolSurface::None] {
+            for tool in Grok.tool_surface(surface) {
+                assert!(
+                    Grok.tool_surface(ToolSurface::Full).contains(tool),
+                    "{tool}"
+                );
+            }
         }
         assert!(!Grok.tool_surface_note().is_empty());
     }

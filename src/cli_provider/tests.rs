@@ -11,6 +11,7 @@ use super::adapters::claude::Claude;
 use super::adapters::codex::Codex;
 use super::adapters::grok::Grok;
 use super::*;
+use crate::session_key::SessionKey;
 use crate::streaming::{StreamEvent, StreamingProvider};
 use tokio_stream::StreamExt;
 
@@ -252,17 +253,12 @@ impl MockCli {
         let argv_log = dir.path().join("argv.log");
         let prompt_copy = dir.path().join("prompt.txt");
         let script = format!(
-            "#!/usr/bin/env bash\nprintf '%s\\n' \"$@\" > '{}'\ncat > '{}'\n{}\n",
+            "printf '%s\\n' \"$@\" > '{}'\ncat > '{}'\n{}",
             argv_log.display(),
             prompt_copy.display(),
             reply_cmd
         );
-        std::fs::write(&bin, script).unwrap();
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
-        }
+        super::fake_cli::write_script(&bin, &script);
         Self {
             _dir: dir,
             bin,
@@ -595,4 +591,154 @@ fn stream_failure_with_policy_text_is_a_typed_refusal() {
         classify_stream_failure(&Claude, "m", "socket hang up".into()),
         StreamEvent::Error(_)
     ));
+}
+
+/// PN-110 audit P1, R2-1, R2-2: every principal × isolation reaches the
+/// argv of a real adapter as the right surface, on the buffered and the
+/// streaming path. Owner: full, or the read-only allowlist while isolated.
+/// Guests and peers: no tools, isolated or not. No scope at all: no tools.
+#[tokio::test]
+async fn every_principal_and_isolation_state_reaches_the_argv() {
+    use crate::tool_surface::{scope, ToolSurface};
+
+    /// What the argv says about the surface.
+    fn tools_arg(argv: &[String]) -> Option<String> {
+        let pos = argv.iter().position(|a| a == "--tools")?;
+        Some(argv[pos + 1].clone())
+    }
+
+    struct Case {
+        principal: &'static str,
+        turn: Option<ToolSurface>,
+        isolated: bool,
+        claude: Option<&'static str>,
+        grok: Option<&'static str>,
+    }
+    const RESTRICTED_GROK: &str = "read_file,list_dir,grep,todo_write";
+    let cases = [
+        Case {
+            principal: "owner",
+            turn: Some(ToolSurface::for_principal(&SessionKey::owner())),
+            isolated: false,
+            claude: None,
+            grok: None,
+        },
+        Case {
+            principal: "owner",
+            turn: Some(ToolSurface::for_principal(&SessionKey::owner())),
+            isolated: true,
+            claude: Some("Read,Grep,Glob"),
+            grok: Some(RESTRICTED_GROK),
+        },
+        Case {
+            principal: "guest",
+            turn: Some(ToolSurface::for_principal(&SessionKey::guest("2002"))),
+            isolated: false,
+            claude: Some(""),
+            grok: Some("todo_write"),
+        },
+        Case {
+            principal: "guest",
+            turn: Some(ToolSurface::for_principal(&SessionKey::guest("2002"))),
+            isolated: true,
+            claude: Some(""),
+            grok: Some("todo_write"),
+        },
+        Case {
+            principal: "peer",
+            turn: Some(ToolSurface::for_principal(&SessionKey::peer("Synth"))),
+            isolated: false,
+            claude: Some(""),
+            grok: Some("todo_write"),
+        },
+        Case {
+            principal: "peer",
+            turn: Some(ToolSurface::for_principal(&SessionKey::peer("Synth"))),
+            isolated: true,
+            claude: Some(""),
+            grok: Some("todo_write"),
+        },
+        // Fails closed (R2-11): a call outside any scope gets no tools.
+        Case {
+            principal: "unscoped",
+            turn: None,
+            isolated: false,
+            claude: Some(""),
+            grok: Some("todo_write"),
+        },
+        Case {
+            principal: "unscoped",
+            turn: None,
+            isolated: true,
+            claude: Some(""),
+            grok: Some("todo_write"),
+        },
+        // Owner work outside a turn (scheduler, intents, farms) asks for
+        // the full surface explicitly.
+        Case {
+            principal: "owner work",
+            turn: Some(ToolSurface::Full),
+            isolated: false,
+            claude: None,
+            grok: None,
+        },
+    ];
+
+    for adapter in ["claude", "grok"] {
+        for case in &cases {
+            // One reply every adapter and both paths read as a result.
+            let mock = MockCli::new(
+                "printf '{\"type\":\"result\",\"result\":\"mock ok\",\"is_error\":false}'",
+            );
+            let provider = match adapter {
+                "claude" => mock.provider("m"),
+                _ => mock.provider_for(Box::new(Grok), "m"),
+            };
+            if case.isolated {
+                crate::server::isolation::enter(mock._dir.path(), "test", None).unwrap();
+            }
+            let expected = match adapter {
+                "claude" => case.claude,
+                _ => case.grok,
+            };
+            let label = format!("{adapter}, {}, isolated={}", case.principal, case.isolated);
+
+            // Every call must succeed: a failed spawn would otherwise leave
+            // no argv log, and the assertion below would fail on that
+            // instead of on the real cause.
+            let invoke = async {
+                provider
+                    .invoke("sys", &[user("hi")], 10, None)
+                    .await
+                    .unwrap_or_else(|e| panic!("{label}: {e}"));
+            };
+            match case.turn {
+                Some(surface) => scope(surface, invoke).await,
+                None => invoke.await,
+            }
+            assert_eq!(tools_arg(&mock.argv()).as_deref(), expected, "{label}");
+
+            let stream = async {
+                let mut stream = provider.invoke_streaming("sys", &[user("hi")], 10, None);
+                let mut done = false;
+                while let Some(event) = stream.next().await {
+                    match event {
+                        StreamEvent::Error(e) => panic!("{label}, streamed: {e}"),
+                        StreamEvent::Done(_) => done = true,
+                        _ => {}
+                    }
+                }
+                assert!(done, "{label}, streamed: no result");
+            };
+            match case.turn {
+                Some(surface) => scope(surface, stream).await,
+                None => stream.await,
+            }
+            assert_eq!(
+                tools_arg(&mock.argv()).as_deref(),
+                expected,
+                "{label}, streamed"
+            );
+        }
+    }
 }
