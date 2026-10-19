@@ -202,50 +202,77 @@ impl<P: ReplyPoster> Forwarder<P> {
             channel_label,
             self.turns.channel()
         );
-
         // The Discord user id is the sender: it is what `[owner] discord_id`
         // matches, so attribution is exactly what it was over HTTP.
         let turn = PluginTurn {
             message: msg.content,
             sender: Some(msg.author_id),
         };
-        let reply = match self.turns.run(turn, None).await {
-            Ok(reply) => reply.response,
-            // Expected while the pulse stops: not worth a warning each.
-            Err(TurnError::ShuttingDown) => {
-                tracing::debug!(
-                    "discord: message {} not answered, shutting down",
-                    msg.message_id
-                );
-                return Handled::TurnFailed(TurnError::ShuttingDown);
-            }
-            Err(e) => {
-                tracing::warn!("discord: turn for message {} failed: {e}", msg.message_id);
-                return Handled::TurnFailed(e);
-            }
+        let reply = match self.reply_to(&msg.message_id, turn).await {
+            Ok(reply) => reply,
+            Err(failed) => return failed,
         };
-
         if reply.trim().is_empty() || is_silent(&reply) {
             tracing::debug!("discord: silent reply in #{channel_label}");
             return Handled::Silent;
         }
+        let delivery = Delivery {
+            message_id: &msg.message_id,
+            channel_id: &msg.channel_id,
+            channel_label,
+        };
+        self.post_once(delivery, &reply).await
+    }
 
+    /// The pulse's reply to one message, or why there is none.
+    async fn reply_to(&self, message_id: &str, turn: PluginTurn) -> Result<String, Handled> {
+        match self.turns.run(turn, None).await {
+            Ok(reply) => Ok(reply.response),
+            // Expected while the pulse stops: not worth a warning each.
+            Err(TurnError::ShuttingDown) => {
+                tracing::debug!("discord: message {message_id} not answered, shutting down");
+                Err(Handled::TurnFailed(TurnError::ShuttingDown))
+            }
+            Err(e) => {
+                tracing::warn!("discord: turn for message {message_id} failed: {e}");
+                Err(Handled::TurnFailed(e))
+            }
+        }
+    }
+
+    /// Post the reply unless the message was already answered, and record
+    /// that it was.
+    async fn post_once(&self, delivery: Delivery<'_>, reply: &str) -> Handled {
         // Second line of defence: a seen-id evicted from the window must
         // still not get a second reply.
-        if self.dedup.lock().await.has_responded(&msg.message_id) {
+        if self.dedup.lock().await.has_responded(delivery.message_id) {
             return Handled::Duplicate;
         }
-        match self.poster.post(&msg.channel_id, &reply).await {
+        match self.poster.post(delivery.channel_id, reply).await {
             Ok(()) => {
-                self.dedup.lock().await.record_responded(&msg.message_id);
+                self.dedup
+                    .lock()
+                    .await
+                    .record_responded(delivery.message_id);
                 Handled::Posted
             }
             Err(e) => {
-                tracing::error!("discord: failed to reply in #{channel_label}: {e}");
+                tracing::error!(
+                    "discord: failed to reply in #{}: {e}",
+                    delivery.channel_label
+                );
                 Handled::PostFailed(e)
             }
         }
     }
+}
+
+/// Where a reply goes, and the message it answers.
+struct Delivery<'a> {
+    message_id: &'a str,
+    channel_id: &'a str,
+    /// The channel's name for the log.
+    channel_label: &'a str,
 }
 
 impl<P: ReplyPoster + 'static> Forwarder<P> {
@@ -259,8 +286,7 @@ impl<P: ReplyPoster + 'static> Forwarder<P> {
         mut stop: watch::Receiver<bool>,
         grace: Duration,
     ) {
-        let mut lanes: HashMap<String, mpsc::Sender<IncomingMessage>> = HashMap::new();
-        let mut workers = JoinSet::new();
+        let mut lanes = Lanes::default();
         loop {
             let msg = tokio::select! {
                 biased;
@@ -273,45 +299,12 @@ impl<P: ReplyPoster + 'static> Forwarder<P> {
             if self.admit(&msg).await.is_some() {
                 continue;
             }
-            let channel = msg.channel_id.clone();
-            let msg = match lanes.get(&channel) {
-                Some(lane) => match lane.try_send(msg) {
-                    Ok(()) => continue,
-                    Err(mpsc::error::TrySendError::Full(msg)) => {
-                        tracing::warn!(
-                            "discord: {LANE_DEPTH} messages already queued in channel {channel}; \
-                             message {} from {} dropped unanswered",
-                            msg.message_id,
-                            msg.author_id
-                        );
-                        continue;
-                    }
-                    // The lane's worker is gone (it panicked); start another.
-                    Err(mpsc::error::TrySendError::Closed(msg)) => msg,
-                },
-                None => msg,
-            };
-            let (lane, queue) = mpsc::channel(LANE_DEPTH);
-            workers.spawn(Arc::clone(&self).lane(queue, stop.clone()));
-            // A fresh lane is empty and its receiver alive: this cannot fail.
-            let _ = lane.try_send(msg);
-            lanes.insert(channel, lane);
+            lanes.queue(&self, msg, &stop);
         }
-
         // Close the gateway's queue now, so a gateway still sending sees it
         // gone and returns, rather than being aborted at its grace.
         drop(rx);
-        drop(lanes);
-        let finished = tokio::time::timeout(grace, async {
-            while workers.join_next().await.is_some() {}
-        })
-        .await;
-        if finished.is_err() {
-            tracing::warn!(
-                "discord: turns still in flight after {grace:?}; abandoning them unanswered"
-            );
-            workers.abort_all();
-        }
+        lanes.finish(grace).await;
     }
 
     /// One channel's messages, in order. Once `stop` is set no further
@@ -341,6 +334,81 @@ impl<P: ReplyPoster + 'static> Forwarder<P> {
                 continue;
             }
             self.answer(msg).await;
+        }
+    }
+}
+
+/// One queue and one worker per Discord channel.
+#[derive(Default)]
+struct Lanes {
+    senders: HashMap<String, mpsc::Sender<IncomingMessage>>,
+    workers: JoinSet<()>,
+}
+
+impl Lanes {
+    /// Queue an admitted message on its channel's lane, starting the lane
+    /// when there is none (or its worker is gone).
+    fn queue<P: ReplyPoster + 'static>(
+        &mut self,
+        forwarder: &Arc<Forwarder<P>>,
+        msg: IncomingMessage,
+        stop: &watch::Receiver<bool>,
+    ) {
+        let channel = msg.channel_id.clone();
+        let Some(msg) = self.send_on_existing_lane(&channel, msg) else {
+            return;
+        };
+        let (lane, queue) = mpsc::channel(LANE_DEPTH);
+        self.workers
+            .spawn(Arc::clone(forwarder).lane(queue, stop.clone()));
+        // A fresh lane is empty and its receiver alive: this cannot fail.
+        let _ = lane.try_send(msg);
+        self.senders.insert(channel, lane);
+    }
+
+    /// Hand `msg` to the channel's running lane. A full lane drops it, said
+    /// in the log; the message comes back when a new lane must take it (no
+    /// lane yet, or its worker panicked).
+    fn send_on_existing_lane(
+        &self,
+        channel: &str,
+        msg: IncomingMessage,
+    ) -> Option<IncomingMessage> {
+        let Some(lane) = self.senders.get(channel) else {
+            return Some(msg);
+        };
+        match lane.try_send(msg) {
+            Ok(()) => None,
+            Err(mpsc::error::TrySendError::Full(msg)) => {
+                tracing::warn!(
+                    "discord: {LANE_DEPTH} messages already queued in channel {channel}; \
+                     message {} from {} dropped unanswered",
+                    msg.message_id,
+                    msg.author_id
+                );
+                None
+            }
+            Err(mpsc::error::TrySendError::Closed(msg)) => Some(msg),
+        }
+    }
+
+    /// Let the lanes finish the turns they have in flight, for up to
+    /// `grace`, starting no new one; then abandon the rest.
+    async fn finish(self, grace: Duration) {
+        let Lanes {
+            senders,
+            mut workers,
+        } = self;
+        drop(senders);
+        let finished = tokio::time::timeout(grace, async {
+            while workers.join_next().await.is_some() {}
+        })
+        .await;
+        if finished.is_err() {
+            tracing::warn!(
+                "discord: turns still in flight after {grace:?}; abandoning them unanswered"
+            );
+            workers.abort_all();
         }
     }
 }

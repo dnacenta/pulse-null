@@ -3654,6 +3654,103 @@ mod discord_forwarder_e2e {
         assert_eq!(poster.posts.lock().unwrap().len(), 1);
     }
 
+    /// Refuses every reply, as Discord does when the bot lost access.
+    struct RefusingPoster;
+
+    impl ReplyPoster for RefusingPoster {
+        fn post<'a>(
+            &'a self,
+            _channel_id: &'a str,
+            _text: &'a str,
+        ) -> Pin<Box<dyn Future<Output = Result<(), PostError>> + Send + 'a>> {
+            Box::pin(async { Err(PostError("Missing Access".to_string())) })
+        }
+    }
+
+    /// A forwarder over `provider`, posting through `poster`.
+    async fn forwarder_over<P: ReplyPoster>(
+        dir: &std::path::Path,
+        provider: Box<dyn crate::streaming::StreamingProvider>,
+        poster: Arc<P>,
+    ) -> (Arc<AppState>, Forwarder<P>) {
+        let state = build_state_boxed_with_config(
+            dir.to_path_buf(),
+            provider,
+            ToolRegistry::new(),
+            test_config(),
+        )
+        .await;
+        state.turns.bind(&state);
+        let turns = state
+            .turns
+            .for_plugin("discord-text-echo", "discord")
+            .unwrap();
+        let dedup = Arc::new(tokio::sync::Mutex::new(DedupState::new()));
+        let forwarder = Forwarder::new(turns, poster, dedup);
+        (state, forwarder)
+    }
+
+    #[tokio::test]
+    async fn a_failed_turn_posts_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let poster = Arc::new(FakePoster::default());
+        let (_state, forwarder) =
+            forwarder_over(dir.path(), Box::new(FailingProvider), Arc::clone(&poster)).await;
+        let handled = forwarder.answer(message("m1", "2002", "hi")).await;
+        assert!(
+            matches!(&handled, Handled::TurnFailed(e) if *e != crate::server::turns::TurnError::ShuttingDown),
+            "{handled:?}"
+        );
+        assert!(poster.posts.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_pulse_shutting_down_answers_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let (state, forwarder, poster) = forwarder_with(dir.path(), vec![mock_text("late")]).await;
+        state.turns.refuse_new();
+        assert_eq!(
+            forwarder.answer(message("m1", "2002", "hi")).await,
+            Handled::TurnFailed(crate::server::turns::TurnError::ShuttingDown)
+        );
+        assert!(poster.posts.lock().unwrap().is_empty());
+    }
+
+    /// The second line of defence: a message answered once is never
+    /// answered again, even when it reaches the turn a second time.
+    #[tokio::test]
+    async fn an_answered_message_gets_no_second_reply() {
+        let dir = tempfile::tempdir().unwrap();
+        let (_state, forwarder, poster) =
+            forwarder_with(dir.path(), vec![mock_text("once"), mock_text("twice")]).await;
+        assert_eq!(
+            forwarder.answer(message("m1", "2002", "hi")).await,
+            Handled::Posted
+        );
+        assert_eq!(
+            forwarder.answer(message("m1", "2002", "hi")).await,
+            Handled::Duplicate
+        );
+        assert_eq!(poster.texts(), vec!["once".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn a_refused_post_is_reported_and_not_recorded_as_answered() {
+        let dir = tempfile::tempdir().unwrap();
+        let (_state, forwarder) = forwarder_over(
+            dir.path(),
+            Box::new(MockProvider::new(vec![mock_text("one"), mock_text("two")])),
+            Arc::new(RefusingPoster),
+        )
+        .await;
+        for _ in 0..2 {
+            assert_eq!(
+                forwarder.answer(message("m1", "2002", "hi")).await,
+                Handled::PostFailed(PostError("Missing Access".to_string()))
+            );
+        }
+    }
+
     #[tokio::test]
     async fn stop_lets_the_turn_in_flight_finish_and_post() {
         let dir = tempfile::tempdir().unwrap();

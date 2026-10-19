@@ -632,7 +632,7 @@ async fn run(
     d: Arc<Dialogue>,
     peers: PeerClient,
     trust: ConversationTrust,
-    mut pause_rx: watch::Receiver<bool>,
+    pause_rx: watch::Receiver<bool>,
     _guard: EndGuard,
 ) {
     let system_prompt = format!(
@@ -640,10 +640,7 @@ async fn run(
         state.system_prompt.read().await,
         peer_context(&d.local, &d.peer, &trust)
     );
-    let max_tokens = state.config.llm.max_tokens;
-    let provider = state.provider.as_ref();
-
-    let mut conversation: Vec<Message> = vec![Message {
+    let conversation = vec![Message {
         role: Role::User,
         content: MessageContent::Text(opener(&d.peer, d.topic.as_deref())),
         source: Some(MessageSource::Human {
@@ -651,16 +648,109 @@ async fn run(
             sender: d.peer.clone(),
         }),
     }];
+    let mut dialogue = DialogueRun {
+        state,
+        d,
+        peers,
+        trust,
+        pause_rx,
+        system_prompt,
+        conversation,
+    };
+    dialogue.converse().await;
+}
 
-    // The local pulse's turn: provider + tool loop on this dialogue's own
-    // message list, as the old tab did.
-    async fn local_turn(
-        provider: &dyn pulse_system_types::llm::LmProvider,
-        state: &AppState,
-        system_prompt: &str,
-        conversation: &mut Vec<Message>,
-        max_tokens: u32,
-    ) -> Result<String, String> {
+/// One running dialogue: the local pulse's own message list, and what each
+/// turn needs.
+struct DialogueRun {
+    state: Arc<AppState>,
+    d: Arc<Dialogue>,
+    peers: PeerClient,
+    trust: ConversationTrust,
+    pause_rx: watch::Receiver<bool>,
+    system_prompt: String,
+    conversation: Vec<Message>,
+}
+
+impl DialogueRun {
+    /// Turns until the cap, a failure, the pause channel going away, or
+    /// isolation.
+    async fn converse(&mut self) {
+        let d = Arc::clone(&self.d);
+        if self.shed() {
+            return;
+        }
+        let Some(mut last) = self.local_reply().await else {
+            return;
+        };
+        let mut turn = d.push_turn(&d.local, &last);
+        while turn < d.max_turns {
+            if !self.may_go_on().await {
+                return;
+            }
+            let Some(reply) = self.peer_reply(&last).await else {
+                return;
+            };
+            turn = d.push_turn(&d.peer, &reply);
+            if turn >= d.max_turns {
+                break;
+            }
+            if !self.may_go_on().await {
+                return;
+            }
+            self.hear_peer(&reply);
+            let Some(next) = self.local_reply().await else {
+                return;
+            };
+            last = next;
+            turn = d.push_turn(&d.local, &last);
+        }
+        d.set_phase(Phase::Finished);
+    }
+
+    /// Not paused (waiting while it is) and not isolated.
+    async fn may_go_on(&mut self) -> bool {
+        self.wait_while_paused().await && !self.shed()
+    }
+
+    /// Wait while paused; false when the pause channel is gone.
+    async fn wait_while_paused(&mut self) -> bool {
+        while !*self.pause_rx.borrow() {
+            if self.pause_rx.changed().await.is_err() {
+                return false;
+            }
+        }
+        true
+    }
+
+    /// Isolation mode started underneath us: end here, before another
+    /// provider or peer call. Checked before every turn.
+    fn shed(&self) -> bool {
+        if crate::server::isolation::is_active(&self.state.root_dir) {
+            self.d
+                .set_phase(Phase::Failed(SHED_BY_ISOLATION.to_string()));
+            return true;
+        }
+        false
+    }
+
+    /// The local pulse's turn; `None` (the dialogue failed) on an error.
+    async fn local_reply(&mut self) -> Option<String> {
+        self.d.set_phase(Phase::LocalThinking);
+        match self.local_turn().await {
+            Ok(text) => Some(text),
+            Err(e) => {
+                self.d
+                    .set_phase(Phase::Failed(format!("{}: {e}", self.d.local)));
+                None
+            }
+        }
+    }
+
+    /// The local pulse's turn: provider + tool loop on this dialogue's own
+    /// message list, as the old tab did.
+    async fn local_turn(&mut self) -> Result<String, String> {
+        let state = &self.state;
         // The registry follows the dialogue's surface (the peer's: none),
         // as the CLI does (audit R2-7).
         let surface = crate::tool_surface::effective(
@@ -670,11 +760,11 @@ async fn run(
         let narrowed =
             crate::server::setup::narrowed_tools(&state.root_dir, &state.config, surface);
         tool_loop::invoke_with_tool_loop(
-            provider,
+            state.provider.as_ref(),
             narrowed.as_ref().unwrap_or(&state.tools),
-            system_prompt,
-            conversation,
-            max_tokens,
+            &self.system_prompt,
+            &mut self.conversation,
+            state.config.llm.max_tokens,
             tool_loop::DEFAULT_MAX_TOOL_ROUNDS,
         )
         .await
@@ -682,93 +772,31 @@ async fn run(
         .map_err(|e| e.to_string())
     }
 
-    // Wait while paused; false when the pause channel is gone.
-    async fn gate(rx: &mut watch::Receiver<bool>) -> bool {
-        while !*rx.borrow() {
-            if rx.changed().await.is_err() {
-                return false;
-            }
-        }
-        true
-    }
-
-    // Isolation mode started underneath us: end here, before another
-    // provider or peer call. Checked before every turn.
-    fn shed(state: &AppState, d: &Dialogue) -> bool {
-        if crate::server::isolation::is_active(&state.root_dir) {
-            d.set_phase(Phase::Failed(SHED_BY_ISOLATION.to_string()));
-            return true;
-        }
-        false
-    }
-
-    if shed(&state, &d) {
-        return;
-    }
-    d.set_phase(Phase::LocalThinking);
-    let mut last = match local_turn(
-        provider,
-        &state,
-        &system_prompt,
-        &mut conversation,
-        max_tokens,
-    )
-    .await
-    {
-        Ok(text) => text,
-        Err(e) => {
-            d.set_phase(Phase::Failed(format!("{}: {e}", d.local)));
-            return;
-        }
-    };
-    let mut turn = d.push_turn(&d.local, &last);
-
-    while turn < d.max_turns {
-        if !gate(&mut pause_rx).await || shed(&state, &d) {
-            return;
-        }
+    /// The peer's turn on `last`; `None` (the dialogue failed) on an error.
+    async fn peer_reply(&self, last: &str) -> Option<String> {
+        let d = &self.d;
         d.set_phase(Phase::PeerThinking);
-        let reply = match send_with_retry(&peers, &d.peer, &last, &d.local).await {
-            Ok(r) => r,
+        match send_with_retry(&self.peers, &d.peer, last, &d.local).await {
+            Ok(reply) => Some(reply),
             Err(e) => {
                 d.set_phase(Phase::Failed(format!("{}: {e}", d.peer)));
-                return;
+                None
             }
-        };
-        turn = d.push_turn(&d.peer, &reply);
-        if turn >= d.max_turns {
-            break;
         }
-        if !gate(&mut pause_rx).await || shed(&state, &d) {
-            return;
-        }
-        conversation.push(Message {
+    }
+
+    /// The peer's reply, as the next user message.
+    fn hear_peer(&mut self, reply: &str) {
+        let text = peer_message(&self.state, &self.d.peer, reply, &self.trust);
+        self.conversation.push(Message {
             role: Role::User,
-            content: MessageContent::Text(peer_message(&state, &d.peer, &reply, &trust)),
+            content: MessageContent::Text(text),
             source: Some(MessageSource::Human {
                 channel: "comms".into(),
-                sender: d.peer.clone(),
+                sender: self.d.peer.clone(),
             }),
         });
-        d.set_phase(Phase::LocalThinking);
-        last = match local_turn(
-            provider,
-            &state,
-            &system_prompt,
-            &mut conversation,
-            max_tokens,
-        )
-        .await
-        {
-            Ok(text) => text,
-            Err(e) => {
-                d.set_phase(Phase::Failed(format!("{}: {e}", d.local)));
-                return;
-            }
-        };
-        turn = d.push_turn(&d.local, &last);
     }
-    d.set_phase(Phase::Finished);
 }
 
 #[cfg(test)]
