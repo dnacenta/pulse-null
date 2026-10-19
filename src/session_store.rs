@@ -471,6 +471,80 @@ fn archive_call(root_dir: &Path, pulse_name: &str, data: &SessionData, trigger: 
     crate::session::archive_quarantine(root_dir, pulse_name, &data.key, quarantine);
 }
 
+/// How many session files a load restored and migrated.
+#[derive(Debug, Default)]
+struct LoadCounts {
+    loaded: u32,
+    migrated: u32,
+}
+
+impl LoadCounts {
+    fn log(&self) {
+        if self.loaded > 0 {
+            tracing::info!("Loaded {} persisted session(s)", self.loaded);
+        }
+        if self.migrated > 0 {
+            tracing::info!(
+                "Migrated {} old-format session(s) to identity keys",
+                self.migrated
+            );
+        }
+    }
+}
+
+/// Read and parse one session file; a file that cannot be read or parsed is
+/// logged and skipped.
+fn read_session_file(path: &Path) -> Option<SessionData> {
+    let content = match fs::read_to_string(path) {
+        Ok(content) => content,
+        Err(e) => {
+            tracing::warn!("Failed to read session file {}: {}", path.display(), e);
+            return None;
+        }
+    };
+    serde_json::from_str(&content)
+        .inspect_err(|e| tracing::warn!("Failed to parse session file {}: {}", path.display(), e))
+        .ok()
+}
+
+/// Merge a loaded session into the one already held for its key: messages
+/// appended, the larger message count and the later activity kept.
+fn merge_loaded(existing: &mut Session, data: SessionData) {
+    existing.data.messages.extend(data.messages);
+    existing.data.message_count = existing
+        .data
+        .message_count
+        .max(existing.data.messages.len());
+    existing.data.last_active = existing.data.last_active.max(data.last_active);
+    existing.mark_dirty();
+}
+
+/// Full session end for the CLEAN TRUNK only: archive, EPHEMERAL, LOGBOOK
+/// and later graph ingestion. The quarantine lane is policy-refused content and
+/// goes to a separate dead-end file (SEC-003) so it never reaches EPHEMERAL
+/// or the graph. An empty session is skipped. Returns the trunk archive.
+fn archive_on_shutdown(
+    root_dir: &Path,
+    pulse_name: &str,
+    key: &str,
+    data: &SessionData,
+) -> Option<PathBuf> {
+    if data.messages.is_empty() && data.quarantine.is_empty() {
+        return None;
+    }
+    let path = crate::session::end_session(
+        root_dir,
+        pulse_name,
+        &data.messages,
+        &data.channel,
+        "server-shutdown",
+        Some(key),
+    )
+    .inspect(|path| tracing::info!("Archived session {} to {}", key, path.display()));
+    crate::session::archive_quarantine(root_dir, pulse_name, key, &data.quarantine);
+    path
+}
+
 /// Resolve a raw channel+sender pair into an identity class.
 ///
 /// Identity classes determine session boundaries, trust levels, and resource
@@ -487,36 +561,31 @@ pub fn resolve_sender(
     peers: &HashMap<String, crate::config::PeerConfig>,
 ) -> SessionKey {
     let sender = sender.unwrap_or("anonymous");
-
-    // TUI/system/reflection channels are always owner
-    if channel == "tui" || channel == "system" || channel == "reflection" {
+    if is_owner_channel(channel) || is_owner_identity(sender, owner) {
         return SessionKey::owner();
     }
-
-    // Check known owner identities
-    if let Some(ref discord_id) = owner.discord_id {
-        if sender == discord_id {
-            return SessionKey::owner();
-        }
-    }
-    if let Some(ref phone) = owner.phone {
-        if sender == phone {
-            return SessionKey::owner();
-        }
-    }
-    if let Some(ref name) = owner.name {
-        if sender.eq_ignore_ascii_case(name) {
-            return SessionKey::owner();
-        }
-    }
-
     // Known peer pulses
     if channel == "comms" && peers.contains_key(sender) {
         return SessionKey::peer(sender);
     }
-
     // Unknown sender
     SessionKey::guest(sender)
+}
+
+/// TUI/system/reflection channels are always owner.
+fn is_owner_channel(channel: &str) -> bool {
+    matches!(channel, "tui" | "system" | "reflection")
+}
+
+/// A known owner identity, on any channel: the Discord id or the phone
+/// number exactly, or the name ignoring ASCII case.
+fn is_owner_identity(sender: &str, owner: &OwnerConfig) -> bool {
+    owner.discord_id.as_deref() == Some(sender)
+        || owner.phone.as_deref() == Some(sender)
+        || owner
+            .name
+            .as_deref()
+            .is_some_and(|name| sender.eq_ignore_ascii_case(name))
 }
 
 /// Check if a session key uses the old `channel:sender` format.
@@ -676,119 +745,98 @@ impl SessionStore {
     /// Old-format session keys (`channel:sender`) are migrated to identity-based
     /// keys (`owner`, `peer:Name`, `guest:sender`) on first load.
     async fn load_persisted(&self) {
-        let entries = match fs::read_dir(&self.sessions_dir) {
-            Ok(e) => e,
-            Err(_) => return,
+        let Ok(entries) = fs::read_dir(&self.sessions_dir) else {
+            return;
         };
-
-        let mut loaded = 0u32;
-        let mut migrated = 0u32;
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if path.extension().and_then(|e| e.to_str()) != Some("json") {
-                continue;
-            }
-
-            match fs::read_to_string(&path) {
-                Ok(content) => match serde_json::from_str::<SessionData>(&content) {
-                    Ok(mut data) => {
-                        // Migrate old-format keys (channel:sender -> identity class)
-                        let was_migrated = if is_old_format_key(&data.key) {
-                            let new_key = resolve_sender(
-                                &data.channel,
-                                Some(&data.sender),
-                                &self.owner,
-                                &self.peers,
-                            );
-                            tracing::info!(
-                                "Migrating session key '{}' -> '{}' (file: {})",
-                                data.key,
-                                new_key,
-                                path.display(),
-                            );
-                            data.key = new_key.into();
-                            migrated += 1;
-
-                            // Remove old file — will be persisted with new key
-                            if let Err(e) = fs::remove_file(&path) {
-                                tracing::warn!(
-                                    "Failed to remove old session file {}: {}",
-                                    path.display(),
-                                    e
-                                );
-                            }
-                            true
-                        } else {
-                            false
-                        };
-
-                        let session = Session {
-                            data: data.clone(),
-                            dirty: was_migrated,
-                        };
-
-                        // Archive and remove expired sessions
-                        if session.is_expired(self.ttl_seconds) {
-                            tracing::debug!("Archiving expired session: {}", data.key);
-
-                            // Full session end: archive + EPHEMERAL + LOGBOOK
-                            if !data.messages.is_empty() {
-                                crate::session::end_session(
-                                    &self.root_dir,
-                                    &self.pulse_name,
-                                    &data.messages,
-                                    &data.channel,
-                                    "session-expired-on-load",
-                                    Some(&data.key),
-                                );
-                            }
-
-                            // Clean up the file (if not already removed by migration)
-                            let _ = fs::remove_file(&path);
-                            continue;
-                        }
-
-                        let key = data.key.clone();
-                        let mut sessions = self.sessions.write().await;
-
-                        // If a session already exists for the new key (e.g., from merging
-                        // discord:owner + voice:owner -> owner), merge messages
-                        if let Some(existing_arc) = sessions.get(&key) {
-                            let mut existing = existing_arc.write().await;
-                            let mut merged = existing.data.messages.clone();
-                            merged.extend(data.messages);
-                            existing.data.messages = merged;
-                            existing.data.message_count = existing
-                                .data
-                                .message_count
-                                .max(existing.data.messages.len());
-                            existing.data.last_active =
-                                existing.data.last_active.max(data.last_active);
-                            existing.mark_dirty();
-                            tracing::info!("Merged migrated session into existing key '{}'", key);
-                        } else {
-                            sessions.insert(key.clone(), std::sync::Arc::new(RwLock::new(session)));
-                        }
-                        loaded += 1;
-                    }
-                    Err(e) => {
-                        tracing::warn!("Failed to parse session file {}: {}", path.display(), e);
-                    }
-                },
-                Err(e) => {
-                    tracing::warn!("Failed to read session file {}: {}", path.display(), e);
-                }
-            }
+        let mut counts = LoadCounts::default();
+        let session_files = entries
+            .flatten()
+            .map(|entry| entry.path())
+            .filter(|path| path.extension().and_then(|e| e.to_str()) == Some("json"));
+        for path in session_files {
+            self.load_session_file(&path, &mut counts).await;
         }
+        counts.log();
+    }
 
-        if loaded > 0 {
-            tracing::info!("Loaded {} persisted session(s)", loaded);
+    /// Load one session file: migrate an old-format key, archive the session
+    /// if it has expired, otherwise add it to the store.
+    async fn load_session_file(&self, path: &Path, counts: &mut LoadCounts) {
+        let Some(mut data) = read_session_file(path) else {
+            return;
+        };
+        let was_migrated = self.migrate_key(&mut data, path);
+        if was_migrated {
+            counts.migrated += 1;
         }
-        if migrated > 0 {
-            tracing::info!(
-                "Migrated {} old-format session(s) to identity keys",
-                migrated
+        let session = Session {
+            data,
+            dirty: was_migrated,
+        };
+        if self.archive_if_expired(&session, path) {
+            return;
+        }
+        self.insert_loaded(session).await;
+        counts.loaded += 1;
+    }
+
+    /// Migrate an old-format key (channel:sender -> identity class); the old
+    /// file is removed and the session is persisted under the new key.
+    fn migrate_key(&self, data: &mut SessionData, path: &Path) -> bool {
+        if !is_old_format_key(&data.key) {
+            return false;
+        }
+        let new_key = resolve_sender(&data.channel, Some(&data.sender), &self.owner, &self.peers);
+        tracing::info!(
+            "Migrating session key '{}' -> '{}' (file: {})",
+            data.key,
+            new_key,
+            path.display(),
+        );
+        data.key = new_key.into();
+        if let Err(e) = fs::remove_file(path) {
+            tracing::warn!(
+                "Failed to remove old session file {}: {}",
+                path.display(),
+                e
             );
+        }
+        true
+    }
+
+    /// Archive and remove an expired session: full session end (archive +
+    /// EPHEMERAL + LOGBOOK) when it has messages, then its file (if not
+    /// already removed by migration). Returns whether it had expired.
+    fn archive_if_expired(&self, session: &Session, path: &Path) -> bool {
+        if !session.is_expired(self.ttl_seconds) {
+            return false;
+        }
+        let data = &session.data;
+        tracing::debug!("Archiving expired session: {}", data.key);
+        if !data.messages.is_empty() {
+            crate::session::end_session(
+                &self.root_dir,
+                &self.pulse_name,
+                &data.messages,
+                &data.channel,
+                "session-expired-on-load",
+                Some(&data.key),
+            );
+        }
+        let _ = fs::remove_file(path);
+        true
+    }
+
+    /// Add a loaded session. If a session already exists for its key (e.g.,
+    /// from merging discord:owner + voice:owner -> owner), merge messages.
+    async fn insert_loaded(&self, session: Session) {
+        let key = session.data.key.clone();
+        let mut sessions = self.sessions.write().await;
+        if let Some(existing) = sessions.get(&key) {
+            merge_loaded(&mut *existing.write().await, session.data);
+            tracing::info!("Merged migrated session into existing key '{}'", key);
+        } else {
+            sessions.insert(key, std::sync::Arc::new(RwLock::new(session)));
         }
     }
 
@@ -1213,49 +1261,20 @@ impl SessionStore {
     pub async fn archive_all(&self, root_dir: &Path, pulse_name: &str) -> Vec<PathBuf> {
         let sessions = self.sessions.read().await;
         let mut archived_paths = Vec::new();
-
-        for (key, session_arc) in sessions.iter() {
-            let session = session_arc.read().await;
-            if session.data.messages.is_empty() && session.data.quarantine.is_empty() {
-                continue;
-            }
-
-            // Full session end for the CLEAN TRUNK only: archive + EPHEMERAL +
-            // LOGBOOK + later graph ingestion. The quarantine lane is
-            // policy-refused content and goes to a separate dead-end file
-            // (SEC-003) so it never reaches EPHEMERAL or the graph.
-            if let Some(path) = crate::session::end_session(
+        for (key, session) in sessions.iter() {
+            let session = session.read().await;
+            archived_paths.extend(archive_on_shutdown(
                 root_dir,
                 pulse_name,
-                &session.data.messages,
-                &session.data.channel,
-                "server-shutdown",
-                Some(key),
-            ) {
-                tracing::info!("Archived session {} to {}", key, path.display());
-                archived_paths.push(path);
-            }
-            crate::session::archive_quarantine(root_dir, pulse_name, key, &session.data.quarantine);
+                key,
+                &session.data,
+            ));
         }
 
         // Voice calls end with the process: archived here, in line (the
         // process is exiting), the same way the sweep archives them.
-        let live: Vec<SessionData> = {
-            let mut calls = self.calls.write().await;
-            let mut live = Vec::with_capacity(calls.len());
-            for (_, arc) in calls.drain() {
-                live.push(arc.read().await.data.clone());
-            }
-            live
-        };
-        let queued: Vec<SessionData> = self
-            .ended_calls
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .drain(..)
-            .collect();
-        for data in live.iter().chain(queued.iter()) {
-            archive_call(root_dir, pulse_name, data, "server-shutdown");
+        for data in self.take_all_calls().await {
+            archive_call(root_dir, pulse_name, &data, "server-shutdown");
         }
 
         // Persist all to disk so they can be restored on restart
@@ -1265,8 +1284,25 @@ impl SessionStore {
         if !archived_paths.is_empty() {
             tracing::info!("Archived {} session(s) on shutdown", archived_paths.len());
         }
-
         archived_paths
+    }
+
+    /// Every live call, then every ended call still queued for the sweep.
+    async fn take_all_calls(&self) -> Vec<SessionData> {
+        let mut all = Vec::new();
+        {
+            let mut calls = self.calls.write().await;
+            for (_, arc) in calls.drain() {
+                all.push(arc.read().await.data.clone());
+            }
+        }
+        all.extend(
+            self.ended_calls
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .drain(..),
+        );
+        all
     }
 
     /// Get lightweight session info for the status endpoint.
@@ -1681,6 +1717,86 @@ mod tests {
         assert_eq!(key, "guest:stranger");
     }
 
+    /// Every rule of the trust decision, in its order of precedence. Each
+    /// row is (channel, sender, expected key).
+    #[test]
+    fn resolve_sender_pins_every_rule() {
+        let owner = OwnerConfig {
+            name: Some("Dani".into()),
+            discord_id: Some("693836830436753409".into()),
+            phone: Some("+34600000000".into()),
+        };
+        let mut peers = HashMap::new();
+        for name in ["Nova", "Dani"] {
+            peers.insert(
+                name.to_string(),
+                crate::config::PeerConfig {
+                    host: "127.0.0.1".into(),
+                    port: 3201,
+                    secret: None,
+                },
+            );
+        }
+        let rows: &[(&str, Option<&str>, &str)] = &[
+            // The owner channels are the owner, whoever is named.
+            ("tui", None, "owner"),
+            ("system", Some("stranger"), "owner"),
+            ("reflection", Some("Nova"), "owner"),
+            // Only those three: a look-alike channel is not one of them.
+            ("tui-chat", Some("stranger"), "guest:stranger"),
+            // The Discord id and the phone number match exactly, on any channel.
+            ("discord", Some("693836830436753409"), "owner"),
+            ("voice", Some("693836830436753409"), "owner"),
+            (
+                "discord",
+                Some("6938368304367534090"),
+                "guest:6938368304367534090",
+            ),
+            ("voice", Some("+34600000000"), "owner"),
+            ("chat", Some("+34600000000"), "owner"),
+            ("voice", Some("34600000000"), "guest:34600000000"),
+            // The name matches ignoring ASCII case, and nothing looser.
+            ("chat", Some("dani"), "owner"),
+            ("discord", Some("DANI"), "owner"),
+            ("chat", Some("Danny"), "guest:Danny"),
+            // An owner identity wins over a peer of the same name.
+            ("comms", Some("Dani"), "owner"),
+            // A peer is a peer only on comms, and only by its exact name.
+            ("comms", Some("Nova"), "peer:Nova"),
+            ("chat", Some("Nova"), "guest:Nova"),
+            ("comms", Some("nova"), "guest:nova"),
+            ("comms", Some("Stranger"), "guest:Stranger"),
+            // Everyone else is a guest; a missing sender is "anonymous".
+            ("chat", None, "guest:anonymous"),
+            ("discord", Some(""), "guest:"),
+        ];
+        for (channel, sender, expected) in rows {
+            let key = resolve_sender(channel, *sender, &owner, &peers);
+            assert_eq!(key, *expected, "({channel:?}, {sender:?})");
+        }
+
+        // With no owner configured, no sender is the owner.
+        let nobody = OwnerConfig::default();
+        assert_eq!(
+            resolve_sender("discord", Some("693836830436753409"), &nobody, &peers),
+            "guest:693836830436753409"
+        );
+        assert_eq!(
+            resolve_sender("chat", None, &nobody, &HashMap::new()),
+            "guest:anonymous"
+        );
+        // A missing sender is matched as "anonymous", so an owner named
+        // that would claim it (pinned as the mapping stands, not endorsed).
+        let named_anonymous = OwnerConfig {
+            name: Some("Anonymous".into()),
+            ..OwnerConfig::default()
+        };
+        assert_eq!(
+            resolve_sender("chat", None, &named_anonymous, &HashMap::new()),
+            "owner"
+        );
+    }
+
     fn user_msg(text: &str) -> Message {
         Message {
             role: Role::User,
@@ -2067,6 +2183,245 @@ mod call_set_tests {
             ended.front().unwrap().key,
             "guest:c-3",
             "the oldest went first"
+        );
+    }
+}
+
+/// Loading persisted sessions at boot, and archiving them at shutdown.
+#[cfg(test)]
+mod load_and_shutdown_tests {
+    use super::*;
+
+    const OWNER_DISCORD: &str = "693836830436753409";
+    const OWNER_PHONE: &str = "+34600000000";
+
+    fn owner() -> OwnerConfig {
+        OwnerConfig {
+            name: Some("Dani".into()),
+            discord_id: Some(OWNER_DISCORD.into()),
+            phone: Some(OWNER_PHONE.into()),
+        }
+    }
+
+    fn said(text: &str) -> Message {
+        Message {
+            role: Role::User,
+            content: MessageContent::Text(text.to_string()),
+            source: None,
+        }
+    }
+
+    fn stored(key: &str, channel: &str, sender: &str, texts: &[&str]) -> SessionData {
+        let mut data = Session::new(key.into(), channel.into(), sender.into()).data;
+        data.messages.extend(texts.iter().map(|t| said(t)));
+        data.message_count = texts.len();
+        data
+    }
+
+    /// Write a session file as a previous run would have left it.
+    fn write_session(root: &Path, file: &str, data: &SessionData) -> PathBuf {
+        let dir = root.join("sessions");
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(file);
+        fs::write(&path, serde_json::to_string(data).unwrap()).unwrap();
+        path
+    }
+
+    async fn load(root: &Path) -> SessionStore {
+        SessionStore::with_identity(
+            root,
+            &crate::config::SessionConfig::default(),
+            "TestPulse",
+            &owner(),
+            &HashMap::new(),
+        )
+        .await
+    }
+
+    fn archived_texts(root: &Path) -> String {
+        let Ok(entries) = fs::read_dir(crate::session::conversations_dir(root)) else {
+            return String::new();
+        };
+        entries
+            .flatten()
+            .filter(|e| e.file_name().to_string_lossy().starts_with("conversation-"))
+            .map(|e| fs::read_to_string(e.path()).unwrap())
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn a_current_key_loads_as_it_was_and_clean() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = write_session(
+            dir.path(),
+            "guest--x.json",
+            &stored("guest:x", "chat", "x", &["hi"]),
+        );
+        let store = load(dir.path()).await;
+        let session = store.get_existing_by_key("guest:x").await.unwrap();
+        let session = session.read().await;
+        assert_eq!(session.data.messages.len(), 1);
+        assert!(!session.dirty);
+        assert!(file.exists());
+    }
+
+    #[tokio::test]
+    async fn an_old_key_migrates_to_its_identity_and_its_file_goes() {
+        let dir = tempfile::tempdir().unwrap();
+        let old = stored(
+            &format!("discord:{OWNER_DISCORD}"),
+            "discord",
+            OWNER_DISCORD,
+            &["hello"],
+        );
+        let file = write_session(dir.path(), "discord--owner.json", &old);
+        let store = load(dir.path()).await;
+
+        assert!(!store.has_session(&format!("discord:{OWNER_DISCORD}")).await);
+        let session = store.get_existing_by_key("owner").await.unwrap();
+        let session = session.read().await;
+        assert_eq!(session.data.key, "owner");
+        assert!(
+            session.dirty,
+            "a migrated session is persisted under its new key"
+        );
+        assert!(!file.exists(), "the old file was removed");
+    }
+
+    #[tokio::test]
+    async fn two_old_keys_for_the_owner_merge_into_one_session() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut discord = stored(
+            &format!("discord:{OWNER_DISCORD}"),
+            "discord",
+            OWNER_DISCORD,
+            &["a", "b"],
+        );
+        let mut voice = stored(
+            &format!("voice:{OWNER_PHONE}"),
+            "voice",
+            OWNER_PHONE,
+            &["c"],
+        );
+        let earlier = Utc::now() - chrono::Duration::hours(2);
+        let later = Utc::now() - chrono::Duration::hours(1);
+        discord.last_active = earlier;
+        voice.last_active = later;
+        write_session(dir.path(), "discord--owner.json", &discord);
+        write_session(dir.path(), "voice--owner.json", &voice);
+
+        let store = load(dir.path()).await;
+        let session = store.get_existing_by_key("owner").await.unwrap();
+        let session = session.read().await;
+        assert_eq!(session.data.messages.len(), 3);
+        assert_eq!(session.data.message_count, 3);
+        assert_eq!(session.data.last_active, later);
+        assert!(session.dirty);
+    }
+
+    #[test]
+    fn a_merge_keeps_the_larger_count_and_the_later_activity() {
+        let mut existing = Session::new("owner".into(), "discord".into(), "d".into());
+        existing.data.messages.push(said("kept"));
+        existing.data.message_count = 10;
+        let later = existing.data.last_active + chrono::Duration::minutes(5);
+        let mut loaded = stored("owner", "voice", "v", &["added"]);
+        loaded.last_active = later;
+
+        merge_loaded(&mut existing, loaded);
+        assert_eq!(existing.data.messages.len(), 2);
+        assert_eq!(existing.data.message_count, 10);
+        assert_eq!(existing.data.last_active, later);
+        assert!(existing.dirty);
+    }
+
+    #[tokio::test]
+    async fn an_expired_session_is_archived_not_loaded() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut old = stored("guest:old", "chat", "old", &["long ago"]);
+        old.last_active = Utc::now() - chrono::Duration::days(30);
+        let file = write_session(dir.path(), "guest--old.json", &old);
+        let mut empty = stored("guest:empty", "chat", "empty", &[]);
+        empty.last_active = Utc::now() - chrono::Duration::days(30);
+        let empty_file = write_session(dir.path(), "guest--empty.json", &empty);
+
+        let store = load(dir.path()).await;
+        assert!(!store.has_session("guest:old").await);
+        assert!(!store.has_session("guest:empty").await);
+        assert!(!file.exists() && !empty_file.exists());
+        let archived = archived_texts(dir.path());
+        assert!(archived.contains("long ago"), "{archived}");
+    }
+
+    #[tokio::test]
+    async fn unreadable_and_foreign_files_are_skipped_and_left_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let sessions = dir.path().join("sessions");
+        fs::create_dir_all(sessions.join("a-directory.json")).unwrap();
+        fs::write(sessions.join("garbage.json"), "{ not json").unwrap();
+        fs::write(sessions.join("notes.txt"), "not a session").unwrap();
+
+        let store = load(dir.path()).await;
+        assert_eq!(store.count().await, 0);
+        assert!(sessions.join("garbage.json").exists());
+        assert!(sessions.join("notes.txt").exists());
+    }
+
+    #[tokio::test]
+    async fn shutdown_archives_trunks_quarantine_and_queued_calls_and_skips_empties() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = load(dir.path()).await;
+        let coordinator = Arc::new(PersistCoordinator::new());
+        store.set_coordinator(Arc::clone(&coordinator));
+        let trunk = store
+            .get_or_create_by_key("guest:talker", "chat", "talker")
+            .await;
+        {
+            let mut talker = trunk.write().await;
+            talker.data.messages.push(said("on the trunk"));
+            talker.mark_dirty();
+        }
+        let refused = store
+            .get_or_create_by_key("guest:refused", "chat", "refused")
+            .await;
+        refused
+            .write()
+            .await
+            .data
+            .quarantine
+            .push(said("refused words"));
+        store
+            .get_or_create_by_key("guest:silent", "chat", "silent")
+            .await;
+        store.queue_ended_call(stored("guest:caller", "voice", "caller", &["ended call"]));
+
+        let paths = store.archive_all(dir.path(), "TestPulse").await;
+        assert!(coordinator.flush(std::time::Duration::from_secs(5)).await);
+        assert_eq!(paths.len(), 1, "only the trunk is returned for the graph");
+        let archived = archived_texts(dir.path());
+        assert!(archived.contains("on the trunk"));
+        assert!(archived.contains("ended call"));
+        assert!(
+            !archived.contains("refused words"),
+            "quarantine never reaches the archive"
+        );
+        let quarantine: String = fs::read_dir(dir.path().join("archives").join("quarantine"))
+            .unwrap()
+            .flatten()
+            .map(|e| fs::read_to_string(e.path()).unwrap())
+            .collect();
+        assert!(quarantine.contains("refused words"));
+        assert!(!quarantine.contains("on the trunk"));
+        assert!(store.ended_calls.lock().unwrap().is_empty());
+        let persisted: String = fs::read_dir(dir.path().join("sessions"))
+            .unwrap()
+            .flatten()
+            .filter(|e| e.path().extension().is_some_and(|x| x == "json"))
+            .map(|e| fs::read_to_string(e.path()).unwrap())
+            .collect();
+        assert!(
+            persisted.contains("on the trunk"),
+            "persisted for the restart"
         );
     }
 }
