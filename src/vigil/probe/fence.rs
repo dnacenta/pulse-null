@@ -261,13 +261,33 @@ fn check_install(
     if canonical_install.starts_with(canonical(home)) {
         return Err(untrusted("is inside the user's home".into()));
     }
-    if let Some(dir) = writable_ancestor(&canonical_install, me) {
+    if let Some(dir) = writable_ancestor(&canonical_install, me).filter(|_| {
+        // Test builds only: a fixture's own install stands in for a
+        // root-owned one (see `tests::trust_fixture_install`).
+        !fixture_install_is_trusted(&canonical_install)
+    }) {
         return Err(untrusted(format!(
             "can be changed by this user ({} is writable)",
             dir.display()
         )));
     }
     Ok(())
+}
+
+/// Is `install` a test fixture's install, registered as standing in for a
+/// root-owned one? Always false outside test builds.
+#[cfg(not(test))]
+fn fixture_install_is_trusted(_install: &Path) -> bool {
+    false
+}
+
+#[cfg(test)]
+fn fixture_install_is_trusted(install: &Path) -> bool {
+    tests::fixture_installs()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .iter()
+        .any(|dir| install == dir)
 }
 
 /// The first of `install` and the directories above it that `me` can
@@ -401,8 +421,33 @@ fn canonical(path: &Path) -> PathBuf {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
+
+    /// Install directories registered by [`trust_fixture_install`].
+    pub(super) fn fixture_installs() -> &'static std::sync::Mutex<Vec<PathBuf>> {
+        static INSTALLS: std::sync::OnceLock<std::sync::Mutex<Vec<PathBuf>>> =
+            std::sync::OnceLock::new();
+        INSTALLS.get_or_init(Default::default)
+    }
+
+    /// Treat `dir` (a test's fake CLI install, in a temp dir) as an install
+    /// only root can change, whoever runs the tests. Under root the
+    /// writability check is skipped anyway; as any other user a temp dir
+    /// (and `/tmp` above it) is writable and would be refused. Only the
+    /// directory registered is trusted; every other install, and every
+    /// other check (exposing or containing a denied path, sitting in the
+    /// home), is unchanged. A test of the refusal itself never registers its
+    /// install.
+    pub(crate) fn trust_fixture_install(dir: &Path) {
+        let dir = canonical(dir);
+        let mut installs = fixture_installs()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if !installs.contains(&dir) {
+            installs.push(dir);
+        }
+    }
     use crate::cli_provider::adapters::claude::Claude;
 
     fn deny(home: &Path) -> DenyList {
@@ -415,6 +460,7 @@ mod tests {
         let install = tempfile::tempdir().unwrap();
         let bin = install.path().join("cli");
         std::fs::write(&bin, "binary").unwrap();
+        trust_fixture_install(install.path());
         let roots = read_roots(
             &Claude,
             &bin.display().to_string(),
@@ -570,6 +616,44 @@ mod tests {
         assert_eq!(
             writable_ancestor(Path::new("/usr/bin"), Some(&stranger)),
             None
+        );
+    }
+
+    /// The test seam is one directory wide: a registered fixture install
+    /// passes the writability check, an unregistered one beside it is still
+    /// refused, and a registered one is still refused for exposing a denied
+    /// path. The identity is given, so this holds whoever runs the tests.
+    #[test]
+    fn only_a_registered_fixture_install_stands_in_for_a_root_owned_one() {
+        let home = tempfile::tempdir().unwrap();
+        let deny = deny(home.path());
+        let outside = tempfile::tempdir().unwrap();
+        let (trusted, other) = (outside.path().join("a"), outside.path().join("b"));
+        std::fs::create_dir_all(&trusted).unwrap();
+        std::fs::create_dir_all(&other).unwrap();
+        let writer = Identity {
+            uid: u32::MAX - 2,
+            gids: vec![],
+        };
+        // The temp dir's parent (/tmp) is world-writable: both are untrusted.
+        for dir in [&trusted, &other] {
+            assert!(matches!(
+                check_install(dir, &[], &deny, home.path(), Some(&writer)),
+                Err(FenceError::UntrustedInstall { .. })
+            ));
+        }
+        trust_fixture_install(&trusted);
+        assert!(check_install(&trusted, &[], &deny, home.path(), Some(&writer)).is_ok());
+        assert!(matches!(
+            check_install(&other, &[], &deny, home.path(), Some(&writer)),
+            Err(FenceError::UntrustedInstall { .. })
+        ));
+        let in_home = home.path().join("bin");
+        std::fs::create_dir_all(&in_home).unwrap();
+        trust_fixture_install(&in_home);
+        assert!(
+            check_install(&in_home, &[], &deny, home.path(), Some(&writer)).is_err(),
+            "registering never lifts the home or deny-list checks"
         );
     }
 

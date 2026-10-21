@@ -118,6 +118,8 @@ exit $code
 "#
         );
         let bin = dir.path().join("fake-claude");
+        // A root-owned install in production; a temp dir here.
+        crate::vigil::probe::fence::tests::trust_fixture_install(dir.path());
         std::fs::write(&bin, script).unwrap();
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
