@@ -560,8 +560,18 @@ pub fn resolve_sender(
     owner: &OwnerConfig,
     peers: &HashMap<String, crate::config::PeerConfig>,
 ) -> SessionKey {
-    let sender = sender.unwrap_or("anonymous");
-    if is_owner_channel(channel) || is_owner_identity(sender, owner) {
+    // These channels are the owner whoever is named, including when the
+    // transport supplies no sender at all.
+    if is_owner_channel(channel) {
+        return SessionKey::owner();
+    }
+    // A missing sender is not an identity. Substituting "anonymous" and then
+    // comparing names would let an owner of that name claim every request
+    // that arrived without one.
+    let Some(sender) = sender else {
+        return SessionKey::guest("anonymous");
+    };
+    if is_owner_identity(sender, owner) {
         return SessionKey::owner();
     }
     // Known peer pulses
@@ -1785,14 +1795,62 @@ mod tests {
             resolve_sender("chat", None, &nobody, &HashMap::new()),
             "guest:anonymous"
         );
-        // A missing sender is matched as "anonymous", so an owner named
-        // that would claim it (pinned as the mapping stands, not endorsed).
+        // A missing sender is not compared with the owner's name, so an
+        // owner named "Anonymous" does not claim it. A sender who actually
+        // presents that name still does.
         let named_anonymous = OwnerConfig {
             name: Some("Anonymous".into()),
             ..OwnerConfig::default()
         };
         assert_eq!(
             resolve_sender("chat", None, &named_anonymous, &HashMap::new()),
+            "guest:anonymous"
+        );
+        assert_eq!(
+            resolve_sender("chat", Some("Anonymous"), &named_anonymous, &HashMap::new()),
+            "owner"
+        );
+    }
+
+    /// No sender is not the name "anonymous". An owner (or a peer) of that
+    /// name must not inherit a request that never identified itself.
+    #[test]
+    fn resolve_sender_missing_sender_is_never_an_identity() {
+        let peers = HashMap::from([(
+            "anonymous".to_string(),
+            crate::config::PeerConfig {
+                host: "127.0.0.1".into(),
+                port: 3201,
+                secret: None,
+            },
+        )]);
+        for name in ["Anonymous", "anonymous", "ANONYMOUS"] {
+            let owner = OwnerConfig {
+                name: Some(name.into()),
+                ..OwnerConfig::default()
+            };
+            assert_eq!(
+                resolve_sender("chat", None, &owner, &peers),
+                "guest:anonymous",
+                "{name} on chat"
+            );
+            assert_eq!(
+                resolve_sender("comms", None, &owner, &peers),
+                "guest:anonymous",
+                "{name} on comms"
+            );
+            assert_eq!(
+                resolve_sender("chat", Some(name), &owner, &HashMap::new()),
+                "owner",
+                "present sender {name}"
+            );
+        }
+        let owner = OwnerConfig {
+            name: Some("Anonymous".into()),
+            ..OwnerConfig::default()
+        };
+        assert_eq!(
+            resolve_sender("tui", None, &owner, &HashMap::new()),
             "owner"
         );
     }
