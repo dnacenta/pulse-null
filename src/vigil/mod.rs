@@ -10,6 +10,7 @@ pub mod collect;
 pub mod compaction_signals;
 pub mod init;
 pub mod parser;
+pub mod probe;
 pub mod pulse;
 pub mod runtime;
 pub mod signals;

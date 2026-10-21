@@ -1,0 +1,62 @@
+# TEST FIXTURE, not a probe set: the shape of situation-use/v1 (families,
+# ids, truths, rules, arms, min_n) with placeholder wording. The real items
+# are sealed (assets/probes/v1/sealed.toml); never copy them here.
+
+set = "situation-use"
+version = 1
+measure = "situation-use"
+delivery = "per-item"
+min_n = 20
+arms = ["pulse", "input-only", "fresh"]
+instructions = """
+Fixture instructions for a per-item set.\
+"""
+
+[[item]]
+id = "tomorrow-calendar"
+family = "tomorrow"
+question = "Fixture task needing tomorrow's date."
+truth = "tomorrow"
+rule = "date"
+
+[[item]]
+id = "friday-reminder"
+family = "tomorrow"
+question = "Fixture task needing the coming Friday's date."
+truth = "coming-friday"
+rule = "date"
+
+[[item]]
+id = "gap-welcome-back"
+family = "gap"
+question = "Fixture task needing the days away."
+truth = "days-away"
+rule = "days"
+
+[[item]]
+id = "gap-last-contact"
+family = "gap"
+question = "Fixture task needing the owner's last date."
+truth = "owner-last-active"
+rule = "date"
+
+[[item]]
+id = "restart-since-contact"
+family = "restart"
+question = "Fixture task: RESTARTED or SAME first."
+truth = "restarted-since-contact"
+rule = "choice"
+
+[[item]]
+id = "model-disclaimer"
+family = "model"
+question = "Fixture task needing the serving model."
+truth = "served-model"
+rule = "model"
+
+[[item]]
+id = "model-cutoff-check"
+family = "model"
+question = "Fixture task needing the serving model, again."
+truth = "served-model"
+rule = "model"

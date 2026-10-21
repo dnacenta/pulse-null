@@ -67,8 +67,14 @@ fn serialize_marks_scheduled_tasks() {
 #[test]
 fn pulse_command_sets_cwd_env_and_scrubs() {
     let root = tempfile::tempdir().unwrap();
-    let cmd = pulse_command("/usr/bin/true", root.path(), &Claude);
-    let std_cmd = cmd.as_std();
+    let cmd = pulse_command(
+        "/usr/bin/true",
+        root.path(),
+        &Claude,
+        &SpawnOverrides::default(),
+    )
+    .unwrap();
+    let std_cmd = cmd.cmd.as_std();
     assert_eq!(std_cmd.get_current_dir(), Some(root.path()));
     let envs: std::collections::HashMap<_, _> = std_cmd.get_envs().collect();
     assert_eq!(
@@ -80,6 +86,7 @@ fn pulse_command_sets_cwd_env_and_scrubs() {
     // though it carries this adapter's prefix.
     assert!(!envs.contains_key(std::ffi::OsStr::new("CLAUDECODE")));
     assert!(cmd
+        .cmd
         .as_std()
         .get_envs()
         .all(|(k, _)| k != "GROK_REASONING_EFFORT"));
@@ -105,7 +112,7 @@ fn provider_resolves_bin_from_override_then_default() {
 
 #[test]
 fn staged_file_is_private_and_self_cleaning() {
-    let f = StagedFile::create("t", "hello").unwrap();
+    let f = StagedFile::create("t", "hello", &std::env::temp_dir()).unwrap();
     let path = f.path().to_path_buf();
     assert!(path.exists());
     #[cfg(unix)]
@@ -158,7 +165,7 @@ fn stage_prepends_when_the_cli_has_no_system_prompt_channel() {
             unimplemented!()
         }
     }
-    let staged = stage(&Prepending, "SYS", "USER").unwrap();
+    let staged = stage(&Prepending, "SYS", "USER", &std::env::temp_dir()).unwrap();
     assert!(staged.system_prompt_file.is_none());
     assert_eq!(staged.stdin_text.as_deref(), Some("SYS\n\nUSER"));
 }
@@ -201,8 +208,8 @@ fn stage_refuses_an_oversized_argv_system_prompt() {
             unimplemented!()
         }
     }
-    assert!(stage(&Argv, &"x".repeat(11), "p").is_err());
-    let ok = stage(&Argv, "short", "p").unwrap();
+    assert!(stage(&Argv, &"x".repeat(11), "p", &std::env::temp_dir()).is_err());
+    let ok = stage(&Argv, "short", "p", &std::env::temp_dir()).unwrap();
     assert!(ok.prompt_file.is_some());
     assert!(ok.stdin_text.is_none());
 }
@@ -558,8 +565,14 @@ async fn failure_text_is_bounded() {
 #[test]
 fn env_set_reaches_the_child() {
     let root = tempfile::tempdir().unwrap();
-    let cmd = pulse_command("/usr/bin/true", root.path(), &Grok);
-    let envs: std::collections::HashMap<_, _> = cmd.as_std().get_envs().collect();
+    let cmd = pulse_command(
+        "/usr/bin/true",
+        root.path(),
+        &Grok,
+        &SpawnOverrides::default(),
+    )
+    .unwrap();
+    let envs: std::collections::HashMap<_, _> = cmd.cmd.as_std().get_envs().collect();
     assert_eq!(
         envs.get(std::ffi::OsStr::new("RUST_LOG")),
         Some(&Some(std::ffi::OsStr::new("warn")))
@@ -741,4 +754,112 @@ async fn every_principal_and_isolation_state_reaches_the_argv() {
             );
         }
     }
+}
+
+// --- capability probe verdict, stream observation ---
+
+fn output(stdout: &str, stderr: &str) -> std::process::Output {
+    use std::os::unix::process::ExitStatusExt;
+    std::process::Output {
+        status: std::process::ExitStatus::from_raw(0),
+        stdout: stdout.as_bytes().to_vec(),
+        stderr: stderr.as_bytes().to_vec(),
+    }
+}
+
+#[tokio::test]
+async fn a_probe_is_supported_unless_its_output_names_the_flag_unknown() {
+    let probe = adapter::Probe {
+        args: Vec::new(),
+        unsupported_marker: "unknown option",
+        capability: "--system-prompt-file",
+    };
+    let verdict = |outcome| probe_verdict(outcome, &Claude, "/bin/claude", &probe);
+    assert!(verdict(Ok(Ok(output("usage: …", "")))).unwrap());
+    assert!(!verdict(Ok(Ok(output("", "error: unknown option")))).unwrap());
+    assert!(!verdict(Ok(Ok(output("unknown option", "")))).unwrap());
+    let failed = verdict(Ok(Err(std::io::Error::other("wait failed")))).unwrap_err();
+    assert!(matches!(failed, CliError::Probe { .. }), "{failed}");
+    let elapsed = tokio::time::timeout(Duration::ZERO, std::future::pending::<()>())
+        .await
+        .unwrap_err();
+    assert!(
+        verdict(Err(elapsed)).unwrap(),
+        "a probe that outlived the parser counts as support"
+    );
+}
+
+#[test]
+fn the_stream_shows_the_served_model_and_each_call_with_its_result() {
+    let raw = [
+        r#"{"type":"system","subtype":"init","model":"claude-opus-5-5"}"#,
+        r#"{"type":"assistant","message":{"model":"claude-opus-5-5","content":[{"type":"tool_use","id":"t1","name":"Read","input":{"file_path":"a"}}]}}"#,
+        r#"{"type":"assistant","message":{"model":"claude-opus-5-5","content":[{"type":"tool_use","id":"t2","name":"Read","input":{"file_path":"b"}}]}}"#,
+        r#"{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"t2","content":[{"type":"text","text":"bee"}]}]}}"#,
+        r#"{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"t9","content":[{"type":"text","text":"orphan"}]}]}}"#,
+    ]
+    .join("\n");
+    let (served, calls) = observe_stream(&Claude, &raw);
+    assert_eq!(served.as_deref(), Some("claude-opus-5-5"));
+    assert_eq!(calls.len(), 2);
+    assert_eq!(calls[0].result, None, "no result came for t1");
+    assert_eq!(calls[1].result.as_deref(), Some("bee"));
+}
+
+#[test]
+fn a_result_goes_to_the_latest_call_with_its_id() {
+    let call = |id: &str| ToolCall {
+        name: "Read".into(),
+        input: serde_json::json!({}),
+        id: Some(id.into()),
+        result: None,
+    };
+    let mut calls = vec![call("t1"), call("t1")];
+    attach_result(&mut calls, "t1", "second".into());
+    assert_eq!(calls[0].result, None);
+    assert_eq!(calls[1].result.as_deref(), Some("second"));
+    attach_result(&mut calls, "t7", "nobody".into());
+    assert!(calls.iter().all(|c| c.result.as_deref() != Some("nobody")));
+}
+
+/// PN-110 × PN-144: a captured run outside any turn gets no tools (it fails
+/// closed, as every invocation does); the probe's own turns ask for the
+/// owner's surface, as the probe always ran them, and isolation of the
+/// copy they run in still narrows it.
+#[tokio::test]
+async fn the_probes_turns_get_the_owners_surface_and_nothing_else_does() {
+    fn tools_arg(argv: &[String]) -> Option<String> {
+        let pos = argv.iter().position(|a| a == "--tools")?;
+        Some(argv[pos + 1].clone())
+    }
+    let mock =
+        MockCli::new("printf '%s\\n' '{\"type\":\"result\",\"result\":\"ok\",\"is_error\":false}'");
+    let provider = mock.provider("m");
+    let messages = [user("hi")];
+
+    provider.invoke_captured("sys", &messages).await.unwrap();
+    assert_eq!(
+        tools_arg(&mock.argv()).as_deref(),
+        Some(""),
+        "outside any scope: no tools"
+    );
+
+    crate::vigil::probe::probe_turn(&provider, "sys", &messages)
+        .await
+        .unwrap();
+    assert_eq!(
+        tools_arg(&mock.argv()),
+        None,
+        "a probe turn: the owner's full surface"
+    );
+
+    crate::server::isolation::enter(mock._dir.path(), "test", None).unwrap();
+    crate::vigil::probe::probe_turn(&provider, "sys", &messages)
+        .await
+        .unwrap();
+    assert_eq!(
+        tools_arg(&mock.argv()).as_deref(),
+        Some("Read,Grep,Glob"),
+        "an isolated copy narrows it"
+    );
 }

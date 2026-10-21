@@ -142,6 +142,8 @@ pub enum CliError {
         #[source]
         source: std::io::Error,
     },
+    #[error(transparent)]
+    Sandbox(#[from] crate::cli_provider::sandbox::SandboxError),
 }
 
 /// A policy refusal from the underlying model.

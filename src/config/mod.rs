@@ -1,4 +1,7 @@
+mod probe;
 mod validate;
+
+pub use probe::{ProbeCadence, ProbeConfig};
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -52,6 +55,9 @@ pub struct Config {
     pub platform: PlatformConfig,
     #[serde(default)]
     pub system_prompt_budget: SystemPromptBudgetConfig,
+    /// Growth-record probes (PN-144); off by default.
+    #[serde(default)]
+    pub probe: ProbeConfig,
     #[serde(default)]
     pub peers: HashMap<String, PeerConfig>,
     #[serde(default)]
@@ -1312,6 +1318,7 @@ pub mod test_support {
             session_health: crate::session_health::SessionHealthConfig::default(),
             platform: PlatformConfig::default(),
             system_prompt_budget: SystemPromptBudgetConfig::default(),
+            probe: ProbeConfig::default(),
             peers: HashMap::new(),
             plugins: HashMap::new(),
             tui: TuiConfig::default(),

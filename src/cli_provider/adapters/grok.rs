@@ -22,13 +22,14 @@
 //! plus pulse-null's own archiver — not from vendor hook plumbing.
 
 use std::ffi::OsString;
+use std::io;
 use std::path::{Path, PathBuf};
 
 use serde_json::Value;
 
 use crate::cli_provider::adapter::{
-    AgentIntegration, CliAdapter, Invocation, OutputMode, PromptDelivery, Reply, StreamLine,
-    SystemPromptDelivery, Usage,
+    AgentIntegration, CliAdapter, Invocation, Observed, OutputMode, PromptDelivery, Reply,
+    StreamLine, SystemPromptDelivery, Usage, VendorScratch, VendorScratchSpec,
 };
 use crate::init::agent_bootstrap::{ensure_config, BootstrapItem, ItemKind, ItemStatus};
 use crate::tool_surface::ToolSurface;
@@ -98,6 +99,33 @@ impl Grok {
             })
             .unwrap_or_else(|| DEFAULT_REASONING_EFFORT.to_string())
     }
+}
+
+/// Copy the regular files of the live `~/.grok` (not a link to one) into
+/// `to_dir`, each at most [`MAX_COPIED_HOME_FILE`]; the copies made, which
+/// are watched at teardown.
+fn copy_home_files(live: &Path, to_dir: &Path) -> io::Result<Vec<PathBuf>> {
+    let mut watched = Vec::new();
+    if !super::is_real_dir(live) {
+        return Ok(watched);
+    }
+    for entry in std::fs::read_dir(live)? {
+        if let Some(to) = copy_home_file(&entry?, to_dir)? {
+            watched.push(to);
+        }
+    }
+    Ok(watched)
+}
+
+/// Copy one entry of the live `~/.grok` when it is a regular file within
+/// the size cap; where the copy went, if it was made.
+fn copy_home_file(entry: &std::fs::DirEntry, to_dir: &Path) -> io::Result<Option<PathBuf>> {
+    let metadata = entry.metadata()?;
+    if !entry.file_type()?.is_file() || metadata.len() > MAX_COPIED_HOME_FILE {
+        return Ok(None);
+    }
+    let to = to_dir.join(entry.file_name());
+    Ok(super::copy_private_file(&entry.path(), &to)?.then_some(to))
 }
 
 impl CliAdapter for Grok {
@@ -263,10 +291,61 @@ impl CliAdapter for Grok {
         super::CLAUDE_ONLY_RULES
     }
 
+    /// `streaming-messages-json` is Claude Code's wire format: an init
+    /// record and assistant messages carrying `tool_use` blocks.
+    fn observe_line(&self, line: &str) -> Vec<Observed> {
+        super::observe_agent_stream_line(line)
+    }
+
+    fn observes_tools(&self) -> bool {
+        true
+    }
+
+    /// `GROK_HOME` moves sessions, config and login state. The copy holds
+    /// the top-level files of the live grok home (its config and login
+    /// state), private to the owner; directories (sessions, the installed
+    /// binary, docs) stay behind. Every copied file is watched: grok may
+    /// refresh its login token mid-run, and a refreshed token is reported at
+    /// teardown, never copied back. Both profiles get the same copy: grok's
+    /// home holds no instructions or memory, only what it needs to run.
+    fn scratch_vendor(&self, spec: &VendorScratchSpec<'_>) -> io::Result<VendorScratch> {
+        let grok_home = spec.dir.join("grok");
+        super::create_private_dir(&grok_home)?;
+        let mut watched = copy_home_files(&spec.live_home.join(".grok"), &grok_home)?;
+        watched.sort();
+        Ok(VendorScratch {
+            env: vec![
+                ("GROK_HOME".to_string(), grok_home.display().to_string()),
+                ("GROK_DISABLE_AUTOUPDATER".to_string(), "1".to_string()),
+            ],
+            watched,
+        })
+    }
+
+    fn vendor_home(&self, home: &Path) -> Option<PathBuf> {
+        Some(home.join(".grok"))
+    }
+
+    /// The installer keeps the binaries under `downloads/` (`bin/grok` is a
+    /// link into it), the bundled agents and skills under `bundled/`, and
+    /// ripgrep under `vendor/`. Sessions, login state and settings sit
+    /// beside them at the top level and stay unreadable.
+    fn probe_install_reads(&self, home: &Path) -> Vec<PathBuf> {
+        let grok = home.join(".grok");
+        ["downloads", "bundled", "vendor"]
+            .iter()
+            .map(|dir| grok.join(dir))
+            .collect()
+    }
+
     fn integration(&self) -> &dyn AgentIntegration {
         self
     }
 }
+
+/// Largest top-level grok home file copied into a probe scratch. Config and
+/// login state are a few KiB; anything bigger is not either.
+const MAX_COPIED_HOME_FILE: u64 = 1024 * 1024;
 
 impl AgentIntegration for Grok {
     fn recall_echo_provider(&self) -> &'static str {
@@ -656,6 +735,46 @@ mod tests {
             Some(PathBuf::from("/p/.claude/rules"))
         );
         assert_eq!(Grok.project_rules_exclude(), ["recall-echo.md"]);
+    }
+
+    #[test]
+    fn scratch_vendor_copies_top_level_files_and_watches_them() {
+        use std::os::unix::fs::PermissionsExt;
+        let home = tempfile::tempdir().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let live = home.path().join(".grok");
+        std::fs::create_dir_all(live.join("sessions/%2Fhome%2Fpulse")).unwrap();
+        std::fs::write(live.join("sessions/%2Fhome%2Fpulse/x"), "old session").unwrap();
+        std::fs::write(live.join("config.toml"), "[compat.claude]\n").unwrap();
+        std::fs::write(live.join("login-state"), "fixture-not-a-token").unwrap();
+        std::os::unix::fs::symlink("/etc/hostname", live.join("link")).unwrap();
+
+        let scratch = Grok
+            .scratch_vendor(&VendorScratchSpec {
+                live_home: home.path(),
+                live_root: Path::new("/nonexistent/live"),
+                item_root: Path::new("/nonexistent/item"),
+                dir: dir.path(),
+                profile: crate::cli_provider::adapter::VendorProfile::Pulse,
+            })
+            .unwrap();
+        let grok_home = dir.path().join("grok");
+        assert!(scratch
+            .env
+            .contains(&("GROK_HOME".to_string(), grok_home.display().to_string())));
+        assert_eq!(
+            scratch.watched,
+            vec![grok_home.join("config.toml"), grok_home.join("login-state")]
+        );
+        for file in &scratch.watched {
+            let mode = std::fs::metadata(file).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600, "{}", file.display());
+        }
+        assert!(
+            !grok_home.join("sessions").exists(),
+            "live sessions stay behind"
+        );
+        assert!(!grok_home.join("link").exists());
     }
 
     #[test]

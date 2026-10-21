@@ -1,0 +1,47 @@
+# Live graph export for one pulse's probe run (PN-144). TEMPLATE: installed
+# with pulse-null-probe@.service (see its header), started by it
+# (Requires=), never on its own schedule.
+#
+# The only probe step that reaches the live SurrealDB server (127.0.0.1),
+# and it only reads: an export without users or access methods, written to
+# ~/.local/state/pulse-null/s/exports/<pulse>.surql (0600) for the run,
+# which takes it if it is under 3 hours old. Network: loopback to the live
+# server only. It runs whether or not the probe run turns out to be due.
+
+[Unit]
+Description=pulse-null probe graph export (%i)
+After=surrealdb.service
+
+[Service]
+Type=oneshot
+User=pulse
+Group=pulse
+WorkingDirectory=/home/pulse/pulse-null/%i
+ExecStart=/usr/local/bin/pulse-null probe export-graph
+Environment=RUST_LOG=info
+UMask=0077
+TimeoutStartSec=20min
+
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/home/pulse/.local/state/pulse-null
+InaccessiblePaths=-/home/pulse/.ssh
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectProc=invisible
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+NoNewPrivileges=yes
+CapabilityBoundingSet=
+RestrictSUIDSGID=yes
+RestrictNamespaces=yes
+LockPersonality=yes
+SystemCallArchitectures=native
+RestrictAddressFamilies=AF_UNIX AF_INET
+IPAddressDeny=any
+IPAddressAllow=127.0.0.1/32
+MemoryMax=2G
+Nice=10
+IOSchedulingClass=idle

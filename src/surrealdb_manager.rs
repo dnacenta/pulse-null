@@ -9,9 +9,9 @@ use std::path::{Path, PathBuf};
 use tokio::io::AsyncBufReadExt;
 use tracing::{error, info, warn};
 
-const SURREAL_PORT: u16 = 8787;
+pub(crate) const SURREAL_PORT: u16 = 8787;
 const SURREAL_BIND: &str = "127.0.0.1";
-const NAMESPACE: &str = "nullarc";
+pub(crate) const NAMESPACE: &str = "nullarc";
 const PID_FILE: &str = "surrealdb/surreal.pid";
 const ROOT_PASSWORD_FILE: &str = "surrealdb/root-password";
 const PASSWORD_LEN: usize = 32;
@@ -232,7 +232,9 @@ async fn is_reachable(addr: &str) -> bool {
     tokio::net::TcpStream::connect(addr).await.is_ok()
 }
 
-fn find_binary(data_dir: &Path) -> Result<PathBuf, Box<dyn std::error::Error + Send + Sync>> {
+pub(crate) fn find_binary(
+    data_dir: &Path,
+) -> Result<PathBuf, Box<dyn std::error::Error + Send + Sync>> {
     let local = data_dir.join("bin/surreal");
     if local.exists() {
         return Ok(local);
@@ -272,7 +274,9 @@ fn ensure_root_password(
     Ok(password)
 }
 
-fn read_root_password(data_dir: &Path) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+pub(crate) fn read_root_password(
+    data_dir: &Path,
+) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
     let pw_path = data_dir.join(ROOT_PASSWORD_FILE);
     let password = std::fs::read_to_string(&pw_path).map_err(|e| {
         format!(
@@ -283,7 +287,7 @@ fn read_root_password(data_dir: &Path) -> Result<String, Box<dyn std::error::Err
     Ok(password.trim().to_string())
 }
 
-fn generate_password() -> String {
+pub(crate) fn generate_password() -> String {
     use std::io::Read;
     let mut bytes = [0u8; PASSWORD_LEN];
     std::fs::File::open("/dev/urandom")
@@ -336,4 +340,35 @@ password_file = "{password_file}"
     std::fs::write(config_path, content.trim_start())?;
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_data_dirs_own_binary_comes_first() {
+        let data_dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(data_dir.path().join("bin")).unwrap();
+        std::fs::write(data_dir.path().join("bin/surreal"), "").unwrap();
+        assert_eq!(
+            find_binary(data_dir.path()).unwrap(),
+            data_dir.path().join("bin/surreal")
+        );
+    }
+
+    /// Without one in the data dir: the one on `PATH`, else
+    /// `/usr/local/bin/surreal`, else an error that says where to put it.
+    #[test]
+    fn without_its_own_binary_the_installed_one_is_found_or_refused() {
+        let data_dir = tempfile::tempdir().unwrap();
+        match find_binary(data_dir.path()) {
+            Ok(found) => {
+                assert!(found.exists(), "{}", found.display());
+                assert!(!found.starts_with(data_dir.path()));
+                assert_eq!(found.file_name().unwrap(), "surreal");
+            }
+            Err(e) => assert!(e.to_string().starts_with("SurrealDB binary not found")),
+        }
+    }
 }

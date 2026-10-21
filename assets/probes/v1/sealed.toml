@@ -1,0 +1,31 @@
+# Sealed probe item sets, v1 (PN-144; mobile-app spec §1a.1 G7 note, D
+# 2026-10-18). PRE-REGISTERED.
+#
+# The item texts are not in this repo, so pulses working on it can't study
+# them, nor anywhere the live pulse can read: each set file lives in
+# /etc/pulse-null-probe/sets/<pulse>/ (root 0700, files 0600), installed
+# once from the reviewed copy by root with
+# `pulse-null probe sets install --from <dir> --pulse <pulse>`, and reaches
+# a run only through the probe unit's LoadCredential=. This file pins each
+# one's SHA-256 (the runner refuses a set whose digest differs; a changed
+# set is a new digest committed here, a new pre-registration) and what is
+# public about it: its label and minimum n. What the sets measure, how they
+# are scored and their thresholds stay public on the methods pages.
+
+[[set]]
+file = "known-answer.toml"
+sha256 = "f9b31a48228e7505d025093c773c3c3a8833205d1830d9b964c444f5580f1c0e"
+label = "known-answer/v1"
+min_n = 30
+
+[[set]]
+file = "situation-use.toml"
+sha256 = "ab59d7f1fbfa107e2295922f1e81fd5d9066af336c60f3d52d6faf10fde43ed4"
+label = "situation-use/v1"
+min_n = 20
+
+[[set]]
+file = "paired-facts.toml"
+sha256 = "159fabd49b60ad657ee798662810cda907cbc13c4654dfc3f764805bcdd2463b"
+label = "paired-facts/v1"
+min_n = 10

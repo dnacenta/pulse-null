@@ -8,6 +8,7 @@ pub mod outreach;
 pub mod pipeline;
 pub mod plugin;
 pub mod praxis;
+pub mod probe;
 pub mod recall;
 pub mod repair;
 pub mod root_guard;

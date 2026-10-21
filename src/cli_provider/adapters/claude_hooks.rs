@@ -479,10 +479,170 @@ pub(super) fn user_hooks_missing_root(home: &Path) -> Vec<String> {
     found
 }
 
+/// Copy the user-level settings into a probe scratch config dir without its
+/// hooks: a user hook would run for the probe and write wherever it writes.
+/// A missing or unreadable source leaves no settings at all.
+pub(super) fn copy_settings_without_hooks(src: &Path, dst: &Path) -> std::io::Result<()> {
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+    let Ok(Some(text)) = read_small_file(src) else {
+        return Ok(());
+    };
+    let Ok(mut doc) = serde_json::from_str::<serde_json::Value>(&text) else {
+        return Ok(());
+    };
+    if let Some(settings) = doc.as_object_mut() {
+        settings.remove("hooks");
+    }
+    let rendered = serde_json::to_string_pretty(&doc).map_err(std::io::Error::other)? + "\n";
+    let mut out = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(dst)?;
+    out.write_all(rendered.as_bytes())
+}
+
+/// The project settings of a probe's scratch copy: every hook goes except
+/// recall-echo's `consume`, which is rewritten to read the scratch copy's
+/// memory. `checkpoint` and `archive-session` would write the probe into the
+/// pulse's archive. `settings.local.json` loses its hooks too.
+pub(super) fn scratch_settings(item_root: &Path, recall_bin: &str) -> Vec<BootstrapItem> {
+    let item_root = item_root
+        .canonicalize()
+        .unwrap_or_else(|_| item_root.to_path_buf());
+    let claude_dir = item_root.join(".claude");
+    let mut items = Vec::new();
+    for (name, keep_consume) in [("settings.json", true), ("settings.local.json", false)] {
+        let scratch = ScratchSettings {
+            item_root: &item_root,
+            recall_bin,
+            keep_consume,
+        };
+        items.extend(scratch.rewrite(&claude_dir.join(name)));
+    }
+    items
+}
+
+/// How one settings file of a scratch copy is rewritten.
+struct ScratchSettings<'a> {
+    item_root: &'a Path,
+    recall_bin: &'a str,
+    /// Keep recall-echo's `consume` hook (pointed at the copy) if it had one.
+    keep_consume: bool,
+}
+
+impl ScratchSettings<'_> {
+    /// Rewrite the settings file at `path`: `None` when there is none, else
+    /// its item (updated, or skipped with why).
+    fn rewrite(&self, path: &Path) -> Option<BootstrapItem> {
+        let item = |status| BootstrapItem {
+            path: path.to_path_buf(),
+            kind: ItemKind::ConfigFile,
+            status,
+        };
+        let text = match read_small_file(path) {
+            Ok(Some(text)) => text,
+            Ok(None) => return None,
+            Err(e) => return Some(item(ItemStatus::Skipped(e))),
+        };
+        let written = self
+            .rendered(&text)
+            .and_then(|rendered| write_regular_file(path, &rendered, self.item_root));
+        Some(item(match written {
+            Ok(()) => ItemStatus::Updated,
+            Err(e) => ItemStatus::Skipped(e),
+        }))
+    }
+
+    /// The settings `text` with every hook gone but, when kept, a `consume`
+    /// it had, now reading the copy's memory.
+    fn rendered(&self, text: &str) -> Result<String, String> {
+        let mut doc = match serde_json::from_str::<serde_json::Value>(text) {
+            Ok(doc) if doc.is_object() => doc,
+            Ok(_) => return Err("not a JSON object".into()),
+            Err(e) => return Err(format!("not valid JSON: {e}")),
+        };
+        let had_consume = has_consume_hook(&doc);
+        let settings = doc.as_object_mut().expect("checked object");
+        settings.remove("hooks");
+        if self.keep_consume && had_consume {
+            let ours = render_hooks(self.recall_bin, self.item_root);
+            settings.insert(
+                "hooks".into(),
+                serde_json::json!({ "SessionStart": ours["SessionStart"].clone() }),
+            );
+        }
+        serde_json::to_string_pretty(&doc)
+            .map(|text| text + "\n")
+            .map_err(|e| format!("could not serialise: {e}"))
+    }
+}
+
+/// Whether the settings run recall-echo's `consume` at session start.
+fn has_consume_hook(doc: &serde_json::Value) -> bool {
+    doc["hooks"]["SessionStart"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .flat_map(|entry| entry["hooks"].as_array().into_iter().flatten())
+        .filter_map(|hook| hook["command"].as_str())
+        .any(|command| is_recall_command(command, "consume"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::init::agent_bootstrap::{ensure_common, verify_common, write_regular_file};
+
+    #[test]
+    fn scratch_settings_keep_only_consume_pointed_at_the_copy() {
+        let dir = pulse();
+        let root = dir.path().canonicalize().unwrap();
+        ensure_all(&root);
+        let mut doc = read_settings(&root);
+        doc["hooks"]["Stop"] =
+            serde_json::json!([{"hooks":[{"type":"command","command":"curl x"}]}]);
+        doc["model"] = "keep-me".into();
+        std::fs::write(root.join(".claude/settings.json"), doc.to_string()).unwrap();
+        std::fs::write(
+            root.join(".claude/settings.local.json"),
+            r#"{"hooks":{"SessionEnd":[]},"other":1}"#,
+        )
+        .unwrap();
+
+        let items = scratch_settings(&root, "/usr/local/bin/recall-echo");
+        assert!(
+            items.iter().all(|i| i.status == ItemStatus::Updated),
+            "{items:?}"
+        );
+        let doc = read_settings(&root);
+        assert_eq!(doc["model"], "keep-me");
+        let events: Vec<&String> = doc["hooks"].as_object().unwrap().keys().collect();
+        assert_eq!(events, ["SessionStart"]);
+        let consume = commands(&doc, "SessionStart");
+        assert_eq!(consume.len(), 1);
+        assert!(consume[0].ends_with(&format!("consume {}", shell_quote(&root))));
+        let local: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(root.join(".claude/settings.local.json")).unwrap(),
+        )
+        .unwrap();
+        assert!(local.get("hooks").is_none());
+        assert_eq!(local["other"], 1);
+    }
+
+    #[test]
+    fn scratch_settings_refuse_what_they_cannot_rewrite() {
+        let dir = pulse();
+        let root = dir.path().canonicalize().unwrap();
+        std::fs::create_dir_all(root.join(".claude")).unwrap();
+        std::fs::write(root.join(".claude/settings.json"), "{not json").unwrap();
+        let items = scratch_settings(&root, "recall-echo");
+        assert!(
+            matches!(items[0].status, ItemStatus::Skipped(_)),
+            "{items:?}"
+        );
+    }
 
     fn ensure_all(root: &Path) -> Vec<BootstrapItem> {
         let mut items = ensure_common(root, "claude-code");

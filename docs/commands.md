@@ -19,6 +19,15 @@ pulse-null archive list|run       journal overflow archives
 pulse-null recall [search|distill]   memory dashboard and tools
 pulse-null praxis | vigil ...     journal enforcement, reflection signals
 pulse-null plugin list|add|remove
+pulse-null probe run [--if-due] [--only SET…] [--keep-scratch]   growth-record probes (sandboxed scratch)
+pulse-null probe status           probe spend vs budget, cost per run, results by lineage
+pulse-null probe verify-isolation [--turn]   show a probe writes nowhere live (--turn: two real turns)
+pulse-null probe facts draw|plant FACT VALUE|list   paired facts for "Remembers" (needs the unit's credentials: run via systemd-run, see methods/probe-runner.md)
+pulse-null probe sets install --from DIR --pulse NAME   (root) install the sealed sets into /etc/pulse-null-probe/sets/NAME
+pulse-null probe export-graph     export the live graph for the next run (the export unit's step)
 ```
+
+Probes are described in [methods/probe-runner.md](methods/probe-runner.md); they refuse to run
+without Landlock (kernel ABI 4) and refuse root.
 
 `init` and `up` refuse to run as root; `PULSE_NULL_ALLOW_ROOT=1` overrides that for CI.
