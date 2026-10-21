@@ -89,10 +89,10 @@ fn config_from_toml(
     name: &str,
     value: &toml::Value,
 ) -> Result<Config, Box<dyn std::error::Error + Send + Sync>> {
-    value
-        .clone()
-        .try_into()
-        .map_err(|e: toml::de::Error| format!("invalid {name} config: {e}").into())
+    value.clone().try_into().map_err(|e: toml::de::Error| {
+        let detail = super::config_error::describe(&e);
+        format!("invalid {name} config: {detail}").into()
+    })
 }
 
 impl Plugin for DiscordPlugin {
@@ -313,5 +313,20 @@ mod tests {
         let missing = toml::Value::Table(toml::toml! { guild_id = "123456789" });
         let err = config_from_toml("discord-text-echo", &missing).unwrap_err();
         assert!(err.to_string().contains("invalid discord-text-echo config"));
+    }
+
+    #[test]
+    fn config_error_does_not_echo_a_credential() {
+        let secret = "sk-live-credential-do-not-log-9f3a7c";
+        let mut table = toml::value::Table::new();
+        table.insert("bot_token".into(), "test-token".into());
+        table.insert("guild_id".into(), "123456789".into());
+        table.insert("listen_channels".into(), secret.into());
+        let err = config_from_toml("discord-echo", &toml::Value::Table(table))
+            .unwrap_err()
+            .to_string();
+        assert!(!err.contains(secret), "{err}");
+        assert!(err.contains("listen_channels"), "{err}");
+        assert!(err.contains("sequence"), "{err}");
     }
 }

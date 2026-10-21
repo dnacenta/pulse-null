@@ -1,6 +1,11 @@
 pub mod manager;
 pub mod registry;
 
+/// Shared by the optional plugins. Compiled for tests so the redaction
+/// behavior is covered without enabling a plugin.
+#[cfg(any(test, feature = "voice", feature = "discord-text"))]
+pub(crate) mod config_error;
+
 // Core modules (always included)
 pub mod recall_echo;
 
