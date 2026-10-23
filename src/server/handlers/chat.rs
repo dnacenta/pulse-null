@@ -18,7 +18,7 @@ use crate::server::auth::AuthIdentity;
 use crate::server::AppState;
 use crate::session_store::{resolve_sender, Session};
 use crate::streaming::StreamingProvider;
-use crate::tool_loop::{self, TurnEvent, TurnSink, TurnStatus};
+use crate::tool_loop::{self, ProgressSink, TurnEvent, TurnSink, TurnStatus};
 use pulse_system_types::llm::{Message, MessageContent, MessageSource, Role};
 
 mod steps;
@@ -121,12 +121,40 @@ pub async fn chat(
     axum::Extension(who): axum::Extension<AuthIdentity>,
     Json(req): Json<ChatRequest>,
 ) -> Result<Json<ChatResponse>, (StatusCode, String)> {
-    run_turn(state, req, who, None).await.map(Json)
+    run_turn(state, req, who, None, None).await.map(Json)
 }
 
 /// Channels whose session is the owner's by construction.
 fn is_owner_channel(channel: &str) -> bool {
     matches!(channel, "tui" | "system" | "reflection")
+}
+
+/// A voice credential speaks only on the voice channel. Any other channel
+/// is 403 before a stream permit is taken, so the refusal is an HTTP status.
+fn refuse_voice_off_channel(who: &AuthIdentity, channel: &str) -> Result<(), (StatusCode, String)> {
+    if matches!(who, AuthIdentity::Voice)
+        && !channel.eq_ignore_ascii_case(crate::server::turns::VOICE_CHANNEL)
+    {
+        tracing::warn!("voice credential posted to {channel:?}");
+        return Err((
+            StatusCode::FORBIDDEN,
+            "a voice credential may only speak on the voice channel".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+/// The voice stream pool belongs to a voice identity. The body `channel`
+/// does not select it: an owner or a peer, including the owner admitted
+/// because no secret is configured, stays on the chat pool.
+fn uses_voice_pool(who: &AuthIdentity) -> bool {
+    match who {
+        AuthIdentity::Voice => true,
+        AuthIdentity::Plugin { channel, .. } => {
+            channel.eq_ignore_ascii_case(crate::server::turns::VOICE_CHANNEL)
+        }
+        AuthIdentity::Owner | AuthIdentity::Peer(_) => false,
+    }
 }
 
 /// A peer credential never reaches an owner channel — 403 before anything
@@ -201,6 +229,7 @@ pub(crate) async fn run_turn(
     req: ChatRequest,
     who: AuthIdentity,
     sink: Option<TurnSink>,
+    control: Option<Arc<tool_loop::ControlPlane>>,
 ) -> Result<ChatResponse, (StatusCode, String)> {
     validate_request(&req)?;
 
@@ -210,12 +239,24 @@ pub(crate) async fn run_turn(
     // refused, and the session key comes from the credential, not from
     // `sender` or `channel`.
     let resolved_key = match &who {
-        AuthIdentity::Owner => resolve_sender(
-            &req.channel,
-            req.sender.as_deref(),
-            &state.config.owner,
-            &state.config.peers,
-        ),
+        AuthIdentity::Owner => {
+            // A demoted `channel: voice` body is still this principal. It
+            // must not open `guest:anonymous` (or the named sender) in the
+            // call set, which is the session a real voice credential uses.
+            if req
+                .channel
+                .eq_ignore_ascii_case(crate::server::turns::VOICE_CHANNEL)
+            {
+                SessionKey::owner()
+            } else {
+                resolve_sender(
+                    &req.channel,
+                    req.sender.as_deref(),
+                    &state.config.owner,
+                    &state.config.peers,
+                )
+            }
+        }
         AuthIdentity::Peer(name) => {
             refuse_peer_on_owner_channel(&who, &req.channel)?;
             SessionKey::peer(name)
@@ -223,6 +264,21 @@ pub(crate) async fn run_turn(
         AuthIdentity::Plugin { name, channel } => {
             resolve_plugin_key(name, channel, &req, &state.config)?
         }
+        AuthIdentity::Voice => {
+            refuse_voice_off_channel(&who, &req.channel)?;
+            // Same rule as the voice plugin: the transport's credential is
+            // not proof of the person on the call.
+            SessionKey::guest(req.sender.as_deref().unwrap_or("anonymous"))
+        }
+    };
+    // The call set is only a voice identity. A demoted body that says
+    // `voice` keeps the principal's ordinary session.
+    let is_call = match &who {
+        AuthIdentity::Voice => true,
+        AuthIdentity::Plugin { channel, .. } => {
+            channel.eq_ignore_ascii_case(crate::server::turns::VOICE_CHANNEL)
+        }
+        AuthIdentity::Owner | AuthIdentity::Peer(_) => false,
     };
 
     // Only the owner's turns reach the agent CLI with its full tool surface;
@@ -230,7 +286,20 @@ pub(crate) async fn run_turn(
     // state (PN-110 audit P1). Everything below — compaction, the provider
     // call, the refusal fallback — runs inside this scope.
     let surface = crate::tool_surface::ToolSurface::for_principal(&resolved_key);
-    crate::tool_surface::scope(surface, run_resolved_turn(state, req, resolved_key, sink)).await
+    let hold_deltas = uses_voice_pool(&who);
+    crate::tool_surface::scope(
+        surface,
+        run_resolved_turn(
+            state,
+            req,
+            resolved_key,
+            sink,
+            hold_deltas,
+            is_call,
+            control,
+        ),
+    )
+    .await
 }
 
 /// The turn after its principal is resolved to `resolved_key`: the steps of
@@ -241,6 +310,9 @@ async fn run_resolved_turn(
     req: ChatRequest,
     resolved_key: SessionKey,
     sink: Option<TurnSink>,
+    hold_deltas: bool,
+    is_call: bool,
+    control: Option<Arc<tool_loop::ControlPlane>>,
 ) -> Result<ChatResponse, (StatusCode, String)> {
     let sender_label = req.sender.as_deref().unwrap_or("unknown");
     if let Some(reply) =
@@ -248,7 +320,7 @@ async fn run_resolved_turn(
     {
         return Ok(reply);
     }
-    let mut turn = steps::TurnScope::new(&state, &req, &resolved_key, sender_label);
+    let mut turn = steps::TurnScope::new(&state, &req, &resolved_key, sender_label, is_call);
 
     let user_message = steps::compose_user_message(&turn).await;
     let incoming = steps::ChannelLine {
@@ -299,6 +371,18 @@ async fn run_resolved_turn(
     // the fallback while guests and peers never do.
     let fallback_capped = steps::fallback_cap_reached(&session.data.health);
     let build_fallback = steps::fallback_builder(&turn, !fallback_capped);
+    let progress = sink.map(|tx| {
+        let mut progress = if hold_deltas {
+            let cap = tool_loop::hold_byte_cap(state.provider.name(), state.config.llm.max_tokens);
+            ProgressSink::holding_capped(tx, cap)
+        } else {
+            ProgressSink::new(tx)
+        };
+        if let Some(control) = control {
+            progress.attach(control);
+        }
+        progress
+    });
     let outcome = invoke_turn_with_refusal_fallback(
         &mut session.data,
         state.provider.as_ref(),
@@ -307,11 +391,29 @@ async fn run_resolved_turn(
         &system_prompt,
         state.config.llm.max_tokens,
         &turn.correlation_id,
-        sink.as_ref(),
+        progress.as_ref(),
     )
     .await;
     record_provider_outcome(&state, &resolved_key, &outcome).await;
     let outcome = outcome.map_err(|e| steps::turn_failure(&turn, fallback_capped, e.as_ref()))?;
+
+    // The guard already replaced the stored reply. A screen client has the
+    // raw deltas and must drop them. A voice-pool client never received
+    // them: the held segment is discarded, then `reset`, then the kept text.
+    if outcome.result.was_truncated {
+        if let Some(progress) = progress.as_ref() {
+            progress.discard_held();
+            if !progress.try_send(TurnEvent::Reset(crate::wire::ResetReason::Guard)) {
+                return Err((
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "reset was not delivered".to_string(),
+                ));
+            }
+            if hold_deltas && !outcome.result.text.is_empty() {
+                progress.send_now(TurnEvent::Delta(outcome.result.text.clone()));
+            }
+        }
+    }
 
     // The turn succeeded: from here on the messages are committed and a
     // dropped future must not undo them.
@@ -422,17 +524,13 @@ const STREAM_CHANNEL_CAPACITY: usize = 256;
 
 fn sse_event(ev: &crate::wire::ChatStreamEvent) -> Event {
     let (name, data) = ev.to_sse_parts();
-    // A serde_json::Value always serializes; the Err arm is unreachable.
-    Event::default()
-        .event(name.clone())
-        .json_data(data)
-        .unwrap_or_else(|_| Event::default().event(name).data("{}"))
+    Event::default().event(name).data(data)
 }
 
-/// Encode one turn event for the wire.
-fn turn_event_to_sse(event: TurnEvent) -> Event {
+/// Encode one turn event as the shared wire type.
+fn turn_event_to_wire(event: TurnEvent) -> crate::wire::ChatStreamEvent {
     use crate::wire::{ChatStreamEvent, TurnPhase};
-    let ev = match event {
+    match event {
         TurnEvent::Status(TurnStatus::Thinking) => ChatStreamEvent::Status {
             status: TurnPhase::Thinking,
             name: None,
@@ -446,8 +544,14 @@ fn turn_event_to_sse(event: TurnEvent) -> Event {
             name: Some(name),
         },
         TurnEvent::Delta(text) => ChatStreamEvent::Delta { text },
-    };
-    sse_event(&ev)
+        TurnEvent::Segment { index, tool } => ChatStreamEvent::Segment { index, tool },
+        TurnEvent::Reset(reason) => ChatStreamEvent::Reset { reason },
+    }
+}
+
+/// Encode one turn event for the wire.
+fn turn_event_to_sse(event: TurnEvent) -> Event {
+    sse_event(&turn_event_to_wire(event))
 }
 
 fn done_to_sse(resp: ChatResponse) -> Event {
@@ -471,16 +575,37 @@ fn error_to_sse(status: StatusCode, message: String) -> Event {
 /// `POST /api/chat/stream` — the same turn as [`chat`], delivered as SSE.
 ///
 /// Events: `status {status: thinking|responding|tool, name?}`, `delta {text}`
-/// (as the provider yields them; the client coalesces), then exactly one of
+/// (as the provider yields them; the client coalesces), `segment {index, tool}`
+/// when an assistant message ends and the server knows whether a tool call
+/// follows, `reset {reason: fallback|guard|budget}` when text already sent is void,
+/// then exactly one of
 /// `done {text, model, tokens_in, tokens_out, isolation, truncated}` or
 /// `error {status, message}`. Dropping the connection aborts the turn: the
 /// provider child is killed and the user message is rolled back.
 ///
-/// Client contract: deltas are best-effort and unvalidated. A consumer that
-/// stops reading loses deltas rather than stalling the turn, and a reply the
-/// hallucination guard cut short is streamed raw first. `done.text` is the
-/// validated, complete reply and must replace whatever was shown; `truncated`
-/// says the guard fired.
+/// The voice stream pool is taken only for a voice identity: the voice
+/// plugin bound to that channel, or a client that presented
+/// `[security] voice_secret`. Every other caller, including the owner,
+/// draws from the chat pool whatever `channel` says. A non-voice caller
+/// that sends `channel: voice` is not rejected; the turn runs on the chat
+/// pool, in that principal's ordinary session, and does not enter the call
+/// set. A voice credential on
+/// any other channel is `403` before a permit is taken.
+///
+/// Client contract: deltas are best-effort. A screen stream forwards them
+/// as the provider yields them, unvalidated. A voice-pool stream holds the
+/// open segment and forwards a delta only after that round's guard has
+/// kept it; a cut or a refusal drops the hold and sends `reset` with no
+/// raw tail before the kept text. `reset` is delivered on a side channel
+/// and written before any event the client has not yet received. A
+/// `segment` that does not fit is written after the events already
+/// accepted into the channel and before anything accepted later. A
+/// consumer that stops reading loses
+/// deltas rather than stalling the turn. If a `reset` was queued and not
+/// written, the stream ends with `error` instead of `done`. `done.text`
+/// is the validated, complete reply and must replace whatever was shown;
+/// `truncated` says the guard fired and unspoken text is discarded even
+/// when `reset` did not arrive.
 pub async fn chat_stream(
     State(state): State<Arc<AppState>>,
     axum::Extension(who): axum::Extension<AuthIdentity>,
@@ -488,19 +613,25 @@ pub async fn chat_stream(
 ) -> Result<Sse<impl Stream<Item = Result<Event, Infallible>>>, (StatusCode, String)> {
     validate_request(&req)?;
     refuse_peer_on_owner_channel(&who, &req.channel)?;
-    let permit = Arc::clone(&state.chat_permits)
-        .try_acquire_owned()
-        .map_err(|_| {
-            (
-                StatusCode::SERVICE_UNAVAILABLE,
-                "too many open streams; try again shortly".to_string(),
-            )
-        })?;
+    refuse_voice_off_channel(&who, &req.channel)?;
+    let permits = if uses_voice_pool(&who) {
+        Arc::clone(&state.voice_permits)
+    } else {
+        Arc::clone(&state.chat_permits)
+    };
+    let permit = permits.try_acquire_owned().map_err(|_| {
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "too many open streams; try again shortly".to_string(),
+        )
+    })?;
 
     let (tx, rx) = mpsc::channel::<TurnEvent>(STREAM_CHANNEL_CAPACITY);
     let (done_tx, done_rx) = tokio::sync::oneshot::channel();
+    let control = Arc::new(tool_loop::ControlPlane::new());
+    let control_for_turn = Arc::clone(&control);
     let task = tokio::spawn(async move {
-        let outcome = run_turn(state, req, who, Some(tx)).await;
+        let outcome = run_turn(state, req, who, Some(tx), Some(control_for_turn)).await;
         let _ = done_tx.send(outcome);
     });
     let guard = AbortOnDrop(task.abort_handle());
@@ -508,17 +639,62 @@ pub async fn chat_stream(
     let stream = async_stream::stream! {
         let _guard = guard;
         let _permit = permit;
+        let _close = tool_loop::ControlClose(Arc::clone(&control));
         let mut rx = rx;
-        while let Some(event) = rx.recv().await {
+        let mut reset_sent = false;
+        let mut written: u64 = 0;
+        loop {
+            for event in control.drain_resets() {
+                reset_sent = true;
+                yield Ok(turn_event_to_sse(event));
+            }
+            // A parked segment follows the channel events accepted before
+            // it. Resets stay ahead of both.
+            for event in control.take_due(written) {
+                yield Ok(turn_event_to_sse(event));
+            }
+            tokio::select! {
+                biased;
+                _ = control.notified() => {}
+                event = rx.recv() => {
+                    match event {
+                        Some(event) => {
+                            for reset in control.drain_resets() {
+                                reset_sent = true;
+                                yield Ok(turn_event_to_sse(reset));
+                            }
+                            for segment in control.take_due(written) {
+                                yield Ok(turn_event_to_sse(segment));
+                            }
+                            yield Ok(turn_event_to_sse(event));
+                            written = written.saturating_add(1);
+                        }
+                        None => break,
+                    }
+                }
+            }
+        }
+        for event in control.drain_resets() {
+            reset_sent = true;
             yield Ok(turn_event_to_sse(event));
         }
-        match done_rx.await {
-            Ok(Ok(resp)) => yield Ok(done_to_sse(resp)),
-            Ok(Err((status, message))) => yield Ok(error_to_sse(status, message)),
-            Err(_) => yield Ok(error_to_sse(
+        for event in control.take_due(u64::MAX) {
+            yield Ok(turn_event_to_sse(event));
+        }
+        if control.reset_queued() && !reset_sent {
+            yield Ok(error_to_sse(
                 StatusCode::INTERNAL_SERVER_ERROR,
-                "turn ended without a result".to_string(),
-            )),
+                "reset was not delivered".to_string(),
+            ));
+        } else {
+            match done_rx.await {
+                Ok(Ok(resp)) => yield Ok(done_to_sse(resp)),
+                Ok(Err((status, message))) => yield Ok(error_to_sse(status, message)),
+                Err(_) => yield Ok(error_to_sse(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "turn ended without a result".to_string(),
+                )),
+            }
         }
     };
 
@@ -637,7 +813,7 @@ async fn invoke_turn_with_refusal_fallback<F>(
     system_prompt: &str,
     max_tokens: u32,
     correlation_id: &str,
-    sink: Option<&TurnSink>,
+    sink: Option<&ProgressSink>,
 ) -> Result<TurnResult, Box<dyn std::error::Error + Send + Sync>>
 where
     F: FnOnce()
@@ -733,9 +909,17 @@ where
     fallback_ctx.push(user_msg.clone());
 
     // The fallback provider is buffered; a streaming client learns it is
-    // thinking again and then gets the whole reply as one delta.
+    // thinking again and then gets the whole reply as one delta. A draft
+    // that already went out, or a voice segment still held, is void first
+    // and is not flushed.
     if let Some(sink) = sink {
-        let _ = sink.try_send(TurnEvent::Status(TurnStatus::Thinking));
+        let dropped = sink.discard_held();
+        if (sink.saw_delta() || dropped)
+            && !sink.try_send(TurnEvent::Reset(crate::wire::ResetReason::Fallback))
+        {
+            return Err("reset was not delivered".into());
+        }
+        sink.try_send(TurnEvent::Status(TurnStatus::Thinking));
     }
     let fallback_outcome = crate::task_context::scope(
         Some(correlation_id.to_string()),
@@ -753,8 +937,8 @@ where
     match fallback_outcome {
         Ok(result) => {
             if let Some(sink) = sink {
-                let _ = sink.try_send(TurnEvent::Status(TurnStatus::Responding));
-                let _ = sink.try_send(TurnEvent::Delta(result.text.clone()));
+                sink.try_send(TurnEvent::Status(TurnStatus::Responding));
+                sink.send_now(TurnEvent::Delta(result.text.clone()));
             }
             // Quarantine the exchange: the trunk stays clean so the default
             // model does not re-trip on later benign turns.
@@ -1024,8 +1208,56 @@ mod channel_style_tests {
 }
 
 #[cfg(test)]
+mod voice_pool_tests {
+    use super::uses_voice_pool;
+    use crate::server::auth::AuthIdentity;
+
+    #[test]
+    fn voice_pool_follows_identity_not_a_channel_string() {
+        assert!(uses_voice_pool(&AuthIdentity::Voice));
+        assert!(uses_voice_pool(&AuthIdentity::Plugin {
+            name: "voice",
+            channel: "Voice".into(),
+        }));
+        assert!(!uses_voice_pool(&AuthIdentity::Plugin {
+            name: "text",
+            channel: "discord".into(),
+        }));
+        assert!(!uses_voice_pool(&AuthIdentity::Owner));
+        assert!(!uses_voice_pool(&AuthIdentity::Peer("peer".into())));
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn segment_and_reset_map_onto_the_wire() {
+        use crate::wire::{ChatStreamEvent, ResetReason};
+        assert_eq!(
+            turn_event_to_wire(TurnEvent::Segment {
+                index: 2,
+                tool: false,
+            }),
+            ChatStreamEvent::Segment {
+                index: 2,
+                tool: false,
+            }
+        );
+        assert_eq!(
+            turn_event_to_wire(TurnEvent::Reset(ResetReason::Guard)),
+            ChatStreamEvent::Reset {
+                reason: ResetReason::Guard,
+            }
+        );
+        assert_eq!(
+            turn_event_to_wire(TurnEvent::Reset(ResetReason::Fallback)),
+            ChatStreamEvent::Reset {
+                reason: ResetReason::Fallback,
+            }
+        );
+    }
 
     #[test]
     fn the_user_turn_is_warning_then_channel_then_message() {

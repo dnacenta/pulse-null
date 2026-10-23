@@ -186,6 +186,9 @@ impl Talk {
                 self.transcript.interrupt_reply(Some(&message));
                 self.end_turn();
             }
+            // Speech-client events. The parser drops them; this arm keeps a
+            // direct call from changing the transcript.
+            ChatEvent::Segment { .. } | ChatEvent::Reset { .. } => {}
         }
     }
 

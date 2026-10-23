@@ -34,8 +34,9 @@ use std::path::{Path, PathBuf};
 use serde_json::Value;
 
 use crate::cli_provider::adapter::{
-    AgentIntegration, CliAdapter, Invocation, Observed, OutputMode, PromptDelivery, Reply,
-    StreamLine, SystemPromptDelivery, Usage, UserHookScan, VendorScratch, VendorScratchSpec,
+    assistant_message_end, AgentIntegration, CliAdapter, Invocation, Observed, OutputMode,
+    PromptDelivery, Reply, StreamLine, SystemPromptDelivery, Usage, UserHookScan, VendorScratch,
+    VendorScratchSpec,
 };
 use crate::init::agent_bootstrap::{ensure_config, BootstrapItem, ItemKind, ItemStatus};
 use crate::tool_surface::ToolSurface;
@@ -233,6 +234,9 @@ impl CliAdapter for Grok {
         let Ok(value) = serde_json::from_str::<Value>(line) else {
             return StreamLine::Other;
         };
+        if let Some(end) = assistant_message_end(&value) {
+            return end;
+        }
         match value.get("type").and_then(Value::as_str) {
             Some("stream_event") => match delta_text(&value) {
                 Some(text) => StreamLine::Delta(text.to_string()),
@@ -677,15 +681,39 @@ mod tests {
 
     #[test]
     fn narration_and_noise_are_not_results() {
-        // The assistant turn that carried "I'll list the files next." plus a
-        // tool call — exactly what leaked through plain json output.
+        // A text-only assistant record is a message boundary, not the reply.
+        // The terminal `result` is still what the runner keeps.
         let assistant = r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"I'll list the files in this directory next."}]}}"#;
-        assert_eq!(Grok.parse_stream_line(assistant), StreamLine::Other);
+        assert_eq!(
+            Grok.parse_stream_line(assistant),
+            StreamLine::MessageEnd {
+                id: None,
+                tool_use: false,
+                text: "I'll list the files in this directory next.".into(),
+            }
+        );
         assert_eq!(Grok.parse_stream_line("not json"), StreamLine::Other);
         assert_eq!(
             Grok.parse_stream_line(r#"{"type":"stream_event","event":{"type":"message_start"}}"#),
             StreamLine::Other
         );
+    }
+
+    #[test]
+    fn assistant_record_with_tool_use_is_boundary() {
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/grok-build/probe-streaming-messages.ndjson"
+        );
+        let body = std::fs::read_to_string(path).unwrap();
+        let ends: Vec<bool> = body
+            .lines()
+            .filter_map(|line| match Grok.parse_stream_line(line) {
+                StreamLine::MessageEnd { tool_use, .. } => Some(tool_use),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(ends, vec![true, false]);
     }
 
     #[test]

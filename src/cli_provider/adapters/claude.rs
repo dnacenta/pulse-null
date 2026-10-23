@@ -14,9 +14,9 @@ use std::path::{Path, PathBuf};
 
 use super::claude_hooks;
 use crate::cli_provider::adapter::{
-    AgentIntegration, CliAdapter, ExitClass, Invocation, Observed, OutputMode, Probe,
-    PromptDelivery, Reply, StreamLine, SystemPromptDelivery, Usage, UserHookScan, VendorProfile,
-    VendorScratch, VendorScratchSpec,
+    assistant_message_end, AgentIntegration, CliAdapter, ExitClass, Invocation, Observed,
+    OutputMode, Probe, PromptDelivery, Reply, StreamLine, SystemPromptDelivery, Usage,
+    UserHookScan, VendorProfile, VendorScratch, VendorScratchSpec,
 };
 use crate::init::agent_bootstrap::BootstrapItem;
 use crate::tool_surface::ToolSurface;
@@ -194,8 +194,9 @@ impl CliAdapter for Claude {
     ///
     /// Written defensively: the CLI's event vocabulary is broader than what
     /// we consume and grows between releases, so anything unrecognised
-    /// becomes `Other` rather than an error. Only two shapes matter — a text
-    /// delta and the terminal result.
+    /// becomes `Other` rather than an error. Three shapes matter — a text
+    /// delta, a whole assistant message (the boundary), and the terminal
+    /// result.
     fn parse_stream_line(&self, line: &str) -> StreamLine {
         let line = line.trim();
         if line.is_empty() {
@@ -204,6 +205,9 @@ impl CliAdapter for Claude {
         let Ok(value) = serde_json::from_str::<serde_json::Value>(line) else {
             return StreamLine::Other;
         };
+        if let Some(end) = assistant_message_end(&value) {
+            return end;
+        }
         match value["type"].as_str() {
             // Partial message: an Anthropic-shaped SSE event wrapped by the CLI.
             Some("stream_event") => {
@@ -632,6 +636,23 @@ mod tests {
                 }),
             }
         );
+    }
+
+    #[test]
+    fn assistant_record_with_tool_use_is_boundary() {
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/claude-code/stream-json-tool-call.ndjson"
+        );
+        let body = std::fs::read_to_string(path).unwrap();
+        let ends: Vec<bool> = body
+            .lines()
+            .filter_map(|line| match Claude.parse_stream_line(line) {
+                StreamLine::MessageEnd { tool_use, .. } => Some(tool_use),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(ends, vec![true, false]);
     }
 
     #[test]

@@ -135,10 +135,407 @@ pub enum TurnStatus {
 pub enum TurnEvent {
     Status(TurnStatus),
     Delta(String),
+    /// An assistant message ended. `index` counts from 0 within the turn.
+    /// `tool` is true when a tool call follows.
+    Segment {
+        index: u32,
+        tool: bool,
+    },
+    /// Text already sent on this turn is void.
+    ///
+    /// The chat handler sends this when a streamed draft is superseded.
+    Reset(crate::wire::ResetReason),
+}
+
+/// Counts `segment` events for one turn, and remembers when the provider
+/// reported the boundaries itself so the loop does not add a second set.
+struct Segments {
+    next: u32,
+    from_provider: bool,
+}
+
+impl Segments {
+    fn new() -> Self {
+        Self {
+            next: 0,
+            from_provider: false,
+        }
+    }
+
+    fn push(&mut self, sink: &ProgressSink, tool: bool) {
+        self.emit(sink, tool, false);
+    }
+
+    /// A boundary emitted after the guard, which must not be held again.
+    fn push_kept(&mut self, sink: &ProgressSink, tool: bool) {
+        self.emit(sink, tool, true);
+    }
+
+    fn emit(&mut self, sink: &ProgressSink, tool: bool, now: bool) {
+        let event = TurnEvent::Segment {
+            index: self.next,
+            tool,
+        };
+        let accepted = if now {
+            sink.send_now(event)
+        } else {
+            sink.try_send(event)
+        };
+        if accepted {
+            self.next = self.next.saturating_add(1);
+        }
+    }
+}
+
+/// Resets and segments that must survive a full delta channel.
+///
+/// Deltas stay on the bounded channel and are dropped when it is full.
+/// A reset is queued here and the stream emits it before any further
+/// event. A segment that does not fit records how many events had already
+/// been accepted into the channel. The stream writes it immediately after
+/// those events, and before anything accepted later.
+pub struct ControlPlane {
+    pending: std::sync::Mutex<ControlPending>,
+    notify: tokio::sync::Notify,
+    reset_queued: std::sync::atomic::AtomicBool,
+    closed: std::sync::atomic::AtomicBool,
+}
+
+struct ParkedSegment {
+    event: TurnEvent,
+    /// Emit after this many channel events have been written.
+    after: u64,
+}
+
+struct ControlPending {
+    resets: std::collections::VecDeque<TurnEvent>,
+    segments: std::collections::VecDeque<ParkedSegment>,
+    /// Events accepted into the delta channel. Published before the
+    /// corresponding send, so a reader cannot observe the event first.
+    accepted: u64,
+}
+
+impl ControlPlane {
+    pub fn new() -> Self {
+        Self {
+            pending: std::sync::Mutex::new(ControlPending {
+                resets: std::collections::VecDeque::new(),
+                segments: std::collections::VecDeque::new(),
+                accepted: 0,
+            }),
+            notify: tokio::sync::Notify::new(),
+            reset_queued: std::sync::atomic::AtomicBool::new(false),
+            closed: std::sync::atomic::AtomicBool::new(false),
+        }
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, ControlPending> {
+        self.pending.lock().unwrap_or_else(|err| err.into_inner())
+    }
+
+    pub fn push_reset(&self, event: TurnEvent) -> bool {
+        if self.closed.load(std::sync::atomic::Ordering::Acquire) {
+            return false;
+        }
+        self.lock().resets.push_back(event);
+        self.reset_queued
+            .store(true, std::sync::atomic::Ordering::Release);
+        self.notify.notify_one();
+        true
+    }
+
+    /// Record one event accepted into the delta channel. Call this before
+    /// that event is sent, so `after` on a later segment includes it.
+    pub fn note_accepted(&self) {
+        let mut pending = self.lock();
+        pending.accepted = pending.accepted.saturating_add(1);
+    }
+
+    pub fn push_segment(&self, event: TurnEvent) -> bool {
+        if self.closed.load(std::sync::atomic::Ordering::Acquire) {
+            return false;
+        }
+        let mut pending = self.lock();
+        let after = pending.accepted;
+        pending.segments.push_back(ParkedSegment { event, after });
+        drop(pending);
+        self.notify.notify_one();
+        true
+    }
+
+    pub fn drain_resets(&self) -> Vec<TurnEvent> {
+        self.lock().resets.drain(..).collect()
+    }
+
+    /// Segments whose preceding channel events have all been written.
+    pub fn take_due(&self, written: u64) -> Vec<TurnEvent> {
+        let mut pending = self.lock();
+        let mut due = Vec::new();
+        while pending
+            .segments
+            .front()
+            .is_some_and(|segment| segment.after <= written)
+        {
+            if let Some(segment) = pending.segments.pop_front() {
+                due.push(segment.event);
+            }
+        }
+        due
+    }
+
+    pub fn notified(&self) -> tokio::sync::futures::Notified<'_> {
+        self.notify.notified()
+    }
+
+    pub fn reset_queued(&self) -> bool {
+        self.reset_queued.load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    pub fn close(&self) {
+        self.closed
+            .store(true, std::sync::atomic::Ordering::Release);
+    }
+}
+
+/// Closes a [`ControlPlane`] when the stream that reads it is dropped.
+pub struct ControlClose(pub std::sync::Arc<ControlPlane>);
+
+impl Drop for ControlClose {
+    fn drop(&mut self) {
+        self.0.close();
+    }
 }
 
 /// Sender half a streaming caller hands to the tool loop.
 pub type TurnSink = tokio::sync::mpsc::Sender<TurnEvent>;
+
+/// Bytes of held speech for a provider that does not honor `max_tokens`.
+const CLI_HOLD_BYTE_CAP: usize = 32 * 1024;
+
+/// Byte cap for one turn's held speech. Derived from the output budget
+/// (`max_tokens` times the chars/4 estimate used for prompt size). A CLI
+/// provider ignores that budget, and a zero budget has no estimate, so
+/// both use a fixed cap.
+pub fn hold_byte_cap(provider: &str, max_tokens: u32) -> usize {
+    if provider == "cli" || max_tokens == 0 {
+        CLI_HOLD_BYTE_CAP
+    } else {
+        (max_tokens as usize).saturating_mul(4).max(1)
+    }
+}
+
+/// Text and message boundaries held back until a round's guard has passed.
+struct HeldSpeech {
+    deltas: Vec<String>,
+    segments: Vec<(u32, bool)>,
+    /// Bytes accepted into `deltas` this turn, including text already flushed.
+    bytes: usize,
+    cap: usize,
+    /// The cap was crossed. Further held text is dropped.
+    overflowed: bool,
+}
+
+/// A [`TurnSink`] that remembers whether any text delta was sent.
+///
+/// The chat handler reads that flag when a later reply supersedes text the
+/// client may already have. Every send is `try_send`: a full or closed
+/// channel drops the event and never stalls the turn.
+///
+/// A voice-pool sink holds the open segment's deltas (and any provider
+/// boundary) until [`Self::flush_held`]. A cut or a refusal calls
+/// [`Self::discard_held`] instead, so the raw tail never reaches the speaker.
+pub struct ProgressSink {
+    tx: TurnSink,
+    saw_delta: std::sync::atomic::AtomicBool,
+    /// `Some` while this sink holds an open segment. `None` forwards deltas
+    /// as they arrive.
+    held: std::sync::Mutex<Option<HeldSpeech>>,
+    /// Resets, and segments that do not fit on `tx`. `None` in tests that
+    /// read the delta channel directly.
+    control: Option<std::sync::Arc<ControlPlane>>,
+}
+
+impl ProgressSink {
+    pub fn new(tx: TurnSink) -> Self {
+        Self {
+            tx,
+            saw_delta: std::sync::atomic::AtomicBool::new(false),
+            held: std::sync::Mutex::new(None),
+            control: None,
+        }
+    }
+
+    /// Hold deltas until the round's guard has kept them.
+    /// The cap is the fixed CLI budget. Production turns pass an explicit cap.
+    #[cfg(test)]
+    pub fn holding(tx: TurnSink) -> Self {
+        Self::holding_capped(tx, CLI_HOLD_BYTE_CAP)
+    }
+
+    /// Hold deltas until the round's guard has kept them, up to `cap` bytes.
+    /// Past that the hold is discarded and one `reset` is delivered.
+    pub fn holding_capped(tx: TurnSink, cap: usize) -> Self {
+        Self {
+            tx,
+            saw_delta: std::sync::atomic::AtomicBool::new(false),
+            held: std::sync::Mutex::new(Some(HeldSpeech {
+                deltas: Vec::new(),
+                segments: Vec::new(),
+                bytes: 0,
+                cap,
+                overflowed: false,
+            })),
+            control: None,
+        }
+    }
+
+    pub fn attach(&mut self, control: std::sync::Arc<ControlPlane>) {
+        self.control = Some(control);
+    }
+
+    /// True when deltas and provider boundaries are waiting for the guard.
+    #[must_use]
+    pub fn is_holding(&self) -> bool {
+        self.lock().is_some()
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, Option<HeldSpeech>> {
+        self.held.lock().unwrap_or_else(|err| err.into_inner())
+    }
+
+    /// True when the event was accepted. A segment index must not advance
+    /// when this returns false: the event was dropped.
+    pub fn try_send(&self, event: TurnEvent) -> bool {
+        let mut held = self.lock();
+        if let Some(buf) = held.as_mut() {
+            match event {
+                TurnEvent::Delta(text) => {
+                    if buf.overflowed {
+                        return true;
+                    }
+                    let next = buf.bytes.saturating_add(text.len());
+                    if next > buf.cap {
+                        buf.deltas.clear();
+                        buf.segments.clear();
+                        buf.overflowed = true;
+                        drop(held);
+                        return self.deliver(TurnEvent::Reset(crate::wire::ResetReason::Budget));
+                    }
+                    buf.bytes = next;
+                    buf.deltas.push(text);
+                    return true;
+                }
+                TurnEvent::Segment { index, tool } => {
+                    if buf.overflowed {
+                        return false;
+                    }
+                    buf.segments.push((index, tool));
+                    return true;
+                }
+                other => {
+                    drop(held);
+                    return self.deliver(other);
+                }
+            }
+        }
+        drop(held);
+        self.deliver(event)
+    }
+
+    /// Deliver `event` even while this sink is holding a segment.
+    pub fn send_now(&self, event: TurnEvent) -> bool {
+        self.deliver(event)
+    }
+
+    fn deliver(&self, event: TurnEvent) -> bool {
+        if matches!(event, TurnEvent::Reset(_)) {
+            if let Some(control) = &self.control {
+                return control.push_reset(event);
+            }
+        }
+        if self.control.is_some() {
+            return self.deliver_in_order(event);
+        }
+        self.enqueue(event)
+    }
+
+    /// Accept `event` into the channel, or park a segment that does not fit
+    /// after every event already accepted.
+    fn deliver_in_order(&self, event: TurnEvent) -> bool {
+        use tokio::sync::mpsc::error::TrySendError;
+        match self.tx.try_reserve() {
+            Ok(permit) => {
+                if let Some(control) = &self.control {
+                    control.note_accepted();
+                }
+                self.mark_delta(&event);
+                permit.send(event);
+                true
+            }
+            Err(TrySendError::Closed(_)) => false,
+            Err(TrySendError::Full(_)) => {
+                if matches!(event, TurnEvent::Segment { .. }) {
+                    if let Some(control) = &self.control {
+                        return control.push_segment(event);
+                    }
+                }
+                false
+            }
+        }
+    }
+
+    fn enqueue(&self, event: TurnEvent) -> bool {
+        self.mark_delta(&event);
+        self.tx.try_send(event).is_ok()
+    }
+
+    fn mark_delta(&self, event: &TurnEvent) {
+        if matches!(event, TurnEvent::Delta(_)) {
+            self.saw_delta
+                .store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
+    /// Forward the held segment. No-op when this sink does not hold.
+    pub fn flush_held(&self) {
+        let pending = {
+            let mut held = self.lock();
+            held.as_mut().map(|buf| {
+                (
+                    std::mem::take(&mut buf.deltas),
+                    std::mem::take(&mut buf.segments),
+                )
+            })
+        };
+        let Some((deltas, segments)) = pending else {
+            return;
+        };
+        for text in deltas {
+            self.deliver(TurnEvent::Delta(text));
+        }
+        for (index, tool) in segments {
+            self.deliver(TurnEvent::Segment { index, tool });
+        }
+    }
+
+    /// Drop the held segment without sending it. True when any text was dropped.
+    pub fn discard_held(&self) -> bool {
+        let mut held = self.lock();
+        let Some(buf) = held.as_mut() else {
+            return false;
+        };
+        let dropped = buf.deltas.iter().any(|text| !text.is_empty());
+        buf.deltas.clear();
+        buf.segments.clear();
+        buf.bytes = 0;
+        dropped
+    }
+
+    #[must_use]
+    pub fn saw_delta(&self) -> bool {
+        self.saw_delta.load(std::sync::atomic::Ordering::Relaxed)
+    }
+}
 
 /// Boxed error type every tool-loop entry point returns.
 pub type BoxError = Box<dyn std::error::Error + Send + Sync>;
@@ -239,7 +636,7 @@ pub async fn invoke_with_tool_loop_streaming(
     messages: &mut Vec<Message>,
     max_tokens: u32,
     max_rounds: u32,
-    sink: &TurnSink,
+    sink: &ProgressSink,
 ) -> Result<ToolLoopResult, BoxError> {
     let tool_defs = if provider.supports_tools() && !tools.is_empty() {
         Some(tools.definitions())
@@ -248,23 +645,84 @@ pub async fn invoke_with_tool_loop_streaming(
     };
     let tool_defs_ref = tool_defs.as_deref();
     let mut rs = RoundState::new();
+    let mut segments = Segments::new();
 
     loop {
-        let _ = sink.try_send(TurnEvent::Status(TurnStatus::Thinking));
-        let result = stream_one_round(
+        sink.try_send(TurnEvent::Status(TurnStatus::Thinking));
+        let round = stream_one_round(
             provider,
             system_prompt,
             messages,
             max_tokens,
             tool_defs_ref,
             sink,
+            &mut segments,
         )
         .await?;
-        match finish_round(&mut rs, result, tools, messages, max_rounds).await {
-            RoundOutcome::Done(done) => return Ok(done),
-            RoundOutcome::Continue => {}
+        let tool_names = round.tool_names;
+        // The guard has to accept the round before a speaker hears it, and
+        // the boundary has to be on the wire before the tool call blocks.
+        // A provider that already closed the message left that boundary in
+        // the hold; flush it too, or a voice client hears it only after the
+        // tool returns.
+        let survives = tool_round_survives_guard(&round.response, rs.rounds, max_rounds);
+        let announce = survives && !segments.from_provider;
+        if announce {
+            sink.flush_held();
+            segments.push_kept(sink, true);
+            for name in &tool_names {
+                sink.try_send(TurnEvent::Status(TurnStatus::Tool(name.clone())));
+            }
+        } else if survives && segments.from_provider && sink.is_holding() {
+            sink.flush_held();
+        }
+        match finish_round(&mut rs, round.response, tools, messages, max_rounds).await {
+            RoundOutcome::Done(done) => {
+                // A cut reply leaves the held segment for the caller to
+                // drop. Reset goes out before any kept text.
+                if !done.was_truncated {
+                    sink.flush_held();
+                    // A provider that reported no boundaries and never called a
+                    // tool stays `delta` then `done`, the same as before.
+                    if !segments.from_provider && done.tool_rounds > 0 {
+                        segments.push_kept(sink, false);
+                    }
+                }
+                return Ok(done);
+            }
+            RoundOutcome::Continue => {
+                if !announce {
+                    sink.flush_held();
+                    if !segments.from_provider {
+                        segments.push_kept(sink, true);
+                    }
+                    for name in tool_names {
+                        sink.try_send(TurnEvent::Status(TurnStatus::Tool(name)));
+                    }
+                }
+            }
         }
     }
+}
+
+/// True when this round will run tools and the guard kept the text.
+/// A truncated round does not: the held text stays buffered for the
+/// caller to drop. `finish_round` increments first and skips the calls
+/// once past the cap.
+fn tool_round_survives_guard(response: &LlmResponse, rounds_so_far: u32, max_rounds: u32) -> bool {
+    if !matches!(response.stop_reason, StopReason::ToolUse) || rounds_so_far >= max_rounds {
+        return false;
+    }
+    let (_sanitized, was_truncated, _marker) = validate_content_blocks_adapter(&response.content);
+    !was_truncated
+}
+
+/// One provider round as the stream delivered it.
+struct StreamedRound {
+    response: LlmResponse,
+    /// Tools the model asked for, held until the message boundary so a
+    /// client sees `segment` before `status tool`.
+    tool_names: Vec<String>,
 }
 
 /// Drive one provider round through its stream, forwarding progress to
@@ -275,25 +733,36 @@ async fn stream_one_round(
     messages: &[Message],
     max_tokens: u32,
     tool_defs: Option<&[serde_json::Value]>,
-    sink: &TurnSink,
-) -> Result<LlmResponse, BoxError> {
+    sink: &ProgressSink,
+    segments: &mut Segments,
+) -> Result<StreamedRound, BoxError> {
     use tokio_stream::StreamExt as _;
 
     let mut stream = provider.invoke_streaming(system_prompt, messages, max_tokens, tool_defs);
     let mut responding = false;
+    let mut tool_names = Vec::new();
     while let Some(event) = stream.next().await {
         match event {
             StreamEvent::TextDelta(text) => {
                 if !responding {
                     responding = true;
-                    let _ = sink.try_send(TurnEvent::Status(TurnStatus::Responding));
+                    sink.try_send(TurnEvent::Status(TurnStatus::Responding));
                 }
-                let _ = sink.try_send(TurnEvent::Delta(text));
+                sink.try_send(TurnEvent::Delta(text));
             }
             StreamEvent::ToolUse { name, .. } => {
-                let _ = sink.try_send(TurnEvent::Status(TurnStatus::Tool(name)));
+                tool_names.push(name);
             }
-            StreamEvent::Done(response) => return Ok(response),
+            StreamEvent::SegmentEnd { tool_use } => {
+                segments.from_provider = true;
+                segments.push(sink, tool_use);
+            }
+            StreamEvent::Done(response) => {
+                return Ok(StreamedRound {
+                    response,
+                    tool_names,
+                });
+            }
             StreamEvent::Refused { model, detail } => {
                 return Err(Box::new(crate::errors::RefusalError { model, detail }));
             }
@@ -689,11 +1158,12 @@ mod streaming_tests {
             .unwrap();
 
         let (tx, mut rx) = tokio::sync::mpsc::channel(64);
+        let sink = ProgressSink::new(tx);
         let mut m2 = vec![user("hi")];
-        let b = invoke_with_tool_loop_streaming(&streamed, &tools, "sys", &mut m2, 100, 5, &tx)
+        let b = invoke_with_tool_loop_streaming(&streamed, &tools, "sys", &mut m2, 100, 5, &sink)
             .await
             .unwrap();
-        drop(tx);
+        drop(sink);
 
         assert_eq!(a.text, b.text);
         assert_eq!(a.input_tokens, b.input_tokens);
@@ -716,15 +1186,385 @@ mod streaming_tests {
             })
             .collect();
         assert_eq!(joined, "the quick brown fox");
+        assert!(
+            events
+                .iter()
+                .all(|e| !matches!(e, TurnEvent::Segment { .. })),
+            "a round with no tool call and no provider boundary emits no segment: {events:?}"
+        );
+    }
+
+    fn tool_round(text: &str, name: &str) -> LlmResponse {
+        LlmResponse {
+            content: vec![
+                ContentBlock::Text { text: text.into() },
+                ContentBlock::ToolUse {
+                    id: "t1".into(),
+                    name: name.into(),
+                    input: serde_json::json!({}),
+                },
+            ],
+            stop_reason: StopReason::ToolUse,
+            model: "scripted".into(),
+            input_tokens: Some(1),
+            output_tokens: Some(1),
+        }
+    }
+
+    #[tokio::test]
+    async fn segments_mark_tool_rounds() {
+        let p = Scripted::new(
+            vec![tool_round("look ", "file_read"), end_turn("found")],
+            true,
+        );
+        let tools = ToolRegistry::new();
+        let (tx, mut rx) = tokio::sync::mpsc::channel(64);
+        let sink = ProgressSink::new(tx);
+        let mut messages = vec![user("hi")];
+        invoke_with_tool_loop_streaming(&p, &tools, "sys", &mut messages, 100, 5, &sink)
+            .await
+            .unwrap();
+        drop(sink);
+
+        let mut events = Vec::new();
+        while let Some(e) = rx.recv().await {
+            events.push(e);
+        }
+        let marked: Vec<TurnEvent> = events
+            .into_iter()
+            .filter(|e| {
+                matches!(
+                    e,
+                    TurnEvent::Delta(_)
+                        | TurnEvent::Segment { .. }
+                        | TurnEvent::Status(TurnStatus::Tool(_))
+                )
+            })
+            .collect();
+        assert_eq!(
+            marked,
+            vec![
+                TurnEvent::Delta("look ".into()),
+                TurnEvent::Segment {
+                    index: 0,
+                    tool: true,
+                },
+                TurnEvent::Status(TurnStatus::Tool("file_read".into())),
+                TurnEvent::Delta("found".into()),
+                TurnEvent::Segment {
+                    index: 1,
+                    tool: false,
+                },
+            ]
+        );
+    }
+
+    /// A provider that does not emit `SegmentEnd` still publishes the
+    /// synthesized tool boundary before the tool call blocks.
+    #[tokio::test]
+    async fn synthesized_segment_is_readable_before_the_tool_returns() {
+        use std::sync::Arc;
+        use tokio::sync::Notify;
+
+        struct HoldTool {
+            entered: Arc<Notify>,
+            release: Arc<Notify>,
+        }
+
+        impl crate::tools::Tool for HoldTool {
+            fn name(&self) -> &str {
+                "file_read"
+            }
+            fn description(&self) -> &str {
+                "blocks until released"
+            }
+            fn input_schema(&self) -> serde_json::Value {
+                serde_json::json!({})
+            }
+            fn execute(&self, _input: serde_json::Value) -> crate::tools::ToolResult<'_> {
+                let entered = Arc::clone(&self.entered);
+                let release = Arc::clone(&self.release);
+                Box::pin(async move {
+                    entered.notify_one();
+                    release.notified().await;
+                    Ok("ok".to_string())
+                })
+            }
+        }
+
+        let entered = Arc::new(Notify::new());
+        let release = Arc::new(Notify::new());
+        let mut tools = ToolRegistry::new();
+        tools.register(Box::new(HoldTool {
+            entered: Arc::clone(&entered),
+            release: Arc::clone(&release),
+        }));
+        let provider = Scripted::new(
+            vec![tool_round("look ", "file_read"), end_turn("found")],
+            true,
+        );
+        let (tx, mut rx) = tokio::sync::mpsc::channel(64);
+        let sink = ProgressSink::new(tx);
+        let mut messages = vec![user("hi")];
+        let invoke =
+            invoke_with_tool_loop_streaming(&provider, &tools, "sys", &mut messages, 100, 5, &sink);
+        tokio::pin!(invoke);
+
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            tokio::select! {
+                _ = &mut invoke => {
+                    panic!("turn finished before the boundary was read")
+                }
+                _ = async {
+                    let mut saw_segment = false;
+                    let mut saw_status = false;
+                    while !saw_segment || !saw_status {
+                        match rx.recv().await {
+                            Some(TurnEvent::Segment { tool: true, .. }) => saw_segment = true,
+                            Some(TurnEvent::Status(TurnStatus::Tool(name))) if name == "file_read" => {
+                                saw_status = true;
+                            }
+                            Some(_) => {}
+                            None => panic!("stream closed before the tool boundary"),
+                        }
+                    }
+                    entered.notified().await;
+                } => {}
+            }
+        })
+        .await
+        .expect("segment was not readable before the tool returned");
+
+        release.notify_one();
+        tokio::time::timeout(std::time::Duration::from_secs(2), invoke)
+            .await
+            .expect("turn did not finish")
+            .unwrap();
+    }
+
+    /// A provider `SegmentEnd` held for the voice channel is readable
+    /// before the tool call blocks.
+    #[tokio::test]
+    async fn provider_segment_is_flushed_before_the_tool_returns() {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        use std::sync::Arc;
+        use tokio::sync::Notify;
+
+        struct HoldTool {
+            entered: Arc<Notify>,
+            release: Arc<Notify>,
+        }
+
+        impl crate::tools::Tool for HoldTool {
+            fn name(&self) -> &str {
+                "file_read"
+            }
+            fn description(&self) -> &str {
+                "blocks until released"
+            }
+            fn input_schema(&self) -> serde_json::Value {
+                serde_json::json!({})
+            }
+            fn execute(&self, _input: serde_json::Value) -> crate::tools::ToolResult<'_> {
+                let entered = Arc::clone(&self.entered);
+                let release = Arc::clone(&self.release);
+                Box::pin(async move {
+                    entered.notify_one();
+                    release.notified().await;
+                    Ok("ok".to_string())
+                })
+            }
+        }
+
+        struct Bounded {
+            round: AtomicU32,
+        }
+        impl LmProvider for Bounded {
+            fn invoke(
+                &self,
+                _s: &str,
+                _m: &[Message],
+                _t: u32,
+                _tools: Option<&[serde_json::Value]>,
+            ) -> std::pin::Pin<
+                Box<
+                    dyn std::future::Future<
+                            Output = Result<LlmResponse, Box<dyn std::error::Error + Send + Sync>>,
+                        > + Send
+                        + '_,
+                >,
+            > {
+                Box::pin(async { Err("unused".into()) })
+            }
+            fn name(&self) -> &str {
+                "bounded"
+            }
+            fn supports_tools(&self) -> bool {
+                true
+            }
+        }
+        impl StreamingProvider for Bounded {
+            fn invoke_streaming(
+                &self,
+                _s: &str,
+                _m: &[Message],
+                _t: u32,
+                _tools: Option<&[serde_json::Value]>,
+            ) -> crate::streaming::StreamResult<'_> {
+                let n = self.round.fetch_add(1, Ordering::SeqCst);
+                Box::pin(async_stream::stream! {
+                    if n == 0 {
+                        yield StreamEvent::TextDelta("hold me".into());
+                        yield StreamEvent::SegmentEnd { tool_use: true };
+                        yield StreamEvent::ToolUse {
+                            id: "t1".into(),
+                            name: "file_read".into(),
+                            input: serde_json::json!({}),
+                        };
+                        yield StreamEvent::Done(tool_round("hold me", "file_read"));
+                    } else {
+                        yield StreamEvent::Done(end_turn("found"));
+                    }
+                })
+            }
+        }
+
+        let entered = Arc::new(Notify::new());
+        let release = Arc::new(Notify::new());
+        let mut tools = ToolRegistry::new();
+        tools.register(Box::new(HoldTool {
+            entered: Arc::clone(&entered),
+            release: Arc::clone(&release),
+        }));
+        let provider = Bounded {
+            round: AtomicU32::new(0),
+        };
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        let sink = ProgressSink::holding(tx);
+        let mut messages = vec![user("hi")];
+        let invoke =
+            invoke_with_tool_loop_streaming(&provider, &tools, "sys", &mut messages, 100, 5, &sink);
+        tokio::pin!(invoke);
+
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            tokio::select! {
+                _ = &mut invoke => {
+                    panic!("turn finished before the boundary was read")
+                }
+                _ = async {
+                    let mut narration = false;
+                    let mut segment = false;
+                    while !narration || !segment {
+                        match rx.recv().await {
+                            Some(TurnEvent::Delta(text)) if text == "hold me" => narration = true,
+                            Some(TurnEvent::Segment { tool: true, .. }) => segment = true,
+                            Some(_) => {}
+                            None => panic!("stream closed before the tool boundary"),
+                        }
+                    }
+                    entered.notified().await;
+                } => {}
+            }
+        })
+        .await
+        .expect("held narration and the tool segment were not readable before the tool returned");
+
+        release.notify_one();
+        tokio::time::timeout(std::time::Duration::from_secs(2), invoke)
+            .await
+            .expect("turn did not finish")
+            .unwrap();
+    }
+
+    /// A provider that already closed each message must not get a second
+    /// boundary from the loop when the round also ended in a tool call.
+    #[tokio::test]
+    async fn provider_boundaries_are_not_doubled() {
+        use std::sync::atomic::{AtomicU32, Ordering};
+
+        struct Bounded {
+            round: AtomicU32,
+        }
+        impl LmProvider for Bounded {
+            fn invoke(
+                &self,
+                _s: &str,
+                _m: &[Message],
+                _t: u32,
+                _tools: Option<&[serde_json::Value]>,
+            ) -> std::pin::Pin<
+                Box<
+                    dyn std::future::Future<
+                            Output = Result<LlmResponse, Box<dyn std::error::Error + Send + Sync>>,
+                        > + Send
+                        + '_,
+                >,
+            > {
+                Box::pin(async { Err("unused".into()) })
+            }
+            fn name(&self) -> &str {
+                "bounded"
+            }
+            fn supports_tools(&self) -> bool {
+                true
+            }
+        }
+        impl StreamingProvider for Bounded {
+            fn invoke_streaming(
+                &self,
+                _s: &str,
+                _m: &[Message],
+                _t: u32,
+                _tools: Option<&[serde_json::Value]>,
+            ) -> crate::streaming::StreamResult<'_> {
+                let n = self.round.fetch_add(1, Ordering::SeqCst);
+                Box::pin(async_stream::stream! {
+                    if n == 0 {
+                        yield StreamEvent::TextDelta("look ".into());
+                        yield StreamEvent::SegmentEnd { tool_use: true };
+                        yield StreamEvent::ToolUse {
+                            id: "t1".into(),
+                            name: "file_read".into(),
+                            input: serde_json::json!({}),
+                        };
+                        yield StreamEvent::Done(tool_round("look ", "file_read"));
+                    } else {
+                        yield StreamEvent::TextDelta("found".into());
+                        yield StreamEvent::SegmentEnd { tool_use: false };
+                        yield StreamEvent::Done(end_turn("found"));
+                    }
+                })
+            }
+        }
+
+        let p = Bounded {
+            round: AtomicU32::new(0),
+        };
+        let tools = ToolRegistry::new();
+        let (tx, mut rx) = tokio::sync::mpsc::channel(64);
+        let sink = ProgressSink::new(tx);
+        let mut messages = vec![user("hi")];
+        invoke_with_tool_loop_streaming(&p, &tools, "sys", &mut messages, 100, 5, &sink)
+            .await
+            .unwrap();
+        drop(sink);
+        let mut segments = Vec::new();
+        while let Some(event) = rx.recv().await {
+            if let TurnEvent::Segment { index, tool } = event {
+                segments.push((index, tool));
+            }
+        }
+        assert_eq!(segments, vec![(0, true), (1, false)]);
     }
 
     #[tokio::test]
     async fn streamed_refusal_surfaces_as_typed_refusal_error() {
         let tools = ToolRegistry::new();
         let (tx, _rx) = tokio::sync::mpsc::channel(8);
+        let sink = ProgressSink::new(tx);
         let mut m = vec![user("hi")];
         let outcome =
-            invoke_with_tool_loop_streaming(&Refuser, &tools, "sys", &mut m, 100, 5, &tx).await;
+            invoke_with_tool_loop_streaming(&Refuser, &tools, "sys", &mut m, 100, 5, &sink).await;
         let Err(err) = outcome else {
             panic!("expected the streamed refusal to error")
         };
@@ -771,9 +1611,11 @@ mod streaming_tests {
     async fn streamed_quota_surfaces_as_typed_quota_error() {
         let tools = ToolRegistry::new();
         let (tx, _rx) = tokio::sync::mpsc::channel(8);
+        let sink = ProgressSink::new(tx);
         let mut m = vec![user("hi")];
         let outcome =
-            invoke_with_tool_loop_streaming(&QuotaSpent, &tools, "sys", &mut m, 100, 5, &tx).await;
+            invoke_with_tool_loop_streaming(&QuotaSpent, &tools, "sys", &mut m, 100, 5, &sink)
+                .await;
         let Err(err) = outcome else {
             panic!("expected the streamed quota failure to error")
         };
@@ -788,10 +1630,11 @@ mod streaming_tests {
         let p = Scripted::new(vec![end_turn(text.trim())], false);
         let tools = ToolRegistry::new();
         let (tx, _rx) = tokio::sync::mpsc::channel(1);
+        let sink = ProgressSink::new(tx);
         let mut m = vec![user("hi")];
         let r = tokio::time::timeout(
             std::time::Duration::from_secs(2),
-            invoke_with_tool_loop_streaming(&p, &tools, "sys", &mut m, 100, 5, &tx),
+            invoke_with_tool_loop_streaming(&p, &tools, "sys", &mut m, 100, 5, &sink),
         )
         .await
         .expect("turn must not block on a full sink")
@@ -805,10 +1648,37 @@ mod streaming_tests {
         let tools = ToolRegistry::new();
         let (tx, rx) = tokio::sync::mpsc::channel(1);
         drop(rx);
+        let sink = ProgressSink::new(tx);
         let mut m = vec![user("hi")];
-        let r = invoke_with_tool_loop_streaming(&p, &tools, "sys", &mut m, 100, 5, &tx)
+        let r = invoke_with_tool_loop_streaming(&p, &tools, "sys", &mut m, 100, 5, &sink)
             .await
             .unwrap();
         assert_eq!(r.text, "ok");
+    }
+
+    /// Past the hold cap the buffered text is dropped and one budget reset
+    /// is delivered. Later deltas do not bring the flood back.
+    #[tokio::test]
+    async fn held_speech_discards_past_the_output_budget() {
+        assert_eq!(hold_byte_cap("cli", 4096), 32 * 1024);
+        assert_eq!(hold_byte_cap("cli", 0), 32 * 1024);
+        assert_eq!(hold_byte_cap("screen", 8), 32);
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        let sink = ProgressSink::holding_capped(tx, 4);
+        assert!(sink.try_send(TurnEvent::Delta("ab".into())));
+        assert!(sink.try_send(TurnEvent::Delta("cdef".into())));
+        assert!(sink.try_send(TurnEvent::Delta("nope".into())));
+        sink.flush_held();
+        drop(sink);
+
+        let mut events = Vec::new();
+        while let Some(event) = rx.recv().await {
+            events.push(event);
+        }
+        assert_eq!(
+            events,
+            vec![TurnEvent::Reset(crate::wire::ResetReason::Budget)]
+        );
     }
 }

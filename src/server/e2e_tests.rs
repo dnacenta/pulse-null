@@ -354,6 +354,7 @@ fn test_config() -> Config {
         },
         security: SecurityConfig {
             secret: None,
+            voice_secret: None,
             injection_detection: false,
         },
         trust: TrustConfig::default(),
@@ -384,6 +385,9 @@ fn test_config() -> Config {
 fn build_app(state: Arc<AppState>) -> Router {
     Router::new()
         .route("/health", get(handlers::health::health))
+        .route("/api/session-health", get(handlers::health::session_health))
+        .route("/api/status", get(handlers::status::status))
+        .route("/api/dashboard", get(handlers::dashboard::dashboard))
         .route("/chat", post(handlers::chat::chat))
         .route("/api/chat/stream", post(handlers::chat::chat_stream))
         .route("/api/events", get(handlers::events::events))
@@ -457,6 +461,7 @@ async fn build_state_with_buffer(
     session_store.set_coordinator(Arc::clone(&persist_coordinator));
     let plugin_manager = crate::plugins::manager::PluginManager::new(&config);
     let alert_queue = crate::scheduler::alerts::AlertQueue::load(&root_dir);
+    let pools = crate::server::stream_pools();
     Arc::new(AppState {
         config,
         provider,
@@ -475,9 +480,10 @@ async fn build_state_with_buffer(
         alert_queue: tokio::sync::Mutex::new(alert_queue),
         provider_status: crate::provider_status::new_shared(),
         leadership: std::sync::atomic::AtomicBool::new(false),
-        event_permits: crate::server::stream_pools().0,
+        event_permits: pools.event,
         comms_permits: crate::server::comms_pool(),
-        chat_permits: crate::server::stream_pools().1,
+        chat_permits: pools.chat,
+        voice_permits: pools.voice,
         comms: crate::comms::Slot::new(),
         graph_extractor: None,
         ledger: Arc::new(crate::ledger::LedgerRing::new(64)),
@@ -1400,14 +1406,66 @@ impl crate::streaming::StreamingProvider for HangingProvider {
 }
 
 async fn post_chat_stream(app: &Router, message: &str) -> axum::response::Response {
-    let body = serde_json::json!({ "message": message });
-    let req = Request::builder()
+    post_chat_stream_on(app, "chat", message).await
+}
+
+async fn post_chat_stream_on(
+    app: &Router,
+    channel: &str,
+    message: &str,
+) -> axum::response::Response {
+    post_chat_stream_secret(app, channel, message, None).await
+}
+
+async fn post_chat_stream_secret(
+    app: &Router,
+    channel: &str,
+    message: &str,
+    secret: Option<&str>,
+) -> axum::response::Response {
+    let body = serde_json::json!({ "message": message, "channel": channel });
+    let mut builder = Request::builder()
         .method("POST")
         .uri("/api/chat/stream")
-        .header("Content-Type", "application/json")
+        .header("Content-Type", "application/json");
+    if let Some(secret) = secret {
+        builder = builder.header("X-Echo-Secret", secret);
+    }
+    let req = builder
         .body(Body::from(serde_json::to_string(&body).unwrap()))
         .unwrap();
     app.clone().oneshot(req).await.unwrap()
+}
+
+async fn post_chat_stream_from(
+    app: &Router,
+    channel: &str,
+    sender: Option<&str>,
+    secret: Option<&str>,
+) -> axum::response::Response {
+    let mut body = serde_json::json!({ "message": "hi", "channel": channel });
+    if let Some(sender) = sender {
+        body["sender"] = serde_json::Value::String(sender.to_string());
+    }
+    let mut builder = Request::builder()
+        .method("POST")
+        .uri("/api/chat/stream")
+        .header("Content-Type", "application/json");
+    if let Some(secret) = secret {
+        builder = builder.header("X-Echo-Secret", secret);
+    }
+    let req = builder
+        .body(Body::from(serde_json::to_string(&body).unwrap()))
+        .unwrap();
+    app.clone().oneshot(req).await.unwrap()
+}
+
+const VOICE_CREDENTIAL: &str = "voice-credential";
+
+fn config_with_voice_credential() -> Config {
+    let mut config = test_config();
+    config.security.voice_secret = Some(VOICE_CREDENTIAL.to_string());
+    config
 }
 
 /// A buffered provider streams through the default adapter as one delta, and
@@ -1447,6 +1505,874 @@ async fn e2e_chat_stream_emits_delta_then_done() {
 
     // The daemon persisted the turn: user + assistant on the trunk.
     assert_eq!(trunk_len(&state).await, 2);
+}
+
+/// SSE frames in arrival order: `(event name, data JSON)`.
+fn sse_frames(body: &str) -> Vec<(String, String)> {
+    let mut frames = Vec::new();
+    let mut name = None;
+    let mut data = String::new();
+    for line in body.lines() {
+        if let Some(rest) = line.strip_prefix("event:") {
+            name = Some(rest.trim().to_string());
+        } else if let Some(rest) = line.strip_prefix("data:") {
+            if !data.is_empty() {
+                data.push('\n');
+            }
+            data.push_str(rest.trim());
+        } else if line.is_empty() {
+            if let Some(event) = name.take() {
+                frames.push((event, std::mem::take(&mut data)));
+            }
+        }
+    }
+    frames
+}
+
+/// AC1: text, a tool call, then the final message. The boundary sits before
+/// the tool status, and the last message is a segment with `tool: false`.
+#[tokio::test]
+async fn e2e_chat_stream_segments_around_tool_round() {
+    let dir = tempfile::tempdir().unwrap();
+    let provider = MockProvider::new(vec![
+        LlmResponse {
+            content: vec![
+                ContentBlock::Text {
+                    text: "I'll look.".to_string(),
+                },
+                ContentBlock::ToolUse {
+                    id: "tu_1".to_string(),
+                    name: "file_read".to_string(),
+                    input: serde_json::json!({ "path": "a.txt" }),
+                },
+            ],
+            stop_reason: StopReason::ToolUse,
+            model: "mock-model".to_string(),
+            input_tokens: Some(10),
+            output_tokens: Some(4),
+        },
+        LlmResponse {
+            content: vec![ContentBlock::Text {
+                text: "Found it.".to_string(),
+            }],
+            stop_reason: StopReason::EndTurn,
+            model: "mock-model".to_string(),
+            input_tokens: Some(12),
+            output_tokens: Some(3),
+        },
+    ]);
+    let state = build_state_in(dir.path().to_path_buf(), provider, ToolRegistry::new()).await;
+    let app = build_app(state);
+
+    let response = post_chat_stream(&app, "read a.txt").await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let frames = sse_frames(&String::from_utf8_lossy(&bytes));
+    let trace: Vec<String> = frames
+        .iter()
+        .map(|(name, data)| match name.as_str() {
+            "delta" => format!("delta:{data}"),
+            "segment" => format!("segment:{data}"),
+            "status" => {
+                let v: serde_json::Value = serde_json::from_str(data).unwrap();
+                if v["status"] == "tool" {
+                    format!("tool:{}", v["name"].as_str().unwrap_or(""))
+                } else {
+                    format!("status:{}", v["status"].as_str().unwrap_or(""))
+                }
+            }
+            "done" => "done".to_string(),
+            other => other.to_string(),
+        })
+        .collect();
+    assert_eq!(
+        trace,
+        vec![
+            "status:thinking".to_string(),
+            "status:responding".to_string(),
+            r#"delta:{"text":"I'll look."}"#.to_string(),
+            r#"segment:{"index":0,"tool":true}"#.to_string(),
+            "tool:file_read".to_string(),
+            "status:thinking".to_string(),
+            "status:responding".to_string(),
+            r#"delta:{"text":"Found it."}"#.to_string(),
+            r#"segment:{"index":1,"tool":false}"#.to_string(),
+            "done".to_string(),
+        ],
+        "{trace:?}"
+    );
+}
+
+/// AC2: `POST /chat` for the same kind of turn stays the JSON it is today.
+#[tokio::test]
+async fn e2e_chat_body_unchanged() {
+    let provider = MockProvider::new(vec![LlmResponse {
+        content: vec![ContentBlock::Text {
+            text: "Hello from mock!".to_string(),
+        }],
+        stop_reason: StopReason::EndTurn,
+        model: "mock-model".to_string(),
+        input_tokens: Some(10),
+        output_tokens: Some(5),
+    }]);
+    let state = build_state(provider, ToolRegistry::new()).await;
+    let app = build_app(state);
+
+    let (status, body) = post_chat(&app, "Hello").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        body,
+        r#"{"response":"Hello from mock!","model":"mock-model","input_tokens":10,"output_tokens":5}"#
+    );
+}
+
+/// An owner turn that streams text and is then refused: the fallback's
+/// delta is preceded by a reset, so a client can drop the refused draft.
+#[tokio::test]
+async fn e2e_chat_stream_reset_on_fallback() {
+    use crate::streaming::{StreamEvent, StreamingProvider};
+
+    struct DeltaThenRefuse;
+
+    impl LmProvider for DeltaThenRefuse {
+        fn invoke(
+            &self,
+            _system_prompt: &str,
+            _messages: &[Message],
+            _max_tokens: u32,
+            _tools: Option<&[serde_json::Value]>,
+        ) -> LlmResult<'_> {
+            Box::pin(async { Err("unused".into()) })
+        }
+        fn name(&self) -> &str {
+            "delta-then-refuse"
+        }
+    }
+
+    impl StreamingProvider for DeltaThenRefuse {
+        fn supports_streaming(&self) -> bool {
+            true
+        }
+        fn invoke_streaming(
+            &self,
+            _system_prompt: &str,
+            _messages: &[Message],
+            _max_tokens: u32,
+            _tools: Option<&[serde_json::Value]>,
+        ) -> crate::streaming::StreamResult<'_> {
+            Box::pin(async_stream::stream! {
+                yield StreamEvent::TextDelta("I cannot ".into());
+                yield StreamEvent::Refused {
+                    model: "m".into(),
+                    detail: "Usage Policy".into(),
+                };
+            })
+        }
+    }
+
+    let dir = tempfile::tempdir().unwrap();
+    let bin = dir.path().join("fake-cli");
+    crate::cli_provider::fake_cli::write_script(
+        &bin,
+        r#"printf '%s\n' '{"result":"the fallback answer"}'"#,
+    );
+    let mut config = test_config();
+    config.llm.provider = "cli".into();
+    // vendor-ok: the fallback builder only constructs a real CLI adapter
+    config.llm.adapter = Some("claude".into());
+    config.llm.cli_bin = Some(bin.display().to_string());
+    config.llm.fallback_model = Some("opus".into());
+    let state = build_state_boxed_with_config(
+        dir.path().to_path_buf(),
+        Box::new(DeltaThenRefuse),
+        ToolRegistry::new(),
+        config,
+    )
+    .await;
+    let app = build_app(state);
+
+    let response = post_chat_stream_on(&app, "tui", "hello").await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let frames = sse_frames(&String::from_utf8_lossy(&bytes));
+    let _refused = frame_index(&frames, |event, data| {
+        event == "delta" && data.contains("I cannot ")
+    });
+    let reset = frame_index(&frames, |event, data| {
+        event == "reset" && data.contains(r#""reason":"fallback""#)
+    });
+    let fallback = frame_index(&frames, |event, data| {
+        event == "delta" && data.contains("the fallback answer")
+    });
+    let done = frame_index(&frames, |event, data| {
+        event == "done" && data.contains("the fallback answer")
+    });
+    // Reset rides a side channel and is written before any delta still
+    // queued, so the refused draft is not ordered ahead of it. The
+    // replacement delta stays after the reset.
+    assert!(reset < fallback && fallback < done, "{frames:?}");
+    assert!(
+        frames.iter().all(|(event, _)| event != "error"),
+        "{frames:?}"
+    );
+}
+
+fn guard_cut_provider(raw: &str) -> MockProvider {
+    MockProvider::new(vec![LlmResponse {
+        content: vec![ContentBlock::Text { text: raw.into() }],
+        stop_reason: StopReason::EndTurn,
+        model: "mock".into(),
+        input_tokens: Some(4),
+        output_tokens: Some(8),
+    }])
+}
+
+const GUARD_RAW: &str = "Here is my response about the topic, which covers several important points.\n[User]: What about this other thing?";
+const GUARD_KEPT: &str =
+    "Here is my response about the topic, which covers several important points.";
+
+/// The guard cuts a reply that invented a later turn. A screen stream sends
+/// the raw delta first. A voice-pool stream never does: reset comes before
+/// the kept text.
+#[tokio::test]
+async fn e2e_chat_stream_reset_on_guard() {
+    let provider = guard_cut_provider(GUARD_RAW);
+    let state = build_state(provider, ToolRegistry::new()).await;
+    let app = build_app(state);
+    let response = post_chat_stream(&app, "hi").await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let frames = sse_frames(&String::from_utf8_lossy(&bytes));
+    let _delta = frame_index(&frames, |event, data| {
+        event == "delta" && data.contains("[User]:")
+    });
+    let reset = frame_index(&frames, |event, data| {
+        event == "reset" && data.contains(r#""reason":"guard""#)
+    });
+    let done = frame_index(&frames, |event, _data| event == "done");
+    // The raw tail is still sent on a screen stream. Reset is written
+    // before any delta the client has not yet received, so it is not
+    // ordered after that tail.
+    assert!(reset < done, "{frames:?}");
+    let done_data = &frames[done].1;
+    assert!(done_data.contains(r#""truncated":true"#), "{done_data}");
+    assert!(done_data.contains(GUARD_KEPT), "{done_data}");
+    assert!(!done_data.contains("[User]:"), "{done_data}");
+
+    let dir = tempfile::tempdir().unwrap();
+    let state = build_state_boxed_with_config(
+        dir.path().to_path_buf(),
+        Box::new(guard_cut_provider(GUARD_RAW)),
+        ToolRegistry::new(),
+        config_with_voice_credential(),
+    )
+    .await;
+    let app = build_app(state);
+    let response = post_chat_stream_secret(&app, "voice", "hi", Some(VOICE_CREDENTIAL)).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let frames = sse_frames(&String::from_utf8_lossy(&bytes));
+    assert!(
+        frames
+            .iter()
+            .all(|(event, data)| !(event == "delta" && data.contains("[User]:"))),
+        "voice delta carried the cut tail: {frames:?}"
+    );
+    let reset = frame_index(&frames, |event, data| {
+        event == "reset" && data.contains(r#""reason":"guard""#)
+    });
+    let kept = frame_index(&frames, |event, data| {
+        event == "delta" && data.contains(GUARD_KEPT)
+    });
+    let done = frame_index(&frames, |event, _data| event == "done");
+    assert!(reset < kept && kept < done, "{frames:?}");
+    assert!(
+        frames[..reset].iter().all(|(event, _)| event != "delta"),
+        "voice flush preceded reset: {frames:?}"
+    );
+    let done_data = &frames[done].1;
+    assert!(done_data.contains(r#""truncated":true"#), "{done_data}");
+    assert!(done_data.contains(GUARD_KEPT), "{done_data}");
+    assert!(!done_data.contains("[User]:"), "{done_data}");
+}
+
+/// A guard cut still delivers `reset` when the delta channel is already
+/// full. The body is not read until the turn has committed, so every slot
+/// is occupied; the first frame after that is `reset`, ahead of the deltas
+/// that were waiting.
+#[tokio::test]
+async fn e2e_chat_stream_reset_jumps_a_full_channel() {
+    use crate::streaming::{StreamEvent, StreamingProvider};
+    use tokio_stream::StreamExt as _;
+
+    /// More text chunks than the 256-slot progress channel.
+    const FLOOD: usize = 400;
+
+    struct FloodThenGuard;
+
+    impl LmProvider for FloodThenGuard {
+        fn invoke(
+            &self,
+            _system_prompt: &str,
+            _messages: &[Message],
+            _max_tokens: u32,
+            _tools: Option<&[serde_json::Value]>,
+        ) -> LlmResult<'_> {
+            Box::pin(async { Err("unused".into()) })
+        }
+        fn name(&self) -> &str {
+            "flood-then-guard"
+        }
+    }
+
+    impl StreamingProvider for FloodThenGuard {
+        fn supports_streaming(&self) -> bool {
+            true
+        }
+        fn invoke_streaming(
+            &self,
+            _system_prompt: &str,
+            _messages: &[Message],
+            _max_tokens: u32,
+            _tools: Option<&[serde_json::Value]>,
+        ) -> crate::streaming::StreamResult<'_> {
+            Box::pin(async_stream::stream! {
+                for _ in 0..FLOOD {
+                    yield StreamEvent::TextDelta("a".into());
+                }
+                yield StreamEvent::Done(LlmResponse {
+                    content: vec![ContentBlock::Text {
+                        text: GUARD_RAW.into(),
+                    }],
+                    stop_reason: StopReason::EndTurn,
+                    model: "mock".into(),
+                    input_tokens: Some(4),
+                    output_tokens: Some(8),
+                });
+            })
+        }
+    }
+
+    let dir = tempfile::tempdir().unwrap();
+    let state = build_state_boxed_with_config(
+        dir.path().to_path_buf(),
+        Box::new(FloodThenGuard),
+        ToolRegistry::new(),
+        test_config(),
+    )
+    .await;
+    let app = build_app(Arc::clone(&state));
+    let response = post_chat_stream(&app, "hi").await;
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let mut committed = false;
+    for _ in 0..100 {
+        if trunk_len(&state).await == 2 {
+            committed = true;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    assert!(committed, "guarded turn did not commit");
+
+    let mut body = response.into_body().into_data_stream();
+    let mut seen = String::new();
+    let frame = loop {
+        if let Some(end) = seen.find("\n\n") {
+            break seen[..end].to_string();
+        }
+        let chunk = tokio::time::timeout(std::time::Duration::from_secs(5), body.next())
+            .await
+            .expect("stream stalled before the first frame")
+            .expect("stream ended before the first frame")
+            .expect("body error");
+        seen.push_str(&String::from_utf8_lossy(&chunk));
+    };
+    assert!(
+        frame.contains("event: reset"),
+        "first frame was not reset:\n{frame}"
+    );
+    assert!(
+        frame.contains(r#""reason":"guard""#),
+        "reset was not the guard cut:\n{frame}"
+    );
+    assert!(
+        !frame.contains("event: delta"),
+        "a delta preceded reset:\n{frame}"
+    );
+}
+
+fn assert_flood_segment_then_later(frames: &[(String, String)]) {
+    let segment = frame_index(frames, |event, data| {
+        event == "segment" && data.contains(r#""tool":true"#)
+    });
+    let later = frame_index(frames, |event, data| {
+        event == "delta" && data.contains("LATER")
+    });
+    assert!(
+        segment < later,
+        "segment did not precede the later delta: {frames:?}"
+    );
+    let mut saw_flood = false;
+    for (index, (event, data)) in frames.iter().enumerate() {
+        if event == "delta" && data.contains(r#""text":"a""#) {
+            saw_flood = true;
+            assert!(
+                index < segment,
+                "a queued delta followed the segment it belongs before: {frames:?}"
+            );
+        }
+    }
+    assert!(saw_flood, "the queued flood never arrived: {frames:?}");
+}
+
+async fn read_sse_releasing(response: axum::response::Response, release: &Notify) -> String {
+    use tokio_stream::StreamExt as _;
+
+    let mut body = response.into_body().into_data_stream();
+    let mut seen = String::new();
+    let mut released = false;
+    loop {
+        if !released && seen.matches("\n\n").count() >= 2 {
+            release.notify_one();
+            released = true;
+        }
+        if released && seen.contains("event: done") && seen.ends_with("\n\n") {
+            return seen;
+        }
+        let chunk = tokio::time::timeout(std::time::Duration::from_secs(5), body.next())
+            .await
+            .expect("stream stalled before the later delta")
+            .expect("stream ended before the later delta")
+            .expect("body error");
+        seen.push_str(&String::from_utf8_lossy(&chunk));
+    }
+}
+
+/// A segment that does not fit on a full delta channel is written after the
+/// deltas already queued and before a delta the provider emits after it.
+/// The body stays unread until that segment is parked, then two frames are
+/// taken so one channel slot frees and the later delta can land.
+#[tokio::test]
+async fn e2e_chat_stream_segment_precedes_a_later_delta() {
+    use crate::streaming::{StreamEvent, StreamingProvider};
+
+    const FLOOD: usize = 400;
+
+    struct FloodThenSegment {
+        parked: Arc<Notify>,
+        release: Arc<Notify>,
+    }
+
+    impl LmProvider for FloodThenSegment {
+        fn invoke(
+            &self,
+            _system_prompt: &str,
+            _messages: &[Message],
+            _max_tokens: u32,
+            _tools: Option<&[serde_json::Value]>,
+        ) -> LlmResult<'_> {
+            Box::pin(async { Err("unused".into()) })
+        }
+        fn name(&self) -> &str {
+            "flood-then-segment"
+        }
+    }
+
+    impl StreamingProvider for FloodThenSegment {
+        fn supports_streaming(&self) -> bool {
+            true
+        }
+        fn invoke_streaming(
+            &self,
+            _system_prompt: &str,
+            _messages: &[Message],
+            _max_tokens: u32,
+            _tools: Option<&[serde_json::Value]>,
+        ) -> crate::streaming::StreamResult<'_> {
+            let parked = Arc::clone(&self.parked);
+            let release = Arc::clone(&self.release);
+            Box::pin(async_stream::stream! {
+                for _ in 0..FLOOD {
+                    yield StreamEvent::TextDelta("a".into());
+                }
+                yield StreamEvent::SegmentEnd { tool_use: true };
+                parked.notify_one();
+                release.notified().await;
+                yield StreamEvent::TextDelta("LATER".into());
+                yield StreamEvent::Done(LlmResponse {
+                    content: vec![ContentBlock::Text { text: "ok".into() }],
+                    stop_reason: StopReason::EndTurn,
+                    model: "mock".into(),
+                    input_tokens: Some(1),
+                    output_tokens: Some(1),
+                });
+            })
+        }
+    }
+
+    let parked = Arc::new(Notify::new());
+    let release = Arc::new(Notify::new());
+    let dir = tempfile::tempdir().unwrap();
+    let state = build_state_boxed_with_config(
+        dir.path().to_path_buf(),
+        Box::new(FloodThenSegment {
+            parked: Arc::clone(&parked),
+            release: Arc::clone(&release),
+        }),
+        ToolRegistry::new(),
+        test_config(),
+    )
+    .await;
+    let app = build_app(Arc::clone(&state));
+    let response = post_chat_stream(&app, "hi").await;
+    assert_eq!(response.status(), StatusCode::OK);
+    within_test_wait("segment parked on a full channel", parked.notified()).await;
+
+    let text = read_sse_releasing(response, &release).await;
+    assert_flood_segment_then_later(&sse_frames(&text));
+}
+
+/// The same order when the segment is flushed from a voice hold onto a full
+/// channel: every queued flood delta, then the segment, then the later delta.
+#[tokio::test]
+async fn e2e_chat_stream_flushed_segment_keeps_its_place() {
+    use std::sync::atomic::{AtomicU32, Ordering};
+
+    use crate::streaming::{StreamEvent, StreamingProvider};
+
+    const FLOOD: usize = 400;
+
+    struct FloodThenHold {
+        round: AtomicU32,
+        parked: Arc<Notify>,
+        release: Arc<Notify>,
+    }
+
+    impl LmProvider for FloodThenHold {
+        fn invoke(
+            &self,
+            _system_prompt: &str,
+            _messages: &[Message],
+            _max_tokens: u32,
+            _tools: Option<&[serde_json::Value]>,
+        ) -> LlmResult<'_> {
+            Box::pin(async { Err("unused".into()) })
+        }
+        fn name(&self) -> &str {
+            "flood-then-hold"
+        }
+        fn supports_tools(&self) -> bool {
+            true
+        }
+    }
+
+    impl StreamingProvider for FloodThenHold {
+        fn supports_streaming(&self) -> bool {
+            true
+        }
+        fn invoke_streaming(
+            &self,
+            _system_prompt: &str,
+            _messages: &[Message],
+            _max_tokens: u32,
+            _tools: Option<&[serde_json::Value]>,
+        ) -> crate::streaming::StreamResult<'_> {
+            let n = self.round.fetch_add(1, Ordering::SeqCst);
+            let parked = Arc::clone(&self.parked);
+            let release = Arc::clone(&self.release);
+            Box::pin(async_stream::stream! {
+                if n == 0 {
+                    for _ in 0..FLOOD {
+                        yield StreamEvent::TextDelta("a".into());
+                    }
+                    yield StreamEvent::SegmentEnd { tool_use: true };
+                    yield StreamEvent::ToolUse {
+                        id: "t1".into(),
+                        name: "file_read".into(),
+                        input: serde_json::json!({}),
+                    };
+                    yield StreamEvent::Done(LlmResponse {
+                        content: vec![
+                            ContentBlock::Text { text: "a".into() },
+                            ContentBlock::ToolUse {
+                                id: "t1".into(),
+                                name: "file_read".into(),
+                                input: serde_json::json!({}),
+                            },
+                        ],
+                        stop_reason: StopReason::ToolUse,
+                        model: "mock".into(),
+                        input_tokens: Some(1),
+                        output_tokens: Some(1),
+                    });
+                } else {
+                    // The first round has already flushed its hold.
+                    parked.notify_one();
+                    release.notified().await;
+                    yield StreamEvent::TextDelta("LATER".into());
+                    yield StreamEvent::Done(LlmResponse {
+                        content: vec![ContentBlock::Text { text: "ok".into() }],
+                        stop_reason: StopReason::EndTurn,
+                        model: "mock".into(),
+                        input_tokens: Some(1),
+                        output_tokens: Some(1),
+                    });
+                }
+            })
+        }
+    }
+
+    let parked = Arc::new(Notify::new());
+    let release = Arc::new(Notify::new());
+    let dir = tempfile::tempdir().unwrap();
+    let state = build_state_boxed_with_config(
+        dir.path().to_path_buf(),
+        Box::new(FloodThenHold {
+            round: AtomicU32::new(0),
+            parked: Arc::clone(&parked),
+            release: Arc::clone(&release),
+        }),
+        ToolRegistry::new(),
+        config_with_voice_credential(),
+    )
+    .await;
+    let app = build_app(Arc::clone(&state));
+    let response = post_chat_stream_secret(&app, "voice", "hi", Some(VOICE_CREDENTIAL)).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    within_test_wait(
+        "held segment flushed onto a full channel",
+        parked.notified(),
+    )
+    .await;
+
+    let text = read_sse_releasing(response, &release).await;
+    assert_flood_segment_then_later(&sse_frames(&text));
+}
+
+/// Four open screen streams fill the chat pool. A voice identity still
+/// opens on its own pool. An owner request whose body says `voice`, and a
+/// fifth screen stream, are both refused on the chat pool.
+#[tokio::test]
+async fn e2e_voice_stream_has_own_pool() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = build_state_boxed_with_config(
+        dir.path().to_path_buf(),
+        Box::new(HangingProvider),
+        ToolRegistry::new(),
+        config_with_voice_credential(),
+    )
+    .await;
+    let app = build_app(Arc::clone(&state));
+    let off_channel = within_test_wait(
+        "voice credential off channel",
+        post_chat_stream_secret(&app, "tui", "hi", Some(VOICE_CREDENTIAL)),
+    )
+    .await;
+    assert_eq!(off_channel.status(), StatusCode::FORBIDDEN);
+    assert_eq!(
+        state.voice_permits.available_permits(),
+        crate::server::MAX_VOICE_STREAMS
+    );
+    let mut held = Vec::new();
+    for n in 0..4 {
+        let response = within_test_wait(
+            &format!("tui stream {n}"),
+            post_chat_stream_on(&app, "tui", "hi"),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK, "tui stream {n}");
+        held.push(response);
+    }
+    let owner_voice =
+        within_test_wait("owner body voice", post_chat_stream_on(&app, "Voice", "hi")).await;
+    assert_eq!(owner_voice.status(), StatusCode::SERVICE_UNAVAILABLE);
+    let voice = within_test_wait(
+        "voice identity",
+        post_chat_stream_secret(&app, "Voice", "hi", Some(VOICE_CREDENTIAL)),
+    )
+    .await;
+    assert_eq!(voice.status(), StatusCode::OK);
+    let fifth = within_test_wait("fifth tui stream", post_chat_stream_on(&app, "tui", "hi")).await;
+    assert_eq!(fifth.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(
+        state.voice_permits.available_permits(),
+        crate::server::MAX_VOICE_STREAMS - 1
+    );
+    drop(held);
+    drop(voice);
+    drop(owner_voice);
+}
+
+/// Four owner streams whose body says `voice` fill the chat pool and leave
+/// the voice pool free for a voice identity.
+#[tokio::test]
+async fn e2e_owner_voice_channel_does_not_exhaust_voice_pool() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = build_state_boxed_with_config(
+        dir.path().to_path_buf(),
+        Box::new(HangingProvider),
+        ToolRegistry::new(),
+        config_with_voice_credential(),
+    )
+    .await;
+    let app = build_app(Arc::clone(&state));
+    let mut held = Vec::new();
+    for n in 0..4 {
+        let response = within_test_wait(
+            &format!("owner voice body {n}"),
+            post_chat_stream_on(&app, "voice", "hi"),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK, "owner voice body {n}");
+        held.push(response);
+    }
+    assert_eq!(state.chat_permits.available_permits(), 0);
+    assert_eq!(
+        state.voice_permits.available_permits(),
+        crate::server::MAX_VOICE_STREAMS
+    );
+    let fifth = within_test_wait(
+        "fifth owner voice body",
+        post_chat_stream_on(&app, "voice", "hi"),
+    )
+    .await;
+    assert_eq!(fifth.status(), StatusCode::SERVICE_UNAVAILABLE);
+    let voice = within_test_wait(
+        "voice identity after owner bodies",
+        post_chat_stream_secret(&app, "voice", "hi", Some(VOICE_CREDENTIAL)),
+    )
+    .await;
+    assert_eq!(voice.status(), StatusCode::OK);
+    assert_eq!(
+        state.voice_permits.available_permits(),
+        crate::server::MAX_VOICE_STREAMS - 1
+    );
+    drop(held);
+    drop(fifth);
+    drop(voice);
+}
+
+/// A demoted `channel: voice` body hangs on the owner's ordinary session.
+/// A voice-credential turn for the same sender, and for no sender, still
+/// produces a frame: it does not share that lock.
+async fn demoted_voice_body_does_not_block_a_call(sender: Option<&str>) {
+    use tokio_stream::StreamExt as _;
+
+    let dir = tempfile::tempdir().unwrap();
+    let state = build_state_boxed_with_config(
+        dir.path().to_path_buf(),
+        Box::new(HangingProvider),
+        ToolRegistry::new(),
+        config_with_voice_credential(),
+    )
+    .await;
+    let app = build_app(Arc::clone(&state));
+    let demoted = within_test_wait(
+        "demoted voice body",
+        post_chat_stream_from(&app, "voice", sender, None),
+    )
+    .await;
+    assert_eq!(demoted.status(), StatusCode::OK);
+    let mut demoted_body = demoted.into_body().into_data_stream();
+    let mut seen = String::new();
+    while !seen.contains("event: status") {
+        let chunk = tokio::time::timeout(std::time::Duration::from_secs(5), demoted_body.next())
+            .await
+            .expect("demoted stream stalled")
+            .expect("demoted stream ended")
+            .expect("demoted body error");
+        seen.push_str(&String::from_utf8_lossy(&chunk));
+    }
+    assert!(
+        state
+            .session_store
+            .get_existing_by_key("owner")
+            .await
+            .is_some(),
+        "demoted voice body did not use the owner session"
+    );
+
+    let voice = within_test_wait(
+        "voice credential while demoted turn holds its session",
+        post_chat_stream_from(&app, "voice", sender, Some(VOICE_CREDENTIAL)),
+    )
+    .await;
+    assert_eq!(voice.status(), StatusCode::OK);
+    let mut voice_body = voice.into_body().into_data_stream();
+    let mut voice_seen = String::new();
+    while !voice_seen.contains("event: status") {
+        let chunk = tokio::time::timeout(std::time::Duration::from_secs(5), voice_body.next())
+            .await
+            .expect("voice stream stalled behind the demoted turn")
+            .expect("voice stream ended")
+            .expect("voice body error");
+        voice_seen.push_str(&String::from_utf8_lossy(&chunk));
+    }
+    drop(demoted_body);
+    drop(voice_body);
+}
+
+#[tokio::test]
+async fn e2e_demoted_voice_body_does_not_block_a_call() {
+    demoted_voice_body_does_not_block_a_call(None).await;
+    demoted_voice_body_does_not_block_a_call(Some("sam")).await;
+}
+
+async fn get_with_secret(app: &Router, path: &str, secret: Option<&str>) -> StatusCode {
+    let mut builder = Request::builder().method("GET").uri(path);
+    if let Some(secret) = secret {
+        builder = builder.header("X-Echo-Secret", secret);
+    }
+    let req = builder.body(Body::empty()).unwrap();
+    app.clone().oneshot(req).await.unwrap().status()
+}
+
+/// A voice credential is not the owner: status, the dashboard, and session
+/// health are 403. `GET /health` stays open with or without that header.
+#[tokio::test]
+async fn e2e_voice_credential_cannot_read_status() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = build_state_boxed_with_config(
+        dir.path().to_path_buf(),
+        Box::new(MockProvider::new(vec![])),
+        ToolRegistry::new(),
+        config_with_voice_credential(),
+    )
+    .await;
+    let app = build_app(state);
+    for path in ["/api/status", "/api/dashboard", "/api/session-health"] {
+        assert_eq!(
+            get_with_secret(&app, path, Some(VOICE_CREDENTIAL)).await,
+            StatusCode::FORBIDDEN,
+            "{path}"
+        );
+        assert_eq!(
+            get_with_secret(&app, path, None).await,
+            StatusCode::OK,
+            "{path}"
+        );
+    }
+    assert_eq!(
+        get_with_secret(&app, "/health", Some(VOICE_CREDENTIAL)).await,
+        StatusCode::OK
+    );
+    assert_eq!(get_with_secret(&app, "/health", None).await, StatusCode::OK);
+}
+
+fn frame_index(frames: &[(String, String)], pred: impl Fn(&str, &str) -> bool) -> usize {
+    frames
+        .iter()
+        .position(|(event, data)| pred(event, data))
+        .unwrap_or_else(|| panic!("missing frame in {frames:?}"))
 }
 
 /// Dropping the SSE response mid-turn aborts the turn and rolls the user
@@ -2854,7 +3780,7 @@ mod plugin_turns_e2e {
             channel: "voice".to_string(),
             sender: Some("1001".to_string()),
         };
-        let outcome = handlers::chat::run_turn(Arc::clone(&state), req, who, None).await;
+        let outcome = handlers::chat::run_turn(Arc::clone(&state), req, who, None, None).await;
         assert_eq!(outcome.err().map(|(s, _)| s), Some(StatusCode::FORBIDDEN));
         assert!(!has_session(&state, "owner").await);
     }
@@ -3407,6 +4333,7 @@ mod tool_surface_e2e {
             Arc::clone(&state),
             peer,
             AuthIdentity::Peer("Synth".to_string()),
+            None,
             None,
         )
         .await
@@ -4699,6 +5626,7 @@ mod in_process_tools_e2e {
             Arc::clone(&state),
             peer,
             crate::server::auth::AuthIdentity::Peer("Synth".to_string()),
+            None,
             None,
         )
         .await

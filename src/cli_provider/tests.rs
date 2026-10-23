@@ -330,6 +330,109 @@ mod timeout_tests {
 
 // --- streaming precedence and non-default deliveries, end to end ---
 
+/// Feeding a recorded tool-call stream through the runner yields a boundary
+/// after the narration and a closing boundary with no tool call. The reply
+/// text stays the adapter's existing choice: assembled deltas, or the
+/// terminal record when the adapter prefers it.
+#[tokio::test]
+async fn runner_yields_segment_end() {
+    let claude_fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/claude-code/stream-json-tool-call.ndjson");
+    let claude = MockCli::new(&format!("cat '{}'", claude_fixture.display()));
+    let provider = claude.provider_for(Box::new(Claude), "m");
+    let claude_events = collect_stream(&provider).await;
+    assert_eq!(
+        segment_ends(&claude_events),
+        vec![true, false],
+        "{claude_events:?}"
+    );
+    assert_eq!(
+        text_deltas(&claude_events),
+        vec!["I'll list the files. ", "three"],
+        "deltas that already arrived are not spoken again: {claude_events:?}"
+    );
+    let done = done_text(&claude_events);
+    assert_eq!(done, "I'll list the files. three");
+
+    let grok_fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/grok-build/probe-streaming-messages.ndjson");
+    let grok = MockCli::new(&format!("cat '{}'", grok_fixture.display()));
+    let provider = grok.provider_for(Box::new(Grok), "grok-x");
+    let grok_events = collect_stream(&provider).await;
+    assert_eq!(
+        segment_ends(&grok_events),
+        vec![true, false],
+        "{grok_events:?}"
+    );
+    assert_eq!(
+        text_deltas(&grok_events),
+        vec!["three"],
+        "a finished message with no token deltas is spoken before its segment: {grok_events:?}"
+    );
+    let spoken = grok_events
+        .iter()
+        .position(|event| matches!(event, StreamEvent::TextDelta(_)))
+        .expect("missing spoken text");
+    let closed = grok_events
+        .iter()
+        .rposition(|event| matches!(event, StreamEvent::SegmentEnd { tool_use: false }))
+        .expect("missing closing segment");
+    assert!(spoken < closed, "{grok_events:?}");
+    assert_eq!(done_text(&grok_events), "three");
+}
+
+/// One assistant message split into a text record and a tool record that
+/// share an id is a single `tool: true` boundary, not a `tool: false`
+/// boundary followed by another.
+#[tokio::test]
+async fn per_block_records_sharing_an_id_emit_one_tool_segment() {
+    let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/cli/per-block-assistant.ndjson");
+    let mock = MockCli::new(&format!("cat '{}'", fixture.display()));
+    let provider = mock.provider_for(Box::new(Claude), "m");
+    let events = collect_stream(&provider).await;
+    assert_eq!(segment_ends(&events), vec![true], "{events:?}");
+}
+
+async fn collect_stream(provider: &CliProvider) -> Vec<StreamEvent> {
+    let mut stream = provider.invoke_streaming("sys", &[user("hi")], 10, None);
+    let mut events = Vec::new();
+    while let Some(event) = stream.next().await {
+        events.push(event);
+    }
+    events
+}
+
+fn text_deltas(events: &[StreamEvent]) -> Vec<&str> {
+    events
+        .iter()
+        .filter_map(|event| match event {
+            StreamEvent::TextDelta(text) => Some(text.as_str()),
+            _ => None,
+        })
+        .collect()
+}
+
+fn segment_ends(events: &[StreamEvent]) -> Vec<bool> {
+    events
+        .iter()
+        .filter_map(|event| match event {
+            StreamEvent::SegmentEnd { tool_use } => Some(*tool_use),
+            _ => None,
+        })
+        .collect()
+}
+
+fn done_text(events: &[StreamEvent]) -> String {
+    let Some(StreamEvent::Done(reply)) = events.last() else {
+        panic!("stream did not end in Done: {events:?}");
+    };
+    match &reply.content[0] {
+        pulse_system_types::llm::ContentBlock::Text { text } => text.clone(),
+        other => panic!("unexpected content {other:?}"),
+    }
+}
+
 /// A CLI whose stream carries narration deltas and two result records; the
 /// grok adapter must answer with the last record, never the deltas.
 #[tokio::test]

@@ -77,7 +77,13 @@ pub type ChatEvent = crate::wire::ChatStreamEvent;
 /// payloads that do not fit are `None`; the caller ignores them.
 #[must_use]
 pub fn chat_event_from_sse(ev: &SseEvent) -> Option<ChatEvent> {
-    ChatEvent::from_sse_parts(ev.event.as_deref()?, &ev.data)
+    // `segment` and `reset` are a speech-client contract. A screen replaces
+    // whatever streamed with `done.text`, so these events are not rendered
+    // and are not decoded.
+    match ev.event.as_deref()? {
+        "segment" | "reset" => None,
+        name => ChatEvent::from_sse_parts(name, &ev.data),
+    }
 }
 
 /// One message of `/api/session/{channel}`.
@@ -552,6 +558,32 @@ mod tests {
             chat_event_from_sse(&ev("status", r#"{"status":"dreaming"}"#)),
             None
         );
+    }
+
+    #[test]
+    fn unknown_stream_events_ignored() {
+        let ev = |name: &str, data: &str| SseEvent {
+            id: None,
+            event: Some(name.into()),
+            data: data.into(),
+        };
+        assert_eq!(
+            chat_event_from_sse(&ev("segment", r#"{"index":0,"tool":true}"#)),
+            None
+        );
+        assert_eq!(
+            chat_event_from_sse(&ev("segment", r#"{"index":1,"tool":false}"#)),
+            None
+        );
+        assert_eq!(
+            chat_event_from_sse(&ev("reset", r#"{"reason":"fallback"}"#)),
+            None
+        );
+        assert_eq!(
+            chat_event_from_sse(&ev("reset", r#"{"reason":"guard"}"#)),
+            None
+        );
+        assert_eq!(chat_event_from_sse(&ev("nope", "{}")), None);
     }
 
     #[test]

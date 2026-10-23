@@ -23,6 +23,11 @@ pub enum StreamEvent {
         input: serde_json::Value,
     },
 
+    /// The provider closed an assistant message. `tool_use` is true when a
+    /// tool call follows. Providers that do not report message boundaries
+    /// never emit this; the tool loop synthesizes one per round instead.
+    SegmentEnd { tool_use: bool },
+
     /// The response is complete. Contains the final assembled response.
     Done(LlmResponse),
 

@@ -67,6 +67,7 @@ max_tokens = 4096
 
 [security]
 # secret = "generate-a-strong-secret-here"
+# voice_secret = "a-different-secret-for-the-voice-stream-pool"
 injection_detection = true
 
 [trust]

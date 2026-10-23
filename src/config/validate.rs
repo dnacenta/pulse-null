@@ -24,6 +24,17 @@ pub fn validate(config: &Config) -> Result<(), ConfigError> {
     validate_pipeline(&config.pipeline)?;
     validate_monitoring(&config.monitoring)?;
     validate_liveness(&config.scheduler.liveness)?;
+    if config
+        .security
+        .voice_secret
+        .as_deref()
+        .is_some_and(|secret| !secret.trim().is_empty())
+        && config.security.voice_credential().is_none()
+    {
+        return Err(ConfigError::Validation(
+            "[security] voice_secret must differ from secret".into(),
+        ));
+    }
     validate_probe(&config.probe)
 }
 
@@ -290,6 +301,19 @@ mod tests {
     #[test]
     fn defaults_validate() {
         assert!(validate_liveness(&LivenessConfig::default()).is_ok());
+    }
+
+    #[test]
+    fn voice_secret_must_differ_from_the_owner_secret() {
+        let mut config = super::super::test_support::minimal_config();
+        config.security.secret = Some("same-value".into());
+        config.security.voice_secret = Some("same-value".into());
+        let message = super::validate(&config).unwrap_err().to_string();
+        assert!(message.contains("voice_secret"), "{message}");
+        assert!(!message.contains("same-value"), "{message}");
+
+        config.security.voice_secret = Some("other-value".into());
+        assert!(super::validate(&config).is_ok());
     }
 
     #[test]

@@ -2136,6 +2136,7 @@ mod tests {
             },
             security: SecurityConfig {
                 secret: None,
+                voice_secret: None,
                 injection_detection: true,
             },
             trust: TrustConfig::default(),

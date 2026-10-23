@@ -94,6 +94,7 @@ async fn assemble_pulse_state(
     let context_buffer = pulse_context_buffer(&config, &root_dir, &persist_coordinator).await;
     let alert_queue = crate::scheduler::alerts::AlertQueue::load(&root_dir);
 
+    let pools = crate::server::stream_pools();
     let state = Arc::new(AppState {
         config: config.clone(),
         provider,
@@ -112,9 +113,10 @@ async fn assemble_pulse_state(
         alert_queue: tokio::sync::Mutex::new(alert_queue),
         provider_status: crate::provider_status::new_shared(),
         leadership: std::sync::atomic::AtomicBool::new(false),
-        event_permits: crate::server::stream_pools().0,
+        event_permits: pools.event,
         comms_permits: crate::server::comms_pool(),
-        chat_permits: crate::server::stream_pools().1,
+        chat_permits: pools.chat,
+        voice_permits: pools.voice,
         comms: crate::comms::Slot::new(),
         ledger: Arc::new(crate::ledger::LedgerRing::new(
             crate::ledger::DEFAULT_RING_CAPACITY,

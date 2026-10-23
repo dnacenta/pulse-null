@@ -66,6 +66,10 @@ pub struct AppState {
     /// Cap on in-flight `/api/chat/stream` turns. Separate from the event
     /// pool so idle watchers can never refuse a message.
     pub chat_permits: Arc<tokio::sync::Semaphore>,
+    /// Cap on in-flight voice-identity `/api/chat/stream` turns. Separate
+    /// from the chat pool so a full screen client cannot refuse a call.
+    /// Taken only for a voice identity, never because the body says `voice`.
+    pub voice_permits: Arc<tokio::sync::Semaphore>,
     /// The one peer-to-peer dialogue this daemon runs at a time (PN-123).
     pub comms: crate::comms::Slot,
     /// Cap on open `/api/comms/{id}/stream` watchers — its own pool, so a
@@ -83,6 +87,9 @@ pub struct AppState {
 pub const MAX_EVENT_STREAMS: usize = 4;
 /// Concurrent `/api/chat/stream` turns before a 503.
 pub const MAX_CHAT_STREAMS: usize = 4;
+/// Concurrent voice-channel streams before a 503. Same size as one plugin's
+/// turn pool: a call and a screen client do not share a budget.
+pub const MAX_VOICE_STREAMS: usize = turns::PLUGIN_POOL_SIZE;
 
 /// Concurrent `/api/comms/{id}/stream` watchers before a 503.
 pub const MAX_COMMS_STREAMS: usize = 2;
@@ -93,13 +100,21 @@ pub fn comms_pool() -> Arc<tokio::sync::Semaphore> {
     Arc::new(tokio::sync::Semaphore::new(MAX_COMMS_STREAMS))
 }
 
-/// The two stream pools, sized by the constants above.
+/// The event, chat, and voice stream pools, sized by the constants above.
+pub struct StreamPools {
+    pub event: Arc<tokio::sync::Semaphore>,
+    pub chat: Arc<tokio::sync::Semaphore>,
+    pub voice: Arc<tokio::sync::Semaphore>,
+}
+
+/// The event, chat, and voice stream pools, sized by the constants above.
 #[must_use]
-pub fn stream_pools() -> (Arc<tokio::sync::Semaphore>, Arc<tokio::sync::Semaphore>) {
-    (
-        Arc::new(tokio::sync::Semaphore::new(MAX_EVENT_STREAMS)),
-        Arc::new(tokio::sync::Semaphore::new(MAX_CHAT_STREAMS)),
-    )
+pub fn stream_pools() -> StreamPools {
+    StreamPools {
+        event: Arc::new(tokio::sync::Semaphore::new(MAX_EVENT_STREAMS)),
+        chat: Arc::new(tokio::sync::Semaphore::new(MAX_CHAT_STREAMS)),
+        voice: Arc::new(tokio::sync::Semaphore::new(MAX_VOICE_STREAMS)),
+    }
 }
 
 /// Rebuild AWARENESS.md from the current plugin and tool state.
