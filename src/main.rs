@@ -60,8 +60,34 @@ struct Cli {
     command: Commands,
 }
 
+/// Every subcommand. The grouped variants are flattened, so the command line
+/// (names, order, help) is the flat list it always was; the groups only keep
+/// each dispatcher small.
 #[derive(Subcommand)]
 enum Commands {
+    #[command(flatten)]
+    Lifecycle(LifecycleCommand),
+    #[command(flatten)]
+    Work(WorkCommand),
+    #[command(flatten)]
+    Cognition(CognitionCommand),
+    /// Verify and repair the entity's agent-CLI integration (instruction file, hooks, config)
+    Repair,
+    /// Isolation mode — the minimal-core diagnostic retreat
+    Isolate {
+        #[command(subcommand)]
+        action: IsolateAction,
+    },
+    /// Growth-record probes, run in sandboxed scratch copies of the pulse
+    Probe {
+        #[command(subcommand)]
+        action: ProbeAction,
+    },
+}
+
+/// Creating, starting, talking to and stopping a pulse.
+#[derive(Subcommand)]
+enum LifecycleCommand {
     /// Initialize a new pulse
     Init {
         /// Directory to create the pulse in (defaults to current directory)
@@ -80,6 +106,11 @@ enum Commands {
     Down,
     /// Show pulse status
     Status,
+}
+
+/// The pulse's work: its schedule, document pipeline, plugins, intents and outreach.
+#[derive(Subcommand)]
+enum WorkCommand {
     /// Manage scheduled tasks
     Schedule {
         #[command(subcommand)]
@@ -110,6 +141,12 @@ enum Commands {
         #[command(subcommand)]
         action: OutreachAction,
     },
+}
+
+/// The cognitive subsystems: memory (recall), pipeline enforcement (praxis)
+/// and metacognitive monitoring (vigil).
+#[derive(Subcommand)]
+enum CognitionCommand {
     /// Memory dashboard and tools
     Recall {
         #[command(subcommand)]
@@ -125,12 +162,81 @@ enum Commands {
         #[command(subcommand)]
         action: VigilAction,
     },
-    /// Verify and repair the entity's agent-CLI integration (instruction file, hooks, config)
-    Repair,
-    /// Isolation mode — the minimal-core diagnostic retreat
-    Isolate {
+}
+
+#[derive(Subcommand)]
+enum ProbeFactsAction {
+    /// Draw the next fact to mention to the pulse (the runtime picks the pair and side)
+    Draw,
+    /// Record the value you mentioned; it must appear in your conversation since the draw
+    Plant {
+        /// The fact id `draw` printed
+        fact: String,
+        /// The value you said, as you said it
+        value: String,
+    },
+    /// List drawn facts and their asks
+    List,
+}
+
+#[derive(Subcommand)]
+enum ProbeSetsAction {
+    /// Install the reviewed, sealed item sets into the held-out record
+    /// (every file must match the digest this binary was built with)
+    Install {
+        /// The directory holding the reviewed set files
+        #[arg(long)]
+        from: std::path::PathBuf,
+        /// The pulse the sets are for (its directory name: echo, synth)
+        #[arg(long)]
+        pulse: String,
+        /// The install root (default /etc/pulse-null-probe/sets)
+        #[arg(long)]
+        dest: Option<std::path::PathBuf>,
+    },
+}
+
+#[derive(Subcommand)]
+enum ProbeAction {
+    /// Run the probe sets in sandboxed scratch copies and record the results
+    Run {
+        /// Run only if a scheduled run is due (the systemd timer's mode)
+        #[arg(long)]
+        if_due: bool,
+        /// Run only these sets (by name or prefix)
+        #[arg(long, num_args = 1..)]
+        only: Vec<String>,
+        /// Leave the scratch directory on disk for inspection
+        #[arg(long)]
+        keep_scratch: bool,
+    },
+    /// Turns and tokens spent against the budget, cost per run, results by lineage
+    Status,
+    /// Paired facts: draw one, record its plant, list them
+    Facts {
         #[command(subcommand)]
-        action: IsolateAction,
+        action: ProbeFactsAction,
+    },
+    /// The sealed item sets: install the reviewed copies
+    Sets {
+        #[command(subcommand)]
+        action: ProbeSetsAction,
+    },
+    /// Export the live graph for the next probe run (the export unit's step)
+    ExportGraph {
+        /// Export only when a scheduled run would go ahead. A refusal exits 0
+        /// and does not contact the live server (the export unit's mode).
+        #[arg(long)]
+        if_due: bool,
+    },
+    /// Show that a probe item writes nowhere live (sandbox self-test; --turn adds two real turns)
+    VerifyIsolation {
+        /// Also run a canned turn in the scratch copy and a fresh-arm date check (two turns)
+        #[arg(long)]
+        turn: bool,
+        /// Leave the scratch directory on disk for inspection
+        #[arg(long)]
+        keep_scratch: bool,
     },
 }
 
@@ -361,213 +467,469 @@ fn open_tui_log() -> Result<std::fs::File, String> {
         .map_err(|e| format!("{}: {e}", path.display()))
 }
 
+/// What a command returns: the error is printed after `Error: `.
+type CommandResult = Result<(), Box<dyn std::error::Error>>;
+
+/// A routed command that has not started: building one runs nothing, so the
+/// routing can be checked without touching a pulse.
+type CommandFuture = std::pin::Pin<Box<dyn std::future::Future<Output = CommandResult>>>;
+
 #[tokio::main]
 async fn main() {
     let cli = Cli::parse();
+    init_tracing(&cli.command);
+    if let Err(message) = run_command(cli.command, cli::root_guard::refuse_root).await {
+        eprintln!("{message}");
+        std::process::exit(1);
+    }
+}
 
+/// Logging: the TUI commands write to the TUI log (stdout is the screen),
+/// everything else to stdout.
+fn init_tracing(command: &Commands) {
     let filter = tracing_subscriber::EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| "pulse_null=info".into());
-    let tui_mode = matches!(
-        cli.command,
-        Commands::Up { headless: false } | Commands::Chat
-    );
-    if tui_mode {
-        match open_tui_log() {
-            Ok(file) => tracing_subscriber::fmt()
-                .with_env_filter(filter)
-                .with_ansi(false)
-                .with_writer(std::sync::Arc::new(file))
-                .init(),
-            Err(e) => {
-                eprintln!("pulse-null: cannot open the TUI log ({e}); logging is off for this run");
-                tracing_subscriber::fmt()
-                    .with_env_filter(filter)
-                    .with_writer(std::io::sink)
-                    .init();
-            }
-        }
+    if writes_tui_log(command) {
+        tracing_subscriber::fmt()
+            .with_env_filter(filter)
+            .with_ansi(false)
+            .with_writer(tui_log_writer(open_tui_log()))
+            .init();
     } else {
         tracing_subscriber::fmt().with_env_filter(filter).init();
     }
+}
 
-    match cli.command {
-        Commands::Init { dir } => {
-            if let Err(e) = cli::root_guard::refuse_root("init") {
-                eprintln!("Error: {e}");
-                std::process::exit(1);
-            }
-            if let Err(e) = cli::init::run(dir).await {
-                eprintln!("Error: {e}");
-                std::process::exit(1);
-            }
+/// Whether `command` runs the TUI, which owns stdout while it runs.
+fn writes_tui_log(command: &Commands) -> bool {
+    matches!(
+        command,
+        Commands::Lifecycle(LifecycleCommand::Up { headless: false } | LifecycleCommand::Chat)
+    )
+}
+
+/// Where TUI logs go: the opened log file, or nowhere (with a warning) when
+/// it could not be opened — never the screen.
+fn tui_log_writer(
+    log: Result<std::fs::File, String>,
+) -> tracing_subscriber::fmt::writer::BoxMakeWriter {
+    use tracing_subscriber::fmt::writer::BoxMakeWriter;
+    match log {
+        Ok(file) => BoxMakeWriter::new(std::sync::Arc::new(file)),
+        Err(e) => {
+            eprintln!("pulse-null: cannot open the TUI log ({e}); logging is off for this run");
+            BoxMakeWriter::new(std::io::sink)
         }
-        Commands::Up { headless } => {
-            if let Err(e) = cli::root_guard::refuse_root("up") {
-                eprintln!("Error: {e}");
-                std::process::exit(1);
-            }
-            if let Err(e) = cli::up::run(headless).await {
-                eprintln!("Error: {e}");
-                std::process::exit(1);
-            }
+    }
+}
+
+/// Run `command` once its root check passes. The error is the whole message
+/// to print before exiting 1.
+async fn run_command(
+    command: Commands,
+    refuse_root: impl FnOnce(&str) -> Result<(), String>,
+) -> Result<(), String> {
+    if let Some(refusal) = root_check(&command).and_then(|check| check.refusal(refuse_root)) {
+        return Err(refusal);
+    }
+    dispatch(command).await.map_err(|e| format!("Error: {e}"))
+}
+
+/// A command's refusal to run as root, checked before it does any work.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct RootCheck {
+    /// The name the refusal message gives the command.
+    command: &'static str,
+    /// What the refusal is printed after: `Error: `, or nothing for the
+    /// commands whose message stands alone.
+    prefix: &'static str,
+}
+
+impl RootCheck {
+    const fn prefixed(command: &'static str) -> Self {
+        Self {
+            command,
+            prefix: "Error: ",
         }
-        Commands::Chat => {
-            if let Err(e) = cli::root_guard::refuse_root("chat") {
-                eprintln!("{e}");
-                std::process::exit(1);
-            }
-            if let Err(e) = cli::chat::run().await {
-                eprintln!("Error: {e}");
-                std::process::exit(1);
-            }
+    }
+
+    const fn bare(command: &'static str) -> Self {
+        Self {
+            command,
+            prefix: "",
         }
-        Commands::Down => {
-            if let Err(e) = cli::down::run().await {
-                eprintln!("Error: {e}");
-                std::process::exit(1);
-            }
+    }
+
+    /// The message to exit with when `refuse_root` refuses this command.
+    fn refusal(self, refuse_root: impl FnOnce(&str) -> Result<(), String>) -> Option<String> {
+        refuse_root(self.command)
+            .err()
+            .map(|e| format!("{}{e}", self.prefix))
+    }
+}
+
+/// The root check `command` makes, if it makes one.
+fn root_check(command: &Commands) -> Option<RootCheck> {
+    match command {
+        Commands::Lifecycle(LifecycleCommand::Init { .. }) => Some(RootCheck::prefixed("init")),
+        Commands::Lifecycle(LifecycleCommand::Up { .. }) => Some(RootCheck::prefixed("up")),
+        Commands::Lifecycle(LifecycleCommand::Chat) => Some(RootCheck::bare("chat")),
+        Commands::Repair => Some(RootCheck::prefixed("repair")),
+        // Every probe command runs as the pulse's user, except the
+        // sealed-set install, which writes a root-only directory.
+        Commands::Probe {
+            action: ProbeAction::Sets { .. },
+        } => None,
+        Commands::Probe { .. } => Some(RootCheck::bare("probe")),
+        _ => None,
+    }
+}
+
+fn dispatch(command: Commands) -> CommandFuture {
+    match command {
+        Commands::Lifecycle(command) => lifecycle_command(command),
+        Commands::Work(command) => work_command(command),
+        Commands::Cognition(command) => cognition_command(command),
+        Commands::Repair => Box::pin(cli::repair::run()),
+        Commands::Isolate { action } => isolate_command(action),
+        Commands::Probe { action } => probe_command(action),
+    }
+}
+
+fn lifecycle_command(command: LifecycleCommand) -> CommandFuture {
+    match command {
+        LifecycleCommand::Init { dir } => Box::pin(cli::init::run(dir)),
+        LifecycleCommand::Up { headless } => Box::pin(cli::up::run(headless)),
+        LifecycleCommand::Chat => Box::pin(cli::chat::run()),
+        LifecycleCommand::Down => Box::pin(cli::down::run()),
+        LifecycleCommand::Status => Box::pin(cli::status::run()),
+    }
+}
+
+fn work_command(command: WorkCommand) -> CommandFuture {
+    match command {
+        WorkCommand::Schedule { action } => schedule_command(action),
+        WorkCommand::Pipeline { action } => pipeline_command(action),
+        WorkCommand::Archive { action } => archive_command(action),
+        WorkCommand::Plugin { action } => plugin_command(action),
+        WorkCommand::Intent { action } => intent_command(action),
+        WorkCommand::Outreach { action } => outreach_command(action),
+    }
+}
+
+fn cognition_command(command: CognitionCommand) -> CommandFuture {
+    match command {
+        CognitionCommand::Recall { action } => recall_command(action),
+        CognitionCommand::Praxis { action } => praxis_command(action),
+        CognitionCommand::Vigil { action } => vigil_command(action),
+    }
+}
+
+fn schedule_command(action: ScheduleAction) -> CommandFuture {
+    match action {
+        ScheduleAction::List => Box::pin(cli::schedule::list()),
+        ScheduleAction::Add { name, cron, prompt } => {
+            Box::pin(cli::schedule::add(name, cron, prompt))
         }
-        Commands::Status => {
-            if let Err(e) = cli::status::run().await {
-                eprintln!("Error: {e}");
-                std::process::exit(1);
-            }
+        ScheduleAction::Remove { id } => Box::pin(cli::schedule::remove(id)),
+        ScheduleAction::Enable { id } => Box::pin(cli::schedule::enable(id)),
+        ScheduleAction::Disable { id } => Box::pin(cli::schedule::disable(id)),
+        ScheduleAction::Model { id, model, clear } => Box::pin(cli::schedule::set_model(
+            id,
+            if clear { None } else { model },
+        )),
+    }
+}
+
+fn pipeline_command(action: PipelineAction) -> CommandFuture {
+    match action {
+        PipelineAction::Health => Box::pin(cli::pipeline::health_cmd()),
+        PipelineAction::Stale => Box::pin(cli::pipeline::stale_cmd()),
+    }
+}
+
+fn archive_command(action: ArchiveAction) -> CommandFuture {
+    match action {
+        ArchiveAction::List { document } => Box::pin(cli::archive::list(document)),
+        ArchiveAction::Run { document } => Box::pin(cli::archive::run(document)),
+    }
+}
+
+fn plugin_command(action: PluginAction) -> CommandFuture {
+    match action {
+        PluginAction::List => Box::pin(cli::plugin::list()),
+        PluginAction::Add { name } => Box::pin(cli::plugin::add(name)),
+        PluginAction::Remove { name } => Box::pin(cli::plugin::remove(name)),
+    }
+}
+
+fn intent_command(action: IntentAction) -> CommandFuture {
+    match action {
+        IntentAction::List => Box::pin(cli::intent::list()),
+        IntentAction::Add {
+            description,
+            prompt,
+            priority,
+        } => Box::pin(cli::intent::add(description, prompt, priority)),
+        IntentAction::Remove { id } => Box::pin(cli::intent::remove(id)),
+        IntentAction::Clear => Box::pin(cli::intent::clear()),
+    }
+}
+
+fn outreach_command(action: OutreachAction) -> CommandFuture {
+    match action {
+        OutreachAction::Status => Box::pin(cli::outreach::status()),
+        OutreachAction::Respond { id, rating } => Box::pin(cli::outreach::respond(id, rating)),
+    }
+}
+
+fn recall_command(action: Option<RecallAction>) -> CommandFuture {
+    match action {
+        None => Box::pin(cli::recall::dashboard_cmd()),
+        Some(RecallAction::Search { query, ranked }) => {
+            Box::pin(cli::recall::search(query, ranked))
         }
-        Commands::Schedule { action } => {
-            let result = match action {
-                ScheduleAction::List => cli::schedule::list().await,
-                ScheduleAction::Add { name, cron, prompt } => {
-                    cli::schedule::add(name, cron, prompt).await
-                }
-                ScheduleAction::Remove { id } => cli::schedule::remove(id).await,
-                ScheduleAction::Enable { id } => cli::schedule::enable(id).await,
-                ScheduleAction::Disable { id } => cli::schedule::disable(id).await,
-                ScheduleAction::Model { id, model, clear } => {
-                    cli::schedule::set_model(id, if clear { None } else { model }).await
-                }
-            };
-            if let Err(e) = result {
-                eprintln!("Error: {e}");
-                std::process::exit(1);
-            }
+        Some(RecallAction::Distill) => Box::pin(cli::recall::distill()),
+    }
+}
+
+fn praxis_command(action: PraxisAction) -> CommandFuture {
+    match action {
+        PraxisAction::Pulse => Box::pin(cli::praxis::pulse()),
+        PraxisAction::Checkpoint => Box::pin(cli::praxis::checkpoint()),
+        PraxisAction::Review => Box::pin(cli::praxis::review()),
+        PraxisAction::Status => Box::pin(cli::praxis::status()),
+        PraxisAction::Scan { json } => Box::pin(cli::praxis::scan(json)),
+        PraxisAction::Archive { dry_run } => Box::pin(cli::praxis::archive(dry_run)),
+        PraxisAction::Init => Box::pin(cli::praxis::init()),
+    }
+}
+
+fn vigil_command(action: VigilAction) -> CommandFuture {
+    match action {
+        VigilAction::Pulse => Box::pin(cli::vigil::pulse()),
+        VigilAction::Collect { trigger } => Box::pin(cli::vigil::collect(trigger)),
+        VigilAction::Status { json } => Box::pin(cli::vigil::status(json)),
+        VigilAction::Init => Box::pin(cli::vigil::init()),
+    }
+}
+
+fn isolate_command(action: IsolateAction) -> CommandFuture {
+    match action {
+        IsolateAction::On { reason } => Box::pin(cli::isolate::on(reason)),
+        IsolateAction::Off => Box::pin(cli::isolate::off()),
+        IsolateAction::Status => Box::pin(cli::isolate::status()),
+    }
+}
+
+fn probe_command(action: ProbeAction) -> CommandFuture {
+    match action {
+        ProbeAction::Run {
+            if_due,
+            only,
+            keep_scratch,
+        } => Box::pin(cli::probe::run(if_due, only, keep_scratch)),
+        ProbeAction::Status => Box::pin(cli::probe::status()),
+        ProbeAction::Facts { action } => probe_facts_command(action),
+        ProbeAction::ExportGraph { if_due } => Box::pin(cli::probe::export_graph(if_due)),
+        ProbeAction::Sets { action } => probe_sets_command(action),
+        ProbeAction::VerifyIsolation { turn, keep_scratch } => {
+            Box::pin(cli::probe::verify_isolation(turn, keep_scratch))
         }
-        Commands::Pipeline { action } => {
-            let result = match action {
-                PipelineAction::Health => cli::pipeline::health_cmd().await,
-                PipelineAction::Stale => cli::pipeline::stale_cmd().await,
-            };
-            if let Err(e) = result {
-                eprintln!("Error: {e}");
-                std::process::exit(1);
-            }
+    }
+}
+
+fn probe_facts_command(action: ProbeFactsAction) -> CommandFuture {
+    match action {
+        ProbeFactsAction::Draw => Box::pin(cli::probe::facts_draw()),
+        ProbeFactsAction::Plant { fact, value } => Box::pin(cli::probe::facts_plant(fact, value)),
+        ProbeFactsAction::List => Box::pin(cli::probe::facts_list()),
+    }
+}
+
+fn probe_sets_command(action: ProbeSetsAction) -> CommandFuture {
+    match action {
+        ProbeSetsAction::Install { from, pulse, dest } => {
+            Box::pin(cli::probe::sets_install(from, pulse, dest))
         }
-        Commands::Archive { action } => {
-            let result = match action {
-                ArchiveAction::List { document } => cli::archive::list(document).await,
-                ArchiveAction::Run { document } => cli::archive::run(document).await,
-            };
-            if let Err(e) = result {
-                eprintln!("Error: {e}");
-                std::process::exit(1);
-            }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Write as _;
+    use tracing_subscriber::fmt::MakeWriter as _;
+
+    fn parse(args: &[&str]) -> Commands {
+        let argv = std::iter::once("pulse-null").chain(args.iter().copied());
+        match Cli::try_parse_from(argv) {
+            Ok(cli) => cli.command,
+            Err(e) => panic!("{args:?} does not parse: {e}"),
         }
-        Commands::Plugin { action } => {
-            let result = match action {
-                PluginAction::List => cli::plugin::list().await,
-                PluginAction::Add { name } => cli::plugin::add(name).await,
-                PluginAction::Remove { name } => cli::plugin::remove(name).await,
-            };
-            if let Err(e) = result {
-                eprintln!("Error: {e}");
-                std::process::exit(1);
-            }
+    }
+
+    /// Every command line the binary accepts, one per dispatcher arm.
+    const EVERY_COMMAND: &[&[&str]] = &[
+        &["init"],
+        &["init", "--dir", "somewhere"],
+        &["up"],
+        &["up", "--headless"],
+        &["chat"],
+        &["down"],
+        &["status"],
+        &["schedule", "list"],
+        &[
+            "schedule",
+            "add",
+            "t",
+            "--cron",
+            "0 0 * * * *",
+            "--prompt",
+            "p",
+        ],
+        &["schedule", "remove", "id"],
+        &["schedule", "enable", "id"],
+        &["schedule", "disable", "id"],
+        &["schedule", "model", "id", "a-model"],
+        &["schedule", "model", "id", "--clear"],
+        &["pipeline", "health"],
+        &["pipeline", "stale"],
+        &["archive", "list"],
+        &["archive", "run", "learning"],
+        &["plugin", "list"],
+        &["plugin", "add", "x"],
+        &["plugin", "remove", "x"],
+        &["intent", "list"],
+        &["intent", "add", "d", "--prompt", "p"],
+        &["intent", "remove", "id"],
+        &["intent", "clear"],
+        &["outreach", "status"],
+        &["outreach", "respond", "id", "--rating", "useful"],
+        &["recall"],
+        &["recall", "search", "q", "--ranked"],
+        &["recall", "distill"],
+        &["praxis", "pulse"],
+        &["praxis", "checkpoint"],
+        &["praxis", "review"],
+        &["praxis", "status"],
+        &["praxis", "scan", "--json"],
+        &["praxis", "archive", "--dry-run"],
+        &["praxis", "init"],
+        &["vigil", "pulse"],
+        &["vigil", "collect"],
+        &["vigil", "status", "--json"],
+        &["vigil", "init"],
+        &["repair"],
+        &["isolate", "on", "--reason", "r"],
+        &["isolate", "off"],
+        &["isolate", "status"],
+        &["probe", "run", "--if-due", "--only", "a", "b"],
+        &["probe", "status"],
+        &["probe", "facts", "draw"],
+        &["probe", "facts", "plant", "fact-1", "value"],
+        &["probe", "facts", "list"],
+        &["probe", "export-graph"],
+        &["probe", "export-graph", "--if-due"],
+        &[
+            "probe", "sets", "install", "--from", "dir", "--pulse", "echo",
+        ],
+        &["probe", "verify-isolation", "--turn", "--keep-scratch"],
+    ];
+
+    #[test]
+    fn every_command_parses_and_routes_without_running() {
+        for args in EVERY_COMMAND {
+            // Building the future runs nothing; dropping it unpolled
+            // leaves no trace.
+            drop(dispatch(parse(args)));
         }
-        Commands::Recall { action } => {
-            let result = match action {
-                None => cli::recall::dashboard_cmd().await,
-                Some(RecallAction::Search { query, ranked }) => {
-                    cli::recall::search(query, ranked).await
-                }
-                Some(RecallAction::Distill) => cli::recall::distill().await,
-            };
-            if let Err(e) = result {
-                eprintln!("Error: {e}");
-                std::process::exit(1);
-            }
+    }
+
+    #[test]
+    fn the_flattened_groups_keep_the_flat_command_list() {
+        use clap::CommandFactory as _;
+        let names: Vec<String> = Cli::command()
+            .get_subcommands()
+            .map(|c| c.get_name().to_string())
+            .collect();
+        assert_eq!(
+            names,
+            [
+                "init", "up", "chat", "down", "status", "schedule", "pipeline", "archive",
+                "plugin", "intent", "outreach", "recall", "praxis", "vigil", "repair", "isolate",
+                "probe",
+            ]
+        );
+    }
+
+    #[test]
+    fn only_the_tui_commands_log_to_the_tui_log() {
+        assert!(writes_tui_log(&parse(&["up"])));
+        assert!(writes_tui_log(&parse(&["chat"])));
+        assert!(!writes_tui_log(&parse(&["up", "--headless"])));
+        assert!(!writes_tui_log(&parse(&["status"])));
+        assert!(!writes_tui_log(&parse(&["probe", "status"])));
+    }
+
+    #[test]
+    fn root_checks_match_the_commands_that_must_not_run_as_root() {
+        let cases: &[(&[&str], Option<RootCheck>)] = &[
+            (&["init"], Some(RootCheck::prefixed("init"))),
+            (&["up", "--headless"], Some(RootCheck::prefixed("up"))),
+            (&["chat"], Some(RootCheck::bare("chat"))),
+            (&["repair"], Some(RootCheck::prefixed("repair"))),
+            (&["probe", "status"], Some(RootCheck::bare("probe"))),
+            (&["probe", "run"], Some(RootCheck::bare("probe"))),
+            (
+                &["probe", "sets", "install", "--from", "d", "--pulse", "echo"],
+                None,
+            ),
+            (&["down"], None),
+            (&["status"], None),
+            (&["schedule", "list"], None),
+            (&["isolate", "status"], None),
+        ];
+        for (args, expected) in cases {
+            assert_eq!(root_check(&parse(args)), *expected, "{args:?}");
         }
-        Commands::Intent { action } => {
-            let result = match action {
-                IntentAction::List => cli::intent::list().await,
-                IntentAction::Add {
-                    description,
-                    prompt,
-                    priority,
-                } => cli::intent::add(description, prompt, priority).await,
-                IntentAction::Remove { id } => cli::intent::remove(id).await,
-                IntentAction::Clear => cli::intent::clear().await,
-            };
-            if let Err(e) = result {
-                eprintln!("Error: {e}");
-                std::process::exit(1);
-            }
-        }
-        Commands::Outreach { action } => {
-            let result = match action {
-                OutreachAction::Status => cli::outreach::status().await,
-                OutreachAction::Respond { id, rating } => cli::outreach::respond(id, rating).await,
-            };
-            if let Err(e) = result {
-                eprintln!("Error: {e}");
-                std::process::exit(1);
-            }
-        }
-        Commands::Praxis { action } => {
-            let result = match action {
-                PraxisAction::Pulse => cli::praxis::pulse().await,
-                PraxisAction::Checkpoint => cli::praxis::checkpoint().await,
-                PraxisAction::Review => cli::praxis::review().await,
-                PraxisAction::Status => cli::praxis::status().await,
-                PraxisAction::Scan { json } => cli::praxis::scan(json).await,
-                PraxisAction::Archive { dry_run } => cli::praxis::archive(dry_run).await,
-                PraxisAction::Init => cli::praxis::init().await,
-            };
-            if let Err(e) = result {
-                eprintln!("Error: {e}");
-                std::process::exit(1);
-            }
-        }
-        Commands::Vigil { action } => {
-            let result = match action {
-                VigilAction::Pulse => cli::vigil::pulse().await,
-                VigilAction::Collect { trigger } => cli::vigil::collect(trigger).await,
-                VigilAction::Status { json } => cli::vigil::status(json).await,
-                VigilAction::Init => cli::vigil::init().await,
-            };
-            if let Err(e) = result {
-                eprintln!("Error: {e}");
-                std::process::exit(1);
-            }
-        }
-        Commands::Repair => {
-            if let Err(e) = cli::root_guard::refuse_root("repair") {
-                eprintln!("Error: {e}");
-                std::process::exit(1);
-            }
-            if let Err(e) = cli::repair::run().await {
-                eprintln!("Error: {e}");
-                std::process::exit(1);
-            }
-        }
-        Commands::Isolate { action } => {
-            let result = match action {
-                IsolateAction::On { reason } => cli::isolate::on(reason).await,
-                IsolateAction::Off => cli::isolate::off().await,
-                IsolateAction::Status => cli::isolate::status().await,
-            };
-            if let Err(e) = result {
-                eprintln!("Error: {e}");
-                std::process::exit(1);
-            }
-        }
+    }
+
+    #[test]
+    fn a_refusal_is_printed_with_or_without_the_error_prefix() {
+        let refuse = |name: &str| Err(format!("refused {name}"));
+        assert_eq!(
+            RootCheck::prefixed("init").refusal(refuse),
+            Some("Error: refused init".to_string())
+        );
+        assert_eq!(
+            RootCheck::bare("chat").refusal(refuse),
+            Some("refused chat".to_string())
+        );
+        assert_eq!(RootCheck::bare("probe").refusal(|_| Ok(())), None);
+    }
+
+    #[tokio::test]
+    async fn a_refused_command_stops_before_it_runs() {
+        let refused = run_command(parse(&["chat"]), |name| Err(format!("no {name}"))).await;
+        assert_eq!(refused, Err("no chat".to_string()));
+        let refused = run_command(parse(&["init"]), |name| Err(format!("no {name}"))).await;
+        assert_eq!(refused, Err("Error: no init".to_string()));
+    }
+
+    #[test]
+    fn the_tui_log_receives_what_the_writer_writes() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("tui.log");
+        let file = std::fs::File::create(&path).unwrap();
+        let writer = tui_log_writer(Ok(file));
+        writer.make_writer().write_all(b"a log line\n").unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "a log line\n");
+    }
+
+    #[test]
+    fn an_unopenable_tui_log_discards_logs() {
+        let writer = tui_log_writer(Err("no HOME to log under".to_string()));
+        writer.make_writer().write_all(b"dropped\n").unwrap();
     }
 }

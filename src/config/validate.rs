@@ -16,92 +16,137 @@ fn validate_threshold(name: &str, soft: usize, hard: usize) -> Result<(), Config
 }
 
 pub fn validate(config: &Config) -> Result<(), ConfigError> {
-    if config.pulse.name.is_empty() {
-        return Err(ConfigError::Validation("Pulse name cannot be empty".into()));
-    }
-    if config.pulse.owner_name.is_empty() {
-        return Err(ConfigError::Validation("Owner name cannot be empty".into()));
-    }
-    if let Some(ref rules_dir) = config.pulse.rules_dir {
-        let path = std::path::Path::new(rules_dir);
-        if !path.exists() {
-            return Err(ConfigError::Validation(format!(
-                "rules_dir '{}' does not exist. Create it or remove the config entry.",
-                rules_dir
-            )));
-        }
-        if !path.is_dir() {
-            return Err(ConfigError::Validation(format!(
-                "rules_dir '{}' is not a directory",
-                rules_dir
-            )));
-        }
-    }
+    validate_pulse(&config.pulse)?;
     if config.server.port == 0 {
         return Err(ConfigError::Validation("Server port must be > 0".into()));
     }
+    validate_llm(&config.llm)?;
+    validate_pipeline(&config.pipeline)?;
+    validate_monitoring(&config.monitoring)?;
+    validate_liveness(&config.scheduler.liveness)?;
+    validate_probe(&config.probe)
+}
+
+/// A pulse name safe as one path component: letters, digits, `-` or `_`,
+/// not empty, and not hidden. The same rule as a probe database name.
+#[must_use]
+pub(crate) fn is_plain_pulse_name(name: &str) -> bool {
+    !name.is_empty()
+        && !name.starts_with('.')
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+}
+
+/// The pulse's name, its owner's, and its rules directory (when set).
+fn validate_pulse(pulse: &super::PulseConfig) -> Result<(), ConfigError> {
+    if pulse.name.is_empty() {
+        return Err(ConfigError::Validation("Pulse name cannot be empty".into()));
+    }
+    if !is_plain_pulse_name(&pulse.name) {
+        return Err(ConfigError::Validation(format!(
+            "'{}' is not a plain pulse name (letters, digits, - or _)",
+            pulse.name
+        )));
+    }
+    if pulse.owner_name.is_empty() {
+        return Err(ConfigError::Validation("Owner name cannot be empty".into()));
+    }
+    if let Some(ref rules_dir) = pulse.rules_dir {
+        validate_rules_dir(rules_dir)?;
+    }
+    Ok(())
+}
+
+fn validate_rules_dir(rules_dir: &str) -> Result<(), ConfigError> {
+    let path = std::path::Path::new(rules_dir);
+    if !path.exists() {
+        return Err(ConfigError::Validation(format!(
+            "rules_dir '{}' does not exist. Create it or remove the config entry.",
+            rules_dir
+        )));
+    }
+    if !path.is_dir() {
+        return Err(ConfigError::Validation(format!(
+            "rules_dir '{}' is not a directory",
+            rules_dir
+        )));
+    }
+    Ok(())
+}
+
+/// A known provider, and for a CLI pulse a known adapter.
+fn validate_llm(llm: &super::LlmConfig) -> Result<(), ConfigError> {
     // Pre-PN-106 spellings are folded by `LlmConfig::normalize` at load time;
     // a struct built by hand may still carry them, so accept both here.
     let valid_providers = ["cli", "anthropic", "ollama", "claude-code", "claude"]; // vendor-ok: legacy aliases
-    if !valid_providers.contains(&config.llm.provider.as_str()) {
+    if !valid_providers.contains(&llm.provider.as_str()) {
         return Err(ConfigError::Validation(format!(
             "Unknown LLM provider: {}. Valid: cli, anthropic, ollama",
-            config.llm.provider
+            llm.provider
         )));
     }
-    if config.llm.provider == "cli" {
-        let adapters = crate::cli_provider::adapters::NAMES;
-        match config.llm.adapter.as_deref() {
-            Some(name) if adapters.contains(&name) => {}
-            Some(name) => {
-                return Err(ConfigError::Validation(format!(
-                    "Unknown [llm] adapter: {name}. Valid: {}",
-                    adapters.join(", ")
-                )))
-            }
-            None => {
-                return Err(ConfigError::Validation(format!(
-                    "[llm] provider = \"cli\" needs an adapter. Valid: {}",
-                    adapters.join(", ")
-                )))
-            }
-        }
+    if llm.provider == "cli" {
+        validate_cli_adapter(llm.adapter.as_deref())?;
     }
-    // Validate pipeline thresholds
-    if config.pipeline.enabled {
-        validate_threshold(
-            "learning",
-            config.pipeline.learning_soft,
-            config.pipeline.learning_hard,
-        )?;
-        validate_threshold(
-            "thoughts",
-            config.pipeline.thoughts_soft,
-            config.pipeline.thoughts_hard,
-        )?;
-        validate_threshold(
+    Ok(())
+}
+
+fn validate_cli_adapter(adapter: Option<&str>) -> Result<(), ConfigError> {
+    let adapters = crate::cli_provider::adapters::NAMES;
+    match adapter {
+        Some(name) if adapters.contains(&name) => Ok(()),
+        Some(name) => Err(ConfigError::Validation(format!(
+            "Unknown [llm] adapter: {name}. Valid: {}",
+            adapters.join(", ")
+        ))),
+        None => Err(ConfigError::Validation(format!(
+            "[llm] provider = \"cli\" needs an adapter. Valid: {}",
+            adapters.join(", ")
+        ))),
+    }
+}
+
+/// Each document's thresholds, when the pipeline is on.
+fn validate_pipeline(pipeline: &super::PipelineConfig) -> Result<(), ConfigError> {
+    if !pipeline.enabled {
+        return Ok(());
+    }
+    for (name, soft, hard) in [
+        ("learning", pipeline.learning_soft, pipeline.learning_hard),
+        ("thoughts", pipeline.thoughts_soft, pipeline.thoughts_hard),
+        (
             "curiosity",
-            config.pipeline.curiosity_soft,
-            config.pipeline.curiosity_hard,
-        )?;
-        validate_threshold(
+            pipeline.curiosity_soft,
+            pipeline.curiosity_hard,
+        ),
+        (
             "reflections",
-            config.pipeline.reflections_soft,
-            config.pipeline.reflections_hard,
-        )?;
-        validate_threshold(
-            "praxis",
-            config.pipeline.praxis_soft,
-            config.pipeline.praxis_hard,
-        )?;
+            pipeline.reflections_soft,
+            pipeline.reflections_hard,
+        ),
+        ("praxis", pipeline.praxis_soft, pipeline.praxis_hard),
+    ] {
+        validate_threshold(name, soft, hard)?;
     }
-    // Validate monitoring window
-    if config.monitoring.enabled && config.monitoring.window_size == 0 {
+    Ok(())
+}
+
+fn validate_monitoring(monitoring: &super::MonitoringConfig) -> Result<(), ConfigError> {
+    if monitoring.enabled && monitoring.window_size == 0 {
         return Err(ConfigError::Validation(
             "Monitoring window_size must be > 0".into(),
         ));
     }
-    validate_liveness(&config.scheduler.liveness)?;
+    Ok(())
+}
+
+/// A disabled section never stops the daemon from booting; the probe gate
+/// validates it again before any run.
+fn validate_probe(probe: &super::ProbeConfig) -> Result<(), ConfigError> {
+    if probe.enabled {
+        probe.validate().map_err(ConfigError::Validation)?;
+    }
     Ok(())
 }
 
@@ -173,6 +218,73 @@ mod tests {
         let mut config = LivenessConfig::default();
         mutate(&mut config);
         config
+    }
+
+    /// Each refusal of `validate`, with its message, in the order checked.
+    #[test]
+    fn every_config_refusal_says_what_is_wrong() {
+        use super::super::test_support::minimal_config;
+        use super::super::Config;
+        let error = |mutate: &dyn Fn(&mut Config)| {
+            let mut config = minimal_config();
+            mutate(&mut config);
+            super::validate(&config).unwrap_err().to_string()
+        };
+        assert!(super::validate(&minimal_config()).is_ok());
+        assert!(error(&|c| c.pulse.name.clear()).ends_with("Pulse name cannot be empty"));
+        assert!(error(&|c| c.pulse.name = "my pulse".into())
+            .ends_with("'my pulse' is not a plain pulse name (letters, digits, - or _)"));
+        let mut hyphen = minimal_config();
+        hyphen.pulse.name = "my-pulse".into();
+        assert!(super::validate(&hyphen).is_ok(), "a hyphen is a plain name");
+        assert!(error(&|c| c.pulse.owner_name.clear()).ends_with("Owner name cannot be empty"));
+        assert!(error(&|c| c.pulse.rules_dir = Some("/nonexistent/rules".into()))
+            .ends_with("rules_dir '/nonexistent/rules' does not exist. Create it or remove the config entry."));
+        assert!(error(&|c| c.pulse.rules_dir = Some("/etc/hosts".into()))
+            .ends_with("rules_dir '/etc/hosts' is not a directory"));
+        let mut with_rules = minimal_config();
+        with_rules.pulse.rules_dir = Some("/etc".into());
+        assert!(
+            super::validate(&with_rules).is_ok(),
+            "a rules dir that exists"
+        );
+        assert!(error(&|c| c.server.port = 0).ends_with("Server port must be > 0"));
+        assert!(error(&|c| c.llm.provider = "nonesuch".into())
+            .ends_with("Unknown LLM provider: nonesuch. Valid: cli, anthropic, ollama"));
+        let thresholds = error(&|c| {
+            c.pipeline.enabled = true;
+            c.pipeline.curiosity_soft = 0;
+        });
+        assert!(
+            thresholds.ends_with("Pipeline curiosity thresholds must be > 0"),
+            "{thresholds}"
+        );
+        let order = error(&|c| {
+            c.pipeline.enabled = true;
+            c.pipeline.praxis_soft = c.pipeline.praxis_hard;
+        });
+        assert!(order.contains("Pipeline praxis soft limit ("), "{order}");
+        let mut off = minimal_config();
+        off.pipeline.enabled = false;
+        off.pipeline.learning_soft = 0;
+        assert!(
+            super::validate(&off).is_ok(),
+            "a disabled pipeline is not checked"
+        );
+        assert!(error(&|c| {
+            c.monitoring.enabled = true;
+            c.monitoring.window_size = 0;
+        })
+        .ends_with("Monitoring window_size must be > 0"));
+        let mut probe = minimal_config();
+        probe.probe.enabled = true;
+        probe.probe.quiet_start = "not a time".into();
+        assert!(
+            super::validate(&probe).is_err(),
+            "an enabled probe section is checked"
+        );
+        probe.probe.enabled = false;
+        assert!(super::validate(&probe).is_ok(), "a disabled one is not");
     }
 
     #[test]

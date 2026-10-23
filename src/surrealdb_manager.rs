@@ -9,9 +9,9 @@ use std::path::{Path, PathBuf};
 use tokio::io::AsyncBufReadExt;
 use tracing::{error, info, warn};
 
-const SURREAL_PORT: u16 = 8787;
+pub(crate) const SURREAL_PORT: u16 = 8787;
 const SURREAL_BIND: &str = "127.0.0.1";
-const NAMESPACE: &str = "nullarc";
+pub(crate) const NAMESPACE: &str = "nullarc";
 const PID_FILE: &str = "surrealdb/surreal.pid";
 const ROOT_PASSWORD_FILE: &str = "surrealdb/root-password";
 const PASSWORD_LEN: usize = 32;
@@ -232,7 +232,9 @@ async fn is_reachable(addr: &str) -> bool {
     tokio::net::TcpStream::connect(addr).await.is_ok()
 }
 
-fn find_binary(data_dir: &Path) -> Result<PathBuf, Box<dyn std::error::Error + Send + Sync>> {
+pub(crate) fn find_binary(
+    data_dir: &Path,
+) -> Result<PathBuf, Box<dyn std::error::Error + Send + Sync>> {
     let local = data_dir.join("bin/surreal");
     if local.exists() {
         return Ok(local);
@@ -272,7 +274,9 @@ fn ensure_root_password(
     Ok(password)
 }
 
-fn read_root_password(data_dir: &Path) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+pub(crate) fn read_root_password(
+    data_dir: &Path,
+) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
     let pw_path = data_dir.join(ROOT_PASSWORD_FILE);
     let password = std::fs::read_to_string(&pw_path).map_err(|e| {
         format!(
@@ -283,20 +287,39 @@ fn read_root_password(data_dir: &Path) -> Result<String, Box<dyn std::error::Err
     Ok(password.trim().to_string())
 }
 
-fn generate_password() -> String {
-    use std::io::Read;
-    let mut bytes = [0u8; PASSWORD_LEN];
-    std::fs::File::open("/dev/urandom")
-        .and_then(|mut f| f.read_exact(&mut bytes))
-        .expect("failed to read /dev/urandom");
+const PASSWORD_CHARSET: &[u8] = b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
 
-    bytes
-        .iter()
-        .map(|b| {
-            let charset = b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
-            charset[(*b as usize) % charset.len()] as char
-        })
-        .collect()
+/// One symbol from [`PASSWORD_CHARSET`], or `None` when `byte` sits in the
+/// leftover residue. `256` is not a multiple of 62, so taking `byte % 62`
+/// would make the first eight symbols more likely. Bytes at or above the
+/// largest multiple of 62 that fits in a byte are discarded instead.
+fn password_symbol(byte: u8) -> Option<u8> {
+    let span = 256 - (256 % PASSWORD_CHARSET.len());
+    if (byte as usize) >= span {
+        None
+    } else {
+        Some(PASSWORD_CHARSET[(byte as usize) % PASSWORD_CHARSET.len()])
+    }
+}
+
+pub(crate) fn generate_password() -> String {
+    use std::io::Read;
+    let mut out = String::with_capacity(PASSWORD_LEN);
+    let mut file = std::fs::File::open("/dev/urandom").expect("failed to read /dev/urandom");
+    let mut buf = [0u8; 64];
+    while out.len() < PASSWORD_LEN {
+        file.read_exact(&mut buf)
+            .expect("failed to read /dev/urandom");
+        for &byte in &buf {
+            if let Some(symbol) = password_symbol(byte) {
+                out.push(symbol as char);
+                if out.len() == PASSWORD_LEN {
+                    break;
+                }
+            }
+        }
+    }
+    out
 }
 
 fn update_recall_echo_config(
@@ -336,4 +359,55 @@ password_file = "{password_file}"
     std::fs::write(config_path, content.trim_start())?;
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_data_dirs_own_binary_comes_first() {
+        let data_dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(data_dir.path().join("bin")).unwrap();
+        std::fs::write(data_dir.path().join("bin/surreal"), "").unwrap();
+        assert_eq!(
+            find_binary(data_dir.path()).unwrap(),
+            data_dir.path().join("bin/surreal")
+        );
+    }
+
+    /// Each alphabet symbol is hit the same number of times, and the
+    /// leftover bytes (248..=255) contribute nothing.
+    #[test]
+    fn password_bytes_are_sampled_without_a_residue_bias() {
+        let mut counts = [0usize; PASSWORD_CHARSET.len()];
+        for byte in 0u16..256 {
+            match password_symbol(byte as u8) {
+                Some(symbol) => {
+                    let index = PASSWORD_CHARSET.iter().position(|c| *c == symbol).unwrap();
+                    counts[index] += 1;
+                }
+                None => assert!(byte >= 248, "{byte}"),
+            }
+        }
+        assert!(counts.iter().all(|n| *n == 4), "{counts:?}");
+        let password = generate_password();
+        assert_eq!(password.len(), PASSWORD_LEN);
+        assert!(password.chars().all(|c| c.is_ascii_alphanumeric()));
+    }
+
+    /// Without one in the data dir: the one on `PATH`, else
+    /// `/usr/local/bin/surreal`, else an error that says where to put it.
+    #[test]
+    fn without_its_own_binary_the_installed_one_is_found_or_refused() {
+        let data_dir = tempfile::tempdir().unwrap();
+        match find_binary(data_dir.path()) {
+            Ok(found) => {
+                assert!(found.exists(), "{}", found.display());
+                assert!(!found.starts_with(data_dir.path()));
+                assert_eq!(found.file_name().unwrap(), "surreal");
+            }
+            Err(e) => assert!(e.to_string().starts_with("SurrealDB binary not found")),
+        }
+    }
 }

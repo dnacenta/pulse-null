@@ -949,10 +949,148 @@ pub(super) fn user_hooks_missing_root(home: &Path) -> UserHookScan {
     UserHookScan::Inspected(found)
 }
 
+/// Copy the user-level settings into a probe scratch config dir without its
+/// hooks: a user hook would run for the probe and write wherever it writes.
+/// A missing or unreadable source leaves no settings at all.
+pub(super) fn copy_settings_without_hooks(src: &Path, dst: &Path) -> std::io::Result<()> {
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+    let Ok(Some(text)) = read_small_file(src) else {
+        return Ok(());
+    };
+    let Ok(mut doc) = serde_json::from_str::<serde_json::Value>(&text) else {
+        return Ok(());
+    };
+    if let Some(settings) = doc.as_object_mut() {
+        settings.remove("hooks");
+    }
+    let rendered = serde_json::to_string_pretty(&doc).map_err(std::io::Error::other)? + "\n";
+    let mut out = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(dst)?;
+    out.write_all(rendered.as_bytes())
+}
+
+/// The project settings of a probe's scratch copy: every hook goes.
+/// `consume` would print the session summary a second time (the prompt
+/// already carries it). `checkpoint` and `archive-session` would write the
+/// probe into the pulse's archive. `settings.local.json` loses its hooks too.
+pub(super) fn scratch_settings(item_root: &Path) -> Vec<BootstrapItem> {
+    let item_root = item_root
+        .canonicalize()
+        .unwrap_or_else(|_| item_root.to_path_buf());
+    let claude_dir = item_root.join(".claude");
+    let mut items = Vec::new();
+    for name in ["settings.json", "settings.local.json"] {
+        let scratch = ScratchSettings {
+            item_root: &item_root,
+        };
+        items.extend(scratch.rewrite(&claude_dir.join(name)));
+    }
+    items
+}
+
+/// How one settings file of a scratch copy is rewritten.
+struct ScratchSettings<'a> {
+    item_root: &'a Path,
+}
+
+impl ScratchSettings<'_> {
+    /// Rewrite the settings file at `path`: `None` when there is none, else
+    /// its item (updated, or skipped with why).
+    fn rewrite(&self, path: &Path) -> Option<BootstrapItem> {
+        let item = |status| BootstrapItem {
+            path: path.to_path_buf(),
+            kind: ItemKind::ConfigFile,
+            status,
+        };
+        let text = match read_small_file(path) {
+            Ok(Some(text)) => text,
+            Ok(None) => return None,
+            Err(e) => return Some(item(ItemStatus::Skipped(e))),
+        };
+        let written = self
+            .rendered(&text)
+            .and_then(|rendered| write_regular_file(path, &rendered, self.item_root));
+        Some(item(match written {
+            Ok(()) => ItemStatus::Updated,
+            Err(e) => ItemStatus::Skipped(e),
+        }))
+    }
+
+    /// The settings `text` with every hook removed.
+    fn rendered(&self, text: &str) -> Result<String, String> {
+        let mut doc = match serde_json::from_str::<serde_json::Value>(text) {
+            Ok(doc) if doc.is_object() => doc,
+            Ok(_) => return Err("not a JSON object".into()),
+            Err(e) => return Err(format!("not valid JSON: {e}")),
+        };
+        let settings = doc.as_object_mut().expect("checked object");
+        settings.remove("hooks");
+        serde_json::to_string_pretty(&doc)
+            .map(|text| text + "\n")
+            .map_err(|e| format!("could not serialise: {e}"))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::init::agent_bootstrap::{ensure_common, verify_common, write_regular_file};
+
+    #[test]
+    fn scratch_settings_drop_every_hook() {
+        let dir = pulse();
+        let root = dir.path().canonicalize().unwrap();
+        ensure_all(&root);
+        let mut doc = read_settings(&root);
+        doc["hooks"]["Stop"] =
+            serde_json::json!([{"hooks":[{"type":"command","command":"curl x"}]}]);
+        doc["hooks"]["SessionStart"] = serde_json::json!([{
+            "hooks": [{
+                "type": "command",
+                "command": "/usr/local/bin/recall-echo consume '/old'"
+            }]
+        }]);
+        doc["model"] = "keep-me".into();
+        std::fs::write(root.join(".claude/settings.json"), doc.to_string()).unwrap();
+        std::fs::write(
+            root.join(".claude/settings.local.json"),
+            r#"{"hooks":{"SessionEnd":[]},"other":1}"#,
+        )
+        .unwrap();
+
+        let items = scratch_settings(&root);
+        assert!(
+            items.iter().all(|i| i.status == ItemStatus::Updated),
+            "{items:?}"
+        );
+        let doc = read_settings(&root);
+        assert_eq!(doc["model"], "keep-me");
+        assert!(doc.get("hooks").is_none(), "{doc}");
+        assert!(!doc.to_string().contains("consume"), "{doc}");
+        let local: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(root.join(".claude/settings.local.json")).unwrap(),
+        )
+        .unwrap();
+        assert!(local.get("hooks").is_none());
+        assert_eq!(local["other"], 1);
+    }
+
+    #[test]
+    fn scratch_settings_refuse_what_they_cannot_rewrite() {
+        let dir = pulse();
+        let root = dir.path().canonicalize().unwrap();
+        std::fs::create_dir_all(root.join(".claude")).unwrap();
+        std::fs::write(root.join(".claude/settings.json"), "{not json").unwrap();
+        let items = scratch_settings(&root);
+        assert!(
+            matches!(items[0].status, ItemStatus::Skipped(_)),
+            "{items:?}"
+        );
+    }
 
     fn ensure_all(root: &Path) -> Vec<BootstrapItem> {
         let mut items = ensure_common(root, "claude-code");

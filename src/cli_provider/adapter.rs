@@ -11,6 +11,7 @@
 //! Nothing in this file names a vendor. Vendors live in [`super::adapters`].
 
 use std::ffi::OsString;
+use std::io;
 use std::path::{Path, PathBuf};
 
 use crate::init::agent_bootstrap::BootstrapItem;
@@ -29,11 +30,10 @@ pub enum PromptDelivery {
 pub enum SystemPromptDelivery {
     /// Staged in a private temp file; the adapter names it on argv.
     File,
-    /// Passed inline on argv. Linux caps one argument at 128 KiB, so the
-    /// runner refuses prompts above `max_bytes` rather than truncating.
-    Argv { max_bytes: usize },
-    /// The CLI has no system-prompt channel: the runner prepends it to the
-    /// user prompt, separated by a blank line.
+    /// The CLI has no system-prompt file flag. The runner prepends the
+    /// prompt to the user prompt, separated by a blank line, and that text
+    /// is staged in a mode-0600 file. It is not placed on argv:
+    /// `/proc/<pid>/cmdline` is world-readable.
     Prepend,
 }
 
@@ -110,11 +110,9 @@ pub struct Probe {
 #[derive(Debug)]
 pub struct Invocation<'a> {
     pub model: &'a str,
-    /// The staged system prompt, when [`SystemPromptDelivery::File`] or
-    /// `Argv` is in use. `None` for `Prepend`.
+    /// The staged system prompt, when [`SystemPromptDelivery::File`] is in
+    /// use. `None` for `Prepend` (the text is in the user prompt file).
     pub system_prompt_file: Option<&'a Path>,
-    /// The system prompt text, for [`SystemPromptDelivery::Argv`].
-    pub system_prompt: &'a str,
     /// The staged user prompt, when [`PromptDelivery::File`] is in use.
     pub prompt_file: Option<&'a Path>,
     /// Which tools the CLI may use: everything (the owner), a read-only
@@ -125,6 +123,83 @@ pub struct Invocation<'a> {
     pub pulse_root: &'a Path,
     /// `[llm] reasoning_effort`, for CLIs that take one.
     pub reasoning_effort: Option<&'a str>,
+}
+
+/// A tool the model called, as the CLI's own stream reported it.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct ToolCall {
+    /// The CLI's own name for the tool.
+    pub name: String,
+    /// The tool input exactly as streamed.
+    pub input: serde_json::Value,
+    /// The call's id in the stream, which its result refers to.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
+    /// The text of the call's result, as the stream reported it (bounded).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub result: Option<String>,
+}
+
+impl ToolCall {
+    /// A call with no id and no result yet.
+    #[must_use]
+    pub fn new(name: impl Into<String>, input: serde_json::Value) -> Self {
+        Self {
+            name: name.into(),
+            input,
+            id: None,
+            result: None,
+        }
+    }
+}
+
+/// What one line of a CLI's output says about the run, beyond the reply.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Observed {
+    /// The model that actually served the turn, as the CLI reports it.
+    ServedModel(String),
+    /// The model called a tool.
+    ToolCall(ToolCall),
+    /// A tool's result came back (`tool_use_id` names the call).
+    ToolResult { tool_use_id: String, text: String },
+}
+
+/// Where a probe's scratch vendor directory sits and what it stands in for.
+#[derive(Debug, Clone, Copy)]
+pub struct VendorScratchSpec<'a> {
+    /// The live user's home, whose vendor directory is copied from.
+    pub live_home: &'a Path,
+    /// The live pulse root the probe item was copied from.
+    pub live_root: &'a Path,
+    /// The probe item's scratch copy of the pulse, the CLI's working directory.
+    pub item_root: &'a Path,
+    /// An empty private directory for the vendor's files.
+    pub dir: &'a Path,
+    /// What the copy carries over from the live user.
+    pub profile: VendorProfile,
+}
+
+/// How much of the live user's vendor directory a probe child sees.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VendorProfile {
+    /// The pulse arm: settings (without hooks), user rules and instructions,
+    /// and the pulse's auto-memory.
+    Pulse,
+    /// A reference arm with no scaffold: only what the CLI needs to log in
+    /// and run (its config and login state), none of the user's
+    /// instructions, rules or memory.
+    Bare,
+}
+
+/// A probe's scratch vendor directory, ready for one child.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct VendorScratch {
+    /// Environment that points the CLI at the scratch directory.
+    pub env: Vec<(String, String)>,
+    /// Files copied from the live vendor directory that the CLI may rewrite
+    /// (a login token it refreshes). They are checked at teardown and never
+    /// copied back.
+    pub watched: Vec<PathBuf>,
 }
 
 /// One agent CLI, as seen by the generic runner.
@@ -262,6 +337,60 @@ pub trait CliAdapter: Send + Sync {
     /// not to be inlined, because what they say is false for this CLI.
     fn project_rules_exclude(&self) -> &'static [&'static str] {
         &[]
+    }
+
+    /// What one output line says about the run beyond the reply: the served
+    /// model and the tools called. Empty for a CLI whose stream does not say
+    /// (see [`observes_tools`](Self::observes_tools)).
+    fn observe_line(&self, _line: &str) -> Vec<Observed> {
+        Vec::new()
+    }
+
+    /// Does [`observe_line`](Self::observe_line) report tool calls? A probe
+    /// on a CLI that cannot show its tool calls cannot be checked for reads
+    /// of held-out stores, so its items say so.
+    fn observes_tools(&self) -> bool {
+        false
+    }
+
+    /// Is the CLI able to log in from inside a probe scratch, given which
+    /// environment variables the runner holds? `Err` names what is missing
+    /// (never a value). `has_env` answers whether a variable is set and
+    /// non-empty.
+    fn probe_auth_ready(&self, _has_env: &dyn Fn(&str) -> bool) -> Result<(), String> {
+        Ok(())
+    }
+
+    /// Populate a probe's scratch vendor directory so this CLI keeps its
+    /// sessions, settings, caches and memory there instead of the live
+    /// user's. CLIs without a scratch layout refuse: a probe that cannot be
+    /// redirected must not run.
+    fn scratch_vendor(&self, _spec: &VendorScratchSpec<'_>) -> io::Result<VendorScratch> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            format!("the {} adapter has no probe scratch layout", self.name()),
+        ))
+    }
+
+    /// Rewrite this CLI's project files inside a probe's scratch copy of the
+    /// pulse: hooks that would archive, checkpoint or capture go, and what is
+    /// left points at `item_root`. A `Skipped` or `Wrong` item means the copy
+    /// is not safe to run.
+    fn scratch_project(&self, _item_root: &Path, _recall_bin: &str) -> Vec<BootstrapItem> {
+        Vec::new()
+    }
+
+    /// The live user's vendor directory for this CLI, for isolation checks.
+    fn vendor_home(&self, _home: &Path) -> Option<PathBuf> {
+        None
+    }
+
+    /// Directories a probe child of this CLI may read (never write) beyond
+    /// the system directories and its resolved binary's own directory: the
+    /// rest of the CLI's install. Never a directory that holds sessions,
+    /// login state or settings.
+    fn probe_install_reads(&self, _home: &Path) -> Vec<PathBuf> {
+        Vec::new()
     }
 
     /// How this CLI's pulse directory is wired (instruction file, hooks,

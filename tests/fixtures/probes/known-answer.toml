@@ -1,0 +1,79 @@
+# TEST FIXTURE, not a probe set: the shape of known-answer/v1 (ids, truths,
+# rules, arms, min_n) with placeholder wording. The real items are sealed
+# (assets/probes/v1/sealed.toml); never copy them here.
+
+set = "known-answer"
+version = 1
+measure = "known-answer"
+min_n = 30
+arms = ["pulse", "input-only", "fresh"]
+instructions = """
+Fixture instructions: one line per number as "<number>: <answer>", dates as \
+YYYY-MM-DD, "<number>: UNKNOWN" when unknown.\
+"""
+
+[[item]]
+id = "name"
+question = "Fixture question about the name."
+truth = "pulse-name"
+rule = "contains"
+
+[[item]]
+id = "owner"
+question = "Fixture question about the owner."
+truth = "owner-name"
+rule = "contains"
+
+[[item]]
+id = "agent-cli"
+question = "Fixture question about the agent CLI."
+truth = "adapter"
+rule = "contains"
+
+[[item]]
+id = "configured-model"
+question = "Fixture question about the configured model."
+truth = "configured-model"
+rule = "model"
+
+[[item]]
+id = "served-model"
+question = "Fixture question about the served model."
+truth = "served-model"
+rule = "model"
+
+[[item]]
+id = "today"
+question = "Fixture question about today."
+truth = "today"
+rule = "date"
+
+[[item]]
+id = "weekday"
+question = "Fixture question about the weekday."
+truth = "weekday"
+rule = "weekday"
+
+[[item]]
+id = "owner-last-wrote"
+question = "Fixture question about the owner's last message."
+truth = "owner-last-active"
+rule = "date"
+
+[[item]]
+id = "runtime-started"
+question = "Fixture question about the runtime start."
+truth = "runtime-started"
+rule = "date"
+
+[[item]]
+id = "last-task"
+question = "Fixture question about the last task."
+truth = "last-task-name"
+rule = "contains"
+
+[[item]]
+id = "last-task-date"
+question = "Fixture question about the last task's date."
+truth = "last-task-date"
+rule = "date"

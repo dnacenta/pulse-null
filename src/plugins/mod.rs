@@ -1,9 +1,8 @@
 pub mod manager;
 pub mod registry;
 
-/// Shared by the optional plugins. Compiled for tests so the redaction
-/// behavior is covered without enabling a plugin.
-#[cfg(any(test, feature = "voice", feature = "discord-text"))]
+/// Shared by the optional plugins and the probe runner. The probe parses
+/// pulse-writable TOML and must report a failure the same way.
 pub(crate) mod config_error;
 
 // Core modules (always included)

@@ -1,0 +1,25 @@
+# Wakes the probe run for one pulse inside the default quiet window
+# (02:00-06:00 Europe/Madrid). TEMPLATE: installed at deploy.
+#
+# Both pulses share one AI account and one disk. Their runs never overlap:
+# a run waits (up to 90 min) for the host lock another pulse's run holds,
+# then re-checks the window. Staggering still keeps that wait short, e.g.
+#   systemctl edit pulse-null-probe@synth.timer
+#     [Timer]
+#     OnCalendar=
+#     OnCalendar=*-*-* 03:30:00 Europe/Madrid
+# The run checks the day, window and budget itself, so waking daily is
+# correct: on a non-probe day the run refuses and exits 0.
+
+[Unit]
+Description=pulse-null probe timer (%i)
+
+[Timer]
+OnCalendar=*-*-* 02:30:00 Europe/Madrid
+RandomizedDelaySec=10min
+# A missed wake-up is not caught up: it would land outside the window.
+Persistent=false
+Unit=pulse-null-probe@%i.service
+
+[Install]
+WantedBy=timers.target

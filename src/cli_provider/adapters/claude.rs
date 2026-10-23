@@ -9,12 +9,14 @@
 //! any of it.
 
 use std::ffi::OsString;
+use std::io;
 use std::path::{Path, PathBuf};
 
 use super::claude_hooks;
 use crate::cli_provider::adapter::{
-    AgentIntegration, CliAdapter, ExitClass, Invocation, OutputMode, Probe, PromptDelivery, Reply,
-    StreamLine, SystemPromptDelivery, Usage, UserHookScan,
+    AgentIntegration, CliAdapter, ExitClass, Invocation, Observed, OutputMode, Probe,
+    PromptDelivery, Reply, StreamLine, SystemPromptDelivery, Usage, UserHookScan, VendorProfile,
+    VendorScratch, VendorScratchSpec,
 };
 use crate::init::agent_bootstrap::BootstrapItem;
 use crate::tool_surface::ToolSurface;
@@ -274,9 +276,110 @@ impl CliAdapter for Claude {
         }
     }
 
+    /// `stream-json --verbose` carries the init record and every assistant
+    /// message with its `tool_use` blocks.
+    fn observe_line(&self, line: &str) -> Vec<Observed> {
+        super::observe_agent_stream_line(line)
+    }
+
+    fn observes_tools(&self) -> bool {
+        true
+    }
+
+    /// A probe scratch carries no credential file: Claude Code logs in from
+    /// the pulse unit's `CLAUDE_CODE_OAUTH_TOKEN`. An API key would bill per
+    /// token instead of the owner's plan, so it does not count.
+    fn probe_auth_ready(&self, has_env: &dyn Fn(&str) -> bool) -> Result<(), String> {
+        if has_env(OAUTH_TOKEN_ENV) {
+            Ok(())
+        } else {
+            Err(format!(
+                "{OAUTH_TOKEN_ENV} is not set; claude probes log in from it (the pulse unit's \
+                 EnvironmentFile) and never copy a credential file"
+            ))
+        }
+    }
+
+    /// `CLAUDE_CONFIG_DIR` moves settings, sessions, `.claude.json` and the
+    /// per-project auto-memory. The copy keeps the user's settings minus
+    /// their hooks, the user rules and instructions, and the live pulse's
+    /// auto-memory re-keyed to the probe's working directory.
+    fn scratch_vendor(&self, spec: &VendorScratchSpec<'_>) -> io::Result<VendorScratch> {
+        let config_dir = spec.dir.join("claude");
+        super::create_private_dir(&config_dir)?;
+        let env = vec![
+            (
+                "CLAUDE_CONFIG_DIR".to_string(),
+                config_dir.display().to_string(),
+            ),
+            ("DISABLE_AUTOUPDATER".to_string(), "1".to_string()),
+            (
+                "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC".to_string(),
+                "1".to_string(),
+            ),
+        ];
+        if spec.profile == VendorProfile::Bare {
+            return Ok(VendorScratch {
+                env,
+                watched: Vec::new(),
+            });
+        }
+        let live = spec.live_home.join(".claude");
+        claude_hooks::copy_settings_without_hooks(
+            &live.join("settings.json"),
+            &config_dir.join("settings.json"),
+        )?;
+        super::copy_private_tree(&live.join("rules"), &config_dir.join("rules"))?;
+        super::copy_private_file(&live.join("CLAUDE.md"), &config_dir.join("CLAUDE.md"))?;
+        let memory = |root: &Path| Path::new("projects").join(project_key(root)).join("memory");
+        super::copy_private_tree(
+            &live.join(memory(spec.live_root)),
+            &config_dir.join(memory(spec.item_root)),
+        )?;
+        Ok(VendorScratch {
+            env,
+            watched: Vec::new(),
+        })
+    }
+
+    /// Project hooks do not survive into the scratch. `consume` would print
+    /// the session summary a second time (the prompt already carries it),
+    /// and `checkpoint` and `archive-session` would write the probe into
+    /// the archive.
+    fn scratch_project(&self, item_root: &Path, _recall_bin: &str) -> Vec<BootstrapItem> {
+        claude_hooks::scratch_settings(item_root)
+    }
+
+    fn vendor_home(&self, home: &Path) -> Option<PathBuf> {
+        Some(home.join(".claude"))
+    }
+
+    /// The native install is one binary (its directory is allowed by the
+    /// runner); the system-wide managed settings live in `/etc/claude-code`.
+    fn probe_install_reads(&self, _home: &Path) -> Vec<PathBuf> {
+        vec![PathBuf::from("/etc/claude-code")]
+    }
+
     fn integration(&self) -> &dyn AgentIntegration {
         self
     }
+}
+
+/// The environment variable Claude Code logs in from headlessly.
+const OAUTH_TOKEN_ENV: &str = "CLAUDE_CODE_OAUTH_TOKEN";
+
+/// Claude Code's directory name for a project under `projects/`: the
+/// working directory's path with every non-alphanumeric character turned
+/// into `-` (so `/home/pulse/pulse-null/echo` is
+/// `-home-pulse-pulse-null-echo`). The path is resolved first, as the CLI
+/// sees its cwd.
+fn project_key(root: &Path) -> String {
+    let resolved = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
+    resolved
+        .to_string_lossy()
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
+        .collect()
 }
 
 fn usage_of(value: &serde_json::Value) -> Usage {
@@ -336,7 +439,6 @@ mod tests {
         Invocation {
             model,
             system_prompt_file: sp,
-            system_prompt: "sys",
             prompt_file: None,
             surface: ToolSurface::Full,
             streaming: false,
@@ -662,6 +764,95 @@ mod tests {
             Claude.classify_exit(r#"{"is_error":true,"result":"USAGE POLICY says no"}"#, ""),
             ExitClass::Refusal(_)
         ));
+    }
+
+    #[test]
+    fn project_key_matches_the_cli_convention() {
+        assert_eq!(
+            project_key(Path::new("/nonexistent/pulse-null/echo")),
+            "-nonexistent-pulse-null-echo"
+        );
+        assert_eq!(
+            project_key(Path::new("/nonexistent/a.b_c")),
+            "-nonexistent-a-b-c"
+        );
+    }
+
+    #[test]
+    fn probes_need_the_oauth_token_and_never_an_api_key() {
+        assert!(Claude.probe_auth_ready(&|k| k == OAUTH_TOKEN_ENV).is_ok());
+        let err = Claude
+            .probe_auth_ready(&|k| k == "ANTHROPIC_API_KEY")
+            .unwrap_err();
+        assert!(err.contains(OAUTH_TOKEN_ENV), "{err}");
+    }
+
+    #[test]
+    fn scratch_vendor_moves_config_and_rekeys_auto_memory() {
+        let home = tempfile::tempdir().unwrap();
+        let live_root = tempfile::tempdir().unwrap();
+        let item_root = tempfile::tempdir().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let live = home.path().join(".claude");
+        std::fs::create_dir_all(live.join("rules")).unwrap();
+        std::fs::write(live.join("rules/r.md"), "rule").unwrap();
+        std::fs::write(live.join(".credentials.json"), "never copied").unwrap();
+        std::fs::write(
+            live.join("settings.json"),
+            r#"{"model":"x","hooks":{"SessionEnd":[{"hooks":[{"type":"command","command":"rm -rf /"}]}]}}"#,
+        )
+        .unwrap();
+        let live_memory = live
+            .join("projects")
+            .join(project_key(live_root.path()))
+            .join("memory");
+        std::fs::create_dir_all(&live_memory).unwrap();
+        std::fs::write(live_memory.join("MEMORY.md"), "remembered").unwrap();
+
+        let scratch = Claude
+            .scratch_vendor(&VendorScratchSpec {
+                live_home: home.path(),
+                live_root: live_root.path(),
+                item_root: item_root.path(),
+                dir: dir.path(),
+                profile: VendorProfile::Pulse,
+            })
+            .unwrap();
+        let config_dir = dir.path().join("claude");
+        assert!(scratch.env.contains(&(
+            "CLAUDE_CONFIG_DIR".to_string(),
+            config_dir.display().to_string()
+        )));
+        assert!(scratch.watched.is_empty());
+        let settings: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(config_dir.join("settings.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(settings["model"], "x");
+        assert!(settings.get("hooks").is_none());
+        assert!(config_dir.join("rules/r.md").exists());
+        assert!(!config_dir.join(".credentials.json").exists());
+        let moved = config_dir
+            .join("projects")
+            .join(project_key(item_root.path()))
+            .join("memory/MEMORY.md");
+        assert_eq!(std::fs::read_to_string(moved).unwrap(), "remembered");
+
+        let bare_dir = tempfile::tempdir().unwrap();
+        let bare = Claude
+            .scratch_vendor(&VendorScratchSpec {
+                live_home: home.path(),
+                live_root: live_root.path(),
+                item_root: item_root.path(),
+                dir: bare_dir.path(),
+                profile: VendorProfile::Bare,
+            })
+            .unwrap();
+        assert!(bare.env.iter().any(|(k, _)| k == "CLAUDE_CONFIG_DIR"));
+        let entries = std::fs::read_dir(bare_dir.path().join("claude"))
+            .unwrap()
+            .count();
+        assert_eq!(entries, 0, "a bare arm carries no scaffold");
     }
 
     #[test]

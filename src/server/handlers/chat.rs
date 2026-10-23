@@ -1028,6 +1028,22 @@ mod tests {
     use super::*;
 
     #[test]
+    fn the_user_turn_is_warning_then_channel_then_message() {
+        use crate::server::injection;
+        use crate::server::prompt::compose_user_message;
+        assert_eq!(
+            compose_user_message(false, None, "hi"),
+            "\nUser message: hi"
+        );
+        let full = compose_user_message(true, Some("dee: earlier"), "hi");
+        assert!(full.starts_with(injection::INJECTION_WARNING));
+        let channel = full.find("[Recent channel activity]").unwrap();
+        let message = full.find("User message: hi").unwrap();
+        assert!(channel < message);
+        assert!(full.contains("dee: earlier\n[End channel activity]"));
+    }
+
+    #[test]
     fn owner_prompt_unchanged() {
         let base = "You are Echo.";
         let result = build_identity_system_prompt(base, &SessionKey::owner(), "D");
