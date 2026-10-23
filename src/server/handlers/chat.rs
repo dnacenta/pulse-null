@@ -493,11 +493,7 @@ const STREAM_CHANNEL_CAPACITY: usize = 256;
 
 fn sse_event(ev: &crate::wire::ChatStreamEvent) -> Event {
     let (name, data) = ev.to_sse_parts();
-    // A serde_json::Value always serializes; the Err arm is unreachable.
-    Event::default()
-        .event(name.clone())
-        .json_data(data)
-        .unwrap_or_else(|_| Event::default().event(name).data("{}"))
+    Event::default().event(name).data(data)
 }
 
 /// Encode one turn event as the shared wire type.

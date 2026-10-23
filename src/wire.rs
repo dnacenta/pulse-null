@@ -76,12 +76,62 @@ pub enum ChatStreamEvent {
 impl ChatStreamEvent {
     /// Split into the SSE event name and its JSON data.
     ///
-    /// Serializing a tagged enum cannot fail, so this never panics.
+    /// The name is a static string. The data is encoded once, with object
+    /// keys in alphabetical order, the same form `docs/http-api.md` shows.
     #[must_use]
-    pub fn to_sse_parts(&self) -> (String, serde_json::Value) {
-        let v = serde_json::to_value(self).unwrap_or_default();
-        let name = v["event"].as_str().unwrap_or("error").to_string();
-        let data = v.get("data").cloned().unwrap_or(serde_json::Value::Null);
+    pub fn to_sse_parts(&self) -> (&'static str, String) {
+        let (name, mut fields) = match self {
+            Self::Status { status, name } => {
+                let mut fields = vec![("status", json_str(phase_name(*status)))];
+                if let Some(name) = name {
+                    fields.push(("name", serde_json::Value::String(name.clone())));
+                }
+                ("status", fields)
+            }
+            Self::Delta { text } => (
+                "delta",
+                vec![("text", serde_json::Value::String(text.clone()))],
+            ),
+            Self::Segment { index, tool } => (
+                "segment",
+                vec![
+                    ("index", json_u64(u64::from(*index))),
+                    ("tool", serde_json::Value::Bool(*tool)),
+                ],
+            ),
+            Self::Reset { reason } => ("reset", vec![("reason", json_str(reset_name(*reason)))]),
+            Self::Done {
+                text,
+                model,
+                tokens_in,
+                tokens_out,
+                isolation,
+                truncated,
+            } => (
+                "done",
+                vec![
+                    ("isolation", serde_json::Value::Bool(*isolation)),
+                    ("model", serde_json::Value::String(model.clone())),
+                    ("text", serde_json::Value::String(text.clone())),
+                    ("tokens_in", json_opt_u32(*tokens_in)),
+                    ("tokens_out", json_opt_u32(*tokens_out)),
+                    ("truncated", serde_json::Value::Bool(*truncated)),
+                ],
+            ),
+            Self::Error { status, message } => (
+                "error",
+                vec![
+                    ("message", serde_json::Value::String(message.clone())),
+                    ("status", json_u64(u64::from(*status))),
+                ],
+            ),
+        };
+        fields.sort_by_key(|(key, _)| *key);
+        let mut map = serde_json::Map::new();
+        for (key, value) in fields {
+            map.insert(key.to_string(), value);
+        }
+        let data = serde_json::to_string(&map).unwrap_or_else(|_| "{}".to_string());
         (name, data)
     }
 
@@ -91,6 +141,36 @@ impl ChatStreamEvent {
     pub fn from_sse_parts(name: &str, data: &str) -> Option<Self> {
         let data: serde_json::Value = serde_json::from_str(data).ok()?;
         serde_json::from_value(serde_json::json!({ "event": name, "data": data })).ok()
+    }
+}
+
+fn phase_name(phase: TurnPhase) -> &'static str {
+    match phase {
+        TurnPhase::Thinking => "thinking",
+        TurnPhase::Tool => "tool",
+        TurnPhase::Responding => "responding",
+    }
+}
+
+fn reset_name(reason: ResetReason) -> &'static str {
+    match reason {
+        ResetReason::Fallback => "fallback",
+        ResetReason::Guard => "guard",
+    }
+}
+
+fn json_str(text: &str) -> serde_json::Value {
+    serde_json::Value::String(text.to_string())
+}
+
+fn json_u64(n: u64) -> serde_json::Value {
+    serde_json::Value::Number(n.into())
+}
+
+fn json_opt_u32(n: Option<u32>) -> serde_json::Value {
+    match n {
+        Some(n) => json_u64(u64::from(n)),
+        None => serde_json::Value::Null,
     }
 }
 
@@ -423,7 +503,7 @@ mod tests {
         ];
         for ev in events {
             let (name, data) = ev.to_sse_parts();
-            let back = ChatStreamEvent::from_sse_parts(&name, &data.to_string()).unwrap();
+            let back = ChatStreamEvent::from_sse_parts(name, &data).unwrap();
             assert_eq!(back, ev);
         }
         assert_eq!(
@@ -457,8 +537,7 @@ mod tests {
                 let (back_name, back_data) = parsed.to_sse_parts();
                 assert_eq!(back_name, event, "{data}");
                 assert_eq!(back_data.to_string(), data, "{event}");
-                let again =
-                    ChatStreamEvent::from_sse_parts(&back_name, &back_data.to_string()).unwrap();
+                let again = ChatStreamEvent::from_sse_parts(back_name, &back_data).unwrap();
                 assert_eq!(again, parsed);
                 seen += 1;
             }

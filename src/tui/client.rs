@@ -78,10 +78,11 @@ pub type ChatEvent = crate::wire::ChatStreamEvent;
 #[must_use]
 pub fn chat_event_from_sse(ev: &SseEvent) -> Option<ChatEvent> {
     // `segment` and `reset` are a speech-client contract. A screen replaces
-    // whatever streamed with `done.text`, so these events are not rendered.
-    match ChatEvent::from_sse_parts(ev.event.as_deref()?, &ev.data)? {
-        ChatEvent::Segment { .. } | ChatEvent::Reset { .. } => None,
-        other => Some(other),
+    // whatever streamed with `done.text`, so these events are not rendered
+    // and are not decoded.
+    match ev.event.as_deref()? {
+        "segment" | "reset" => None,
+        name => ChatEvent::from_sse_parts(name, &ev.data),
     }
 }
 
