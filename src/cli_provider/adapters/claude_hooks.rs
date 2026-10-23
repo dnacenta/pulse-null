@@ -181,6 +181,37 @@ fn is_recall_command(command: &str, sub: &str) -> bool {
     })
 }
 
+/// `sh -c` / `bash -c` whose script is itself a recall-echo `consume`.
+/// Reported, never deleted: a wrapper is a hand-written command.
+fn is_wrapped_consume(command: &str) -> bool {
+    let words = shell_words(command);
+    let (Some(bin), Some(flag), Some(script)) = (words.first(), words.get(1), words.get(2)) else {
+        return false;
+    };
+    if flag.quoted || flag.text != "-c" {
+        return false;
+    }
+    let name = Path::new(&bin.text).file_name().and_then(|n| n.to_str());
+    if !matches!(name, Some("sh" | "bash")) {
+        return false;
+    }
+    is_recall_command(&script.text, "consume")
+}
+
+fn has_wrapped_consume(existing: &serde_json::Value) -> bool {
+    existing["hooks"]
+        .as_object()
+        .into_iter()
+        .flat_map(|events| events.values())
+        .flat_map(|entries| entries.as_array().into_iter().flatten())
+        .flat_map(|entry| entry["hooks"].as_array().into_iter().flatten())
+        .filter_map(|hook| hook["command"].as_str())
+        .any(is_wrapped_consume)
+}
+
+const WRAPPED_CONSUME_REASON: &str =
+    "retired consume still runs inside an sh -c or bash -c wrapper; left in place";
+
 /// Drop recall-echo `sub` hooks from one event entry, keeping every other
 /// hook in it. `None` when nothing is left worth keeping.
 fn strip_recall_hooks(mut entry: serde_json::Value, sub: &str) -> Option<serde_json::Value> {
@@ -271,7 +302,8 @@ fn has_canonical_hooks(existing: &serde_json::Value, ours: &serde_json::Value) -
     });
     let retired_absent = RETIRED_RECALL_HOOKS
         .iter()
-        .all(|(event, sub)| recall_commands(existing, event, sub).is_empty());
+        .all(|(event, sub)| recall_commands(existing, event, sub).is_empty())
+        && !has_wrapped_consume(existing);
     installed && retired_absent
 }
 
@@ -304,8 +336,12 @@ fn ensure_settings(path: &Path, ours: &serde_json::Value, within: &Path) -> Boot
         Err(e) => return item(ItemStatus::Skipped(e)),
     };
     let was_present = existing.is_some();
+    let wrapped = existing.as_ref().is_some_and(has_wrapped_consume);
     let merged = merge_hooks(existing.clone().unwrap_or(serde_json::json!({})), ours);
     if existing.as_ref() == Some(&merged) {
+        if wrapped {
+            return item(ItemStatus::Skipped(WRAPPED_CONSUME_REASON.into()));
+        }
         return item(ItemStatus::Exists);
     }
     let rendered = match serde_json::to_string_pretty(&merged) {
@@ -585,7 +621,9 @@ pub(super) fn verify_files(pulse_root: &Path) -> Vec<BootstrapItem> {
         Ok(Some(text)) => match serde_json::from_str::<serde_json::Value>(&text) {
             Ok(existing) => {
                 let ours = render_hooks(&recall_bin, &pulse_root);
-                if has_canonical_hooks(&existing, &ours) {
+                if has_wrapped_consume(&existing) {
+                    ItemStatus::Wrong(WRAPPED_CONSUME_REASON.into())
+                } else if has_canonical_hooks(&existing, &ours) {
                     ItemStatus::Exists
                 } else {
                     ItemStatus::Wrong("recall-echo hooks missing or stale".into())
@@ -1210,6 +1248,78 @@ mod tests {
             "sh -c 'recall-echo consume /e'",
             "consume"
         ));
+        assert!(is_wrapped_consume("sh -c 'recall-echo consume /e'"));
+        assert!(is_wrapped_consume("bash -c 'recall-echo consume /e'"));
+        assert!(is_wrapped_consume("/bin/sh -c 'recall-echo consume /e'"));
+        assert!(is_wrapped_consume(
+            "/usr/bin/bash -c 'recall-echo consume /e || true'"
+        ));
+        assert!(!is_wrapped_consume("sh -c 'echo hi'"));
+        assert!(!is_wrapped_consume("sh -lc 'recall-echo consume /e'"));
+        assert!(!is_wrapped_consume("sh -c 'echo recall-echo consume'"));
+    }
+
+    #[test]
+    fn wrapped_consume_is_flagged_not_deleted() {
+        let dir = pulse();
+        let root = dir.path().canonicalize().unwrap();
+        let bin = "recall-echo";
+        let path = root.join(".claude/settings.json");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+
+        for command in [
+            "sh -c 'recall-echo consume /e'",
+            "bash -c 'recall-echo consume /e'",
+            "/bin/sh -c 'recall-echo consume /e'",
+        ] {
+            let mut hooks = render_hooks(bin, &root);
+            hooks["SessionStart"] = serde_json::json!([{
+                "hooks": [{"type": "command", "command": command}]
+            }]);
+            let original = serde_json::to_string_pretty(&serde_json::json!({ "hooks": hooks }))
+                .unwrap()
+                + "\n";
+            std::fs::write(&path, &original).unwrap();
+
+            let before = verify_files(&root)
+                .into_iter()
+                .find(|item| item.path == path)
+                .unwrap();
+            assert!(
+                matches!(before.status, ItemStatus::Wrong(ref reason) if reason == WRAPPED_CONSUME_REASON),
+                "{command}: {before:?}"
+            );
+
+            let items = ensure_files(&root, bin);
+            let settings = items.iter().find(|item| item.path == path).unwrap();
+            assert!(
+                matches!(settings.status, ItemStatus::Skipped(ref reason) if reason == WRAPPED_CONSUME_REASON),
+                "{command}: {settings:?}"
+            );
+            assert_eq!(
+                std::fs::read_to_string(&path).unwrap(),
+                original,
+                "{command} was edited"
+            );
+        }
+
+        // A wrapper that is not consume does not make a canonical file unhealthy.
+        let mut hooks = render_hooks(bin, &root);
+        hooks["Stop"] = serde_json::json!([{
+            "hooks": [{"type": "command", "command": "sh -c 'echo hi'"}]
+        }]);
+        let original =
+            serde_json::to_string_pretty(&serde_json::json!({ "hooks": hooks })).unwrap() + "\n";
+        std::fs::write(&path, &original).unwrap();
+        let healthy = verify_files(&root)
+            .into_iter()
+            .find(|item| item.path == path)
+            .unwrap();
+        assert_eq!(healthy.status, ItemStatus::Exists, "{healthy:?}");
+        let again = ensure_files(&root, bin);
+        let settings = again.iter().find(|item| item.path == path).unwrap();
+        assert_eq!(settings.status, ItemStatus::Exists, "{settings:?}");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
     }
 
     #[test]
