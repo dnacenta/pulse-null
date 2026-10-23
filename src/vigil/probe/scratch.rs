@@ -709,7 +709,8 @@ fn rewrite_recall_echo_config(
     let text = crate::fs_safe::read_bounded(&path, 1024 * 1024)
         .map_err(|e| unsafe_file(e.to_string()))?
         .unwrap_or_default();
-    let mut doc: toml::Table = toml::from_str(&text).map_err(|e| unsafe_file(e.to_string()))?;
+    let mut doc: toml::Table = toml::from_str(&text)
+        .map_err(|e| unsafe_file(crate::plugins::config_error::describe(&e)))?;
     let rewritten = scratch_recall_echo_config(&mut doc, item_root, live_root, run_dir, graph);
     rewritten.map_err(unsafe_file)?;
     let rendered = toml::to_string(&doc).map_err(|e| unsafe_file(e.to_string()))?;

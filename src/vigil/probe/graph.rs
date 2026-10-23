@@ -122,8 +122,12 @@ impl LiveGraph {
     /// live root credential there) and the namespace and database are the
     /// ones the runtime provisions for `pulse`.
     pub fn from_recall_echo_config(text: &str, pulse: &str) -> Result<Option<Self>, GraphError> {
-        let doc: toml::Table =
-            toml::from_str(text).map_err(|e| GraphError::Unsafe(format!("not valid TOML: {e}")))?;
+        let doc: toml::Table = toml::from_str(text).map_err(|e| {
+            GraphError::Unsafe(format!(
+                "[graph]: {}",
+                crate::plugins::config_error::describe(&e)
+            ))
+        })?;
         let Some(graph) = doc.get("graph").and_then(toml::Value::as_table) else {
             return Ok(None);
         };
@@ -141,10 +145,9 @@ impl LiveGraph {
         let addr = loopback_addr(field("url")?)?;
         let namespace = field("namespace")?;
         if namespace != crate::surrealdb_manager::NAMESPACE {
-            return Err(GraphError::Unsafe(format!(
-                "[graph] namespace '{namespace}' is not the runtime's ('{}')",
-                crate::surrealdb_manager::NAMESPACE
-            )));
+            return Err(GraphError::Unsafe(
+                "[graph] namespace: expected the runtime namespace".into(),
+            ));
         }
         let database = field("database")?;
         if !database.eq_ignore_ascii_case(pulse)
@@ -152,9 +155,9 @@ impl LiveGraph {
                 .chars()
                 .all(|c| c.is_ascii_alphanumeric() || c == '_')
         {
-            return Err(GraphError::Unsafe(format!(
-                "[graph] database '{database}' is not this pulse's ('{pulse}')"
-            )));
+            return Err(GraphError::Unsafe(
+                "[graph] database: expected this pulse's name".into(),
+            ));
         }
         Ok(Some(Self {
             addr,
@@ -178,7 +181,7 @@ fn loopback_addr(url: &str) -> Result<String, GraphError> {
         .find_map(|scheme| url.strip_prefix(scheme))
         .unwrap_or(url)
         .trim_end_matches('/');
-    let refused = || GraphError::Unsafe(format!("[graph] url '{url}' is not a loopback address"));
+    let refused = || GraphError::Unsafe("[graph] url: expected a loopback host:port".into());
     let (host, port) = bare.rsplit_once(':').ok_or_else(refused)?;
     port.parse::<u16>().map_err(|_| refused())?;
     let loopback = host == "localhost"
@@ -1161,6 +1164,24 @@ mod tests {
         )
         .unwrap()
         .is_some());
+    }
+
+    /// A pulse-writable recall-echo config must not be copied into the error.
+    #[test]
+    fn a_config_error_names_the_key_and_not_the_value() {
+        let secret = "super-secret-value";
+        let broken = format!("[graph]\nmode = \"{secret}");
+        let toml_err = LiveGraph::from_recall_echo_config(&broken, "echo").unwrap_err();
+        assert!(!toml_err.to_string().contains(secret), "{toml_err}");
+        let url_err = LiveGraph::from_recall_echo_config(
+            &config(&format!("https://{secret}:443"), "nullarc", "echo"),
+            "echo",
+        )
+        .unwrap_err();
+        let msg = url_err.to_string();
+        assert!(!msg.contains(secret), "{msg}");
+        assert!(msg.contains("url"), "{msg}");
+        assert!(msg.contains("loopback"), "{msg}");
     }
 
     #[test]

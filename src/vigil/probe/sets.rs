@@ -216,7 +216,8 @@ fn definition_sha256(file_sha256: &str, arms: &[Arm]) -> String {
 
 impl LoadedSet {
     fn parse(text: &str) -> Result<Self, String> {
-        let set: ItemSet = toml::from_str(text).map_err(|e| e.to_string())?;
+        let set: ItemSet =
+            toml::from_str(text).map_err(|e| crate::plugins::config_error::describe(&e))?;
         check_items(&set)?;
         let file_sha256 = hex(&Sha256::digest(text.as_bytes()));
         let sha256 = definition_sha256(&file_sha256, &set.arms);

@@ -1,6 +1,10 @@
 pub mod manager;
 pub mod registry;
 
+/// Shared by the optional plugins and the probe runner. The probe parses
+/// pulse-writable TOML and must report a failure the same way.
+pub(crate) mod config_error;
+
 // Core modules (always included)
 pub mod recall_echo;
 

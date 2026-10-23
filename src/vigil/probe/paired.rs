@@ -161,7 +161,8 @@ impl LoadedPairs {
     }
 
     fn parse(text: &str) -> Result<Self, String> {
-        let set: PairSet = toml::from_str(text).map_err(|e| e.to_string())?;
+        let set: PairSet =
+            toml::from_str(text).map_err(|e| crate::plugins::config_error::describe(&e))?;
         if set.pairs.is_empty() || set.offsets_days.is_empty() {
             return Err("paired-facts set has no pairs or no offsets".into());
         }
