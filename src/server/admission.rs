@@ -91,35 +91,49 @@ pub(crate) fn admit_turn(
     refuse_peer_on_owner_channel(&who, &req.channel).map_err(http_error)?;
     refuse_voice_off_channel(&who, &req.channel).map_err(http_error)?;
 
-    // The key and call-set choice, moved from `run_turn`.
-    let key = match &who {
+    let key = resolve_key(state, &who, &req)?;
+    let call = is_call(&who);
+    count_guest(state, &who, &key, call)?;
+    Ok(Admitted {
+        key,
+        is_call: call,
+        request: req,
+        identity: who,
+    })
+}
+
+/// The session key for an identity that already passed the admission checks.
+fn resolve_key(
+    state: &AppState,
+    who: &AuthIdentity,
+    req: &ChatRequest,
+) -> Result<SessionKey, AdmitError> {
+    match who {
         AuthIdentity::Owner => {
             // A demoted `channel: voice` body is still this principal. It
             // must not open `guest:anonymous` (or the named sender) in the
             // call set, which is the session a real voice credential uses.
-            if req
-                .channel
-                .eq_ignore_ascii_case(crate::server::turns::VOICE_CHANNEL)
-            {
-                SessionKey::owner()
-            } else {
-                resolve_sender(
-                    &req.channel,
-                    req.sender.as_deref(),
-                    &state.config.owner,
-                    &state.config.peers,
-                )
-            }
+            Ok(
+                if req
+                    .channel
+                    .eq_ignore_ascii_case(crate::server::turns::VOICE_CHANNEL)
+                {
+                    SessionKey::owner()
+                } else {
+                    resolve_sender(
+                        &req.channel,
+                        req.sender.as_deref(),
+                        &state.config.owner,
+                        &state.config.peers,
+                    )
+                },
+            )
         }
-        AuthIdentity::Peer(name) => {
-            refuse_peer_on_owner_channel(&who, &req.channel).map_err(http_error)?;
-            SessionKey::peer(name)
-        }
+        AuthIdentity::Peer(name) => Ok(SessionKey::peer(name)),
         AuthIdentity::Plugin { name, channel } => {
-            resolve_plugin_key(name, channel, &req, &state.config).map_err(http_error)?
+            resolve_plugin_key(name, channel, req, &state.config).map_err(http_error)
         }
         AuthIdentity::Voice => {
-            refuse_voice_off_channel(&who, &req.channel).map_err(http_error)?;
             // The credential is not the person on the call, and a blank
             // sender would collapse every such call onto one key.
             let sender = req.sender.as_deref().unwrap_or("");
@@ -129,25 +143,21 @@ pub(crate) fn admit_turn(
                     "a voice turn needs a sender".to_string(),
                 ));
             }
-            SessionKey::guest(sender)
+            Ok(SessionKey::guest(sender))
         }
-    };
-    // The call set is only a voice identity. A demoted body that says
-    // `voice` keeps the principal's ordinary session.
-    let is_call = match &who {
+    }
+}
+
+/// The call set is only a voice identity. A demoted body that says `voice`
+/// keeps the principal's ordinary session.
+fn is_call(who: &AuthIdentity) -> bool {
+    match who {
         AuthIdentity::Voice => true,
         AuthIdentity::Plugin { channel, .. } => {
             channel.eq_ignore_ascii_case(crate::server::turns::VOICE_CHANNEL)
         }
         AuthIdentity::Owner | AuthIdentity::Peer(_) => false,
-    };
-    count_guest(state, &who, &req, &key)?;
-    Ok(Admitted {
-        key,
-        is_call,
-        request: req,
-        identity: who,
-    })
+    }
 }
 
 /// Guest caps for a plugin principal and for the HTTP voice credential.
@@ -156,8 +166,8 @@ pub(crate) fn admit_turn(
 fn count_guest(
     state: &AppState,
     who: &AuthIdentity,
-    req: &ChatRequest,
     key: &SessionKey,
+    is_call: bool,
 ) -> Result<(), AdmitError> {
     let ledger = match who {
         AuthIdentity::Plugin { name, .. } => *name,
@@ -167,10 +177,7 @@ fn count_guest(
     if !key.is_guest() {
         return Ok(());
     }
-    let kind = if req
-        .channel
-        .eq_ignore_ascii_case(crate::server::turns::VOICE_CHANNEL)
-    {
+    let kind = if is_call {
         GuestKind::Call
     } else {
         GuestKind::Sender
