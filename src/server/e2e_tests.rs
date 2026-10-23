@@ -1909,14 +1909,60 @@ async fn e2e_chat_stream_reset_jumps_a_full_channel() {
     );
 }
 
-/// A segment that does not fit on a full delta channel is written before a
-/// delta the provider emits after it. The body stays unread until that
-/// segment is parked, then two frames are taken so one channel slot frees
-/// and the later delta can land.
+fn assert_flood_segment_then_later(frames: &[(String, String)]) {
+    let segment = frame_index(frames, |event, data| {
+        event == "segment" && data.contains(r#""tool":true"#)
+    });
+    let later = frame_index(frames, |event, data| {
+        event == "delta" && data.contains("LATER")
+    });
+    assert!(
+        segment < later,
+        "segment did not precede the later delta: {frames:?}"
+    );
+    let mut saw_flood = false;
+    for (index, (event, data)) in frames.iter().enumerate() {
+        if event == "delta" && data.contains(r#""text":"a""#) {
+            saw_flood = true;
+            assert!(
+                index < segment,
+                "a queued delta followed the segment it belongs before: {frames:?}"
+            );
+        }
+    }
+    assert!(saw_flood, "the queued flood never arrived: {frames:?}");
+}
+
+async fn read_sse_releasing(response: axum::response::Response, release: &Notify) -> String {
+    use tokio_stream::StreamExt as _;
+
+    let mut body = response.into_body().into_data_stream();
+    let mut seen = String::new();
+    let mut released = false;
+    loop {
+        if !released && seen.matches("\n\n").count() >= 2 {
+            release.notify_one();
+            released = true;
+        }
+        if released && seen.contains("event: done") && seen.ends_with("\n\n") {
+            return seen;
+        }
+        let chunk = tokio::time::timeout(std::time::Duration::from_secs(5), body.next())
+            .await
+            .expect("stream stalled before the later delta")
+            .expect("stream ended before the later delta")
+            .expect("body error");
+        seen.push_str(&String::from_utf8_lossy(&chunk));
+    }
+}
+
+/// A segment that does not fit on a full delta channel is written after the
+/// deltas already queued and before a delta the provider emits after it.
+/// The body stays unread until that segment is parked, then two frames are
+/// taken so one channel slot frees and the later delta can land.
 #[tokio::test]
 async fn e2e_chat_stream_segment_precedes_a_later_delta() {
     use crate::streaming::{StreamEvent, StreamingProvider};
-    use tokio_stream::StreamExt as _;
 
     const FLOOD: usize = 400;
 
@@ -1990,36 +2036,125 @@ async fn e2e_chat_stream_segment_precedes_a_later_delta() {
     assert_eq!(response.status(), StatusCode::OK);
     within_test_wait("segment parked on a full channel", parked.notified()).await;
 
-    let mut body = response.into_body().into_data_stream();
-    let mut seen = String::new();
-    let mut released = false;
-    let text = loop {
-        if !released && seen.matches("\n\n").count() >= 2 {
-            release.notify_one();
-            released = true;
+    let text = read_sse_releasing(response, &release).await;
+    assert_flood_segment_then_later(&sse_frames(&text));
+}
+
+/// The same order when the segment is flushed from a voice hold onto a full
+/// channel: every queued flood delta, then the segment, then the later delta.
+#[tokio::test]
+async fn e2e_chat_stream_flushed_segment_keeps_its_place() {
+    use std::sync::atomic::{AtomicU32, Ordering};
+
+    use crate::streaming::{StreamEvent, StreamingProvider};
+
+    const FLOOD: usize = 400;
+
+    struct FloodThenHold {
+        round: AtomicU32,
+        parked: Arc<Notify>,
+        release: Arc<Notify>,
+    }
+
+    impl LmProvider for FloodThenHold {
+        fn invoke(
+            &self,
+            _system_prompt: &str,
+            _messages: &[Message],
+            _max_tokens: u32,
+            _tools: Option<&[serde_json::Value]>,
+        ) -> LlmResult<'_> {
+            Box::pin(async { Err("unused".into()) })
         }
-        if released && seen.contains("event: done") && seen.ends_with("\n\n") {
-            break seen;
+        fn name(&self) -> &str {
+            "flood-then-hold"
         }
-        let chunk = tokio::time::timeout(std::time::Duration::from_secs(5), body.next())
-            .await
-            .expect("stream stalled before the later delta")
-            .expect("stream ended before the later delta")
-            .expect("body error");
-        seen.push_str(&String::from_utf8_lossy(&chunk));
-    };
-    assert!(released, "the later delta was never given a free slot");
-    let frames = sse_frames(&text);
-    let segment = frame_index(&frames, |event, data| {
-        event == "segment" && data.contains(r#""tool":true"#)
-    });
-    let later = frame_index(&frames, |event, data| {
-        event == "delta" && data.contains("LATER")
-    });
-    assert!(
-        segment < later,
-        "segment did not precede the later delta: {frames:?}"
-    );
+        fn supports_tools(&self) -> bool {
+            true
+        }
+    }
+
+    impl StreamingProvider for FloodThenHold {
+        fn supports_streaming(&self) -> bool {
+            true
+        }
+        fn invoke_streaming(
+            &self,
+            _system_prompt: &str,
+            _messages: &[Message],
+            _max_tokens: u32,
+            _tools: Option<&[serde_json::Value]>,
+        ) -> crate::streaming::StreamResult<'_> {
+            let n = self.round.fetch_add(1, Ordering::SeqCst);
+            let parked = Arc::clone(&self.parked);
+            let release = Arc::clone(&self.release);
+            Box::pin(async_stream::stream! {
+                if n == 0 {
+                    for _ in 0..FLOOD {
+                        yield StreamEvent::TextDelta("a".into());
+                    }
+                    yield StreamEvent::SegmentEnd { tool_use: true };
+                    yield StreamEvent::ToolUse {
+                        id: "t1".into(),
+                        name: "file_read".into(),
+                        input: serde_json::json!({}),
+                    };
+                    yield StreamEvent::Done(LlmResponse {
+                        content: vec![
+                            ContentBlock::Text { text: "a".into() },
+                            ContentBlock::ToolUse {
+                                id: "t1".into(),
+                                name: "file_read".into(),
+                                input: serde_json::json!({}),
+                            },
+                        ],
+                        stop_reason: StopReason::ToolUse,
+                        model: "mock".into(),
+                        input_tokens: Some(1),
+                        output_tokens: Some(1),
+                    });
+                } else {
+                    // The first round has already flushed its hold.
+                    parked.notify_one();
+                    release.notified().await;
+                    yield StreamEvent::TextDelta("LATER".into());
+                    yield StreamEvent::Done(LlmResponse {
+                        content: vec![ContentBlock::Text { text: "ok".into() }],
+                        stop_reason: StopReason::EndTurn,
+                        model: "mock".into(),
+                        input_tokens: Some(1),
+                        output_tokens: Some(1),
+                    });
+                }
+            })
+        }
+    }
+
+    let parked = Arc::new(Notify::new());
+    let release = Arc::new(Notify::new());
+    let dir = tempfile::tempdir().unwrap();
+    let state = build_state_boxed_with_config(
+        dir.path().to_path_buf(),
+        Box::new(FloodThenHold {
+            round: AtomicU32::new(0),
+            parked: Arc::clone(&parked),
+            release: Arc::clone(&release),
+        }),
+        ToolRegistry::new(),
+        config_with_voice_credential(),
+    )
+    .await;
+    let app = build_app(Arc::clone(&state));
+    let response = post_chat_stream_secret(&app, "voice", "hi", Some(VOICE_CREDENTIAL)).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    within_test_wait(
+        "held segment flushed onto a full channel",
+        parked.notified(),
+    )
+    .await;
+
+    let text = read_sse_releasing(response, &release).await;
+    assert_flood_segment_then_later(&sse_frames(&text));
 }
 
 /// Four open screen streams fill the chat pool. A voice identity still

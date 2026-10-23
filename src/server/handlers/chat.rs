@@ -596,9 +596,11 @@ fn error_to_sse(status: StatusCode, message: String) -> Event {
 /// as the provider yields them, unvalidated. A voice-pool stream holds the
 /// open segment and forwards a delta only after that round's guard has
 /// kept it; a cut or a refusal drops the hold and sends `reset` with no
-/// raw tail before the kept text. `reset` (and a `segment` that does not
-/// fit) is delivered on a side channel and written before any delta the
-/// client has not yet received. A consumer that stops reading loses
+/// raw tail before the kept text. `reset` is delivered on a side channel
+/// and written before any event the client has not yet received. A
+/// `segment` that does not fit is written after the events already
+/// accepted into the channel and before anything accepted later. A
+/// consumer that stops reading loses
 /// deltas rather than stalling the turn. If a `reset` was queued and not
 /// written, the stream ends with `error` instead of `done`. `done.text`
 /// is the validated, complete reply and must replace whatever was shown;
@@ -640,15 +642,15 @@ pub async fn chat_stream(
         let _close = tool_loop::ControlClose(Arc::clone(&control));
         let mut rx = rx;
         let mut reset_sent = false;
+        let mut written: u64 = 0;
         loop {
             for event in control.drain_resets() {
                 reset_sent = true;
                 yield Ok(turn_event_to_sse(event));
             }
-            // A segment that did not fit is ordered with the deltas still
-            // queued, the same way a reset is: ahead of anything not yet
-            // written. Waiting until `rx` closes lets a later delta pass it.
-            for event in control.drain_segments() {
+            // A parked segment follows the channel events accepted before
+            // it. Resets stay ahead of both.
+            for event in control.take_due(written) {
                 yield Ok(turn_event_to_sse(event));
             }
             tokio::select! {
@@ -661,10 +663,11 @@ pub async fn chat_stream(
                                 reset_sent = true;
                                 yield Ok(turn_event_to_sse(reset));
                             }
-                            for segment in control.drain_segments() {
+                            for segment in control.take_due(written) {
                                 yield Ok(turn_event_to_sse(segment));
                             }
                             yield Ok(turn_event_to_sse(event));
+                            written = written.saturating_add(1);
                         }
                         None => break,
                     }
@@ -675,7 +678,7 @@ pub async fn chat_stream(
             reset_sent = true;
             yield Ok(turn_event_to_sse(event));
         }
-        for event in control.drain_segments() {
+        for event in control.take_due(u64::MAX) {
             yield Ok(turn_event_to_sse(event));
         }
         if control.reset_queued() && !reset_sent {

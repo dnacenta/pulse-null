@@ -191,9 +191,9 @@ impl Segments {
 ///
 /// Deltas stay on the bounded channel and are dropped when it is full.
 /// A reset is queued here and the stream emits it before any further
-/// delta. A segment that does not fit on the delta channel is queued
-/// here and emitted after the deltas that did fit, so a skipped index
-/// is not how a client learns the message ended.
+/// event. A segment that does not fit records how many events had already
+/// been accepted into the channel. The stream writes it immediately after
+/// those events, and before anything accepted later.
 pub struct ControlPlane {
     pending: std::sync::Mutex<ControlPending>,
     notify: tokio::sync::Notify,
@@ -201,9 +201,18 @@ pub struct ControlPlane {
     closed: std::sync::atomic::AtomicBool,
 }
 
+struct ParkedSegment {
+    event: TurnEvent,
+    /// Emit after this many channel events have been written.
+    after: u64,
+}
+
 struct ControlPending {
     resets: std::collections::VecDeque<TurnEvent>,
-    segments: std::collections::VecDeque<TurnEvent>,
+    segments: std::collections::VecDeque<ParkedSegment>,
+    /// Events accepted into the delta channel. Published before the
+    /// corresponding send, so a reader cannot observe the event first.
+    accepted: u64,
 }
 
 impl ControlPlane {
@@ -212,6 +221,7 @@ impl ControlPlane {
             pending: std::sync::Mutex::new(ControlPending {
                 resets: std::collections::VecDeque::new(),
                 segments: std::collections::VecDeque::new(),
+                accepted: 0,
             }),
             notify: tokio::sync::Notify::new(),
             reset_queued: std::sync::atomic::AtomicBool::new(false),
@@ -224,25 +234,30 @@ impl ControlPlane {
     }
 
     pub fn push_reset(&self, event: TurnEvent) -> bool {
-        self.push(event, true)
+        if self.closed.load(std::sync::atomic::Ordering::Acquire) {
+            return false;
+        }
+        self.lock().resets.push_back(event);
+        self.reset_queued
+            .store(true, std::sync::atomic::Ordering::Release);
+        self.notify.notify_one();
+        true
+    }
+
+    /// Record one event accepted into the delta channel. Call this before
+    /// that event is sent, so `after` on a later segment includes it.
+    pub fn note_accepted(&self) {
+        let mut pending = self.lock();
+        pending.accepted = pending.accepted.saturating_add(1);
     }
 
     pub fn push_segment(&self, event: TurnEvent) -> bool {
-        self.push(event, false)
-    }
-
-    fn push(&self, event: TurnEvent, reset: bool) -> bool {
         if self.closed.load(std::sync::atomic::Ordering::Acquire) {
             return false;
         }
         let mut pending = self.lock();
-        if reset {
-            pending.resets.push_back(event);
-            self.reset_queued
-                .store(true, std::sync::atomic::Ordering::Release);
-        } else {
-            pending.segments.push_back(event);
-        }
+        let after = pending.accepted;
+        pending.segments.push_back(ParkedSegment { event, after });
         drop(pending);
         self.notify.notify_one();
         true
@@ -252,8 +267,20 @@ impl ControlPlane {
         self.lock().resets.drain(..).collect()
     }
 
-    pub fn drain_segments(&self) -> Vec<TurnEvent> {
-        self.lock().segments.drain(..).collect()
+    /// Segments whose preceding channel events have all been written.
+    pub fn take_due(&self, written: u64) -> Vec<TurnEvent> {
+        let mut pending = self.lock();
+        let mut due = Vec::new();
+        while pending
+            .segments
+            .front()
+            .is_some_and(|segment| segment.after <= written)
+        {
+            if let Some(segment) = pending.segments.pop_front() {
+                due.push(segment.event);
+            }
+        }
+        due
     }
 
     pub fn notified(&self) -> tokio::sync::futures::Notified<'_> {
@@ -426,16 +453,27 @@ impl ProgressSink {
                 return control.push_reset(event);
             }
         }
-        if matches!(event, TurnEvent::Delta(_)) {
-            self.saw_delta
-                .store(true, std::sync::atomic::Ordering::Relaxed);
+        if self.control.is_some() {
+            return self.deliver_in_order(event);
         }
-        match self.tx.try_send(event) {
-            Ok(()) => true,
-            Err(
-                tokio::sync::mpsc::error::TrySendError::Full(event)
-                | tokio::sync::mpsc::error::TrySendError::Closed(event),
-            ) => {
+        self.enqueue(event)
+    }
+
+    /// Accept `event` into the channel, or park a segment that does not fit
+    /// after every event already accepted.
+    fn deliver_in_order(&self, event: TurnEvent) -> bool {
+        use tokio::sync::mpsc::error::TrySendError;
+        match self.tx.try_reserve() {
+            Ok(permit) => {
+                if let Some(control) = &self.control {
+                    control.note_accepted();
+                }
+                self.mark_delta(&event);
+                permit.send(event);
+                true
+            }
+            Err(TrySendError::Closed(_)) => false,
+            Err(TrySendError::Full(_)) => {
                 if matches!(event, TurnEvent::Segment { .. }) {
                     if let Some(control) = &self.control {
                         return control.push_segment(event);
@@ -443,6 +481,18 @@ impl ProgressSink {
                 }
                 false
             }
+        }
+    }
+
+    fn enqueue(&self, event: TurnEvent) -> bool {
+        self.mark_delta(&event);
+        self.tx.try_send(event).is_ok()
+    }
+
+    fn mark_delta(&self, event: &TurnEvent) {
+        if matches!(event, TurnEvent::Delta(_)) {
+            self.saw_delta
+                .store(true, std::sync::atomic::Ordering::Relaxed);
         }
     }
 
