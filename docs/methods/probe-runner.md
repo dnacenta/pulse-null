@@ -91,8 +91,9 @@ cannot read them. The probe runs as its own user (`[probe] user`, default
   the receipts, same owner and mode.
 - **What the separate user closes.** The probe unit, the verify unit and
   the export unit run as `pulse-probe` (or `[probe] user`). A run refuses
-  when its effective uid is the owner of the live pulse directory, or when
-  `record/probes` is readable by that uid. The credentials directory
+  when its effective uid is the owner of the live pulse directory, when
+  `record/probes` is readable by that uid, or when the record carries a
+  named access-list entry. The credentials directory
   systemd builds for the unit is that user's, so the live pulse cannot read
   the sets while a run is up. Scratch, staged question files and the graph
   export live under `/var/lib/pulse-null-probe`, not under the pulse's

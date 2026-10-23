@@ -177,7 +177,8 @@ pub(crate) fn home_of(uid: u32) -> Result<PathBuf, String> {
 /// Whether `dir` can be read by `uid`. A missing directory is not readable.
 /// A symlink is treated as readable so a replaced record is refused. When
 /// the group-read bit is set and that user's groups cannot be listed, the
-/// directory is treated as readable (fail closed).
+/// directory is treated as readable (fail closed). A named entry on the
+/// directory or on a file in it is refused: the mode bits do not show it.
 fn record_readable_by(dir: &Path, uid: u32) -> Result<bool, String> {
     let meta = match std::fs::symlink_metadata(dir) {
         Ok(meta) => meta,
@@ -186,6 +187,15 @@ fn record_readable_by(dir: &Path, uid: u32) -> Result<bool, String> {
     };
     if meta.file_type().is_symlink() {
         return Ok(true);
+    }
+    match record_list(dir)? {
+        RecordList::Named => {
+            return Err(
+                "the probe record carries an access list; named entries are refused".into(),
+            );
+        }
+        RecordList::Symlink => return Ok(true),
+        RecordList::Plain => {}
     }
     use std::os::unix::fs::MetadataExt;
     let groups = groups_of(uid);
@@ -196,6 +206,115 @@ fn record_readable_by(dir: &Path, uid: u32) -> Result<bool, String> {
         uid,
         groups.as_deref(),
     ))
+}
+
+/// What an access-list walk of the record found.
+enum RecordList {
+    /// Mode bits only, or no list.
+    Plain,
+    /// A named user or group entry, beyond the base mode.
+    Named,
+    /// A symlink inside the record. The caller treats it as readable.
+    Symlink,
+}
+
+/// The record directory and the files under it. A read of the list that
+/// fails for any reason other than "no list" fails closed.
+fn record_list(dir: &Path) -> Result<RecordList, String> {
+    let mut pending = vec![dir.to_path_buf()];
+    while let Some(path) = pending.pop() {
+        let meta = std::fs::symlink_metadata(&path)
+            .map_err(|e| format!("cannot stat {}: {e}", path.display()))?;
+        if meta.file_type().is_symlink() {
+            return Ok(RecordList::Symlink);
+        }
+        if access_list_named(&path)? {
+            return Ok(RecordList::Named);
+        }
+        if meta.is_dir() {
+            for entry in std::fs::read_dir(&path)
+                .map_err(|e| format!("cannot list {}: {e}", path.display()))?
+            {
+                let entry = entry.map_err(|e| format!("cannot list {}: {e}", path.display()))?;
+                pending.push(entry.path());
+            }
+        }
+    }
+    Ok(RecordList::Plain)
+}
+
+/// `true` when the access list has a named user or group entry. `false`
+/// when there is no list. An unreadable list is an error.
+fn access_list_named(path: &Path) -> Result<bool, String> {
+    match read_access_list(path)? {
+        None => Ok(false),
+        Some(bytes) => list_has_named_entry(&bytes),
+    }
+}
+
+fn read_access_list(path: &Path) -> Result<Option<Vec<u8>>, String> {
+    let c_path = std::ffi::CString::new(path.as_os_str().as_encoded_bytes())
+        .map_err(|_| format!("{} is not a path", path.display()))?;
+    let name = std::ffi::CString::new("system.posix_acl_access").expect("a fixed attribute name");
+    let mut buf = vec![0u8; 256];
+    loop {
+        // SAFETY: lgetxattr reads at most `buf.len()` bytes into `buf` and
+        // does not follow a symlink. A negative return leaves the error in errno.
+        let rc = unsafe {
+            libc::lgetxattr(
+                c_path.as_ptr(),
+                name.as_ptr(),
+                buf.as_mut_ptr().cast(),
+                buf.len(),
+            )
+        };
+        if rc >= 0 {
+            buf.truncate(rc as usize);
+            return Ok(Some(buf));
+        }
+        let err = std::io::Error::last_os_error();
+        if err.raw_os_error() == Some(libc::ERANGE) {
+            let next = buf.len().saturating_mul(2);
+            if next > 64 * 1024 {
+                return Err(format!("access list on {} does not fit", path.display()));
+            }
+            buf.resize(next, 0);
+            continue;
+        }
+        if access_list_error(&err).is_none() {
+            return Ok(None);
+        }
+        return Err(format!(
+            "cannot read the access list on {}: {err}",
+            path.display()
+        ));
+    }
+}
+
+/// `None` only for a missing list. Every other read error fails closed.
+fn access_list_error(err: &std::io::Error) -> Option<&std::io::Error> {
+    if err.raw_os_error() == Some(libc::ENODATA) {
+        None
+    } else {
+        Some(err)
+    }
+}
+
+/// Named user (`0x02`) and named group (`0x08`) entries are beyond the
+/// base mode. Anything that is not a version-2 list fails closed.
+fn list_has_named_entry(bytes: &[u8]) -> Result<bool, String> {
+    if bytes.len() < 4 || !(bytes.len() - 4).is_multiple_of(8) {
+        return Err("access list is not readable".into());
+    }
+    let version = u32::from_le_bytes(bytes[0..4].try_into().expect("four bytes"));
+    if version != 2 {
+        return Err("access list is not readable".into());
+    }
+    let (entries, _) = bytes[4..].as_chunks::<8>();
+    Ok(entries.iter().any(|entry| {
+        let tag = u16::from_le_bytes([entry[0], entry[1]]);
+        tag == 0x02 || tag == 0x08
+    }))
 }
 
 /// Unix read permission of mode `mode` (owner `owner`, group `group`) for
@@ -594,5 +713,63 @@ mod tests {
         );
         assert!(record_readable_by(dir.path(), meta.uid()).unwrap());
         assert!(!record_readable_by(&dir.path().join("missing"), other).unwrap());
+    }
+
+    #[test]
+    fn a_named_access_list_entry_is_refused_and_a_missing_list_is_not() {
+        let base = access_list_bytes(&[(0x01, 7), (0x04, 5), (0x20, 0)]);
+        assert!(!list_has_named_entry(&base).unwrap());
+        let named = access_list_bytes(&[(0x01, 7), (0x02, 4), (0x04, 5), (0x10, 7), (0x20, 0)]);
+        assert!(list_has_named_entry(&named).unwrap());
+        assert!(
+            list_has_named_entry(&[0, 0, 0, 1]).is_err(),
+            "a bad list fails closed"
+        );
+        let enodata = std::io::Error::from_raw_os_error(libc::ENODATA);
+        assert!(access_list_error(&enodata).is_none());
+        let io = std::io::Error::from_raw_os_error(libc::EIO);
+        assert!(access_list_error(&io).is_some());
+
+        let dir = tempfile::tempdir().unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        write_access_list(dir.path(), &named);
+        let err = record_readable_by(dir.path(), 1).unwrap_err();
+        assert!(err.contains("access list"), "{err}");
+
+        let plain = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(plain.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let file = plain.path().join("items.jsonl");
+        std::fs::write(&file, b"{}\n").unwrap();
+        write_access_list(&file, &named);
+        let err = record_readable_by(plain.path(), 1).unwrap_err();
+        assert!(err.contains("access list"), "{err}");
+    }
+
+    /// A version-2 access list. `id` is unused for the base entries and a
+    /// fixed uid for a named one; the kernel accepts either.
+    fn access_list_bytes(entries: &[(u16, u16)]) -> Vec<u8> {
+        let mut bytes = 2u32.to_le_bytes().to_vec();
+        for (tag, perm) in entries {
+            bytes.extend(tag.to_le_bytes());
+            bytes.extend(perm.to_le_bytes());
+            bytes.extend(1000u32.to_le_bytes());
+        }
+        bytes
+    }
+
+    fn write_access_list(path: &Path, bytes: &[u8]) {
+        let c_path = std::ffi::CString::new(path.as_os_str().as_encoded_bytes()).unwrap();
+        let name = std::ffi::CString::new("system.posix_acl_access").unwrap();
+        let rc = unsafe {
+            libc::lsetxattr(
+                c_path.as_ptr(),
+                name.as_ptr(),
+                bytes.as_ptr().cast(),
+                bytes.len(),
+                0,
+            )
+        };
+        assert_eq!(rc, 0, "{}", std::io::Error::last_os_error());
     }
 }
