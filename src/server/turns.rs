@@ -26,6 +26,7 @@ use axum::http::StatusCode;
 use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore};
 use tokio::time::Instant;
 
+use super::admission::{admit_turn, AdmitError};
 use super::auth::AuthIdentity;
 use super::guest_budget::{GuestKind, GuestLedger, GuestRefusal};
 use super::handlers::chat::{run_turn, ChatRequest, ChatResponse};
@@ -507,12 +508,18 @@ impl PluginTurns {
             channel: self.channel.clone(),
             sender: turn.sender,
         };
-        self.admit_guest(&state, &request)?;
         let who = AuthIdentity::Plugin {
             name: self.name,
             channel: self.channel.clone(),
         };
-        run_turn(state, request, who, sink, None)
+        let admitted = admit_turn(&state, &who, &request).map_err(|error| match error {
+            AdmitError::Http(status, message) => TurnError::Refused(status, message),
+            AdmitError::Guest(GuestRefusal::DailyBudgetSpent) => TurnError::DailyBudgetSpent,
+            AdmitError::Guest(GuestRefusal::CallTurnsSpent) => TurnError::CallTurnsSpent,
+            AdmitError::Guest(GuestRefusal::SenderRateLimited) => TurnError::SenderRateLimited,
+        })?;
+        self.admit_guest(&state, &request)?;
+        run_turn(state, request, who, admitted, sink, None)
             .await
             .map_err(|(status, message)| TurnError::Refused(status, message))
     }

@@ -14,6 +14,7 @@ use axum::response::sse::{Event, KeepAlive, Sse};
 use futures_core::Stream;
 use tokio::sync::mpsc;
 
+use crate::server::admission::{admit_turn, AdmitError, Admitted};
 use crate::server::auth::AuthIdentity;
 use crate::server::AppState;
 use crate::session_store::{resolve_sender, Session};
@@ -70,7 +71,7 @@ const MAX_CHANNEL_LEN: usize = 64;
 const MAX_SENDER_LEN: usize = 64;
 
 /// Validate incoming chat request fields.
-fn validate_request(req: &ChatRequest) -> Result<(), (StatusCode, String)> {
+pub(crate) fn validate_request(req: &ChatRequest) -> Result<(), (StatusCode, String)> {
     if req.message.len() > MAX_MESSAGE_LEN {
         return Err((
             StatusCode::PAYLOAD_TOO_LARGE,
@@ -121,7 +122,10 @@ pub async fn chat(
     axum::Extension(who): axum::Extension<AuthIdentity>,
     Json(req): Json<ChatRequest>,
 ) -> Result<Json<ChatResponse>, (StatusCode, String)> {
-    run_turn(state, req, who, None, None).await.map(Json)
+    let admitted = admit_turn(&state, &who, &req).map_err(AdmitError::into_http)?;
+    run_turn(state, req, who, admitted, None, None)
+        .await
+        .map(Json)
 }
 
 /// Channels whose session is the owner's by construction.
@@ -131,7 +135,10 @@ fn is_owner_channel(channel: &str) -> bool {
 
 /// A voice credential speaks only on the voice channel. Any other channel
 /// is 403 before a stream permit is taken, so the refusal is an HTTP status.
-fn refuse_voice_off_channel(who: &AuthIdentity, channel: &str) -> Result<(), (StatusCode, String)> {
+pub(crate) fn refuse_voice_off_channel(
+    who: &AuthIdentity,
+    channel: &str,
+) -> Result<(), (StatusCode, String)> {
     if matches!(who, AuthIdentity::Voice)
         && !channel.eq_ignore_ascii_case(crate::server::turns::VOICE_CHANNEL)
     {
@@ -160,7 +167,7 @@ fn uses_voice_pool(who: &AuthIdentity) -> bool {
 /// A peer credential never reaches an owner channel — 403 before anything
 /// else (the stream endpoint checks this before it opens the stream, so the
 /// refusal is an HTTP status, not an event inside a 200).
-fn refuse_peer_on_owner_channel(
+pub(crate) fn refuse_peer_on_owner_channel(
     who: &AuthIdentity,
     channel: &str,
 ) -> Result<(), (StatusCode, String)> {
@@ -213,9 +220,9 @@ pub(crate) fn resolve_plugin_key(
     ))
 }
 
-/// Run one conversation turn end to end: identity, isolation, context buffer,
-/// session limits, compaction, the provider call (with refusal fallback),
-/// guards, persistence, and the post-interaction event.
+/// Run one already-admitted conversation turn end to end: isolation, context
+/// buffer, session limits, compaction, the provider call (with refusal
+/// fallback), guards, persistence, and the post-interaction event.
 ///
 /// `/chat` calls this with no sink and returns the response as JSON.
 /// `/api/chat/stream` passes a [`TurnSink`] and forwards every
@@ -228,74 +235,25 @@ pub(crate) async fn run_turn(
     state: Arc<AppState>,
     req: ChatRequest,
     who: AuthIdentity,
+    admitted: Admitted,
     sink: Option<TurnSink>,
     control: Option<Arc<tool_loop::ControlPlane>>,
 ) -> Result<ChatResponse, (StatusCode, String)> {
-    validate_request(&req)?;
-
-    // Authentication happened in the middleware (server/auth.rs); the
-    // identity it established is what the turn runs as. A peer credential
-    // can never become the owner through the body: the owner channels are
-    // refused, and the session key comes from the credential, not from
-    // `sender` or `channel`.
-    let resolved_key = match &who {
-        AuthIdentity::Owner => {
-            // A demoted `channel: voice` body is still this principal. It
-            // must not open `guest:anonymous` (or the named sender) in the
-            // call set, which is the session a real voice credential uses.
-            if req
-                .channel
-                .eq_ignore_ascii_case(crate::server::turns::VOICE_CHANNEL)
-            {
-                SessionKey::owner()
-            } else {
-                resolve_sender(
-                    &req.channel,
-                    req.sender.as_deref(),
-                    &state.config.owner,
-                    &state.config.peers,
-                )
-            }
-        }
-        AuthIdentity::Peer(name) => {
-            refuse_peer_on_owner_channel(&who, &req.channel)?;
-            SessionKey::peer(name)
-        }
-        AuthIdentity::Plugin { name, channel } => {
-            resolve_plugin_key(name, channel, &req, &state.config)?
-        }
-        AuthIdentity::Voice => {
-            refuse_voice_off_channel(&who, &req.channel)?;
-            // Same rule as the voice plugin: the transport's credential is
-            // not proof of the person on the call.
-            SessionKey::guest(req.sender.as_deref().unwrap_or("anonymous"))
-        }
-    };
-    // The call set is only a voice identity. A demoted body that says
-    // `voice` keeps the principal's ordinary session.
-    let is_call = match &who {
-        AuthIdentity::Voice => true,
-        AuthIdentity::Plugin { channel, .. } => {
-            channel.eq_ignore_ascii_case(crate::server::turns::VOICE_CHANNEL)
-        }
-        AuthIdentity::Owner | AuthIdentity::Peer(_) => false,
-    };
-
     // Only the owner's turns reach the agent CLI with its full tool surface;
     // a guest or peer runs on the restricted one, whatever the isolation
     // state (PN-110 audit P1). Everything below — compaction, the provider
     // call, the refusal fallback — runs inside this scope.
-    let surface = crate::tool_surface::ToolSurface::for_principal(&resolved_key);
+    let surface = crate::tool_surface::ToolSurface::for_principal(&admitted.key);
     let hold_deltas = uses_voice_pool(&who);
     crate::tool_surface::scope(
         surface,
         run_resolved_turn(
             state,
             req,
-            resolved_key,
+            admitted.key,
             sink,
             hold_deltas,
-            is_call,
+            admitted.is_call,
             control,
         ),
     )
@@ -625,13 +583,16 @@ pub async fn chat_stream(
             "too many open streams; try again shortly".to_string(),
         )
     })?;
+    // Admission after the permit: a 503 is not a turn, and a refusal here
+    // drops the permit with this return, before any frame is written.
+    let admitted = admit_turn(&state, &who, &req).map_err(AdmitError::into_http)?;
 
     let (tx, rx) = mpsc::channel::<TurnEvent>(STREAM_CHANNEL_CAPACITY);
     let (done_tx, done_rx) = tokio::sync::oneshot::channel();
     let control = Arc::new(tool_loop::ControlPlane::new());
     let control_for_turn = Arc::clone(&control);
     let task = tokio::spawn(async move {
-        let outcome = run_turn(state, req, who, Some(tx), Some(control_for_turn)).await;
+        let outcome = run_turn(state, req, who, admitted, Some(tx), Some(control_for_turn)).await;
         let _ = done_tx.send(outcome);
     });
     let guard = AbortOnDrop(task.abort_handle());

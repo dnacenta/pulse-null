@@ -3780,7 +3780,12 @@ mod plugin_turns_e2e {
             channel: "voice".to_string(),
             sender: Some("1001".to_string()),
         };
-        let outcome = handlers::chat::run_turn(Arc::clone(&state), req, who, None, None).await;
+        let outcome = match crate::server::admission::admit_turn(&state, &who, &req) {
+            Ok(admitted) => {
+                handlers::chat::run_turn(Arc::clone(&state), req, who, admitted, None, None).await
+            }
+            Err(error) => Err(error.into_http()),
+        };
         assert_eq!(outcome.err().map(|(s, _)| s), Some(StatusCode::FORBIDDEN));
         assert!(!has_session(&state, "owner").await);
     }
@@ -4329,15 +4334,12 @@ mod tool_surface_e2e {
             channel: "chat".to_string(),
             sender: None,
         };
-        handlers::chat::run_turn(
-            Arc::clone(&state),
-            peer,
-            AuthIdentity::Peer("Synth".to_string()),
-            None,
-            None,
-        )
-        .await
-        .unwrap();
+        let who = AuthIdentity::Peer("Synth".to_string());
+        let admitted =
+            crate::server::admission::admit_turn(&state, &who, &peer).expect("peer turn admitted");
+        handlers::chat::run_turn(Arc::clone(&state), peer, who, admitted, None, None)
+            .await
+            .unwrap();
         assert_eq!(
             tools(&argv_log).as_deref(),
             NO_TOOLS,
@@ -5622,15 +5624,12 @@ mod in_process_tools_e2e {
             channel: "chat".to_string(),
             sender: None,
         };
-        handlers::chat::run_turn(
-            Arc::clone(&state),
-            peer,
-            crate::server::auth::AuthIdentity::Peer("Synth".to_string()),
-            None,
-            None,
-        )
-        .await
-        .unwrap();
+        let who = crate::server::auth::AuthIdentity::Peer("Synth".to_string());
+        let admitted =
+            crate::server::admission::admit_turn(&state, &who, &peer).expect("peer turn admitted");
+        handlers::chat::run_turn(Arc::clone(&state), peer, who, admitted, None, None)
+            .await
+            .unwrap();
         assert!(last(&offered).is_empty(), "a peer: {:?}", last(&offered));
     }
 

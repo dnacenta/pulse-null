@@ -1,3 +1,4 @@
+mod admission;
 pub mod auth;
 pub mod boot;
 pub mod capability;
