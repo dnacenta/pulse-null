@@ -1346,6 +1346,41 @@ mod tests {
         assert_eq!(twin.wrong, 1, "unanswered is not made up");
     }
 
+    /// A version-6 row and a version-7 row in one summary are two labelled
+    /// groups. Their answers are not pooled, and an item-set block that
+    /// holds both is not read as a result.
+    #[test]
+    fn a_v6_row_and_a_v7_row_are_not_pooled() {
+        let dir = tempfile::tempdir().unwrap();
+        let record = Record::open(dir.path()).unwrap();
+        for version in [6, 7] {
+            let mut row = item("pulse", "correct", "claude-opus-5-5");
+            row["scorer_version"] = version.into();
+            record.append(Stream::Items, row).unwrap();
+        }
+        let summary = summary_of(&record);
+        let groups: Vec<&GroupKey> = summary
+            .groups
+            .keys()
+            .filter(|k| k.set == "known-answer/v1")
+            .collect();
+        assert_eq!(groups.len(), 2, "v6 and v7 are not one group");
+        let mut versions: Vec<&str> = groups.iter().map(|k| k.scorer_version.as_str()).collect();
+        versions.sort_unstable();
+        assert_eq!(versions, ["6", "7"]);
+        for key in &groups {
+            let n: u32 = summary.groups[*key]
+                .iter()
+                .map(|arm| arm.proportion.n)
+                .sum();
+            assert_eq!(n, 1, "a version is not pooled with the other");
+            assert!(
+                summary.interrupted.contains(*key),
+                "an item-set block with two scorer versions is not a result"
+            );
+        }
+    }
+
     /// R2-13: answers of one run are one cluster: the interval comes from
     /// the spread between runs, not from the number of items.
     #[test]
