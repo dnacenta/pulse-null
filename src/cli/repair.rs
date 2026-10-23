@@ -42,6 +42,7 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let mut changed = 0;
     let mut existing = 0;
     let mut skipped = 0;
+    let mut user_level_concern = false;
 
     for item in &results {
         println!("  {item}");
@@ -91,7 +92,9 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
 
-        match integration.user_hooks_missing_root(&home) {
+        let scan = integration.user_hooks_missing_root(&home);
+        user_level_concern = user_level_needs_attention(&scan);
+        match scan {
             UserHookScan::NotInspected { path, reason } => {
                 println!();
                 println!(
@@ -120,19 +123,13 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     println!();
+    let summary = repair_summary_line(changed, existing, user_level_concern);
     if changed > 0 {
-        println!(
-            "  {} Repaired {} item(s). {} already ok.",
-            style("✓").green().bold(),
-            changed,
-            existing
-        );
+        println!("  {} {summary}", style("✓").green().bold());
+    } else if user_level_concern {
+        println!("  {} {summary}", style("⚠").yellow().bold());
     } else {
-        println!(
-            "  {} Everything looks good. {} item(s) verified.",
-            style("✓").green().bold(),
-            existing
-        );
+        println!("  {} {summary}", style("✓").green().bold());
     }
     if skipped > 0 {
         println!(
@@ -144,6 +141,25 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
     println!();
 
     Ok(())
+}
+
+/// Final repair line. A user-level report, or a file that was not inspected,
+/// means the run is not clean even when no pulse file changed.
+fn repair_summary_line(changed: usize, existing: usize, user_level_concern: bool) -> String {
+    if changed > 0 {
+        format!("Repaired {changed} item(s). {existing} already ok.")
+    } else if user_level_concern {
+        format!("User-level hooks still need attention. {existing} item(s) verified.")
+    } else {
+        format!("Everything looks good. {existing} item(s) verified.")
+    }
+}
+
+fn user_level_needs_attention(scan: &UserHookScan) -> bool {
+    match scan {
+        UserHookScan::NotInspected { .. } => true,
+        UserHookScan::Inspected(hooks) => !hooks.is_empty(),
+    }
 }
 
 struct UserHookWarning {
@@ -261,5 +277,33 @@ mod tests {
             "{line}"
         );
         assert!(line.contains("was not inspected"), "{line}");
+    }
+
+    #[test]
+    fn summary_line_is_not_clean_after_a_user_level_warning() {
+        let reported = UserHookScan::Inspected(vec![ReportedUserHook {
+            command: "recall-echo consume '/e'".into(),
+            carries_root: true,
+            consume: true,
+        }]);
+        let unread = UserHookScan::NotInspected {
+            path: Path::new("/home/u/.claude/settings.json").to_path_buf(),
+            reason: "not valid JSON: expected value".into(),
+        };
+        let quiet = UserHookScan::Inspected(Vec::new());
+        assert!(user_level_needs_attention(&reported));
+        assert!(user_level_needs_attention(&unread));
+        assert!(!user_level_needs_attention(&quiet));
+
+        let warned = repair_summary_line(0, 3, true);
+        assert!(!warned.contains("Everything looks good."), "{warned}");
+        assert_eq!(
+            warned,
+            "User-level hooks still need attention. 3 item(s) verified."
+        );
+        let clean = repair_summary_line(0, 3, false);
+        assert_eq!(clean, "Everything looks good. 3 item(s) verified.");
+        let repaired = repair_summary_line(2, 3, true);
+        assert_eq!(repaired, "Repaired 2 item(s). 3 already ok.");
     }
 }
