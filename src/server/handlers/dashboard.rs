@@ -1,15 +1,21 @@
 use std::sync::Arc;
 
 use axum::extract::State;
+use axum::http::StatusCode;
 use axum::Json;
 
 use pulse_system_types::monitoring::{CognitiveStatus, DocumentHealth, ThresholdStatus, Trend};
 
+use crate::server::auth::AuthIdentity;
 use crate::wire::{CognitiveHealth, CognitiveSignals, CognitiveStatus as WireStatus};
 
 use crate::server::AppState;
 
-pub async fn dashboard(State(state): State<Arc<AppState>>) -> Json<serde_json::Value> {
+pub async fn dashboard(
+    State(state): State<Arc<AppState>>,
+    axum::Extension(who): axum::Extension<AuthIdentity>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    who.require_owner()?;
     let config = &state.config;
     let version = env!("CARGO_PKG_VERSION");
 
@@ -73,11 +79,11 @@ pub async fn dashboard(State(state): State<Arc<AppState>>) -> Json<serde_json::V
         serde_json::Value::Null
     };
 
-    Json(serde_json::json!({
+    Ok(Json(serde_json::json!({
         "pulse": pulse,
         "pipeline": pipeline_data,
         "cognitive_health": cognitive_data,
-    }))
+    })))
 }
 
 fn doc_json(doc: &DocumentHealth) -> serde_json::Value {

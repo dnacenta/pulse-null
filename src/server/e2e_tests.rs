@@ -384,6 +384,9 @@ fn test_config() -> Config {
 fn build_app(state: Arc<AppState>) -> Router {
     Router::new()
         .route("/health", get(handlers::health::health))
+        .route("/api/session-health", get(handlers::health::session_health))
+        .route("/api/status", get(handlers::status::status))
+        .route("/api/dashboard", get(handlers::dashboard::dashboard))
         .route("/chat", post(handlers::chat::chat))
         .route("/api/chat/stream", post(handlers::chat::chat_stream))
         .route("/api/events", get(handlers::events::events))
@@ -2186,6 +2189,47 @@ async fn demoted_voice_body_does_not_block_a_call(sender: Option<&str>) {
 async fn e2e_demoted_voice_body_does_not_block_a_call() {
     demoted_voice_body_does_not_block_a_call(None).await;
     demoted_voice_body_does_not_block_a_call(Some("sam")).await;
+}
+
+async fn get_with_secret(app: &Router, path: &str, secret: Option<&str>) -> StatusCode {
+    let mut builder = Request::builder().method("GET").uri(path);
+    if let Some(secret) = secret {
+        builder = builder.header("X-Echo-Secret", secret);
+    }
+    let req = builder.body(Body::empty()).unwrap();
+    app.clone().oneshot(req).await.unwrap().status()
+}
+
+/// A voice credential is not the owner: status, the dashboard, and session
+/// health are 403. `GET /health` stays open with or without that header.
+#[tokio::test]
+async fn e2e_voice_credential_cannot_read_status() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = build_state_boxed_with_config(
+        dir.path().to_path_buf(),
+        Box::new(MockProvider::new(vec![])),
+        ToolRegistry::new(),
+        config_with_voice_credential(),
+    )
+    .await;
+    let app = build_app(state);
+    for path in ["/api/status", "/api/dashboard", "/api/session-health"] {
+        assert_eq!(
+            get_with_secret(&app, path, Some(VOICE_CREDENTIAL)).await,
+            StatusCode::FORBIDDEN,
+            "{path}"
+        );
+        assert_eq!(
+            get_with_secret(&app, path, None).await,
+            StatusCode::OK,
+            "{path}"
+        );
+    }
+    assert_eq!(
+        get_with_secret(&app, "/health", Some(VOICE_CREDENTIAL)).await,
+        StatusCode::OK
+    );
+    assert_eq!(get_with_secret(&app, "/health", None).await, StatusCode::OK);
 }
 
 fn frame_index(frames: &[(String, String)], pred: impl Fn(&str, &str) -> bool) -> usize {

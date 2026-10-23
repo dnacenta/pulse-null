@@ -5,6 +5,7 @@ use axum::http::StatusCode;
 use axum::Json;
 
 use crate::provider_status::ProviderState;
+use crate::server::auth::AuthIdentity;
 use crate::server::AppState;
 use crate::wire::HealthResponse;
 
@@ -45,7 +46,12 @@ pub async fn health(State(state): State<Arc<AppState>>) -> (StatusCode, Json<Hea
 }
 
 /// Session health endpoint — returns health snapshots for all active sessions.
-pub async fn session_health(State(state): State<Arc<AppState>>) -> Json<serde_json::Value> {
+/// Owner only. `GET /health` stays the unauthenticated liveness probe.
+pub async fn session_health(
+    State(state): State<Arc<AppState>>,
+    axum::Extension(who): axum::Extension<AuthIdentity>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    who.require_owner()?;
     let snapshots = state
         .session_store
         .session_health(&state.config.session_health)
@@ -62,9 +68,9 @@ pub async fn session_health(State(state): State<Arc<AppState>>) -> Json<serde_js
         })
         .count();
 
-    Json(serde_json::json!({
+    Ok(Json(serde_json::json!({
         "total_sessions": snapshots.len(),
         "degraded_sessions": degraded_count,
         "sessions": snapshots,
-    }))
+    })))
 }
