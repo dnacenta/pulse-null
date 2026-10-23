@@ -7,6 +7,7 @@
 
 use std::path::{Path, PathBuf};
 
+use crate::cli_provider::adapter::ReportedUserHook;
 use crate::init::agent_bootstrap::{
     ensure_config, ensure_dir, find_recall_echo_bin, read_small_file, shell_quote,
     write_regular_file, BootstrapItem, ItemKind, ItemStatus,
@@ -20,8 +21,24 @@ pub(super) const RECALL_ECHO_RULES_FILE: &str = "recall-echo.md";
 /// starts with it is ours to refresh; anything else was edited by hand.
 const RULES_HEADER: &str = "# recall-echo — Memory Protocol";
 
+#[cfg(test)]
+thread_local! {
+    static HOME_OVERRIDE: std::cell::RefCell<Option<PathBuf>> = const { std::cell::RefCell::new(None) };
+}
+
 fn home_dir() -> Option<PathBuf> {
+    #[cfg(test)]
+    {
+        if let Some(path) = HOME_OVERRIDE.with(|slot| slot.borrow().clone()) {
+            return Some(path);
+        }
+    }
     std::env::var_os("HOME").map(PathBuf::from)
+}
+
+#[cfg(test)]
+fn set_home_override(path: Option<PathBuf>) {
+    HOME_OVERRIDE.with(|slot| *slot.borrow_mut() = path);
 }
 
 /// The recall-echo hooks a pulse installs, in the event order Claude Code
@@ -460,6 +477,21 @@ pub(super) fn verify_files(pulse_root: &Path) -> Vec<BootstrapItem> {
                 ),
             });
         }
+        // User-level consume prints one pulse's EPHEMERAL.md into every
+        // Claude Code session. The file stays untouched; verify is not
+        // clean while the hook is there.
+        if user_hooks_missing_root(&home)
+            .iter()
+            .any(|hook| hook.consume)
+        {
+            items.push(BootstrapItem {
+                path: home.join(".claude/settings.json"),
+                kind: ItemKind::ConfigFile,
+                status: ItemStatus::Wrong(
+                    "user-level consume still runs in every session; the path picks which file is printed but does not limit which sessions the hook runs in. recall-echo init writes `<recall-bin> consume '<pulse-root>'` — remove that hook by hand".into(),
+                ),
+            });
+        }
     }
 
     items
@@ -494,11 +526,30 @@ pub(super) fn legacy_home_links(pulse_root: &Path, home: &Path) -> Vec<PathBuf> 
         .collect()
 }
 
-/// recall-echo hook commands in the *user-level* `$HOME/.claude/settings.json`
-/// that carry no pulse root. Under one pulse per user they worked by
-/// accident of cwd; with several they fire for every pulse and resolve to
-/// the wrong one. Reported for the operator to remove — never edited here.
-pub(super) fn user_hooks_missing_root(home: &Path) -> Vec<String> {
+/// Whether `command` names a pulse root. The repair message uses this to
+/// choose its wording; a rooted `consume` is still reported.
+fn command_carries_root(command: &str) -> bool {
+    if command.contains("--pulse-root") || command.contains("--entity-root") {
+        return true;
+    }
+    is_recall_command(command, "consume")
+        && command
+            .split_whitespace()
+            .skip_while(|w| *w != "consume")
+            .nth(1)
+            .is_some_and(|arg| !arg.starts_with(['|', '&', ';', '>', '<']))
+}
+
+/// recall-echo hook commands in the user-level `$HOME/.claude/settings.json`
+/// that repair reports and does not edit.
+///
+/// Every `consume` hook is reported, with or without a positional root.
+/// `recall-echo init` writes `<recall-bin> consume '<pulse-root>'` there.
+/// The path chooses which `memory/EPHEMERAL.md` is printed; Claude Code
+/// runs user-level hooks in every session, so the path does not limit
+/// which sessions the hook runs in. Other recall-echo hooks are reported
+/// only when they name no pulse root.
+pub(super) fn user_hooks_missing_root(home: &Path) -> Vec<ReportedUserHook> {
     let path = home.join(".claude/settings.json");
     let Ok(Some(text)) = read_small_file(&path) else {
         return Vec::new();
@@ -514,23 +565,21 @@ pub(super) fn user_hooks_missing_root(home: &Path) -> Vec<String> {
                     let Some(command) = hook["command"].as_str() else {
                         continue;
                     };
-                    let ours = RECALL_HOOKS
-                        .iter()
-                        .chain(RETIRED_RECALL_HOOKS.iter())
-                        .any(|(_, sub)| is_recall_command(command, sub));
+                    let consume = is_recall_command(command, "consume");
+                    let ours = consume
+                        || RECALL_HOOKS
+                            .iter()
+                            .any(|(_, sub)| is_recall_command(command, sub));
                     if !ours {
                         continue;
                     }
-                    let carries_root = command.contains("--pulse-root")
-                        || command.contains("--entity-root")
-                        || (is_recall_command(command, "consume")
-                            && command
-                                .split_whitespace()
-                                .skip_while(|w| *w != "consume")
-                                .nth(1)
-                                .is_some_and(|arg| !arg.starts_with(['|', '&', ';', '>', '<'])));
-                    if !carries_root {
-                        found.push(command.to_string());
+                    let carries_root = command_carries_root(command);
+                    if consume || !carries_root {
+                        found.push(ReportedUserHook {
+                            command: command.to_string(),
+                            carries_root,
+                            consume,
+                        });
                     }
                 }
             }
@@ -781,6 +830,26 @@ mod tests {
         );
     }
 
+    fn reported_commands(home: &Path) -> Vec<String> {
+        let mut found: Vec<String> = user_hooks_missing_root(home)
+            .into_iter()
+            .map(|hook| hook.command)
+            .collect();
+        found.sort();
+        found
+    }
+
+    struct HomeOverride;
+    impl Drop for HomeOverride {
+        fn drop(&mut self) {
+            set_home_override(None);
+        }
+    }
+    fn override_home(path: &Path) -> HomeOverride {
+        set_home_override(Some(path.to_path_buf()));
+        HomeOverride
+    }
+
     #[test]
     fn user_hooks_without_root_are_reported_not_edited() {
         let home = tempfile::tempdir().unwrap();
@@ -798,18 +867,97 @@ mod tests {
         .to_string();
         std::fs::write(claude.join("settings.json"), &original).unwrap();
 
-        let mut found = user_hooks_missing_root(home.path());
-        found.sort();
+        let found = user_hooks_missing_root(home.path());
         assert_eq!(
-            found,
+            reported_commands(home.path()),
             vec![
                 "/usr/local/bin/recall-echo archive-session || true".to_string(),
                 "/usr/local/bin/recall-echo checkpoint --trigger precompact".to_string(),
+                "/usr/local/bin/recall-echo consume '/srv/e'".to_string(),
             ]
         );
+        let consume = found
+            .iter()
+            .find(|hook| hook.command.contains("consume"))
+            .unwrap();
+        assert!(consume.consume && consume.carries_root, "{consume:?}");
+        assert!(found
+            .iter()
+            .filter(|hook| !hook.consume)
+            .all(|hook| !hook.carries_root));
         assert_eq!(
             std::fs::read_to_string(claude.join("settings.json")).unwrap(),
             original
+        );
+    }
+
+    /// `recall-echo init` writes this SessionStart command into the user-level
+    /// settings file: an unquoted binary, `consume`, and the pulse root in
+    /// single quotes. The root picks the file that is printed. It does not
+    /// limit which sessions the hook runs in, and the file is not edited.
+    #[test]
+    fn user_level_recall_echo_init_consume_is_reported_and_verify_is_not_clean() {
+        let home = tempfile::tempdir().unwrap();
+        let claude = home.path().join(".claude");
+        std::fs::create_dir_all(&claude).unwrap();
+        let command = "/usr/local/bin/recall-echo consume '/srv/pulse-a'";
+        let original = serde_json::json!({
+            "hooks": {
+                "SessionStart": [{
+                    "matcher": "startup|resume",
+                    "hooks": [{"type": "command", "command": command}]
+                }],
+                "SessionEnd": [{"hooks": [{"type": "command", "command": "/usr/local/bin/recall-echo archive-session --pulse-root '/srv/pulse-a'"}]}],
+                "PreCompact": [{"hooks": [{"type": "command", "command": "/usr/local/bin/recall-echo checkpoint --trigger precompact --pulse-root '/srv/pulse-a'"}]}]
+            }
+        })
+        .to_string();
+        std::fs::write(claude.join("settings.json"), &original).unwrap();
+
+        let found = user_hooks_missing_root(home.path());
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert_eq!(found[0].command, command);
+        assert!(found[0].consume && found[0].carries_root, "{found:?}");
+        assert_eq!(
+            std::fs::read_to_string(claude.join("settings.json")).unwrap(),
+            original
+        );
+
+        let dir = pulse();
+        let root = dir.path().canonicalize().unwrap();
+        ensure_files(&root, "recall-echo");
+        let _home = override_home(home.path());
+        let items = verify_files(&root);
+        let user = items
+            .iter()
+            .find(|item| item.path == home.path().join(".claude/settings.json"))
+            .expect("user-level settings are part of verify");
+        match &user.status {
+            ItemStatus::Wrong(reason) => {
+                assert!(
+                    reason.contains(
+                        "the path picks which file is printed but does not limit which sessions the hook runs in"
+                    ),
+                    "{reason}"
+                );
+                assert!(
+                    reason
+                        .contains("recall-echo init writes `<recall-bin> consume '<pulse-root>'`"),
+                    "{reason}"
+                );
+            }
+            other => panic!("verify reported clean for a user-level consume hook: {other:?}"),
+        }
+        assert!(
+            items
+                .iter()
+                .any(|item| !matches!(item.status, ItemStatus::Exists)),
+            "verify reported clean: {items:?}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(claude.join("settings.json")).unwrap(),
+            original,
+            "verify must not edit the user-level file"
         );
     }
 
@@ -974,9 +1122,10 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            user_hooks_missing_root(home.path()),
+            reported_commands(home.path()),
             vec!["recall-echo consume || true".to_string()]
         );
+        assert!(!user_hooks_missing_root(home.path())[0].carries_root);
     }
 
     #[test]
@@ -1156,7 +1305,7 @@ mod tests {
         std::fs::write(claude.join("settings.json"), &original).unwrap();
 
         assert_eq!(
-            user_hooks_missing_root(home.path()),
+            reported_commands(home.path()),
             vec!["recall-echo consume || true".to_string()]
         );
         assert_eq!(
