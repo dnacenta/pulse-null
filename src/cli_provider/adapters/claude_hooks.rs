@@ -20,17 +20,24 @@ fn home_dir() -> Option<PathBuf> {
     std::env::var_os("HOME").map(PathBuf::from)
 }
 
-/// The three recall-echo hook subcommands, in the event order Claude Code
-/// fires them. `consume` takes the root positionally; the other two take
-/// `--pulse-root` — matching what `recall-echo init` itself writes. Hooks
-/// written before PN-115 spell it `--pulse-root` (recall-echo ≥ 4.6.0 reads
-/// both); `ensure` rewrites them to the canonical form like any other stale
-/// recall-echo hook.
-const RECALL_HOOKS: [(&str, &str); 3] = [
-    ("SessionStart", "consume"),
+/// The recall-echo hooks a pulse installs, in the event order Claude Code
+/// fires them. Both take `--pulse-root` — matching what `recall-echo init`
+/// itself writes. Hooks written before PN-115 spell it `--entity-root`
+/// (recall-echo ≥ 4.6.0 reads both); `ensure` rewrites them to the canonical
+/// form like any other stale recall-echo hook.
+///
+/// SessionStart `consume` is not one of them. The runtime loads
+/// EPHEMERAL.md into the chat prompt, so a SessionStart hook delivered it a
+/// second time, and into task and intent runs that leave it out on purpose.
+const RECALL_HOOKS: [(&str, &str); 2] = [
     ("PreCompact", "checkpoint"),
     ("SessionEnd", "archive-session"),
 ];
+
+/// Hooks earlier pulses installed and that repair now removes. `merge_hooks`
+/// only rewrites the subcommands in [`RECALL_HOOKS`], so without this list a
+/// retired `consume` hook would stay in settings.json.
+const RETIRED_RECALL_HOOKS: [(&str, &str); 1] = [("SessionStart", "consume")];
 
 /// The canonical hook command for one subcommand.
 fn hook_command(recall_bin: &str, sub: &str, root: &Path) -> String {
@@ -47,18 +54,13 @@ fn hook_command(recall_bin: &str, sub: &str, root: &Path) -> String {
 fn render_hooks(recall_bin: &str, root: &Path) -> serde_json::Value {
     let mut hooks = serde_json::Map::new();
     for (event, sub) in RECALL_HOOKS {
-        let mut entry = serde_json::Map::new();
-        if event == "SessionStart" {
-            entry.insert("matcher".into(), "startup|resume".into());
-        }
-        entry.insert(
-            "hooks".into(),
-            serde_json::json!([{
+        let entry = serde_json::json!({
+            "hooks": [{
                 "type": "command",
                 "command": hook_command(recall_bin, sub, root)
-            }]),
-        );
-        hooks.insert(event.into(), serde_json::Value::Array(vec![entry.into()]));
+            }]
+        });
+        hooks.insert(event.into(), serde_json::Value::Array(vec![entry]));
     }
     serde_json::Value::Object(hooks)
 }
@@ -136,53 +138,86 @@ fn strip_recall_hooks(mut entry: serde_json::Value, sub: &str) -> Option<serde_j
 
 /// Merge our hooks into an existing settings document: every other key and
 /// every foreign hook survives; each recall-echo hook appears exactly once,
-/// in its canonical form.
+/// in its canonical form. Retired hooks are stripped. An event left with no
+/// hooks is removed, and a `hooks` object this function created that ends
+/// up empty is removed too — a `hooks` key the user already had is kept.
 fn merge_hooks(mut existing: serde_json::Value, ours: &serde_json::Value) -> serde_json::Value {
     if !existing.is_object() {
         existing = serde_json::json!({});
     }
     let root = existing.as_object_mut().expect("object");
-    let hooks_value = root.entry("hooks").or_insert_with(|| serde_json::json!({}));
-    if !hooks_value.is_object() {
-        *hooks_value = serde_json::json!({});
-    }
-    let hooks = hooks_value.as_object_mut().expect("object");
-
-    for (event, sub) in RECALL_HOOKS {
-        let mut entries: Vec<serde_json::Value> = hooks
-            .get(event)
-            .and_then(|v| v.as_array())
-            .cloned()
-            .unwrap_or_default()
-            .into_iter()
-            .filter_map(|entry| strip_recall_hooks(entry, sub))
-            .collect();
-        if let Some(canonical) = ours[event].as_array().and_then(|a| a.first()) {
-            entries.push(canonical.clone());
+    let created_hooks = !root.contains_key("hooks");
+    let hooks_empty = {
+        let hooks_value = root.entry("hooks").or_insert_with(|| serde_json::json!({}));
+        if !hooks_value.is_object() {
+            *hooks_value = serde_json::json!({});
         }
-        hooks.insert(event.to_string(), serde_json::Value::Array(entries));
+        let hooks = hooks_value.as_object_mut().expect("object");
+
+        for (event, sub) in RETIRED_RECALL_HOOKS {
+            let Some(raw) = hooks.get(event).and_then(|v| v.as_array()).cloned() else {
+                continue;
+            };
+            let kept: Vec<serde_json::Value> = raw
+                .into_iter()
+                .filter_map(|entry| strip_recall_hooks(entry, sub))
+                .collect();
+            if kept.is_empty() {
+                hooks.remove(event);
+            } else {
+                hooks.insert(event.to_string(), serde_json::Value::Array(kept));
+            }
+        }
+
+        for (event, sub) in RECALL_HOOKS {
+            let mut entries: Vec<serde_json::Value> = hooks
+                .get(event)
+                .and_then(|v| v.as_array())
+                .cloned()
+                .unwrap_or_default()
+                .into_iter()
+                .filter_map(|entry| strip_recall_hooks(entry, sub))
+                .collect();
+            if let Some(canonical) = ours[event].as_array().and_then(|a| a.first()) {
+                entries.push(canonical.clone());
+            }
+            hooks.insert(event.to_string(), serde_json::Value::Array(entries));
+        }
+        hooks.is_empty()
+    };
+    if created_hooks && hooks_empty {
+        root.remove("hooks");
     }
     existing
 }
 
 /// Does `existing` already carry our hooks — each event with exactly one
-/// recall-echo hook for its subcommand, in canonical form? Order among an
-/// event's entries does not matter; only `merge_hooks` normalises it.
+/// recall-echo hook for its subcommand, in canonical form — and no retired
+/// recall hook? Order among an event's entries does not matter; only
+/// `merge_hooks` normalises it.
 fn has_canonical_hooks(existing: &serde_json::Value, ours: &serde_json::Value) -> bool {
-    RECALL_HOOKS.iter().all(|(event, sub)| {
+    let installed = RECALL_HOOKS.iter().all(|(event, sub)| {
         let Some(canonical) = ours[event][0]["hooks"][0]["command"].as_str() else {
             return false;
         };
-        let commands: Vec<&str> = existing["hooks"][event]
-            .as_array()
-            .into_iter()
-            .flatten()
-            .flat_map(|entry| entry["hooks"].as_array().into_iter().flatten())
-            .filter_map(|h| h["command"].as_str())
-            .filter(|c| is_recall_command(c, sub))
-            .collect();
-        commands == [canonical]
-    })
+        recall_commands(existing, event, sub) == [canonical]
+    });
+    let retired_absent = RETIRED_RECALL_HOOKS
+        .iter()
+        .all(|(event, sub)| recall_commands(existing, event, sub).is_empty());
+    installed && retired_absent
+}
+
+/// recall-echo `sub` commands under one event.
+fn recall_commands<'a>(existing: &'a serde_json::Value, event: &str, sub: &str) -> Vec<&'a str> {
+    existing["hooks"][event]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .flat_map(|entry| entry["hooks"].as_array().into_iter().flatten())
+        .filter_map(|h| h["command"].as_str())
+        .filter(|c| is_recall_command(c, sub))
+        .collect()
 }
 
 /// Bring `.claude/settings.json` up to date without clobbering anything else
@@ -357,7 +392,7 @@ pub(super) fn verify_files(pulse_root: &Path) -> Vec<BootstrapItem> {
     let recall_bin = find_recall_echo_bin();
     let mut items = Vec::new();
 
-    // settings.json: present and carrying all three canonical hooks.
+    // settings.json: present, carrying the canonical hooks, and no retired one.
     let settings = claude_dir.join("settings.json");
     let status = match read_small_file(&settings) {
         Ok(Some(text)) => match serde_json::from_str::<serde_json::Value>(&text) {
@@ -457,6 +492,7 @@ pub(super) fn user_hooks_missing_root(home: &Path) -> Vec<String> {
                     };
                     let ours = RECALL_HOOKS
                         .iter()
+                        .chain(RETIRED_RECALL_HOOKS.iter())
                         .any(|(_, sub)| is_recall_command(command, sub));
                     if !ours {
                         continue;
@@ -532,14 +568,13 @@ mod tests {
 
         let doc = read_settings(&root);
         let quoted = shell_quote(&root);
-        assert_eq!(commands(&doc, "SessionStart").len(), 1);
-        assert!(commands(&doc, "SessionStart")[0].ends_with(&format!("consume {quoted}")));
+        assert!(doc["hooks"].get("SessionStart").is_none(), "{doc}");
+        assert!(!doc.to_string().contains("consume"), "{doc}");
         assert!(commands(&doc, "PreCompact")[0].ends_with(&format!(
             "checkpoint --trigger precompact --pulse-root {quoted}"
         )));
         assert!(commands(&doc, "SessionEnd")[0]
             .ends_with(&format!("archive-session --pulse-root {quoted}")));
-        assert_eq!(doc["hooks"]["SessionStart"][0]["matcher"], "startup|resume");
 
         assert!(root.join(".claude/rules/recall-echo.md").exists());
         assert!(root.join("memory/.recall-echo.toml").exists());
@@ -605,7 +640,7 @@ mod tests {
         let pre = commands(&doc, "PreCompact");
         assert_eq!(pre.len(), 1);
         assert!(pre[0].contains("--pulse-root"));
-        assert_eq!(commands(&doc, "SessionStart").len(), 1);
+        assert!(doc["hooks"].get("SessionStart").is_none(), "{doc}");
     }
 
     /// PN-115: hooks written by a pre-rename binary carry `--entity-root`.
@@ -918,5 +953,212 @@ mod tests {
             user_hooks_missing_root(home.path()),
             vec!["recall-echo consume || true".to_string()]
         );
+    }
+
+    #[test]
+    fn fresh_pulse_has_no_session_start_hook() {
+        let dir = pulse();
+        let root = dir.path().canonicalize().unwrap();
+        let items = ensure_files(&root, "recall-echo");
+        let settings = items
+            .iter()
+            .find(|i| i.path.ends_with("settings.json"))
+            .unwrap();
+        assert_eq!(settings.status, ItemStatus::Created);
+
+        let doc = read_settings(&root);
+        assert!(doc["hooks"].get("SessionStart").is_none(), "{doc}");
+        assert!(!doc.to_string().contains("consume"), "{doc}");
+        let quoted = shell_quote(&root);
+        assert!(commands(&doc, "PreCompact")[0].ends_with(&format!(
+            "checkpoint --trigger precompact --pulse-root {quoted}"
+        )));
+        assert!(commands(&doc, "SessionEnd")[0]
+            .ends_with(&format!("archive-session --pulse-root {quoted}")));
+    }
+
+    #[test]
+    fn repair_strips_consume_keeps_foreign_hook() {
+        let dir = pulse();
+        let root = dir.path().canonicalize().unwrap();
+        std::fs::create_dir_all(root.join(".claude")).unwrap();
+        std::fs::write(
+            root.join(".claude/settings.json"),
+            serde_json::json!({
+                "hooks": {
+                    "SessionStart": [{
+                        "matcher": "startup|resume",
+                        "hooks": [
+                            {"type": "command", "command": format!("recall-echo consume {}", shell_quote(&root))},
+                            {"type": "command", "command": "echo foreign"}
+                        ]
+                    }],
+                    "PreCompact": [{"hooks": [{"type": "command", "command": "recall-echo checkpoint --trigger precompact"}]}],
+                    "SessionEnd": [{"hooks": [{"type": "command", "command": "recall-echo archive-session || true"}]}]
+                }
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        let before = verify_files(&root)
+            .into_iter()
+            .find(|i| i.path.ends_with("settings.json"))
+            .unwrap();
+        assert!(
+            matches!(before.status, ItemStatus::Wrong(ref reason) if reason.contains("stale")),
+            "{before:?}"
+        );
+
+        let items = ensure_files(&root, "recall-echo");
+        let settings = items
+            .iter()
+            .find(|i| i.path.ends_with("settings.json"))
+            .unwrap();
+        assert_eq!(settings.status, ItemStatus::Updated);
+
+        let doc = read_settings(&root);
+        assert_eq!(
+            commands(&doc, "SessionStart"),
+            vec!["echo foreign".to_string()]
+        );
+        assert!(!doc.to_string().contains("consume"), "{doc}");
+        let quoted = shell_quote(&root);
+        assert!(commands(&doc, "PreCompact")[0].ends_with(&format!(
+            "checkpoint --trigger precompact --pulse-root {quoted}"
+        )));
+        assert!(commands(&doc, "SessionEnd")[0]
+            .ends_with(&format!("archive-session --pulse-root {quoted}")));
+
+        let after = verify_files(&root)
+            .into_iter()
+            .find(|i| i.path.ends_with("settings.json"))
+            .unwrap();
+        assert_eq!(after.status, ItemStatus::Exists, "{after:?}");
+    }
+
+    #[test]
+    fn verify_flags_leftover_consume() {
+        let dir = pulse();
+        let root = dir.path().canonicalize().unwrap();
+        let bin = find_recall_echo_bin();
+        let mut hooks = render_hooks(&bin, &root);
+        hooks["SessionStart"] = serde_json::json!([{
+            "matcher": "startup|resume",
+            "hooks": [{"type": "command", "command": hook_command(&bin, "consume", &root)}]
+        }]);
+        std::fs::create_dir_all(root.join(".claude")).unwrap();
+        std::fs::write(
+            root.join(".claude/settings.json"),
+            serde_json::to_string_pretty(&serde_json::json!({ "hooks": hooks })).unwrap() + "\n",
+        )
+        .unwrap();
+
+        let before = verify_files(&root)
+            .into_iter()
+            .find(|i| i.path.ends_with("settings.json"))
+            .unwrap();
+        assert!(
+            matches!(before.status, ItemStatus::Wrong(ref reason) if reason.contains("stale")),
+            "{before:?}"
+        );
+
+        let items = ensure_files(&root, &bin);
+        let settings = items
+            .iter()
+            .find(|i| i.path.ends_with("settings.json"))
+            .unwrap();
+        assert_eq!(settings.status, ItemStatus::Updated);
+        let doc = read_settings(&root);
+        assert!(doc["hooks"].get("SessionStart").is_none(), "{doc}");
+        assert!(!doc.to_string().contains("consume"), "{doc}");
+
+        let after = verify_files(&root)
+            .into_iter()
+            .find(|i| i.path.ends_with("settings.json"))
+            .unwrap();
+        assert_eq!(after.status, ItemStatus::Exists, "{after:?}");
+    }
+
+    #[test]
+    fn empty_event_removed_after_strip() {
+        let dir = pulse();
+        let root = dir.path().canonicalize().unwrap();
+        std::fs::create_dir_all(root.join(".claude")).unwrap();
+        std::fs::write(
+            root.join(".claude/settings.json"),
+            serde_json::json!({
+                "permissions": {"allow": ["Bash(ls:*)"]},
+                "hooks": {
+                    "SessionStart": [{"hooks": [
+                        {"type": "command", "command": format!("recall-echo consume {}", shell_quote(&root))}
+                    ]}]
+                }
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        let items = ensure_files(&root, "recall-echo");
+        let settings = items
+            .iter()
+            .find(|i| i.path.ends_with("settings.json"))
+            .unwrap();
+        assert_eq!(settings.status, ItemStatus::Updated);
+
+        let doc = read_settings(&root);
+        assert!(
+            doc["hooks"].get("SessionStart").is_none(),
+            "empty event removed: {doc}"
+        );
+        assert!(doc["hooks"]["PreCompact"].is_array(), "{doc}");
+        assert!(doc["hooks"]["SessionEnd"].is_array(), "{doc}");
+        assert_eq!(doc["permissions"]["allow"][0], "Bash(ls:*)");
+    }
+
+    #[test]
+    fn user_level_rootless_consume_still_reported() {
+        let home = tempfile::tempdir().unwrap();
+        let claude = home.path().join(".claude");
+        std::fs::create_dir_all(&claude).unwrap();
+        let original = serde_json::json!({
+            "hooks": {
+                "SessionStart": [{"hooks": [
+                    {"type": "command", "command": "recall-echo consume || true"}
+                ]}]
+            }
+        })
+        .to_string();
+        std::fs::write(claude.join("settings.json"), &original).unwrap();
+
+        assert_eq!(
+            user_hooks_missing_root(home.path()),
+            vec!["recall-echo consume || true".to_string()]
+        );
+        assert_eq!(
+            std::fs::read_to_string(claude.join("settings.json")).unwrap(),
+            original
+        );
+    }
+
+    #[test]
+    fn ensure_twice_is_idempotent() {
+        let dir = pulse();
+        let root = dir.path();
+        let first = ensure_files(root, "recall-echo");
+        assert!(
+            first
+                .iter()
+                .any(|i| { i.path.ends_with("settings.json") && i.status == ItemStatus::Created }),
+            "{first:?}"
+        );
+        let second = ensure_files(root, "recall-echo");
+        assert!(
+            second.iter().all(|i| i.status == ItemStatus::Exists),
+            "{second:?}"
+        );
+        let doc = read_settings(root);
+        assert!(doc["hooks"].get("SessionStart").is_none(), "{doc}");
+        assert!(!doc.to_string().contains("consume"), "{doc}");
     }
 }
