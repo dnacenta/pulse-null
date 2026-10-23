@@ -226,9 +226,11 @@ before a number is shown ("not enough yet · k of 10").
 ## Limits
 
 - The value is the owner's choice; the pairs ask for nothing sensitive, but a
-  value is kept in the held-out record (`record/probes/facts.jsonl`, 0600),
-  which names neither the pair nor which side was planted (only a keyed
-  commitment; see probe-runner.md, "Sets").
+  value is kept in the held-out record (`record/probes/facts.jsonl`, 0600,
+  owned by the probe user under `/var/lib/pulse-null-probe/<pulse>/`, which
+  the live pulse cannot read). A draw row names neither the pair nor which
+  side was planted (only a keyed commitment; see probe-runner.md, "Sets").
+  After the first ask, the item row's truth stays in that same directory.
 - The twin can only be "never told" as far as the runtime can check: a fact
   the owner mentioned outside the owner session's WAL and the archives (in
   a session that was never archived, another channel, a file the pulse

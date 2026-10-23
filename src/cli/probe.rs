@@ -1,9 +1,11 @@
 //! `pulse-null probe` — the growth-record probe runner (PN-144).
 //!
-//! Run as the pulse's own user from its directory (the systemd unit's
-//! WorkingDirectory). Probes never touch the live pulse: every item runs in
-//! a scratch copy under a Landlock sandbox, and a kernel without Landlock
-//! refuses the run.
+//! Run as the probe user (`[probe] user`, default `pulse-probe`) from the
+//! pulse's directory (the systemd unit's WorkingDirectory). The live pulse
+//! is a different uid. Probes never touch the live pulse: every item runs
+//! in a scratch copy under a Landlock sandbox, and a kernel without Landlock
+//! refuses the run. Scratch, exports and the record live in the probe user's
+//! private state, not in the pulse's home.
 
 use std::error::Error;
 use std::path::{Path, PathBuf};
@@ -23,8 +25,8 @@ use crate::vigil::probe::record::Record;
 use crate::vigil::probe::run::{self as probe_run, RunEnv, RunOutcome, RunRequest, RunSummary};
 use crate::vigil::probe::schedule::RunStatus;
 use crate::vigil::probe::scratch::{
-    scratch_parent, sweep_under_host_lock, GraphTarget, ItemKind, ItemPlan, ItemScratch,
-    ItemTeardown, Scratch, ScratchSpec, SCRATCH_STALE_AFTER,
+    probe_scratch_parent, probe_state_root, sweep_under_host_lock, GraphTarget, ItemKind, ItemPlan,
+    ItemScratch, ItemTeardown, Scratch, ScratchSpec, SCRATCH_STALE_AFTER,
 };
 use crate::vigil::probe::sealed::{self, InstalledSets, Registry, SealError};
 use crate::vigil::probe::summary::{
@@ -75,11 +77,22 @@ fn stop_on(
 /// `[graph] data_dir` does not name one.
 const DEFAULT_DATA_DIR: &str = "/opt/pulse-null";
 
+/// The uid that owns `path` (the live pulse directory's owner is the pulse).
+fn owner_uid(path: &Path) -> Result<u32, Box<dyn Error>> {
+    use std::os::unix::fs::MetadataExt;
+    Ok(std::fs::metadata(path)?.uid())
+}
+
 /// The pulse a probe command runs for, resolved once.
 struct ProbeContext {
     config: Config,
     live_root: PathBuf,
+    /// The live pulse user's home (vendor state, the deny list). Not this
+    /// process's home when the unit runs as the probe user.
     home: PathBuf,
+    /// Probe-private state: scratch, exports and the record. Never the
+    /// pulse's `~/.local/state`.
+    probe_state: PathBuf,
     adapter_name: String,
     /// The pulse's graph, when recall-echo keeps it on the server.
     live_graph: Option<LiveGraph>,
@@ -87,13 +100,28 @@ struct ProbeContext {
 
 impl ProbeContext {
     /// The pulse whose `pulse-null.toml` is found from the current
-    /// directory, for the user whose home is `$HOME`.
+    /// directory. The pulse user's home is that directory's owner's, not
+    /// this process's: the unit runs as the probe user. Probe-private state
+    /// follows [`probe_state_root`] (the unit's `PULSE_NULL_PROBE_STATE`,
+    /// else this process's home).
     fn load() -> Result<Self, Box<dyn Error>> {
-        Self::at(&Config::find_config()?, std::env::var_os("HOME"))
+        let config_path = Config::find_config()?;
+        let root = config_path
+            .parent()
+            .ok_or_else(|| crate::errors::ConfigError::Validation("Invalid config path".into()))?;
+        let pulse_home = crate::vigil::probe::confine::home_of(owner_uid(root)?)?;
+        let mut ctx = Self::at(&config_path, Some(pulse_home.into()))?;
+        let process_home = std::env::var_os("HOME")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| ctx.home.clone());
+        ctx.probe_state = probe_state_root(&process_home);
+        Ok(ctx)
     }
 
-    /// The pulse whose `pulse-null.toml` is at `config_path`, for the user
-    /// whose home is `home`.
+    /// The pulse whose `pulse-null.toml` is at `config_path`, for the pulse
+    /// user whose home is `home`. Probe state is under that home so a test
+    /// fixture stays inside its temporary directory; [`Self::load`] replaces
+    /// it with the probe user's state.
     fn at(config_path: &Path, home: Option<std::ffi::OsString>) -> Result<Self, Box<dyn Error>> {
         let root = config_path
             .parent()
@@ -110,13 +138,25 @@ impl ProbeContext {
             crate::fs_safe::read_bounded(&live_root.join("memory/.recall-echo.toml"), 1024 * 1024)?
                 .unwrap_or_default();
         let live_graph = LiveGraph::from_recall_echo_config(&recall_config, &config.pulse.name)?;
+        let probe_state = home.join(".local/state/pulse-null/probe");
         Ok(Self {
             config,
             live_root,
             home,
+            probe_state,
             adapter_name,
             live_graph,
         })
+    }
+
+    /// `<probe state>/<pulse>`, the root [`Record::open`] writes under.
+    fn record_root(&self) -> Result<PathBuf, String> {
+        crate::vigil::probe::scratch::probe_record_root(&self.probe_state, &self.config.pulse.name)
+    }
+
+    /// Scratch, the host lock and graph exports.
+    fn scratch_parent(&self) -> PathBuf {
+        probe_scratch_parent(&self.probe_state)
     }
 
     /// TCP ports a probe child may connect to besides the run's throwaway
@@ -141,7 +181,7 @@ impl ProbeContext {
 
     /// Where this pulse's graph export is left for the next run.
     fn export_path(&self) -> PathBuf {
-        graph::export_path(&scratch_parent(&self.home), &self.config.pulse.name)
+        graph::export_path(&self.scratch_parent(), &self.config.pulse.name)
     }
 
     /// Export the live graph for the next run (the export unit's step, the
@@ -178,7 +218,7 @@ impl ProbeContext {
 
     /// Sweep what crashed runs left, then create this run's scratch.
     fn create_scratch(&self, keep: bool) -> Result<Scratch, Box<dyn Error>> {
-        let parent = scratch_parent(&self.home);
+        let parent = self.scratch_parent();
         for stale in sweep_under_host_lock(&parent, SCRATCH_STALE_AFTER) {
             tracing::info!("removed stale probe scratch {}", stale.display());
         }
@@ -300,6 +340,10 @@ struct RunHost {
     credentials: Option<PathBuf>,
     has_env: &'static dyn Fn(&str) -> bool,
     confinement: &'static dyn Fn() -> Result<(), String>,
+    /// When set, [`crate::vigil::probe::confine::require`] checks the probe
+    /// user against the live pulse. Tests leave it off: the suite runs as
+    /// the owner of its fixture directory.
+    enforce_identity: bool,
     stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
@@ -318,7 +362,8 @@ impl RunHost {
             memory,
             credentials,
             has_env: &env_is_set,
-            confinement: &crate::vigil::probe::confine::require,
+            confinement: &crate::vigil::probe::confine::require_unit,
+            enforce_identity: true,
         })
     }
 }
@@ -334,11 +379,26 @@ async fn run_for(
     let deny = ctx.deny(ctx.adapter()?.as_ref());
     let registry = Registry::v1()?;
     let host = detect(ctx.live_graph.is_some()).await?;
+    let record_root = ctx.record_root()?;
+    let scratch = ctx.scratch_parent();
+    let record_dir = record_root.join("record/probes");
+    let expected_user = ctx.config.probe.user.clone();
+    let pulse_uid = owner_uid(&ctx.live_root)?;
+    let enforce = host.enforce_identity;
+    let base = host.confinement;
+    let check = || -> Result<(), String> {
+        if enforce {
+            crate::vigil::probe::confine::require(&expected_user, pulse_uid, &record_dir)
+        } else {
+            base()
+        }
+    };
     let env = RunEnv {
         config: &ctx.config,
         live_root: &ctx.live_root,
         home: &ctx.home,
-        scratch_parent: &scratch_parent(&ctx.home),
+        record_root: &record_root,
+        scratch_parent: &scratch,
         tz,
         now: host.now,
         landlock: host.landlock,
@@ -350,7 +410,7 @@ async fn run_for(
         registry: &registry,
         credentials: host.credentials.as_deref(),
         host_lock_wait: HOST_LOCK_WAIT,
-        confinement: host.confinement,
+        confinement: &check,
         stop: &host.stop,
         time_budget: RUN_TIME_BUDGET,
         memory: &host.memory,
@@ -448,7 +508,7 @@ fn status_report(
     now: chrono::DateTime<chrono::Utc>,
 ) -> Result<Report, Box<dyn Error>> {
     let tz = ctx.timezone()?;
-    let record = Record::existing(&ctx.live_root);
+    let record = Record::existing(&ctx.record_root()?);
     let summary = summarize(record.as_ref(), &minimum_n(&Registry::v1()?), tz, now)?;
     let mut report = Report::default();
     report.line(status_header(
@@ -754,7 +814,7 @@ fn facts_draw_for(
     now: chrono::DateTime<chrono::Utc>,
 ) -> Result<Report, Box<dyn Error>> {
     let pairs = pairs()?;
-    let record = Record::open(&ctx.live_root)?;
+    let record = Record::open(&ctx.record_root()?)?;
     let drawn = paired::draw(&record, &pairs, now).map_err(fact_error)?;
     Ok(drawn_report(&drawn, &ctx.config.pulse.name))
 }
@@ -808,7 +868,7 @@ fn facts_plant_for(
     planting: &Planting,
 ) -> Result<Report, Box<dyn Error>> {
     let pairs = pairs()?;
-    let record = Record::open(&ctx.live_root)?;
+    let record = Record::open(&ctx.record_root()?)?;
     let (mention, twin_mentioned) = paired::plant(
         &record,
         &ctx.live_root,
@@ -859,7 +919,7 @@ fn facts_list_for(
     pairs: PairsSource,
     now: chrono::DateTime<chrono::Utc>,
 ) -> Result<Report, Box<dyn Error>> {
-    let Some(record) = Record::existing(&ctx.live_root) else {
+    let Some(record) = Record::existing(&ctx.record_root()?) else {
         return Ok(facts_report(&[], &[], now));
     };
     let pairs = pairs()?;
@@ -1506,10 +1566,12 @@ mod tests {
             let home = tempfile::tempdir().unwrap();
             let mut config = fixture_config();
             config.llm.cli_bin = cli_bin.map(|bin| bin.display().to_string());
+            let home_path = home.path().canonicalize().unwrap();
             let ctx = ProbeContext {
                 config,
                 live_root: live.path().canonicalize().unwrap(),
-                home: home.path().canonicalize().unwrap(),
+                probe_state: home_path.join(".local/state/pulse-null/probe"),
+                home: home_path,
                 adapter_name: "claude".into(),
                 live_graph: None,
             };
@@ -1648,6 +1710,7 @@ mod tests {
             credentials: None,
             has_env: &always,
             confinement: &confined,
+            enforce_identity: false,
             stop: std::sync::Arc::default(),
         }
     }
@@ -2254,7 +2317,7 @@ mod tests {
         assert!(drawn.starts_with("  ◉ fact "), "{drawn}");
         assert!(drawn.contains(" drawn. In normal conversation with Fixture, mention "));
         assert!(drawn.contains(": that side is the baseline.\n"));
-        let record = Record::existing(&ctx.live_root).unwrap();
+        let record = Record::existing(&ctx.record_root().unwrap()).unwrap();
         let rows = record
             .read(crate::vigil::probe::record::Stream::Facts)
             .unwrap()
@@ -2330,7 +2393,7 @@ mod tests {
             refused(facts_plant_for(ctx, no_credentials, &planting)),
             "no credentials"
         );
-        Record::open(&ctx.live_root).unwrap();
+        Record::open(&ctx.record_root().unwrap()).unwrap();
         assert_eq!(
             refused(facts_list_for(ctx, no_credentials, at(2, 9))),
             "no credentials"
@@ -2480,7 +2543,7 @@ mod tests {
 
     /// Scratch dirs left under the fixture's scratch parent.
     fn scratch_left(ctx: &ProbeContext) -> Vec<PathBuf> {
-        std::fs::read_dir(scratch_parent(&ctx.home))
+        std::fs::read_dir(ctx.scratch_parent())
             .map(|dir| {
                 dir.filter_map(Result::ok)
                     .map(|e| e.path())

@@ -3,9 +3,9 @@
 //!
 //! The item texts are not in the repo: pulses work on the repo, and a pulse
 //! that can study its probes measures nothing (Goodhart). Nor are they
-//! anywhere the live pulse can read: the pulse runs as the same Unix user
-//! as the probe runner, so the sets live in a root-owned directory and reach
-//! a run only as systemd credentials:
+//! anywhere the live pulse can read. The probe runs as its own user
+//! (`pulse-probe` unless `[probe] user` says otherwise), and the sets live
+//! in a root-owned directory and reach a run only as systemd credentials:
 //!
 //! ```text
 //!  reviewed copy ── (root) probe sets install --from <dir> --pulse <p> ──▶

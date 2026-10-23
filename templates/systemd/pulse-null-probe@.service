@@ -10,16 +10,38 @@
 # The block between the CONFINEMENT markers is identical in this file and the
 # verify unit (a test in src/vigil/probe/confine.rs holds them equal).
 #
-# Install (as root, once per pulse):
+# Install (as root, once). The operator does the user and ACL steps by hand.
+# Do not run them from this repo, and do not touch a live server from here.
+#
 #   cp pulse-null-probe@.service pulse-null-probe@.timer \
 #      pulse-null-probe-export@.service pulse-null-probe-verify@.service \
 #      /etc/systemd/system/
-#   install -d -m 0700 -o pulse -g pulse /home/pulse/pulse-null/<pulse>/record \
-#       /home/pulse/.local/state/pulse-null
-#   # The vendor login only, never the pulse's whole EnvironmentFile:
+#   # The probe user. It must not be the live pulse's uid. `[probe] user`
+#   # defaults to this name; a different name means the same change in
+#   # User= and Group= below, in the verify and export units, and in the
+#   # pulse's config.
+#   useradd --system --create-home --home-dir /var/lib/pulse-null-probe \
+#       --shell /usr/sbin/nologin pulse-probe
+#   install -d -m 0700 -o pulse-probe -g pulse-probe /var/lib/pulse-null-probe
+#   # The probe user reads the pulse tree in order to copy a scratch, and
+#   # must not read secrets/. The pulse user's own mode on secrets stays
+#   # 0700/0600; the named-user entry gives the probe user nothing there.
+#   setfacl -m u:pulse-probe:rx /home/pulse /home/pulse/pulse-null
+#   setfacl -R -m u:pulse-probe:rX /home/pulse/pulse-null/<pulse>
+#   setfacl -R -m u:pulse-probe:--- /home/pulse/pulse-null/<pulse>/secrets
+#   setfacl -d -m u:pulse-probe:rX /home/pulse/pulse-null/<pulse>
+#   setfacl -d -m u:pulse-probe:--- /home/pulse/pulse-null/<pulse>/secrets
+#   # Login files the runner copies from the pulse user's home (the adapter's
+#   # directory there; see "Vendor state" in docs/methods/probe-runner.md):
+#   setfacl -m u:pulse-probe:rx /home/pulse
+#   # The live graph root password, so the export unit can read it:
+#   setfacl -m u:pulse-probe:r /opt/pulse-null/surrealdb/root-password
+#   # The vendor login only, never the pulse's whole EnvironmentFile.
+#   # systemd reads this as root into the probe process; the pulse's uid
+#   # cannot read that process's environment.
 #   install -m 0600 -o root -g root /dev/null /etc/pulse-null/probe-<pulse>.env
 #   #   then put the one line CLAUDE_CODE_OAUTH_TOKEN=… in it (claude pulses;
-#   #   a grok pulse logs in from the copied ~/.grok login state and needs none)
+#   #   a grok pulse logs in from the copied login state and needs none)
 #   # A resolver off the IPv4 loopback (systemd-resolved's 127.0.0.53 is
 #   # denied here); the unit refuses to start without this file:
 #   printf 'nameserver 9.9.9.9\nnameserver 1.1.1.1\nnameserver 2620:fe::fe\n' \
@@ -52,11 +74,12 @@ Wants=network-online.target
 
 [Service]
 Type=oneshot
-User=pulse
-Group=pulse
+User=pulse-probe
+Group=pulse-probe
 WorkingDirectory=/home/pulse/pulse-null/%i
 ExecStart=/usr/local/bin/pulse-null probe run --if-due
 Environment=RUST_LOG=info
+Environment=PULSE_NULL_PROBE_STATE=/var/lib/pulse-null-probe
 EnvironmentFile=/etc/pulse-null/probe-%i.env
 # The sealed item sets and the fact key, from a root-only directory the
 # pulse's user cannot read (`probe sets install`, as root). systemd copies
@@ -76,11 +99,12 @@ TimeoutStartSec=4h
 # >>> CONFINEMENT (identical in pulse-null-probe-verify@.service) >>>
 UMask=0077
 
-# --- Filesystem: the runner writes only the record and its scratch --------
+# --- Filesystem: the runner writes only the probe user's private state ----
 ProtectSystem=strict
 ProtectHome=read-only
-ReadWritePaths=/home/pulse/pulse-null/%i/record /home/pulse/.local/state/pulse-null
+ReadWritePaths=/var/lib/pulse-null-probe
 InaccessiblePaths=-/home/pulse/.ssh
+InaccessiblePaths=-/home/pulse/.local/state
 # Host sockets any local user may connect to, which Landlock does not
 # mediate (a named-socket connect): the system bus (busctl/D-Bus can read
 # other services' state), tailscaled, snapd, avahi and uuidd. Nothing in a

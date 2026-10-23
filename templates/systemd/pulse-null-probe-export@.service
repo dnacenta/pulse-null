@@ -4,9 +4,11 @@
 #
 # The only probe step that reaches the live SurrealDB server (127.0.0.1),
 # and it only reads: an export without users or access methods, written to
-# ~/.local/state/pulse-null/s/exports/<pulse>.surql (0600) for the run,
-# which takes it if it is under 3 hours old. Network: loopback to the live
-# server only. It runs whether or not the probe run turns out to be due.
+# /var/lib/pulse-null-probe/s/exports/<pulse>.surql (0600, probe user) for
+# the run, which takes it if it is under 3 hours old. The directory is not
+# writable by the pulse user, so the pulse cannot replace the export before
+# import. Network: loopback to the live server only. It runs whether or not
+# the probe run turns out to be due.
 
 [Unit]
 Description=pulse-null probe graph export (%i)
@@ -14,18 +16,20 @@ After=surrealdb.service
 
 [Service]
 Type=oneshot
-User=pulse
-Group=pulse
+User=pulse-probe
+Group=pulse-probe
 WorkingDirectory=/home/pulse/pulse-null/%i
 ExecStart=/usr/local/bin/pulse-null probe export-graph
 Environment=RUST_LOG=info
+Environment=PULSE_NULL_PROBE_STATE=/var/lib/pulse-null-probe
 UMask=0077
 TimeoutStartSec=20min
 
 ProtectSystem=strict
 ProtectHome=read-only
-ReadWritePaths=/home/pulse/.local/state/pulse-null
+ReadWritePaths=/var/lib/pulse-null-probe
 InaccessiblePaths=-/home/pulse/.ssh
+InaccessiblePaths=-/home/pulse/.local/state
 PrivateTmp=yes
 PrivateDevices=yes
 ProtectProc=invisible

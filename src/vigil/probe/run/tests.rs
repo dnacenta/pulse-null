@@ -227,6 +227,7 @@ impl Harness {
             config: &self.config,
             live_root: &root,
             home: self.home.path(),
+            record_root: &root,
             scratch_parent: &self.state.path().join("s"),
             tz: Tz::Europe__Madrid,
             now,
@@ -400,10 +401,27 @@ async fn a_full_run_records_every_arm_and_writes_nothing_live() {
         &std::fs::read_to_string(receipts.join("known-answer-pulse.json")).unwrap(),
     )
     .unwrap();
-    assert_eq!(receipt["served_model"], "claude-opus-5-5");
-    // R2-9: the receipt says what the pulse's prompt was made of, and the
-    // general disclosure is one of its parts.
-    let included: Vec<&str> = receipt["system_prompt_components"]["included"]
+    // A receipt is a digest, the score and where the answer came from.
+    assert!(receipt.get("question").is_none(), "{receipt}");
+    assert!(receipt.get("raw").is_none(), "{receipt}");
+    assert!(receipt.get("truths").is_none(), "{receipt}");
+    assert_eq!(receipt["question_sha256"].as_str().unwrap().len(), 64);
+    assert!(receipt["score"].is_array(), "{receipt}");
+    assert!(receipt["answered_from"].is_null());
+    let evidence: Value = serde_json::from_str(
+        &std::fs::read_to_string(
+            root.join("record/probes/private")
+                .join(&summary.run)
+                .join("known-answer-pulse.json"),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(evidence["served_model"], "claude-opus-5-5");
+    assert!(!evidence["question"].as_str().unwrap().is_empty());
+    // R2-9: the private evidence says what the pulse's prompt was made of,
+    // and the general disclosure is one of its parts.
+    let included: Vec<&str> = evidence["system_prompt_components"]["included"]
         .as_array()
         .unwrap()
         .iter()
@@ -411,7 +429,7 @@ async fn a_full_run_records_every_arm_and_writes_nothing_live() {
         .collect();
     assert!(included.contains(&"measurement-disclosure"), "{included:?}");
     assert!(included.contains(&"SELF.md"), "{included:?}");
-    assert!(receipt["raw"]
+    assert!(evidence["raw"]
         .as_str()
         .unwrap()
         .contains("\"type\":\"result\""));
@@ -661,16 +679,35 @@ async fn a_turn_that_reads_the_record_is_void() {
         .iter()
         .filter(|r| r["arm"] == "input-only")
         .all(|r| r["outcome"] != "void"));
-    let receipt = h
-        .root()
-        .join("record/probes/receipts")
-        .join(&summary.run)
-        .join("known-answer-pulse.json");
-    let receipt: Value = serde_json::from_str(&std::fs::read_to_string(receipt).unwrap()).unwrap();
-    assert_eq!(receipt["void"], "Read call reaches record/");
+    let receipt: Value = serde_json::from_str(
+        &std::fs::read_to_string(
+            h.root()
+                .join("record/probes/receipts")
+                .join(&summary.run)
+                .join("known-answer-pulse.json"),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    assert!(receipt["score"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .all(|s| s == "void"));
+    let evidence: Value = serde_json::from_str(
+        &std::fs::read_to_string(
+            h.root()
+                .join("record/probes/private")
+                .join(&summary.run)
+                .join("known-answer-pulse.json"),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(evidence["void"], "Read call reaches record/");
     assert_eq!(
-        receipt["tool_calls"][0]["name"], "Read",
-        "the call is kept as a receipt"
+        evidence["tool_calls"][0]["name"], "Read",
+        "the call is kept in the private evidence"
     );
 }
 

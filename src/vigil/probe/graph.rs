@@ -9,7 +9,7 @@
 //! ```text
 //!  pulse-null-probe-export@<pulse>   (loopback allowed, nothing else)
 //!    probe export-graph ── export (root, read only) ──▶ live server 127.0.0.1:<port>
-//!      writes ~/.local/state/pulse-null/s/exports/<pulse>.surql (0600)
+//!      writes <probe-state>/s/exports/<pulse>.surql (0600, probe user)
 //!  pulse-null-probe@<pulse>          (127.0.0.0/8 denied; ::1 allowed)
 //!    probe run ── takes the export (fresh, consumed) ──┐
 //!      surreal start memory ──▶ throwaway [::1]:<random port>, random root

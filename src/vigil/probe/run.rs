@@ -16,8 +16,8 @@
 //! ```
 //!
 //! Probe turns never go through the daemon's turn path: no session, context
-//! buffer, WAL or archive is touched. The only live writes are the runner's
-//! own rows under `record/probes/`.
+//! buffer, WAL or archive is touched. The runner writes only under the probe
+//! user's private state (`record/probes/` there, not in the live home).
 
 use std::os::unix::fs::DirBuilderExt;
 use std::path::Path;
@@ -39,7 +39,7 @@ use super::fence::{self, DenyList};
 use super::graph::{self, GraphSource, ScratchGraph};
 use super::observe;
 use super::paired::{self, LoadedPairs};
-use super::record::{Record, Stream, RECORD_VERSION};
+use super::record::{self, Record, Stream, RECORD_VERSION};
 use super::schedule::{self, GateInput, History, Refusal, RunStatus};
 use super::score::{self, Outcome};
 use super::scratch::{
@@ -50,7 +50,7 @@ use super::sealed::{self, Registry};
 use super::sets::{self, Arm, Delivery, Item, LoadedSet};
 use super::truth::{TruthSources, Truths};
 
-/// Longest answer text kept on an item row; the receipt keeps it whole.
+/// Longest answer text kept on an item row; the private evidence keeps it whole.
 const ANSWER_MAX_BYTES: usize = 300;
 
 /// What a run is asked to do.
@@ -69,6 +69,9 @@ pub struct RunEnv<'a> {
     pub config: &'a Config,
     pub live_root: &'a Path,
     pub home: &'a Path,
+    /// Where the probe record is rooted (`<dir>/record/probes`). The probe
+    /// user's private state, not the live pulse home.
+    pub record_root: &'a Path,
     pub scratch_parent: &'a Path,
     pub tz: Tz,
     pub now: DateTime<Utc>,
@@ -468,7 +471,7 @@ impl<'a> Planner<'a> {
     /// from there.
     fn first_look(&self) -> Result<std::time::Instant, Stop> {
         let env = self.env;
-        let existing = Record::existing(env.live_root);
+        let existing = Record::existing(env.record_root);
         let first_asks = self.asks_in(existing.as_ref(), env.now)?;
         let first_truths = Truths::at(
             &TruthSources::read(env.live_root, env.config),
@@ -516,7 +519,7 @@ impl<'a> Planner<'a> {
             }
             return Err(refused(Refusal::HostBusy));
         };
-        let record = Record::open(env.live_root)?;
+        let record = Record::open(env.record_root)?;
         let Some(lock) = record.try_lock()? else {
             return Err(refused(Refusal::Locked));
         };
@@ -1263,7 +1266,33 @@ impl TurnContext<'_> {
         let truths = self
             .truths_now()
             .with_served_model(captured.served_model.as_deref());
-        let receipt = self.record.write_receipt(
+        let answers = match turn.set.set.delivery {
+            Delivery::Batched => score::split_batched(&captured.reply, turn.items.len()),
+            Delivery::PerItem => vec![Some(captured.reply.trim().to_string())],
+        };
+        let mut scored = Vec::with_capacity(turn.items.len());
+        for (item, answer) in turn.items.iter().zip(answers) {
+            let truth = truths.get(item.truth);
+            let outcome = if void.is_some() {
+                Outcome::Void
+            } else {
+                score::score(item.rule, truth, answer.as_deref())
+            };
+            scored.push((
+                item,
+                answer,
+                truth.map(|t| t.value.clone()),
+                truth.map(|t| t.source),
+                outcome,
+            ));
+        }
+        let scores: Vec<serde_json::Value> = scored
+            .iter()
+            .map(|(_, _, _, _, outcome)| json!(outcome))
+            .collect();
+        // The question, the raw CLI output and the truths stay in the
+        // probe-private directory. The receipt keeps a digest and the score.
+        self.record.write_private(
             self.run_id,
             &receipt_name,
             &json!({
@@ -1287,31 +1316,29 @@ impl TurnContext<'_> {
                 "raw": captured.raw,
             }),
         )?;
-        let answers = match turn.set.set.delivery {
-            Delivery::Batched => score::split_batched(&captured.reply, turn.items.len()),
-            Delivery::PerItem => vec![Some(captured.reply.trim().to_string())],
-        };
-        for (item, answer) in turn.items.iter().zip(answers) {
-            let truth = truths.get(item.truth);
-            let scored = score::score(item.rule, truth, answer.as_deref());
-            let outcome = if void.is_some() {
-                Outcome::Void
-            } else {
-                scored
-            };
+        let receipt = self.record.write_receipt(
+            self.run_id,
+            &receipt_name,
+            &record::slim_receipt(question, &scores, None),
+        )?;
+        let receipt_rel = receipt
+            .strip_prefix(self.record.dir())
+            .unwrap_or(receipt.as_path())
+            .to_path_buf();
+        for (item, answer, truth, source, outcome) in scored {
             self.record.append(
                 Stream::Items,
                 self.item_row(turn, &item.id, outcome, captured.served_model.as_deref())
                     .merged(json!({
                         "answer": answer.as_deref().map(|a| crate::utils::safe_truncate(a, ANSWER_MAX_BYTES)),
-                        "truth": truth.map(|t| &t.value),
-                        "truth_source": truth.map(|t| t.source),
+                        "truth": truth,
+                        "truth_source": source,
                         "tool_calls": captured.tool_calls.len(),
                         "observes_tools": self.adapter.observes_tools(),
                         "void_reason": void,
                         "family": item.family,
                         "rule": item.rule,
-                        "receipt": receipt.strip_prefix(self.record.dir()).unwrap_or(receipt.as_path()),
+                        "receipt": receipt_rel,
                     })),
             )?;
             tally.items += 1;

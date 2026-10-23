@@ -13,22 +13,24 @@ Wants=network-online.target
 
 [Service]
 Type=oneshot
-User=pulse
-Group=pulse
+User=pulse-probe
+Group=pulse-probe
 WorkingDirectory=/home/pulse/pulse-null/%i
 ExecStart=/usr/local/bin/pulse-null probe verify-isolation
 Environment=RUST_LOG=info
+Environment=PULSE_NULL_PROBE_STATE=/var/lib/pulse-null-probe
 EnvironmentFile=/etc/pulse-null/probe-%i.env
 TimeoutStartSec=30min
 
 # >>> CONFINEMENT (identical in pulse-null-probe-verify@.service) >>>
 UMask=0077
 
-# --- Filesystem: the runner writes only the record and its scratch --------
+# --- Filesystem: the runner writes only the probe user's private state ----
 ProtectSystem=strict
 ProtectHome=read-only
-ReadWritePaths=/home/pulse/pulse-null/%i/record /home/pulse/.local/state/pulse-null
+ReadWritePaths=/var/lib/pulse-null-probe
 InaccessiblePaths=-/home/pulse/.ssh
+InaccessiblePaths=-/home/pulse/.local/state
 # Host sockets any local user may connect to, which Landlock does not
 # mediate (a named-socket connect): the system bus (busctl/D-Bus can read
 # other services' state), tailscaled, snapd, avahi and uuidd. Nothing in a

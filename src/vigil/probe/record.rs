@@ -1,14 +1,21 @@
-//! The probe record: `record/probes/` in the live pulse home (PN-144).
+//! The probe record: `record/probes/` under the probe user's private state,
+//! not in the live pulse home (PN-144). The probe user owns it (0700/0600);
+//! the live pulse's uid cannot read it.
 //!
 //! ```text
-//!  record/probes/            0700
+//!  <probe-state>/<pulse>/record/probes/     0700, probe user
 //!    runs.jsonl              one start and one finish row per run
 //!    items.jsonl             one row per scored answer
 //!    facts.jsonl             paired facts: drawn, planted, asked
 //!    budget.jsonl            one row per model turn spent
-//!    receipts/<run>/*.json   what each turn was asked and answered
+//!    receipts/<run>/*.json   question digest, score, answered_from
+//!    private/<run>/*.json    question text, raw CLI output, truth keys
 //!    run.lock                one run at a time
 //! ```
+//!
+//! A receipt names the question by its SHA-256 and keeps the score and
+//! `answered_from`. The question text, the raw CLI output and the truth
+//! keys are only in `private/`, which has the same owner and mode.
 //!
 //! Every row is hash-chained to the one before it in its file
 //! (`prev`, `hash` over the canonical JSON), so an edited, inserted or
@@ -17,9 +24,10 @@
 //! every row chained to it; later rows that chain to the last verified one
 //! (every row appended after the break does) are used again. A line that is
 //! not a row at all (a write torn by a crash, junk) is skipped and counted,
-//! and never stops the rows after it from being read. This is tamper *evidence*: the pulse's user can still
-//! rewrite the whole file with a recomputed chain until the live pulse is
-//! sandboxed (G2: detected, not prevented). Files are 0600.
+//! and never stops the rows after it from being read. The chain is tamper
+//! evidence. The directory is not writable by the live pulse; a rewrite by
+//! someone who can write it (the probe user, root) is still only detected.
+//! Files are 0600.
 
 use std::io::{self, Write};
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
@@ -128,6 +136,10 @@ impl Record {
             .recursive(true)
             .mode(0o700)
             .create(dir.join("receipts"))?;
+        std::fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(dir.join("private"))?;
         Ok(Self::at(dir))
     }
 
@@ -221,12 +233,24 @@ impl Record {
         read_chain(&self.dir.join(stream.file()))
     }
 
-    /// Write one receipt (0600) under `receipts/<run>/<name>.json`. A `raw`
-    /// field longer than [`RECEIPT_RAW_MAX`] is cut there (and marked), so
-    /// receipts, which are kept as evidence, grow by a bounded amount a turn.
+    /// Write one receipt (0600) under `receipts/<run>/<name>.json`. A receipt
+    /// holds the question's digest, the score and `answered_from`
+    /// ([`slim_receipt`]). A `raw` field longer than [`RECEIPT_RAW_MAX`] is
+    /// cut there (and marked).
     pub fn write_receipt(&self, run: &str, name: &str, receipt: &Value) -> io::Result<PathBuf> {
-        let mut receipt = receipt.clone();
-        let long_raw = receipt
+        self.write_note("receipts", run, name, receipt)
+    }
+
+    /// The question text, raw CLI output and truth keys for one turn (0600),
+    /// under `private/<run>/<name>.json`. Same owner and mode as a receipt;
+    /// this is the only copy of that text.
+    pub fn write_private(&self, run: &str, name: &str, note: &Value) -> io::Result<PathBuf> {
+        self.write_note("private", run, name, note)
+    }
+
+    fn write_note(&self, kind: &str, run: &str, name: &str, note: &Value) -> io::Result<PathBuf> {
+        let mut note = note.clone();
+        let long_raw = note
             .get("raw")
             .and_then(Value::as_str)
             .filter(|raw| raw.len() > RECEIPT_RAW_MAX)
@@ -237,11 +261,10 @@ impl Record {
                 )
             });
         if let Some((cut, len)) = long_raw {
-            receipt["raw"] = Value::String(cut);
-            receipt["raw_truncated_from_bytes"] = Value::from(len);
+            note["raw"] = Value::String(cut);
+            note["raw_truncated_from_bytes"] = Value::from(len);
         }
-        let receipt = &receipt;
-        let dir = self.dir.join("receipts").join(run);
+        let dir = self.dir.join(kind).join(run);
         std::fs::DirBuilder::new()
             .recursive(true)
             .mode(0o700)
@@ -252,9 +275,27 @@ impl Record {
             .create_new(true)
             .mode(0o600)
             .open(&path)?;
-        file.write_all(serde_json::to_string_pretty(receipt)?.as_bytes())?;
+        file.write_all(serde_json::to_string_pretty(&note)?.as_bytes())?;
         Ok(path)
     }
+}
+
+/// SHA-256 of a question, hex-encoded. Receipts store this and not the text.
+#[must_use]
+pub fn question_digest(question: &str) -> String {
+    super::scratch::hex(&Sha256::digest(question.as_bytes()))
+}
+
+/// The receipt stored in the record: the question's digest, the score (one
+/// outcome per item, in order) and where the answer came from. No question
+/// text, raw output or truth.
+#[must_use]
+pub fn slim_receipt(question: &str, score: &[Value], answered_from: Option<&str>) -> Value {
+    serde_json::json!({
+        "question_sha256": question_digest(question),
+        "score": score,
+        "answered_from": answered_from,
+    })
 }
 
 /// Take an exclusive lock on the file at `path` without waiting. `None` when

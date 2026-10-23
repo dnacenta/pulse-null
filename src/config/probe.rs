@@ -15,12 +15,18 @@ pub enum ProbeCadence {
     Pro,
 }
 
+/// The Unix user a probe unit runs as. Never the live pulse's user.
+pub const DEFAULT_PROBE_USER: &str = "pulse-probe";
+
 /// `[probe]`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct ProbeConfig {
     /// Off until the owner turns it on.
     pub enabled: bool,
+    /// The user the probe unit runs as (`User=` in the unit). A run refuses
+    /// when its own uid is the live pulse's.
+    pub user: String,
     pub cadence: ProbeCadence,
     /// Start of the quiet window, `HH:MM` in `[scheduler] timezone`.
     pub quiet_start: String,
@@ -37,6 +43,7 @@ impl Default for ProbeConfig {
     fn default() -> Self {
         Self {
             enabled: false,
+            user: DEFAULT_PROBE_USER.to_string(),
             cadence: ProbeCadence::Max,
             quiet_start: "02:00".to_string(),
             quiet_end: "06:00".to_string(),
@@ -71,8 +78,26 @@ impl ProbeConfig {
         if self.max_turns_per_run > self.weekly_turns {
             return Err("[probe] max_turns_per_run cannot exceed weekly_turns".into());
         }
+        if !valid_user(&self.user) {
+            return Err(format!(
+                "[probe] user '{}' is not a plain account name",
+                self.user
+            ));
+        }
         Ok(())
     }
+}
+
+/// A login name the unit can run as: a letter or `_`, then letters, digits,
+/// `-` or `_`, at most 32 characters.
+fn valid_user(name: &str) -> bool {
+    let mut chars = name.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    name.len() <= 32
+        && (first.is_ascii_lowercase() || first == '_')
+        && chars.all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-' || c == '_')
 }
 
 /// `HH:MM` → minutes after midnight.
@@ -93,9 +118,14 @@ mod tests {
 
     #[test]
     fn defaults_are_off_and_valid() {
-        let config = ProbeConfig::default();
+        let mut config = ProbeConfig::default();
         assert!(!config.enabled);
+        assert_eq!(config.user, DEFAULT_PROBE_USER);
         assert_eq!(config.quiet_window().unwrap(), (120, 360));
+        assert!(config.validate().is_ok());
+        config.user = "Pulse".into();
+        assert!(config.validate().is_err());
+        config.user = "pulse-probe".into();
         assert!(config.validate().is_ok());
     }
 

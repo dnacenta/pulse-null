@@ -21,7 +21,7 @@
 //! and the item and the read fence ([`super::fence`]) the only places it can
 //! read.
 
-use std::ffi::OsString;
+use std::ffi::{OsStr, OsString};
 use std::io;
 use std::path::{Path, PathBuf};
 
@@ -137,15 +137,43 @@ pub enum ItemKind {
     Bare,
 }
 
-/// The parent directory for scratch dirs: `$XDG_STATE_HOME/pulse-null/s`,
-/// else `~/.local/state/pulse-null/s`. Kept short because recall-echo puts a
-/// Unix socket under it.
-pub fn scratch_parent(home: &Path) -> PathBuf {
-    std::env::var_os("XDG_STATE_HOME")
-        .filter(|v| !v.is_empty())
-        .map(PathBuf::from)
-        .unwrap_or_else(|| home.join(".local/state"))
-        .join("pulse-null/s")
+/// The unit sets this to the probe-private state root (`/var/lib/pulse-null-probe`).
+/// Scratch, exports and the record live under it, never under the pulse's home.
+pub const PROBE_STATE_ENV: &str = "PULSE_NULL_PROBE_STATE";
+
+/// Where this process keeps probe-private state. `override_env` is
+/// [`PROBE_STATE_ENV`] when the caller wants the process environment;
+/// tests pass a fixed value. Without it, state is under `process_home`,
+/// which is the probe user's home when the unit runs as that user — never
+/// a home handed in for the pulse.
+pub fn state_root(override_env: Option<&OsStr>, process_home: &Path) -> PathBuf {
+    match override_env {
+        Some(value) if !value.is_empty() => PathBuf::from(value),
+        _ => process_home.join(".local/state/pulse-null/probe"),
+    }
+}
+
+/// [`state_root`] from the process environment.
+pub fn probe_state_root(process_home: &Path) -> PathBuf {
+    state_root(std::env::var_os(PROBE_STATE_ENV).as_deref(), process_home)
+}
+
+/// Scratch directories, the host lock and graph exports, under the probe
+/// state root. Kept short because recall-echo puts a Unix socket under it.
+pub fn probe_scratch_parent(state: &Path) -> PathBuf {
+    state.join("s")
+}
+
+/// The directory [`super::record::Record::open`] treats as a pulse root:
+/// the record is `<state>/<pulse>/record/probes`, outside the live home.
+pub fn probe_record_root(state: &Path, pulse: &str) -> Result<PathBuf, String> {
+    let name = pulse.to_ascii_lowercase();
+    if !is_plain_name(&name) {
+        return Err(format!(
+            "'{pulse}' is not a plain pulse name (letters, digits, - or _)"
+        ));
+    }
+    Ok(state.join(name))
 }
 
 /// One run's scratch directory. Dropping it removes everything unless it was
@@ -1497,8 +1525,24 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn scratch_parent_is_short_and_under_state() {
-        let parent = scratch_parent(Path::new("/home/p"));
-        assert!(parent.ends_with("pulse-null/s"));
+    fn probe_state_stays_out_of_a_pulse_home_when_the_unit_sets_it() {
+        let pulse_home = Path::new("/home/pulse");
+        let set = state_root(Some(OsStr::new("/var/lib/pulse-null-probe")), pulse_home);
+        assert_eq!(set, Path::new("/var/lib/pulse-null-probe"));
+        assert!(!set.starts_with(pulse_home));
+        let own = state_root(None, Path::new("/var/lib/pulse-null-probe"));
+        assert!(own.starts_with("/var/lib/pulse-null-probe"));
+        assert!(!own.starts_with(pulse_home));
+        let record = probe_record_root(&set, "Echo").unwrap();
+        assert_eq!(
+            record,
+            Path::new("/var/lib/pulse-null-probe/echo"),
+            "the record root is the probe state, not the live home"
+        );
+        assert!(probe_record_root(&set, "../x").is_err());
+        assert_eq!(
+            probe_scratch_parent(&set),
+            Path::new("/var/lib/pulse-null-probe/s")
+        );
     }
 }

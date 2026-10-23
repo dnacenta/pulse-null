@@ -127,9 +127,9 @@ impl LoadedPairs {
 
     /// The commitment a draw row carries for `pair` and its planted side:
     /// SHA-256 over the fact key, the fact and the assignment. A reader of
-    /// the record (the live pulse can read it) learns nothing of which pair
-    /// was drawn or which side is the never-told twin; the runner, holding
-    /// the key, recovers both (audit R2-11).
+    /// the record learns nothing of which pair was drawn or which side is
+    /// the never-told twin; the runner, holding the key, recovers both
+    /// (audit R2-11). The live pulse's uid cannot read the record.
     fn assignment(&self, fact: &str, pair: &str, planted: Which) -> String {
         let side = match planted {
             Which::A => "a",

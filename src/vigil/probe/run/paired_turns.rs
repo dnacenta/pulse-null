@@ -8,7 +8,7 @@ use serde_json::json;
 use super::{RunError, Settled, Tally, TurnContext, ANSWER_MAX_BYTES};
 use crate::cli_provider::CapturedRun;
 use crate::vigil::probe::paired::{self, Ask, LoadedPairs, SideRole};
-use crate::vigil::probe::record::{Stream, RECORD_VERSION};
+use crate::vigil::probe::record::{self, Stream, RECORD_VERSION};
 use crate::vigil::probe::score::Outcome;
 use crate::vigil::probe::sets::Arm;
 
@@ -140,9 +140,11 @@ impl TurnContext<'_> {
         } else {
             scored
         };
-        let receipt = self.record.write_receipt(
+        let name = format!("paired-facts-{}", turn.item);
+        let from = paired::answered_from(ask, &captured.tool_calls, self.adapter.observes_tools());
+        self.record.write_private(
             self.run_id,
-            &format!("paired-facts-{}", turn.item),
+            &name,
             &json!({
                 "run": self.run_id,
                 "set": turn.label,
@@ -160,6 +162,11 @@ impl TurnContext<'_> {
                 "raw": captured.raw,
             }),
         )?;
+        let receipt = self.record.write_receipt(
+            self.run_id,
+            &name,
+            &record::slim_receipt(turn.question, &[json!(outcome)], Some(from)),
+        )?;
         self.record.append(
             Stream::Items,
             turn.row(json!({
@@ -168,7 +175,7 @@ impl TurnContext<'_> {
                 "answer": crate::utils::safe_truncate(captured.reply.trim(), ANSWER_MAX_BYTES),
                 "truth": ask.value,
                 "truth_source": "probe facts plant (confirmed in an owner message)",
-                "answered_from": paired::answered_from(ask, &captured.tool_calls, self.adapter.observes_tools()),
+                "answered_from": from,
                 "answer_kind": paired::answer_kind(ask, &captured.reply),
                 "tool_calls": captured.tool_calls.len(),
                 "observes_tools": self.adapter.observes_tools(),

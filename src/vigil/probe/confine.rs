@@ -11,7 +11,7 @@
 //! unit (or an equivalent `systemd-run`) never runs half-confined;
 //! `verify-isolation` shows the same checks.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use super::verify::Check;
@@ -44,8 +44,21 @@ pub fn checks() -> Vec<Check> {
     checks
 }
 
-/// `Ok` when every confinement check passes; else why the run is refused.
-pub fn require() -> Result<(), String> {
+/// `Ok` when the process is the probe user (not the live pulse), the probe
+/// record is not readable by the pulse's uid, and every confinement check
+/// passes. `record_dir` is `record/probes`.
+pub fn require(expected_user: &str, pulse_uid: u32, record_dir: &Path) -> Result<(), String> {
+    let euid = euid();
+    let name = account(euid).map(|a| a.name).unwrap_or_default();
+    let readable = record_readable_by(record_dir, pulse_uid)?;
+    if let Some(reason) = identity_refusal(euid, &name, expected_user, pulse_uid, readable) {
+        return Err(reason);
+    }
+    require_unit()
+}
+
+/// `Ok` when every unit confinement check passes; else why the run is refused.
+pub fn require_unit() -> Result<(), String> {
     let failed: Vec<String> = checks()
         .into_iter()
         .filter(|c| !c.passed)
@@ -60,6 +73,169 @@ pub fn require() -> Result<(), String> {
             failed.join("; ")
         ))
     }
+}
+
+/// Why this process must not run a probe, or `None` when the uid split holds.
+/// `record_readable` is whether `record/probes` is readable by `pulse_uid`.
+#[must_use]
+pub fn identity_refusal(
+    euid: u32,
+    euid_name: &str,
+    expected_user: &str,
+    pulse_uid: u32,
+    record_readable: bool,
+) -> Option<String> {
+    if euid == pulse_uid {
+        return Some(format!(
+            "the probe runs as its own user ({expected_user}), not as the live pulse \
+             (uid {pulse_uid})"
+        ));
+    }
+    if euid_name != expected_user {
+        return Some(format!(
+            "running as {euid_name}, not the probe user '{expected_user}' ([probe] user)"
+        ));
+    }
+    if record_readable {
+        return Some(
+            "the probe record is readable by the live pulse; it must be mode 0700 \
+             and owned by the probe user"
+                .into(),
+        );
+    }
+    None
+}
+
+fn euid() -> u32 {
+    // SAFETY: geteuid has no preconditions and returns the effective uid.
+    unsafe { libc::geteuid() }
+}
+
+/// A passwd entry. The home is the account's, copied out of the libc buffer.
+struct Account {
+    name: String,
+    gid: u32,
+    home: PathBuf,
+}
+
+/// The passwd entry for `uid`.
+fn account(uid: u32) -> Result<Account, String> {
+    let mut cap = 16 * 1024;
+    loop {
+        let mut buf = vec![0u8; cap];
+        let mut pwd = std::mem::MaybeUninit::<libc::passwd>::uninit();
+        let mut result: *mut libc::passwd = std::ptr::null_mut();
+        // SAFETY: getpwuid_r writes the entry into `pwd` and `buf`, and sets
+        // `result` to `pwd` or null. The strings are copied before `buf` drops.
+        let rc = unsafe {
+            libc::getpwuid_r(
+                uid,
+                pwd.as_mut_ptr(),
+                buf.as_mut_ptr().cast(),
+                buf.len(),
+                &mut result,
+            )
+        };
+        if rc == libc::ERANGE {
+            cap = cap.saturating_mul(2);
+            if cap > 1024 * 1024 {
+                return Err(format!("passwd entry for uid {uid} does not fit"));
+            }
+            continue;
+        }
+        if rc != 0 || result.is_null() {
+            return Err(format!("no passwd entry for uid {uid}"));
+        }
+        // SAFETY: `result` points at `pwd`, which getpwuid_r has initialized.
+        let pwd = unsafe { &*result };
+        let name =
+            cstr(pwd.pw_name).map_err(|_| format!("user name for uid {uid} is not utf-8"))?;
+        let home = cstr(pwd.pw_dir).map_err(|_| format!("home for uid {uid} is not utf-8"))?;
+        return Ok(Account {
+            name,
+            gid: pwd.pw_gid,
+            home: PathBuf::from(home),
+        });
+    }
+}
+
+fn cstr(ptr: *const libc::c_char) -> Result<String, ()> {
+    if ptr.is_null() {
+        return Err(());
+    }
+    // SAFETY: `ptr` is a NUL-terminated string from a passwd field just read.
+    let text = unsafe { std::ffi::CStr::from_ptr(ptr) };
+    text.to_str().map(str::to_string).map_err(|_| ())
+}
+
+/// The home directory of `uid`.
+pub(crate) fn home_of(uid: u32) -> Result<PathBuf, String> {
+    Ok(account(uid)?.home)
+}
+
+/// Whether `dir` can be read by `uid`. A missing directory is not readable.
+/// A symlink is treated as readable so a replaced record is refused. When
+/// the group-read bit is set and that user's groups cannot be listed, the
+/// directory is treated as readable (fail closed).
+fn record_readable_by(dir: &Path, uid: u32) -> Result<bool, String> {
+    let meta = match std::fs::symlink_metadata(dir) {
+        Ok(meta) => meta,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(e) => return Err(format!("cannot stat {}: {e}", dir.display())),
+    };
+    if meta.file_type().is_symlink() {
+        return Ok(true);
+    }
+    use std::os::unix::fs::MetadataExt;
+    let groups = groups_of(uid);
+    Ok(access_allows(
+        meta.uid(),
+        meta.gid(),
+        meta.mode(),
+        uid,
+        groups.as_deref(),
+    ))
+}
+
+/// Unix read permission of mode `mode` (owner `owner`, group `group`) for
+/// `uid`. `groups` is that user's group list; `None` means it is unknown,
+/// and a group-read bit then counts as readable.
+fn access_allows(owner: u32, group: u32, mode: u32, uid: u32, groups: Option<&[u32]>) -> bool {
+    let mode = mode & 0o777;
+    if owner == uid {
+        return mode & 0o400 != 0;
+    }
+    if mode & 0o004 != 0 {
+        return true;
+    }
+    if mode & 0o040 != 0 {
+        return groups.is_none_or(|gs| gs.contains(&group));
+    }
+    false
+}
+
+/// Groups `uid` belongs to, primary included. `None` when the list cannot
+/// be read (the caller fails closed).
+fn groups_of(uid: u32) -> Option<Vec<u32>> {
+    let account = account(uid).ok()?;
+    let name = std::ffi::CString::new(account.name).ok()?;
+    let mut len = 64i32;
+    for _ in 0..8 {
+        let mut groups = vec![0; len as usize];
+        // SAFETY: getgrouplist writes at most `len` group ids into `groups`
+        // and sets `len` to the number written, or to the size required.
+        let rc = unsafe {
+            libc::getgrouplist(name.as_ptr(), account.gid, groups.as_mut_ptr(), &mut len)
+        };
+        if rc >= 0 {
+            groups.truncate(len.max(0) as usize);
+            return Some(groups);
+        }
+        if len <= groups.len() as i32 {
+            return None;
+        }
+    }
+    None
 }
 
 fn loopback_check() -> Check {
@@ -206,6 +382,53 @@ mod tests {
     /// Outside the unit (as in the test suite) a run must be refused.
     #[test]
     fn this_test_process_is_not_confined() {
-        assert!(require().is_err());
+        assert!(require_unit().is_err());
+    }
+
+    #[test]
+    fn the_probe_user_must_not_be_the_pulse_and_the_record_must_be_private() {
+        assert!(identity_refusal(10, "pulse", "pulse-probe", 10, false)
+            .unwrap()
+            .contains("not as the live pulse"));
+        assert!(identity_refusal(20, "ubuntu", "pulse-probe", 10, false)
+            .unwrap()
+            .contains("not the probe user"));
+        assert!(identity_refusal(20, "pulse-probe", "pulse-probe", 10, true)
+            .unwrap()
+            .contains("readable by the live pulse"));
+        assert!(identity_refusal(20, "pulse-probe", "pulse-probe", 10, false).is_none());
+    }
+
+    #[test]
+    fn a_0700_directory_is_not_readable_by_another_uid() {
+        let dir = tempfile::tempdir().unwrap();
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let meta = std::fs::metadata(dir.path()).unwrap();
+        let other = meta.uid().wrapping_add(1);
+        assert!(
+            !access_allows(meta.uid(), meta.gid(), meta.mode(), other, Some(&[])),
+            "mode 0700 is not readable by another uid"
+        );
+        assert!(access_allows(
+            meta.uid(),
+            meta.gid(),
+            meta.mode(),
+            meta.uid(),
+            Some(&[])
+        ));
+        assert!(access_allows(1, 1, 0o755, 2, Some(&[])));
+        assert!(access_allows(1, 5, 0o750, 2, Some(&[5])));
+        assert!(!access_allows(1, 5, 0o750, 2, Some(&[9])));
+        assert!(
+            access_allows(1, 5, 0o750, 2, None),
+            "unknown groups fail closed"
+        );
+        assert!(
+            !record_readable_by(dir.path(), other).unwrap(),
+            "the directory this test created is not readable by another uid"
+        );
+        assert!(record_readable_by(dir.path(), meta.uid()).unwrap());
+        assert!(!record_readable_by(&dir.path().join("missing"), other).unwrap());
     }
 }

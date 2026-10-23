@@ -17,7 +17,7 @@ asking changes nothing the pulse lives in.
    │  gate: enabled · probe day (with --if-due) · quiet window · budget
    │        · not ISOLATION · Landlock ABI ≥ 4 · lock free   → else refused, nothing written
    ▼
- scratch  ~/.local/state/pulse-null/s/<run>/   (0700, removed at teardown)
+ scratch  /var/lib/pulse-null-probe/s/<run>/   (0700, probe user, removed at teardown)
    base/<pulse>       filtered copy of the pulse home
    items/<n>/<pulse>  one working copy per turn
    items/<n>/vendor   the agent CLI's own state (CLAUDE_CONFIG_DIR / GROK_HOME)
@@ -26,7 +26,10 @@ asking changes nothing the pulse lives in.
    ▼
  for each set × arm: one turn under a Landlock sandbox → receipt → rule scores
    ▼
- record/probes/{runs,items,budget,facts}.jsonl + receipts/<run>/   (0700/0600)
+ /var/lib/pulse-null-probe/<pulse>/record/probes/   (0700/0600, probe user)
+   {runs,items,budget,facts}.jsonl
+   receipts/<run>/   question digest, score, answered_from
+   private/<run>/    question text, raw CLI output, truth keys
 ```
 
 ## Sets (v1), sealed
@@ -43,7 +46,8 @@ asking changes nothing the pulse lives in.
 probes would be measured on its studying. The repo keeps each set file's
 SHA-256, and its public label and minimum n, in
 `assets/probes/v1/sealed.toml`. The files are kept where the live pulse
-cannot read them, though it runs as the same Unix user as the runner:
+cannot read them. The probe runs as its own user (`[probe] user`, default
+`pulse-probe`), not as the pulse:
 
 - **At rest:** `/etc/pulse-null-probe/sets/<pulse>/` (root 0700, files
   0600), with `fact-key` beside them (below). Root installs them once from
@@ -60,8 +64,9 @@ cannot read them, though it runs as the same Unix user as the runner:
   through `systemd-run` with the same credentials (as root):
 
   ```
-  systemd-run --pty --wait --collect --uid=pulse --gid=pulse \
+  systemd-run --pty --wait --collect --uid=pulse-probe --gid=pulse-probe \
     -p WorkingDirectory=/home/pulse/pulse-null/<pulse> \
+    -p Environment=PULSE_NULL_PROBE_STATE=/var/lib/pulse-null-probe \
     -p LoadCredential=paired-facts.toml:/etc/pulse-null-probe/sets/<pulse>/paired-facts.toml \
     -p LoadCredential=fact-key:/etc/pulse-null-probe/sets/<pulse>/fact-key \
     -p LoadCredential=known-answer.toml:/etc/pulse-null-probe/sets/<pulse>/known-answer.toml \
@@ -71,28 +76,29 @@ cannot read them, though it runs as the same Unix user as the runner:
 
   `probe status` needs no credentials: the minimum n it reads by is public.
 - **The record does not name the twin.** A draw row in
-  `record/probes/facts.jsonl` (which the live pulse can read, G2) carries no
-  pair, side or slot: only `assignment`, a SHA-256 over the fact key, the
-  fact id, the pair and the planted side. The runner, holding the key,
-  recovers which pair and side it was; a reader without the key learns
-  nothing of which side is the never-told twin. Item rows carry no pair id
-  either, but see the next point: after a fact's first ask they give the
-  twin away all the same.
-- **Residual gaps (stated).** While a probe unit runs, its credentials
-  directory exists under `/run/credentials/` and is readable by the unit's
-  user, which the live pulse shares: a pulse that looked there during the
-  quiet window could read the sets. And each turn's receipt
-  (`record/probes/receipts/`) keeps the question it asked, as evidence
-  (G3), so the items a pulse was asked are in the record after a run. And
-  after a paired fact's first ask its item rows in
-  `record/probes/items.jsonl`, which the live pulse can read, name the
-  fact, each ask's `side` (`twin` among them) and, on the planted side,
-  the planted value (`truth`); with the receipts' questions they tell a
-  pulse that looks which slot is the never-told twin and what it was told,
-  so the keyed commitment protects a fact only until its first ask. All
-  three close with the deny rules on `record/` (Concept v2 Phase 1) and a
-  probe user of its own (PN-146); until then a read is detected by the void
-  scan only when it happens inside a probe turn.
+  `record/probes/facts.jsonl` carries no pair, side or slot: only
+  `assignment`, a SHA-256 over the fact key, the fact id, the pair and the
+  planted side. The runner, holding the key, recovers which pair and side
+  it was; a reader without the key learns nothing of which side is the
+  never-told twin. The file is mode 0600 and owned by the probe user, under
+  `/var/lib/pulse-null-probe/<pulse>/`, which the live pulse cannot read.
+  Item rows carry no pair id. After a fact's first ask they do name the
+  fact, each ask's `side` (`twin` among them) and, on the planted side, the
+  planted value (`truth`). Those rows are in the same probe-private
+  directory. A receipt does not repeat the question or the value: it keeps
+  the question's SHA-256, the score and `answered_from`. The question text,
+  the raw CLI output and the truth keys are only in `private/<run>/` beside
+  the receipts, same owner and mode.
+- **What the separate user closes.** The probe unit, the verify unit and
+  the export unit run as `pulse-probe` (or `[probe] user`). A run refuses
+  when its effective uid is the owner of the live pulse directory, or when
+  `record/probes` is readable by that uid. The credentials directory
+  systemd builds for the unit is that user's, so the live pulse cannot read
+  the sets while a run is up. Scratch, staged question files and the graph
+  export live under `/var/lib/pulse-null-probe`, not under the pulse's
+  `~/.local/state`. The vendor token is in the probe process's environment;
+  another uid cannot read it. The 7-day ask is held out on that basis: the
+  answer key is not in a file the pulse can open between runs.
 
 A changed set is a new digest committed here: a new pre-registration and a
 new set version. What stays public: the schema (`src/vigil/probe/sets.rs`,
@@ -192,7 +198,8 @@ instructions or memory, only what the CLI needs to log in.
   server, over 127.0.0.1 and nothing else (`IPAddressDeny=any`,
   `IPAddressAllow=127.0.0.1/32`), and it only reads: an export without users
   or access methods, renamed into place as
-  `~/.local/state/pulse-null/s/exports/<pulse>.surql` (0600). Its root
+  `/var/lib/pulse-null-probe/s/exports/<pulse>.surql` (0600, owned by the
+  probe user; the pulse user cannot write that directory). Its root
   credential goes only to a loopback address, and only for the `nullarc`
   namespace and this pulse's own database (anything else in the
   pulse-writable recall-echo config refuses it). The run then starts its
@@ -265,11 +272,10 @@ but the run's rows.
   `record/`, `secrets/`, the graph credential, the probe CLI or this
   machine) stays as a second line and as evidence in the receipts; it is
   not what keeps a probe out of a live store.
-- **Signals and Unix sockets** are not scoped by Landlock ABI 4: a probe
-  child runs as the pulse's user and could signal the live daemons (audit
-  #13, no change: systemd 255 has no `PrivatePIDs=` and unprivileged user
-  namespaces are blocked on this host; revisit with a separate probe user
-  or systemd ≥ 257). Landlock ABI 4 mediates neither path traversal nor
+- **Signals and Unix sockets** are not scoped by Landlock ABI 4. The probe
+  child runs as the probe user, not the pulse's, so it cannot signal the
+  live daemons (their processes are another uid). Landlock ABI 4 mediates
+  neither path traversal nor
   `connect` on a named Unix socket: a child that knows a live socket's path
   can connect to it without being able to list its directory. The live
   pulses' recall-echo daemons put theirs in `$XDG_RUNTIME_DIR/recall-echo/`
@@ -309,8 +315,11 @@ but the run's rows.
   as `systemctl start pulse-null-probe-verify@<pulse>`, the same
   confinement line for line (by hand outside it, the unit checks fail and it
   exports the graph for itself, since the loopback is open there).
-- The pulse's own live process is not sandboxed: it can still read or write
-  `record/` (G2: detected, not prevented). The record is hash-chained; an
+- The pulse's own live process is not sandboxed. It cannot read or write
+  the probe record: that directory is mode 0700, owned by the probe user,
+  and it is not under the pulse home. A run refuses when the two uids are
+  the same or when the pulse's uid can read `record/probes`. The record is
+  hash-chained; an
   edited, inserted or removed row breaks the chain and the break is
   reported by `probe status`. A row that does not verify is not used, nor
   is any row chained to it; rows appended after the break chain to the last
@@ -345,8 +354,8 @@ but the run's rows.
   three due paired facts of four asks, 12). A run that would exceed
   either is refused before it starts.
 - **One run at a time** per pulse (`record/probes/run.lock`), and one on
-  the host (`~/.local/state/pulse-null/s/host.lock`, shared by every pulse
-  of the user): a run waits up to 90 minutes for another pulse's run to
+  the host (`/var/lib/pulse-null-probe/s/host.lock`, shared by every pulse
+  the probe user runs): a run waits up to 90 minutes for another pulse's run to
   finish, then re-checks the gate.
 - **Load.** Probe children run at background priority (nice 10, idle I/O
   class), as does the unit (`Nice=`, `IOSchedulingClass=idle`,
@@ -400,9 +409,10 @@ but the run's rows.
   export unit (`pulse-null-probe-export@.service`), which runs whether or
   not the run turns out to be due. The unit
   gets only the vendor login (`/etc/pulse-null/probe-<pulse>.env`, one
-  line), never the pulse's whole EnvironmentFile, and runs with
-  `ProtectSystem=strict`, `ProtectHome=read-only` (writable: the record and
-  the scratch parent), `PrivateTmp`, `PrivateDevices`, `ProtectProc`, no
+  line), never the pulse's whole EnvironmentFile, and runs as the probe
+  user with `ProtectSystem=strict`, `ProtectHome=read-only` (writable:
+  `/var/lib/pulse-null-probe` only), `PrivateTmp`, `PrivateDevices`,
+  `ProtectProc`, no
   capabilities, `RestrictAddressFamilies`, the `IPAddressDeny=` and probe
   resolver above, the host sockets made inaccessible,
   `MemoryMax=4G`, `TasksMax=512`; systemd kills the whole cgroup at the end
@@ -438,10 +448,11 @@ version or any other lineage field (G6); paired facts are grouped by served
 model, memory, scorer and reasoning effort instead of the runtime's and the
 CLI's versions, which change many times over a fact's 90 days (see their
 page). Each
-turn's receipt keeps the question, the reply, the raw CLI output (up to
-512 KiB, marked when cut), the tool calls and the truths it was scored
-against (G3). Receipts are evidence and are kept; each turn adds a bounded
-amount.
+turn's receipt keeps the question's SHA-256, the score and `answered_from`.
+The question text, the reply, the raw CLI output (up to 512 KiB, marked
+when cut), the tool calls and the truths it was scored against (G3) are
+kept in `private/<run>/` in the same probe-private directory, not in the
+receipt. Each turn adds a bounded amount.
 
 **Truths are the turn's own.** The runtime's stores are read once per run;
 the clock's truths (today, the weekday, tomorrow, the coming Friday, days
