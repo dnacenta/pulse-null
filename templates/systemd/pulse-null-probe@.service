@@ -34,8 +34,10 @@
 #   # Login files the runner copies from the pulse user's home (the adapter's
 #   # directory there; see "Vendor state" in docs/methods/probe-runner.md):
 #   setfacl -m u:pulse-probe:rx /home/pulse
-#   # The live graph root password, so the export unit can read it:
-#   setfacl -m u:pulse-probe:r /opt/pulse-null/surrealdb/root-password
+#   # The graph root password stays mode 0600, owned by root. Only the
+#   # export unit receives it, via LoadCredential= on that unit. Do not
+#   # grant the probe user the file. The run and verify units have no path
+#   # to it.
 #   # The vendor login only, never the pulse's whole EnvironmentFile.
 #   # systemd reads this as root into the probe process; the pulse's uid
 #   # cannot read that process's environment.

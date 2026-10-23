@@ -90,7 +90,11 @@ cannot read them. The probe runs as its own user (`[probe] user`, default
   the raw CLI output and the truth keys are only in `private/<run>/` beside
   the receipts, same owner and mode.
 - **What the separate user closes.** The probe unit, the verify unit and
-  the export unit run as `pulse-probe` (or `[probe] user`). A run refuses
+  the export unit run as `pulse-probe` (or `[probe] user`). The graph
+  root password stays mode 0600 and owned by root. Only the export unit
+  receives it, as `LoadCredential=root-password`, and the export reads
+  `$CREDENTIALS_DIRECTORY/root-password`. The run and verify units do not
+  load it. A run refuses
   when its effective uid is the owner of the live pulse directory, when
   `record/probes` is readable by that uid, or when the record carries a
   named access-list entry. The credentials directory

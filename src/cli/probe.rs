@@ -191,7 +191,14 @@ impl ProbeContext {
         let Some(live) = &self.live_graph else {
             return Ok(None);
         };
-        let source = LiveSource::from_data_dir(live, &self.data_dir());
+        let credentials = std::env::var_os(crate::vigil::probe::sealed::CREDENTIALS_ENV)
+            .filter(|dir| !dir.is_empty())
+            .map(PathBuf::from)
+            .ok_or(
+                "the graph root password reaches the export only as a unit credential; \
+                 the export unit loads it",
+            )?;
+        let source = LiveSource::from_credential(live, &credentials)?;
         Ok(Some(
             graph::export_live(&source, live, &self.export_path()).await?,
         ))

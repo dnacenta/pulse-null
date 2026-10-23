@@ -13,6 +13,11 @@
 # full run, or another gate refusal). A run that is due still exports first
 # (`Requires=` on the probe unit). A hand-started run that finds no fresh
 # export fails closed.
+#
+# The graph root password stays mode 0600, owned by root. This unit is the
+# only one that receives it: systemd copies it into the credentials
+# directory, and the export reads $CREDENTIALS_DIRECTORY/root-password.
+# The run and verify units do not load it.
 
 [Unit]
 Description=pulse-null probe graph export (%i)
@@ -26,6 +31,7 @@ WorkingDirectory=/home/pulse/pulse-null/%i
 ExecStart=/usr/local/bin/pulse-null probe export-graph --if-due
 Environment=RUST_LOG=info
 Environment=PULSE_NULL_PROBE_STATE=/var/lib/pulse-null-probe
+LoadCredential=root-password:/opt/pulse-null/surrealdb/root-password
 UMask=0077
 TimeoutStartSec=20min
 

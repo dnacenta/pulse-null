@@ -79,22 +79,12 @@ pub enum GraphError {
     Server(String),
 }
 
-/// One SurrealDB HTTP endpoint and where its root credential comes from.
+/// One SurrealDB HTTP endpoint and its root credential. `Debug` redacts it.
 #[derive(Clone)]
 struct Endpoint {
     /// `host:port`.
     addr: String,
-    root_password: RootPassword,
-}
-
-/// The root password, read only when a request needs it, so a run that is
-/// refused never touches the live credential.
-#[derive(Clone)]
-enum RootPassword {
-    /// The runtime's shared data dir (`<data_dir>/surrealdb/root-password`).
-    DataDir(PathBuf),
-    /// A password the runner generated (the throwaway server's).
-    Given(String),
+    root_password: String,
 }
 
 impl fmt::Debug for Endpoint {
@@ -204,27 +194,45 @@ pub struct LiveSource {
 }
 
 impl LiveSource {
-    /// The live server of `live`, with the root password in the runtime's
-    /// shared data dir (`<data_dir>/surrealdb/root-password`), read on use.
-    #[must_use]
-    pub fn from_data_dir(live: &LiveGraph, data_dir: &Path) -> Self {
-        Self {
-            endpoint: Endpoint {
-                addr: live.addr.clone(),
-                root_password: RootPassword::DataDir(data_dir.to_path_buf()),
-            },
-        }
+    /// The file name of the graph root password inside
+    /// `$CREDENTIALS_DIRECTORY`. Only the export unit loads it.
+    pub const GRAPH_ROOT_CREDENTIAL: &str = "root-password";
+
+    /// The live server, with the root password read from the export unit's
+    /// credential directory. The file on disk stays mode 0600 and owned by
+    /// root; the unit copies it for this process only.
+    pub fn from_credential(live: &LiveGraph, credentials: &Path) -> Result<Self, GraphError> {
+        let password = credential_password(credentials)?;
+        Ok(Self::with_password(&live.addr, &password))
     }
 
-    #[cfg(test)]
     pub(crate) fn with_password(addr: &str, password: &str) -> Self {
         Self {
             endpoint: Endpoint {
                 addr: addr.to_string(),
-                root_password: RootPassword::Given(password.to_string()),
+                root_password: password.to_string(),
             },
         }
     }
+}
+
+/// The graph root password from the export unit's credential directory.
+/// The value is not included in an error.
+fn credential_password(dir: &Path) -> Result<String, GraphError> {
+    let path = dir.join(LiveSource::GRAPH_ROOT_CREDENTIAL);
+    let text = std::fs::read_to_string(&path).map_err(|e| {
+        GraphError::Io(std::io::Error::other(format!(
+            "cannot read the graph root credential at {}: {e}",
+            path.display()
+        )))
+    })?;
+    let password = text.trim().to_string();
+    if password.is_empty() {
+        return Err(GraphError::Unsafe(
+            "the graph root credential is empty".into(),
+        ));
+    }
+    Ok(password)
 }
 
 /// Everything a run needs to copy the pulse's graph: where the export unit
@@ -437,12 +445,8 @@ fn define_sql(names: &ProbeNames, password: &str) -> Result<String, GraphError> 
 const EXPORT_OPTIONS: &str = r#"{"users":false,"accesses":false}"#;
 
 impl Endpoint {
-    fn password(&self) -> Result<String, GraphError> {
-        match &self.root_password {
-            RootPassword::DataDir(dir) => crate::surrealdb_manager::read_root_password(dir)
-                .map_err(|e| GraphError::Io(std::io::Error::other(e.to_string()))),
-            RootPassword::Given(password) => Ok(password.clone()),
-        }
+    fn password(&self) -> &str {
+        &self.root_password
     }
 
     fn client(&self) -> Result<reqwest::Client, GraphError> {
@@ -466,7 +470,7 @@ impl Endpoint {
     ) -> Result<reqwest::RequestBuilder, GraphError> {
         let mut request = client
             .post(self.url(path))
-            .basic_auth("root", Some(self.password()?));
+            .basic_auth("root", Some(self.password()));
         if let Some((namespace, database)) = scope {
             request = request
                 .header("surreal-ns", namespace)
@@ -734,7 +738,7 @@ impl ThrowawayServer {
             child: tokio::sync::Mutex::new(child),
             endpoint: Endpoint {
                 addr: format!("[::1]:{port}"),
-                root_password: RootPassword::Given(password),
+                root_password: password,
             },
             port,
         };
@@ -1067,6 +1071,32 @@ mod tests {
     use super::*;
 
     #[test]
+    fn the_export_reads_the_root_password_from_its_credential_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = credential_password(dir.path()).unwrap_err().to_string();
+        assert!(
+            missing.contains("cannot read the graph root credential"),
+            "{missing}"
+        );
+        std::fs::write(
+            dir.path().join(LiveSource::GRAPH_ROOT_CREDENTIAL),
+            "pw-value\n",
+        )
+        .unwrap();
+        assert_eq!(credential_password(dir.path()).unwrap(), "pw-value");
+        let live = LiveGraph {
+            addr: "127.0.0.1:1".into(),
+            namespace: "nullarc".into(),
+            database: "echo".into(),
+        };
+        let source = LiveSource::from_credential(&live, dir.path()).unwrap();
+        assert!(!format!("{source:?}").contains("pw-value"));
+        std::fs::write(dir.path().join(LiveSource::GRAPH_ROOT_CREDENTIAL), "\n").unwrap();
+        let empty = credential_password(dir.path()).unwrap_err().to_string();
+        assert!(empty.contains("empty"), "{empty}");
+    }
+
+    #[test]
     fn a_listen_line_names_its_inode_only_for_that_port() {
         let header = "  sl  local_address                         remote_address                        st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode\n";
         let listen = "   1: 00000000000000000000000001000000:1F90 00000000000000000000000000000000:0000 0A 00000000:00000000 00:00000000 00000000     0        0 12345 1 0000000000000000 100 0 0 10 0\n";
@@ -1280,9 +1310,7 @@ mod tests {
             )
             .await
             .unwrap();
-        let RootPassword::Given(password) = server.endpoint.root_password.clone() else {
-            unreachable!()
-        };
+        let password = server.endpoint.root_password.clone();
         let source = LiveSource::with_password(server.addr(), &password);
         let live = LiveGraph {
             addr: server.addr().to_string(),

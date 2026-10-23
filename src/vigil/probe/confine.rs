@@ -638,6 +638,16 @@ mod tests {
         assert!(
             EXPORT_UNIT.contains("ExecStart=/usr/local/bin/pulse-null probe export-graph --if-due")
         );
+        assert!(EXPORT_UNIT
+            .contains("LoadCredential=root-password:/opt/pulse-null/surrealdb/root-password"));
+        assert!(
+            !PROBE_UNIT.contains("root-password"),
+            "the run unit has no path to the graph root password"
+        );
+        assert!(
+            !VERIFY_UNIT.contains("root-password"),
+            "the verify unit has no path to the graph root password"
+        );
     }
 
     #[test]
