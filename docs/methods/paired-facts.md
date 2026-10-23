@@ -167,7 +167,7 @@ any data and changed only as a new set version.
 |---|---|---|
 | `offsets_days` | 1, 7, 30, 90 | a day, a week, a month, a quarter: from "still in the session" to "long past it" |
 | `max_active` (facts in flight) | 3 | the turn budget and the owner (below) |
-| `min_n` (per side and offset) | 10 | an initial guess for one batch. Up to three facts share a run, so a batch of 10 is several runs. "Remembers" is a t interval on the run means of the paired differences, read only when that interval lies above zero; it is not read from Wilson intervals on the separate arms |
+| `min_n` (per side and offset) | 10 | an initial guess for one batch. Up to three facts share a run, so a batch of 10 is several runs. "Remembers" is an interval on the run means of the paired differences, read only when that interval lies above zero. Identical means are widened (a minimum half-width from the 1/3 grid step, and a Wilson bound on how many run means were positive), so two agreeing runs do not decide and a small positive mean that does not move does not decide at those run counts. It is not read from Wilson intervals on the separate arms |
 | plant window | 14 days | long enough to bring a topic up in normal conversation without forcing it, short enough that an abandoned draw does not hold a slot for long |
 
 **Why `max_active` is 3, and the cap that fits it.** Each due fact takes
@@ -221,9 +221,15 @@ guess as its unhedged hits, "chance k of n unhedged" (the chance rate).
 The decision is not those marginal intervals. For each fact, status scores
 the planted unhedged hit minus the forced guess's unhedged hit, and the
 planted hit minus the twin's made-up answer, averages within a run, and
-prints a 95% t interval on the run means (`vs chance`, `vs twin`). It
-decides only when that interval lies above zero. One run is not a
-decision. Labels name the
+prints an interval on the run means (`vs chance`, `vs twin`). That
+interval starts as a 95% t interval and is widened so identical run means
+are not a point: the half-width is at least t times 1/3 over the square
+root of the run count (a run holds at most three facts, and a fact's
+difference is −1, 0 or +1), and it also takes in a Wilson interval on how
+many of the run means were positive, mapped onto [−1, +1]. It decides
+only when the widened interval lies above zero. Two runs at +1 do not
+decide. A constant small positive mean does not decide across the runs a
+batch contains. One run is not a decision. Labels name the
 pre-registered offset; status also shows how many days after the plant
 the asks actually came (`elapsed_days` on every row), since a missed run
 makes an ask late. For the planted side and the
@@ -255,11 +261,14 @@ before a number is shown ("not enough yet · k of 10").
   stays on the row (`lookup` when a tool result held the value or a call
   named the slot, `context` otherwise) and `probe status` breaks lookup
   out on the planted line.
-- Fail branch: if, at 1 or 7 days, the t interval on the run means of
+- Fail branch: if, at 1 or 7 days, the widened interval on the run means of
   (planted unhedged hit − forced-guess unhedged hit) does not lie above
-  zero, or the t interval on (planted hit − twin made-up) does not,
-  "Remembers" reads as not yet shown. Lookup is shown apart from context
-  and does not decide by itself. What a model with no memory volunteers
-  is shown and never decides it. The 30- and 90-day offsets are
-  exploratory and never decide it. "Made up" is not read until a labelled
-  check of the coding frame exists.
+  zero, or the widened interval on (planted hit − twin made-up) does not,
+  "Remembers" reads as not yet shown. The widening is the floor above: a
+  minimum half-width from the 1/3 grid step, and a Wilson bound on how
+  many run means were positive. Identical run means are not read as
+  certainty. Lookup is shown apart from context and does not decide by
+  itself. What a model with no memory volunteers is shown and never
+  decides it. The 30- and 90-day offsets are exploratory and never decide
+  it. "Made up" is not read until a labelled check of the coding frame
+  exists.

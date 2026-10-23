@@ -163,11 +163,14 @@ pub struct ArmResult {
     pub from_known: bool,
 }
 
-/// A 95% Student's t interval on the mean of per-run mean paired
-/// differences, in [-1, 1]. One difference is one fact: the planted
-/// unhedged hit minus the forced guess's, or the planted hit minus the
-/// twin's made-up answer. "Remembers" is read only when the interval lies
-/// above zero, and never from exploratory offsets.
+/// An interval on the mean of per-run mean paired differences, in [-1, 1].
+/// One difference is one fact: the planted unhedged hit minus the forced
+/// guess's, or the planted hit minus the twin's made-up answer. The
+/// interval is a 95% t interval widened so identical run means are not a
+/// point (a minimum half-width from the difference grid, and a Wilson
+/// bound on how many run means were positive). "Remembers" is read only
+/// when that widened interval lies above zero, and never from exploratory
+/// offsets.
 #[derive(Debug, Clone, PartialEq)]
 pub struct PairedGap {
     pub offset_days: i64,
@@ -181,7 +184,7 @@ pub struct PairedGap {
 }
 
 impl PairedGap {
-    /// The decision the interval supports: entirely above zero, on a
+    /// The decision the widened interval supports: entirely above zero, on a
     /// confirmatory offset, with more than one run.
     #[must_use]
     pub fn above_zero(&self) -> bool {
@@ -642,8 +645,20 @@ fn pairing_gaps(facts: &BTreeMap<FactKey, OpenFact>) -> BTreeMap<GroupKey, Vec<P
     gaps
 }
 
-/// The mean of `means` and a 95% t interval on it, clipped to [-1, 1].
-/// One run has no spread, so the interval is the whole of the range.
+/// A run holds at most this many paired facts, so a mean of differences in
+/// {-1, 0, +1} moves in steps of `1/PAIRED_FACTS_PER_RUN`.
+const PAIRED_FACTS_PER_RUN: usize = 3;
+
+/// The mean of `means` and an interval on it, clipped to [-1, 1]. One run
+/// has no spread, so the interval is the whole of the range.
+///
+/// With two or more runs the interval is the union of three bounds. A
+/// sample variance of zero is not evidence that the variance is zero:
+/// - Student's t on the observed run means;
+/// - the same critical value times the grid step `1/k` over sqrt(runs), a
+///   minimum half-width (a run of at most k facts cannot show a smaller move);
+/// - a Wilson interval on how many run means were strictly positive, mapped
+///   from a proportion onto a difference by `2p - 1`.
 fn run_mean_interval(means: &[f64]) -> (f64, f64, f64) {
     let runs = means.len();
     if runs == 0 {
@@ -654,8 +669,17 @@ fn run_mean_interval(means: &[f64]) -> (f64, f64, f64) {
         return (mean, -1.0, 1.0);
     }
     let variance = means.iter().map(|x| (x - mean).powi(2)).sum::<f64>() / (runs - 1) as f64;
-    let half = t_975(runs - 1) * (variance / runs as f64).sqrt();
-    (mean, (mean - half).max(-1.0), (mean + half).min(1.0))
+    let t = t_975(runs - 1);
+    let half = t * (variance / runs as f64).sqrt();
+    let step = 1.0 / PAIRED_FACTS_PER_RUN as f64;
+    let grid_half = t * step / (runs as f64).sqrt();
+    let positive = u32::try_from(means.iter().filter(|m| **m > 0.0).count()).unwrap_or(u32::MAX);
+    let sign = wilson(positive, u32::try_from(runs).unwrap_or(u32::MAX));
+    let sign_low = (2.0 * sign.low - 1.0).clamp(-1.0, 1.0);
+    let sign_high = (2.0 * sign.high - 1.0).clamp(-1.0, 1.0);
+    let low = (mean - half).min(mean - grid_half).min(sign_low).max(-1.0);
+    let high = (mean + half).max(mean + grid_half).max(sign_high).min(1.0);
+    (mean, low, high)
 }
 
 /// The first day of each baseline's rows (UTC): where its 4-week blocks
@@ -1437,8 +1461,11 @@ mod tests {
         }
     }
 
-    /// The paired decision is a t interval on run means, above zero only
-    /// when that whole interval is. One run is not a decision.
+    /// The paired decision is a widened interval on run means, above zero
+    /// only when that whole interval is. Identical means are not a point:
+    /// two runs at +1 do not decide, and a small positive mean that does
+    /// not move does not decide at a batch's run count. One run is not a
+    /// decision.
     #[test]
     fn paired_decisions_use_the_run_mean_interval() {
         let dir = tempfile::tempdir().unwrap();
@@ -1474,7 +1501,18 @@ mod tests {
         let chance = gaps.iter().find(|g| g.against == "chance").unwrap();
         assert_eq!(chance.runs, 2);
         assert!((chance.mean - 1.0).abs() < 1e-12, "{chance:?}");
-        assert!(chance.above_zero(), "{chance:?}");
+        assert!(chance.low <= 0.0, "{chance:?}");
+        assert!(chance.high > chance.low, "{chance:?}");
+        assert!(!chance.above_zero(), "{chance:?}");
+        let small = run_mean_interval(&[0.1; 4]);
+        assert!(small.1 <= 0.0, "{small:?}");
+        assert!(!gap_of(4, small).above_zero());
+        let batch = run_mean_interval(&[0.1; 10]);
+        assert!(batch.1 <= 0.0, "{batch:?}");
+        assert!(!gap_of(10, batch).above_zero());
+        let cleared = run_mean_interval(&[1.0; 4]);
+        assert!(cleared.1 > 0.0, "{cleared:?}");
+        assert!(gap_of(4, cleared).above_zero());
         let twin = gaps.iter().find(|g| g.against == "twin").unwrap();
         assert!((twin.mean - 0.0).abs() < 1e-12, "{twin:?}");
         assert!(!twin.above_zero(), "{twin:?}");
@@ -1502,6 +1540,18 @@ mod tests {
             .unwrap();
         assert_eq!((gap.low, gap.high), (-1.0, 1.0));
         assert!(!gap.above_zero());
+    }
+
+    fn gap_of(runs: u32, (mean, low, high): (f64, f64, f64)) -> PairedGap {
+        PairedGap {
+            offset_days: 7,
+            against: "chance",
+            runs,
+            mean,
+            low,
+            high,
+            exploratory: false,
+        }
     }
 
     #[test]
