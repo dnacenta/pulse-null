@@ -849,7 +849,10 @@ fn widened(range: Option<(i64, i64)>, days: i64) -> (i64, i64) {
 /// would be far too narrow). Runs that agree have no spread between them,
 /// which is not certainty: the interval is never narrower than the Wilson
 /// interval on how many of the runs were all-correct (a run-level floor,
-/// not Wilson on the items). Clipped to [0, 1]. With a single run nothing
+/// not Wilson on the items). When those runs agree and none is all-correct,
+/// the published interval is 0 to the observed rate. That is a conservative
+/// bound, not a 95% interval: it cannot cover a rate above what was
+/// observed. Clipped to [0, 1]. With a single run nothing
 /// is known about the spread between runs, and the interval is all of
 /// [0, 1] (audit R2-13).
 #[must_use]

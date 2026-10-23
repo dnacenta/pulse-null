@@ -534,8 +534,8 @@ The one rule set every measure page refers to:
 - **What each measure decides** (and nothing else): known-answer, whether the
   facts reach the prompt (its fail branch); situation-use v1, nothing (no
   success criterion; its input-only arm is a ceiling check); paired facts,
-  "Remembers" (the run-mean paired differences above zero: planted unhedged
-  above the forced guess, and planted hits above the twin's made-up rate).
+  "Remembers" (the widened interval on the run means of the chance
+  contrast, planted unhedged above the forced guess).
   Each page states its
   thresholds against this rule set.
 
