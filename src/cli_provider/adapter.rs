@@ -63,10 +63,15 @@ pub enum StreamLine {
     /// One assistant record. The runner groups records that share `id` and
     /// forwards a single boundary when the id changes or the result arrives.
     /// `tool_use` is true when any content block in the record is a tool
-    /// call. `id` is absent when the record did not name a message. The
-    /// runner does not append this record's text: the reply still comes
-    /// from deltas or the terminal record.
-    MessageEnd { id: Option<String>, tool_use: bool },
+    /// call. `id` is absent when the record did not name a message. `text`
+    /// is the text blocks in this record. The runner yields it before a
+    /// boundary with `tool_use` false when those bytes were not already
+    /// deltas.
+    MessageEnd {
+        id: Option<String>,
+        tool_use: bool,
+        text: String,
+    },
     /// Structure we do not consume (tool events, init).
     Other,
 }
@@ -85,15 +90,23 @@ pub(crate) fn assistant_message_end(value: &serde_json::Value) -> Option<StreamL
         .pointer("/message/id")
         .and_then(|id| id.as_str())
         .map(str::to_string);
-    let tool_use = value
-        .pointer("/message/content")
-        .and_then(|c| c.as_array())
-        .is_some_and(|blocks| {
-            blocks
-                .iter()
-                .any(|block| block.get("type").and_then(|t| t.as_str()) == Some("tool_use"))
-        });
-    Some(StreamLine::MessageEnd { id, tool_use })
+    let content = value.pointer("/message/content").and_then(|c| c.as_array());
+    let tool_use = content.is_some_and(|blocks| {
+        blocks
+            .iter()
+            .any(|block| block.get("type").and_then(|t| t.as_str()) == Some("tool_use"))
+    });
+    let mut text = String::new();
+    if let Some(blocks) = content {
+        for block in blocks {
+            if block.get("type").and_then(|t| t.as_str()) == Some("text") {
+                if let Some(piece) = block.get("text").and_then(|t| t.as_str()) {
+                    text.push_str(piece);
+                }
+            }
+        }
+    }
+    Some(StreamLine::MessageEnd { id, tool_use, text })
 }
 
 /// Token counts as the CLI reported them, when it did.

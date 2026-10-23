@@ -90,7 +90,7 @@ data: {"message":"upstream model error","status":500}
 Ordering:
 
 - `status thinking` comes before a round's first delta. `status responding` comes before that round's deltas.
-- `segment` comes after the deltas of the message it closes. When `tool` is true it comes before `status tool`.
+- `segment` comes after the deltas of the message it closes. When `tool` is true it comes before `status tool`. A message that arrived with no token deltas is still spoken: its text is a `delta` before a `segment` with `tool` false, unless that same text already arrived as deltas. A speech client that sees no `delta` before `done` speaks `done.text`.
 - A provider that reports no message boundary and calls no tool sends no `segment`. That stream is deltas, then `done`.
 - `reset` is written before any delta the client has not yet received, including deltas already sitting in the progress channel. `reason` `fallback` comes before the fallback reply's delta. On a screen stream it is sent only when a delta was produced. On a voice-pool stream a held draft is dropped, and `reset` is sent with no raw tail before it.
 - On a screen stream, `reset` with `reason` `guard` still leaves the raw tail in the stream, and it comes before `done`. On a voice-pool stream the raw tail is not sent: `reset` comes first, then a delta of the kept text, then `done`. `done.text` is the cut reply, and `truncated` is true. A speech client discards unspoken text on `reset` and speaks `done.text` after it.

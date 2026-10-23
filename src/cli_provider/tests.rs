@@ -383,12 +383,10 @@ async fn runner_yields_segment_end() {
         vec![true, false],
         "{claude_events:?}"
     );
-    assert!(
-        matches!(
-            claude_events.first(),
-            Some(StreamEvent::TextDelta(text)) if text == "I'll list the files. "
-        ),
-        "{claude_events:?}"
+    assert_eq!(
+        text_deltas(&claude_events),
+        vec!["I'll list the files. ", "three"],
+        "deltas that already arrived are not spoken again: {claude_events:?}"
     );
     let done = done_text(&claude_events);
     assert_eq!(done, "I'll list the files. three");
@@ -403,12 +401,20 @@ async fn runner_yields_segment_end() {
         vec![true, false],
         "{grok_events:?}"
     );
-    assert!(
-        grok_events
-            .iter()
-            .all(|event| !matches!(event, StreamEvent::TextDelta(_))),
-        "the recorded stream has no partial deltas: {grok_events:?}"
+    assert_eq!(
+        text_deltas(&grok_events),
+        vec!["three"],
+        "a finished message with no token deltas is spoken before its segment: {grok_events:?}"
     );
+    let spoken = grok_events
+        .iter()
+        .position(|event| matches!(event, StreamEvent::TextDelta(_)))
+        .expect("missing spoken text");
+    let closed = grok_events
+        .iter()
+        .rposition(|event| matches!(event, StreamEvent::SegmentEnd { tool_use: false }))
+        .expect("missing closing segment");
+    assert!(spoken < closed, "{grok_events:?}");
     assert_eq!(done_text(&grok_events), "three");
 }
 
@@ -432,6 +438,16 @@ async fn collect_stream(provider: &CliProvider) -> Vec<StreamEvent> {
         events.push(event);
     }
     events
+}
+
+fn text_deltas(events: &[StreamEvent]) -> Vec<&str> {
+    events
+        .iter()
+        .filter_map(|event| match event {
+            StreamEvent::TextDelta(text) => Some(text.as_str()),
+            _ => None,
+        })
+        .collect()
 }
 
 fn segment_ends(events: &[StreamEvent]) -> Vec<bool> {

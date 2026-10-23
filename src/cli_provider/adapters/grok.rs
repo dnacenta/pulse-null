@@ -608,6 +608,7 @@ mod tests {
             StreamLine::MessageEnd {
                 id: None,
                 tool_use: false,
+                text: "I'll list the files in this directory next.".into(),
             }
         );
         assert_eq!(Grok.parse_stream_line("not json"), StreamLine::Other);

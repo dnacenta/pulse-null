@@ -460,6 +460,43 @@ fn settle(
     }
 }
 
+/// Close one assistant message.
+///
+/// A `tool: false` message whose text was not already yielded as deltas
+/// gets that text first, so a stream with no token deltas is still
+/// speakable. The same text already present in `deltas_since` is not
+/// yielded again.
+fn close_assistant_message(
+    open: Option<(Option<String>, bool, String, String)>,
+) -> Vec<StreamEvent> {
+    let Some((_id, tool_use, text, deltas)) = open else {
+        return Vec::new();
+    };
+    let mut events = Vec::new();
+    if !tool_use {
+        if let Some(say) = speech_not_yet_delta(&deltas, &text) {
+            events.push(StreamEvent::TextDelta(say.to_string()));
+        }
+    }
+    events.push(StreamEvent::SegmentEnd { tool_use });
+    events
+}
+
+/// The part of `text` a speaker has not already heard as deltas.
+fn speech_not_yet_delta<'a>(deltas_since: &str, text: &'a str) -> Option<&'a str> {
+    if text.is_empty() || deltas_since == text {
+        return None;
+    }
+    if deltas_since.is_empty() {
+        return Some(text);
+    }
+    match text.strip_prefix(deltas_since) {
+        Some(rest) if !rest.is_empty() => Some(rest),
+        _ if deltas_since.contains(text) => None,
+        _ => Some(text),
+    }
+}
+
 /// Reduce a buffered NDJSON body to the reply.
 fn reply_from_ndjson(adapter: &dyn CliAdapter, stdout: &str) -> Result<Reply, String> {
     let mut assembled = String::new();
@@ -813,7 +850,11 @@ impl StreamingProvider for CliProvider {
                     // message. The boundary waits until the id changes or
                     // the terminal result arrives, so an early text block
                     // cannot close the message before its tool call.
-                    let mut open_message: Option<(Option<String>, bool)> = None;
+                    // (id, tool_use, text, deltas that arrived before this
+                    // record). Deltas after the record stay in `unassigned`
+                    // until the next record or the result claims them.
+                    let mut open_message: Option<(Option<String>, bool, String, String)> = None;
+                    let mut unassigned = String::new();
 
                     let mut failure: Option<StreamEvent> = None;
                     loop {
@@ -826,33 +867,47 @@ impl StreamingProvider for CliProvider {
                             Ok(Ok(Some(line))) => match adapter.parse_stream_line(&line) {
                                 StreamLine::Delta(text) => {
                                     assembled.push_str(&text);
+                                    unassigned.push_str(&text);
                                     yield StreamEvent::TextDelta(text);
                                 }
                                 StreamLine::Result { text, is_error, usage } => {
-                                    if let Some((_, tool_use)) = open_message.take() {
-                                        yield StreamEvent::SegmentEnd { tool_use };
+                                    if let Some((_, _, _, deltas)) = open_message.as_mut() {
+                                        deltas.push_str(&unassigned);
+                                        unassigned.clear();
+                                    }
+                                    for event in close_assistant_message(open_message.take()) {
+                                        if let StreamEvent::TextDelta(ref extra) = event {
+                                            assembled.push_str(extra);
+                                        }
+                                        yield event;
                                     }
                                     terminal = Some((text, is_error, usage));
                                 }
                                 StreamLine::Usage(usage) => usage_seen = Some(usage),
-                                StreamLine::MessageEnd { id, tool_use } => {
-                                    let same = open_message.as_ref().is_some_and(|(open_id, _)| {
+                                StreamLine::MessageEnd { id, tool_use, text } => {
+                                    let same = open_message.as_ref().is_some_and(|(open_id, _, _, _)| {
                                         match (open_id, &id) {
                                             (Some(open_id), Some(id)) => open_id == id,
                                             _ => false,
                                         }
                                     });
                                     if same {
-                                        if let Some((_, open_tool)) = open_message.as_mut() {
+                                        if let Some((_, open_tool, open_text, deltas)) =
+                                            open_message.as_mut()
+                                        {
                                             *open_tool |= tool_use;
+                                            open_text.push_str(&text);
+                                            deltas.push_str(&unassigned);
+                                            unassigned.clear();
                                         }
                                     } else {
-                                        if let Some((_, open_tool)) = open_message.take() {
-                                            yield StreamEvent::SegmentEnd {
-                                                tool_use: open_tool,
-                                            };
+                                        for event in close_assistant_message(open_message.take()) {
+                                            if let StreamEvent::TextDelta(ref extra) = event {
+                                                assembled.push_str(extra);
+                                            }
+                                            yield event;
                                         }
-                                        open_message = Some((id, tool_use));
+                                        open_message = Some((id, tool_use, text, std::mem::take(&mut unassigned)));
                                     }
                                 }
                                 StreamLine::Other => {}
@@ -866,6 +921,21 @@ impl StreamingProvider for CliProvider {
                     }
 
                     let _ = tokio::time::timeout(idle, child.wait()).await;
+
+                    // A message still open at end of stream (no terminal
+                    // record) closes before the reply is settled, so its
+                    // text counts as a delta.
+                    if failure.is_none() {
+                        if let Some((_, _, _, deltas)) = open_message.as_mut() {
+                            deltas.push_str(&unassigned);
+                        }
+                        for event in close_assistant_message(open_message.take()) {
+                            if let StreamEvent::TextDelta(ref extra) = event {
+                                assembled.push_str(extra);
+                            }
+                            yield event;
+                        }
+                    }
 
                     // A terminal record flagged as an error: a policy refusal
                     // is a typed event (the chat handler falls back on it);
@@ -883,12 +953,7 @@ impl StreamingProvider for CliProvider {
                         log_stderr_tail(name, stderr_tail).await;
                     }
                     match outcome {
-                        Ok(reply) => {
-                            if let Some((_, tool_use)) = open_message.take() {
-                                yield StreamEvent::SegmentEnd { tool_use };
-                            }
-                            yield StreamEvent::Done(response(reply, &model));
-                        }
+                        Ok(reply) => yield StreamEvent::Done(response(reply, &model)),
                         Err(event) => yield event,
                     }
                 }
