@@ -7,8 +7,14 @@
 //!
 //! 1. `-p -` treats `-` as the literal prompt — grok never reads stdin — so
 //!    the prompt is staged in a file and named with `--prompt-file`.
-//! 2. `--system-prompt-file` does not exist (exit 2, "unexpected argument");
-//!    the system prompt goes inline via `--system-prompt-override`.
+//! 2. `--system-prompt-file` does not exist (exit 2, "unexpected argument").
+//!    `--system-prompt-override` would put the prompt on argv, and
+//!    `/proc/<pid>/cmdline` is mode 0444 for every local account.
+//!    `ProtectProc` hides `/proc` inside the unit's mount namespace only;
+//!    it does not change the host's. The prompt is prepended to the user
+//!    prompt and staged in a mode-0600 file. It is never placed on argv.
+//!    Grok's own default system prompt is still present: this CLI has no
+//!    file channel that replaces it.
 //! 3. `--output-format json` returns a `text` field that CONCATENATES every
 //!    assistant turn, pre-tool narration included. That narration leaked into
 //!    Echo's Discord replies in August 2026. The stream format's terminal
@@ -22,13 +28,15 @@
 //! plus pulse-null's own archiver — not from vendor hook plumbing.
 
 use std::ffi::OsString;
+use std::io;
 use std::path::{Path, PathBuf};
 
 use serde_json::Value;
 
 use crate::cli_provider::adapter::{
-    assistant_message_end, AgentIntegration, CliAdapter, Invocation, OutputMode, PromptDelivery,
-    Reply, StreamLine, SystemPromptDelivery, Usage, UserHookScan,
+    assistant_message_end, AgentIntegration, CliAdapter, Invocation, Observed, OutputMode,
+    PromptDelivery, Reply, StreamLine, SystemPromptDelivery, Usage, UserHookScan, VendorScratch,
+    VendorScratchSpec,
 };
 use crate::init::agent_bootstrap::{ensure_config, BootstrapItem, ItemKind, ItemStatus};
 use crate::tool_surface::ToolSurface;
@@ -100,6 +108,33 @@ impl Grok {
     }
 }
 
+/// Copy the regular files of the live `~/.grok` (not a link to one) into
+/// `to_dir`, each at most [`MAX_COPIED_HOME_FILE`]; the copies made, which
+/// are watched at teardown.
+fn copy_home_files(live: &Path, to_dir: &Path) -> io::Result<Vec<PathBuf>> {
+    let mut watched = Vec::new();
+    if !super::is_real_dir(live) {
+        return Ok(watched);
+    }
+    for entry in std::fs::read_dir(live)? {
+        if let Some(to) = copy_home_file(&entry?, to_dir)? {
+            watched.push(to);
+        }
+    }
+    Ok(watched)
+}
+
+/// Copy one entry of the live `~/.grok` when it is a regular file within
+/// the size cap; where the copy went, if it was made.
+fn copy_home_file(entry: &std::fs::DirEntry, to_dir: &Path) -> io::Result<Option<PathBuf>> {
+    let metadata = entry.metadata()?;
+    if !entry.file_type()?.is_file() || metadata.len() > MAX_COPIED_HOME_FILE {
+        return Ok(None);
+    }
+    let to = to_dir.join(entry.file_name());
+    Ok(super::copy_private_file(&entry.path(), &to)?.then_some(to))
+}
+
 impl CliAdapter for Grok {
     fn name(&self) -> &'static str {
         "grok"
@@ -130,17 +165,12 @@ impl CliAdapter for Grok {
         PromptDelivery::File
     }
 
-    /// Inline on argv. Linux caps a single argument at 128 KiB; the runner
-    /// refuses anything larger rather than silently truncating the pulse's
-    /// identity.
-    /// Grok has no file channel for the system prompt, so it rides on argv
-    /// (`--system-prompt-override`). That makes the pulse's identity and
-    /// memory readable in `/proc/<pid>/cmdline` by any local account while
-    /// a turn runs — an accepted trade-off of this CLI, to be compensated at
-    /// the host (`ProtectProc=invisible`, `hidepid`), not something another
-    /// adapter should copy.
+    /// Prepended into the mode-0600 prompt file. Grok Build 1.0.0 has no
+    /// system-prompt file flag, and `--system-prompt-override` would put
+    /// the text on argv. Host `/proc/<pid>/cmdline` is mode 0444;
+    /// `ProtectProc` does not change that mount.
     fn system_prompt_delivery(&self) -> SystemPromptDelivery {
-        SystemPromptDelivery::Argv { max_bytes: 120_000 }
+        SystemPromptDelivery::Prepend
     }
 
     /// NDJSON either way — see the module docs on why plain `json` is banned.
@@ -156,10 +186,9 @@ impl CliAdapter for Grok {
         args.push("--model".into());
         args.push(inv.model.into());
 
-        if !inv.system_prompt.is_empty() {
-            args.push("--system-prompt-override".into());
-            args.push(inv.system_prompt.into());
-        }
+        // The system prompt is not an argument. The runner prepends it to
+        // the user prompt ([`SystemPromptDelivery::Prepend`]), which is the
+        // mode-0600 file named below.
         if let Some(prompt_file) = inv.prompt_file {
             args.push("--prompt-file".into());
             args.push(prompt_file.as_os_str().to_os_string());
@@ -266,10 +295,61 @@ impl CliAdapter for Grok {
         super::CLAUDE_ONLY_RULES
     }
 
+    /// `streaming-messages-json` is Claude Code's wire format: an init
+    /// record and assistant messages carrying `tool_use` blocks.
+    fn observe_line(&self, line: &str) -> Vec<Observed> {
+        super::observe_agent_stream_line(line)
+    }
+
+    fn observes_tools(&self) -> bool {
+        true
+    }
+
+    /// `GROK_HOME` moves sessions, config and login state. The copy holds
+    /// the top-level files of the live grok home (its config and login
+    /// state), private to the owner; directories (sessions, the installed
+    /// binary, docs) stay behind. Every copied file is watched: grok may
+    /// refresh its login token mid-run, and a refreshed token is reported at
+    /// teardown, never copied back. Both profiles get the same copy: grok's
+    /// home holds no instructions or memory, only what it needs to run.
+    fn scratch_vendor(&self, spec: &VendorScratchSpec<'_>) -> io::Result<VendorScratch> {
+        let grok_home = spec.dir.join("grok");
+        super::create_private_dir(&grok_home)?;
+        let mut watched = copy_home_files(&spec.live_home.join(".grok"), &grok_home)?;
+        watched.sort();
+        Ok(VendorScratch {
+            env: vec![
+                ("GROK_HOME".to_string(), grok_home.display().to_string()),
+                ("GROK_DISABLE_AUTOUPDATER".to_string(), "1".to_string()),
+            ],
+            watched,
+        })
+    }
+
+    fn vendor_home(&self, home: &Path) -> Option<PathBuf> {
+        Some(home.join(".grok"))
+    }
+
+    /// The installer keeps the binaries under `downloads/` (`bin/grok` is a
+    /// link into it), the bundled agents and skills under `bundled/`, and
+    /// ripgrep under `vendor/`. Sessions, login state and settings sit
+    /// beside them at the top level and stay unreadable.
+    fn probe_install_reads(&self, home: &Path) -> Vec<PathBuf> {
+        let grok = home.join(".grok");
+        ["downloads", "bundled", "vendor"]
+            .iter()
+            .map(|dir| grok.join(dir))
+            .collect()
+    }
+
     fn integration(&self) -> &dyn AgentIntegration {
         self
     }
 }
+
+/// Largest top-level grok home file copied into a probe scratch. Config and
+/// login state are a few KiB; anything bigger is not either.
+const MAX_COPIED_HOME_FILE: u64 = 1024 * 1024;
 
 impl AgentIntegration for Grok {
     fn recall_echo_provider(&self) -> &'static str {
@@ -414,7 +494,6 @@ mod tests {
         Invocation {
             model: "grok-4.6",
             system_prompt_file: None,
-            system_prompt: "You are Echo.",
             prompt_file: Some(prompt_file),
             surface: ToolSurface::Full,
             streaming: false,
@@ -449,9 +528,11 @@ mod tests {
             "plain json concatenates every assistant turn"
         );
         assert_eq!(value_of(&args, "--model"), Some("grok-4.6"));
-        assert_eq!(
-            value_of(&args, "--system-prompt-override"),
-            Some("You are Echo.")
+        assert!(
+            !args
+                .iter()
+                .any(|arg| arg == "--system-prompt-override" || arg.contains("You are Echo.")),
+            "the system prompt is not on argv: {args:?}"
         );
         assert_eq!(value_of(&args, "--prompt-file"), Some("/tmp/prompt.txt"));
         assert!(args.iter().any(|arg| arg == "--no-memory"));
@@ -683,6 +764,46 @@ mod tests {
             Some(PathBuf::from("/p/.claude/rules"))
         );
         assert_eq!(Grok.project_rules_exclude(), ["recall-echo.md"]);
+    }
+
+    #[test]
+    fn scratch_vendor_copies_top_level_files_and_watches_them() {
+        use std::os::unix::fs::PermissionsExt;
+        let home = tempfile::tempdir().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let live = home.path().join(".grok");
+        std::fs::create_dir_all(live.join("sessions/%2Fhome%2Fpulse")).unwrap();
+        std::fs::write(live.join("sessions/%2Fhome%2Fpulse/x"), "old session").unwrap();
+        std::fs::write(live.join("config.toml"), "[compat.claude]\n").unwrap();
+        std::fs::write(live.join("login-state"), "fixture-not-a-token").unwrap();
+        std::os::unix::fs::symlink("/etc/hostname", live.join("link")).unwrap();
+
+        let scratch = Grok
+            .scratch_vendor(&VendorScratchSpec {
+                live_home: home.path(),
+                live_root: Path::new("/nonexistent/live"),
+                item_root: Path::new("/nonexistent/item"),
+                dir: dir.path(),
+                profile: crate::cli_provider::adapter::VendorProfile::Pulse,
+            })
+            .unwrap();
+        let grok_home = dir.path().join("grok");
+        assert!(scratch
+            .env
+            .contains(&("GROK_HOME".to_string(), grok_home.display().to_string())));
+        assert_eq!(
+            scratch.watched,
+            vec![grok_home.join("config.toml"), grok_home.join("login-state")]
+        );
+        for file in &scratch.watched {
+            let mode = std::fs::metadata(file).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600, "{}", file.display());
+        }
+        assert!(
+            !grok_home.join("sessions").exists(),
+            "live sessions stay behind"
+        );
+        assert!(!grok_home.join("link").exists());
     }
 
     #[test]

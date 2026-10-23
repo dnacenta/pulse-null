@@ -138,23 +138,19 @@ pub(super) fn isolation_command_reply(
 /// The user message as the model sees it: an injection warning for a
 /// suspicious guest, the channel's recent activity, then the message itself.
 pub(super) async fn compose_user_message(turn: &TurnScope<'_>) -> String {
-    let mut message = String::new();
-    if flags_injection(
+    let injection_warning = flags_injection(
         turn.key,
         turn.state.config.security.injection_detection,
         &turn.req.message,
-    ) {
-        message.push_str(injection::INJECTION_WARNING);
-        message.push('\n');
-    }
-    if let Some(activity) = channel_activity(turn).await {
-        message.push_str("\n[Recent channel activity]\n");
-        message.push_str(&activity);
-        message.push_str("\n[End channel activity]\n");
-    }
-    message.push_str("\nUser message: ");
-    message.push_str(&turn.req.message);
-    message
+    );
+    let activity = channel_activity(turn).await;
+    // One composition for every turn: the probe runner (PN-144) asks its
+    // questions through the same function.
+    crate::server::prompt::compose_user_message(
+        injection_warning,
+        activity.as_deref(),
+        &turn.req.message,
+    )
 }
 
 /// Injection detection: only for guests.

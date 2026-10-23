@@ -1,0 +1,193 @@
+# Growth-record probe run for one pulse (PN-144). TEMPLATE: installed at
+# deploy, never by the runtime. Instance name = the pulse's directory under
+# /home/pulse/pulse-null (echo, synth).
+#
+# Three units, one confinement:
+#   pulse-null-probe-export@  exports the live graph (the only probe step that
+#                             reaches 127.0.0.1, where the live server is);
+#   pulse-null-probe@         the run (this file); 127.0.0.0/8 denied;
+#   pulse-null-probe-verify@  verify-isolation under the same confinement.
+# The block between the CONFINEMENT markers is identical in this file and the
+# verify unit (a test in src/vigil/probe/confine.rs holds them equal).
+#
+# Install (as root, once). The operator does the user and ACL steps by hand.
+# Do not run them from this repo, and do not touch a live server from here.
+#
+#   cp pulse-null-probe@.service pulse-null-probe@.timer \
+#      pulse-null-probe-export@.service pulse-null-probe-verify@.service \
+#      /etc/systemd/system/
+#   # The probe user. It must not be the live pulse's uid. `[probe] user`
+#   # defaults to this name; a different name means the same change in
+#   # User= and Group= below, in the verify and export units, and in the
+#   # pulse's config.
+#   useradd --system --create-home --home-dir /var/lib/pulse-null-probe \
+#       --shell /usr/sbin/nologin pulse-probe
+#   install -d -m 0700 -o pulse-probe -g pulse-probe /var/lib/pulse-null-probe
+#   # The probe user reads the pulse tree in order to copy a scratch, and
+#   # must not search secrets/. Deny secrets/ first, access and default,
+#   # then grant read on everything else. The pulse directory has no
+#   # default entry for the probe user: a secrets/ created later does not
+#   # inherit a grant. Directories that already exist, other than
+#   # secrets/, keep a default grant for files created inside them.
+#   setfacl -m u:pulse-probe:rx /home/pulse /home/pulse/pulse-null
+#   setfacl -m u:pulse-probe:--- /home/pulse/pulse-null/<pulse>/secrets
+#   setfacl -d -m u:pulse-probe:--- /home/pulse/pulse-null/<pulse>/secrets
+#   setfacl -R -m u:pulse-probe:--- /home/pulse/pulse-null/<pulse>/secrets
+#   setfacl -d -x u:pulse-probe /home/pulse/pulse-null/<pulse> || true
+#   find /home/pulse/pulse-null/<pulse> -path '*/secrets' -prune -o \
+#       -exec setfacl -m u:pulse-probe:rX {} +
+#   find /home/pulse/pulse-null/<pulse> -mindepth 1 -path '*/secrets' -prune -o \
+#       -type d -exec setfacl -d -m u:pulse-probe:rX {} +
+#   # Login files the runner copies from the pulse user's home (the adapter's
+#   # directory there; see "Vendor state" in docs/methods/probe-runner.md):
+#   setfacl -m u:pulse-probe:rx /home/pulse
+#   # The graph root password stays mode 0600, owned by root. Only the
+#   # export unit receives it, via LoadCredential= on that unit. Do not
+#   # grant the probe user the file. The run and verify units have no path
+#   # to it.
+#   # The vendor login only, never the pulse's whole EnvironmentFile.
+#   # systemd reads this as root into the probe process; the pulse's uid
+#   # cannot read that process's environment.
+#   install -m 0600 -o root -g root /dev/null /etc/pulse-null/probe-<pulse>.env
+#   #   then put the one line CLAUDE_CODE_OAUTH_TOKEN=… in it (claude pulses;
+#   #   a grok pulse logs in from the copied login state and needs none)
+#   # A resolver off the IPv4 loopback (systemd-resolved's 127.0.0.53 is
+#   # denied here); the unit refuses to start without this file:
+#   printf 'nameserver 9.9.9.9\nnameserver 1.1.1.1\nnameserver 2620:fe::fe\n' \
+#       > /etc/pulse-null/probe-resolv.conf && chmod 0644 /etc/pulse-null/probe-resolv.conf
+#   systemctl edit pulse-null-probe@<pulse>.service     (and the same for
+#   systemctl edit pulse-null-probe-verify@<pulse>.service)
+#     -> [Service]
+#        IPAddressDeny=<this host's public IPv4>/32 <public IPv6>/128
+#        (a template cannot know them; see "Network" below)
+#   # The reviewed sealed sets (root-only; the unit loads them as credentials):
+#   pulse-null probe sets install --from <reviewed dir> --pulse <pulse>
+#   systemctl daemon-reload && systemctl enable --now pulse-null-probe@<pulse>.timer
+#
+# By hand: `systemctl start pulse-null-probe@<pulse>` (it runs the export
+# first). `pulse-null probe run` and `verify-isolation` outside the unit
+# refuse: they check from the inside that the loopback and [::1]:443 are
+# denied, the host's public addresses are denied, the host sockets are
+# hidden and the resolver is off the loopback. verify-isolation stops
+# before any export or CLI turn.
+#
+# The run itself decides whether it is due (`--if-due`): enabled, a probe
+# day, inside [probe] quiet_start..quiet_end, under the weekly budget, not
+# isolated, Landlock present, confined as here, no other run holding the
+# lock. A refusal for any of those exits 0; an aborted run exits 1.
+
+[Unit]
+Description=pulse-null probe run (%i)
+# The graph export first: the run itself never reaches 127.0.0.1.
+Requires=pulse-null-probe-export@%i.service
+After=pulse-null-probe-export@%i.service network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=pulse-probe
+Group=pulse-probe
+WorkingDirectory=/home/pulse/pulse-null/%i
+ExecStart=/usr/local/bin/pulse-null probe run --if-due
+Environment=RUST_LOG=info
+Environment=PULSE_NULL_PROBE_STATE=/var/lib/pulse-null-probe
+EnvironmentFile=/etc/pulse-null/probe-%i.env
+# The sealed item sets and the fact key, from a root-only directory the
+# pulse's user cannot read (`probe sets install`, as root). systemd copies
+# them into the unit's credentials directory ($CREDENTIALS_DIRECTORY) for
+# the run only; the unit does not start without them.
+LoadCredential=known-answer.toml:/etc/pulse-null-probe/sets/%i/known-answer.toml
+LoadCredential=situation-use.toml:/etc/pulse-null-probe/sets/%i/situation-use.toml
+LoadCredential=paired-facts.toml:/etc/pulse-null-probe/sets/%i/paired-facts.toml
+LoadCredential=fact-key:/etc/pulse-null-probe/sets/%i/fact-key
+# Up to 90 min waiting for another pulse's run (the host lock), then up to
+# 2 h of turns (the runner's own time budget, after which no turn starts),
+# plus setup and teardown. Past this the unit is wedged: systemd sends
+# SIGTERM (the runner stops and writes its finish row), then kills the
+# whole cgroup.
+TimeoutStartSec=4h
+
+# >>> CONFINEMENT (identical in pulse-null-probe-verify@.service) >>>
+UMask=0077
+
+# --- Filesystem: the runner writes only the probe user's private state ----
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/var/lib/pulse-null-probe
+InaccessiblePaths=-/home/pulse/.ssh
+InaccessiblePaths=-/home/pulse/.local/state
+# Host sockets any local user may connect to, which Landlock does not
+# mediate (a named-socket connect): the system bus (busctl/D-Bus can read
+# other services' state), tailscaled, snapd, avahi and uuidd. Nothing in a
+# probe run needs them; the leading '-' skips one a host does not have.
+InaccessiblePaths=-/run/dbus -/run/tailscale -/run/snapd.socket -/run/snapd-snap.socket
+InaccessiblePaths=-/run/avahi-daemon -/run/uuidd
+# The live recall-echo socket lives under $XDG_RUNTIME_DIR (/run/user/<uid>).
+# Landlock does not mediate a named-socket connect, so the directory is hidden.
+InaccessiblePaths=-/run/user
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectProc=invisible
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+
+# --- Process -----------------------------------------------------------------
+NoNewPrivileges=yes
+CapabilityBoundingSet=
+AmbientCapabilities=
+RestrictSUIDSGID=yes
+RestrictNamespaces=yes
+RestrictRealtime=yes
+LockPersonality=yes
+SystemCallArchitectures=native
+# MemoryDenyWriteExecute= stays off: the agent CLIs run JIT engines.
+
+# --- Network -----------------------------------------------------------------
+# Default deny. Landlock holds a probe child to TCP 443 and the throwaway
+# port; this unit adds addresses, which Landlock cannot. Allowed: the probe
+# resolvers, ::1 (the throwaway; nothing on this host listens on ::1:443),
+# and the public Internet so the child can open TCP 443 to the vendor API.
+# systemd cannot allow a port without the address, so UDP to those same
+# addresses stays open — Landlock does not cover UDP either. More specific
+# denies cover the IPv4 loopback, private, CGNAT, link-local and ULA
+# ranges. The host's own public addresses are a drop-in (systemctl edit),
+# more specific than the public allow. The live graph export happens in
+# pulse-null-probe-export@, before this unit starts, and names resolve
+# through the probe resolver bound over /etc/resolv.conf.
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
+IPAddressDeny=any
+IPAddressAllow=9.9.9.9
+IPAddressAllow=1.1.1.1
+IPAddressAllow=2620:fe::fe
+IPAddressAllow=::1
+IPAddressAllow=0.0.0.0/0
+IPAddressAllow=::/0
+IPAddressDeny=127.0.0.0/8
+IPAddressDeny=10.0.0.0/8 172.16.0.0/12 192.168.0.0/16 100.64.0.0/10 169.254.0.0/16
+IPAddressDeny=fc00::/7 fe80::/10 multicast
+BindReadOnlyPaths=/etc/pulse-null/probe-resolv.conf:/etc/resolv.conf
+
+# --- Resources -----------------------------------------------------------------
+MemoryMax=4G
+TasksMax=512
+# A measurement never competes with the live pulses (the probe children
+# also lower themselves; this covers the runner's copies too).
+Nice=10
+IOSchedulingClass=idle
+CPUWeight=20
+# IOWeight= acts only under the BFQ I/O scheduler (or io.cost); this host's
+# disk runs mq-deadline, where it does nothing. Kept for hosts with BFQ.
+# IOSchedulingClass=idle does act under mq-deadline (I/O priorities).
+IOWeight=20
+KillMode=control-group
+# Out of memory anywhere in the unit (the CLI, the throwaway graph) stops
+# the whole run rather than leaving it half alive: systemd sends SIGTERM,
+# the runner stops, tears down and writes its finish row (memory.peak is in
+# it) within TimeoutStopSec.
+OOMPolicy=stop
+TimeoutStopSec=2min
+# <<< CONFINEMENT <<<

@@ -14,6 +14,31 @@ use crate::scheduler::intent::IntentQueue;
 /// Rough chars-per-token estimate (same constant used in context.rs).
 const CHARS_PER_TOKEN: usize = 4;
 
+/// The opening tag of the runtime-written situation block, as Concept v2 C1
+/// specifies its rendering. Probe results take their baseline label from
+/// whether this builder renders it (PN-144 audit #7, R2-8).
+pub const SITUATION_TAG: &str = "<situation written-by=\"runtime\">";
+
+/// The general disclosure the lifecycle stance promises ("a pulse knows it
+/// is being measured and why it can't see the results"), one fixed
+/// sentence, in every system prompt this builder makes (chat and task), as
+/// an essential component right after the instruction file (PN-144 audit
+/// R2-9). Probe items carry no notice of their own; this is the notice. Its
+/// SHA-256 is on every probe row, so a changed wording is a new lineage.
+pub const MEASUREMENT_DISCLOSURE: &str = "Your runtime measures you with held-out probes; \
+you never see the items or the results, because knowing them would change what they measure.";
+
+/// The disclosure as a prompt component.
+fn disclosure_component() -> PromptComponent {
+    PromptComponent {
+        name: "measurement-disclosure",
+        content: MEASUREMENT_DISCLOSURE.to_string(),
+        tokens: estimate_tokens(MEASUREMENT_DISCLOSURE),
+        tier: PromptTier::Essential,
+        cap: 0,
+    }
+}
+
 /// Estimate tokens for a text blob.
 fn estimate_tokens(text: &str) -> usize {
     text.len() / CHARS_PER_TOKEN
@@ -204,6 +229,8 @@ pub struct SystemPromptResult {
     pub was_trimmed: bool,
     /// Components that were dropped entirely (name + original tokens).
     pub dropped_components: Vec<(String, usize)>,
+    /// The components the prompt holds, in order (name + tokens).
+    pub components: Vec<(String, usize)>,
 }
 
 /// Async version of build_system_prompt — runs the blocking file I/O
@@ -219,6 +246,32 @@ pub async fn build_system_prompt_async(
     .map_err(|e| crate::errors::PromptError::Assembly(e.to_string()))
     .and_then(|r| r.map_err(crate::errors::PromptError::Assembly))?;
     Ok(result)
+}
+
+/// The user turn as the provider receives it: the injection warning (for a
+/// guest message that tripped the scan), the channel's recent activity, then
+/// the message itself. The chat handler composes every turn with it, and the
+/// probe runner (PN-144) asks its questions through the same composition
+/// with neither of the first two.
+#[must_use]
+pub fn compose_user_message(
+    injection_warning: bool,
+    channel_context: Option<&str>,
+    message: &str,
+) -> String {
+    let mut user_message = String::new();
+    if injection_warning {
+        user_message.push_str(crate::server::injection::INJECTION_WARNING);
+        user_message.push('\n');
+    }
+    if let Some(context) = channel_context {
+        user_message.push_str("\n[Recent channel activity]\n");
+        user_message.push_str(context);
+        user_message.push_str("\n[End channel activity]\n");
+    }
+    user_message.push_str("\nUser message: ");
+    user_message.push_str(message);
+    user_message
 }
 
 /// Build the system prompt from pulse documents.
@@ -246,95 +299,135 @@ pub fn build_system_prompt_budgeted(
     config: &Config,
 ) -> Result<SystemPromptResult, crate::errors::PromptError> {
     let budget_cfg = &config.system_prompt_budget;
-    let budget_enabled = budget_cfg.enabled;
-
-    // Collect all components with their metadata.
     let mut components = Vec::new();
-
-    // --- Tier 0 (Essential): the instruction file ---
-    if let Some(path) = instruction_file(root_dir, config) {
-        let label = instruction_label(&path);
-        let content = std::fs::read_to_string(&path)?;
-        let capped = if budget_enabled && budget_cfg.instructions_cap > 0 {
-            truncate_to_token_cap(&content, budget_cfg.instructions_cap)
-        } else {
-            content
-        };
-        let tokens = estimate_tokens(&capped);
-        components.push(PromptComponent {
-            name: label,
-            content: capped,
-            tokens,
-            tier: PromptTier::Essential,
-            cap: budget_cfg.instructions_cap,
-        });
-    }
-
-    // --- Tier 0 (Essential): rule files — the operator's, then the pulse's own ---
+    // Tier 0 (Essential): the instruction file, the disclosure, the rule
+    // files (the operator's, then the pulse's own).
+    components.extend(instruction_component(root_dir, config)?);
+    components.push(disclosure_component());
     components.extend(rules_components(root_dir, config));
+    // Tier 1 (High): SELF.md, AWARENESS.md, MEMORY.md.
+    components.extend(self_component(root_dir, budget_cfg)?);
+    components.extend(awareness_component(root_dir, config)?);
+    components.extend(memory_component(root_dir, config)?);
+    // Tier 0 (Essential): memory curation and identity classes.
+    components.push(memory_curation_component(config));
+    components.push(identity_classes_component());
+    // Tier 1 (High): THOUGHT_STACK.md (held to its chat cap), the journal
+    // counts (a runtime fact, Amendment C), EPHEMERAL.md.
+    components.extend(thought_stack_component(
+        root_dir,
+        budget_cfg,
+        chat_thought_stack_cap(budget_cfg),
+    )?);
+    components.extend(journal_counts_component(root_dir, config));
+    components.extend(ephemeral_component(root_dir, budget_cfg)?);
+    // Tier 2 (Low): FINDINGS.md, graph awareness.
+    components.extend(findings_component(root_dir, config)?);
+    components.extend(graph_awareness_component(root_dir, config));
+    enforce_budget_and_assemble(components, budget_cfg, "chat")
+}
 
-    // --- Tier 1 (High): SELF.md ---
+impl PromptComponent {
+    fn new(name: &'static str, content: String, tier: PromptTier, cap: usize) -> Self {
+        let tokens = estimate_tokens(&content);
+        Self {
+            name,
+            content,
+            tokens,
+            tier,
+            cap,
+        }
+    }
+}
+
+/// `content` held to `cap` tokens, when the budget is on and the cap set.
+fn capped(
+    content: String,
+    budget_cfg: &crate::config::SystemPromptBudgetConfig,
+    cap: usize,
+) -> String {
+    if budget_cfg.enabled && cap > 0 {
+        truncate_to_token_cap(&content, cap)
+    } else {
+        content
+    }
+}
+
+/// Tier 0 (Essential): the instruction file, when the pulse has one.
+fn instruction_component(
+    root_dir: &Path,
+    config: &Config,
+) -> Result<Option<PromptComponent>, crate::errors::PromptError> {
+    let Some(path) = instruction_file(root_dir, config) else {
+        return Ok(None);
+    };
+    let budget_cfg = &config.system_prompt_budget;
+    let content = std::fs::read_to_string(&path)?;
+    Ok(Some(PromptComponent::new(
+        instruction_label(&path),
+        capped(content, budget_cfg, budget_cfg.instructions_cap),
+        PromptTier::Essential,
+        budget_cfg.instructions_cap,
+    )))
+}
+
+/// Tier 1 (High): SELF.md, as `<identity>`.
+fn self_component(
+    root_dir: &Path,
+    budget_cfg: &crate::config::SystemPromptBudgetConfig,
+) -> Result<Option<PromptComponent>, crate::errors::PromptError> {
     let self_path = root_dir.join("SELF.md");
-    if self_path.exists() {
-        let content = std::fs::read_to_string(&self_path)?;
-        let wrapped = format!("<identity>\n{}\n</identity>", content);
-        let capped = if budget_enabled && budget_cfg.self_md_cap > 0 {
-            truncate_to_token_cap(&wrapped, budget_cfg.self_md_cap)
-        } else {
-            wrapped
-        };
-        let tokens = estimate_tokens(&capped);
-        components.push(PromptComponent {
-            name: "SELF.md",
-            content: capped,
-            tokens,
-            tier: PromptTier::High,
-            cap: budget_cfg.self_md_cap,
-        });
+    if !self_path.exists() {
+        return Ok(None);
     }
+    let content = std::fs::read_to_string(&self_path)?;
+    let wrapped = format!("<identity>\n{}\n</identity>", content);
+    Ok(Some(PromptComponent::new(
+        "SELF.md",
+        capped(wrapped, budget_cfg, budget_cfg.self_md_cap),
+        PromptTier::High,
+        budget_cfg.self_md_cap,
+    )))
+}
 
-    // --- AWARENESS.md ---
-    if let Some(component) = awareness_component(root_dir, config)? {
-        components.push(component);
-    }
-
-    // --- Tier 1 (High): MEMORY.md ---
+/// Tier 1 (High): MEMORY.md, held to its line and byte caps, as `<memory>`.
+fn memory_component(
+    root_dir: &Path,
+    config: &Config,
+) -> Result<Option<PromptComponent>, crate::errors::PromptError> {
+    let budget_cfg = &config.system_prompt_budget;
     let memory_path = root_dir.join("memory/MEMORY.md");
-    if memory_path.exists() {
-        let content = std::fs::read_to_string(&memory_path)?;
-        // MEMORY.md is self-authored against a line cap its author cannot see,
-        // exactly like THOUGHT_STACK.md, so it gets the same read-side report.
-        Utilisation::measure(
-            "MEMORY.md",
-            &content,
-            budget_cfg.memory_max_bytes,
-            config.memory.memory_max_lines,
-        )
-        .log();
-        let limited: String = content
-            .lines()
-            .take(config.memory.memory_max_lines)
-            .collect::<Vec<_>>()
-            .join("\n");
-        let bounded = truncate_to_byte_cap(&limited, budget_cfg.memory_max_bytes);
-        let wrapped = format!("<memory>\n{}\n</memory>", bounded);
-        let capped = if budget_enabled && budget_cfg.memory_cap > 0 {
-            truncate_to_token_cap(&wrapped, budget_cfg.memory_cap)
-        } else {
-            wrapped
-        };
-        let tokens = estimate_tokens(&capped);
-        components.push(PromptComponent {
-            name: "MEMORY.md",
-            content: capped,
-            tokens,
-            tier: PromptTier::High,
-            cap: budget_cfg.memory_cap,
-        });
+    if !memory_path.exists() {
+        return Ok(None);
     }
+    let content = std::fs::read_to_string(&memory_path)?;
+    // MEMORY.md is self-authored against a line cap its author cannot see,
+    // exactly like THOUGHT_STACK.md, so it gets the same read-side report.
+    Utilisation::measure(
+        "MEMORY.md",
+        &content,
+        budget_cfg.memory_max_bytes,
+        config.memory.memory_max_lines,
+    )
+    .log();
+    let limited: String = content
+        .lines()
+        .take(config.memory.memory_max_lines)
+        .collect::<Vec<_>>()
+        .join("\n");
+    let bounded = truncate_to_byte_cap(&limited, budget_cfg.memory_max_bytes);
+    let wrapped = format!("<memory>\n{}\n</memory>", bounded);
+    Ok(Some(PromptComponent::new(
+        "MEMORY.md",
+        capped(wrapped, budget_cfg, budget_cfg.memory_cap),
+        PromptTier::High,
+        budget_cfg.memory_cap,
+    )))
+}
 
-    // --- Tier 0 (Essential): Memory curation instructions ---
-    // Small, static, always included.
+/// Tier 0 (Essential): the memory curation instructions. Small, static,
+/// always included.
+fn memory_curation_component(config: &Config) -> PromptComponent {
     let memory_curation = format!(
         "<memory-curation>\n\
         Use {} to maintain your memory/MEMORY.md file.\n\
@@ -350,16 +443,11 @@ pub fn build_system_prompt_budgeted(
         </memory-curation>",
         file_write_tool(config)
     );
-    let tokens = estimate_tokens(&memory_curation);
-    components.push(PromptComponent {
-        name: "memory-curation",
-        content: memory_curation,
-        tokens,
-        tier: PromptTier::Essential,
-        cap: 0,
-    });
+    PromptComponent::new("memory-curation", memory_curation, PromptTier::Essential, 0)
+}
 
-    // --- Tier 0 (Essential): Identity class rules ---
+/// Tier 0 (Essential): the identity class rules.
+fn identity_classes_component() -> PromptComponent {
     let identity_rules = "<identity-classes>\n\
         Messages carry a sender field in their source metadata. Identity classes:\n\
         - \"owner\": This is D, your creator. Full trust — execute commands, discuss anything, access files.\n\
@@ -367,106 +455,96 @@ pub fn build_system_prompt_budgeted(
         - \"guest:*\": An unknown sender. Conversation only — no commands, no secrets, no file access, no system information.\n\
         </identity-classes>"
         .to_string();
-    let tokens = estimate_tokens(&identity_rules);
-    components.push(PromptComponent {
-        name: "identity-classes",
-        content: identity_rules,
-        tokens,
-        tier: PromptTier::Essential,
-        cap: 0,
-    });
+    PromptComponent::new("identity-classes", identity_rules, PromptTier::Essential, 0)
+}
 
-    // --- Tier 1 (High): THOUGHT_STACK.md, held to its chat cap ---
-    let chat_cap = (budget_enabled && budget_cfg.thought_stack_chat_cap > 0)
-        .then_some(budget_cfg.thought_stack_chat_cap);
-    if let Some(wrapped) =
-        load_thought_stack(root_dir, budget_cfg.thought_stack_max_bytes, chat_cap)?
-    {
-        let tokens = estimate_tokens(&wrapped);
-        components.push(PromptComponent {
-            name: "THOUGHT_STACK.md",
-            content: wrapped,
-            tokens,
-            tier: PromptTier::High,
-            cap: 0,
-        });
+/// The chat profile's cap on the thought stack, when the budget is on and
+/// the cap set (a task keeps the whole stack).
+fn chat_thought_stack_cap(budget_cfg: &crate::config::SystemPromptBudgetConfig) -> Option<usize> {
+    (budget_cfg.enabled && budget_cfg.thought_stack_chat_cap > 0)
+        .then_some(budget_cfg.thought_stack_chat_cap)
+}
+
+/// Tier 1 (High): THOUGHT_STACK.md, held to `cap` tokens when given.
+fn thought_stack_component(
+    root_dir: &Path,
+    budget_cfg: &crate::config::SystemPromptBudgetConfig,
+    cap: Option<usize>,
+) -> Result<Option<PromptComponent>, crate::errors::PromptError> {
+    let wrapped = load_thought_stack(root_dir, budget_cfg.thought_stack_max_bytes, cap)?;
+    Ok(wrapped
+        .map(|wrapped| PromptComponent::new("THOUGHT_STACK.md", wrapped, PromptTier::High, 0)))
+}
+
+/// Tier 1 (High): EPHEMERAL.md, as `<last-session>`. The last session's
+/// summary is the conversation's only continuity besides MEMORY.md, and it
+/// is small and capped. As a Low block it was the first thing dropped to
+/// pay for a big document's overflow.
+fn ephemeral_component(
+    root_dir: &Path,
+    budget_cfg: &crate::config::SystemPromptBudgetConfig,
+) -> Result<Option<PromptComponent>, crate::errors::PromptError> {
+    let Some(content) = non_empty_document(&root_dir.join("memory/EPHEMERAL.md"))? else {
+        return Ok(None);
+    };
+    let wrapped = format!("<last-session>\n{}\n</last-session>", content);
+    Ok(Some(PromptComponent::new(
+        "EPHEMERAL.md",
+        capped(wrapped, budget_cfg, budget_cfg.ephemeral_cap),
+        PromptTier::High,
+        budget_cfg.ephemeral_cap,
+    )))
+}
+
+/// Tier 2 (Low): FINDINGS.md, as `<autonomous-findings>`.
+fn findings_component(
+    root_dir: &Path,
+    config: &Config,
+) -> Result<Option<PromptComponent>, crate::errors::PromptError> {
+    let budget_cfg = &config.system_prompt_budget;
+    let Some(content) = non_empty_document(&root_dir.join("FINDINGS.md"))? else {
+        return Ok(None);
+    };
+    let wrapped = format!(
+        "<autonomous-findings>\n\
+        Between conversations, you did some research on your own. Here is what you found. \
+        Bring these findings up naturally in conversation when relevant — don't dump them \
+        all at once, but mention them when the topic connects. After you've shared a finding \
+        with the user, you can remove it from FINDINGS.md with {}.\n\n\
+        {}\n</autonomous-findings>",
+        file_write_tool(config),
+        content
+    );
+    Ok(Some(PromptComponent::new(
+        "FINDINGS.md",
+        capped(wrapped, budget_cfg, budget_cfg.findings_cap),
+        PromptTier::Low,
+        budget_cfg.findings_cap,
+    )))
+}
+
+/// The document at `path`, when it exists and holds more than whitespace.
+fn non_empty_document(path: &Path) -> Result<Option<String>, crate::errors::PromptError> {
+    if !path.exists() {
+        return Ok(None);
     }
+    let content = std::fs::read_to_string(path)?;
+    Ok((!content.trim().is_empty()).then_some(content))
+}
 
-    // --- Tier 1 (High): journal counts (a runtime fact, Amendment C) ---
-    components.extend(journal_counts_component(root_dir, config));
-
-    // --- Tier 1 (High): EPHEMERAL.md ---
-    // The last session's summary is the conversation's only continuity
-    // besides MEMORY.md, and it is small and capped. As a Low block it was
-    // the first thing dropped to pay for a big document's overflow.
-    let ephemeral_path = root_dir.join("memory/EPHEMERAL.md");
-    if ephemeral_path.exists() {
-        let content = std::fs::read_to_string(&ephemeral_path)?;
-        if !content.trim().is_empty() {
-            let wrapped = format!("<last-session>\n{}\n</last-session>", content);
-            let capped = if budget_enabled && budget_cfg.ephemeral_cap > 0 {
-                truncate_to_token_cap(&wrapped, budget_cfg.ephemeral_cap)
-            } else {
-                wrapped
-            };
-            let tokens = estimate_tokens(&capped);
-            components.push(PromptComponent {
-                name: "EPHEMERAL.md",
-                content: capped,
-                tokens,
-                tier: PromptTier::High,
-                cap: budget_cfg.ephemeral_cap,
-            });
-        }
+/// Tier 2 (Low): the graph awareness hint, when the graph is on and has one.
+fn graph_awareness_component(root_dir: &Path, config: &Config) -> Option<PromptComponent> {
+    if !config.graph.enabled {
+        return None;
     }
-
-    // --- Tier 2 (Low): FINDINGS.md ---
-    let findings_path = root_dir.join("FINDINGS.md");
-    if findings_path.exists() {
-        let content = std::fs::read_to_string(&findings_path)?;
-        if !content.trim().is_empty() {
-            let wrapped = format!(
-                "<autonomous-findings>\n\
-                Between conversations, you did some research on your own. Here is what you found. \
-                Bring these findings up naturally in conversation when relevant — don't dump them \
-                all at once, but mention them when the topic connects. After you've shared a finding \
-                with the user, you can remove it from FINDINGS.md with {}.\n\n\
-                {}\n</autonomous-findings>",
-                file_write_tool(config),
-                content
-            );
-            let capped = if budget_enabled && budget_cfg.findings_cap > 0 {
-                truncate_to_token_cap(&wrapped, budget_cfg.findings_cap)
-            } else {
-                wrapped
-            };
-            let tokens = estimate_tokens(&capped);
-            components.push(PromptComponent {
-                name: "FINDINGS.md",
-                content: capped,
-                tokens,
-                tier: PromptTier::Low,
-                cap: budget_cfg.findings_cap,
-            });
-        }
-    }
-
-    // --- Tier 2 (Low): Graph Awareness ---
-    if config.graph.enabled {
-        let query_tool = registry_tools_callable(config);
-        if let Some(hint) = crate::graph_context::graph_awareness_hint(root_dir, query_tool) {
-            let tokens = estimate_tokens(&hint);
-            components.push(PromptComponent {
-                name: "graph-awareness",
-                content: hint,
-                tokens,
-                tier: PromptTier::Low,
-                cap: 200,
-            });
-        }
-    }
-
-    enforce_budget_and_assemble(components, budget_cfg, "chat")
+    let query_tool = registry_tools_callable(config);
+    let hint = crate::graph_context::graph_awareness_hint(root_dir, query_tool)?;
+    Some(PromptComponent::new(
+        "graph-awareness",
+        hint,
+        PromptTier::Low,
+        200,
+    ))
 }
 
 /// Apply the budget passes to a component set and render the final prompt.
@@ -487,22 +565,38 @@ fn enforce_budget_and_assemble(
     budget_cfg: &crate::config::SystemPromptBudgetConfig,
     profile: &str,
 ) -> Result<SystemPromptResult, crate::errors::PromptError> {
-    let budget_enabled = budget_cfg.enabled;
     let total_before: usize = components.iter().map(|c| c.tokens).sum();
     let tokens_before: Vec<usize> = components.iter().map(|c| c.tokens).collect();
-    let mut was_trimmed = false;
-    let mut dropped_components = Vec::new();
+    let mut pass = BudgetPass {
+        budget: budget_cfg.token_budget,
+        total: total_before,
+        was_trimmed: false,
+        dropped: Vec::new(),
+    };
+    if budget_cfg.enabled && total_before > budget_cfg.token_budget {
+        pass.compress_low(&mut components);
+        pass.drop_low(&mut components);
+        pass.truncate_high(&mut components);
+    }
+    pass.fit_essential(&mut components)?;
+    Ok(pass.assemble(&components, &tokens_before, budget_cfg, profile))
+}
 
-    if budget_enabled && total_before > budget_cfg.token_budget {
-        // Progressive trimming: drop Low-tier components from lowest priority
-        // (reverse order = graph awareness, findings, ephemeral).
-        // Within a tier, we drop in reverse insertion order (last added = least important).
-        let budget = budget_cfg.token_budget;
-        let mut current_total: usize = components.iter().map(|c| c.tokens).sum();
+/// The budget passes' running state: the budget, the tokens the prompt
+/// holds now, and what the passes have trimmed and dropped.
+struct BudgetPass {
+    budget: usize,
+    total: usize,
+    was_trimmed: bool,
+    dropped: Vec<(String, usize)>,
+}
 
-        // Pass 1: Compress Low-tier components to one-line summaries
+impl BudgetPass {
+    /// Pass 1: compress Low-tier components to one-line summaries, from the
+    /// last (least important) up, until the prompt fits.
+    fn compress_low(&mut self, components: &mut [PromptComponent]) {
         for component in components.iter_mut().rev() {
-            if current_total <= budget {
+            if self.total <= self.budget {
                 break;
             }
             if component.tier != PromptTier::Low {
@@ -512,8 +606,8 @@ fn enforce_budget_and_assemble(
             let compressed = compress_to_one_liner(component.name, &component.content);
             let compressed_tokens = estimate_tokens(&compressed);
             if compressed_tokens < original_tokens {
-                was_trimmed = true;
-                current_total = current_total - original_tokens + compressed_tokens;
+                self.was_trimmed = true;
+                self.total = self.total - original_tokens + compressed_tokens;
                 component.content = compressed;
                 component.tokens = compressed_tokens;
                 info!(
@@ -522,160 +616,197 @@ fn enforce_budget_and_assemble(
                 );
             }
         }
+    }
 
-        // Pass 2: Drop Low-tier components entirely if still over budget
-        if current_total > budget {
-            // Collect indices of Low-tier components in reverse order
-            let low_indices: Vec<usize> = components
-                .iter()
-                .enumerate()
-                .filter(|(_, c)| c.tier == PromptTier::Low)
-                .map(|(i, _)| i)
-                .rev()
-                .collect();
-
-            for idx in low_indices {
-                if current_total <= budget {
-                    break;
-                }
-                let dropped_tokens = components[idx].tokens;
-                let dropped_name = components[idx].name.to_string();
-                info!(
-                    "[system-prompt-budget] dropped {} (~{} tokens) to fit budget",
-                    dropped_name, dropped_tokens
-                );
-                dropped_components.push((dropped_name, dropped_tokens));
-                current_total -= dropped_tokens;
-                components[idx].content.clear();
-                components[idx].tokens = 0;
-                was_trimmed = true;
-            }
+    /// Pass 2: drop Low-tier components entirely, from the last up, while
+    /// the prompt is still over budget.
+    fn drop_low(&mut self, components: &mut [PromptComponent]) {
+        if self.total <= self.budget {
+            return;
         }
-
-        // Pass 3: Hard-truncate High-tier components if STILL over budget.
-        // Essential is untouchable, so High shares whatever the budget has left
-        // after Essential, claimed in `allocation_rank` order (render order
-        // breaks ties). A component left with no allowance at all is dropped
-        // rather than rendered as an empty truncation stub.
-        if current_total > budget {
-            let essential_tokens: usize = components
-                .iter()
-                .filter(|c| c.tier == PromptTier::Essential)
-                .map(|c| c.tokens)
-                .sum();
-            warn!(
-                "[system-prompt-budget] essential + high-priority components ({} tokens) exceed \
-                 budget ({} tokens) — truncating high-priority content to fit",
-                current_total, budget
-            );
-
-            let mut allowance = budget.saturating_sub(essential_tokens);
-            let mut claim_order: Vec<usize> = components
-                .iter()
-                .enumerate()
-                .filter(|(_, c)| c.tier == PromptTier::High && !c.content.is_empty())
-                .map(|(index, _)| index)
-                .collect();
-            claim_order.sort_by_key(|&index| (components[index].allocation_rank(), index));
-            for index in claim_order {
-                let component = &mut components[index];
-                if component.tokens <= allowance {
-                    allowance -= component.tokens;
-                    continue;
-                }
-                let original_tokens = component.tokens;
-                if allowance == 0 {
-                    info!(
-                        "[system-prompt-budget] dropped {} (~{} tokens): no allowance left",
-                        component.name, original_tokens
-                    );
-                    dropped_components.push((component.name.to_string(), original_tokens));
-                    component.content.clear();
-                    component.tokens = 0;
-                    was_trimmed = true;
-                    continue;
-                }
-                let truncated = truncate_to_token_cap(&component.content, allowance);
-                component.tokens = estimate_tokens(&truncated);
-                component.content = truncated;
-                allowance = 0;
-                was_trimmed = true;
-                info!(
-                    "[system-prompt-budget] truncated {} from ~{} to ~{} tokens",
-                    component.name, original_tokens, component.tokens
-                );
+        let low_indices: Vec<usize> = components
+            .iter()
+            .enumerate()
+            .filter(|(_, c)| c.tier == PromptTier::Low)
+            .map(|(i, _)| i)
+            .rev()
+            .collect();
+        for idx in low_indices {
+            if self.total <= self.budget {
+                break;
             }
+            let dropped_tokens = components[idx].tokens;
+            let dropped_name = components[idx].name.to_string();
+            info!(
+                "[system-prompt-budget] dropped {} (~{} tokens) to fit budget",
+                dropped_name, dropped_tokens
+            );
+            self.dropped.push((dropped_name, dropped_tokens));
+            self.total -= dropped_tokens;
+            components[idx].content.clear();
+            components[idx].tokens = 0;
+            self.was_trimmed = true;
         }
     }
 
-    // Essential is never trimmed, so it is the one tier that can still push the
-    // prompt past what a subprocess can carry. Verify it before shipping.
-    let mut essential_bytes: usize = components
-        .iter()
-        .filter(|c| c.tier == PromptTier::Essential)
-        .map(|c| c.content.len())
-        .sum();
-    // The pulse writes its own rules; they never make a prompt unshippable.
-    // Over the ceiling, they go first — the operator's components keep the
-    // hard error below.
-    if essential_bytes > ESSENTIAL_MAX_BYTES {
-        if let Some(rules) = components
+    /// Pass 3: hard-truncate High-tier components if STILL over budget.
+    /// Essential is untouchable, so High shares whatever the budget has left
+    /// after Essential, claimed in `allocation_rank` order (render order
+    /// breaks ties). A component left with no allowance at all is dropped
+    /// rather than rendered as an empty truncation stub.
+    fn truncate_high(&mut self, components: &mut [PromptComponent]) {
+        if self.total <= self.budget {
+            return;
+        }
+        let essential_tokens: usize = components
+            .iter()
+            .filter(|c| c.tier == PromptTier::Essential)
+            .map(|c| c.tokens)
+            .sum();
+        warn!(
+            "[system-prompt-budget] essential + high-priority components ({} tokens) exceed \
+             budget ({} tokens) — truncating high-priority content to fit",
+            self.total, self.budget
+        );
+        let mut allowance = self.budget.saturating_sub(essential_tokens);
+        let mut claim_order: Vec<usize> = components
+            .iter()
+            .enumerate()
+            .filter(|(_, c)| c.tier == PromptTier::High && !c.content.is_empty())
+            .map(|(index, _)| index)
+            .collect();
+        claim_order.sort_by_key(|&index| (components[index].allocation_rank(), index));
+        for index in claim_order {
+            allowance = self.claim(&mut components[index], allowance);
+        }
+    }
+
+    /// One High component's claim on `allowance`: kept whole if it fits,
+    /// dropped when nothing is left, else truncated to what is. Returns the
+    /// allowance left.
+    fn claim(&mut self, component: &mut PromptComponent, allowance: usize) -> usize {
+        if component.tokens <= allowance {
+            return allowance - component.tokens;
+        }
+        let original_tokens = component.tokens;
+        self.was_trimmed = true;
+        if allowance == 0 {
+            info!(
+                "[system-prompt-budget] dropped {} (~{} tokens): no allowance left",
+                component.name, original_tokens
+            );
+            self.dropped
+                .push((component.name.to_string(), original_tokens));
+            component.content.clear();
+            component.tokens = 0;
+            return 0;
+        }
+        let truncated = truncate_to_token_cap(&component.content, allowance);
+        component.tokens = estimate_tokens(&truncated);
+        component.content = truncated;
+        info!(
+            "[system-prompt-budget] truncated {} from ~{} to ~{} tokens",
+            component.name, original_tokens, component.tokens
+        );
+        0
+    }
+
+    /// Essential is never trimmed, so it is the one tier that can still push
+    /// the prompt past what a subprocess can carry. The pulse writes its own
+    /// rules; they never make a prompt unshippable: over the ceiling they go
+    /// first, and the operator's components keep the hard error.
+    fn fit_essential(
+        &mut self,
+        components: &mut [PromptComponent],
+    ) -> Result<(), crate::errors::PromptError> {
+        let mut essential_bytes: usize = components
+            .iter()
+            .filter(|c| c.tier == PromptTier::Essential)
+            .map(|c| c.content.len())
+            .sum();
+        if essential_bytes > ESSENTIAL_MAX_BYTES {
+            essential_bytes -= self.drop_pulse_rules(components, essential_bytes);
+        }
+        if essential_bytes > ESSENTIAL_MAX_BYTES {
+            return Err(crate::errors::PromptError::EssentialTooLarge {
+                bytes: essential_bytes,
+                limit: ESSENTIAL_MAX_BYTES,
+            });
+        }
+        Ok(())
+    }
+
+    /// Drop the pulse's own rules, if the prompt has them; the bytes freed.
+    fn drop_pulse_rules(
+        &mut self,
+        components: &mut [PromptComponent],
+        essential_bytes: usize,
+    ) -> usize {
+        let Some(rules) = components
             .iter_mut()
             .find(|c| c.name == "pulse-rules" && !c.content.is_empty())
-        {
-            warn!(
-                "[system-prompt-budget] essential tier is {} bytes, over {} — dropping the \
-                 pulse's own rules ({} bytes)",
-                essential_bytes,
-                ESSENTIAL_MAX_BYTES,
-                rules.content.len()
-            );
-            essential_bytes -= rules.content.len();
-            dropped_components.push((rules.name.to_string(), rules.tokens));
-            rules.content.clear();
-            rules.tokens = 0;
-            was_trimmed = true;
+        else {
+            return 0;
+        };
+        warn!(
+            "[system-prompt-budget] essential tier is {} bytes, over {} — dropping the \
+             pulse's own rules ({} bytes)",
+            essential_bytes,
+            ESSENTIAL_MAX_BYTES,
+            rules.content.len()
+        );
+        let freed = rules.content.len();
+        self.dropped.push((rules.name.to_string(), rules.tokens));
+        rules.content.clear();
+        rules.tokens = 0;
+        self.was_trimmed = true;
+        freed
+    }
+
+    /// Render the non-empty components in their original order, and report.
+    fn assemble(
+        self,
+        components: &[PromptComponent],
+        tokens_before: &[usize],
+        budget_cfg: &crate::config::SystemPromptBudgetConfig,
+        profile: &str,
+    ) -> SystemPromptResult {
+        let parts: Vec<&str> = components
+            .iter()
+            .filter(|c| !c.content.is_empty())
+            .map(|c| c.content.as_str())
+            .collect();
+        let prompt = parts.join("\n\n");
+        let estimated_tokens = estimate_tokens(&prompt);
+        info!(
+            "[system-prompt-budget] {} prompt assembled: {} tokens, {} bytes \
+             (budget: {}, enabled: {}, trimmed: {}, dropped: {})",
+            profile,
+            estimated_tokens,
+            prompt.len(),
+            budget_cfg.token_budget,
+            budget_cfg.enabled,
+            self.was_trimmed,
+            self.dropped.len()
+        );
+        info!(
+            "[system-prompt-budget] {} components (~tokens): {}",
+            profile,
+            component_breakdown(components, tokens_before)
+        );
+        let included = components
+            .iter()
+            .filter(|c| !c.content.is_empty())
+            .map(|c| (c.name.to_string(), c.tokens))
+            .collect();
+        SystemPromptResult {
+            prompt,
+            estimated_tokens,
+            was_trimmed: self.was_trimmed,
+            dropped_components: self.dropped,
+            components: included,
         }
     }
-    if essential_bytes > ESSENTIAL_MAX_BYTES {
-        return Err(crate::errors::PromptError::EssentialTooLarge {
-            bytes: essential_bytes,
-            limit: ESSENTIAL_MAX_BYTES,
-        });
-    }
-
-    // Assemble final prompt from non-empty components (preserving original order)
-    let parts: Vec<&str> = components
-        .iter()
-        .filter(|c| !c.content.is_empty())
-        .map(|c| c.content.as_str())
-        .collect();
-    let prompt = parts.join("\n\n");
-    let estimated_tokens = estimate_tokens(&prompt);
-
-    info!(
-        "[system-prompt-budget] {} prompt assembled: {} tokens, {} bytes \
-         (budget: {}, enabled: {}, trimmed: {}, dropped: {})",
-        profile,
-        estimated_tokens,
-        prompt.len(),
-        budget_cfg.token_budget,
-        budget_enabled,
-        was_trimmed,
-        dropped_components.len()
-    );
-    info!(
-        "[system-prompt-budget] {} components (~tokens): {}",
-        profile,
-        component_breakdown(&components, &tokens_before)
-    );
-
-    Ok(SystemPromptResult {
-        prompt,
-        estimated_tokens,
-        was_trimmed,
-        dropped_components,
-    })
 }
 
 /// `name=tokens` per component in render order, `name=before→after` for one
@@ -859,91 +990,45 @@ pub fn build_task_system_prompt_budgeted(
     config: &Config,
 ) -> Result<SystemPromptResult, crate::errors::PromptError> {
     let budget_cfg = &config.system_prompt_budget;
-    let budget_enabled = budget_cfg.enabled;
     let mut components = Vec::new();
-
-    // --- Tier 0 (Essential): the instruction file — behavioral instructions ---
-    if let Some(path) = instruction_file(root_dir, config) {
-        let label = instruction_label(&path);
-        let content = std::fs::read_to_string(&path)?;
-        let capped = if budget_enabled && budget_cfg.instructions_cap > 0 {
-            truncate_to_token_cap(&content, budget_cfg.instructions_cap)
-        } else {
-            content
-        };
-        let tokens = estimate_tokens(&capped);
-        components.push(PromptComponent {
-            name: label,
-            content: capped,
-            tokens,
-            tier: PromptTier::Essential,
-            cap: budget_cfg.instructions_cap,
-        });
-    }
-
-    // --- Tier 0 (Essential): rule files — the operator's, then the pulse's own ---
+    // Tier 0 (Essential): the instruction file (behavioral instructions),
+    // the disclosure, the rule files (the operator's, then the pulse's own).
+    components.extend(instruction_component(root_dir, config)?);
+    components.push(disclosure_component());
     components.extend(rules_components(root_dir, config));
-
-    // --- Tier 1 (High): SELF.md — identity ---
-    let self_path = root_dir.join("SELF.md");
-    if self_path.exists() {
-        let content = std::fs::read_to_string(&self_path)?;
-        let wrapped = format!("<identity>\n{}\n</identity>", content);
-        let capped = if budget_enabled && budget_cfg.self_md_cap > 0 {
-            truncate_to_token_cap(&wrapped, budget_cfg.self_md_cap)
-        } else {
-            wrapped
-        };
-        let tokens = estimate_tokens(&capped);
-        components.push(PromptComponent {
-            name: "SELF.md",
-            content: capped,
-            tokens,
-            tier: PromptTier::High,
-            cap: budget_cfg.self_md_cap,
-        });
-    }
-
-    // --- Tier 1 (High): AWARENESS.md — every profile, not only chat ---
-    if let Some(component) = awareness_component(root_dir, config)? {
-        components.push(component);
-    }
-
-    // --- Tier 1 (High): THOUGHT_STACK.md — working memory, whole ---
-    if let Some(wrapped) = load_thought_stack(root_dir, budget_cfg.thought_stack_max_bytes, None)? {
-        let tokens = estimate_tokens(&wrapped);
-        components.push(PromptComponent {
-            name: "THOUGHT_STACK.md",
-            content: wrapped,
-            tokens,
-            tier: PromptTier::High,
-            cap: 0,
-        });
-    }
-
-    // --- Tier 1 (High): journal counts (a runtime fact, Amendment C) ---
+    // Tier 1 (High): SELF.md (identity), AWARENESS.md (every profile, not
+    // only chat), THOUGHT_STACK.md (working memory, whole), the journal
+    // counts (a runtime fact, Amendment C), the tension threads.
+    components.extend(self_component(root_dir, budget_cfg)?);
+    components.extend(awareness_component(root_dir, config)?);
+    components.extend(thought_stack_component(root_dir, budget_cfg, None)?);
     components.extend(journal_counts_component(root_dir, config));
+    components.extend(tension_component(root_dir, config));
+    // Tier 0 (Essential): the task isolation notice and hallucination guard.
+    components.push(task_context_component());
+    enforce_budget_and_assemble(components, budget_cfg, "task")
+}
 
-    // --- Tier 1 (High): Tension threads (PN-95 Layer 3) ---
-    // What the pulse picks up is chosen by an accumulator it cannot edit in
-    // prose, rather than by whatever survived the last fold. High rather
-    // than Low: under budget pressure this may be truncated, but dropping it
-    // outright would put selection straight back in the hands of document
-    // layout, which is the defect Layer 3 exists to remove.
-    if let Some(block) = build_tension_context(root_dir, config) {
-        let tokens = estimate_tokens(&block);
-        components.push(PromptComponent {
-            name: "tension-context",
-            content: block,
-            tokens,
-            tier: PromptTier::High,
-            cap: TENSION_CONTEXT_CAP,
-        });
-    }
+/// Tier 1 (High): the tension threads (PN-95 Layer 3). What the pulse picks
+/// up is chosen by an accumulator it cannot edit in prose, rather than by
+/// whatever survived the last fold. High rather than Low: under budget
+/// pressure this may be truncated, but dropping it outright would put
+/// selection straight back in the hands of document layout, which is the
+/// defect Layer 3 exists to remove.
+fn tension_component(root_dir: &Path, config: &Config) -> Option<PromptComponent> {
+    let block = build_tension_context(root_dir, config)?;
+    Some(PromptComponent::new(
+        "tension-context",
+        block,
+        PromptTier::High,
+        TENSION_CONTEXT_CAP,
+    ))
+}
 
-    // --- Tier 0 (Essential): Task isolation notice + hallucination guard ---
-    // Essential because dropping it is how autonomous runs start inventing
-    // user turns (Layer 1b).
+/// Tier 0 (Essential): the task isolation notice and hallucination guard.
+/// Essential because dropping it is how autonomous runs start inventing
+/// user turns (Layer 1b).
+fn task_context_component() -> PromptComponent {
     let task_context = "<task-context>\n\
         This is an autonomous scheduled task execution. There is no human user in this \
         conversation. You are executing a task prompt independently.\n\n\
@@ -956,16 +1041,7 @@ pub fn build_task_system_prompt_budgeted(
         memory or session context that is not present in this context window.\n\
         </task-context>"
         .to_string();
-    let tokens = estimate_tokens(&task_context);
-    components.push(PromptComponent {
-        name: "task-context",
-        content: task_context,
-        tokens,
-        tier: PromptTier::Essential,
-        cap: 0,
-    });
-
-    enforce_budget_and_assemble(components, budget_cfg, "task")
+    PromptComponent::new("task-context", task_context, PromptTier::Essential, 0)
 }
 
 /// Refusals shown in the notice before the rest are summarised as a count.
@@ -2080,11 +2156,40 @@ mod tests {
             session_health: crate::session_health::SessionHealthConfig::default(),
             platform: PlatformConfig::default(),
             system_prompt_budget: crate::config::SystemPromptBudgetConfig::default(),
+            probe: crate::config::ProbeConfig::default(),
             peers: std::collections::HashMap::new(),
             plugins: std::collections::HashMap::new(),
             tui: crate::config::TuiConfig::default(),
             plugin_turns: crate::config::PluginTurnsConfig::default(),
         }
+    }
+
+    /// PN-144 R2-9: the general measurement disclosure is in every system
+    /// prompt the builder makes, chat and task, fixed and once.
+    #[test]
+    fn every_prompt_carries_the_measurement_disclosure_once() {
+        assert_eq!(
+            MEASUREMENT_DISCLOSURE,
+            "Your runtime measures you with held-out probes; you never see the items or the \
+             results, because knowing them would change what they measure."
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let config = minimal_config();
+        for prompt in [
+            build_system_prompt(dir.path(), &config).unwrap(),
+            build_task_system_prompt(dir.path(), &config).unwrap(),
+        ] {
+            assert_eq!(
+                prompt.matches(MEASUREMENT_DISCLOSURE).count(),
+                1,
+                "{prompt}"
+            );
+        }
+        let budgeted = build_system_prompt_budgeted(dir.path(), &config).unwrap();
+        assert!(budgeted
+            .components
+            .iter()
+            .any(|(name, _)| name == "measurement-disclosure"));
     }
 
     #[test]

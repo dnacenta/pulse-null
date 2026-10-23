@@ -1,0 +1,61 @@
+# Live graph export for one pulse's probe run (PN-144). TEMPLATE: installed
+# with pulse-null-probe@.service (see its header), started by it
+# (Requires=), never on its own schedule.
+#
+# The only probe step that reaches the live SurrealDB server (127.0.0.1),
+# and it only reads: an export without users or access methods, written to
+# /var/lib/pulse-null-probe/s/exports/<pulse>.surql (0600, probe user) for
+# the run, which takes it if it is under 3 hours old. The directory is not
+# writable by the pulse user, so the pulse cannot replace the export before
+# import. Network: loopback to the live server only. `--if-due` exits 0
+# without contacting the server when a scheduled run would be refused
+# (not a probe day, outside the quiet window, over the weekly budget for a
+# full run, or another gate refusal). A run that is due still exports first
+# (`Requires=` on the probe unit). A hand-started run that finds no fresh
+# export fails closed.
+#
+# The graph root password stays mode 0600, owned by root. This unit is the
+# only one that receives it: systemd copies it into the credentials
+# directory, and the export reads $CREDENTIALS_DIRECTORY/root-password.
+# The run and verify units do not load it.
+
+[Unit]
+Description=pulse-null probe graph export (%i)
+After=surrealdb.service
+
+[Service]
+Type=oneshot
+User=pulse-probe
+Group=pulse-probe
+WorkingDirectory=/home/pulse/pulse-null/%i
+ExecStart=/usr/local/bin/pulse-null probe export-graph --if-due
+Environment=RUST_LOG=info
+Environment=PULSE_NULL_PROBE_STATE=/var/lib/pulse-null-probe
+LoadCredential=root-password:/opt/pulse-null/surrealdb/root-password
+UMask=0077
+TimeoutStartSec=20min
+
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/var/lib/pulse-null-probe
+InaccessiblePaths=-/home/pulse/.ssh
+InaccessiblePaths=-/home/pulse/.local/state
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectProc=invisible
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+NoNewPrivileges=yes
+CapabilityBoundingSet=
+RestrictSUIDSGID=yes
+RestrictNamespaces=yes
+LockPersonality=yes
+SystemCallArchitectures=native
+RestrictAddressFamilies=AF_UNIX AF_INET
+IPAddressDeny=any
+IPAddressAllow=127.0.0.1/32
+MemoryMax=2G
+Nice=10
+IOSchedulingClass=idle

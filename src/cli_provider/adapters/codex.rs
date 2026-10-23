@@ -259,7 +259,6 @@ mod tests {
         Invocation {
             model: "gpt-5.3-codex",
             system_prompt_file: None,
-            system_prompt: "You are Echo.",
             prompt_file: None,
             surface: ToolSurface::Full,
             streaming: false,

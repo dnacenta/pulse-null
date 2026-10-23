@@ -10,6 +10,7 @@
 
 pub mod adapter;
 pub mod adapters;
+pub mod sandbox;
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -29,9 +30,10 @@ use crate::streaming::{StreamEvent, StreamResult, StreamingProvider};
 use crate::tool_surface::ToolSurface;
 
 use adapter::{
-    CliAdapter, ExitClass, Invocation, OutputMode, PromptDelivery, Reply, StreamLine,
-    SystemPromptDelivery, Usage,
+    CliAdapter, ExitClass, Invocation, Observed, OutputMode, PromptDelivery, Reply, StreamLine,
+    SystemPromptDelivery, ToolCall, Usage,
 };
+use sandbox::Sandbox;
 
 /// Default timeout for a CLI subprocess.
 ///
@@ -86,6 +88,44 @@ pub struct CliProvider {
     /// reach a subprocess that brings its own tools. A non-owner turn gets
     /// no tools at all (see [`CliProvider::surface`]).
     pulse_root: PathBuf,
+    /// Extra environment and an optional sandbox for every child. Empty for
+    /// the live pulse; a probe sets both.
+    overrides: SpawnOverrides,
+}
+
+/// What a probe changes about how a CLI child is spawned: environment that
+/// redirects the CLI's own state into a scratch directory (applied after
+/// [`child_env`], so it wins), and a Landlock sandbox. A sandbox that cannot
+/// be built fails the spawn; it never degrades to an unsandboxed child.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SpawnOverrides {
+    pub env: Vec<(std::ffi::OsString, std::ffi::OsString)>,
+    pub sandbox: Option<Sandbox>,
+    /// Where the prompt files a child reads are staged. A sandboxed child
+    /// can read only its own directories, so a probe stages them there;
+    /// `None` is the system temp dir.
+    pub stage_dir: Option<PathBuf>,
+}
+
+impl SpawnOverrides {
+    /// The directory prompt files are staged in.
+    fn stage_dir(&self) -> PathBuf {
+        self.stage_dir.clone().unwrap_or_else(std::env::temp_dir)
+    }
+}
+
+/// Everything one captured invocation produced: the reply, the raw output
+/// (the receipt), and what the stream said about the run.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CapturedRun {
+    pub reply: String,
+    /// The CLI's stdout, unmodified.
+    pub raw: String,
+    /// The model that actually served the turn, when the CLI said.
+    pub served_model: Option<String>,
+    /// Tool calls in stream order.
+    pub tool_calls: Vec<ToolCall>,
+    pub usage: Usage,
 }
 
 impl CliProvider {
@@ -106,7 +146,16 @@ impl CliProvider {
             model,
             reasoning_effort: None,
             pulse_root,
+            overrides: SpawnOverrides::default(),
         }
+    }
+
+    /// Spawn every child with these overrides (a probe's scratch env and
+    /// sandbox).
+    #[must_use]
+    pub fn with_overrides(mut self, overrides: SpawnOverrides) -> Self {
+        self.overrides = overrides;
+        self
     }
 
     /// Reasoning-effort hint for adapters whose CLI takes one.
@@ -217,18 +266,47 @@ pub fn child_env(
 }
 
 /// A command for `bin` anchored to `pulse_root`: cwd and `RECALL_ECHO_HOME`
-/// point at the pulse root, and the child sees only [`child_env`]. Free
-/// function so the spawn shape can be tested without spawning.
+/// point at the pulse root, and the child sees only [`child_env`] plus the
+/// overrides' environment. With a sandbox in the overrides the ruleset is
+/// built now and the child is spawned inside it ([`PulseCommand::spawn`]);
+/// a sandbox that cannot be built is an error, never an unsandboxed child.
+/// Free function so the spawn shape can be tested without spawning.
 fn pulse_command(
     bin: &str,
     pulse_root: &Path,
     adapter: &dyn CliAdapter,
-) -> tokio::process::Command {
+    overrides: &SpawnOverrides,
+) -> Result<PulseCommand, CliError> {
     let mut cmd = tokio::process::Command::new(bin);
     cmd.current_dir(pulse_root)
         .env_clear()
-        .envs(child_env(pulse_root, Some(adapter)));
-    cmd
+        .envs(child_env(pulse_root, Some(adapter)))
+        .envs(overrides.env.iter().map(|(k, v)| (k, v)));
+    let sandbox = overrides
+        .sandbox
+        .as_ref()
+        .map(Sandbox::prepare)
+        .transpose()?;
+    Ok(PulseCommand { cmd, sandbox })
+}
+
+/// A CLI command and the sandbox its child must start in, if any.
+struct PulseCommand {
+    cmd: tokio::process::Command,
+    sandbox: Option<sandbox::PreparedSandbox>,
+}
+
+impl PulseCommand {
+    /// Spawn the child, inside the sandbox when there is one.
+    async fn spawn(self) -> std::io::Result<tokio::process::Child> {
+        match self.sandbox {
+            Some(sandbox) => sandbox.spawn(self.cmd).await,
+            None => {
+                let mut cmd = self.cmd;
+                cmd.spawn()
+            }
+        }
+    }
 }
 
 /// A private on-disk file for a single invocation.
@@ -244,10 +322,9 @@ struct StagedFile {
 }
 
 impl StagedFile {
-    /// Write `contents` to a uniquely named private file in the temp dir.
-    fn create(label: &str, contents: &str) -> Result<Self, CliError> {
-        let path =
-            std::env::temp_dir().join(format!("pulse-null-{label}-{}.md", uuid::Uuid::new_v4()));
+    /// Write `contents` to a uniquely named private file in `dir`.
+    fn create(label: &str, contents: &str, dir: &Path) -> Result<Self, CliError> {
+        let path = dir.join(format!("pulse-null-{label}-{}.md", uuid::Uuid::new_v4()));
 
         let mut options = std::fs::OpenOptions::new();
         options.write(true).create_new(true);
@@ -305,27 +382,25 @@ struct Staged {
 }
 
 /// Stage the prompts the way the adapter wants them delivered.
-fn stage(adapter: &dyn CliAdapter, system_prompt: &str, prompt: &str) -> Result<Staged, CliError> {
+fn stage(
+    adapter: &dyn CliAdapter,
+    system_prompt: &str,
+    prompt: &str,
+    dir: &Path,
+) -> Result<Staged, CliError> {
     let (system_prompt_file, effective_prompt) = match adapter.system_prompt_delivery() {
         SystemPromptDelivery::File => (
-            Some(StagedFile::create("system-prompt", system_prompt)?),
+            Some(StagedFile::create("system-prompt", system_prompt, dir)?),
             prompt.to_string(),
         ),
-        SystemPromptDelivery::Argv { max_bytes } => {
-            if system_prompt.len() > max_bytes {
-                return Err(CliError::SystemPromptTooLarge {
-                    adapter: adapter.name(),
-                    bytes: system_prompt.len(),
-                    max: max_bytes,
-                });
-            }
-            (None, prompt.to_string())
-        }
         SystemPromptDelivery::Prepend => (None, format!("{system_prompt}\n\n{prompt}")),
     };
     let (prompt_file, stdin_text) = match adapter.prompt_delivery() {
         PromptDelivery::Stdin => (None, Some(effective_prompt)),
-        PromptDelivery::File => (Some(StagedFile::create("prompt", &effective_prompt)?), None),
+        PromptDelivery::File => (
+            Some(StagedFile::create("prompt", &effective_prompt, dir)?),
+            None,
+        ),
     };
     Ok(Staged {
         system_prompt_file,
@@ -347,8 +422,11 @@ async fn ensure_capability(
     adapter: &dyn CliAdapter,
     bin: &str,
     pulse_root: &Path,
+    overrides: &SpawnOverrides,
 ) -> Result<(), CliError> {
-    let absent = std::env::temp_dir().join(format!("pulse-null-probe-{}.md", uuid::Uuid::new_v4()));
+    let absent = overrides
+        .stage_dir()
+        .join(format!("pulse-null-probe-{}.md", uuid::Uuid::new_v4()));
     let Some(probe) = adapter.probe(&absent) else {
         return Ok(());
     };
@@ -358,52 +436,10 @@ async fn ensure_capability(
         .unwrap_or_else(|e| e.into_inner())
         .get(&key)
         .copied();
-
     let supported = match cached {
         Some(supported) => supported,
         None => {
-            // Same cwd and environment as a real invocation: a CLI that
-            // checks its working directory during argument parsing must
-            // answer the probe the way it will answer the call.
-            let mut cmd = pulse_command(bin, pulse_root, adapter);
-            cmd.args(&probe.args)
-                .stdin(Stdio::null())
-                .stdout(Stdio::piped())
-                .stderr(Stdio::piped());
-            cmd.kill_on_drop(true);
-            let child = cmd.spawn().map_err(|source| CliError::Probe {
-                adapter: adapter.name(),
-                bin: bin.to_string(),
-                source,
-            })?;
-            let supported =
-                match tokio::time::timeout(PROBE_TIMEOUT, child.wait_with_output()).await {
-                    Ok(Ok(output)) => {
-                        let mut combined = String::from_utf8_lossy(&output.stderr).into_owned();
-                        combined.push_str(&String::from_utf8_lossy(&output.stdout));
-                        !combined.contains(probe.unsupported_marker)
-                    }
-                    Ok(Err(source)) => {
-                        return Err(CliError::Probe {
-                            adapter: adapter.name(),
-                            bin: bin.to_string(),
-                            source,
-                        })
-                    }
-                    Err(_) => {
-                        // The flag was accepted by the argument parser — an
-                        // unknown option exits immediately — so treat a slow probe
-                        // as support.
-                        warn!(
-                            "probe of '{}' ({}) for {} timed out after {}s; assuming supported",
-                            bin,
-                            adapter.name(),
-                            probe.capability,
-                            PROBE_TIMEOUT.as_secs()
-                        );
-                        true
-                    }
-                };
+            let supported = run_probe(adapter, bin, pulse_root, overrides, &probe).await?;
             probe_cache()
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
@@ -411,7 +447,6 @@ async fn ensure_capability(
             supported
         }
     };
-
     if supported {
         Ok(())
     } else {
@@ -420,6 +455,76 @@ async fn ensure_capability(
             bin: bin.to_string(),
             capability: probe.capability,
         })
+    }
+}
+
+/// Run `probe` with the same cwd and environment as a real invocation: a
+/// CLI that checks its working directory during argument parsing must
+/// answer the probe the way it will answer the call.
+async fn run_probe(
+    adapter: &dyn CliAdapter,
+    bin: &str,
+    pulse_root: &Path,
+    overrides: &SpawnOverrides,
+    probe: &adapter::Probe,
+) -> Result<bool, CliError> {
+    let mut command = pulse_command(bin, pulse_root, adapter, overrides)?;
+    command
+        .cmd
+        .args(&probe.args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    command.cmd.kill_on_drop(true);
+    let sandboxed = command.sandbox.is_some();
+    let child = command.spawn().await.map_err(|source| CliError::Probe {
+        adapter: adapter.name(),
+        bin: bin.to_string(),
+        source,
+    })?;
+    let _group = sandboxed.then(|| sandbox::GroupGuard::of(&child));
+    let waited = async {
+        if sandboxed {
+            sandbox::wait_bounded(child, SANDBOXED_STDERR_MAX, SANDBOXED_STDERR_MAX).await
+        } else {
+            child.wait_with_output().await
+        }
+    };
+    let outcome = tokio::time::timeout(PROBE_TIMEOUT, waited).await;
+    probe_verdict(outcome, adapter, bin, probe)
+}
+
+/// Whether the probe says the CLI has the capability: its output lacks the
+/// unsupported marker. A failed wait is a probe error; a probe that timed
+/// out had its flag accepted by the argument parser (an unknown option
+/// exits at once), so it counts as support.
+fn probe_verdict(
+    outcome: Result<std::io::Result<std::process::Output>, tokio::time::error::Elapsed>,
+    adapter: &dyn CliAdapter,
+    bin: &str,
+    probe: &adapter::Probe,
+) -> Result<bool, CliError> {
+    match outcome {
+        Ok(Ok(output)) => {
+            let mut combined = String::from_utf8_lossy(&output.stderr).into_owned();
+            combined.push_str(&String::from_utf8_lossy(&output.stdout));
+            Ok(!combined.contains(probe.unsupported_marker))
+        }
+        Ok(Err(source)) => Err(CliError::Probe {
+            adapter: adapter.name(),
+            bin: bin.to_string(),
+            source,
+        }),
+        Err(_) => {
+            warn!(
+                "probe of '{}' ({}) for {} timed out after {}s; assuming supported",
+                bin,
+                adapter.name(),
+                probe.capability,
+                PROBE_TIMEOUT.as_secs()
+            );
+            Ok(true)
+        }
     }
 }
 
@@ -532,6 +637,44 @@ fn response(reply: Reply, model: &str) -> LlmResponse {
 
 type BoxError = Box<dyn std::error::Error + Send + Sync>;
 
+/// The reply in a streamed invocation's stdout, as the adapter's streaming
+/// output mode carries it.
+fn streamed_reply(adapter: &dyn CliAdapter, raw: &str) -> Result<Reply, String> {
+    match adapter.output_mode(true) {
+        OutputMode::SingleJson => adapter.parse_single(raw),
+        OutputMode::Ndjson => reply_from_ndjson(adapter, raw),
+    }
+}
+
+/// What the stream showed besides the reply: the model that served the
+/// turn, and the tool calls in order, each with its result once it came.
+fn observe_stream(adapter: &dyn CliAdapter, raw: &str) -> (Option<String>, Vec<ToolCall>) {
+    let mut served_model = None;
+    let mut tool_calls = Vec::new();
+    for observed in raw.lines().flat_map(|line| adapter.observe_line(line)) {
+        match observed {
+            Observed::ServedModel(model) => served_model = Some(model),
+            Observed::ToolCall(call) => tool_calls.push(call),
+            Observed::ToolResult { tool_use_id, text } => {
+                attach_result(&mut tool_calls, &tool_use_id, text);
+            }
+        }
+    }
+    (served_model, tool_calls)
+}
+
+/// Give the latest call with id `tool_use_id` its result (a result for no
+/// call seen is dropped).
+fn attach_result(tool_calls: &mut [ToolCall], tool_use_id: &str, text: String) {
+    if let Some(call) = tool_calls
+        .iter_mut()
+        .rev()
+        .find(|c| c.id.as_deref() == Some(tool_use_id))
+    {
+        call.result = Some(text);
+    }
+}
+
 impl LmProvider for CliProvider {
     fn invoke(
         &self,
@@ -547,6 +690,7 @@ impl LmProvider for CliProvider {
             pulse_root: self.pulse_root.clone(),
             reasoning_effort: self.reasoning_effort.clone(),
             surface: self.surface(),
+            overrides: &self.overrides,
             system_prompt: system_prompt.to_string(),
             messages: messages.to_vec(),
         };
@@ -572,6 +716,9 @@ struct CliCall<'a> {
     pulse_root: PathBuf,
     reasoning_effort: Option<String>,
     surface: ToolSurface,
+    /// Where prompts are staged and how the child is spawned (a probe's
+    /// scratch environment and sandbox; empty for the live pulse).
+    overrides: &'a SpawnOverrides,
     system_prompt: String,
     messages: Vec<Message>,
 }
@@ -579,14 +726,26 @@ struct CliCall<'a> {
 impl CliCall<'_> {
     async fn run(self) -> Result<LlmResponse, BoxError> {
         let prompt = serialize_messages(&self.messages);
-        ensure_capability(self.adapter, &self.bin, &self.pulse_root).await?;
+        ensure_capability(self.adapter, &self.bin, &self.pulse_root, self.overrides).await?;
         // Dropped on every exit from this future — success, error, timeout
         // and cancellation — which unlinks the staged prompts.
-        let staged = stage(self.adapter, &self.system_prompt, &prompt)?;
+        let staged = stage(
+            self.adapter,
+            &self.system_prompt,
+            &prompt,
+            &self.overrides.stage_dir(),
+        )?;
         let output = self.execute(&staged).await?;
         let stdout = String::from_utf8_lossy(&output.stdout).to_string();
         if !output.status.success() {
-            return Err(self.exit_failure(&output, &stdout));
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            return Err(exit_failure(
+                self.adapter,
+                &self.model,
+                output.status,
+                &stdout,
+                &stderr,
+            ));
         }
         // An exit-0 reply flagged as an error may be a policy refusal or a
         // spent quota; type it like the exit-non-zero path does.
@@ -596,99 +755,21 @@ impl CliCall<'_> {
         Ok(response(reply, &self.model))
     }
 
-    /// Spawn the CLI, hand it the prompt on stdin when the adapter takes it
-    /// there, and collect its output.
+    /// Spawn the CLI (inside the overrides' sandbox, if any), hand it the
+    /// prompt on stdin when the adapter takes it there, and collect its
+    /// output ([`run_to_completion`]).
     async fn execute(&self, staged: &Staged) -> Result<std::process::Output, BoxError> {
-        let name = self.adapter.name();
-        let mut child = self.spawn(staged)?;
-        if let (Some(text), Some(stdin)) = (&staged.stdin_text, child.stdin.take()) {
-            write_prompt(name, stdin, text).await?;
-        }
-        wait_for_output(name, child).await
-    }
-
-    fn spawn(&self, staged: &Staged) -> Result<tokio::process::Child, BoxError> {
         let args = self.adapter.invoke_args(&Invocation {
             model: &self.model,
             system_prompt_file: staged.system_prompt_file.as_ref().map(StagedFile::path),
-            system_prompt: &self.system_prompt,
             prompt_file: staged.prompt_file.as_ref().map(StagedFile::path),
             surface: self.surface,
             streaming: false,
             pulse_root: &self.pulse_root,
             reasoning_effort: self.reasoning_effort.as_deref(),
         });
-        let mut cmd = pulse_command(&self.bin, &self.pulse_root, self.adapter);
-        cmd.args(&args)
-            .stdin(if staged.stdin_text.is_some() {
-                Stdio::piped()
-            } else {
-                Stdio::null()
-            })
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
-        // Ensure the subprocess is killed if the timeout fires and drops the future.
-        cmd.kill_on_drop(true);
-        cmd.spawn().map_err(|e| {
-            Box::new(std::io::Error::new(
-                e.kind(),
-                format!(
-                    "failed to spawn {} ({}): {e}",
-                    self.adapter.name(),
-                    self.bin
-                ),
-            )) as BoxError
-        })
-    }
-
-    /// A non-zero exit, typed. A policy refusal is a distinct, recoverable
-    /// signal: the chat handler falls back to another model on it. A spent
-    /// quota is typed too, so callers never re-derive it from text.
-    /// Everything else (network, timeout, empty) stays generic.
-    fn exit_failure(&self, output: &std::process::Output, stdout: &str) -> BoxError {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        let class = self.adapter.classify_exit(stdout, &stderr);
-        if let ExitClass::Refusal(detail) = &class {
-            return Box::new(RefusalError {
-                model: self.model.clone(),
-                detail: truncate(detail, ERROR_TEXT_MAX).to_string(),
-            });
-        }
-        self.warn_on_exit_class(&class);
-        // The detail is only what the CLI itself said about the failure —
-        // never raw stdout, which for a streaming CLI is the model's own
-        // transcript (R2-02).
-        let full = failure_text(self.adapter, &class, stdout, &stderr);
-        let detail = truncate(&full, ERROR_TEXT_MAX).to_string();
-        if class == ExitClass::QuotaExhausted {
-            return Box::new(QuotaError {
-                model: self.model.clone(),
-                detail,
-            });
-        }
-        exited(self.adapter.name(), output.status, &detail).into()
-    }
-
-    fn warn_on_exit_class(&self, class: &ExitClass) {
-        let name = self.adapter.name();
-        match class {
-            ExitClass::FlaggedButUnmatched => {
-                warn!(
-                    model = %self.model,
-                    adapter = name,
-                    "CLI exited non-zero with a structured error that did not match \
-                     the refusal signature — detection may have drifted"
-                );
-            }
-            ExitClass::QuotaExhausted => {
-                warn!(
-                    model = %self.model,
-                    adapter = name,
-                    "CLI exited non-zero: the provider's usage quota is exhausted"
-                );
-            }
-            _ => {}
-        }
+        let cmd = pulse_command(&self.bin, &self.pulse_root, self.adapter, self.overrides)?;
+        run_to_completion(cmd, self.adapter.name(), &self.bin, &args, staged).await
     }
 
     /// The reply, in the adapter's buffered output mode.
@@ -697,49 +778,6 @@ impl CliCall<'_> {
             OutputMode::SingleJson => self.adapter.parse_single(stdout),
             OutputMode::Ndjson => reply_from_ndjson(self.adapter, stdout),
         }
-    }
-}
-
-/// Write the prompt to the CLI's stdin; dropping `stdin` closes it, which
-/// signals EOF.
-async fn write_prompt(
-    name: &str,
-    mut stdin: tokio::process::ChildStdin,
-    text: &str,
-) -> Result<(), BoxError> {
-    use tokio::io::AsyncWriteExt;
-    stdin.write_all(text.as_bytes()).await.map_err(|e| {
-        Box::new(std::io::Error::new(
-            e.kind(),
-            format!("failed to write to {name} stdin: {e}"),
-        )) as BoxError
-    })
-}
-
-/// The CLI's output, within [`subprocess_timeout`].
-async fn wait_for_output(
-    name: &str,
-    child: tokio::process::Child,
-) -> Result<std::process::Output, BoxError> {
-    tokio::time::timeout(subprocess_timeout(), child.wait_with_output())
-        .await
-        .map_err(|_| -> BoxError {
-            format!("{name} timed out after {}s", subprocess_timeout().as_secs()).into()
-        })?
-        .map_err(|e| {
-            Box::new(std::io::Error::new(
-                e.kind(),
-                format!("failed to wait for {name}: {e}"),
-            )) as BoxError
-        })
-}
-
-/// The generic failure for a non-zero exit, with the CLI's own detail.
-fn exited(name: &str, status: std::process::ExitStatus, detail: &str) -> String {
-    if detail.is_empty() {
-        format!("{name} exited {status}")
-    } else {
-        format!("{name} exited {status}: {detail}")
     }
 }
 
@@ -763,18 +801,19 @@ impl StreamingProvider for CliProvider {
         let reasoning_effort = self.reasoning_effort.clone();
         let surface = self.surface();
         let adapter: &dyn CliAdapter = self.adapter.as_ref();
+        let overrides = &self.overrides;
 
         Box::pin(async_stream::stream! {
             let prompt = serialize_messages(&messages);
             let name = adapter.name();
 
-            if let Err(e) = ensure_capability(adapter, &bin, &pulse_root).await {
+            if let Err(e) = ensure_capability(adapter, &bin, &pulse_root, overrides).await {
                 yield StreamEvent::Error(format!("{e}"));
                 return;
             }
             // Dropped when this stream is dropped — success, error, or the
             // consumer walking away mid-reply — which unlinks the prompts.
-            let staged = match stage(adapter, &system_prompt, &prompt) {
+            let staged = match stage(adapter, &system_prompt, &prompt, &overrides.stage_dir()) {
                 Ok(staged) => staged,
                 Err(e) => {
                     yield StreamEvent::Error(format!("{e}"));
@@ -785,7 +824,6 @@ impl StreamingProvider for CliProvider {
             let args = adapter.invoke_args(&Invocation {
                 model: &model,
                 system_prompt_file: staged.system_prompt_file.as_ref().map(StagedFile::path),
-                system_prompt: &system_prompt,
                 prompt_file: staged.prompt_file.as_ref().map(StagedFile::path),
                 surface,
                 streaming: true,
@@ -793,15 +831,21 @@ impl StreamingProvider for CliProvider {
                 reasoning_effort: reasoning_effort.as_deref(),
             });
 
-            let mut cmd = pulse_command(&bin, &pulse_root, adapter);
-            cmd.args(&args)
+            let mut command = match pulse_command(&bin, &pulse_root, adapter, overrides) {
+                Ok(command) => command,
+                Err(e) => {
+                    yield StreamEvent::Error(format!("{e}"));
+                    return;
+                }
+            };
+            command.cmd.args(&args)
                 .stdin(if staged.stdin_text.is_some() { Stdio::piped() } else { Stdio::null() })
                 .stdout(Stdio::piped())
                 .stderr(Stdio::piped());
             // The caller hanging up must not leave a model running.
-            cmd.kill_on_drop(true);
+            command.cmd.kill_on_drop(true);
 
-            let mut child = match cmd.spawn() {
+            let mut child = match command.spawn().await {
                 Ok(child) => child,
                 Err(e) => {
                     yield StreamEvent::Error(format!("failed to spawn {name} ({bin}): {e}"));
@@ -989,6 +1033,238 @@ impl StreamingProvider for CliProvider {
             }
         })
     }
+}
+
+/// Spawn `cmd` with `args`, feed it the staged stdin text, and wait for it
+/// to exit within [`subprocess_timeout`]. The child is killed if this future
+/// is dropped (the timeout firing, or the caller walking away).
+async fn run_to_completion(
+    mut command: PulseCommand,
+    name: &str,
+    bin: &str,
+    args: &[std::ffi::OsString],
+    staged: &Staged,
+) -> Result<std::process::Output, BoxError> {
+    command
+        .cmd
+        .args(args)
+        .stdin(if staged.stdin_text.is_some() {
+            Stdio::piped()
+        } else {
+            Stdio::null()
+        })
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    command.cmd.kill_on_drop(true);
+
+    let sandboxed = command.sandbox.is_some();
+    let mut child = command.spawn().await.map_err(|e| {
+        Box::new(std::io::Error::new(
+            e.kind(),
+            format!("failed to spawn {name} ({bin}): {e}"),
+        )) as BoxError
+    })?;
+    // A sandboxed (probe) child leads its own group: whatever it leaves
+    // running is killed on every way out of here, timeout included.
+    let _group = sandboxed.then(|| sandbox::GroupGuard::of(&child));
+
+    if let (Some(text), Some(mut stdin)) = (&staged.stdin_text, child.stdin.take()) {
+        use tokio::io::AsyncWriteExt;
+        stdin.write_all(text.as_bytes()).await.map_err(|e| {
+            Box::new(std::io::Error::new(
+                e.kind(),
+                format!("failed to write to {name} stdin: {e}"),
+            )) as BoxError
+        })?;
+        // Dropping stdin closes it and signals EOF.
+    }
+
+    let waited = async {
+        if sandboxed {
+            sandbox::wait_bounded(child, SANDBOXED_STDOUT_MAX, SANDBOXED_STDERR_MAX).await
+        } else {
+            child.wait_with_output().await
+        }
+    };
+    tokio::time::timeout(subprocess_timeout(), waited)
+        .await
+        .map_err(|_| -> BoxError {
+            format!("{name} timed out after {}s", subprocess_timeout().as_secs()).into()
+        })?
+        .map_err(|e| {
+            Box::new(std::io::Error::new(
+                e.kind(),
+                format!("failed to wait for {name}: {e}"),
+            )) as BoxError
+        })
+}
+
+/// The most a sandboxed (probe) child may write to stdout: its whole
+/// transcript, kept as a receipt. Past it the child is stopped.
+const SANDBOXED_STDOUT_MAX: usize = 32 * 1024 * 1024;
+
+/// The most a sandboxed child may write to stderr.
+const SANDBOXED_STDERR_MAX: usize = 1024 * 1024;
+
+impl CliProvider {
+    /// `<bin> --version`, spawned exactly as a turn is (same cwd, env and
+    /// sandbox): the CLI's own version line, for lineage and as a check that
+    /// the CLI starts at all where a probe runs it. No model is called.
+    pub async fn cli_version(&self) -> Result<String, BoxError> {
+        let adapter = self.adapter.as_ref();
+        let mut command = pulse_command(&self.bin, &self.pulse_root, adapter, &self.overrides)?;
+        command
+            .cmd
+            .arg("--version")
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true);
+        let sandboxed = command.sandbox.is_some();
+        let child = command.spawn().await?;
+        let _group = sandboxed.then(|| sandbox::GroupGuard::of(&child));
+        let output = tokio::time::timeout(
+            VERSION_TIMEOUT,
+            sandbox::wait_bounded(child, SANDBOXED_STDERR_MAX, SANDBOXED_STDERR_MAX),
+        )
+        .await
+        .map_err(|_| -> BoxError { format!("{} --version timed out", adapter.name()).into() })??;
+        let text = |bytes: &[u8]| String::from_utf8_lossy(bytes).trim().to_string();
+        if !output.status.success() {
+            let stderr = text(&output.stderr);
+            return Err(format!(
+                "{} --version exited {}: {}",
+                adapter.name(),
+                output.status,
+                truncate(&stderr, ERROR_TEXT_MAX)
+            )
+            .into());
+        }
+        let stdout = text(&output.stdout);
+        let line = stdout.lines().find(|l| !l.trim().is_empty()).unwrap_or("");
+        Ok(truncate(line.trim(), VERSION_MAX_BYTES).to_string())
+    }
+}
+
+/// How long `--version` may take.
+const VERSION_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// Longest version line kept.
+const VERSION_MAX_BYTES: usize = 120;
+
+impl CliProvider {
+    /// Run one turn and keep everything it produced: the reply, the raw
+    /// output, the served model and the tool calls. It runs the adapter's
+    /// streaming argv (the format that carries tool events) to completion,
+    /// so the whole transcript is kept. Failures are typed as
+    /// [`invoke`](LmProvider::invoke) types them: a spent quota is a
+    /// [`QuotaError`], a refusal a [`RefusalError`]. Its tools are the
+    /// surface of the scope it is called in, as for every invocation: a
+    /// probe asks for the owner's ([`crate::tool_surface::owner_work`]).
+    pub async fn invoke_captured(
+        &self,
+        system_prompt: &str,
+        messages: &[Message],
+    ) -> Result<CapturedRun, BoxError> {
+        let adapter = self.adapter.as_ref();
+        let name = adapter.name();
+        let prompt = serialize_messages(messages);
+
+        ensure_capability(adapter, &self.bin, &self.pulse_root, &self.overrides).await?;
+        let staged = stage(adapter, system_prompt, &prompt, &self.overrides.stage_dir())?;
+        let args = adapter.invoke_args(&Invocation {
+            model: &self.model,
+            system_prompt_file: staged.system_prompt_file.as_ref().map(StagedFile::path),
+            prompt_file: staged.prompt_file.as_ref().map(StagedFile::path),
+            surface: self.surface(),
+            streaming: true,
+            pulse_root: &self.pulse_root,
+            reasoning_effort: self.reasoning_effort.as_deref(),
+        });
+        let cmd = pulse_command(&self.bin, &self.pulse_root, adapter, &self.overrides)?;
+        let output = run_to_completion(cmd, name, &self.bin, &args, &staged).await?;
+
+        let raw = String::from_utf8_lossy(&output.stdout).into_owned();
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            return Err(exit_failure(
+                adapter,
+                &self.model,
+                output.status,
+                &raw,
+                &stderr,
+            ));
+        }
+        let reply =
+            streamed_reply(adapter, &raw).map_err(|e| typed_failure(adapter, &self.model, e))?;
+        let (served_model, tool_calls) = observe_stream(adapter, &raw);
+        Ok(CapturedRun {
+            reply: reply.text,
+            raw,
+            served_model,
+            tool_calls,
+            usage: reply.usage,
+        })
+    }
+}
+
+/// The error a non-zero exit amounts to. A policy refusal is a distinct,
+/// recoverable signal: the chat handler falls back to another model on it.
+/// A spent quota is typed too, so callers never re-derive it from text.
+/// Everything else (network, timeout, empty) stays generic.
+fn exit_failure(
+    adapter: &dyn CliAdapter,
+    model: &str,
+    status: std::process::ExitStatus,
+    stdout: &str,
+    stderr: &str,
+) -> BoxError {
+    let name = adapter.name();
+    let class = adapter.classify_exit(stdout, stderr);
+    match &class {
+        ExitClass::Refusal(detail) => {
+            return Box::new(RefusalError {
+                model: model.to_string(),
+                detail: truncate(detail, ERROR_TEXT_MAX).to_string(),
+            });
+        }
+        ExitClass::FlaggedButUnmatched => {
+            warn!(
+                model = %model,
+                adapter = name,
+                "CLI exited non-zero with a structured error that did not match \
+                 the refusal signature — detection may have drifted"
+            );
+        }
+        ExitClass::QuotaExhausted => {
+            warn!(
+                model = %model,
+                adapter = name,
+                "CLI exited non-zero: the provider's usage quota is exhausted"
+            );
+        }
+        ExitClass::Plain => {}
+    }
+
+    // The detail is only what the CLI itself said about the failure — never
+    // raw stdout, which for a streaming CLI is the model's own transcript
+    // (R2-02).
+    let full = failure_text(adapter, &class, stdout, stderr);
+    let detail = truncate(&full, ERROR_TEXT_MAX).to_string();
+
+    if class == ExitClass::QuotaExhausted {
+        return Box::new(QuotaError {
+            model: model.to_string(),
+            detail,
+        });
+    }
+
+    let msg = if detail.is_empty() {
+        format!("{name} exited {status}")
+    } else {
+        format!("{name} exited {status}: {detail}")
+    };
+    msg.into()
 }
 
 /// The text a non-zero exit's error carries: what the CLI said about the

@@ -1,0 +1,37 @@
+# TEST FIXTURE, not a probe set: the shape of paired-facts/v1 with
+# placeholder pairs. The real pairs are sealed
+# (assets/probes/v1/sealed.toml); never copy them here.
+
+set = "paired-facts"
+version = 1
+min_n = 10
+offsets_days = [1, 7, 30, 90]
+max_active = 3
+instructions = """
+Fixture instructions: the answer, or UNKNOWN.\
+"""
+
+[[pair]]
+id = "keepsakes"
+a = { slot = "favourite sundial", ask_owner = "your favourite sundial", question = "Fixture: the owner's favourite sundial?", keywords = ["favourite sundial", "favorite sundial"] }
+b = { slot = "favourite umbrella", ask_owner = "your favourite umbrella", question = "Fixture: the owner's favourite umbrella?", keywords = ["favourite umbrella", "favorite umbrella", "best umbrella"] }
+
+[[pair]]
+id = "fixture-two"
+a = { slot = "fixture slot 2a", ask_owner = "fixture 2a", question = "Fixture: slot 2a?", keywords = ["fixture slot 2a"] }
+b = { slot = "fixture slot 2b", ask_owner = "fixture 2b", question = "Fixture: slot 2b?", keywords = ["fixture slot 2b"] }
+
+[[pair]]
+id = "fixture-three"
+a = { slot = "fixture slot 3a", ask_owner = "fixture 3a", question = "Fixture: slot 3a?", keywords = ["fixture slot 3a"] }
+b = { slot = "fixture slot 3b", ask_owner = "fixture 3b", question = "Fixture: slot 3b?", keywords = ["fixture slot 3b"] }
+
+[[pair]]
+id = "fixture-four"
+a = { slot = "fixture slot 4a", ask_owner = "fixture 4a", question = "Fixture: slot 4a?", keywords = ["fixture slot 4a"] }
+b = { slot = "fixture slot 4b", ask_owner = "fixture 4b", question = "Fixture: slot 4b?", keywords = ["fixture slot 4b"] }
+
+[[pair]]
+id = "fixture-five"
+a = { slot = "fixture slot 5a", ask_owner = "fixture 5a", question = "Fixture: slot 5a?", keywords = ["fixture slot 5a"] }
+b = { slot = "fixture slot 5b", ask_owner = "fixture 5b", question = "Fixture: slot 5b?", keywords = ["fixture slot 5b"] }

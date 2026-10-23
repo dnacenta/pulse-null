@@ -1,0 +1,108 @@
+# probe verify-isolation for one pulse, under the probe run's confinement
+# (PN-144). TEMPLATE: installed with pulse-null-probe@.service (see its
+# header). Start it by hand: `systemctl start pulse-null-probe-verify@<pulse>`
+# then read `journalctl -u pulse-null-probe-verify@<pulse>`. It spends no
+# model turn; for the canned turn, add `--turn` with `systemctl edit`.
+# The CONFINEMENT block is the probe unit's, line for line.
+
+[Unit]
+Description=pulse-null probe isolation check (%i)
+Requires=pulse-null-probe-export@%i.service
+After=pulse-null-probe-export@%i.service network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=pulse-probe
+Group=pulse-probe
+WorkingDirectory=/home/pulse/pulse-null/%i
+ExecStart=/usr/local/bin/pulse-null probe verify-isolation
+Environment=RUST_LOG=info
+Environment=PULSE_NULL_PROBE_STATE=/var/lib/pulse-null-probe
+EnvironmentFile=/etc/pulse-null/probe-%i.env
+TimeoutStartSec=30min
+
+# >>> CONFINEMENT (identical in pulse-null-probe-verify@.service) >>>
+UMask=0077
+
+# --- Filesystem: the runner writes only the probe user's private state ----
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/var/lib/pulse-null-probe
+InaccessiblePaths=-/home/pulse/.ssh
+InaccessiblePaths=-/home/pulse/.local/state
+# Host sockets any local user may connect to, which Landlock does not
+# mediate (a named-socket connect): the system bus (busctl/D-Bus can read
+# other services' state), tailscaled, snapd, avahi and uuidd. Nothing in a
+# probe run needs them; the leading '-' skips one a host does not have.
+InaccessiblePaths=-/run/dbus -/run/tailscale -/run/snapd.socket -/run/snapd-snap.socket
+InaccessiblePaths=-/run/avahi-daemon -/run/uuidd
+# The live recall-echo socket lives under $XDG_RUNTIME_DIR (/run/user/<uid>).
+# Landlock does not mediate a named-socket connect, so the directory is hidden.
+InaccessiblePaths=-/run/user
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectProc=invisible
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+
+# --- Process -----------------------------------------------------------------
+NoNewPrivileges=yes
+CapabilityBoundingSet=
+AmbientCapabilities=
+RestrictSUIDSGID=yes
+RestrictNamespaces=yes
+RestrictRealtime=yes
+LockPersonality=yes
+SystemCallArchitectures=native
+# MemoryDenyWriteExecute= stays off: the agent CLIs run JIT engines.
+
+# --- Network -----------------------------------------------------------------
+# Default deny. Landlock holds a probe child to TCP 443 and the throwaway
+# port; this unit adds addresses, which Landlock cannot. Allowed: the probe
+# resolvers, ::1 (the throwaway; nothing on this host listens on ::1:443),
+# and the public Internet so the child can open TCP 443 to the vendor API.
+# systemd cannot allow a port without the address, so UDP to those same
+# addresses stays open — Landlock does not cover UDP either. More specific
+# denies cover the IPv4 loopback, private, CGNAT, link-local and ULA
+# ranges. The host's own public addresses are a drop-in (systemctl edit),
+# more specific than the public allow. The live graph export happens in
+# pulse-null-probe-export@, before this unit starts, and names resolve
+# through the probe resolver bound over /etc/resolv.conf.
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
+IPAddressDeny=any
+IPAddressAllow=9.9.9.9
+IPAddressAllow=1.1.1.1
+IPAddressAllow=2620:fe::fe
+IPAddressAllow=::1
+IPAddressAllow=0.0.0.0/0
+IPAddressAllow=::/0
+IPAddressDeny=127.0.0.0/8
+IPAddressDeny=10.0.0.0/8 172.16.0.0/12 192.168.0.0/16 100.64.0.0/10 169.254.0.0/16
+IPAddressDeny=fc00::/7 fe80::/10 multicast
+BindReadOnlyPaths=/etc/pulse-null/probe-resolv.conf:/etc/resolv.conf
+
+# --- Resources -----------------------------------------------------------------
+MemoryMax=4G
+TasksMax=512
+# A measurement never competes with the live pulses (the probe children
+# also lower themselves; this covers the runner's copies too).
+Nice=10
+IOSchedulingClass=idle
+CPUWeight=20
+# IOWeight= acts only under the BFQ I/O scheduler (or io.cost); this host's
+# disk runs mq-deadline, where it does nothing. Kept for hosts with BFQ.
+# IOSchedulingClass=idle does act under mq-deadline (I/O priorities).
+IOWeight=20
+KillMode=control-group
+# Out of memory anywhere in the unit (the CLI, the throwaway graph) stops
+# the whole run rather than leaving it half alive: systemd sends SIGTERM,
+# the runner stops, tears down and writes its finish row (memory.peak is in
+# it) within TimeoutStopSec.
+OOMPolicy=stop
+TimeoutStopSec=2min
+# <<< CONFINEMENT <<<
