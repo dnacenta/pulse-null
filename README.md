@@ -25,7 +25,7 @@ It is a research scaffold, not a consciousness claim.
 
 ## Install
 
-Rust 1.89 or newer. Build from source; crates.io still holds an old 0.22.0.
+Rust 1.90 or newer. Build from source; crates.io still holds an old 0.22.0.
 
 ```sh
 cargo install --locked --git https://github.com/dnacenta/pulse-null
