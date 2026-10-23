@@ -181,6 +181,93 @@ fn is_recall_command(command: &str, sub: &str) -> bool {
     })
 }
 
+/// Whether a hook command runs recall-echo `consume`. Report-only: quotes
+/// are stripped and operators are word breaks, so a `recall-echo` program
+/// word (any path) followed later by the word `consume` counts. False
+/// positives are cheap. Rewrites still use [`is_recall_command`].
+fn command_runs_consume(command: &str) -> bool {
+    let stripped: String = command
+        .chars()
+        .filter(|c| *c != '\'' && *c != '"')
+        .collect();
+    let mut seen_recall = false;
+    for word in stripped
+        .split(|c: char| c.is_whitespace() || matches!(c, '|' | '&' | ';' | '<' | '>' | '(' | ')'))
+    {
+        if word.is_empty() {
+            continue;
+        }
+        if seen_recall && word == "consume" {
+            return true;
+        }
+        if Path::new(word)
+            .file_name()
+            .is_some_and(|name| name == "recall-echo")
+        {
+            seen_recall = true;
+        }
+    }
+    false
+}
+
+/// Hook commands under `hooks`, including a flat `{type, command}` object
+/// directly under an event and the nested `{hooks: [{command}]}` shape.
+fn each_hook_command(doc: &serde_json::Value) -> Vec<&str> {
+    let mut commands = Vec::new();
+    let Some(events) = doc.get("hooks").and_then(|value| value.as_object()) else {
+        return commands;
+    };
+    for entries in events.values() {
+        for entry in entries.as_array().into_iter().flatten() {
+            if let Some(command) = entry.get("command").and_then(|value| value.as_str()) {
+                commands.push(command);
+            }
+            for hook in entry
+                .get("hooks")
+                .and_then(|value| value.as_array())
+                .into_iter()
+                .flatten()
+            {
+                if let Some(command) = hook.get("command").and_then(|value| value.as_str()) {
+                    commands.push(command);
+                }
+            }
+        }
+    }
+    commands
+}
+
+/// A `consume` hook [`merge_hooks`] will not delete. A nested command the
+/// precise parser recognises is stripped, so it is stale rather than left
+/// in place. Flat `{type, command}` objects and every other spelling stay.
+fn consume_left_in_place(doc: &serde_json::Value) -> bool {
+    let Some(events) = doc.get("hooks").and_then(|value| value.as_object()) else {
+        return false;
+    };
+    for entries in events.values() {
+        for entry in entries.as_array().into_iter().flatten() {
+            if let Some(command) = entry.get("command").and_then(|value| value.as_str()) {
+                if command_runs_consume(command) {
+                    return true;
+                }
+            }
+            for hook in entry
+                .get("hooks")
+                .and_then(|value| value.as_array())
+                .into_iter()
+                .flatten()
+            {
+                if let Some(command) = hook.get("command").and_then(|value| value.as_str()) {
+                    if command_runs_consume(command) && !is_recall_command(command, "consume") {
+                        return true;
+                    }
+                }
+            }
+        }
+    }
+    false
+}
+
 /// `sh -c` / `bash -c` whose script is itself a recall-echo `consume`.
 /// Reported, never deleted: a wrapper is a hand-written command.
 fn is_wrapped_consume(command: &str) -> bool {
@@ -199,13 +286,8 @@ fn is_wrapped_consume(command: &str) -> bool {
 }
 
 fn has_wrapped_consume(existing: &serde_json::Value) -> bool {
-    existing["hooks"]
-        .as_object()
+    each_hook_command(existing)
         .into_iter()
-        .flat_map(|events| events.values())
-        .flat_map(|entries| entries.as_array().into_iter().flatten())
-        .flat_map(|entry| entry["hooks"].as_array().into_iter().flatten())
-        .filter_map(|hook| hook["command"].as_str())
         .any(is_wrapped_consume)
 }
 
@@ -303,7 +385,8 @@ fn has_canonical_hooks(existing: &serde_json::Value, ours: &serde_json::Value) -
     let retired_absent = RETIRED_RECALL_HOOKS
         .iter()
         .all(|(event, sub)| recall_commands(existing, event, sub).is_empty())
-        && !has_wrapped_consume(existing);
+        && !has_wrapped_consume(existing)
+        && !consume_left_in_place(existing);
     installed && retired_absent
 }
 
@@ -361,6 +444,11 @@ fn ensure_settings(path: &Path, ours: &serde_json::Value, within: &Path) -> Boot
     if existing.as_ref() == Some(&merged) {
         if wrapped {
             return item(ItemStatus::Skipped(WRAPPED_CONSUME_REASON.into()));
+        }
+        if consume_left_in_place(&merged) {
+            return item(ItemStatus::Skipped(
+                "retired consume still runs; left in place".into(),
+            ));
         }
         return item(ItemStatus::Exists);
     }
@@ -643,6 +731,8 @@ pub(super) fn verify_files(pulse_root: &Path) -> Vec<BootstrapItem> {
                 let ours = render_hooks(&recall_bin, &pulse_root);
                 if has_wrapped_consume(&existing) {
                     ItemStatus::Wrong(WRAPPED_CONSUME_REASON.into())
+                } else if consume_left_in_place(&existing) {
+                    ItemStatus::Wrong("retired consume still runs; left in place".into())
                 } else if has_canonical_hooks(&existing, &ours) {
                     ItemStatus::Exists
                 } else {
@@ -832,31 +922,22 @@ pub(super) fn user_hooks_missing_root(home: &Path) -> UserHookScan {
         }
     };
     let mut found = Vec::new();
-    if let Some(events) = doc["hooks"].as_object() {
-        for entries in events.values() {
-            for entry in entries.as_array().into_iter().flatten() {
-                for hook in entry["hooks"].as_array().into_iter().flatten() {
-                    let Some(command) = hook["command"].as_str() else {
-                        continue;
-                    };
-                    let consume = is_recall_command(command, "consume");
-                    let ours = consume
-                        || RECALL_HOOKS
-                            .iter()
-                            .any(|(_, sub)| is_recall_command(command, sub));
-                    if !ours {
-                        continue;
-                    }
-                    let carries_root = command_carries_root(command);
-                    if consume || !carries_root {
-                        found.push(ReportedUserHook {
-                            command: command.to_string(),
-                            carries_root,
-                            consume,
-                        });
-                    }
-                }
-            }
+    for command in each_hook_command(&doc) {
+        let consume = command_runs_consume(command);
+        let ours = consume
+            || RECALL_HOOKS
+                .iter()
+                .any(|(_, sub)| is_recall_command(command, sub));
+        if !ours {
+            continue;
+        }
+        let carries_root = command_carries_root(command);
+        if consume || !carries_root {
+            found.push(ReportedUserHook {
+                command: command.to_string(),
+                carries_root,
+                consume,
+            });
         }
     }
     UserHookScan::Inspected(found)
@@ -1397,6 +1478,207 @@ mod tests {
         let again = ensure_files(&root, bin);
         let settings = again.iter().find(|item| item.path == path).unwrap();
         assert_eq!(settings.status, ItemStatus::Exists, "{settings:?}");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
+    }
+
+    /// Spellings the precise shell parser does not treat as `consume`, but
+    /// that still run it. Report-only: neither file is rewritten to delete
+    /// them.
+    fn consume_spellings() -> &'static [&'static str] {
+        &[
+            "recall-echo consume||true",
+            "recall-echo consume;true",
+            "recall-echo consume&>/dev/null",
+            "env recall-echo consume '/e'",
+            "exec recall-echo consume '/e'",
+            "FOO=1 recall-echo consume '/e'",
+            "sh -lc 'recall-echo consume /e'",
+            "dash -c 'recall-echo consume /e'",
+            "sh -c \"recall-echo consume /e\"",
+        ]
+    }
+
+    #[test]
+    fn consume_spellings_are_reported_in_the_user_level_file() {
+        let home = tempfile::tempdir().unwrap();
+        let claude = home.path().join(".claude");
+        std::fs::create_dir_all(&claude).unwrap();
+        let path = claude.join("settings.json");
+        for command in consume_spellings() {
+            assert!(command_runs_consume(command), "{command}");
+            assert!(
+                !is_recall_command(command, "consume"),
+                "{command} is safe to delete"
+            );
+            let original = serde_json::json!({
+                "hooks": {
+                    "SessionStart": [{"hooks": [{"type": "command", "command": command}]}]
+                }
+            })
+            .to_string();
+            std::fs::write(&path, &original).unwrap();
+            let found = inspected(home.path());
+            assert!(
+                found
+                    .iter()
+                    .any(|hook| hook.command == *command && hook.consume),
+                "{command}: {found:?}"
+            );
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
+        }
+    }
+
+    #[test]
+    fn consume_spellings_are_reported_in_pulse_settings() {
+        let dir = pulse();
+        let root = dir.path().canonicalize().unwrap();
+        let bin = find_recall_echo_bin();
+        let path = root.join(".claude/settings.json");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        for command in consume_spellings() {
+            let mut hooks = render_hooks(&bin, &root);
+            hooks["SessionStart"] = serde_json::json!([{
+                "hooks": [{"type": "command", "command": command}]
+            }]);
+            let original = serde_json::to_string_pretty(&serde_json::json!({ "hooks": hooks }))
+                .unwrap()
+                + "\n";
+            std::fs::write(&path, &original).unwrap();
+
+            let before = verify_files(&root)
+                .into_iter()
+                .find(|item| item.path == path)
+                .unwrap();
+            match &before.status {
+                ItemStatus::Wrong(reason) => assert!(
+                    reason.contains("retired consume still runs"),
+                    "{command}: {reason}"
+                ),
+                other => panic!("{command}: verify looked clean: {other:?}"),
+            }
+
+            let item = ensure_settings(&path, &render_hooks(&bin, &root), &root);
+            assert!(
+                !matches!(item.status, ItemStatus::Exists),
+                "{command}: ensure called it clean: {:?}",
+                item.status
+            );
+            assert_eq!(
+                std::fs::read_to_string(&path).unwrap(),
+                original,
+                "{command} was rewritten"
+            );
+        }
+    }
+
+    #[test]
+    fn flat_hook_object_consume_is_reported_in_both_files() {
+        let command = "recall-echo consume '/e'";
+        let home = tempfile::tempdir().unwrap();
+        let claude = home.path().join(".claude");
+        std::fs::create_dir_all(&claude).unwrap();
+        let user_path = claude.join("settings.json");
+        let user_original = serde_json::json!({
+            "hooks": {
+                "SessionStart": [{"type": "command", "command": command}]
+            }
+        })
+        .to_string();
+        std::fs::write(&user_path, &user_original).unwrap();
+        let found = inspected(home.path());
+        assert!(
+            found
+                .iter()
+                .any(|hook| hook.command == command && hook.consume),
+            "{found:?}"
+        );
+        assert_eq!(std::fs::read_to_string(&user_path).unwrap(), user_original);
+
+        let dir = pulse();
+        let root = dir.path().canonicalize().unwrap();
+        let bin = find_recall_echo_bin();
+        let path = root.join(".claude/settings.json");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let mut hooks = render_hooks(&bin, &root);
+        hooks["SessionStart"] = serde_json::json!([{
+            "type": "command",
+            "command": command
+        }]);
+        let original =
+            serde_json::to_string_pretty(&serde_json::json!({ "hooks": hooks })).unwrap() + "\n";
+        std::fs::write(&path, &original).unwrap();
+        let before = verify_files(&root)
+            .into_iter()
+            .find(|item| item.path == path)
+            .unwrap();
+        match &before.status {
+            ItemStatus::Wrong(reason) => {
+                assert!(reason.contains("retired consume still runs"), "{reason}")
+            }
+            other => panic!("verify looked clean: {other:?}"),
+        }
+        let item = ensure_settings(&path, &render_hooks(&bin, &root), &root);
+        assert!(
+            !matches!(item.status, ItemStatus::Exists),
+            "ensure called a flat consume clean: {:?}",
+            item.status
+        );
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
+    }
+
+    #[test]
+    fn consume_lookalikes_stay_unreported() {
+        let lookalikes = [
+            "echo recall-echo-consume-notes",
+            "/usr/bin/other consume /e",
+        ];
+        for command in lookalikes {
+            assert!(!command_runs_consume(command), "{command}");
+        }
+
+        let home = tempfile::tempdir().unwrap();
+        let claude = home.path().join(".claude");
+        std::fs::create_dir_all(&claude).unwrap();
+        let user_path = claude.join("settings.json");
+        let user_original = serde_json::json!({
+            "hooks": {
+                "SessionStart": [{"hooks": [
+                    {"type": "command", "command": lookalikes[0]},
+                    {"type": "command", "command": lookalikes[1]}
+                ]}]
+            }
+        })
+        .to_string();
+        std::fs::write(&user_path, &user_original).unwrap();
+        assert!(
+            inspected(home.path()).is_empty(),
+            "{:?}",
+            inspected(home.path())
+        );
+        assert_eq!(std::fs::read_to_string(&user_path).unwrap(), user_original);
+
+        let dir = pulse();
+        let root = dir.path().canonicalize().unwrap();
+        let bin = find_recall_echo_bin();
+        let path = root.join(".claude/settings.json");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let mut hooks = render_hooks(&bin, &root);
+        hooks["Stop"] = serde_json::json!([{
+            "hooks": [
+                {"type": "command", "command": lookalikes[0]},
+                {"type": "command", "command": lookalikes[1]}
+            ]
+        }]);
+        let original =
+            serde_json::to_string_pretty(&serde_json::json!({ "hooks": hooks })).unwrap() + "\n";
+        std::fs::write(&path, &original).unwrap();
+        let before = verify_files(&root)
+            .into_iter()
+            .find(|item| item.path == path)
+            .unwrap();
+        assert_eq!(before.status, ItemStatus::Exists, "{before:?}");
+        let item = ensure_settings(&path, &render_hooks(&bin, &root), &root);
+        assert_eq!(item.status, ItemStatus::Exists, "{:?}", item.status);
         assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
     }
 
