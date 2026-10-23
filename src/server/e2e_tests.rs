@@ -477,6 +477,7 @@ async fn build_state_with_buffer(
         event_permits: crate::server::stream_pools().0,
         comms_permits: crate::server::comms_pool(),
         chat_permits: crate::server::stream_pools().1,
+        voice_permits: crate::server::stream_pools().2,
         comms: crate::comms::Slot::new(),
         graph_extractor: None,
         ledger: Arc::new(crate::ledger::LedgerRing::new(64)),
@@ -1399,7 +1400,15 @@ impl crate::streaming::StreamingProvider for HangingProvider {
 }
 
 async fn post_chat_stream(app: &Router, message: &str) -> axum::response::Response {
-    let body = serde_json::json!({ "message": message });
+    post_chat_stream_on(app, "chat", message).await
+}
+
+async fn post_chat_stream_on(
+    app: &Router,
+    channel: &str,
+    message: &str,
+) -> axum::response::Response {
+    let body = serde_json::json!({ "message": message, "channel": channel });
     let req = Request::builder()
         .method("POST")
         .uri("/api/chat/stream")
@@ -1567,6 +1576,176 @@ async fn e2e_chat_body_unchanged() {
         body,
         r#"{"response":"Hello from mock!","model":"mock-model","input_tokens":10,"output_tokens":5}"#
     );
+}
+
+/// An owner turn that streams text and is then refused: the fallback's
+/// delta is preceded by a reset, so a client can drop the refused draft.
+#[tokio::test]
+async fn e2e_chat_stream_reset_on_fallback() {
+    use crate::streaming::{StreamEvent, StreamingProvider};
+
+    struct DeltaThenRefuse;
+
+    impl LmProvider for DeltaThenRefuse {
+        fn invoke(
+            &self,
+            _system_prompt: &str,
+            _messages: &[Message],
+            _max_tokens: u32,
+            _tools: Option<&[serde_json::Value]>,
+        ) -> LlmResult<'_> {
+            Box::pin(async { Err("unused".into()) })
+        }
+        fn name(&self) -> &str {
+            "delta-then-refuse"
+        }
+    }
+
+    impl StreamingProvider for DeltaThenRefuse {
+        fn supports_streaming(&self) -> bool {
+            true
+        }
+        fn invoke_streaming(
+            &self,
+            _system_prompt: &str,
+            _messages: &[Message],
+            _max_tokens: u32,
+            _tools: Option<&[serde_json::Value]>,
+        ) -> crate::streaming::StreamResult<'_> {
+            Box::pin(async_stream::stream! {
+                yield StreamEvent::TextDelta("I cannot ".into());
+                yield StreamEvent::Refused {
+                    model: "m".into(),
+                    detail: "Usage Policy".into(),
+                };
+            })
+        }
+    }
+
+    let dir = tempfile::tempdir().unwrap();
+    let bin = dir.path().join("fake-cli");
+    crate::cli_provider::fake_cli::write_script(
+        &bin,
+        r#"printf '%s\n' '{"result":"the fallback answer"}'"#,
+    );
+    let mut config = test_config();
+    config.llm.provider = "cli".into();
+    // vendor-ok: the fallback builder only constructs a real CLI adapter
+    config.llm.adapter = Some("claude".into());
+    config.llm.cli_bin = Some(bin.display().to_string());
+    config.llm.fallback_model = Some("opus".into());
+    let state = build_state_boxed_with_config(
+        dir.path().to_path_buf(),
+        Box::new(DeltaThenRefuse),
+        ToolRegistry::new(),
+        config,
+    )
+    .await;
+    let app = build_app(state);
+
+    let response = post_chat_stream_on(&app, "tui", "hello").await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let frames = sse_frames(&String::from_utf8_lossy(&bytes));
+    let refused = frame_index(&frames, |event, data| {
+        event == "delta" && data.contains("I cannot ")
+    });
+    let reset = frame_index(&frames, |event, data| {
+        event == "reset" && data.contains(r#""reason":"fallback""#)
+    });
+    let fallback = frame_index(&frames, |event, data| {
+        event == "delta" && data.contains("the fallback answer")
+    });
+    let done = frame_index(&frames, |event, data| {
+        event == "done" && data.contains("the fallback answer")
+    });
+    assert!(
+        refused < reset && reset < fallback && fallback < done,
+        "{frames:?}"
+    );
+    assert!(
+        frames.iter().all(|(event, _)| event != "error"),
+        "{frames:?}"
+    );
+}
+
+/// The guard cuts a reply that invented a later turn. The raw delta goes
+/// out first; reset precedes the truncated done text.
+#[tokio::test]
+async fn e2e_chat_stream_reset_on_guard() {
+    let raw = "Here is my response about the topic, which covers several important points.\n[User]: What about this other thing?";
+    let provider = MockProvider::new(vec![LlmResponse {
+        content: vec![ContentBlock::Text { text: raw.into() }],
+        stop_reason: StopReason::EndTurn,
+        model: "mock".into(),
+        input_tokens: Some(4),
+        output_tokens: Some(8),
+    }]);
+    let state = build_state(provider, ToolRegistry::new()).await;
+    let app = build_app(state);
+    let response = post_chat_stream(&app, "hi").await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let frames = sse_frames(&String::from_utf8_lossy(&bytes));
+    let delta = frame_index(&frames, |event, data| {
+        event == "delta" && data.contains("[User]:")
+    });
+    let reset = frame_index(&frames, |event, data| {
+        event == "reset" && data.contains(r#""reason":"guard""#)
+    });
+    let done = frame_index(&frames, |event, _data| event == "done");
+    assert!(delta < reset && reset < done, "{frames:?}");
+    let done_data = &frames[done].1;
+    assert!(done_data.contains(r#""truncated":true"#), "{done_data}");
+    assert!(
+        done_data.contains(
+            "Here is my response about the topic, which covers several important points."
+        ),
+        "{done_data}"
+    );
+    assert!(!done_data.contains("[User]:"), "{done_data}");
+}
+
+/// Four open screen streams fill the chat pool. A voice stream still opens,
+/// and a fifth screen stream is refused.
+#[tokio::test]
+async fn e2e_voice_stream_has_own_pool() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = build_state_boxed_with_config(
+        dir.path().to_path_buf(),
+        Box::new(HangingProvider),
+        ToolRegistry::new(),
+        test_config(),
+    )
+    .await;
+    let app = build_app(state);
+    let mut held = Vec::new();
+    for n in 0..4 {
+        let response = within_test_wait(
+            &format!("tui stream {n}"),
+            post_chat_stream_on(&app, "tui", "hi"),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK, "tui stream {n}");
+        held.push(response);
+    }
+    let voice = within_test_wait("voice stream", post_chat_stream_on(&app, "Voice", "hi")).await;
+    assert_eq!(voice.status(), StatusCode::OK);
+    let fifth = within_test_wait("fifth tui stream", post_chat_stream_on(&app, "tui", "hi")).await;
+    assert_eq!(fifth.status(), StatusCode::SERVICE_UNAVAILABLE);
+    drop(held);
+    drop(voice);
+}
+
+fn frame_index(frames: &[(String, String)], pred: impl Fn(&str, &str) -> bool) -> usize {
+    frames
+        .iter()
+        .position(|(event, data)| pred(event, data))
+        .unwrap_or_else(|| panic!("missing frame in {frames:?}"))
 }
 
 /// Dropping the SSE response mid-turn aborts the turn and rolls the user

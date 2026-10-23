@@ -144,9 +144,6 @@ pub enum TurnEvent {
     /// Text already sent on this turn is void.
     ///
     /// The chat handler sends this when a streamed draft is superseded.
-    /// Nothing constructs it until that path exists, and a binary crate
-    /// warns on an unbuilt variant.
-    #[allow(dead_code)]
     Reset(crate::wire::ResetReason),
 }
 
@@ -165,8 +162,8 @@ impl Segments {
         }
     }
 
-    fn push(&mut self, sink: &TurnSink, tool: bool) {
-        let _ = sink.try_send(TurnEvent::Segment {
+    fn push(&mut self, sink: &ProgressSink, tool: bool) {
+        sink.try_send(TurnEvent::Segment {
             index: self.next,
             tool,
         });
@@ -176,6 +173,38 @@ impl Segments {
 
 /// Sender half a streaming caller hands to the tool loop.
 pub type TurnSink = tokio::sync::mpsc::Sender<TurnEvent>;
+
+/// A [`TurnSink`] that remembers whether any text delta was sent.
+///
+/// The chat handler reads that flag when a later reply supersedes text the
+/// client may already have. Every send is `try_send`: a full or closed
+/// channel drops the event and never stalls the turn.
+pub struct ProgressSink {
+    tx: TurnSink,
+    saw_delta: std::sync::atomic::AtomicBool,
+}
+
+impl ProgressSink {
+    pub fn new(tx: TurnSink) -> Self {
+        Self {
+            tx,
+            saw_delta: std::sync::atomic::AtomicBool::new(false),
+        }
+    }
+
+    pub fn try_send(&self, event: TurnEvent) {
+        if matches!(event, TurnEvent::Delta(_)) {
+            self.saw_delta
+                .store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+        let _ = self.tx.try_send(event);
+    }
+
+    #[must_use]
+    pub fn saw_delta(&self) -> bool {
+        self.saw_delta.load(std::sync::atomic::Ordering::Relaxed)
+    }
+}
 
 /// Boxed error type every tool-loop entry point returns.
 pub type BoxError = Box<dyn std::error::Error + Send + Sync>;
@@ -276,7 +305,7 @@ pub async fn invoke_with_tool_loop_streaming(
     messages: &mut Vec<Message>,
     max_tokens: u32,
     max_rounds: u32,
-    sink: &TurnSink,
+    sink: &ProgressSink,
 ) -> Result<ToolLoopResult, BoxError> {
     let tool_defs = if provider.supports_tools() && !tools.is_empty() {
         Some(tools.definitions())
@@ -288,7 +317,7 @@ pub async fn invoke_with_tool_loop_streaming(
     let mut segments = Segments::new();
 
     loop {
-        let _ = sink.try_send(TurnEvent::Status(TurnStatus::Thinking));
+        sink.try_send(TurnEvent::Status(TurnStatus::Thinking));
         let round = stream_one_round(
             provider,
             system_prompt,
@@ -314,7 +343,7 @@ pub async fn invoke_with_tool_loop_streaming(
                     segments.push(sink, true);
                 }
                 for name in tool_names {
-                    let _ = sink.try_send(TurnEvent::Status(TurnStatus::Tool(name)));
+                    sink.try_send(TurnEvent::Status(TurnStatus::Tool(name)));
                 }
             }
         }
@@ -337,7 +366,7 @@ async fn stream_one_round(
     messages: &[Message],
     max_tokens: u32,
     tool_defs: Option<&[serde_json::Value]>,
-    sink: &TurnSink,
+    sink: &ProgressSink,
     segments: &mut Segments,
 ) -> Result<StreamedRound, BoxError> {
     use tokio_stream::StreamExt as _;
@@ -350,9 +379,9 @@ async fn stream_one_round(
             StreamEvent::TextDelta(text) => {
                 if !responding {
                     responding = true;
-                    let _ = sink.try_send(TurnEvent::Status(TurnStatus::Responding));
+                    sink.try_send(TurnEvent::Status(TurnStatus::Responding));
                 }
-                let _ = sink.try_send(TurnEvent::Delta(text));
+                sink.try_send(TurnEvent::Delta(text));
             }
             StreamEvent::ToolUse { name, .. } => {
                 tool_names.push(name);
@@ -762,11 +791,12 @@ mod streaming_tests {
             .unwrap();
 
         let (tx, mut rx) = tokio::sync::mpsc::channel(64);
+        let sink = ProgressSink::new(tx);
         let mut m2 = vec![user("hi")];
-        let b = invoke_with_tool_loop_streaming(&streamed, &tools, "sys", &mut m2, 100, 5, &tx)
+        let b = invoke_with_tool_loop_streaming(&streamed, &tools, "sys", &mut m2, 100, 5, &sink)
             .await
             .unwrap();
-        drop(tx);
+        drop(sink);
 
         assert_eq!(a.text, b.text);
         assert_eq!(a.input_tokens, b.input_tokens);
@@ -822,11 +852,12 @@ mod streaming_tests {
         );
         let tools = ToolRegistry::new();
         let (tx, mut rx) = tokio::sync::mpsc::channel(64);
+        let sink = ProgressSink::new(tx);
         let mut messages = vec![user("hi")];
-        invoke_with_tool_loop_streaming(&p, &tools, "sys", &mut messages, 100, 5, &tx)
+        invoke_with_tool_loop_streaming(&p, &tools, "sys", &mut messages, 100, 5, &sink)
             .await
             .unwrap();
-        drop(tx);
+        drop(sink);
 
         let mut events = Vec::new();
         while let Some(e) = rx.recv().await {
@@ -927,11 +958,12 @@ mod streaming_tests {
         };
         let tools = ToolRegistry::new();
         let (tx, mut rx) = tokio::sync::mpsc::channel(64);
+        let sink = ProgressSink::new(tx);
         let mut messages = vec![user("hi")];
-        invoke_with_tool_loop_streaming(&p, &tools, "sys", &mut messages, 100, 5, &tx)
+        invoke_with_tool_loop_streaming(&p, &tools, "sys", &mut messages, 100, 5, &sink)
             .await
             .unwrap();
-        drop(tx);
+        drop(sink);
         let mut segments = Vec::new();
         while let Some(event) = rx.recv().await {
             if let TurnEvent::Segment { index, tool } = event {
@@ -945,9 +977,10 @@ mod streaming_tests {
     async fn streamed_refusal_surfaces_as_typed_refusal_error() {
         let tools = ToolRegistry::new();
         let (tx, _rx) = tokio::sync::mpsc::channel(8);
+        let sink = ProgressSink::new(tx);
         let mut m = vec![user("hi")];
         let outcome =
-            invoke_with_tool_loop_streaming(&Refuser, &tools, "sys", &mut m, 100, 5, &tx).await;
+            invoke_with_tool_loop_streaming(&Refuser, &tools, "sys", &mut m, 100, 5, &sink).await;
         let Err(err) = outcome else {
             panic!("expected the streamed refusal to error")
         };
@@ -994,9 +1027,11 @@ mod streaming_tests {
     async fn streamed_quota_surfaces_as_typed_quota_error() {
         let tools = ToolRegistry::new();
         let (tx, _rx) = tokio::sync::mpsc::channel(8);
+        let sink = ProgressSink::new(tx);
         let mut m = vec![user("hi")];
         let outcome =
-            invoke_with_tool_loop_streaming(&QuotaSpent, &tools, "sys", &mut m, 100, 5, &tx).await;
+            invoke_with_tool_loop_streaming(&QuotaSpent, &tools, "sys", &mut m, 100, 5, &sink)
+                .await;
         let Err(err) = outcome else {
             panic!("expected the streamed quota failure to error")
         };
@@ -1011,10 +1046,11 @@ mod streaming_tests {
         let p = Scripted::new(vec![end_turn(text.trim())], false);
         let tools = ToolRegistry::new();
         let (tx, _rx) = tokio::sync::mpsc::channel(1);
+        let sink = ProgressSink::new(tx);
         let mut m = vec![user("hi")];
         let r = tokio::time::timeout(
             std::time::Duration::from_secs(2),
-            invoke_with_tool_loop_streaming(&p, &tools, "sys", &mut m, 100, 5, &tx),
+            invoke_with_tool_loop_streaming(&p, &tools, "sys", &mut m, 100, 5, &sink),
         )
         .await
         .expect("turn must not block on a full sink")
@@ -1028,8 +1064,9 @@ mod streaming_tests {
         let tools = ToolRegistry::new();
         let (tx, rx) = tokio::sync::mpsc::channel(1);
         drop(rx);
+        let sink = ProgressSink::new(tx);
         let mut m = vec![user("hi")];
-        let r = invoke_with_tool_loop_streaming(&p, &tools, "sys", &mut m, 100, 5, &tx)
+        let r = invoke_with_tool_loop_streaming(&p, &tools, "sys", &mut m, 100, 5, &sink)
             .await
             .unwrap();
         assert_eq!(r.text, "ok");

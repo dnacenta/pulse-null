@@ -18,7 +18,7 @@ use crate::server::auth::AuthIdentity;
 use crate::server::AppState;
 use crate::session_store::{resolve_sender, Session};
 use crate::streaming::StreamingProvider;
-use crate::tool_loop::{self, TurnEvent, TurnSink, TurnStatus};
+use crate::tool_loop::{self, ProgressSink, TurnEvent, TurnSink, TurnStatus};
 use pulse_system_types::llm::{Message, MessageContent, MessageSource, Role};
 
 mod steps;
@@ -299,6 +299,7 @@ async fn run_resolved_turn(
     // the fallback while guests and peers never do.
     let fallback_capped = steps::fallback_cap_reached(&session.data.health);
     let build_fallback = steps::fallback_builder(&turn, !fallback_capped);
+    let progress = sink.map(ProgressSink::new);
     let outcome = invoke_turn_with_refusal_fallback(
         &mut session.data,
         state.provider.as_ref(),
@@ -307,11 +308,19 @@ async fn run_resolved_turn(
         &system_prompt,
         state.config.llm.max_tokens,
         &turn.correlation_id,
-        sink.as_ref(),
+        progress.as_ref(),
     )
     .await;
     record_provider_outcome(&state, &resolved_key, &outcome).await;
     let outcome = outcome.map_err(|e| steps::turn_failure(&turn, fallback_capped, e.as_ref()))?;
+
+    // The guard already replaced the stored reply. Tell a client that has
+    // been reading the raw stream to drop it before `done` arrives.
+    if outcome.result.was_truncated {
+        if let Some(progress) = progress.as_ref() {
+            progress.try_send(TurnEvent::Reset(crate::wire::ResetReason::Guard));
+        }
+    }
 
     // The turn succeeded: from here on the messages are committed and a
     // dropped future must not undo them.
@@ -479,10 +488,14 @@ fn error_to_sse(status: StatusCode, message: String) -> Event {
 /// Events: `status {status: thinking|responding|tool, name?}`, `delta {text}`
 /// (as the provider yields them; the client coalesces), `segment {index, tool}`
 /// when an assistant message ends and the server knows whether a tool call
-/// follows, then exactly one of
+/// follows, `reset {reason: fallback|guard}` when text already sent is void,
+/// then exactly one of
 /// `done {text, model, tokens_in, tokens_out, isolation, truncated}` or
 /// `error {status, message}`. Dropping the connection aborts the turn: the
 /// provider child is killed and the user message is rolled back.
+///
+/// Voice-channel requests (`channel` equal to `voice`, case-insensitive)
+/// take a pool of their own, so a full screen client cannot refuse a call.
 ///
 /// Client contract: deltas are best-effort and unvalidated. A consumer that
 /// stops reading loses deltas rather than stalling the turn, and a reply the
@@ -496,14 +509,20 @@ pub async fn chat_stream(
 ) -> Result<Sse<impl Stream<Item = Result<Event, Infallible>>>, (StatusCode, String)> {
     validate_request(&req)?;
     refuse_peer_on_owner_channel(&who, &req.channel)?;
-    let permit = Arc::clone(&state.chat_permits)
-        .try_acquire_owned()
-        .map_err(|_| {
-            (
-                StatusCode::SERVICE_UNAVAILABLE,
-                "too many open streams; try again shortly".to_string(),
-            )
-        })?;
+    let permits = if req
+        .channel
+        .eq_ignore_ascii_case(crate::server::turns::VOICE_CHANNEL)
+    {
+        Arc::clone(&state.voice_permits)
+    } else {
+        Arc::clone(&state.chat_permits)
+    };
+    let permit = permits.try_acquire_owned().map_err(|_| {
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "too many open streams; try again shortly".to_string(),
+        )
+    })?;
 
     let (tx, rx) = mpsc::channel::<TurnEvent>(STREAM_CHANNEL_CAPACITY);
     let (done_tx, done_rx) = tokio::sync::oneshot::channel();
@@ -645,7 +664,7 @@ async fn invoke_turn_with_refusal_fallback<F>(
     system_prompt: &str,
     max_tokens: u32,
     correlation_id: &str,
-    sink: Option<&TurnSink>,
+    sink: Option<&ProgressSink>,
 ) -> Result<TurnResult, Box<dyn std::error::Error + Send + Sync>>
 where
     F: FnOnce()
@@ -741,9 +760,13 @@ where
     fallback_ctx.push(user_msg.clone());
 
     // The fallback provider is buffered; a streaming client learns it is
-    // thinking again and then gets the whole reply as one delta.
+    // thinking again and then gets the whole reply as one delta. Text
+    // already sent from the refused draft is void first.
     if let Some(sink) = sink {
-        let _ = sink.try_send(TurnEvent::Status(TurnStatus::Thinking));
+        if sink.saw_delta() {
+            sink.try_send(TurnEvent::Reset(crate::wire::ResetReason::Fallback));
+        }
+        sink.try_send(TurnEvent::Status(TurnStatus::Thinking));
     }
     let fallback_outcome = crate::task_context::scope(
         Some(correlation_id.to_string()),
@@ -761,8 +784,8 @@ where
     match fallback_outcome {
         Ok(result) => {
             if let Some(sink) = sink {
-                let _ = sink.try_send(TurnEvent::Status(TurnStatus::Responding));
-                let _ = sink.try_send(TurnEvent::Delta(result.text.clone()));
+                sink.try_send(TurnEvent::Status(TurnStatus::Responding));
+                sink.try_send(TurnEvent::Delta(result.text.clone()));
             }
             // Quarantine the exchange: the trunk stays clean so the default
             // model does not re-trip on later benign turns.

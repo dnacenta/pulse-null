@@ -215,6 +215,7 @@ async fn assemble_state(
         event_permits: super::stream_pools().0,
         comms_permits: super::comms_pool(),
         chat_permits: super::stream_pools().1,
+        voice_permits: super::stream_pools().2,
         comms: crate::comms::Slot::new(),
         ledger,
         graph_extractor: crate::graph_extract::GraphExtractor::for_pulse(&config, &root_dir),

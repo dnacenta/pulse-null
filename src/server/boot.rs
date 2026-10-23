@@ -115,6 +115,7 @@ async fn assemble_pulse_state(
         event_permits: crate::server::stream_pools().0,
         comms_permits: crate::server::comms_pool(),
         chat_permits: crate::server::stream_pools().1,
+        voice_permits: crate::server::stream_pools().2,
         comms: crate::comms::Slot::new(),
         ledger: Arc::new(crate::ledger::LedgerRing::new(
             crate::ledger::DEFAULT_RING_CAPACITY,
