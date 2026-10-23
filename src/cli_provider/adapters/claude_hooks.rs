@@ -386,8 +386,108 @@ The SessionEnd hook runs `recall-echo archive-session` and archives this convers
 "#
 }
 
-/// Write a generated file, and refresh a copy that still starts with
-/// `header`. A file that does not is hand-edited: leave it byte-for-byte
+/// The rules file this module wrote before the 4.x lifecycle rewrite.
+/// Repair refreshes a file only when it is still this text, or the
+/// current template. Anything else was edited by hand.
+const OLD_GENERATED_RULES: &str = r#"# recall-echo — Memory Protocol
+
+You have a persistent four-layer memory system. Use it to maintain continuity across sessions.
+All paths below are relative to your pulse directory, which is the working directory you run in.
+
+## Memory Layers
+
+### Layer 0 — Knowledge Graph (structured, semantic)
+- Embedded SurrealDB graph database with FastEmbed local embeddings.
+- Stores pulses, relationships, and conversation episodes.
+- Bayesian confidence scoring on relationships — corroborated knowledge gains confidence over time.
+- Semantic search finds memories by meaning, not just keywords.
+- Queried via `recall-echo graph search`, `graph query`, or `graph traverse`.
+
+### Layer 1 — Curated Memory (memory/MEMORY.md)
+- Your source of truth. Distilled facts, preferences, patterns, key decisions.
+- Loaded into your system prompt at startup.
+- Keep under 200 lines. Only write confirmed, stable information.
+- Before adding, check if an existing entry should be updated. No duplicates.
+
+### Layer 2 — Recent Sessions (memory/EPHEMERAL.md)
+- Rolling window of your last 5 session summaries, loaded into your system prompt.
+- Read at session start to orient on recent work.
+- Each entry has a pointer to the full archive.
+- Managed automatically by recall-echo hooks. Do not edit manually.
+
+### Layer 3 — Full Archive (archives/conversations/)
+- Index: `memory/ARCHIVE.md`
+- Full conversations: `archives/conversations/conversation-NNN.md`
+- NOT loaded into context. Search on demand using Grep.
+- To search: `Grep pattern="search term" path="archives/conversations/"`
+
+## Session Lifecycle
+
+### On session start:
+1. MEMORY.md and EPHEMERAL.md are in your context.
+2. Orient from recent sessions. Use archive pointers if you need full context.
+
+### During the session:
+- Update memory/MEMORY.md when you learn stable facts.
+- When the user references past work, search the archive first.
+- Do NOT update MEMORY.md with speculative or session-specific info.
+
+### On PreCompact (context about to be compressed):
+The PreCompact hook automatically runs `recall-echo checkpoint --trigger precompact`.
+The output tells you the file path and log number. Open that file and fill in the
+Summary, Key Details, Action Items, and Unresolved sections with context from the
+current conversation.
+
+### On session end:
+- The SessionEnd hook archives this conversation automatically.
+- No manual action required.
+
+## Commands
+
+- `recall-echo init` — Initialize or upgrade the memory system
+- `recall-echo consume` — Output EPHEMERAL.md at session start (SessionStart hook)
+- `recall-echo checkpoint --trigger precompact` — Save checkpoint before context compression
+- `recall-echo archive-session` — Archive conversation from JSONL transcript (SessionEnd hook)
+- `recall-echo search <query>` — Search conversation archives
+- `recall-echo search <query> --ranked` — Ranked search with relevance scoring
+- `recall-echo graph search <query>` — Semantic search across graph entitys
+- `recall-echo graph query <query>` — Hybrid search (semantic + graph expansion + episodes)
+- `recall-echo graph traverse <pulse>` — Graph traversal with confidence display
+
+## Rules
+
+- Never write duplicates to MEMORY.md. Check first, update if exists.
+- When MEMORY.md approaches 200 lines, distill it.
+- Archive conversations are immutable. Never modify them.
+- When the user says "we discussed this before" — search archives before saying you don't remember.
+"#;
+
+/// The first line equals `header` exactly. A `\n` or `\r\n` may follow it.
+/// One trailing `\r` on that line is ignored; anything else on the line is
+/// not the header.
+fn first_line_is_header(text: &str, header: &str) -> bool {
+    let mut line = text.split('\n').next().unwrap_or("");
+    if let Some(stripped) = line.strip_suffix('\r') {
+        line = stripped;
+    }
+    line == header
+}
+
+/// A generated file we may replace: one leading BOM stripped, the first
+/// line exactly `header`, and the body (CRLF normalised) equal to the
+/// current template or [`OLD_GENERATED_RULES`].
+fn is_known_generated(text: &str, content: &str, header: &str) -> bool {
+    let stripped = text.strip_prefix('\u{FEFF}').unwrap_or(text);
+    if !first_line_is_header(stripped, header) {
+        return false;
+    }
+    let normalized = stripped.replace("\r\n", "\n");
+    normalized == content || normalized == OLD_GENERATED_RULES
+}
+
+/// Write a generated file. Refresh it only when it is still the current
+/// template or the known previous one, allowing one leading BOM and CRLF
+/// line endings. Every other file is hand-edited: leave it byte-for-byte
 /// and report why.
 fn ensure_generated(path: &Path, content: &str, header: &str, within: &Path) -> BootstrapItem {
     let item = |status| BootstrapItem {
@@ -405,10 +505,12 @@ fn ensure_generated(path: &Path, content: &str, header: &str, within: &Path) -> 
             Err(e) => item(ItemStatus::Skipped(e)),
         },
         Some(text) if text == content => item(ItemStatus::Exists),
-        Some(text) if text.starts_with(header) => match write_regular_file(path, content, within) {
-            Ok(()) => item(ItemStatus::Updated),
-            Err(e) => item(ItemStatus::Skipped(e)),
-        },
+        Some(text) if is_known_generated(&text, content, header) => {
+            match write_regular_file(path, content, within) {
+                Ok(()) => item(ItemStatus::Updated),
+                Err(e) => item(ItemStatus::Skipped(e)),
+            }
+        }
         Some(_) => item(ItemStatus::Skipped("hand-edited; left as is".into())),
     }
 }
@@ -1469,79 +1571,6 @@ mod tests {
     }
 
     /// The rules file pulses carried before the 4.x lifecycle rewrite.
-    const OLD_GENERATED_RULES: &str = r#"# recall-echo — Memory Protocol
-
-You have a persistent four-layer memory system. Use it to maintain continuity across sessions.
-All paths below are relative to your pulse directory, which is the working directory you run in.
-
-## Memory Layers
-
-### Layer 0 — Knowledge Graph (structured, semantic)
-- Embedded SurrealDB graph database with FastEmbed local embeddings.
-- Stores pulses, relationships, and conversation episodes.
-- Bayesian confidence scoring on relationships — corroborated knowledge gains confidence over time.
-- Semantic search finds memories by meaning, not just keywords.
-- Queried via `recall-echo graph search`, `graph query`, or `graph traverse`.
-
-### Layer 1 — Curated Memory (memory/MEMORY.md)
-- Your source of truth. Distilled facts, preferences, patterns, key decisions.
-- Loaded into your system prompt at startup.
-- Keep under 200 lines. Only write confirmed, stable information.
-- Before adding, check if an existing entry should be updated. No duplicates.
-
-### Layer 2 — Recent Sessions (memory/EPHEMERAL.md)
-- Rolling window of your last 5 session summaries, loaded into your system prompt.
-- Read at session start to orient on recent work.
-- Each entry has a pointer to the full archive.
-- Managed automatically by recall-echo hooks. Do not edit manually.
-
-### Layer 3 — Full Archive (archives/conversations/)
-- Index: `memory/ARCHIVE.md`
-- Full conversations: `archives/conversations/conversation-NNN.md`
-- NOT loaded into context. Search on demand using Grep.
-- To search: `Grep pattern="search term" path="archives/conversations/"`
-
-## Session Lifecycle
-
-### On session start:
-1. MEMORY.md and EPHEMERAL.md are in your context.
-2. Orient from recent sessions. Use archive pointers if you need full context.
-
-### During the session:
-- Update memory/MEMORY.md when you learn stable facts.
-- When the user references past work, search the archive first.
-- Do NOT update MEMORY.md with speculative or session-specific info.
-
-### On PreCompact (context about to be compressed):
-The PreCompact hook automatically runs `recall-echo checkpoint --trigger precompact`.
-The output tells you the file path and log number. Open that file and fill in the
-Summary, Key Details, Action Items, and Unresolved sections with context from the
-current conversation.
-
-### On session end:
-- The SessionEnd hook archives this conversation automatically.
-- No manual action required.
-
-## Commands
-
-- `recall-echo init` — Initialize or upgrade the memory system
-- `recall-echo consume` — Output EPHEMERAL.md at session start (SessionStart hook)
-- `recall-echo checkpoint --trigger precompact` — Save checkpoint before context compression
-- `recall-echo archive-session` — Archive conversation from JSONL transcript (SessionEnd hook)
-- `recall-echo search <query>` — Search conversation archives
-- `recall-echo search <query> --ranked` — Ranked search with relevance scoring
-- `recall-echo graph search <query>` — Semantic search across graph entitys
-- `recall-echo graph query <query>` — Hybrid search (semantic + graph expansion + episodes)
-- `recall-echo graph traverse <pulse>` — Graph traversal with confidence display
-
-## Rules
-
-- Never write duplicates to MEMORY.md. Check first, update if exists.
-- When MEMORY.md approaches 200 lines, distill it.
-- Archive conversations are immutable. Never modify them.
-- When the user says "we discussed this before" — search archives before saying you don't remember.
-"#;
-
     fn rules_item(items: &[BootstrapItem]) -> &BootstrapItem {
         items
             .iter()
@@ -1612,6 +1641,74 @@ current conversation.
             ),
             "{verified:?}"
         );
+    }
+
+    #[test]
+    fn longer_rules_title_is_kept() {
+        let dir = pulse();
+        let root = dir.path().canonicalize().unwrap();
+        let path = root.join(".claude/rules/recall-echo.md");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let original = "# recall-echo — Memory Protocol (local notes)\nKeep this.\n";
+        std::fs::write(&path, original).unwrap();
+
+        let items = ensure_files(&root, "recall-echo");
+        assert!(
+            matches!(
+                &rules_item(&items).status,
+                ItemStatus::Skipped(reason) if reason == "hand-edited; left as is"
+            ),
+            "{items:?}"
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), original.as_bytes());
+    }
+
+    #[test]
+    fn exact_rules_title_with_extra_notes_is_kept() {
+        let dir = pulse();
+        let root = dir.path().canonicalize().unwrap();
+        let path = root.join(".claude/rules/recall-echo.md");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let original = "# recall-echo — Memory Protocol\n\nLocal notes that must stay.\n";
+        std::fs::write(&path, original).unwrap();
+
+        let items = ensure_files(&root, "recall-echo");
+        assert!(
+            matches!(
+                &rules_item(&items).status,
+                ItemStatus::Skipped(reason) if reason == "hand-edited; left as is"
+            ),
+            "{items:?}"
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), original.as_bytes());
+    }
+
+    #[test]
+    fn bom_stock_rules_are_refreshed() {
+        let dir = pulse();
+        let root = dir.path().canonicalize().unwrap();
+        let path = root.join(".claude/rules/recall-echo.md");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let original = format!("\u{FEFF}{OLD_GENERATED_RULES}");
+        std::fs::write(&path, &original).unwrap();
+
+        let items = ensure_files(&root, "recall-echo");
+        assert_eq!(rules_item(&items).status, ItemStatus::Updated);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), render_rules_md());
+    }
+
+    #[test]
+    fn crlf_stock_rules_are_refreshed() {
+        let dir = pulse();
+        let root = dir.path().canonicalize().unwrap();
+        let path = root.join(".claude/rules/recall-echo.md");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let original = render_rules_md().replace('\n', "\r\n");
+        std::fs::write(&path, &original).unwrap();
+
+        let items = ensure_files(&root, "recall-echo");
+        assert_eq!(rules_item(&items).status, ItemStatus::Updated);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), render_rules_md());
     }
 
     #[test]
