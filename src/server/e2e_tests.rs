@@ -1883,6 +1883,119 @@ async fn e2e_chat_stream_reset_jumps_a_full_channel() {
     );
 }
 
+/// A segment that does not fit on a full delta channel is written before a
+/// delta the provider emits after it. The body stays unread until that
+/// segment is parked, then two frames are taken so one channel slot frees
+/// and the later delta can land.
+#[tokio::test]
+async fn e2e_chat_stream_segment_precedes_a_later_delta() {
+    use crate::streaming::{StreamEvent, StreamingProvider};
+    use tokio_stream::StreamExt as _;
+
+    const FLOOD: usize = 400;
+
+    struct FloodThenSegment {
+        parked: Arc<Notify>,
+        release: Arc<Notify>,
+    }
+
+    impl LmProvider for FloodThenSegment {
+        fn invoke(
+            &self,
+            _system_prompt: &str,
+            _messages: &[Message],
+            _max_tokens: u32,
+            _tools: Option<&[serde_json::Value]>,
+        ) -> LlmResult<'_> {
+            Box::pin(async { Err("unused".into()) })
+        }
+        fn name(&self) -> &str {
+            "flood-then-segment"
+        }
+    }
+
+    impl StreamingProvider for FloodThenSegment {
+        fn supports_streaming(&self) -> bool {
+            true
+        }
+        fn invoke_streaming(
+            &self,
+            _system_prompt: &str,
+            _messages: &[Message],
+            _max_tokens: u32,
+            _tools: Option<&[serde_json::Value]>,
+        ) -> crate::streaming::StreamResult<'_> {
+            let parked = Arc::clone(&self.parked);
+            let release = Arc::clone(&self.release);
+            Box::pin(async_stream::stream! {
+                for _ in 0..FLOOD {
+                    yield StreamEvent::TextDelta("a".into());
+                }
+                yield StreamEvent::SegmentEnd { tool_use: true };
+                parked.notify_one();
+                release.notified().await;
+                yield StreamEvent::TextDelta("LATER".into());
+                yield StreamEvent::Done(LlmResponse {
+                    content: vec![ContentBlock::Text { text: "ok".into() }],
+                    stop_reason: StopReason::EndTurn,
+                    model: "mock".into(),
+                    input_tokens: Some(1),
+                    output_tokens: Some(1),
+                });
+            })
+        }
+    }
+
+    let parked = Arc::new(Notify::new());
+    let release = Arc::new(Notify::new());
+    let dir = tempfile::tempdir().unwrap();
+    let state = build_state_boxed_with_config(
+        dir.path().to_path_buf(),
+        Box::new(FloodThenSegment {
+            parked: Arc::clone(&parked),
+            release: Arc::clone(&release),
+        }),
+        ToolRegistry::new(),
+        test_config(),
+    )
+    .await;
+    let app = build_app(Arc::clone(&state));
+    let response = post_chat_stream(&app, "hi").await;
+    assert_eq!(response.status(), StatusCode::OK);
+    within_test_wait("segment parked on a full channel", parked.notified()).await;
+
+    let mut body = response.into_body().into_data_stream();
+    let mut seen = String::new();
+    let mut released = false;
+    let text = loop {
+        if !released && seen.matches("\n\n").count() >= 2 {
+            release.notify_one();
+            released = true;
+        }
+        if released && seen.contains("event: done") && seen.ends_with("\n\n") {
+            break seen;
+        }
+        let chunk = tokio::time::timeout(std::time::Duration::from_secs(5), body.next())
+            .await
+            .expect("stream stalled before the later delta")
+            .expect("stream ended before the later delta")
+            .expect("body error");
+        seen.push_str(&String::from_utf8_lossy(&chunk));
+    };
+    assert!(released, "the later delta was never given a free slot");
+    let frames = sse_frames(&text);
+    let segment = frame_index(&frames, |event, data| {
+        event == "segment" && data.contains(r#""tool":true"#)
+    });
+    let later = frame_index(&frames, |event, data| {
+        event == "delta" && data.contains("LATER")
+    });
+    assert!(
+        segment < later,
+        "segment did not precede the later delta: {frames:?}"
+    );
+}
+
 /// Four open screen streams fill the chat pool. A voice identity still
 /// opens on its own pool. An owner request whose body says `voice`, and a
 /// fifth screen stream, are both refused on the chat pool.

@@ -613,6 +613,12 @@ pub async fn chat_stream(
                 reset_sent = true;
                 yield Ok(turn_event_to_sse(event));
             }
+            // A segment that did not fit is ordered with the deltas still
+            // queued, the same way a reset is: ahead of anything not yet
+            // written. Waiting until `rx` closes lets a later delta pass it.
+            for event in control.drain_segments() {
+                yield Ok(turn_event_to_sse(event));
+            }
             tokio::select! {
                 biased;
                 _ = control.notified() => {}
@@ -622,6 +628,9 @@ pub async fn chat_stream(
                             for reset in control.drain_resets() {
                                 reset_sent = true;
                                 yield Ok(turn_event_to_sse(reset));
+                            }
+                            for segment in control.drain_segments() {
+                                yield Ok(turn_event_to_sse(segment));
                             }
                             yield Ok(turn_event_to_sse(event));
                         }
