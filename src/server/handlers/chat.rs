@@ -121,7 +121,7 @@ pub async fn chat(
     axum::Extension(who): axum::Extension<AuthIdentity>,
     Json(req): Json<ChatRequest>,
 ) -> Result<Json<ChatResponse>, (StatusCode, String)> {
-    run_turn(state, req, who, None).await.map(Json)
+    run_turn(state, req, who, None, None).await.map(Json)
 }
 
 /// Channels whose session is the owner's by construction.
@@ -229,6 +229,7 @@ pub(crate) async fn run_turn(
     req: ChatRequest,
     who: AuthIdentity,
     sink: Option<TurnSink>,
+    control: Option<Arc<tool_loop::ControlPlane>>,
 ) -> Result<ChatResponse, (StatusCode, String)> {
     validate_request(&req)?;
 
@@ -267,7 +268,7 @@ pub(crate) async fn run_turn(
     let hold_deltas = uses_voice_pool(&who);
     crate::tool_surface::scope(
         surface,
-        run_resolved_turn(state, req, resolved_key, sink, hold_deltas),
+        run_resolved_turn(state, req, resolved_key, sink, hold_deltas, control),
     )
     .await
 }
@@ -281,6 +282,7 @@ async fn run_resolved_turn(
     resolved_key: SessionKey,
     sink: Option<TurnSink>,
     hold_deltas: bool,
+    control: Option<Arc<tool_loop::ControlPlane>>,
 ) -> Result<ChatResponse, (StatusCode, String)> {
     let sender_label = req.sender.as_deref().unwrap_or("unknown");
     if let Some(reply) =
@@ -340,11 +342,15 @@ async fn run_resolved_turn(
     let fallback_capped = steps::fallback_cap_reached(&session.data.health);
     let build_fallback = steps::fallback_builder(&turn, !fallback_capped);
     let progress = sink.map(|tx| {
-        if hold_deltas {
+        let mut progress = if hold_deltas {
             ProgressSink::holding(tx)
         } else {
             ProgressSink::new(tx)
+        };
+        if let Some(control) = control {
+            progress.attach(control);
         }
+        progress
     });
     let outcome = invoke_turn_with_refusal_fallback(
         &mut session.data,
@@ -366,7 +372,12 @@ async fn run_resolved_turn(
     if outcome.result.was_truncated {
         if let Some(progress) = progress.as_ref() {
             progress.discard_held();
-            progress.try_send(TurnEvent::Reset(crate::wire::ResetReason::Guard));
+            if !progress.try_send(TurnEvent::Reset(crate::wire::ResetReason::Guard)) {
+                return Err((
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "reset was not delivered".to_string(),
+                ));
+            }
             if hold_deltas && !outcome.result.text.is_empty() {
                 progress.send_now(TurnEvent::Delta(outcome.result.text.clone()));
             }
@@ -557,10 +568,14 @@ fn error_to_sse(status: StatusCode, message: String) -> Event {
 /// as the provider yields them, unvalidated. A voice-pool stream holds the
 /// open segment and forwards a delta only after that round's guard has
 /// kept it; a cut or a refusal drops the hold and sends `reset` with no
-/// raw tail before the kept text. A consumer that stops reading loses
-/// deltas rather than stalling the turn. `done.text` is the validated,
-/// complete reply and must replace whatever was shown; `truncated` says
-/// the guard fired.
+/// raw tail before the kept text. `reset` (and a `segment` that does not
+/// fit) is delivered on a side channel and written before any delta the
+/// client has not yet received. A consumer that stops reading loses
+/// deltas rather than stalling the turn. If a `reset` was queued and not
+/// written, the stream ends with `error` instead of `done`. `done.text`
+/// is the validated, complete reply and must replace whatever was shown;
+/// `truncated` says the guard fired and unspoken text is discarded even
+/// when `reset` did not arrive.
 pub async fn chat_stream(
     State(state): State<Arc<AppState>>,
     axum::Extension(who): axum::Extension<AuthIdentity>,
@@ -583,8 +598,10 @@ pub async fn chat_stream(
 
     let (tx, rx) = mpsc::channel::<TurnEvent>(STREAM_CHANNEL_CAPACITY);
     let (done_tx, done_rx) = tokio::sync::oneshot::channel();
+    let control = Arc::new(tool_loop::ControlPlane::new());
+    let control_for_turn = Arc::clone(&control);
     let task = tokio::spawn(async move {
-        let outcome = run_turn(state, req, who, Some(tx)).await;
+        let outcome = run_turn(state, req, who, Some(tx), Some(control_for_turn)).await;
         let _ = done_tx.send(outcome);
     });
     let guard = AbortOnDrop(task.abort_handle());
@@ -592,17 +609,52 @@ pub async fn chat_stream(
     let stream = async_stream::stream! {
         let _guard = guard;
         let _permit = permit;
+        let _close = tool_loop::ControlClose(Arc::clone(&control));
         let mut rx = rx;
-        while let Some(event) = rx.recv().await {
+        let mut reset_sent = false;
+        loop {
+            for event in control.drain_resets() {
+                reset_sent = true;
+                yield Ok(turn_event_to_sse(event));
+            }
+            tokio::select! {
+                biased;
+                _ = control.notified() => {}
+                event = rx.recv() => {
+                    match event {
+                        Some(event) => {
+                            for reset in control.drain_resets() {
+                                reset_sent = true;
+                                yield Ok(turn_event_to_sse(reset));
+                            }
+                            yield Ok(turn_event_to_sse(event));
+                        }
+                        None => break,
+                    }
+                }
+            }
+        }
+        for event in control.drain_resets() {
+            reset_sent = true;
             yield Ok(turn_event_to_sse(event));
         }
-        match done_rx.await {
-            Ok(Ok(resp)) => yield Ok(done_to_sse(resp)),
-            Ok(Err((status, message))) => yield Ok(error_to_sse(status, message)),
-            Err(_) => yield Ok(error_to_sse(
+        for event in control.drain_segments() {
+            yield Ok(turn_event_to_sse(event));
+        }
+        if control.reset_queued() && !reset_sent {
+            yield Ok(error_to_sse(
                 StatusCode::INTERNAL_SERVER_ERROR,
-                "turn ended without a result".to_string(),
-            )),
+                "reset was not delivered".to_string(),
+            ));
+        } else {
+            match done_rx.await {
+                Ok(Ok(resp)) => yield Ok(done_to_sse(resp)),
+                Ok(Err((status, message))) => yield Ok(error_to_sse(status, message)),
+                Err(_) => yield Ok(error_to_sse(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "turn ended without a result".to_string(),
+                )),
+            }
         }
     };
 
@@ -822,8 +874,10 @@ where
     // and is not flushed.
     if let Some(sink) = sink {
         let dropped = sink.discard_held();
-        if sink.saw_delta() || dropped {
-            sink.try_send(TurnEvent::Reset(crate::wire::ResetReason::Fallback));
+        if (sink.saw_delta() || dropped)
+            && !sink.try_send(TurnEvent::Reset(crate::wire::ResetReason::Fallback))
+        {
+            return Err("reset was not delivered".into());
         }
         sink.try_send(TurnEvent::Status(TurnStatus::Thinking));
     }

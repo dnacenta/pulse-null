@@ -163,20 +163,119 @@ impl Segments {
     }
 
     fn push(&mut self, sink: &ProgressSink, tool: bool) {
-        sink.try_send(TurnEvent::Segment {
-            index: self.next,
-            tool,
-        });
-        self.next = self.next.saturating_add(1);
+        self.emit(sink, tool, false);
     }
 
     /// A boundary emitted after the guard, which must not be held again.
     fn push_kept(&mut self, sink: &ProgressSink, tool: bool) {
-        sink.send_now(TurnEvent::Segment {
+        self.emit(sink, tool, true);
+    }
+
+    fn emit(&mut self, sink: &ProgressSink, tool: bool, now: bool) {
+        let event = TurnEvent::Segment {
             index: self.next,
             tool,
-        });
-        self.next = self.next.saturating_add(1);
+        };
+        let accepted = if now {
+            sink.send_now(event)
+        } else {
+            sink.try_send(event)
+        };
+        if accepted {
+            self.next = self.next.saturating_add(1);
+        }
+    }
+}
+
+/// Resets and segments that must survive a full delta channel.
+///
+/// Deltas stay on the bounded channel and are dropped when it is full.
+/// A reset is queued here and the stream emits it before any further
+/// delta. A segment that does not fit on the delta channel is queued
+/// here and emitted after the deltas that did fit, so a skipped index
+/// is not how a client learns the message ended.
+pub struct ControlPlane {
+    pending: std::sync::Mutex<ControlPending>,
+    notify: tokio::sync::Notify,
+    reset_queued: std::sync::atomic::AtomicBool,
+    closed: std::sync::atomic::AtomicBool,
+}
+
+struct ControlPending {
+    resets: std::collections::VecDeque<TurnEvent>,
+    segments: std::collections::VecDeque<TurnEvent>,
+}
+
+impl ControlPlane {
+    pub fn new() -> Self {
+        Self {
+            pending: std::sync::Mutex::new(ControlPending {
+                resets: std::collections::VecDeque::new(),
+                segments: std::collections::VecDeque::new(),
+            }),
+            notify: tokio::sync::Notify::new(),
+            reset_queued: std::sync::atomic::AtomicBool::new(false),
+            closed: std::sync::atomic::AtomicBool::new(false),
+        }
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, ControlPending> {
+        self.pending.lock().unwrap_or_else(|err| err.into_inner())
+    }
+
+    pub fn push_reset(&self, event: TurnEvent) -> bool {
+        self.push(event, true)
+    }
+
+    pub fn push_segment(&self, event: TurnEvent) -> bool {
+        self.push(event, false)
+    }
+
+    fn push(&self, event: TurnEvent, reset: bool) -> bool {
+        if self.closed.load(std::sync::atomic::Ordering::Acquire) {
+            return false;
+        }
+        let mut pending = self.lock();
+        if reset {
+            pending.resets.push_back(event);
+            self.reset_queued
+                .store(true, std::sync::atomic::Ordering::Release);
+        } else {
+            pending.segments.push_back(event);
+        }
+        drop(pending);
+        self.notify.notify_one();
+        true
+    }
+
+    pub fn drain_resets(&self) -> Vec<TurnEvent> {
+        self.lock().resets.drain(..).collect()
+    }
+
+    pub fn drain_segments(&self) -> Vec<TurnEvent> {
+        self.lock().segments.drain(..).collect()
+    }
+
+    pub fn notified(&self) -> tokio::sync::futures::Notified<'_> {
+        self.notify.notified()
+    }
+
+    pub fn reset_queued(&self) -> bool {
+        self.reset_queued.load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    pub fn close(&self) {
+        self.closed
+            .store(true, std::sync::atomic::Ordering::Release);
+    }
+}
+
+/// Closes a [`ControlPlane`] when the stream that reads it is dropped.
+pub struct ControlClose(pub std::sync::Arc<ControlPlane>);
+
+impl Drop for ControlClose {
+    fn drop(&mut self) {
+        self.0.close();
     }
 }
 
@@ -205,6 +304,9 @@ pub struct ProgressSink {
     /// `Some` while this sink holds an open segment. `None` forwards deltas
     /// as they arrive.
     held: std::sync::Mutex<Option<HeldSpeech>>,
+    /// Resets, and segments that do not fit on `tx`. `None` in tests that
+    /// read the delta channel directly.
+    control: Option<std::sync::Arc<ControlPlane>>,
 }
 
 impl ProgressSink {
@@ -213,6 +315,7 @@ impl ProgressSink {
             tx,
             saw_delta: std::sync::atomic::AtomicBool::new(false),
             held: std::sync::Mutex::new(None),
+            control: None,
         }
     }
 
@@ -222,47 +325,71 @@ impl ProgressSink {
             tx,
             saw_delta: std::sync::atomic::AtomicBool::new(false),
             held: std::sync::Mutex::new(Some(HeldSpeech::default())),
+            control: None,
         }
+    }
+
+    pub fn attach(&mut self, control: std::sync::Arc<ControlPlane>) {
+        self.control = Some(control);
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, Option<HeldSpeech>> {
         self.held.lock().unwrap_or_else(|err| err.into_inner())
     }
 
-    pub fn try_send(&self, event: TurnEvent) {
+    /// True when the event was accepted. A segment index must not advance
+    /// when this returns false: the event was dropped.
+    pub fn try_send(&self, event: TurnEvent) -> bool {
         let mut held = self.lock();
         if let Some(buf) = held.as_mut() {
             match event {
                 TurnEvent::Delta(text) => {
                     buf.deltas.push(text);
-                    return;
+                    return true;
                 }
                 TurnEvent::Segment { index, tool } => {
                     buf.segments.push((index, tool));
-                    return;
+                    return true;
                 }
                 other => {
                     drop(held);
-                    let _ = self.tx.try_send(other);
-                    return;
+                    return self.deliver(other);
                 }
             }
         }
         drop(held);
-        self.deliver(event);
+        self.deliver(event)
     }
 
     /// Deliver `event` even while this sink is holding a segment.
-    pub fn send_now(&self, event: TurnEvent) {
-        self.deliver(event);
+    pub fn send_now(&self, event: TurnEvent) -> bool {
+        self.deliver(event)
     }
 
-    fn deliver(&self, event: TurnEvent) {
+    fn deliver(&self, event: TurnEvent) -> bool {
+        if matches!(event, TurnEvent::Reset(_)) {
+            if let Some(control) = &self.control {
+                return control.push_reset(event);
+            }
+        }
         if matches!(event, TurnEvent::Delta(_)) {
             self.saw_delta
                 .store(true, std::sync::atomic::Ordering::Relaxed);
         }
-        let _ = self.tx.try_send(event);
+        match self.tx.try_send(event) {
+            Ok(()) => true,
+            Err(
+                tokio::sync::mpsc::error::TrySendError::Full(event)
+                | tokio::sync::mpsc::error::TrySendError::Closed(event),
+            ) => {
+                if matches!(event, TurnEvent::Segment { .. }) {
+                    if let Some(control) = &self.control {
+                        return control.push_segment(event);
+                    }
+                }
+                false
+            }
+        }
     }
 
     /// Forward the held segment. No-op when this sink does not hold.

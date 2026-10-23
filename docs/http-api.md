@@ -85,15 +85,15 @@ event: error
 data: {"message":"upstream model error","status":500}
 ```
 
-`status` is `thinking` when a round starts, `responding` when text starts, and `tool` (with `name`) while a tool runs. `delta` is best-effort text. A screen stream forwards it as the provider yields it, unvalidated, and `done.text` replaces the transcript. A voice-pool stream holds the open segment and forwards a delta only after that round's guard has kept it. A client that stops reading loses deltas; the turn does not wait. `segment` marks the end of one assistant message. `index` counts from 0 within the turn. `tool` is true when a tool call follows that message. `reset` means text already sent on this turn is void. `reason` is `fallback` when a refusal fallback replaced a draft, or `guard` when the reply was cut short. `done` is the validated reply and the token counts. `truncated` is true when the reply was cut short. `error` ends a turn that was not saved; `status` is the HTTP status the blocking endpoint would have returned.
+`status` is `thinking` when a round starts, `responding` when text starts, and `tool` (with `name`) while a tool runs. `delta` is best-effort text. A screen stream forwards it as the provider yields it, unvalidated, and `done.text` replaces the transcript. A voice-pool stream holds the open segment and forwards a delta only after that round's guard has kept it. A client that stops reading loses deltas; the turn does not wait. `segment` marks the end of one assistant message. `index` counts from 0 within the turn. `tool` is true when a tool call follows that message. `reset` means text already sent on this turn is void. `reason` is `fallback` when a refusal fallback replaced a draft, or `guard` when the reply was cut short. `done` is the validated reply and the token counts. `truncated` is true when the reply was cut short. A speech client discards unspoken text when `truncated` is true even if no `reset` arrived. `error` ends a turn that was not saved; `status` is the HTTP status the blocking endpoint would have returned.
 
 Ordering:
 
 - `status thinking` comes before a round's first delta. `status responding` comes before that round's deltas.
 - `segment` comes after the deltas of the message it closes. When `tool` is true it comes before `status tool`.
 - A provider that reports no message boundary and calls no tool sends no `segment`. That stream is deltas, then `done`.
-- `reset` with `reason` `fallback` comes before the fallback reply's delta. On a screen stream it is sent only when a delta already went out. On a voice-pool stream a held draft is dropped, and `reset` is sent with no raw tail before it.
-- On a screen stream, `reset` with `reason` `guard` comes after the raw deltas and before `done`. On a voice-pool stream the raw tail is not sent: `reset` comes first, then a delta of the kept text, then `done`. `done.text` is the cut reply, and `truncated` is true.
+- `reset` is written before any delta the client has not yet received, including deltas already sitting in the progress channel. `reason` `fallback` comes before the fallback reply's delta. On a screen stream it is sent only when a delta was produced. On a voice-pool stream a held draft is dropped, and `reset` is sent with no raw tail before it.
+- On a screen stream, `reset` with `reason` `guard` still leaves the raw tail in the stream, and it comes before `done`. On a voice-pool stream the raw tail is not sent: `reset` comes first, then a delta of the kept text, then `done`. `done.text` is the cut reply, and `truncated` is true. A speech client discards unspoken text on `reset` and speaks `done.text` after it.
 - A provider error after deltas ends the stream with exactly one `error`. The user turn is rolled back.
 
 Closing the connection cancels the turn. Nothing from that turn is saved: the user message is rolled back the same way a failed turn is.
@@ -102,7 +102,7 @@ Closing the connection cancels the turn. Nothing from that turn is saved: the us
 
 1. Speak `delta` text clause by clause as it arrives.
 2. On `segment` with `tool` true: discard any not-yet-spoken text from that segment. Optionally play a short filler while `status tool` lasts.
-3. On `reset`: stop speaking, drop queued text, then speak `done.text` minus what was already said (or a short repair phrase).
+3. On `reset`: stop speaking, drop queued text, then speak `done.text` minus what was already said (or a short repair phrase). `done.truncated` means the same discard even when `reset` is absent.
 4. On `error`: speak a short apology; the turn was not saved.
 5. Never rely on `done` arriving to start speaking; use it for metadata and the authoritative transcript.
 

@@ -1672,7 +1672,7 @@ async fn e2e_chat_stream_reset_on_fallback() {
         .await
         .unwrap();
     let frames = sse_frames(&String::from_utf8_lossy(&bytes));
-    let refused = frame_index(&frames, |event, data| {
+    let _refused = frame_index(&frames, |event, data| {
         event == "delta" && data.contains("I cannot ")
     });
     let reset = frame_index(&frames, |event, data| {
@@ -1684,10 +1684,10 @@ async fn e2e_chat_stream_reset_on_fallback() {
     let done = frame_index(&frames, |event, data| {
         event == "done" && data.contains("the fallback answer")
     });
-    assert!(
-        refused < reset && reset < fallback && fallback < done,
-        "{frames:?}"
-    );
+    // Reset rides a side channel and is written before any delta still
+    // queued, so the refused draft is not ordered ahead of it. The
+    // replacement delta stays after the reset.
+    assert!(reset < fallback && fallback < done, "{frames:?}");
     assert!(
         frames.iter().all(|(event, _)| event != "error"),
         "{frames:?}"
@@ -1722,14 +1722,17 @@ async fn e2e_chat_stream_reset_on_guard() {
         .await
         .unwrap();
     let frames = sse_frames(&String::from_utf8_lossy(&bytes));
-    let delta = frame_index(&frames, |event, data| {
+    let _delta = frame_index(&frames, |event, data| {
         event == "delta" && data.contains("[User]:")
     });
     let reset = frame_index(&frames, |event, data| {
         event == "reset" && data.contains(r#""reason":"guard""#)
     });
     let done = frame_index(&frames, |event, _data| event == "done");
-    assert!(delta < reset && reset < done, "{frames:?}");
+    // The raw tail is still sent on a screen stream. Reset is written
+    // before any delta the client has not yet received, so it is not
+    // ordered after that tail.
+    assert!(reset < done, "{frames:?}");
     let done_data = &frames[done].1;
     assert!(done_data.contains(r#""truncated":true"#), "{done_data}");
     assert!(done_data.contains(GUARD_KEPT), "{done_data}");
@@ -1772,6 +1775,112 @@ async fn e2e_chat_stream_reset_on_guard() {
     assert!(done_data.contains(r#""truncated":true"#), "{done_data}");
     assert!(done_data.contains(GUARD_KEPT), "{done_data}");
     assert!(!done_data.contains("[User]:"), "{done_data}");
+}
+
+/// A guard cut still delivers `reset` when the delta channel is already
+/// full. The body is not read until the turn has committed, so every slot
+/// is occupied; the first frame after that is `reset`, ahead of the deltas
+/// that were waiting.
+#[tokio::test]
+async fn e2e_chat_stream_reset_jumps_a_full_channel() {
+    use crate::streaming::{StreamEvent, StreamingProvider};
+    use tokio_stream::StreamExt as _;
+
+    /// More text chunks than the 256-slot progress channel.
+    const FLOOD: usize = 400;
+
+    struct FloodThenGuard;
+
+    impl LmProvider for FloodThenGuard {
+        fn invoke(
+            &self,
+            _system_prompt: &str,
+            _messages: &[Message],
+            _max_tokens: u32,
+            _tools: Option<&[serde_json::Value]>,
+        ) -> LlmResult<'_> {
+            Box::pin(async { Err("unused".into()) })
+        }
+        fn name(&self) -> &str {
+            "flood-then-guard"
+        }
+    }
+
+    impl StreamingProvider for FloodThenGuard {
+        fn supports_streaming(&self) -> bool {
+            true
+        }
+        fn invoke_streaming(
+            &self,
+            _system_prompt: &str,
+            _messages: &[Message],
+            _max_tokens: u32,
+            _tools: Option<&[serde_json::Value]>,
+        ) -> crate::streaming::StreamResult<'_> {
+            Box::pin(async_stream::stream! {
+                for _ in 0..FLOOD {
+                    yield StreamEvent::TextDelta("a".into());
+                }
+                yield StreamEvent::Done(LlmResponse {
+                    content: vec![ContentBlock::Text {
+                        text: GUARD_RAW.into(),
+                    }],
+                    stop_reason: StopReason::EndTurn,
+                    model: "mock".into(),
+                    input_tokens: Some(4),
+                    output_tokens: Some(8),
+                });
+            })
+        }
+    }
+
+    let dir = tempfile::tempdir().unwrap();
+    let state = build_state_boxed_with_config(
+        dir.path().to_path_buf(),
+        Box::new(FloodThenGuard),
+        ToolRegistry::new(),
+        test_config(),
+    )
+    .await;
+    let app = build_app(Arc::clone(&state));
+    let response = post_chat_stream(&app, "hi").await;
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let mut committed = false;
+    for _ in 0..100 {
+        if trunk_len(&state).await == 2 {
+            committed = true;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    assert!(committed, "guarded turn did not commit");
+
+    let mut body = response.into_body().into_data_stream();
+    let mut seen = String::new();
+    let frame = loop {
+        if let Some(end) = seen.find("\n\n") {
+            break seen[..end].to_string();
+        }
+        let chunk = tokio::time::timeout(std::time::Duration::from_secs(5), body.next())
+            .await
+            .expect("stream stalled before the first frame")
+            .expect("stream ended before the first frame")
+            .expect("body error");
+        seen.push_str(&String::from_utf8_lossy(&chunk));
+    };
+    assert!(
+        frame.contains("event: reset"),
+        "first frame was not reset:\n{frame}"
+    );
+    assert!(
+        frame.contains(r#""reason":"guard""#),
+        "reset was not the guard cut:\n{frame}"
+    );
+    assert!(
+        !frame.contains("event: delta"),
+        "a delta preceded reset:\n{frame}"
+    );
 }
 
 /// Four open screen streams fill the chat pool. A voice identity still
@@ -3289,7 +3398,7 @@ mod plugin_turns_e2e {
             channel: "voice".to_string(),
             sender: Some("1001".to_string()),
         };
-        let outcome = handlers::chat::run_turn(Arc::clone(&state), req, who, None).await;
+        let outcome = handlers::chat::run_turn(Arc::clone(&state), req, who, None, None).await;
         assert_eq!(outcome.err().map(|(s, _)| s), Some(StatusCode::FORBIDDEN));
         assert!(!has_session(&state, "owner").await);
     }
@@ -3842,6 +3951,7 @@ mod tool_surface_e2e {
             Arc::clone(&state),
             peer,
             AuthIdentity::Peer("Synth".to_string()),
+            None,
             None,
         )
         .await
@@ -5134,6 +5244,7 @@ mod in_process_tools_e2e {
             Arc::clone(&state),
             peer,
             crate::server::auth::AuthIdentity::Peer("Synth".to_string()),
+            None,
             None,
         )
         .await
