@@ -240,7 +240,8 @@ separately, out of the same n: a hedged "maybe lychee?" counts as
 remembered but is not an unhedged hit. For the forced guess they are its
 number. When the rows say where the answer came from, the planted line
 breaks **lookup** out of n, so a pass by archive or graph search is not
-pooled with context. **Minimum n = 10** per side and offset
+pooled with context. A lookup hit stays on that line and is left out of
+both paired differences. **Minimum n = 10** per side and offset
 before a number is shown ("not enough yet · k of 10").
 
 ## Limits
@@ -261,7 +262,7 @@ before a number is shown ("not enough yet · k of 10").
   that WAL is invisible until the session is archived. `answered_from`
   stays on the row (`lookup` when a tool result held the value or a call
   named the slot, `context` otherwise) and `probe status` breaks lookup
-  out on the planted line.
+  out on the planted line. A lookup hit is not a paired difference.
 - Fail branch: if, at 1 or 7 days, the widened interval on the run means of
   (planted unhedged hit − forced-guess unhedged hit) does not lie above
   zero, "Remembers" reads as not yet shown. The widening is the floor
@@ -269,7 +270,7 @@ before a number is shown ("not enough yet · k of 10").
   on how many run means were positive. Identical run means are not read as
   certainty. The twin contrast does not enter this branch until a labelled
   check of real replies exists; until then it is a count and cannot read
-  as "above zero". Lookup is shown apart from context and does not decide
-  by itself. What a model with no memory volunteers is shown and never
+  as "above zero". A lookup hit is left out of both paired differences and
+  stays on the planted line. What a model with no memory volunteers is shown and never
   decides it. The 30- and 90-day offsets are exploratory and never decide
   it.

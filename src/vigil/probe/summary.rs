@@ -389,6 +389,9 @@ struct SideBits {
     hit: f64,
     /// Wrong. On a twin, made up.
     made_up: f64,
+    /// The answer was read from a lookup. A planted hit from a lookup is
+    /// not evidence of memory, so it stays off both paired differences.
+    lookup: bool,
 }
 
 impl Grouping<'_> {
@@ -430,6 +433,7 @@ impl Grouping<'_> {
             )),
             hit: f64::from(u8::from(outcome == Outcome::Correct)),
             made_up: f64::from(u8::from(outcome == Outcome::Wrong)),
+            lookup: row["answered_from"].as_str() == Some("lookup"),
         };
         let open = self
             .facts
@@ -607,6 +611,11 @@ fn pairing_gaps(facts: &BTreeMap<FactKey, OpenFact>) -> BTreeMap<GroupKey, Vec<P
         let Some((group, planted)) = &open.planted else {
             continue;
         };
+        // A lookup hit is shown on the planted line and left out of both
+        // differences. It is not evidence that the fact was remembered.
+        if planted.hit > 0.0 && planted.lookup {
+            continue;
+        }
         let mut push = |against: &'static str, diff: f64| {
             by_run
                 .entry(GapKey {
@@ -1526,7 +1535,7 @@ mod tests {
             row["offset_days"] = 7.into();
             row["fact"] = fact.into();
             row["answer_kind"] = kind.into();
-            row["answered_from"] = "lookup".into();
+            row["answered_from"] = "context".into();
             row
         };
         for (run, fact) in [("r1", "f1"), ("r2", "f2")] {
@@ -1568,8 +1577,53 @@ mod tests {
             .iter()
             .find(|a| a.arm == "planted 7d")
             .unwrap();
-        assert_eq!(planted.lookup, 2);
+        assert_eq!(planted.lookup, 0);
         assert!(planted.from_known);
+
+        let lookup = tempfile::tempdir().unwrap();
+        let record = Record::open(lookup.path()).unwrap();
+        for (run, fact) in [("r1", "f1"), ("r2", "f2")] {
+            for (side, outcome, kind) in [
+                ("planted", "correct", "value"),
+                ("guess", "wrong", "value"),
+                ("twin", "wrong", "value"),
+            ] {
+                record
+                    .append(Stream::Items, row(run, side, outcome, kind, fact))
+                    .unwrap();
+            }
+        }
+        for (side, outcome, kind) in [
+            ("planted", "correct", "value"),
+            ("guess", "correct", "value"),
+            ("twin", "correct", "value"),
+        ] {
+            let mut looked = row("r3", side, outcome, kind, "f3");
+            if side == "planted" {
+                looked["answered_from"] = "lookup".into();
+            }
+            record.append(Stream::Items, looked).unwrap();
+        }
+        let summary = summary_of(&record);
+        let (key, gaps) = summary
+            .decisions
+            .iter()
+            .find(|(k, _)| k.set == "paired-facts/v1")
+            .unwrap();
+        let chance = gaps.iter().find(|g| g.against == "chance").unwrap();
+        assert_eq!(chance.runs, 2, "the lookup hit is not a third run");
+        assert!((chance.mean - 1.0).abs() < 1e-12, "{chance:?}");
+        let twin_gap = gaps.iter().find(|g| g.against == "twin").unwrap();
+        assert_eq!(
+            twin_gap.runs, 2,
+            "the lookup hit is out of the twin contrast"
+        );
+        assert!((twin_gap.mean - 0.0).abs() < 1e-12, "{twin_gap:?}");
+        let planted = summary.groups[key]
+            .iter()
+            .find(|a| a.arm == "planted 7d")
+            .unwrap();
+        assert_eq!(planted.lookup, 1);
 
         let one = tempfile::tempdir().unwrap();
         let record = Record::open(one.path()).unwrap();
