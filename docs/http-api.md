@@ -45,7 +45,7 @@ The same turn as `POST /chat`, delivered as server-sent events. The request body
 
 `channel` defaults to `chat`. It does not select the stream pool, and a value of `voice` does not select the call session. Both follow the caller's identity.
 
-The voice stream pool is taken only by a voice identity. That is the in-process voice plugin bound to the `voice` channel (any case), or a client that presents `[security] voice_secret` in the `X-Echo-Secret` header. The credential is configured on the server and must differ from `[security] secret`. A voice credential may speak only on the `voice` channel; any other channel is `403` and takes no permit.
+The voice stream pool is taken only by a voice identity. That is the in-process voice plugin bound to the `voice` channel (any case), or a client that presents `[security] voice_secret` in the `X-Echo-Secret` header. The credential is configured on the server and must differ from `[security] secret`. A voice credential may speak only on the `voice` channel; any other channel is `403` and takes no permit. A voice turn must send a non-blank `sender`. A missing, empty, or whitespace-only sender is `400` and takes no permit, on `POST /chat` and on this stream, even when the voice pool is full. A sender that contains an ASCII control character is `400` for every caller.
 
 A voice identity is a guest call under `[plugin_turns]`. `voice_turns_per_call` bounds that call. `daily_turns` bounds the credential's own UTC day, `http-voice`, separate from any plugin. Past a cap, `POST /chat` and this stream answer `429` with a short sentence and, on the stream, no event frame. A turn counts once it is admitted, even if the provider fails or the client disconnects.
 

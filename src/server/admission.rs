@@ -10,8 +10,8 @@ use axum::http::StatusCode;
 use crate::server::auth::AuthIdentity;
 use crate::server::guest_budget::{GuestKind, GuestRefusal};
 use crate::server::handlers::chat::{
-    refuse_peer_on_owner_channel, refuse_voice_off_channel, resolve_plugin_key, validate_request,
-    ChatRequest,
+    refuse_peer_on_owner_channel, refuse_voice_off_channel, refuse_voice_without_sender,
+    resolve_plugin_key, validate_request, ChatRequest,
 };
 use crate::server::AppState;
 use crate::session_key::SessionKey;
@@ -80,8 +80,9 @@ fn http_error((status, message): (StatusCode, String)) -> AdmitError {
     AdmitError::Http(status, message)
 }
 
-/// Validate `req`, refuse a peer on an owner channel and a voice credential
-/// off the voice channel, then resolve the session key the turn runs as.
+/// Validate `req`, refuse a peer on an owner channel, a voice credential
+/// off the voice channel, and a voice credential with no sender, then
+/// resolve the session key the turn runs as.
 pub(crate) fn admit_turn(
     state: &AppState,
     who: AuthIdentity,
@@ -90,6 +91,7 @@ pub(crate) fn admit_turn(
     validate_request(&req).map_err(http_error)?;
     refuse_peer_on_owner_channel(&who, &req.channel).map_err(http_error)?;
     refuse_voice_off_channel(&who, &req.channel).map_err(http_error)?;
+    refuse_voice_without_sender(&who, req.sender.as_deref()).map_err(http_error)?;
 
     let key = resolve_key(state, &who, &req)?;
     let call = is_call(&who);
@@ -134,16 +136,9 @@ fn resolve_key(
             resolve_plugin_key(name, channel, req, &state.config).map_err(http_error)
         }
         AuthIdentity::Voice => {
-            // The credential is not the person on the call, and a blank
-            // sender would collapse every such call onto one key.
-            let sender = req.sender.as_deref().unwrap_or("");
-            if sender.trim().is_empty() {
-                return Err(AdmitError::Http(
-                    StatusCode::BAD_REQUEST,
-                    "a voice turn needs a sender".to_string(),
-                ));
-            }
-            Ok(SessionKey::guest(sender))
+            // `refuse_voice_without_sender` already rejected a blank sender.
+            // The credential is not the person on the call.
+            Ok(SessionKey::guest(req.sender.as_deref().unwrap_or("")))
         }
     }
 }

@@ -4587,6 +4587,48 @@ mod http_voice_budget {
     }
 
     #[tokio::test]
+    async fn a_full_voice_pool_still_rejects_a_missing_sender() {
+        let dir = tempfile::tempdir().unwrap();
+        let gate = Arc::new(Gate::default());
+        let holders = crate::server::MAX_VOICE_STREAMS;
+        let state = voice_state(
+            dir.path(),
+            caps(holders as u32 + 1, 0, 0),
+            Box::new(GatedProvider(Arc::clone(&gate))),
+        )
+        .await;
+        let app = build_app(Arc::clone(&state));
+
+        let mut held = Vec::new();
+        for n in 0..holders {
+            let sender = format!("other-{n}");
+            let response =
+                post_stream(&app, "voice", Some(&sender), "hold", Some(VOICE_CREDENTIAL)).await;
+            assert_eq!(response.status(), StatusCode::OK, "holder {n}");
+            held.push(response);
+        }
+        assert_eq!(state.voice_permits.available_permits(), 0);
+
+        let missing = post_stream(&app, "voice", None, "hi", Some(VOICE_CREDENTIAL)).await;
+        assert_eq!(missing.status(), StatusCode::BAD_REQUEST);
+        let bytes = axum::body::to_bytes(missing.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(
+            String::from_utf8(bytes.to_vec()).unwrap(),
+            "a voice turn needs a sender"
+        );
+        assert_eq!(state.voice_permits.available_permits(), 0);
+
+        let (status, body) = chat(&app, "after-blank", VOICE_CREDENTIAL).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let (status, body) = chat(&app, "one-past", VOICE_CREDENTIAL).await;
+        assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(body, DAY_SPENT);
+        drop(held);
+    }
+
+    #[tokio::test]
     async fn owner_voice_body_is_never_counted() {
         let dir = tempfile::tempdir().unwrap();
         let state = voice_state(dir.path(), caps(0, 1, 0), mock_ok()).await;

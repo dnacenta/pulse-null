@@ -155,6 +155,22 @@ pub(crate) fn refuse_voice_off_channel(
     Ok(())
 }
 
+/// A voice credential names the person on the call. A missing, empty, or
+/// whitespace-only sender is 400 before a stream permit is taken, so a full
+/// voice pool does not turn that refusal into 503.
+pub(crate) fn refuse_voice_without_sender(
+    who: &AuthIdentity,
+    sender: Option<&str>,
+) -> Result<(), (StatusCode, String)> {
+    if matches!(who, AuthIdentity::Voice) && sender.unwrap_or("").trim().is_empty() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "a voice turn needs a sender".to_string(),
+        ));
+    }
+    Ok(())
+}
+
 /// The voice stream pool belongs to a voice identity. The body `channel`
 /// does not select it: an owner or a peer, including the owner admitted
 /// because no secret is configured, stays on the chat pool.
@@ -562,6 +578,7 @@ pub async fn chat_stream(
     validate_request(&req)?;
     refuse_peer_on_owner_channel(&who, &req.channel)?;
     refuse_voice_off_channel(&who, &req.channel)?;
+    refuse_voice_without_sender(&who, req.sender.as_deref())?;
     let permits = if uses_voice_pool(&who) {
         Arc::clone(&state.voice_permits)
     } else {
