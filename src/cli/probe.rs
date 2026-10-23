@@ -698,15 +698,20 @@ fn arm_reading(arm: &ArmResult, block: BlockState) -> String {
     } else if !block.readable {
         format!("{} answers so far (read when the block closes)", p.n)
     } else if arm.enough() && arm.arm.starts_with("twin") {
-        let made = crate::vigil::probe::score::wilson(arm.wrong, p.n);
-        format!(
-            "made up {} of {} it was never told · {:.0}% ({:.0}–{:.0})",
-            arm.wrong,
-            p.n,
-            100.0 * f64::from(arm.wrong) / f64::from(p.n.max(1)),
-            100.0 * made.low,
-            100.0 * made.high
-        )
+        // A count only, until a labelled check of real replies exists.
+        if crate::vigil::probe::summary::MADE_UP_CALIBRATED {
+            let made = crate::vigil::probe::score::wilson(arm.wrong, p.n);
+            format!(
+                "made up {} of {} it was never told · {:.0}% ({:.0}–{:.0})",
+                arm.wrong,
+                p.n,
+                100.0 * f64::from(arm.wrong) / f64::from(p.n.max(1)),
+                100.0 * made.low,
+                100.0 * made.high
+            )
+        } else {
+            format!("made up {} of {} it was never told", arm.wrong, p.n)
+        }
     } else if arm.enough() && arm.arm.starts_with("guess") {
         chance_rate(arm)
     } else if arm.enough() {
@@ -785,6 +790,14 @@ fn gap_shown(gap: &PairedGap, arms: &[ArmResult]) -> bool {
 }
 
 fn gap_line(gap: &PairedGap) -> String {
+    let role = format!("{}d paired difference", gap.offset_days);
+    let label = format!("vs {}", gap.against);
+    if gap.against == "twin" && !crate::vigil::probe::summary::MADE_UP_CALIBRATED {
+        return format!(
+            "      {label:<11} {role:<27} {} runs · uncalibrated, not a decision",
+            gap.runs
+        );
+    }
     let decision = if gap.exploratory {
         "exploratory, not a decision"
     } else if gap.above_zero() {
@@ -795,9 +808,7 @@ fn gap_line(gap: &PairedGap) -> String {
         "not above zero"
     };
     format!(
-        "      {:<11} {:<27} {:+.0}% ({:+.0}–{:+.0}) over {} runs · {decision}",
-        format!("vs {}", gap.against),
-        format!("{}d paired difference", gap.offset_days),
+        "      {label:<11} {role:<27} {:+.0}% ({:+.0}–{:+.0}) over {} runs · {decision}",
         100.0 * gap.mean,
         100.0 * gap.low,
         100.0 * gap.high,
@@ -2106,16 +2117,26 @@ mod tests {
         );
         let mut twin = arm("twin-7d", 0, 10);
         twin.wrong = 3;
-        let made = crate::vigil::probe::score::wilson(3, 10);
         assert_eq!(
             arm_reading(&twin, readable),
-            format!(
-                "made up 3 of 10 it was never told · {:.0}% ({:.0}–{:.0})",
-                30.0,
-                100.0 * made.low,
-                100.0 * made.high
-            )
+            "made up 3 of 10 it was never told"
         );
+        let mut twin_gap = PairedGap {
+            offset_days: 7,
+            against: "twin",
+            runs: 4,
+            mean: 1.0,
+            low: 0.5,
+            high: 1.0,
+            exploratory: false,
+        };
+        let line = gap_line(&twin_gap);
+        assert!(line.contains("4 runs"));
+        assert!(line.contains("uncalibrated, not a decision"), "{line}");
+        assert!(!line.contains("above zero"), "{line}");
+        assert!(!twin_gap.above_zero());
+        twin_gap.against = "chance";
+        assert!(gap_line(&twin_gap).contains("above zero"));
         let few = arm("planted-7d", 2, 4);
         assert_eq!(arm_reading(&few, readable), "not enough yet · 4 of 10");
         let mut uninstalled = few.clone();

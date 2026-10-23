@@ -22,6 +22,11 @@ use super::schedule::{self, timestamp, History, RunStatus};
 use super::score::{wilson, Outcome, Proportion};
 use super::sealed::Registry;
 
+/// The twin contrast (planted hit minus a made-up answer) is not a decision
+/// until a labelled check of real replies exists. Status still shows the count.
+/// A static, so the other branch stays compiled while this is false.
+pub static MADE_UP_CALIBRATED: bool = false;
+
 /// One stream's chain state.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ChainState {
@@ -185,11 +190,19 @@ pub struct PairedGap {
 
 impl PairedGap {
     /// The decision the widened interval supports: entirely above zero, on a
-    /// confirmatory offset, with more than one run.
+    /// confirmatory offset, with more than one run. The twin contrast does
+    /// not decide while [`MADE_UP_CALIBRATED`] is false.
     #[must_use]
     pub fn above_zero(&self) -> bool {
-        !self.exploratory && self.runs >= 2 && self.low > 0.0
+        paired_above_zero(self, MADE_UP_CALIBRATED)
     }
+}
+
+/// `above_zero` with the calibration flag passed in, so a test can show
+/// both sides of it.
+fn paired_above_zero(gap: &PairedGap, made_up_calibrated: bool) -> bool {
+    let twin_ready = gap.against != "twin" || made_up_calibrated;
+    twin_ready && !gap.exploratory && gap.runs >= 2 && gap.low > 0.0
 }
 
 impl ArmResult {
@@ -1540,6 +1553,19 @@ mod tests {
             .unwrap();
         assert_eq!((gap.low, gap.high), (-1.0, 1.0));
         assert!(!gap.above_zero());
+    }
+
+    /// The twin contrast is a count until a labelled check exists. A gap
+    /// that would otherwise lie above zero does not decide.
+    #[test]
+    fn an_uncalibrated_twin_contrast_does_not_decide() {
+        assert!(!MADE_UP_CALIBRATED);
+        let mut gap = gap_of(4, (1.0, 0.5, 1.0));
+        gap.against = "twin";
+        assert!(!gap.above_zero(), "{gap:?}");
+        assert!(paired_above_zero(&gap, true), "the flag is the only gate");
+        gap.against = "chance";
+        assert!(gap.above_zero());
     }
 
     fn gap_of(runs: u32, (mean, low, high): (f64, f64, f64)) -> PairedGap {

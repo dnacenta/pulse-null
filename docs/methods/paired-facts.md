@@ -214,22 +214,23 @@ digests' first eight characters. "Made up"
 counts the twin's wrong answers only; an empty answer counts in n and is
 neither correct nor made up. Per group, by side and offset (`planted 7d`,
 `twin 7d`, `chance 7d`, `guess 7d`): the planted side as "remembered k of
-n"; the twin as "made up m of n it was never told" with a 95% Wilson
-interval on those wrong answers (not on abstentions); the fresh arm's
-UNKNOWN-allowed ask as "volunteered with no memory k of n"; the forced
-guess as its unhedged hits, "chance k of n unhedged" (the chance rate).
-The decision is not those marginal intervals. For each fact, status scores
-the planted unhedged hit minus the forced guess's unhedged hit, and the
-planted hit minus the twin's made-up answer, averages within a run, and
-prints an interval on the run means (`vs chance`, `vs twin`). That
-interval starts as a 95% t interval and is widened so identical run means
-are not a point: the half-width is at least t times 1/3 over the square
-root of the run count (a run holds at most three facts, and a fact's
-difference is −1, 0 or +1), and it also takes in a Wilson interval on how
-many of the run means were positive, mapped onto [−1, +1]. It decides
-only when the widened interval lies above zero. Two runs at +1 do not
-decide. A constant small positive mean does not decide across the runs a
-batch contains. One run is not a decision. Labels name the
+n"; the twin as a count, "made up m of n it was never told", until a
+labelled check of real replies exists (no interval and no "above zero"
+on that contrast); the fresh arm's UNKNOWN-allowed ask as "volunteered
+with no memory k of n"; the forced guess as its unhedged hits, "chance k
+of n unhedged" (the chance rate). The decision is not those marginal
+counts. For each fact, status scores the planted unhedged hit minus the
+forced guess's unhedged hit, averages within a run, and prints an interval
+on the run means (`vs chance`). That interval starts as a 95% t interval
+and is widened so identical run means are not a point: the half-width is
+at least t times 1/3 over the square root of the run count (a run holds at
+most three facts, and a fact's difference is −1, 0 or +1), and it also
+takes in a Wilson interval on how many of the run means were positive,
+mapped onto [−1, +1]. It decides only when the widened interval lies above
+zero. Two runs at +1 do not decide. A constant small positive mean does
+not decide across the runs a batch contains. One run is not a decision.
+`vs twin` (planted hit minus made-up) is shown as a run count only and
+does not decide while that labelled check is missing. Labels name the
 pre-registered offset; status also shows how many days after the plant
 the asks actually came (`elapsed_days` on every row), since a missed run
 makes an ask late. For the planted side and the
@@ -263,12 +264,12 @@ before a number is shown ("not enough yet · k of 10").
   out on the planted line.
 - Fail branch: if, at 1 or 7 days, the widened interval on the run means of
   (planted unhedged hit − forced-guess unhedged hit) does not lie above
-  zero, or the widened interval on (planted hit − twin made-up) does not,
-  "Remembers" reads as not yet shown. The widening is the floor above: a
-  minimum half-width from the 1/3 grid step, and a Wilson bound on how
-  many run means were positive. Identical run means are not read as
-  certainty. Lookup is shown apart from context and does not decide by
-  itself. What a model with no memory volunteers is shown and never
+  zero, "Remembers" reads as not yet shown. The widening is the floor
+  above: a minimum half-width from the 1/3 grid step, and a Wilson bound
+  on how many run means were positive. Identical run means are not read as
+  certainty. The twin contrast does not enter this branch until a labelled
+  check of real replies exists; until then it is a count and cannot read
+  as "above zero". Lookup is shown apart from context and does not decide
+  by itself. What a model with no memory volunteers is shown and never
   decides it. The 30- and 90-day offsets are exploratory and never decide
-  it. "Made up" is not read until a labelled check of the coding frame
-  exists.
+  it.

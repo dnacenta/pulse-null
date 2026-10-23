@@ -554,9 +554,9 @@ record file's chain state, and each measure by lineage group, block and
 arm: k of n with a 95% interval (clustered by run for the item sets, with
 Student's t on runs − 1 degrees of freedom and never narrower than a Wilson
 interval on how many runs were all-correct, the run count printed beside
-it; for paired facts, a t interval on the run means of the paired
-differences, decided only when it lies above zero, and Wilson on the twin's
-wrong answers) once the block has closed, or "not
+it; for paired facts, a widened t interval on the run means of the
+chance contrast, decided only when it lies above zero; the twin contrast
+is a count and does not decide until a labelled check exists) once the block has closed, or "not
 enough yet · k of N" below the set's pre-registered minimum (G5). Planted
 rows that say where the answer came from break lookup out of the count.
 There is
