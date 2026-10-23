@@ -8,7 +8,7 @@
 use axum::http::StatusCode;
 
 use crate::server::auth::AuthIdentity;
-use crate::server::guest_budget::GuestRefusal;
+use crate::server::guest_budget::{GuestKind, GuestRefusal};
 use crate::server::handlers::chat::{
     refuse_peer_on_owner_channel, refuse_voice_off_channel, resolve_plugin_key, validate_request,
     ChatRequest,
@@ -26,13 +26,15 @@ pub(crate) struct Admitted {
     _private: (),
 }
 
+/// The ledger HTTP voice turns spend, separate from any plugin's day.
+pub(crate) const HTTP_VOICE_LEDGER: &str = "http-voice";
+
 /// Why a turn was not admitted.
 #[derive(Debug)]
 pub(crate) enum AdmitError {
     /// Validation or an identity refusal, as `/chat` would have answered.
     Http(StatusCode, String),
-    /// A guest cap refused the turn. Nothing builds this until caps run here.
-    #[allow(dead_code)]
+    /// A guest cap refused the turn.
     Guest(GuestRefusal),
 }
 
@@ -42,18 +44,7 @@ impl AdmitError {
     pub(crate) fn into_http(self) -> (StatusCode, String) {
         match self {
             Self::Http(status, message) => (status, message),
-            Self::Guest(GuestRefusal::DailyBudgetSpent) => (
-                StatusCode::TOO_MANY_REQUESTS,
-                "No more guest turns today. Please try again tomorrow.".to_string(),
-            ),
-            Self::Guest(GuestRefusal::CallTurnsSpent) => (
-                StatusCode::TOO_MANY_REQUESTS,
-                "This call has used all its turns.".to_string(),
-            ),
-            Self::Guest(GuestRefusal::SenderRateLimited) => (
-                StatusCode::TOO_MANY_REQUESTS,
-                "Too many messages. Please slow down.".to_string(),
-            ),
+            Self::Guest(refusal) => (StatusCode::TOO_MANY_REQUESTS, refusal.message().to_string()),
         }
     }
 }
@@ -116,11 +107,55 @@ pub(crate) fn admit_turn(
         }
         AuthIdentity::Owner | AuthIdentity::Peer(_) => false,
     };
+    count_guest(state, who, req, &key)?;
     Ok(Admitted {
         key,
         is_call,
         _private: (),
     })
+}
+
+/// Guest caps for a plugin principal and for the HTTP voice credential.
+/// The owner and a peer are never counted. A refusal is not counted; an
+/// admitted turn is, and nothing later refunds it.
+fn count_guest(
+    state: &AppState,
+    who: &AuthIdentity,
+    req: &ChatRequest,
+    key: &SessionKey,
+) -> Result<(), AdmitError> {
+    let ledger = match who {
+        AuthIdentity::Plugin { name, .. } => *name,
+        AuthIdentity::Voice => HTTP_VOICE_LEDGER,
+        AuthIdentity::Owner | AuthIdentity::Peer(_) => return Ok(()),
+    };
+    if !key.is_guest() {
+        return Ok(());
+    }
+    let kind = if req
+        .channel
+        .eq_ignore_ascii_case(crate::server::turns::VOICE_CHANNEL)
+    {
+        GuestKind::Call
+    } else {
+        GuestKind::Sender
+    };
+    state
+        .turns
+        .guest_ledger(ledger)
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .admit(
+            key.as_str(),
+            kind,
+            &state.config.plugin_turns,
+            std::time::Instant::now(),
+            chrono::Utc::now().date_naive(),
+        )
+        .map_err(|refusal| {
+            tracing::warn!("guest turn for {key} refused on {ledger}: {refusal:?}");
+            AdmitError::Guest(refusal)
+        })
 }
 
 #[cfg(test)]

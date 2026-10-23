@@ -509,6 +509,35 @@ async fn post_chat(app: &Router, message: &str) -> (StatusCode, String) {
     (status, text)
 }
 
+async fn post_chat_secret(
+    app: &Router,
+    channel: &str,
+    sender: Option<&str>,
+    message: &str,
+    secret: Option<&str>,
+) -> (StatusCode, String) {
+    let mut body = serde_json::json!({ "message": message, "channel": channel });
+    if let Some(sender) = sender {
+        body["sender"] = serde_json::Value::String(sender.to_string());
+    }
+    let mut builder = Request::builder()
+        .method("POST")
+        .uri("/chat")
+        .header("Content-Type", "application/json");
+    if let Some(secret) = secret {
+        builder = builder.header("X-Echo-Secret", secret);
+    }
+    let req = builder
+        .body(Body::from(serde_json::to_string(&body).unwrap()))
+        .unwrap();
+    let response = app.clone().oneshot(req).await.unwrap();
+    let status = response.status();
+    let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    (status, String::from_utf8(bytes.to_vec()).unwrap())
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -4233,8 +4262,327 @@ mod plugin_turns_e2e {
 }
 
 // ---------------------------------------------------------------------------
-// PN-110 audit P1: only the owner's turns get the CLI's full tool surface
+// PN-163: HTTP voice turns spend the same guest caps
 // ---------------------------------------------------------------------------
+
+mod http_voice_budget {
+    use super::*;
+    use crate::config::PluginTurnsConfig;
+    use crate::server::turns::PluginTurn;
+    use crate::streaming::StreamingProvider;
+
+    const OWNER_SECRET: &str = "owner-secret";
+    const CALL_SPENT: &str = "This call has used all its turns.";
+    const DAY_SPENT: &str = "No more guest turns today. Please try again tomorrow.";
+
+    fn caps(daily: u32, per_call: u32, burst: u32) -> PluginTurnsConfig {
+        PluginTurnsConfig {
+            daily_turns: daily,
+            voice_turns_per_call: per_call,
+            guest_burst: burst,
+            guest_per_minute: 0.0,
+        }
+    }
+
+    async fn voice_state(
+        dir: &std::path::Path,
+        caps: PluginTurnsConfig,
+        provider: Box<dyn StreamingProvider>,
+    ) -> Arc<AppState> {
+        let mut config = config_with_voice_credential();
+        config.security.secret = Some(OWNER_SECRET.to_string());
+        config.owner.discord_id = Some("1001".to_string());
+        config.plugin_turns = caps;
+        let state =
+            build_state_boxed_with_config(dir.to_path_buf(), provider, ToolRegistry::new(), config)
+                .await;
+        state.turns.bind(&state);
+        state
+    }
+
+    fn mock_ok() -> Box<dyn StreamingProvider> {
+        Box::new(MockProvider::new(vec![]))
+    }
+
+    async fn post_stream(
+        app: &Router,
+        channel: &str,
+        sender: Option<&str>,
+        message: &str,
+        secret: Option<&str>,
+    ) -> axum::response::Response {
+        let mut body = serde_json::json!({ "message": message, "channel": channel });
+        if let Some(sender) = sender {
+            body["sender"] = serde_json::Value::String(sender.to_string());
+        }
+        let mut builder = Request::builder()
+            .method("POST")
+            .uri("/api/chat/stream")
+            .header("Content-Type", "application/json");
+        if let Some(secret) = secret {
+            builder = builder.header("X-Echo-Secret", secret);
+        }
+        let req = builder
+            .body(Body::from(serde_json::to_string(&body).unwrap()))
+            .unwrap();
+        app.clone().oneshot(req).await.unwrap()
+    }
+
+    async fn chat(app: &Router, sender: &str, secret: &str) -> (StatusCode, String) {
+        post_chat_secret(app, "voice", Some(sender), "hi", Some(secret)).await
+    }
+
+    fn plugin_turn(sender: &str) -> PluginTurn {
+        PluginTurn {
+            message: "hi".to_string(),
+            sender: Some(sender.to_string()),
+        }
+    }
+
+    #[tokio::test]
+    async fn http_voice_chat_has_a_call_cap() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = voice_state(dir.path(), caps(0, 2, 0), mock_ok()).await;
+        let app = build_app(state);
+        for n in 1..=2 {
+            let (status, body) = chat(&app, "pv-CA1", VOICE_CREDENTIAL).await;
+            assert_eq!(status, StatusCode::OK, "turn {n}: {body}");
+        }
+        let (status, body) = chat(&app, "pv-CA1", VOICE_CREDENTIAL).await;
+        assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(body, CALL_SPENT);
+    }
+
+    #[tokio::test]
+    async fn http_voice_stream_refusal_is_429_before_any_frame() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = voice_state(dir.path(), caps(0, 1, 0), mock_ok()).await;
+        let app = build_app(Arc::clone(&state));
+
+        let first = post_stream(&app, "voice", Some("pv-CA1"), "hi", Some(VOICE_CREDENTIAL)).await;
+        assert_eq!(first.status(), StatusCode::OK);
+        let _ = axum::body::to_bytes(first.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(
+            state.voice_permits.available_permits(),
+            crate::server::MAX_VOICE_STREAMS
+        );
+
+        let refused =
+            post_stream(&app, "voice", Some("pv-CA1"), "hi", Some(VOICE_CREDENTIAL)).await;
+        assert_eq!(refused.status(), StatusCode::TOO_MANY_REQUESTS);
+        let content_type = refused
+            .headers()
+            .get("content-type")
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or("");
+        assert!(
+            !content_type.starts_with("text/event-stream"),
+            "{content_type}"
+        );
+        let bytes = axum::body::to_bytes(refused.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(String::from_utf8(bytes.to_vec()).unwrap(), CALL_SPENT);
+        assert_eq!(
+            state.voice_permits.available_permits(),
+            crate::server::MAX_VOICE_STREAMS,
+            "a refusal must not keep a voice permit"
+        );
+
+        let other = post_stream(&app, "voice", Some("pv-CA2"), "hi", Some(VOICE_CREDENTIAL)).await;
+        assert_eq!(other.status(), StatusCode::OK);
+        let _ = axum::body::to_bytes(other.into_body(), usize::MAX)
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn http_voice_daily_budget_owner_outside() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = voice_state(dir.path(), caps(2, 0, 0), mock_ok()).await;
+        let app = build_app(state);
+        let (status, body) = chat(&app, "one", VOICE_CREDENTIAL).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let (status, body) = chat(&app, "two", VOICE_CREDENTIAL).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let (status, body) = chat(&app, "three", VOICE_CREDENTIAL).await;
+        assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(body, DAY_SPENT);
+        let (status, body) = chat(&app, "owner", OWNER_SECRET).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+    }
+
+    #[tokio::test]
+    async fn http_voice_and_plugin_have_separate_days() {
+        let plugin_then_http = tempfile::tempdir().unwrap();
+        let state = voice_state(plugin_then_http.path(), caps(1, 0, 0), mock_ok()).await;
+        let voice = state.turns.for_plugin("voice-echo", "voice").unwrap();
+        assert!(voice.run(plugin_turn("plugin-caller"), None).await.is_ok());
+        let app = build_app(Arc::clone(&state));
+        let (status, body) = chat(&app, "http-caller", VOICE_CREDENTIAL).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+
+        let http_then_plugin = tempfile::tempdir().unwrap();
+        let state = voice_state(http_then_plugin.path(), caps(1, 0, 0), mock_ok()).await;
+        let app = build_app(Arc::clone(&state));
+        let (status, body) = chat(&app, "http-caller", VOICE_CREDENTIAL).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let voice = state.turns.for_plugin("voice-echo", "voice").unwrap();
+        assert!(voice.run(plugin_turn("plugin-caller"), None).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn concurrent_turns_never_exceed_the_call_cap() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = voice_state(dir.path(), caps(0, 1, 0), mock_ok()).await;
+        let app = build_app(state);
+        let left = app.clone();
+        let right = app.clone();
+        let (one, two) = tokio::join!(
+            chat(&left, "same-call", VOICE_CREDENTIAL),
+            chat(&right, "same-call", VOICE_CREDENTIAL),
+        );
+        let mut statuses = [one.0, two.0];
+        statuses.sort();
+        assert_eq!(statuses, [StatusCode::OK, StatusCode::TOO_MANY_REQUESTS]);
+        let refused = if one.0 == StatusCode::TOO_MANY_REQUESTS {
+            one.1
+        } else {
+            two.1
+        };
+        assert_eq!(refused, CALL_SPENT);
+    }
+
+    #[tokio::test]
+    async fn a_dropped_stream_turn_is_charged() {
+        let dir = tempfile::tempdir().unwrap();
+        let gate = Arc::new(Gate::default());
+        let state = voice_state(
+            dir.path(),
+            caps(0, 2, 0),
+            Box::new(GatedProvider(Arc::clone(&gate))),
+        )
+        .await;
+        let app = build_app(Arc::clone(&state));
+        let hanging = post_stream(
+            &app,
+            "voice",
+            Some("caller"),
+            "hold",
+            Some(VOICE_CREDENTIAL),
+        )
+        .await;
+        assert_eq!(hanging.status(), StatusCode::OK);
+        gate.wait_holding(1).await;
+        drop(hanging);
+
+        let mut rolled_back = false;
+        for _ in 0..50 {
+            let read = async {
+                match state
+                    .session_store
+                    .get_existing_by_key("guest:caller")
+                    .await
+                {
+                    Some(arc) => arc.read().await.data.messages.len(),
+                    None => 0,
+                }
+            };
+            match tokio::time::timeout(std::time::Duration::from_millis(200), read).await {
+                Ok(0) => {
+                    rolled_back = true;
+                    break;
+                }
+                Ok(_) => tokio::time::sleep(std::time::Duration::from_millis(20)).await,
+                Err(_) => {}
+            }
+        }
+        assert!(
+            rolled_back,
+            "dropping the stream did not roll the turn back"
+        );
+
+        let (status, body) = chat(&app, "caller", VOICE_CREDENTIAL).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let (status, body) = chat(&app, "caller", VOICE_CREDENTIAL).await;
+        assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(body, CALL_SPENT);
+    }
+
+    #[tokio::test]
+    async fn pool_full_and_bad_requests_are_not_charged() {
+        let dir = tempfile::tempdir().unwrap();
+        let gate = Arc::new(Gate::default());
+        let state = voice_state(
+            dir.path(),
+            caps(0, 1, 0),
+            Box::new(GatedProvider(Arc::clone(&gate))),
+        )
+        .await;
+        let app = build_app(Arc::clone(&state));
+
+        let (status, _) = post_chat_secret(
+            &app,
+            "bad/name",
+            Some("caller"),
+            "hi",
+            Some(VOICE_CREDENTIAL),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        let off = post_stream(&app, "chat", Some("caller"), "hi", Some(VOICE_CREDENTIAL)).await;
+        assert_eq!(off.status(), StatusCode::FORBIDDEN);
+
+        let mut held = Vec::new();
+        for n in 0..crate::server::MAX_VOICE_STREAMS {
+            let sender = format!("other-{n}");
+            let response =
+                post_stream(&app, "voice", Some(&sender), "hold", Some(VOICE_CREDENTIAL)).await;
+            assert_eq!(response.status(), StatusCode::OK, "holder {n}");
+            held.push(response);
+        }
+        assert_eq!(state.voice_permits.available_permits(), 0);
+        let full = post_stream(&app, "voice", Some("caller"), "hi", Some(VOICE_CREDENTIAL)).await;
+        assert_eq!(full.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(state.voice_permits.available_permits(), 0);
+        drop(held);
+        drop(full);
+        assert_eq!(
+            state.voice_permits.available_permits(),
+            crate::server::MAX_VOICE_STREAMS
+        );
+
+        let (status, body) = chat(&app, "caller", VOICE_CREDENTIAL).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let (status, body) = chat(&app, "caller", VOICE_CREDENTIAL).await;
+        assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(body, CALL_SPENT);
+    }
+
+    #[tokio::test]
+    async fn owner_voice_body_is_never_counted() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = voice_state(dir.path(), caps(0, 1, 0), mock_ok()).await;
+        let app = build_app(state);
+        for n in 0..5 {
+            let (status, body) = chat(&app, "sam", OWNER_SECRET).await;
+            assert_eq!(status, StatusCode::OK, "turn {n}: {body}");
+        }
+    }
+
+    #[tokio::test]
+    async fn zero_caps_leave_http_voice_uncapped() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = voice_state(dir.path(), caps(0, 0, 0), mock_ok()).await;
+        let app = build_app(state);
+        for n in 0..8 {
+            let (status, body) = chat(&app, "caller", VOICE_CREDENTIAL).await;
+            assert_eq!(status, StatusCode::OK, "turn {n}: {body}");
+        }
+    }
+}
 
 mod tool_surface_e2e {
     use super::*;

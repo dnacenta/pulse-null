@@ -28,7 +28,7 @@ use tokio::time::Instant;
 
 use super::admission::{admit_turn, AdmitError};
 use super::auth::AuthIdentity;
-use super::guest_budget::{GuestKind, GuestLedger, GuestRefusal};
+use super::guest_budget::{GuestLedger, GuestRefusal};
 use super::handlers::chat::{run_turn, ChatRequest, ChatResponse};
 use super::rate_limit::RateLimiter;
 use super::AppState;
@@ -326,6 +326,19 @@ impl TurnRunner {
         self.refuse_new();
         self.drain(within).await
     }
+
+    /// The guest ledger stored under `name`, creating the same budget entry
+    /// a plugin handle uses so that handle and these turns share one ledger.
+    pub(crate) fn guest_ledger(&self, name: &'static str) -> Arc<Mutex<GuestLedger>> {
+        self.shared
+            .budgets
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .entry(name)
+            .or_insert_with(Budget::new)
+            .guests
+            .clone()
+    }
 }
 
 /// The plugin-facing half of the runner.
@@ -518,52 +531,9 @@ impl PluginTurns {
             AdmitError::Guest(GuestRefusal::CallTurnsSpent) => TurnError::CallTurnsSpent,
             AdmitError::Guest(GuestRefusal::SenderRateLimited) => TurnError::SenderRateLimited,
         })?;
-        self.admit_guest(&state, &request)?;
         run_turn(state, request, who, admitted, sink, None)
             .await
             .map_err(|(status, message)| TurnError::Refused(status, message))
-    }
-
-    /// The `[plugin_turns]` caps, for a guest's turn; the owner's are never
-    /// counted. A request that would not resolve is left for the turn
-    /// pipeline to refuse.
-    fn admit_guest(&self, state: &AppState, request: &ChatRequest) -> Result<(), TurnError> {
-        let Ok(key) = crate::server::handlers::chat::resolve_plugin_key(
-            self.name,
-            &self.channel,
-            request,
-            &state.config,
-        ) else {
-            return Ok(());
-        };
-        if !key.is_guest() {
-            return Ok(());
-        }
-        let kind = if self.channel.eq_ignore_ascii_case(VOICE_CHANNEL) {
-            GuestKind::Call
-        } else {
-            GuestKind::Sender
-        };
-        let admitted = self
-            .budget
-            .guests
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .admit(
-                key.as_str(),
-                kind,
-                &state.config.plugin_turns,
-                Instant::now().into_std(),
-                chrono::Utc::now().date_naive(),
-            );
-        admitted.map_err(|refusal| {
-            tracing::warn!("plugin {}: turn for {key} refused: {refusal:?}", self.name);
-            match refusal {
-                GuestRefusal::DailyBudgetSpent => TurnError::DailyBudgetSpent,
-                GuestRefusal::CallTurnsSpent => TurnError::CallTurnsSpent,
-                GuestRefusal::SenderRateLimited => TurnError::SenderRateLimited,
-            }
-        })
     }
 
     /// A token from the plugin's rate bucket. With [`SlotWait::Forever`] the
