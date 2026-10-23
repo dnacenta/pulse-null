@@ -1433,6 +1433,29 @@ async fn post_chat_stream_secret(
     app.clone().oneshot(req).await.unwrap()
 }
 
+async fn post_chat_stream_from(
+    app: &Router,
+    channel: &str,
+    sender: Option<&str>,
+    secret: Option<&str>,
+) -> axum::response::Response {
+    let mut body = serde_json::json!({ "message": "hi", "channel": channel });
+    if let Some(sender) = sender {
+        body["sender"] = serde_json::Value::String(sender.to_string());
+    }
+    let mut builder = Request::builder()
+        .method("POST")
+        .uri("/api/chat/stream")
+        .header("Content-Type", "application/json");
+    if let Some(secret) = secret {
+        builder = builder.header("X-Echo-Secret", secret);
+    }
+    let req = builder
+        .body(Body::from(serde_json::to_string(&body).unwrap()))
+        .unwrap();
+    app.clone().oneshot(req).await.unwrap()
+}
+
 const VOICE_CREDENTIAL: &str = "voice-credential";
 
 fn config_with_voice_credential() -> Config {
@@ -2097,6 +2120,72 @@ async fn e2e_owner_voice_channel_does_not_exhaust_voice_pool() {
     drop(held);
     drop(fifth);
     drop(voice);
+}
+
+/// A demoted `channel: voice` body hangs on the owner's ordinary session.
+/// A voice-credential turn for the same sender, and for no sender, still
+/// produces a frame: it does not share that lock.
+async fn demoted_voice_body_does_not_block_a_call(sender: Option<&str>) {
+    use tokio_stream::StreamExt as _;
+
+    let dir = tempfile::tempdir().unwrap();
+    let state = build_state_boxed_with_config(
+        dir.path().to_path_buf(),
+        Box::new(HangingProvider),
+        ToolRegistry::new(),
+        config_with_voice_credential(),
+    )
+    .await;
+    let app = build_app(Arc::clone(&state));
+    let demoted = within_test_wait(
+        "demoted voice body",
+        post_chat_stream_from(&app, "voice", sender, None),
+    )
+    .await;
+    assert_eq!(demoted.status(), StatusCode::OK);
+    let mut demoted_body = demoted.into_body().into_data_stream();
+    let mut seen = String::new();
+    while !seen.contains("event: status") {
+        let chunk = tokio::time::timeout(std::time::Duration::from_secs(5), demoted_body.next())
+            .await
+            .expect("demoted stream stalled")
+            .expect("demoted stream ended")
+            .expect("demoted body error");
+        seen.push_str(&String::from_utf8_lossy(&chunk));
+    }
+    assert!(
+        state
+            .session_store
+            .get_existing_by_key("owner")
+            .await
+            .is_some(),
+        "demoted voice body did not use the owner session"
+    );
+
+    let voice = within_test_wait(
+        "voice credential while demoted turn holds its session",
+        post_chat_stream_from(&app, "voice", sender, Some(VOICE_CREDENTIAL)),
+    )
+    .await;
+    assert_eq!(voice.status(), StatusCode::OK);
+    let mut voice_body = voice.into_body().into_data_stream();
+    let mut voice_seen = String::new();
+    while !voice_seen.contains("event: status") {
+        let chunk = tokio::time::timeout(std::time::Duration::from_secs(5), voice_body.next())
+            .await
+            .expect("voice stream stalled behind the demoted turn")
+            .expect("voice stream ended")
+            .expect("voice body error");
+        voice_seen.push_str(&String::from_utf8_lossy(&chunk));
+    }
+    drop(demoted_body);
+    drop(voice_body);
+}
+
+#[tokio::test]
+async fn e2e_demoted_voice_body_does_not_block_a_call() {
+    demoted_voice_body_does_not_block_a_call(None).await;
+    demoted_voice_body_does_not_block_a_call(Some("sam")).await;
 }
 
 fn frame_index(frames: &[(String, String)], pred: impl Fn(&str, &str) -> bool) -> usize {

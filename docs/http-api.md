@@ -47,7 +47,7 @@ The same turn as `POST /chat`, delivered as server-sent events. The request body
 
 The voice stream pool is taken only by a voice identity. That is the in-process voice plugin bound to the `voice` channel (any case), or a client that presents `[security] voice_secret` in the `X-Echo-Secret` header. The credential is configured on the server and must differ from `[security] secret`. A voice credential may speak only on the `voice` channel; any other channel is `403` and takes no permit.
 
-Every other caller uses the chat stream pool, whatever `channel` says. That includes the owner, a peer, and every caller when `[security] secret` is unset (those requests are the owner). A non-voice caller that sends `channel` equal to `voice` is not rejected. The turn runs on the chat pool, and `channel` still routes the session.
+Every other caller uses the chat stream pool, whatever `channel` says. That includes the owner, a peer, and every caller when `[security] secret` is unset (those requests are the owner). A non-voice caller that sends `channel` equal to `voice` is not rejected. The turn runs on the chat pool, in that principal's ordinary session, and does not enter the call set.
 
 Each pool allows 4 streams at once. A further request gets `503` with `too many open streams; try again shortly`. The response is `text/event-stream`, with a comment keep-alive every 15 seconds.
 

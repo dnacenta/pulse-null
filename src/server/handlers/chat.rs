@@ -239,12 +239,24 @@ pub(crate) async fn run_turn(
     // refused, and the session key comes from the credential, not from
     // `sender` or `channel`.
     let resolved_key = match &who {
-        AuthIdentity::Owner => resolve_sender(
-            &req.channel,
-            req.sender.as_deref(),
-            &state.config.owner,
-            &state.config.peers,
-        ),
+        AuthIdentity::Owner => {
+            // A demoted `channel: voice` body is still this principal. It
+            // must not open `guest:anonymous` (or the named sender) in the
+            // call set, which is the session a real voice credential uses.
+            if req
+                .channel
+                .eq_ignore_ascii_case(crate::server::turns::VOICE_CHANNEL)
+            {
+                SessionKey::owner()
+            } else {
+                resolve_sender(
+                    &req.channel,
+                    req.sender.as_deref(),
+                    &state.config.owner,
+                    &state.config.peers,
+                )
+            }
+        }
         AuthIdentity::Peer(name) => {
             refuse_peer_on_owner_channel(&who, &req.channel)?;
             SessionKey::peer(name)
@@ -259,6 +271,15 @@ pub(crate) async fn run_turn(
             SessionKey::guest(req.sender.as_deref().unwrap_or("anonymous"))
         }
     };
+    // The call set is only a voice identity. A demoted body that says
+    // `voice` keeps the principal's ordinary session.
+    let is_call = match &who {
+        AuthIdentity::Voice => true,
+        AuthIdentity::Plugin { channel, .. } => {
+            channel.eq_ignore_ascii_case(crate::server::turns::VOICE_CHANNEL)
+        }
+        AuthIdentity::Owner | AuthIdentity::Peer(_) => false,
+    };
 
     // Only the owner's turns reach the agent CLI with its full tool surface;
     // a guest or peer runs on the restricted one, whatever the isolation
@@ -268,7 +289,15 @@ pub(crate) async fn run_turn(
     let hold_deltas = uses_voice_pool(&who);
     crate::tool_surface::scope(
         surface,
-        run_resolved_turn(state, req, resolved_key, sink, hold_deltas, control),
+        run_resolved_turn(
+            state,
+            req,
+            resolved_key,
+            sink,
+            hold_deltas,
+            is_call,
+            control,
+        ),
     )
     .await
 }
@@ -282,6 +311,7 @@ async fn run_resolved_turn(
     resolved_key: SessionKey,
     sink: Option<TurnSink>,
     hold_deltas: bool,
+    is_call: bool,
     control: Option<Arc<tool_loop::ControlPlane>>,
 ) -> Result<ChatResponse, (StatusCode, String)> {
     let sender_label = req.sender.as_deref().unwrap_or("unknown");
@@ -290,7 +320,7 @@ async fn run_resolved_turn(
     {
         return Ok(reply);
     }
-    let mut turn = steps::TurnScope::new(&state, &req, &resolved_key, sender_label);
+    let mut turn = steps::TurnScope::new(&state, &req, &resolved_key, sender_label, is_call);
 
     let user_message = steps::compose_user_message(&turn).await;
     let incoming = steps::ChannelLine {
@@ -557,7 +587,8 @@ fn error_to_sse(status: StatusCode, message: String) -> Event {
 /// `[security] voice_secret`. Every other caller, including the owner,
 /// draws from the chat pool whatever `channel` says. A non-voice caller
 /// that sends `channel: voice` is not rejected; the turn runs on the chat
-/// pool and the channel still routes the session. A voice credential on
+/// pool, in that principal's ordinary session, and does not enter the call
+/// set. A voice credential on
 /// any other channel is `403` before a permit is taken.
 ///
 /// Client contract: deltas are best-effort. A screen stream forwards them

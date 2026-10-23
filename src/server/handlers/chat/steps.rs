@@ -41,10 +41,10 @@ pub(super) struct TurnScope<'a> {
     /// guest, and one caller's words are not another caller's context
     /// (PN-110 audit #3).
     is_voice: bool,
-    /// A voice caller's call is its own guest session, in the store's call
-    /// set: never persisted, never evicting another kind of session (audit
-    /// R2-6). A non-guest on the voice channel (an owner client over HTTP)
-    /// keeps an ordinary session.
+    /// A voice identity's turn (the voice credential, or the plugin bound to
+    /// the voice channel). That session lives in the call set: never
+    /// persisted, never evicting another kind of session (audit R2-6). A
+    /// non-voice principal whose body says `voice` is not a call.
     is_call: bool,
     /// Per-turn correlation ID for the utility feedback loop.
     pub(super) correlation_id: String,
@@ -56,6 +56,7 @@ impl<'a> TurnScope<'a> {
         req: &'a ChatRequest,
         key: &'a SessionKey,
         sender_label: &'a str,
+        is_call: bool,
     ) -> Self {
         let is_voice = req
             .channel
@@ -68,7 +69,7 @@ impl<'a> TurnScope<'a> {
             sender_label,
             isolated: isolation::is_active(&state.root_dir),
             is_voice,
-            is_call: is_voice && key.is_guest(),
+            is_call,
             correlation_id: chat_correlation_id(key),
         }
     }
