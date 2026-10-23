@@ -1350,4 +1350,26 @@ current conversation.
         );
         assert_eq!(std::fs::read_to_string(&path).unwrap(), OLD_GENERATED_RULES);
     }
+
+    #[test]
+    fn no_hook_injects_ephemeral() {
+        assert!(
+            RECALL_HOOKS.iter().all(|(_, sub)| *sub != "consume"),
+            "RECALL_HOOKS installs consume: {RECALL_HOOKS:?}"
+        );
+        let dir = pulse();
+        let root = dir.path().canonicalize().unwrap();
+        ensure_files(&root, "recall-echo");
+        let doc = read_settings(&root);
+        assert!(doc["hooks"].get("SessionStart").is_none(), "{doc}");
+        let hooks = doc["hooks"].as_object().expect("hooks object");
+        for event in hooks.keys() {
+            for command in commands(&doc, event) {
+                assert!(
+                    !is_recall_command(&command, "consume"),
+                    "{event} injects EPHEMERAL via {command}"
+                );
+            }
+        }
+    }
 }
