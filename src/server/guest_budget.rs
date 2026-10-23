@@ -45,6 +45,18 @@ pub enum GuestRefusal {
     SenderRateLimited,
 }
 
+impl GuestRefusal {
+    /// A short sentence a caller can be shown. It names no ledger and no secret.
+    #[must_use]
+    pub fn message(self) -> &'static str {
+        match self {
+            Self::DailyBudgetSpent => "No more guest turns today. Please try again tomorrow.",
+            Self::CallTurnsSpent => "This call has used all its turns.",
+            Self::SenderRateLimited => "Too many messages. Please slow down.",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 struct CallUse {
     turns: u32,
@@ -303,5 +315,22 @@ mod tests {
             !ledger.calls.contains_key("call-0"),
             "the oldest was forgotten"
         );
+    }
+
+    #[test]
+    fn refusal_messages_are_short_plain_sentences() {
+        for refusal in [
+            GuestRefusal::DailyBudgetSpent,
+            GuestRefusal::CallTurnsSpent,
+            GuestRefusal::SenderRateLimited,
+        ] {
+            let message = refusal.message();
+            assert!(message.ends_with('.'), "{message}");
+            assert!(message.len() <= 60, "{} chars: {message}", message.len());
+            assert!(
+                !message.to_ascii_lowercase().contains("plugin"),
+                "{message}"
+            );
+        }
     }
 }

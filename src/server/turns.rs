@@ -26,8 +26,9 @@ use axum::http::StatusCode;
 use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore};
 use tokio::time::Instant;
 
+use super::admission::{admit_turn, AdmitError};
 use super::auth::AuthIdentity;
-use super::guest_budget::{GuestKind, GuestLedger, GuestRefusal};
+use super::guest_budget::{GuestLedger, GuestRefusal};
 use super::handlers::chat::{run_turn, ChatRequest, ChatResponse};
 use super::rate_limit::RateLimiter;
 use super::AppState;
@@ -219,6 +220,9 @@ struct Shared {
         allow(dead_code)
     )]
     budgets: Mutex<HashMap<&'static str, Budget>>,
+    /// HTTP voice guest turns. Kept off the plugin-name map, so a plugin
+    /// cannot be given this ledger, and the credential gets no pool or rate bucket.
+    http_voice_guests: Mutex<GuestLedger>,
     #[cfg_attr(
         not(any(feature = "voice", feature = "discord-text")),
         allow(dead_code)
@@ -257,6 +261,7 @@ impl TurnRunner {
                 in_flight: AtomicUsize::new(0),
                 drained: Notify::new(),
                 budgets: Mutex::new(HashMap::new()),
+                http_voice_guests: Mutex::new(GuestLedger::default()),
                 ready_timeout,
             }),
         }
@@ -324,6 +329,25 @@ impl TurnRunner {
     pub(crate) async fn close(&self, within: Duration) -> bool {
         self.refuse_new();
         self.drain(within).await
+    }
+
+    /// The guest ledger stored under `name`, creating the same budget entry
+    /// a plugin handle uses so that handle and these turns share one ledger.
+    pub(crate) fn guest_ledger(&self, name: &'static str) -> Arc<Mutex<GuestLedger>> {
+        self.shared
+            .budgets
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .entry(name)
+            .or_insert_with(Budget::new)
+            .guests
+            .clone()
+    }
+
+    /// The HTTP voice credential's guest ledger. Not a plugin budget: no
+    /// pool and no rate limiter, and not reachable by a plugin name.
+    pub(crate) fn http_voice_ledger(&self) -> &Mutex<GuestLedger> {
+        &self.shared.http_voice_guests
     }
 }
 
@@ -507,56 +531,19 @@ impl PluginTurns {
             channel: self.channel.clone(),
             sender: turn.sender,
         };
-        self.admit_guest(&state, &request)?;
         let who = AuthIdentity::Plugin {
             name: self.name,
             channel: self.channel.clone(),
         };
-        run_turn(state, request, who, sink, None)
+        let admitted = admit_turn(&state, who, request).map_err(|error| match error {
+            AdmitError::Http(status, message) => TurnError::Refused(status, message),
+            AdmitError::Guest(GuestRefusal::DailyBudgetSpent) => TurnError::DailyBudgetSpent,
+            AdmitError::Guest(GuestRefusal::CallTurnsSpent) => TurnError::CallTurnsSpent,
+            AdmitError::Guest(GuestRefusal::SenderRateLimited) => TurnError::SenderRateLimited,
+        })?;
+        run_turn(state, admitted, sink, None)
             .await
             .map_err(|(status, message)| TurnError::Refused(status, message))
-    }
-
-    /// The `[plugin_turns]` caps, for a guest's turn; the owner's are never
-    /// counted. A request that would not resolve is left for the turn
-    /// pipeline to refuse.
-    fn admit_guest(&self, state: &AppState, request: &ChatRequest) -> Result<(), TurnError> {
-        let Ok(key) = crate::server::handlers::chat::resolve_plugin_key(
-            self.name,
-            &self.channel,
-            request,
-            &state.config,
-        ) else {
-            return Ok(());
-        };
-        if !key.is_guest() {
-            return Ok(());
-        }
-        let kind = if self.channel.eq_ignore_ascii_case(VOICE_CHANNEL) {
-            GuestKind::Call
-        } else {
-            GuestKind::Sender
-        };
-        let admitted = self
-            .budget
-            .guests
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .admit(
-                key.as_str(),
-                kind,
-                &state.config.plugin_turns,
-                Instant::now().into_std(),
-                chrono::Utc::now().date_naive(),
-            );
-        admitted.map_err(|refusal| {
-            tracing::warn!("plugin {}: turn for {key} refused: {refusal:?}", self.name);
-            match refusal {
-                GuestRefusal::DailyBudgetSpent => TurnError::DailyBudgetSpent,
-                GuestRefusal::CallTurnsSpent => TurnError::CallTurnsSpent,
-                GuestRefusal::SenderRateLimited => TurnError::SenderRateLimited,
-            }
-        })
     }
 
     /// A token from the plugin's rate bucket. With [`SlotWait::Forever`] the
@@ -646,6 +633,39 @@ impl PluginTurns {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn http_voice_ledger_is_not_a_plugin_budget() {
+        use crate::config::PluginTurnsConfig;
+        use crate::server::guest_budget::GuestKind;
+
+        let runner = TurnRunner::new();
+        let limits = PluginTurnsConfig {
+            daily_turns: 1,
+            voice_turns_per_call: 0,
+            guest_burst: 0,
+            guest_per_minute: 0.0,
+        };
+        let now = std::time::Instant::now();
+        let today = chrono::Utc::now().date_naive();
+        let plugin = runner.guest_ledger("http-voice");
+        plugin
+            .lock()
+            .unwrap()
+            .admit("guest:a", GuestKind::Call, &limits, now, today)
+            .unwrap();
+        assert!(plugin
+            .lock()
+            .unwrap()
+            .admit("guest:b", GuestKind::Call, &limits, now, today)
+            .is_err());
+        runner
+            .http_voice_ledger()
+            .lock()
+            .unwrap()
+            .admit("guest:a", GuestKind::Call, &limits, now, today)
+            .unwrap();
+    }
 
     #[test]
     fn reserved_channels_are_refused_case_insensitively() {
