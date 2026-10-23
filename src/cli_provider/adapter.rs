@@ -60,23 +60,31 @@ pub enum StreamLine {
     },
     /// A usage-only record; the runner attaches it to the reply.
     Usage(Usage),
-    /// The model closed an assistant message. `tool_use` is true when any
-    /// content block in that message is a tool call. The runner forwards
-    /// this as a message boundary and does not append its text: the reply
-    /// still comes from deltas or the terminal record.
-    MessageEnd { tool_use: bool },
+    /// One assistant record. The runner groups records that share `id` and
+    /// forwards a single boundary when the id changes or the result arrives.
+    /// `tool_use` is true when any content block in the record is a tool
+    /// call. `id` is absent when the record did not name a message. The
+    /// runner does not append this record's text: the reply still comes
+    /// from deltas or the terminal record.
+    MessageEnd { id: Option<String>, tool_use: bool },
     /// Structure we do not consume (tool events, init).
     Other,
 }
 
-/// A whole assistant message, when `value` is one.
+/// A whole assistant record, when `value` is one.
 ///
 /// `tool_use` is true when any block under `message.content` has type
-/// `tool_use`. Records that are not assistant messages return `None`.
+/// `tool_use`. `id` is `message.id` when the record names one. Records
+/// that are not assistant messages return `None`. The runner, not this
+/// function, decides when the message has closed.
 pub(crate) fn assistant_message_end(value: &serde_json::Value) -> Option<StreamLine> {
     if value.get("type").and_then(|t| t.as_str()) != Some("assistant") {
         return None;
     }
+    let id = value
+        .pointer("/message/id")
+        .and_then(|id| id.as_str())
+        .map(str::to_string);
     let tool_use = value
         .pointer("/message/content")
         .and_then(|c| c.as_array())
@@ -85,7 +93,7 @@ pub(crate) fn assistant_message_end(value: &serde_json::Value) -> Option<StreamL
                 .iter()
                 .any(|block| block.get("type").and_then(|t| t.as_str()) == Some("tool_use"))
         });
-    Some(StreamLine::MessageEnd { tool_use })
+    Some(StreamLine::MessageEnd { id, tool_use })
 }
 
 /// Token counts as the CLI reported them, when it did.

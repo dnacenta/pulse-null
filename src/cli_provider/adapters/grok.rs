@@ -605,7 +605,10 @@ mod tests {
         let assistant = r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"I'll list the files in this directory next."}]}}"#;
         assert_eq!(
             Grok.parse_stream_line(assistant),
-            StreamLine::MessageEnd { tool_use: false }
+            StreamLine::MessageEnd {
+                id: None,
+                tool_use: false,
+            }
         );
         assert_eq!(Grok.parse_stream_line("not json"), StreamLine::Other);
         assert_eq!(
@@ -624,7 +627,7 @@ mod tests {
         let ends: Vec<bool> = body
             .lines()
             .filter_map(|line| match Grok.parse_stream_line(line) {
-                StreamLine::MessageEnd { tool_use } => Some(tool_use),
+                StreamLine::MessageEnd { tool_use, .. } => Some(tool_use),
                 _ => None,
             })
             .collect();

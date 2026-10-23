@@ -809,6 +809,11 @@ impl StreamingProvider for CliProvider {
                     let mut assembled = String::new();
                     let mut terminal: Option<(String, bool, Option<Usage>)> = None;
                     let mut usage_seen = None;
+                    // Assistant records that share a message id are one
+                    // message. The boundary waits until the id changes or
+                    // the terminal result arrives, so an early text block
+                    // cannot close the message before its tool call.
+                    let mut open_message: Option<(Option<String>, bool)> = None;
 
                     let mut failure: Option<StreamEvent> = None;
                     loop {
@@ -824,11 +829,31 @@ impl StreamingProvider for CliProvider {
                                     yield StreamEvent::TextDelta(text);
                                 }
                                 StreamLine::Result { text, is_error, usage } => {
+                                    if let Some((_, tool_use)) = open_message.take() {
+                                        yield StreamEvent::SegmentEnd { tool_use };
+                                    }
                                     terminal = Some((text, is_error, usage));
                                 }
                                 StreamLine::Usage(usage) => usage_seen = Some(usage),
-                                StreamLine::MessageEnd { tool_use } => {
-                                    yield StreamEvent::SegmentEnd { tool_use };
+                                StreamLine::MessageEnd { id, tool_use } => {
+                                    let same = open_message.as_ref().is_some_and(|(open_id, _)| {
+                                        match (open_id, &id) {
+                                            (Some(open_id), Some(id)) => open_id == id,
+                                            _ => false,
+                                        }
+                                    });
+                                    if same {
+                                        if let Some((_, open_tool)) = open_message.as_mut() {
+                                            *open_tool |= tool_use;
+                                        }
+                                    } else {
+                                        if let Some((_, open_tool)) = open_message.take() {
+                                            yield StreamEvent::SegmentEnd {
+                                                tool_use: open_tool,
+                                            };
+                                        }
+                                        open_message = Some((id, tool_use));
+                                    }
                                 }
                                 StreamLine::Other => {}
                             },
@@ -858,7 +883,12 @@ impl StreamingProvider for CliProvider {
                         log_stderr_tail(name, stderr_tail).await;
                     }
                     match outcome {
-                        Ok(reply) => yield StreamEvent::Done(response(reply, &model)),
+                        Ok(reply) => {
+                            if let Some((_, tool_use)) = open_message.take() {
+                                yield StreamEvent::SegmentEnd { tool_use };
+                            }
+                            yield StreamEvent::Done(response(reply, &model));
+                        }
                         Err(event) => yield event,
                     }
                 }

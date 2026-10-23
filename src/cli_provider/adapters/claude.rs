@@ -546,7 +546,7 @@ mod tests {
         let ends: Vec<bool> = body
             .lines()
             .filter_map(|line| match Claude.parse_stream_line(line) {
-                StreamLine::MessageEnd { tool_use } => Some(tool_use),
+                StreamLine::MessageEnd { tool_use, .. } => Some(tool_use),
                 _ => None,
             })
             .collect();

@@ -412,6 +412,19 @@ async fn runner_yields_segment_end() {
     assert_eq!(done_text(&grok_events), "three");
 }
 
+/// One assistant message split into a text record and a tool record that
+/// share an id is a single `tool: true` boundary, not a `tool: false`
+/// boundary followed by another.
+#[tokio::test]
+async fn per_block_records_sharing_an_id_emit_one_tool_segment() {
+    let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/cli/per-block-assistant.ndjson");
+    let mock = MockCli::new(&format!("cat '{}'", fixture.display()));
+    let provider = mock.provider_for(Box::new(Claude), "m");
+    let events = collect_stream(&provider).await;
+    assert_eq!(segment_ends(&events), vec![true], "{events:?}");
+}
+
 async fn collect_stream(provider: &CliProvider) -> Vec<StreamEvent> {
     let mut stream = provider.invoke_streaming("sys", &[user("hi")], 10, None);
     let mut events = Vec::new();
