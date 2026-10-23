@@ -395,7 +395,12 @@ async fn run_for(
     let base = host.confinement;
     let check = || -> Result<(), String> {
         if enforce {
-            crate::vigil::probe::confine::require(&expected_user, pulse_uid, &record_dir)
+            crate::vigil::probe::confine::require(
+                &expected_user,
+                pulse_uid,
+                &record_dir,
+                &ctx.live_root,
+            )
         } else {
             base()
         }

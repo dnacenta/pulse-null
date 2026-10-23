@@ -24,13 +24,20 @@
 #       --shell /usr/sbin/nologin pulse-probe
 #   install -d -m 0700 -o pulse-probe -g pulse-probe /var/lib/pulse-null-probe
 #   # The probe user reads the pulse tree in order to copy a scratch, and
-#   # must not read secrets/. The pulse user's own mode on secrets stays
-#   # 0700/0600; the named-user entry gives the probe user nothing there.
+#   # must not search secrets/. Deny secrets/ first, access and default,
+#   # then grant read on everything else. The pulse directory has no
+#   # default entry for the probe user: a secrets/ created later does not
+#   # inherit a grant. Directories that already exist, other than
+#   # secrets/, keep a default grant for files created inside them.
 #   setfacl -m u:pulse-probe:rx /home/pulse /home/pulse/pulse-null
-#   setfacl -R -m u:pulse-probe:rX /home/pulse/pulse-null/<pulse>
-#   setfacl -R -m u:pulse-probe:--- /home/pulse/pulse-null/<pulse>/secrets
-#   setfacl -d -m u:pulse-probe:rX /home/pulse/pulse-null/<pulse>
+#   setfacl -m u:pulse-probe:--- /home/pulse/pulse-null/<pulse>/secrets
 #   setfacl -d -m u:pulse-probe:--- /home/pulse/pulse-null/<pulse>/secrets
+#   setfacl -R -m u:pulse-probe:--- /home/pulse/pulse-null/<pulse>/secrets
+#   setfacl -d -x u:pulse-probe /home/pulse/pulse-null/<pulse> || true
+#   find /home/pulse/pulse-null/<pulse> -path '*/secrets' -prune -o \
+#       -exec setfacl -m u:pulse-probe:rX {} +
+#   find /home/pulse/pulse-null/<pulse> -mindepth 1 -path '*/secrets' -prune -o \
+#       -type d -exec setfacl -d -m u:pulse-probe:rX {} +
 #   # Login files the runner copies from the pulse user's home (the adapter's
 #   # directory there; see "Vendor state" in docs/methods/probe-runner.md):
 #   setfacl -m u:pulse-probe:rx /home/pulse

@@ -46,15 +46,22 @@ pub fn checks() -> Vec<Check> {
 }
 
 /// `Ok` when the process is the probe user (not the live pulse), the probe
-/// record is not readable by the pulse's uid, and every confinement check
-/// passes. `record_dir` is `record/probes`.
-pub fn require(expected_user: &str, pulse_uid: u32, record_dir: &Path) -> Result<(), String> {
+/// record is not readable by the pulse's uid, `secrets/` is not searchable
+/// by this process, and every confinement check passes. `record_dir` is
+/// `record/probes`. `live_root` is the pulse directory.
+pub fn require(
+    expected_user: &str,
+    pulse_uid: u32,
+    record_dir: &Path,
+    live_root: &Path,
+) -> Result<(), String> {
     let euid = euid();
     let name = account(euid).map(|a| a.name).unwrap_or_default();
     let readable = record_readable_by(record_dir, pulse_uid)?;
     if let Some(reason) = identity_refusal(euid, &name, expected_user, pulse_uid, readable) {
         return Err(reason);
     }
+    secrets_refusal(&live_root.join("secrets"), euid)?;
     require_unit()
 }
 
@@ -315,6 +322,159 @@ fn list_has_named_entry(bytes: &[u8]) -> Result<bool, String> {
         let tag = u16::from_le_bytes([entry[0], entry[1]]);
         tag == 0x02 || tag == 0x08
     }))
+}
+
+const ACL_USER_OBJ: u16 = 0x01;
+const ACL_USER: u16 = 0x02;
+const ACL_GROUP_OBJ: u16 = 0x04;
+const ACL_GROUP: u16 = 0x08;
+const ACL_MASK: u16 = 0x10;
+const ACL_OTHER: u16 = 0x20;
+const ACL_EXECUTE: u16 = 0x01;
+
+struct AclEntry {
+    tag: u16,
+    perm: u16,
+    id: u32,
+}
+
+/// Refuse when the probe user can search `secrets`. A missing directory is
+/// not a refusal. A symlink is. An access list that cannot be read fails
+/// closed.
+fn secrets_refusal(secrets: &Path, probe_uid: u32) -> Result<(), String> {
+    if secrets_traversable(secrets, probe_uid)? {
+        Err(
+            "secrets/ is traversable by the probe user; the probe must not be able to search it"
+                .into(),
+        )
+    } else {
+        Ok(())
+    }
+}
+
+/// Whether `probe_uid` can search `secrets`. A missing directory is not
+/// traversable. A symlink is. An access list that cannot be read is an error.
+fn secrets_traversable(secrets: &Path, probe_uid: u32) -> Result<bool, String> {
+    let meta = match std::fs::symlink_metadata(secrets) {
+        Ok(meta) => meta,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(e) => return Err(format!("cannot stat {}: {e}", secrets.display())),
+    };
+    if meta.file_type().is_symlink() {
+        return Ok(true);
+    }
+    use std::os::unix::fs::MetadataExt;
+    let groups = groups_of(probe_uid);
+    match read_access_list(secrets)? {
+        None => Ok(mode_executable(
+            meta.uid(),
+            meta.gid(),
+            meta.mode(),
+            probe_uid,
+            groups.as_deref(),
+        )),
+        Some(bytes) => acl_executable(&bytes, meta.uid(), meta.gid(), probe_uid, groups.as_deref()),
+    }
+}
+
+/// Unix search permission of mode `mode` for `uid`, when there is no access
+/// list. `groups` of `None` means the list is unknown: a group or other
+/// execute bit then counts as searchable.
+fn mode_executable(owner: u32, group: u32, mode: u32, uid: u32, groups: Option<&[u32]>) -> bool {
+    let mode = mode & 0o777;
+    if owner == uid {
+        return mode & 0o100 != 0;
+    }
+    let group_x = mode & 0o010 != 0;
+    let other_x = mode & 0o001 != 0;
+    match groups {
+        None => group_x || other_x,
+        Some(gs) if gs.contains(&group) => group_x,
+        Some(_) => other_x,
+    }
+}
+
+fn parse_access_list(bytes: &[u8]) -> Result<Vec<AclEntry>, String> {
+    if bytes.len() < 4 || !(bytes.len() - 4).is_multiple_of(8) {
+        return Err("access list is not readable".into());
+    }
+    let version = u32::from_le_bytes(bytes[0..4].try_into().expect("four bytes"));
+    if version != 2 {
+        return Err("access list is not readable".into());
+    }
+    let (entries, _) = bytes[4..].as_chunks::<8>();
+    Ok(entries
+        .iter()
+        .map(|entry| AclEntry {
+            tag: u16::from_le_bytes([entry[0], entry[1]]),
+            perm: u16::from_le_bytes([entry[2], entry[3]]),
+            id: u32::from_le_bytes([entry[4], entry[5], entry[6], entry[7]]),
+        })
+        .collect())
+}
+
+fn acl_perm(entries: &[AclEntry], tag: u16) -> Option<u16> {
+    entries
+        .iter()
+        .find(|entry| entry.tag == tag)
+        .map(|entry| entry.perm)
+}
+
+/// Whether `uid` can search a directory whose access list is `bytes`.
+/// A named user entry replaces the group and other classes for that uid.
+/// The mask (or the owning-group entry, when there is no mask) limits
+/// every named and group entry. Unknown groups fail closed.
+fn acl_executable(
+    bytes: &[u8],
+    owner: u32,
+    group: u32,
+    uid: u32,
+    groups: Option<&[u32]>,
+) -> Result<bool, String> {
+    let entries = parse_access_list(bytes)?;
+    let user_obj = acl_perm(&entries, ACL_USER_OBJ).ok_or("access list is not readable")?;
+    let group_obj = acl_perm(&entries, ACL_GROUP_OBJ).ok_or("access list is not readable")?;
+    let other = acl_perm(&entries, ACL_OTHER).ok_or("access list is not readable")?;
+    let mask = acl_perm(&entries, ACL_MASK).unwrap_or(group_obj);
+    if uid == owner {
+        return Ok(user_obj & ACL_EXECUTE != 0);
+    }
+    if let Some(entry) = entries
+        .iter()
+        .find(|entry| entry.tag == ACL_USER && entry.id == uid)
+    {
+        return Ok(entry.perm & mask & ACL_EXECUTE != 0);
+    }
+    let group_exec = |perm: u16| perm & mask & ACL_EXECUTE != 0;
+    match groups {
+        None => {
+            let any_group = group_exec(group_obj)
+                || entries
+                    .iter()
+                    .any(|entry| entry.tag == ACL_GROUP && group_exec(entry.perm));
+            Ok(any_group || other & ACL_EXECUTE != 0)
+        }
+        Some(gs) => {
+            let mut matched = false;
+            let mut granted = 0u16;
+            if gs.contains(&group) {
+                matched = true;
+                granted |= group_obj;
+            }
+            for entry in entries
+                .iter()
+                .filter(|entry| entry.tag == ACL_GROUP && gs.contains(&entry.id))
+            {
+                matched = true;
+                granted |= entry.perm;
+            }
+            if matched {
+                Ok(group_exec(granted))
+            } else {
+                Ok(other & ACL_EXECUTE != 0)
+            }
+        }
+    }
 }
 
 /// Unix read permission of mode `mode` (owner `owner`, group `group`) for
@@ -756,14 +916,123 @@ mod tests {
         assert!(err.contains("access list"), "{err}");
     }
 
+    #[test]
+    fn a_secrets_directory_the_probe_can_search_is_refused() {
+        let missing = tempfile::tempdir().unwrap();
+        assert!(secrets_refusal(&missing.path().join("secrets"), 1).is_ok());
+
+        let dir = tempfile::tempdir().unwrap();
+        let secrets = dir.path().join("secrets");
+        std::fs::create_dir(&secrets).unwrap();
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        std::fs::set_permissions(&secrets, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let owner = std::fs::metadata(&secrets).unwrap().uid();
+        let probe = owner.wrapping_add(1);
+        assert!(
+            secrets_refusal(&secrets, probe).is_ok(),
+            "mode 0700 is not searchable by another uid"
+        );
+        let owner_err = secrets_refusal(&secrets, owner).unwrap_err();
+        assert!(owner_err.contains("traversable"), "{owner_err}");
+
+        std::fs::set_permissions(&secrets, std::fs::Permissions::from_mode(0o701)).unwrap();
+        assert!(
+            secrets_refusal(&secrets, probe)
+                .unwrap_err()
+                .contains("traversable"),
+            "other-execute is a refusal"
+        );
+
+        std::fs::set_permissions(&secrets, std::fs::Permissions::from_mode(0o700)).unwrap();
+        write_access_list(
+            &secrets,
+            &access_list_with_ids(&[
+                (0x01, 7, 0),
+                (0x02, 1, probe),
+                (0x04, 0, 0),
+                (0x10, 7, 0),
+                (0x20, 0, 0),
+            ]),
+        );
+        assert!(
+            secrets_refusal(&secrets, probe)
+                .unwrap_err()
+                .contains("traversable"),
+            "a named execute entry is a refusal"
+        );
+        write_access_list(
+            &secrets,
+            &access_list_with_ids(&[
+                (0x01, 7, 0),
+                (0x02, 1, probe),
+                (0x04, 0, 0),
+                (0x10, 6, 0),
+                (0x20, 0, 0),
+            ]),
+        );
+        assert!(
+            secrets_refusal(&secrets, probe).is_ok(),
+            "a mask without execute removes the named grant"
+        );
+        std::fs::set_permissions(&secrets, std::fs::Permissions::from_mode(0o755)).unwrap();
+        write_access_list(
+            &secrets,
+            &access_list_with_ids(&[
+                (0x01, 7, 0),
+                (0x02, 0, probe),
+                (0x04, 5, 0),
+                (0x10, 7, 0),
+                (0x20, 5, 0),
+            ]),
+        );
+        assert!(
+            secrets_refusal(&secrets, probe).is_ok(),
+            "a named deny replaces other-execute"
+        );
+
+        let link = dir.path().join("secrets-link");
+        std::os::unix::fs::symlink(&secrets, &link).unwrap();
+        assert!(secrets_refusal(&link, probe)
+            .unwrap_err()
+            .contains("traversable"));
+
+        assert!(
+            acl_executable(&[0, 0, 0, 1], 1, 2, 9, Some(&[])).is_err(),
+            "a bad list fails closed"
+        );
+
+        let group = access_list_with_ids(&[
+            (0x01, 7, 0),
+            (0x04, 0, 0),
+            (0x08, 1, 50),
+            (0x10, 7, 0),
+            (0x20, 0, 0),
+        ]);
+        assert!(acl_executable(&group, 1, 2, 9, Some(&[50])).unwrap());
+        assert!(!acl_executable(&group, 1, 2, 9, Some(&[9])).unwrap());
+        assert!(
+            acl_executable(&group, 1, 2, 9, None).unwrap(),
+            "unknown groups fail closed"
+        );
+    }
+
     /// A version-2 access list. `id` is unused for the base entries and a
     /// fixed uid for a named one; the kernel accepts either.
     fn access_list_bytes(entries: &[(u16, u16)]) -> Vec<u8> {
+        access_list_with_ids(
+            &entries
+                .iter()
+                .map(|(tag, perm)| (*tag, *perm, 1000))
+                .collect::<Vec<_>>(),
+        )
+    }
+
+    fn access_list_with_ids(entries: &[(u16, u16, u32)]) -> Vec<u8> {
         let mut bytes = 2u32.to_le_bytes().to_vec();
-        for (tag, perm) in entries {
+        for (tag, perm, id) in entries {
             bytes.extend(tag.to_le_bytes());
             bytes.extend(perm.to_le_bytes());
-            bytes.extend(1000u32.to_le_bytes());
+            bytes.extend(id.to_le_bytes());
         }
         bytes
     }
