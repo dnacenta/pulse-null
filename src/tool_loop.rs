@@ -169,19 +169,42 @@ impl Segments {
         });
         self.next = self.next.saturating_add(1);
     }
+
+    /// A boundary emitted after the guard, which must not be held again.
+    fn push_kept(&mut self, sink: &ProgressSink, tool: bool) {
+        sink.send_now(TurnEvent::Segment {
+            index: self.next,
+            tool,
+        });
+        self.next = self.next.saturating_add(1);
+    }
 }
 
 /// Sender half a streaming caller hands to the tool loop.
 pub type TurnSink = tokio::sync::mpsc::Sender<TurnEvent>;
+
+/// Text and message boundaries held back until a round's guard has passed.
+#[derive(Default)]
+struct HeldSpeech {
+    deltas: Vec<String>,
+    segments: Vec<(u32, bool)>,
+}
 
 /// A [`TurnSink`] that remembers whether any text delta was sent.
 ///
 /// The chat handler reads that flag when a later reply supersedes text the
 /// client may already have. Every send is `try_send`: a full or closed
 /// channel drops the event and never stalls the turn.
+///
+/// A voice-pool sink holds the open segment's deltas (and any provider
+/// boundary) until [`Self::flush_held`]. A cut or a refusal calls
+/// [`Self::discard_held`] instead, so the raw tail never reaches the speaker.
 pub struct ProgressSink {
     tx: TurnSink,
     saw_delta: std::sync::atomic::AtomicBool,
+    /// `Some` while this sink holds an open segment. `None` forwards deltas
+    /// as they arrive.
+    held: std::sync::Mutex<Option<HeldSpeech>>,
 }
 
 impl ProgressSink {
@@ -189,15 +212,91 @@ impl ProgressSink {
         Self {
             tx,
             saw_delta: std::sync::atomic::AtomicBool::new(false),
+            held: std::sync::Mutex::new(None),
         }
     }
 
+    /// Hold deltas until the round's guard has kept them.
+    pub fn holding(tx: TurnSink) -> Self {
+        Self {
+            tx,
+            saw_delta: std::sync::atomic::AtomicBool::new(false),
+            held: std::sync::Mutex::new(Some(HeldSpeech::default())),
+        }
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, Option<HeldSpeech>> {
+        self.held.lock().unwrap_or_else(|err| err.into_inner())
+    }
+
     pub fn try_send(&self, event: TurnEvent) {
+        let mut held = self.lock();
+        if let Some(buf) = held.as_mut() {
+            match event {
+                TurnEvent::Delta(text) => {
+                    buf.deltas.push(text);
+                    return;
+                }
+                TurnEvent::Segment { index, tool } => {
+                    buf.segments.push((index, tool));
+                    return;
+                }
+                other => {
+                    drop(held);
+                    let _ = self.tx.try_send(other);
+                    return;
+                }
+            }
+        }
+        drop(held);
+        self.deliver(event);
+    }
+
+    /// Deliver `event` even while this sink is holding a segment.
+    pub fn send_now(&self, event: TurnEvent) {
+        self.deliver(event);
+    }
+
+    fn deliver(&self, event: TurnEvent) {
         if matches!(event, TurnEvent::Delta(_)) {
             self.saw_delta
                 .store(true, std::sync::atomic::Ordering::Relaxed);
         }
         let _ = self.tx.try_send(event);
+    }
+
+    /// Forward the held segment. No-op when this sink does not hold.
+    pub fn flush_held(&self) {
+        let pending = {
+            let mut held = self.lock();
+            held.as_mut().map(|buf| {
+                (
+                    std::mem::take(&mut buf.deltas),
+                    std::mem::take(&mut buf.segments),
+                )
+            })
+        };
+        let Some((deltas, segments)) = pending else {
+            return;
+        };
+        for text in deltas {
+            self.deliver(TurnEvent::Delta(text));
+        }
+        for (index, tool) in segments {
+            self.deliver(TurnEvent::Segment { index, tool });
+        }
+    }
+
+    /// Drop the held segment without sending it. True when any text was dropped.
+    pub fn discard_held(&self) -> bool {
+        let mut held = self.lock();
+        let Some(buf) = held.as_mut() else {
+            return false;
+        };
+        let dropped = buf.deltas.iter().any(|text| !text.is_empty());
+        buf.deltas.clear();
+        buf.segments.clear();
+        dropped
     }
 
     #[must_use]
@@ -331,16 +430,22 @@ pub async fn invoke_with_tool_loop_streaming(
         let tool_names = round.tool_names;
         match finish_round(&mut rs, round.response, tools, messages, max_rounds).await {
             RoundOutcome::Done(done) => {
-                // A provider that reported no boundaries and never called a
-                // tool stays `delta` then `done`, the same as before.
-                if !segments.from_provider && done.tool_rounds > 0 {
-                    segments.push(sink, false);
+                // A cut reply leaves the held segment for the caller to
+                // drop. Reset goes out before any kept text.
+                if !done.was_truncated {
+                    sink.flush_held();
+                    // A provider that reported no boundaries and never called a
+                    // tool stays `delta` then `done`, the same as before.
+                    if !segments.from_provider && done.tool_rounds > 0 {
+                        segments.push_kept(sink, false);
+                    }
                 }
                 return Ok(done);
             }
             RoundOutcome::Continue => {
+                sink.flush_held();
                 if !segments.from_provider {
-                    segments.push(sink, true);
+                    segments.push_kept(sink, true);
                 }
                 for name in tool_names {
                     sink.try_send(TurnEvent::Status(TurnStatus::Tool(name)));

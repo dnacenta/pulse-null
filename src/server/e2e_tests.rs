@@ -1694,18 +1694,26 @@ async fn e2e_chat_stream_reset_on_fallback() {
     );
 }
 
-/// The guard cuts a reply that invented a later turn. The raw delta goes
-/// out first; reset precedes the truncated done text.
-#[tokio::test]
-async fn e2e_chat_stream_reset_on_guard() {
-    let raw = "Here is my response about the topic, which covers several important points.\n[User]: What about this other thing?";
-    let provider = MockProvider::new(vec![LlmResponse {
+fn guard_cut_provider(raw: &str) -> MockProvider {
+    MockProvider::new(vec![LlmResponse {
         content: vec![ContentBlock::Text { text: raw.into() }],
         stop_reason: StopReason::EndTurn,
         model: "mock".into(),
         input_tokens: Some(4),
         output_tokens: Some(8),
-    }]);
+    }])
+}
+
+const GUARD_RAW: &str = "Here is my response about the topic, which covers several important points.\n[User]: What about this other thing?";
+const GUARD_KEPT: &str =
+    "Here is my response about the topic, which covers several important points.";
+
+/// The guard cuts a reply that invented a later turn. A screen stream sends
+/// the raw delta first. A voice-pool stream never does: reset comes before
+/// the kept text.
+#[tokio::test]
+async fn e2e_chat_stream_reset_on_guard() {
+    let provider = guard_cut_provider(GUARD_RAW);
     let state = build_state(provider, ToolRegistry::new()).await;
     let app = build_app(state);
     let response = post_chat_stream(&app, "hi").await;
@@ -1724,12 +1732,45 @@ async fn e2e_chat_stream_reset_on_guard() {
     assert!(delta < reset && reset < done, "{frames:?}");
     let done_data = &frames[done].1;
     assert!(done_data.contains(r#""truncated":true"#), "{done_data}");
+    assert!(done_data.contains(GUARD_KEPT), "{done_data}");
+    assert!(!done_data.contains("[User]:"), "{done_data}");
+
+    let dir = tempfile::tempdir().unwrap();
+    let state = build_state_boxed_with_config(
+        dir.path().to_path_buf(),
+        Box::new(guard_cut_provider(GUARD_RAW)),
+        ToolRegistry::new(),
+        config_with_voice_credential(),
+    )
+    .await;
+    let app = build_app(state);
+    let response = post_chat_stream_secret(&app, "voice", "hi", Some(VOICE_CREDENTIAL)).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let frames = sse_frames(&String::from_utf8_lossy(&bytes));
     assert!(
-        done_data.contains(
-            "Here is my response about the topic, which covers several important points."
-        ),
-        "{done_data}"
+        frames
+            .iter()
+            .all(|(event, data)| !(event == "delta" && data.contains("[User]:"))),
+        "voice delta carried the cut tail: {frames:?}"
     );
+    let reset = frame_index(&frames, |event, data| {
+        event == "reset" && data.contains(r#""reason":"guard""#)
+    });
+    let kept = frame_index(&frames, |event, data| {
+        event == "delta" && data.contains(GUARD_KEPT)
+    });
+    let done = frame_index(&frames, |event, _data| event == "done");
+    assert!(reset < kept && kept < done, "{frames:?}");
+    assert!(
+        frames[..reset].iter().all(|(event, _)| event != "delta"),
+        "voice flush preceded reset: {frames:?}"
+    );
+    let done_data = &frames[done].1;
+    assert!(done_data.contains(r#""truncated":true"#), "{done_data}");
+    assert!(done_data.contains(GUARD_KEPT), "{done_data}");
     assert!(!done_data.contains("[User]:"), "{done_data}");
 }
 

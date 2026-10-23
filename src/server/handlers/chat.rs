@@ -264,7 +264,12 @@ pub(crate) async fn run_turn(
     // state (PN-110 audit P1). Everything below — compaction, the provider
     // call, the refusal fallback — runs inside this scope.
     let surface = crate::tool_surface::ToolSurface::for_principal(&resolved_key);
-    crate::tool_surface::scope(surface, run_resolved_turn(state, req, resolved_key, sink)).await
+    let hold_deltas = uses_voice_pool(&who);
+    crate::tool_surface::scope(
+        surface,
+        run_resolved_turn(state, req, resolved_key, sink, hold_deltas),
+    )
+    .await
 }
 
 /// The turn after its principal is resolved to `resolved_key`: the steps of
@@ -275,6 +280,7 @@ async fn run_resolved_turn(
     req: ChatRequest,
     resolved_key: SessionKey,
     sink: Option<TurnSink>,
+    hold_deltas: bool,
 ) -> Result<ChatResponse, (StatusCode, String)> {
     let sender_label = req.sender.as_deref().unwrap_or("unknown");
     if let Some(reply) =
@@ -333,7 +339,13 @@ async fn run_resolved_turn(
     // the fallback while guests and peers never do.
     let fallback_capped = steps::fallback_cap_reached(&session.data.health);
     let build_fallback = steps::fallback_builder(&turn, !fallback_capped);
-    let progress = sink.map(ProgressSink::new);
+    let progress = sink.map(|tx| {
+        if hold_deltas {
+            ProgressSink::holding(tx)
+        } else {
+            ProgressSink::new(tx)
+        }
+    });
     let outcome = invoke_turn_with_refusal_fallback(
         &mut session.data,
         state.provider.as_ref(),
@@ -348,11 +360,16 @@ async fn run_resolved_turn(
     record_provider_outcome(&state, &resolved_key, &outcome).await;
     let outcome = outcome.map_err(|e| steps::turn_failure(&turn, fallback_capped, e.as_ref()))?;
 
-    // The guard already replaced the stored reply. Tell a client that has
-    // been reading the raw stream to drop it before `done` arrives.
+    // The guard already replaced the stored reply. A screen client has the
+    // raw deltas and must drop them. A voice-pool client never received
+    // them: the held segment is discarded, then `reset`, then the kept text.
     if outcome.result.was_truncated {
         if let Some(progress) = progress.as_ref() {
+            progress.discard_held();
             progress.try_send(TurnEvent::Reset(crate::wire::ResetReason::Guard));
+            if hold_deltas && !outcome.result.text.is_empty() {
+                progress.send_now(TurnEvent::Delta(outcome.result.text.clone()));
+            }
         }
     }
 
@@ -536,11 +553,14 @@ fn error_to_sse(status: StatusCode, message: String) -> Event {
 /// pool and the channel still routes the session. A voice credential on
 /// any other channel is `403` before a permit is taken.
 ///
-/// Client contract: deltas are best-effort and unvalidated. A consumer that
-/// stops reading loses deltas rather than stalling the turn, and a reply the
-/// hallucination guard cut short is streamed raw first. `done.text` is the
-/// validated, complete reply and must replace whatever was shown; `truncated`
-/// says the guard fired.
+/// Client contract: deltas are best-effort. A screen stream forwards them
+/// as the provider yields them, unvalidated. A voice-pool stream holds the
+/// open segment and forwards a delta only after that round's guard has
+/// kept it; a cut or a refusal drops the hold and sends `reset` with no
+/// raw tail before the kept text. A consumer that stops reading loses
+/// deltas rather than stalling the turn. `done.text` is the validated,
+/// complete reply and must replace whatever was shown; `truncated` says
+/// the guard fired.
 pub async fn chat_stream(
     State(state): State<Arc<AppState>>,
     axum::Extension(who): axum::Extension<AuthIdentity>,
@@ -797,10 +817,12 @@ where
     fallback_ctx.push(user_msg.clone());
 
     // The fallback provider is buffered; a streaming client learns it is
-    // thinking again and then gets the whole reply as one delta. Text
-    // already sent from the refused draft is void first.
+    // thinking again and then gets the whole reply as one delta. A draft
+    // that already went out, or a voice segment still held, is void first
+    // and is not flushed.
     if let Some(sink) = sink {
-        if sink.saw_delta() {
+        let dropped = sink.discard_held();
+        if sink.saw_delta() || dropped {
             sink.try_send(TurnEvent::Reset(crate::wire::ResetReason::Fallback));
         }
         sink.try_send(TurnEvent::Status(TurnStatus::Thinking));
@@ -822,7 +844,7 @@ where
         Ok(result) => {
             if let Some(sink) = sink {
                 sink.try_send(TurnEvent::Status(TurnStatus::Responding));
-                sink.try_send(TurnEvent::Delta(result.text.clone()));
+                sink.send_now(TurnEvent::Delta(result.text.clone()));
             }
             // Quarantine the exchange: the trunk stays clean so the default
             // model does not re-trip on later benign turns.
