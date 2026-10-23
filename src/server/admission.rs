@@ -18,12 +18,39 @@ use crate::session_key::SessionKey;
 use crate::session_store::resolve_sender;
 
 /// Proof that [`admit_turn`] accepted this request. Only that function builds one.
+/// The turn reads the request and the identity from here, not from a second copy.
 #[derive(Debug)]
 pub(crate) struct Admitted {
-    pub(crate) key: SessionKey,
-    pub(crate) is_call: bool,
-    /// Keeps other modules from building an [`Admitted`] by struct literal.
-    _private: (),
+    key: SessionKey,
+    is_call: bool,
+    request: ChatRequest,
+    identity: AuthIdentity,
+}
+
+impl Admitted {
+    /// The session this turn runs as.
+    #[must_use]
+    pub(crate) fn key(&self) -> &SessionKey {
+        &self.key
+    }
+
+    /// Whether this turn is a voice call (the call set, and held deltas).
+    #[must_use]
+    pub(crate) fn is_call(&self) -> bool {
+        self.is_call
+    }
+
+    /// The request that was admitted.
+    #[must_use]
+    pub(crate) fn request(&self) -> &ChatRequest {
+        &self.request
+    }
+
+    /// The identity that was admitted.
+    #[must_use]
+    pub(crate) fn identity(&self) -> &AuthIdentity {
+        &self.identity
+    }
 }
 
 /// The ledger HTTP voice turns spend, separate from any plugin's day.
@@ -57,15 +84,15 @@ fn http_error((status, message): (StatusCode, String)) -> AdmitError {
 /// off the voice channel, then resolve the session key the turn runs as.
 pub(crate) fn admit_turn(
     state: &AppState,
-    who: &AuthIdentity,
-    req: &ChatRequest,
+    who: AuthIdentity,
+    req: ChatRequest,
 ) -> Result<Admitted, AdmitError> {
-    validate_request(req).map_err(http_error)?;
-    refuse_peer_on_owner_channel(who, &req.channel).map_err(http_error)?;
-    refuse_voice_off_channel(who, &req.channel).map_err(http_error)?;
+    validate_request(&req).map_err(http_error)?;
+    refuse_peer_on_owner_channel(&who, &req.channel).map_err(http_error)?;
+    refuse_voice_off_channel(&who, &req.channel).map_err(http_error)?;
 
     // The key and call-set choice, moved from `run_turn`.
-    let key = match who {
+    let key = match &who {
         AuthIdentity::Owner => {
             // A demoted `channel: voice` body is still this principal. It
             // must not open `guest:anonymous` (or the named sender) in the
@@ -85,14 +112,14 @@ pub(crate) fn admit_turn(
             }
         }
         AuthIdentity::Peer(name) => {
-            refuse_peer_on_owner_channel(who, &req.channel).map_err(http_error)?;
+            refuse_peer_on_owner_channel(&who, &req.channel).map_err(http_error)?;
             SessionKey::peer(name)
         }
         AuthIdentity::Plugin { name, channel } => {
-            resolve_plugin_key(name, channel, req, &state.config).map_err(http_error)?
+            resolve_plugin_key(name, channel, &req, &state.config).map_err(http_error)?
         }
         AuthIdentity::Voice => {
-            refuse_voice_off_channel(who, &req.channel).map_err(http_error)?;
+            refuse_voice_off_channel(&who, &req.channel).map_err(http_error)?;
             // Same rule as the voice plugin: the transport's credential is
             // not proof of the person on the call.
             SessionKey::guest(req.sender.as_deref().unwrap_or("anonymous"))
@@ -100,18 +127,19 @@ pub(crate) fn admit_turn(
     };
     // The call set is only a voice identity. A demoted body that says
     // `voice` keeps the principal's ordinary session.
-    let is_call = match who {
+    let is_call = match &who {
         AuthIdentity::Voice => true,
         AuthIdentity::Plugin { channel, .. } => {
             channel.eq_ignore_ascii_case(crate::server::turns::VOICE_CHANNEL)
         }
         AuthIdentity::Owner | AuthIdentity::Peer(_) => false,
     };
-    count_guest(state, who, req, &key)?;
+    count_guest(state, &who, &req, &key)?;
     Ok(Admitted {
         key,
         is_call,
-        _private: (),
+        request: req,
+        identity: who,
     })
 }
 
@@ -267,10 +295,10 @@ mod tests {
     async fn owner_voice_body_is_the_owner_session() {
         let dir = tempfile::tempdir().unwrap();
         let state = state_in(dir.path()).await;
-        let admitted = admit_turn(&state, &AuthIdentity::Owner, &request("voice", Some("sam")))
+        let admitted = admit_turn(&state, AuthIdentity::Owner, request("voice", Some("sam")))
             .expect("owner voice body admitted");
-        assert_eq!(admitted.key, SessionKey::owner());
-        assert!(!admitted.is_call);
+        assert_eq!(admitted.key(), &SessionKey::owner());
+        assert!(!admitted.is_call());
     }
 
     #[tokio::test]
@@ -279,24 +307,20 @@ mod tests {
         let state = state_in(dir.path()).await;
         let admitted = admit_turn(
             &state,
-            &AuthIdentity::Voice,
-            &request("voice", Some("caller")),
+            AuthIdentity::Voice,
+            request("voice", Some("caller")),
         )
         .expect("voice credential admitted");
-        assert_eq!(admitted.key, SessionKey::guest("caller"));
-        assert!(admitted.is_call);
+        assert_eq!(admitted.key(), &SessionKey::guest("caller"));
+        assert!(admitted.is_call());
     }
 
     #[tokio::test]
     async fn voice_credential_off_channel_is_403() {
         let dir = tempfile::tempdir().unwrap();
         let state = state_in(dir.path()).await;
-        let error = admit_turn(
-            &state,
-            &AuthIdentity::Voice,
-            &request("chat", Some("caller")),
-        )
-        .expect_err("voice credential off channel");
+        let error = admit_turn(&state, AuthIdentity::Voice, request("chat", Some("caller")))
+            .expect_err("voice credential off channel");
         let (status, message) = error.into_http();
         assert_eq!(status, StatusCode::FORBIDDEN);
         assert_eq!(
@@ -309,7 +333,7 @@ mod tests {
     async fn invalid_request_is_400() {
         let dir = tempfile::tempdir().unwrap();
         let state = state_in(dir.path()).await;
-        let error = admit_turn(&state, &AuthIdentity::Owner, &request("bad/name", None))
+        let error = admit_turn(&state, AuthIdentity::Owner, request("bad/name", None))
             .expect_err("invalid channel");
         let (status, _) = error.into_http();
         assert_eq!(status, StatusCode::BAD_REQUEST);

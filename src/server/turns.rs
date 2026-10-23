@@ -525,13 +525,13 @@ impl PluginTurns {
             name: self.name,
             channel: self.channel.clone(),
         };
-        let admitted = admit_turn(&state, &who, &request).map_err(|error| match error {
+        let admitted = admit_turn(&state, who, request).map_err(|error| match error {
             AdmitError::Http(status, message) => TurnError::Refused(status, message),
             AdmitError::Guest(GuestRefusal::DailyBudgetSpent) => TurnError::DailyBudgetSpent,
             AdmitError::Guest(GuestRefusal::CallTurnsSpent) => TurnError::CallTurnsSpent,
             AdmitError::Guest(GuestRefusal::SenderRateLimited) => TurnError::SenderRateLimited,
         })?;
-        run_turn(state, request, who, admitted, sink, None)
+        run_turn(state, admitted, sink, None)
             .await
             .map_err(|(status, message)| TurnError::Refused(status, message))
     }

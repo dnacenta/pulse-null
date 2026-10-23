@@ -24,7 +24,7 @@ use pulse_system_types::llm::{Message, MessageContent, MessageSource, Role};
 
 mod steps;
 
-#[derive(Deserialize)]
+#[derive(Debug, Deserialize)]
 #[allow(dead_code)]
 pub struct ChatRequest {
     pub message: String,
@@ -122,10 +122,8 @@ pub async fn chat(
     axum::Extension(who): axum::Extension<AuthIdentity>,
     Json(req): Json<ChatRequest>,
 ) -> Result<Json<ChatResponse>, (StatusCode, String)> {
-    let admitted = admit_turn(&state, &who, &req).map_err(AdmitError::into_http)?;
-    run_turn(state, req, who, admitted, None, None)
-        .await
-        .map(Json)
+    let admitted = admit_turn(&state, who, req).map_err(AdmitError::into_http)?;
+    run_turn(state, admitted, None, None).await.map(Json)
 }
 
 /// Channels whose session is the owner's by construction.
@@ -233,8 +231,6 @@ pub(crate) fn resolve_plugin_key(
 /// trunk never carries a dangling user turn. Nothing is persisted.
 pub(crate) async fn run_turn(
     state: Arc<AppState>,
-    req: ChatRequest,
-    who: AuthIdentity,
     admitted: Admitted,
     sink: Option<TurnSink>,
     control: Option<Arc<tool_loop::ControlPlane>>,
@@ -243,21 +239,8 @@ pub(crate) async fn run_turn(
     // a guest or peer runs on the restricted one, whatever the isolation
     // state (PN-110 audit P1). Everything below — compaction, the provider
     // call, the refusal fallback — runs inside this scope.
-    let surface = crate::tool_surface::ToolSurface::for_principal(&admitted.key);
-    let hold_deltas = uses_voice_pool(&who);
-    crate::tool_surface::scope(
-        surface,
-        run_resolved_turn(
-            state,
-            req,
-            admitted.key,
-            sink,
-            hold_deltas,
-            admitted.is_call,
-            control,
-        ),
-    )
-    .await
+    let surface = crate::tool_surface::ToolSurface::for_principal(admitted.key());
+    crate::tool_surface::scope(surface, run_resolved_turn(state, admitted, sink, control)).await
 }
 
 /// The turn after its principal is resolved to `resolved_key`: the steps of
@@ -265,20 +248,21 @@ pub(crate) async fn run_turn(
 /// session under the turn guard; [`steps::commit_turn`] commits a success.
 async fn run_resolved_turn(
     state: Arc<AppState>,
-    req: ChatRequest,
-    resolved_key: SessionKey,
+    admitted: Admitted,
     sink: Option<TurnSink>,
-    hold_deltas: bool,
-    is_call: bool,
     control: Option<Arc<tool_loop::ControlPlane>>,
 ) -> Result<ChatResponse, (StatusCode, String)> {
+    let hold_deltas = uses_voice_pool(admitted.identity());
+    let is_call = admitted.is_call();
+    let req = admitted.request();
+    let resolved_key = admitted.key();
     let sender_label = req.sender.as_deref().unwrap_or("unknown");
     if let Some(reply) =
-        steps::isolation_command_reply(&state.root_dir, &req, &resolved_key, sender_label)
+        steps::isolation_command_reply(&state.root_dir, req, resolved_key, sender_label)
     {
         return Ok(reply);
     }
-    let mut turn = steps::TurnScope::new(&state, &req, &resolved_key, sender_label, is_call);
+    let mut turn = steps::TurnScope::new(&state, req, resolved_key, sender_label, is_call);
 
     let user_message = steps::compose_user_message(&turn).await;
     let incoming = steps::ChannelLine {
@@ -352,7 +336,7 @@ async fn run_resolved_turn(
         progress.as_ref(),
     )
     .await;
-    record_provider_outcome(&state, &resolved_key, &outcome).await;
+    record_provider_outcome(&state, resolved_key, &outcome).await;
     let outcome = outcome.map_err(|e| steps::turn_failure(&turn, fallback_capped, e.as_ref()))?;
 
     // The guard already replaced the stored reply. A screen client has the
@@ -585,14 +569,14 @@ pub async fn chat_stream(
     })?;
     // Admission after the permit: a 503 is not a turn, and a refusal here
     // drops the permit with this return, before any frame is written.
-    let admitted = admit_turn(&state, &who, &req).map_err(AdmitError::into_http)?;
+    let admitted = admit_turn(&state, who, req).map_err(AdmitError::into_http)?;
 
     let (tx, rx) = mpsc::channel::<TurnEvent>(STREAM_CHANNEL_CAPACITY);
     let (done_tx, done_rx) = tokio::sync::oneshot::channel();
     let control = Arc::new(tool_loop::ControlPlane::new());
     let control_for_turn = Arc::clone(&control);
     let task = tokio::spawn(async move {
-        let outcome = run_turn(state, req, who, admitted, Some(tx), Some(control_for_turn)).await;
+        let outcome = run_turn(state, admitted, Some(tx), Some(control_for_turn)).await;
         let _ = done_tx.send(outcome);
     });
     let guard = AbortOnDrop(task.abort_handle());

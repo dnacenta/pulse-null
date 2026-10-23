@@ -3809,9 +3809,9 @@ mod plugin_turns_e2e {
             channel: "voice".to_string(),
             sender: Some("1001".to_string()),
         };
-        let outcome = match crate::server::admission::admit_turn(&state, &who, &req) {
+        let outcome = match crate::server::admission::admit_turn(&state, who, req) {
             Ok(admitted) => {
-                handlers::chat::run_turn(Arc::clone(&state), req, who, admitted, None, None).await
+                handlers::chat::run_turn(Arc::clone(&state), admitted, None, None).await
             }
             Err(error) => Err(error.into_http()),
         };
@@ -4684,8 +4684,8 @@ mod tool_surface_e2e {
         };
         let who = AuthIdentity::Peer("Synth".to_string());
         let admitted =
-            crate::server::admission::admit_turn(&state, &who, &peer).expect("peer turn admitted");
-        handlers::chat::run_turn(Arc::clone(&state), peer, who, admitted, None, None)
+            crate::server::admission::admit_turn(&state, who, peer).expect("peer turn admitted");
+        handlers::chat::run_turn(Arc::clone(&state), admitted, None, None)
             .await
             .unwrap();
         assert_eq!(
@@ -5974,8 +5974,8 @@ mod in_process_tools_e2e {
         };
         let who = crate::server::auth::AuthIdentity::Peer("Synth".to_string());
         let admitted =
-            crate::server::admission::admit_turn(&state, &who, &peer).expect("peer turn admitted");
-        handlers::chat::run_turn(Arc::clone(&state), peer, who, admitted, None, None)
+            crate::server::admission::admit_turn(&state, who, peer).expect("peer turn admitted");
+        handlers::chat::run_turn(Arc::clone(&state), admitted, None, None)
             .await
             .unwrap();
         assert!(last(&offered).is_empty(), "a peer: {:?}", last(&offered));
