@@ -1221,7 +1221,7 @@ mod tests {
     }
 
     #[test]
-    fn user_hooks_without_root_are_reported_not_edited() {
+    fn every_consume_hook_is_reported_and_other_hooks_only_when_rootless() {
         let home = tempfile::tempdir().unwrap();
         let claude = home.path().join(".claude");
         std::fs::create_dir_all(&claude).unwrap();
