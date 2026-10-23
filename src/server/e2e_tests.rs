@@ -4275,7 +4275,7 @@ mod plugin_turns_e2e {
 mod http_voice_budget {
     use super::*;
     use crate::config::PluginTurnsConfig;
-    use crate::server::turns::PluginTurn;
+    use crate::server::turns::{PluginTurn, TurnError};
     use crate::streaming::StreamingProvider;
 
     const OWNER_SECRET: &str = "owner-secret";
@@ -4427,6 +4427,10 @@ mod http_voice_budget {
         let state = voice_state(plugin_then_http.path(), caps(1, 0, 0), mock_ok()).await;
         let voice = state.turns.for_plugin("voice-echo", "voice").unwrap();
         assert!(voice.run(plugin_turn("plugin-caller"), None).await.is_ok());
+        assert_eq!(
+            voice.run(plugin_turn("plugin-other"), None).await.err(),
+            Some(TurnError::DailyBudgetSpent)
+        );
         let app = build_app(Arc::clone(&state));
         let (status, body) = chat(&app, "http-caller", VOICE_CREDENTIAL).await;
         assert_eq!(status, StatusCode::OK, "{body}");
@@ -4436,21 +4440,35 @@ mod http_voice_budget {
         let app = build_app(Arc::clone(&state));
         let (status, body) = chat(&app, "http-caller", VOICE_CREDENTIAL).await;
         assert_eq!(status, StatusCode::OK, "{body}");
+        let (status, body) = chat(&app, "http-other", VOICE_CREDENTIAL).await;
+        assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(body, DAY_SPENT);
         let voice = state.turns.for_plugin("voice-echo", "voice").unwrap();
         assert!(voice.run(plugin_turn("plugin-caller"), None).await.is_ok());
     }
 
     #[tokio::test]
+    async fn a_provider_error_after_admission_is_still_charged() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = voice_state(dir.path(), caps(0, 1, 0), Box::new(FailingProvider)).await;
+        let app = build_app(state);
+        let (status, body) = chat(&app, "caller", VOICE_CREDENTIAL).await;
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "{body}");
+        let (status, body) = chat(&app, "caller", VOICE_CREDENTIAL).await;
+        assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(body, CALL_SPENT);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn concurrent_turns_never_exceed_the_call_cap() {
         let dir = tempfile::tempdir().unwrap();
         let state = voice_state(dir.path(), caps(0, 1, 0), mock_ok()).await;
         let app = build_app(state);
         let left = app.clone();
         let right = app.clone();
-        let (one, two) = tokio::join!(
-            chat(&left, "same-call", VOICE_CREDENTIAL),
-            chat(&right, "same-call", VOICE_CREDENTIAL),
-        );
+        let one = tokio::spawn(async move { chat(&left, "same-call", VOICE_CREDENTIAL).await });
+        let two = tokio::spawn(async move { chat(&right, "same-call", VOICE_CREDENTIAL).await });
+        let (one, two) = (one.await.unwrap(), two.await.unwrap());
         let mut statuses = [one.0, two.0];
         statuses.sort();
         assert_eq!(statuses, [StatusCode::OK, StatusCode::TOO_MANY_REQUESTS]);
