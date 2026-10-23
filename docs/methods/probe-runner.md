@@ -551,9 +551,11 @@ shown.
 `pulse-null probe status` shows turns and tokens spent this week against the
 budget, the measured cost per complete run (mean turns and tokens), each
 record file's chain state, and each measure by lineage group, block and
-arm: k of n with a 95% interval (clustered by run for the item sets, with
+arm: k of n with an interval (clustered by run for the item sets, with
 Student's t on runs − 1 degrees of freedom and never narrower than a Wilson
-interval on how many runs were all-correct, the run count printed beside
+interval on how many runs were all-correct; when those runs agree and none
+is all-correct, the interval is 0 to the observed rate, a conservative
+bound rather than a 95% interval, the run count printed beside
 it; for paired facts, a widened t interval on the run means of the
 chance contrast, decided only when it lies above zero; the twin contrast
 is a count and does not decide until a labelled check exists) once the block has closed, or "not

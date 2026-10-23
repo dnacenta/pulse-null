@@ -94,7 +94,7 @@ group. Per arm: k correct of n counted, with a 95% interval clustered by run (th
 the pooled proportion over runs, scaled by Student's t with runs − 1 degrees of freedom, and never
 narrower than a Wilson interval on how many of the runs were all-correct: the answers of one run share a turn and
 are not independent, a few runs say little about their spread, and runs that all agree are not
-certainty — agreement is not Wilson on the items). The run count is printed beside the interval. With a single run the interval is all of 0–100%.
+certainty — agreement is not Wilson on the items). When the runs agree and none is all-correct, the published interval is 0 to the observed rate. That is a conservative bound, not a 95% interval: it cannot cover a rate above what was observed. The run count is printed beside the interval. With a single run the interval is all of 0–100%.
 **Minimum n = 30** counted answers (about three runs) before a proportion is
 shown; below it: "not enough yet · k of 30" (G5).
 

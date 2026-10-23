@@ -154,7 +154,7 @@ the pooled proportion over runs, scaled by Student's t with runs − 1 degrees o
 narrower than a Wilson interval on how many of the runs were all-correct). The cluster unit is the
 run: each drawn item is its own turn, and the runs are what the interval treats as dependent.
 A few runs say little about their spread, and runs that all agree are not
-certainty — agreement is not Wilson on the items. The run count is printed beside the interval. With a single run the interval is all of 0–100%. **minimum n = 20** per
+certainty — agreement is not Wilson on the items. When the runs agree and none is all-correct, the published interval is 0 to the observed rate. That is a conservative bound, not a 95% interval: it cannot cover a rate above what was observed. The run count is printed beside the interval. With a single run the interval is all of 0–100%. **minimum n = 20** per
   arm before a proportion is shown ("not enough yet · k of 20"). Families are
   pooled within the group and broken out in receipts.
 - **No success criterion in v1.** Nothing is decided from this set, the
