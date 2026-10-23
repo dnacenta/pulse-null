@@ -1656,7 +1656,7 @@ mod streaming_tests {
         assert_eq!(r.text, "ok");
     }
 
-    /// Past the hold cap the buffered text is dropped and one guard reset
+    /// Past the hold cap the buffered text is dropped and one budget reset
     /// is delivered. Later deltas do not bring the flood back.
     #[tokio::test]
     async fn held_speech_discards_past_the_output_budget() {
