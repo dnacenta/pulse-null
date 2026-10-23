@@ -50,8 +50,9 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 /// How long the throwaway server may take to answer its health check.
 const STARTUP_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// Ports tried before the throwaway server gives up (another process may
-/// take a free port between choosing it and binding it).
+/// Ports tried before the throwaway server gives up. A port is accepted
+/// only while the child holds its listening socket; a foreign listener is
+/// refused and the next attempt picks another port.
 const START_ATTEMPTS: u32 = 3;
 
 /// The throwaway server's directory inside the scratch; it is its cwd and
@@ -560,7 +561,7 @@ fn bounded(text: &str) -> String {
 /// dropped.
 #[derive(Debug)]
 pub struct ThrowawayServer {
-    child: tokio::process::Child,
+    child: tokio::sync::Mutex<tokio::process::Child>,
     endpoint: Endpoint,
     port: u16,
 }
@@ -700,7 +701,7 @@ impl ThrowawayServer {
             std::fs::write(spec.dir.join(SERVER_PID_FILE), pid.to_string())?;
         }
         let server = Self {
-            child,
+            child: tokio::sync::Mutex::new(child),
             endpoint: Endpoint {
                 addr: format!("[::1]:{port}"),
                 root_password: RootPassword::Given(password),
@@ -710,21 +711,43 @@ impl ThrowawayServer {
         server.answering(spec.dir).await
     }
 
-    /// The started server once it answers; an error (and the server
-    /// stopped) when it exits first or says nothing within
-    /// [`STARTUP_TIMEOUT`].
+    /// `Some(status)` once the child has exited, `None` while it runs.
+    async fn child_exit(&self) -> std::io::Result<Option<std::process::ExitStatus>> {
+        self.child.lock().await.try_wait()
+    }
+
+    /// Whether the child process holds the listening socket for this port.
+    /// A health check is not identity: another local account can bind the
+    /// port in the gap after it was chosen and answer `/health`.
+    async fn owns_port(&self) -> bool {
+        self.child
+            .lock()
+            .await
+            .id()
+            .is_some_and(|pid| port_owned_by(pid, self.port))
+    }
+
+    /// The started server once the child holds the port and answers. An
+    /// error (and the server stopped) when the child exits first, or when
+    /// that does not happen within [`STARTUP_TIMEOUT`]. Health is asked
+    /// only after `try_wait` shows the child still running and only when
+    /// the listening socket is one of the child's fds.
     async fn answering(mut self, dir: &Path) -> Result<Self, GraphError> {
         let deadline = tokio::time::Instant::now() + STARTUP_TIMEOUT;
         while tokio::time::Instant::now() < deadline {
-            if self.endpoint.healthy().await {
-                return Ok(self);
-            }
-            if let Ok(Some(status)) = self.child.try_wait() {
+            if let Some(status) = self.child_exit().await? {
                 let log = std::fs::read_to_string(dir.join("surreal.log")).unwrap_or_default();
                 return Err(GraphError::Server(format!(
                     "exited {status}: {}",
                     bounded(&log)
                 )));
+            }
+            if self.owns_port().await
+                && self.endpoint.healthy().await
+                && self.owns_port().await
+                && self.child_exit().await?.is_none()
+            {
+                return Ok(self);
             }
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
@@ -748,11 +771,68 @@ impl ThrowawayServer {
 
     /// Kill the server and reap it.
     pub async fn stop(&mut self) {
-        let _ = self.child.kill().await;
+        let _ = self.child.lock().await.kill().await;
     }
 }
 
-/// A port on the IPv6 loopback that was free a moment ago. The throwaway
+/// `[::1]` as `/proc/net/tcp6` prints an IPv6 address (four little-endian words).
+const LOOPBACK_V6: &str = "00000000000000000000000001000000";
+
+/// `TCP_LISTEN` in `/proc/net/tcp6`.
+const TCP_LISTEN: &str = "0A";
+
+/// Whether `pid` holds a listening socket on `[::1]:port`.
+///
+/// `/proc/<pid>/net/tcp6` is the network namespace, so a foreign listener
+/// on the same port is listed there too. It counts only when one of that
+/// process's own file descriptors is the socket's inode. Unreadable proc
+/// entries are not ownership.
+fn port_owned_by(pid: u32, port: u16) -> bool {
+    let Ok(table) = std::fs::read_to_string(format!("/proc/{pid}/net/tcp6")) else {
+        return false;
+    };
+    parse_listen_inodes(&table, port)
+        .iter()
+        .any(|inode| process_has_socket(pid, *inode))
+}
+
+/// Inodes of `[::1]:port` listeners in a `/proc/net/tcp6` table.
+fn parse_listen_inodes(table: &str, port: u16) -> Vec<u64> {
+    let want = format!("{LOOPBACK_V6}:{port:04X}");
+    table
+        .lines()
+        .skip(1)
+        .filter_map(|line| {
+            let mut fields = line.split_whitespace();
+            let _slot = fields.next()?;
+            let local = fields.next()?;
+            let _remote = fields.next()?;
+            let state = fields.next()?;
+            if !local.eq_ignore_ascii_case(&want) || !state.eq_ignore_ascii_case(TCP_LISTEN) {
+                return None;
+            }
+            // tx:rx, tr:when, retrnsmt, uid, timeout, then the inode.
+            fields.nth(5)?.parse().ok()
+        })
+        .collect()
+}
+
+/// Whether `pid` has a file descriptor for socket `inode`.
+fn process_has_socket(pid: u32, inode: u64) -> bool {
+    let want = format!("socket:[{inode}]");
+    let Ok(dir) = std::fs::read_dir(format!("/proc/{pid}/fd")) else {
+        return false;
+    };
+    dir.flatten().any(|entry| {
+        std::fs::read_link(entry.path())
+            .ok()
+            .is_some_and(|path| path.to_string_lossy() == want)
+    })
+}
+
+/// A port on the IPv6 loopback that was free a moment ago. The socket is
+/// dropped so the child can bind it; the child is accepted only once that
+/// listening socket is one of its own fds ([`port_owned_by`]). The throwaway
 /// listens on `::1`, which the probe unit allows, never on 127.0.0.1, which
 /// it denies (the live graph server and the host's nginx listen there).
 fn free_loopback_port() -> std::io::Result<u16> {
@@ -850,6 +930,11 @@ impl ScratchGraph {
         let password = crate::surrealdb_manager::generate_password();
         let password_file = spec.dir.join(super::scratch::GRAPH_PASSWORD_FILE);
         let loaded = async {
+            if server.child_exit().await?.is_some() || !server.owns_port().await {
+                return Err(GraphError::Server(
+                    "the throwaway port is not held by the server".into(),
+                ));
+            }
             write_private(&password_file, &password)?;
             server
                 .endpoint
@@ -875,11 +960,19 @@ impl ScratchGraph {
         })
     }
 
-    /// Does the throwaway still answer? Checked before every turn that uses
-    /// it: a server that died (out of memory, say) would turn every later
-    /// memory lookup into an error the pulse is scored on (audit R2-10).
+    /// Does the throwaway still answer, and is the listener still the child?
+    /// Checked before every turn that uses it: a server that died (out of
+    /// memory, say) would turn every later memory lookup into an error the
+    /// pulse is scored on (audit R2-10). A foreign listener on the port is
+    /// not the server.
     pub async fn alive(&self) -> bool {
+        if self.server.child_exit().await.ok().flatten().is_some() || !self.server.owns_port().await
+        {
+            return false;
+        }
         self.server.endpoint.healthy().await
+            && self.server.owns_port().await
+            && self.server.child_exit().await.ok().flatten().is_none()
     }
 
     /// What a probe item's recall-echo config should point at.
@@ -942,6 +1035,45 @@ fn create_private_dir(dir: &Path) -> std::io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_listen_line_names_its_inode_only_for_that_port() {
+        let header = "  sl  local_address                         remote_address                        st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode\n";
+        let listen = "   1: 00000000000000000000000001000000:1F90 00000000000000000000000000000000:0000 0A 00000000:00000000 00:00000000 00000000     0        0 12345 1 0000000000000000 100 0 0 10 0\n";
+        assert_eq!(
+            parse_listen_inodes(&format!("{header}{listen}"), 0x1F90),
+            vec![12345]
+        );
+        assert!(parse_listen_inodes(&format!("{header}{listen}"), 1).is_empty());
+        let established = listen.replace(" 0A ", " 01 ");
+        assert!(parse_listen_inodes(&format!("{header}{established}"), 0x1F90).is_empty());
+        let other_addr = listen.replace(LOOPBACK_V6, "00000000000000000000000000000000");
+        assert!(parse_listen_inodes(&format!("{header}{other_addr}"), 0x1F90).is_empty());
+    }
+
+    /// A listener in this process is not a child that does not hold the fd.
+    #[test]
+    fn a_foreign_listener_on_the_throwaway_port_is_refused() {
+        let listener = std::net::TcpListener::bind("[::1]:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        assert!(
+            port_owned_by(std::process::id(), port),
+            "this process holds the listening socket"
+        );
+        let mut child = std::process::Command::new("/bin/sleep")
+            .arg("30")
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+        assert!(
+            !port_owned_by(child.id(), port),
+            "the listener is not the child's"
+        );
+        let _ = child.kill();
+        let _ = child.wait();
+    }
 
     #[test]
     fn probe_names_are_plain_identifiers() {

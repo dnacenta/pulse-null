@@ -392,8 +392,9 @@ but the run's rows.
   - **out of memory:** `OOMPolicy=stop` turns an OOM kill anywhere in the
     unit into such a stop, rather than a run left half alive;
   - **the throwaway graph:** before every pulse turn the runner checks that
-    it still answers; one that stopped (out of memory, say) stops the run,
-    since every later memory lookup would fail and be scored.
+    the child still holds the listening socket and that it answers. One
+    that stopped (out of memory, say), or a port held by someone else,
+    stops the run, since every later memory lookup would fail and be scored.
 - **Telemetry in the finish row:** `graph` (the export's size and age when
   taken, and how long loading the throwaway took) and `memory_peak_bytes`
   (cgroup v2 `memory.peak` of the run's cgroup: under the unit the runner,
