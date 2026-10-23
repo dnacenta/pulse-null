@@ -128,14 +128,6 @@ pub enum CliError {
         #[source]
         source: std::io::Error,
     },
-    #[error(
-        "{adapter} takes the system prompt on argv and this one is {bytes} bytes, over its {max} byte cap"
-    )]
-    SystemPromptTooLarge {
-        adapter: &'static str,
-        bytes: usize,
-        max: usize,
-    },
     #[error("failed to stage a prompt file at '{path}': {source}")]
     StagedFile {
         path: String,

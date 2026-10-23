@@ -101,10 +101,11 @@ baseline, the same before and after Phase 1.
   ceiling and scorer check, not a baseline that can lose**: the block
   states the answers.
 - **fresh**: the same CLI and model with nothing from the runtime but one
-  neutral system-prompt line, through the same flag as the pulse's (so the
-  CLI's default prompt, which may carry the date or the model, is not what
-  "no scaffold" is credited with). Labelled reference only, never the
-  headline (§1a.1 G4).
+  neutral system-prompt line, delivered the same way as the pulse's.
+  Claude's `--system-prompt-file` replaces the CLI default. Grok's prompt
+  is prepended into the mode-0600 prompt file (see the probe-runner page):
+  that CLI's own default, which may carry the date or the model, stays.
+  Labelled reference only, never the headline (§1a.1 G4).
 
 ## Scoring (rule only)
 

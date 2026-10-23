@@ -170,50 +170,6 @@ fn stage_prepends_when_the_cli_has_no_system_prompt_channel() {
     assert_eq!(staged.stdin_text.as_deref(), Some("SYS\n\nUSER"));
 }
 
-#[test]
-fn stage_refuses_an_oversized_argv_system_prompt() {
-    struct Argv;
-    impl CliAdapter for Argv {
-        fn name(&self) -> &'static str {
-            "argv"
-        }
-        fn default_bin(&self) -> &'static str {
-            "argv"
-        }
-        fn default_model(&self) -> &'static str {
-            ""
-        }
-        fn prompt_delivery(&self) -> adapter::PromptDelivery {
-            adapter::PromptDelivery::File
-        }
-        fn system_prompt_delivery(&self) -> adapter::SystemPromptDelivery {
-            adapter::SystemPromptDelivery::Argv { max_bytes: 10 }
-        }
-        fn output_mode(&self, _: bool) -> adapter::OutputMode {
-            adapter::OutputMode::Ndjson
-        }
-        fn invoke_args(&self, _: &Invocation<'_>) -> Vec<std::ffi::OsString> {
-            vec![]
-        }
-        fn parse_single(&self, _: &str) -> Result<adapter::Reply, String> {
-            Err("n/a".into())
-        }
-        fn parse_stream_line(&self, _: &str) -> adapter::StreamLine {
-            adapter::StreamLine::Other
-        }
-        fn classify_exit(&self, _: &str, _: &str) -> adapter::ExitClass {
-            adapter::ExitClass::Plain
-        }
-        fn integration(&self) -> &dyn adapter::AgentIntegration {
-            unimplemented!()
-        }
-    }
-    assert!(stage(&Argv, &"x".repeat(11), "p", &std::env::temp_dir()).is_err());
-    let ok = stage(&Argv, "short", "p", &std::env::temp_dir()).unwrap();
-    assert!(ok.prompt_file.is_some());
-    assert!(ok.stdin_text.is_none());
-}
-
 // --- NDJSON reduction ---
 
 #[test]
@@ -400,7 +356,12 @@ async fn streaming_prefers_the_terminal_record_when_the_adapter_says_so() {
     assert_eq!(reply.output_tokens, Some(3));
     let argv = mock.argv();
     assert!(argv.contains(&"--prompt-file".to_string()));
-    assert!(argv.contains(&"--system-prompt-override".to_string()));
+    assert!(
+        !argv
+            .iter()
+            .any(|a| a == "--system-prompt-override" || a == "sys"),
+        "the system prompt is staged in the prompt file, not on argv: {argv:?}"
+    );
     assert!(!argv.iter().any(|a| a == "-"), "grok never reads stdin");
     // The buffered path agrees.
     let out = mock

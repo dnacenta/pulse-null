@@ -30,11 +30,10 @@ pub enum PromptDelivery {
 pub enum SystemPromptDelivery {
     /// Staged in a private temp file; the adapter names it on argv.
     File,
-    /// Passed inline on argv. Linux caps one argument at 128 KiB, so the
-    /// runner refuses prompts above `max_bytes` rather than truncating.
-    Argv { max_bytes: usize },
-    /// The CLI has no system-prompt channel: the runner prepends it to the
-    /// user prompt, separated by a blank line.
+    /// The CLI has no system-prompt file flag. The runner prepends the
+    /// prompt to the user prompt, separated by a blank line, and that text
+    /// is staged in a mode-0600 file. It is not placed on argv:
+    /// `/proc/<pid>/cmdline` is world-readable.
     Prepend,
 }
 
@@ -111,11 +110,9 @@ pub struct Probe {
 #[derive(Debug)]
 pub struct Invocation<'a> {
     pub model: &'a str,
-    /// The staged system prompt, when [`SystemPromptDelivery::File`] or
-    /// `Argv` is in use. `None` for `Prepend`.
+    /// The staged system prompt, when [`SystemPromptDelivery::File`] is in
+    /// use. `None` for `Prepend` (the text is in the user prompt file).
     pub system_prompt_file: Option<&'a Path>,
-    /// The system prompt text, for [`SystemPromptDelivery::Argv`].
-    pub system_prompt: &'a str,
     /// The staged user prompt, when [`PromptDelivery::File`] is in use.
     pub prompt_file: Option<&'a Path>,
     /// Which tools the CLI may use: everything (the owner), a read-only

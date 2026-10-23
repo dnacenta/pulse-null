@@ -436,7 +436,6 @@ mod tests {
         Invocation {
             model,
             system_prompt_file: sp,
-            system_prompt: "sys",
             prompt_file: None,
             surface: ToolSurface::Full,
             streaming: false,

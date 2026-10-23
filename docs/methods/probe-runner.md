@@ -133,7 +133,7 @@ what was included, with tokens, and what the budget dropped).
 |---|---|---|---|
 | `pulse` | a copy of the pulse home | the pulse's own, built by the prompt builder from the copy | what is measured |
 | `input-only` | empty | only the runtime facts, in a fixed template (`assets/probes/v1/facts.md`) | a ceiling and scorer check in v1: the facts state the answers, so it cannot lose |
-| `fresh` | empty | one neutral line (`assets/probes/v1/fresh-system.md`), passed the way the pulse's prompt is (claude `--system-prompt-file`, grok `--system-prompt-override`, both replacing the CLI's default, which may carry the date or the model) | labelled reference, never the headline |
+| `fresh` | empty | one neutral line (`assets/probes/v1/fresh-system.md`), passed the way the pulse's prompt is. Claude replaces the CLI default with `--system-prompt-file`. Grok has no such flag; the line is prepended into the mode-0600 prompt file and is not put on argv (host `/proc/<pid>/cmdline` is world-readable, and `ProtectProc` does not change that mount). Grok's own default system prompt, which may carry the date or the model, is therefore still present | labelled reference, never the headline |
 
 All arms use the pulse's own agent CLI and configured model. The `fresh` and
 `input-only` arms get a vendor directory with no settings, rules, user

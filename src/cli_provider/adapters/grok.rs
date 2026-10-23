@@ -7,8 +7,14 @@
 //!
 //! 1. `-p -` treats `-` as the literal prompt — grok never reads stdin — so
 //!    the prompt is staged in a file and named with `--prompt-file`.
-//! 2. `--system-prompt-file` does not exist (exit 2, "unexpected argument");
-//!    the system prompt goes inline via `--system-prompt-override`.
+//! 2. `--system-prompt-file` does not exist (exit 2, "unexpected argument").
+//!    `--system-prompt-override` would put the prompt on argv, and
+//!    `/proc/<pid>/cmdline` is mode 0444 for every local account.
+//!    `ProtectProc` hides `/proc` inside the unit's mount namespace only;
+//!    it does not change the host's. The prompt is prepended to the user
+//!    prompt and staged in a mode-0600 file. It is never placed on argv.
+//!    Grok's own default system prompt is still present: this CLI has no
+//!    file channel that replaces it.
 //! 3. `--output-format json` returns a `text` field that CONCATENATES every
 //!    assistant turn, pre-tool narration included. That narration leaked into
 //!    Echo's Discord replies in August 2026. The stream format's terminal
@@ -158,17 +164,12 @@ impl CliAdapter for Grok {
         PromptDelivery::File
     }
 
-    /// Inline on argv. Linux caps a single argument at 128 KiB; the runner
-    /// refuses anything larger rather than silently truncating the pulse's
-    /// identity.
-    /// Grok has no file channel for the system prompt, so it rides on argv
-    /// (`--system-prompt-override`). That makes the pulse's identity and
-    /// memory readable in `/proc/<pid>/cmdline` by any local account while
-    /// a turn runs — an accepted trade-off of this CLI, to be compensated at
-    /// the host (`ProtectProc=invisible`, `hidepid`), not something another
-    /// adapter should copy.
+    /// Prepended into the mode-0600 prompt file. Grok Build 1.0.0 has no
+    /// system-prompt file flag, and `--system-prompt-override` would put
+    /// the text on argv. Host `/proc/<pid>/cmdline` is mode 0444;
+    /// `ProtectProc` does not change that mount.
     fn system_prompt_delivery(&self) -> SystemPromptDelivery {
-        SystemPromptDelivery::Argv { max_bytes: 120_000 }
+        SystemPromptDelivery::Prepend
     }
 
     /// NDJSON either way — see the module docs on why plain `json` is banned.
@@ -184,10 +185,9 @@ impl CliAdapter for Grok {
         args.push("--model".into());
         args.push(inv.model.into());
 
-        if !inv.system_prompt.is_empty() {
-            args.push("--system-prompt-override".into());
-            args.push(inv.system_prompt.into());
-        }
+        // The system prompt is not an argument. The runner prepends it to
+        // the user prompt ([`SystemPromptDelivery::Prepend`]), which is the
+        // mode-0600 file named below.
         if let Some(prompt_file) = inv.prompt_file {
             args.push("--prompt-file".into());
             args.push(prompt_file.as_os_str().to_os_string());
@@ -490,7 +490,6 @@ mod tests {
         Invocation {
             model: "grok-4.6",
             system_prompt_file: None,
-            system_prompt: "You are Echo.",
             prompt_file: Some(prompt_file),
             surface: ToolSurface::Full,
             streaming: false,
@@ -525,9 +524,11 @@ mod tests {
             "plain json concatenates every assistant turn"
         );
         assert_eq!(value_of(&args, "--model"), Some("grok-4.6"));
-        assert_eq!(
-            value_of(&args, "--system-prompt-override"),
-            Some("You are Echo.")
+        assert!(
+            !args
+                .iter()
+                .any(|arg| arg == "--system-prompt-override" || arg.contains("You are Echo.")),
+            "the system prompt is not on argv: {args:?}"
         );
         assert_eq!(value_of(&args, "--prompt-file"), Some("/tmp/prompt.txt"));
         assert!(args.iter().any(|arg| arg == "--no-memory"));

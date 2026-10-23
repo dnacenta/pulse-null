@@ -393,16 +393,6 @@ fn stage(
             Some(StagedFile::create("system-prompt", system_prompt, dir)?),
             prompt.to_string(),
         ),
-        SystemPromptDelivery::Argv { max_bytes } => {
-            if system_prompt.len() > max_bytes {
-                return Err(CliError::SystemPromptTooLarge {
-                    adapter: adapter.name(),
-                    bytes: system_prompt.len(),
-                    max: max_bytes,
-                });
-            }
-            (None, prompt.to_string())
-        }
         SystemPromptDelivery::Prepend => (None, format!("{system_prompt}\n\n{prompt}")),
     };
     let (prompt_file, stdin_text) = match adapter.prompt_delivery() {
@@ -732,7 +722,6 @@ impl CliCall<'_> {
         let args = self.adapter.invoke_args(&Invocation {
             model: &self.model,
             system_prompt_file: staged.system_prompt_file.as_ref().map(StagedFile::path),
-            system_prompt: &self.system_prompt,
             prompt_file: staged.prompt_file.as_ref().map(StagedFile::path),
             surface: self.surface,
             streaming: false,
@@ -795,7 +784,6 @@ impl StreamingProvider for CliProvider {
             let args = adapter.invoke_args(&Invocation {
                 model: &model,
                 system_prompt_file: staged.system_prompt_file.as_ref().map(StagedFile::path),
-                system_prompt: &system_prompt,
                 prompt_file: staged.prompt_file.as_ref().map(StagedFile::path),
                 surface,
                 streaming: true,
@@ -1086,7 +1074,6 @@ impl CliProvider {
         let args = adapter.invoke_args(&Invocation {
             model: &self.model,
             system_prompt_file: staged.system_prompt_file.as_ref().map(StagedFile::path),
-            system_prompt,
             prompt_file: staged.prompt_file.as_ref().map(StagedFile::path),
             surface: self.surface(),
             streaming: true,
