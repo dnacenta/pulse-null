@@ -47,8 +47,9 @@ impl Default for ProbeConfig {
             cadence: ProbeCadence::Max,
             quiet_start: "02:00".to_string(),
             quiet_end: "06:00".to_string(),
-            // Three max-cadence runs of up to 27 turns each: every item set
-            // (15) and three due paired facts of four asks (12).
+            // Three max-cadence runs. The worst case is 14 item-set turns
+            // plus 12 paired asks (three due facts, four asks each): 26,
+            // under the cap of 27.
             weekly_turns: 81,
             max_turns_per_run: 27,
         }
