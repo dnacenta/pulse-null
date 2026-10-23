@@ -861,6 +861,86 @@ mod streaming_tests {
         );
     }
 
+    /// A provider that already closed each message must not get a second
+    /// boundary from the loop when the round also ended in a tool call.
+    #[tokio::test]
+    async fn provider_boundaries_are_not_doubled() {
+        use std::sync::atomic::{AtomicU32, Ordering};
+
+        struct Bounded {
+            round: AtomicU32,
+        }
+        impl LmProvider for Bounded {
+            fn invoke(
+                &self,
+                _s: &str,
+                _m: &[Message],
+                _t: u32,
+                _tools: Option<&[serde_json::Value]>,
+            ) -> std::pin::Pin<
+                Box<
+                    dyn std::future::Future<
+                            Output = Result<LlmResponse, Box<dyn std::error::Error + Send + Sync>>,
+                        > + Send
+                        + '_,
+                >,
+            > {
+                Box::pin(async { Err("unused".into()) })
+            }
+            fn name(&self) -> &str {
+                "bounded"
+            }
+            fn supports_tools(&self) -> bool {
+                true
+            }
+        }
+        impl StreamingProvider for Bounded {
+            fn invoke_streaming(
+                &self,
+                _s: &str,
+                _m: &[Message],
+                _t: u32,
+                _tools: Option<&[serde_json::Value]>,
+            ) -> crate::streaming::StreamResult<'_> {
+                let n = self.round.fetch_add(1, Ordering::SeqCst);
+                Box::pin(async_stream::stream! {
+                    if n == 0 {
+                        yield StreamEvent::TextDelta("look ".into());
+                        yield StreamEvent::SegmentEnd { tool_use: true };
+                        yield StreamEvent::ToolUse {
+                            id: "t1".into(),
+                            name: "file_read".into(),
+                            input: serde_json::json!({}),
+                        };
+                        yield StreamEvent::Done(tool_round("look ", "file_read"));
+                    } else {
+                        yield StreamEvent::TextDelta("found".into());
+                        yield StreamEvent::SegmentEnd { tool_use: false };
+                        yield StreamEvent::Done(end_turn("found"));
+                    }
+                })
+            }
+        }
+
+        let p = Bounded {
+            round: AtomicU32::new(0),
+        };
+        let tools = ToolRegistry::new();
+        let (tx, mut rx) = tokio::sync::mpsc::channel(64);
+        let mut messages = vec![user("hi")];
+        invoke_with_tool_loop_streaming(&p, &tools, "sys", &mut messages, 100, 5, &tx)
+            .await
+            .unwrap();
+        drop(tx);
+        let mut segments = Vec::new();
+        while let Some(event) = rx.recv().await {
+            if let TurnEvent::Segment { index, tool } = event {
+                segments.push((index, tool));
+            }
+        }
+        assert_eq!(segments, vec![(0, true), (1, false)]);
+    }
+
     #[tokio::test]
     async fn streamed_refusal_surfaces_as_typed_refusal_error() {
         let tools = ToolRegistry::new();

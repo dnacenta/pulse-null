@@ -474,7 +474,10 @@ fn reply_from_ndjson(adapter: &dyn CliAdapter, stdout: &str) -> Result<Reply, St
                 usage,
             } => terminal = Some((text, is_error, usage)),
             StreamLine::Usage(usage) => usage_seen = Some(usage),
-            StreamLine::Other => {}
+            // A boundary carries no reply text. Folding the message body
+            // in here would duplicate narration the terminal record already
+            // excluded.
+            StreamLine::MessageEnd { .. } | StreamLine::Other => {}
         }
     }
     settle(adapter, assembled, terminal, usage_seen)
@@ -824,6 +827,9 @@ impl StreamingProvider for CliProvider {
                                     terminal = Some((text, is_error, usage));
                                 }
                                 StreamLine::Usage(usage) => usage_seen = Some(usage),
+                                StreamLine::MessageEnd { tool_use } => {
+                                    yield StreamEvent::SegmentEnd { tool_use };
+                                }
                                 StreamLine::Other => {}
                             },
                             Ok(Ok(None)) => break,

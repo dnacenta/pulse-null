@@ -1,0 +1,6 @@
+{"type":"stream_event","event":{"type":"content_block_delta","delta":{"type":"text_delta","text":"I'll list the files. "}}}
+{"type":"assistant","message":{"id":"msg_1","type":"message","role":"assistant","content":[{"type":"text","text":"I'll list the files. "},{"type":"tool_use","id":"toolu_1","name":"Bash","input":{"command":"ls"}}]}}
+{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_1","content":"a.txt\n"}]}}
+{"type":"stream_event","event":{"type":"content_block_delta","delta":{"type":"text_delta","text":"three"}}}
+{"type":"assistant","message":{"id":"msg_2","type":"message","role":"assistant","content":[{"type":"text","text":"three"}]}}
+{"type":"result","subtype":"success","is_error":false,"result":"three","usage":{"input_tokens":4,"output_tokens":2}}

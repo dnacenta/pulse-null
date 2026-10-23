@@ -60,8 +60,32 @@ pub enum StreamLine {
     },
     /// A usage-only record; the runner attaches it to the reply.
     Usage(Usage),
+    /// The model closed an assistant message. `tool_use` is true when any
+    /// content block in that message is a tool call. The runner forwards
+    /// this as a message boundary and does not append its text: the reply
+    /// still comes from deltas or the terminal record.
+    MessageEnd { tool_use: bool },
     /// Structure we do not consume (tool events, init).
     Other,
+}
+
+/// A whole assistant message, when `value` is one.
+///
+/// `tool_use` is true when any block under `message.content` has type
+/// `tool_use`. Records that are not assistant messages return `None`.
+pub(crate) fn assistant_message_end(value: &serde_json::Value) -> Option<StreamLine> {
+    if value.get("type").and_then(|t| t.as_str()) != Some("assistant") {
+        return None;
+    }
+    let tool_use = value
+        .pointer("/message/content")
+        .and_then(|c| c.as_array())
+        .is_some_and(|blocks| {
+            blocks
+                .iter()
+                .any(|block| block.get("type").and_then(|t| t.as_str()) == Some("tool_use"))
+        });
+    Some(StreamLine::MessageEnd { tool_use })
 }
 
 /// Token counts as the CLI reported them, when it did.
