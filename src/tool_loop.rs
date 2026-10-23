@@ -419,7 +419,7 @@ impl ProgressSink {
                         buf.segments.clear();
                         buf.overflowed = true;
                         drop(held);
-                        return self.deliver(TurnEvent::Reset(crate::wire::ResetReason::Guard));
+                        return self.deliver(TurnEvent::Reset(crate::wire::ResetReason::Budget));
                     }
                     buf.bytes = next;
                     buf.deltas.push(text);
@@ -1678,7 +1678,7 @@ mod streaming_tests {
         }
         assert_eq!(
             events,
-            vec![TurnEvent::Reset(crate::wire::ResetReason::Guard)]
+            vec![TurnEvent::Reset(crate::wire::ResetReason::Budget)]
         );
     }
 }

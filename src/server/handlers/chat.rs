@@ -577,7 +577,7 @@ fn error_to_sse(status: StatusCode, message: String) -> Event {
 /// Events: `status {status: thinking|responding|tool, name?}`, `delta {text}`
 /// (as the provider yields them; the client coalesces), `segment {index, tool}`
 /// when an assistant message ends and the server knows whether a tool call
-/// follows, `reset {reason: fallback|guard}` when text already sent is void,
+/// follows, `reset {reason: fallback|guard|budget}` when text already sent is void,
 /// then exactly one of
 /// `done {text, model, tokens_in, tokens_out, isolation, truncated}` or
 /// `error {status, message}`. Dropping the connection aborts the turn: the
