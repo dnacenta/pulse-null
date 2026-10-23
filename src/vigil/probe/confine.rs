@@ -34,13 +34,14 @@ const LOOPBACK_PROBE: &str = "127.0.0.1:9";
 /// The confinement checks, as `verify-isolation` shows them.
 #[must_use]
 pub fn checks() -> Vec<Check> {
-    let mut checks = vec![loopback_check()];
+    let mut checks = vec![loopback_check(), v6_https_check()];
     checks.extend(HOST_SOCKETS.iter().filter_map(|path| socket_check(path)));
     let resolv = crate::fs_safe::read_bounded(Path::new("/etc/resolv.conf"), 64 * 1024)
         .ok()
         .flatten()
         .unwrap_or_default();
     checks.push(resolver_check(&resolv));
+    checks.push(public_address_check());
     checks
 }
 
@@ -244,25 +245,158 @@ fn loopback_check() -> Check {
     loopback_verdict(result.map(|_| ()))
 }
 
-/// What a connect to the IPv4 loopback says about the unit's address deny.
-fn loopback_verdict(result: std::io::Result<()>) -> Check {
-    let name = "unit: the IPv4 loopback is denied".to_string();
+/// `[::1]:443` must be denied. The unit allows `::1` so the throwaway can
+/// listen, and Landlock allows TCP 443 on every address. Nothing in the run
+/// connects to `[::1]:443`; a connect that is not `EPERM` means the address
+/// filter is not holding that port.
+const V6_HTTPS: &str = "[::1]:443";
+
+fn v6_https_check() -> Check {
+    let address = V6_HTTPS.parse().expect("a socket address");
+    let result = std::net::TcpStream::connect_timeout(&address, Duration::from_secs(2));
+    connect_verdict("unit: [::1]:443 is denied", "[::1]:443", result.map(|_| ()))
+}
+
+/// What a connect says about an address the unit must deny. Only `EPERM`
+/// (the filter) passes; a refusal from nothing listening does not.
+fn connect_verdict(name: &str, target: &str, result: std::io::Result<()>) -> Check {
     match result {
         Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => Check {
-            name,
+            name: name.to_string(),
             passed: true,
-            detail: "127.0.0.1 refused by the address filter".into(),
+            detail: format!("{target} refused by the address filter"),
         },
         Err(e) => Check {
-            name,
+            name: name.to_string(),
             passed: false,
-            detail: format!("127.0.0.1 is reachable ({e})"),
+            detail: format!("{target} is reachable ({e})"),
         },
         Ok(()) => Check {
-            name,
+            name: name.to_string(),
             passed: false,
-            detail: "127.0.0.1 is reachable (connected)".into(),
+            detail: format!("{target} is reachable (connected)"),
         },
+    }
+}
+
+/// What a connect to the IPv4 loopback says about the unit's address deny.
+fn loopback_verdict(result: std::io::Result<()>) -> Check {
+    connect_verdict("unit: the IPv4 loopback is denied", "127.0.0.1", result)
+}
+
+/// The host's own public addresses must be denied by the per-host drop-in.
+/// Ranges the unit template already denies (loopback, private, CGNAT,
+/// link-local, ULA) are not this check. No public address is a pass: there
+/// is nothing for the drop-in to name. A failure to list addresses fails
+/// closed.
+fn public_address_check() -> Check {
+    let name = "unit: the host's public addresses are denied";
+    match public_addrs() {
+        Err(detail) => Check {
+            name: name.to_string(),
+            passed: false,
+            detail,
+        },
+        Ok(addrs) if addrs.is_empty() => Check {
+            name: name.to_string(),
+            passed: true,
+            detail: "this host has no public address".into(),
+        },
+        Ok(addrs) => {
+            let open: Vec<String> = addrs
+                .iter()
+                .filter(|addr| !address_denied(**addr))
+                .map(|addr| addr.to_string())
+                .collect();
+            Check {
+                name: name.to_string(),
+                passed: open.is_empty(),
+                detail: if open.is_empty() {
+                    "public addresses refused by the address filter".into()
+                } else {
+                    format!("reachable: {}", open.join(", "))
+                },
+            }
+        }
+    }
+}
+
+fn address_denied(addr: std::net::IpAddr) -> bool {
+    let target = std::net::SocketAddr::new(addr, 9);
+    let result = std::net::TcpStream::connect_timeout(&target, Duration::from_secs(2));
+    result.is_err_and(|e| e.kind() == std::io::ErrorKind::PermissionDenied)
+}
+
+/// Public addresses on this host: not a range the unit template already denies.
+fn public_addrs() -> Result<Vec<std::net::IpAddr>, String> {
+    let mut head: *mut libc::ifaddrs = std::ptr::null_mut();
+    // SAFETY: getifaddrs writes a list we free with freeifaddrs.
+    let rc = unsafe { libc::getifaddrs(&mut head) };
+    if rc != 0 {
+        return Err(format!(
+            "cannot list host addresses ({})",
+            std::io::Error::last_os_error()
+        ));
+    }
+    let mut addrs = Vec::new();
+    let mut cur = head;
+    while !cur.is_null() {
+        // SAFETY: `cur` is a node in the list getifaddrs just returned.
+        let ifa = unsafe { &*cur };
+        if let Some(addr) = ifa_addr(ifa.ifa_addr) {
+            if needs_public_drop_in(addr) {
+                addrs.push(addr);
+            }
+        }
+        cur = ifa.ifa_next;
+    }
+    // SAFETY: `head` is the list getifaddrs returned.
+    unsafe { libc::freeifaddrs(head) };
+    addrs.sort();
+    addrs.dedup();
+    Ok(addrs)
+}
+
+fn ifa_addr(ptr: *const libc::sockaddr) -> Option<std::net::IpAddr> {
+    if ptr.is_null() {
+        return None;
+    }
+    // SAFETY: `ptr` is a sockaddr from getifaddrs, family-checked before the cast.
+    let family = unsafe { (*ptr).sa_family };
+    if family == libc::AF_INET as libc::sa_family_t {
+        let sin = unsafe { &*(ptr.cast::<libc::sockaddr_in>()) };
+        return Some(std::net::Ipv4Addr::from(u32::from_be(sin.sin_addr.s_addr)).into());
+    }
+    if family == libc::AF_INET6 as libc::sa_family_t {
+        let sin6 = unsafe { &*(ptr.cast::<libc::sockaddr_in6>()) };
+        return Some(std::net::Ipv6Addr::from(sin6.sin6_addr.s6_addr).into());
+    }
+    None
+}
+
+/// Whether `addr` is outside the ranges the unit template denies, so only
+/// the per-host drop-in can cover it.
+fn needs_public_drop_in(addr: std::net::IpAddr) -> bool {
+    match addr {
+        std::net::IpAddr::V4(ip) => {
+            let [a, b, _, _] = ip.octets();
+            let cgnat = a == 100 && (64..128).contains(&b);
+            !ip.is_private()
+                && !ip.is_loopback()
+                && !ip.is_link_local()
+                && !ip.is_unspecified()
+                && !ip.is_broadcast()
+                && !ip.is_multicast()
+                && !cgnat
+        }
+        std::net::IpAddr::V6(ip) => {
+            let ula = (ip.octets()[0] & 0xfe) == 0xfc;
+            !ip.is_loopback()
+                && !ip.is_unspecified()
+                && !ip.is_multicast()
+                && !ip.is_unicast_link_local()
+                && !ula
+        }
     }
 }
 
@@ -363,20 +497,48 @@ mod tests {
         );
     }
 
-    /// The run denies the IPv4 loopback and resolves off it; only the
-    /// export reaches 127.0.0.1, and nothing else.
+    /// The run denies by default and allows the resolvers, the throwaway
+    /// and the public Internet (TCP 443 is Landlock's limit; the address
+    /// filter cannot name a port). Only the export reaches 127.0.0.1.
     #[test]
     fn only_the_export_unit_reaches_the_ipv4_loopback() {
         let block = confinement_block(PROBE_UNIT);
+        assert!(block.contains("IPAddressDeny=any"));
         assert!(block.contains("IPAddressDeny=127.0.0.0/8"));
+        assert!(block.contains("IPAddressAllow=::1"));
+        assert!(block.contains("IPAddressAllow=9.9.9.9"));
+        assert!(block.contains("IPAddressAllow=1.1.1.1"));
+        assert!(block.contains("IPAddressAllow=2620:fe::fe"));
+        assert!(block.contains("InaccessiblePaths=-/run/user"));
         assert!(
             block.contains("BindReadOnlyPaths=/etc/pulse-null/probe-resolv.conf:/etc/resolv.conf")
         );
-        assert!(!block.contains("IPAddressAllow"), "nothing re-allowed");
         assert!(PROBE_UNIT.contains("Requires=pulse-null-probe-export@%i.service"));
         assert!(EXPORT_UNIT.contains("IPAddressDeny=any"));
         assert!(EXPORT_UNIT.contains("IPAddressAllow=127.0.0.1/32"));
         assert!(EXPORT_UNIT.contains("ExecStart=/usr/local/bin/pulse-null probe export-graph"));
+    }
+
+    #[test]
+    fn a_public_address_needs_the_drop_in_and_a_private_one_does_not() {
+        use std::net::IpAddr;
+        let public: IpAddr = "203.0.113.5".parse().unwrap();
+        let private: IpAddr = "10.1.2.3".parse().unwrap();
+        let cgnat: IpAddr = "100.64.0.1".parse().unwrap();
+        let loopback: IpAddr = "127.0.0.1".parse().unwrap();
+        let v6: IpAddr = "2001:db8::1".parse().unwrap();
+        let ula: IpAddr = "fd00::1".parse().unwrap();
+        let link: IpAddr = "fe80::1".parse().unwrap();
+        assert!(needs_public_drop_in(public));
+        assert!(needs_public_drop_in(v6));
+        assert!(!needs_public_drop_in(private));
+        assert!(!needs_public_drop_in(cgnat));
+        assert!(!needs_public_drop_in(loopback));
+        assert!(!needs_public_drop_in(ula));
+        assert!(!needs_public_drop_in(link));
+        let denied = std::io::Error::from_raw_os_error(libc::EPERM);
+        assert!(connect_verdict("v6", "[::1]:443", Err(denied)).passed);
+        assert!(!connect_verdict("v6", "[::1]:443", Ok(())).passed);
     }
 
     /// Outside the unit (as in the test suite) a run must be refused.

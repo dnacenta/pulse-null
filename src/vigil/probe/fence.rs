@@ -109,7 +109,6 @@ pub const DEVICE_WRITES: &[&str] = &[
     "/dev/full",
     "/dev/tty",
     "/dev/ptmx",
-    "/dev/pts",
 ];
 
 /// Live paths a probe child must never read, with what they are. Used to

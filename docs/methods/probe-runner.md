@@ -145,8 +145,9 @@ instructions or memory, only what the CLI needs to log in.
   runs under a Landlock ruleset the child applies to itself just before it
   execs. It may **read** only the read fence below and its own item
   directory, and **write** only beneath its item directory (plus
-  `/dev/null`, `/dev/zero`, `/dev/full`, `/dev/tty`, `/dev/ptmx`,
-  `/dev/pts`). Reads and writes anywhere else — the live pulse home, its
+  `/dev/null`, `/dev/zero`, `/dev/full`, `/dev/tty`, `/dev/ptmx`).
+  `/dev/pts` is not a write root: that directory is the host's terminals.
+  Reads and writes anywhere else — the live pulse home, its
   `secrets/` and `record/`, the graph credential directory, the user's home
   with `~/.config` and `~/.ssh`, the live vendor directories, the base copy
   and the other items — fail with `EACCES`. The child gets a `HOME`,
@@ -156,8 +157,8 @@ instructions or memory, only what the CLI needs to log in.
 - **Network.** TCP connections are allowed only to port 443 (the vendor's
   API) and the run's throwaway graph server's port. Binding TCP is
   refused. The live pulse's HTTP port and the live graph server's port are
-  unreachable, and under the unit so is 127.0.0.1:443 (`verify-isolation`
-  checks all three; see "Loopback" below).
+  unreachable, and under the unit so are 127.0.0.1:443 and `[::1]:443`
+  (`verify-isolation` checks them; see "Loopback and addresses" below).
 - **What a child leaves behind.** Every sandboxed child leads a process
   group of its own; when it exits (or times out) the group is killed, so a
   background job it started dies with it (a daemon that calls `setsid`
@@ -295,26 +296,32 @@ but the run's rows.
   password, once visible that way and on its command line, was rotated on
   2026-10-18 and now reaches the server from a root-only environment file,
   never its argv.
-- **Loopback.** Landlock holds a child to ports 443 and the throwaway's,
-  and cannot say "443 but not on 127.0.0.1" (where the host's nginx listens
-  on 0.0.0.0:443). The probe unit says it by address: `IPAddressDeny=` for
-  all of 127.0.0.0/8, and for this host's own non-loopback addresses (the
-  private, CGNAT/Tailscale, ULA and link-local ranges, the public ones
-  through a per-host drop-in). That works because nothing in the run needs
-  the IPv4 loopback any more: the live export happens in its own unit
-  first, the throwaway listens on `::1` (where nothing listens on 443), and
-  names resolve through a probe resolver off the loopback
+- **Loopback and addresses.** Landlock holds a child to ports 443 and the
+  throwaway's, and cannot say "443 but not on 127.0.0.1" (where the host's
+  nginx listens on 0.0.0.0:443). The probe unit starts from
+  `IPAddressDeny=any` and allows the probe resolvers, `::1` (the throwaway;
+  nothing on this host listens on `[::1]:443`), and the public Internet so
+  the child can open TCP 443 to the vendor API. systemd cannot allow a port
+  without the address, so UDP to those addresses stays open; Landlock does
+  not cover UDP. More specific denies cover 127.0.0.0/8 and this host's
+  private, CGNAT/Tailscale, ULA and link-local ranges. The host's own
+  public addresses are a per-host drop-in (`systemctl edit`), more specific
+  than the public allow. A run checks `[::1]:443` and those public
+  addresses from the inside and refuses unless the filter answers `EPERM`.
+  The live export happens in its own unit first, and names resolve through
+  a probe resolver off the loopback
   (`/etc/pulse-null/probe-resolv.conf` bound over `/etc/resolv.conf`;
-  systemd-resolved's 127.0.0.53 is denied). `verify-isolation` checks from
-  inside a child that 127.0.0.1:443 is refused.
-- **By hand.** `pulse-null probe run` checks from the inside that it is
-  confined like the unit (127.0.0.1 refused by the address filter, the host
-  sockets above unreachable, the resolver off the loopback) and refuses
-  otherwise: run it as `systemctl start pulse-null-probe@<pulse>`, which
-  runs the export first. `verify-isolation` shows the same checks; run it
-  as `systemctl start pulse-null-probe-verify@<pulse>`, the same
-  confinement line for line (by hand outside it, the unit checks fail and it
-  exports the graph for itself, since the loopback is open there).
+  systemd-resolved's 127.0.0.53 is denied). `/run/user` is inaccessible, so
+  a child cannot connect to a live recall-echo socket there.
+- **By hand.** `pulse-null probe run` and `verify-isolation` check from the
+  inside that the process is confined like the unit (the IPv4 loopback and
+  `[::1]:443` refused by the address filter, the host's public addresses
+  denied, the host sockets above unreachable, the resolver off the loopback)
+  and refuse otherwise. `verify-isolation` stops before exporting the live
+  graph or starting a CLI turn, and it does not grant `/dev/pts` as a write
+  root. Run them as `systemctl start pulse-null-probe@<pulse>` and
+  `systemctl start pulse-null-probe-verify@<pulse>` (the same confinement
+  line for line). The run unit starts the export first.
 - The pulse's own live process is not sandboxed. It cannot read or write
   the probe record: that directory is mode 0700, owned by the probe user,
   and it is not under the pulse home. A run refuses when the two uids are

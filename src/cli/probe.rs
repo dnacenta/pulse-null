@@ -1110,16 +1110,19 @@ impl VerifyHost {
 }
 
 /// Show that a probe item of `ctx`'s pulse writes nowhere live.
+/// A failed confinement check stops here: no export, no scratch, no CLI.
 async fn verify_for(
     ctx: &ProbeContext,
     request: &VerifyRequest,
     detect: impl FnOnce() -> VerifyHost,
 ) -> Result<Report, Box<dyn Error>> {
+    let host = detect();
+    if let Some(report) = refused_confinement(&host.confinement) {
+        return Ok(report);
+    }
     LandlockSupport::detect().require()?;
     let adapter = ctx.adapter()?;
     let recall_bin = crate::init::agent_bootstrap::find_recall_echo_bin();
-    let host = detect();
-    export_unless_confined(ctx, &host.confinement).await?;
     let scratch = ctx.create_scratch(request.keep_scratch)?;
     let (graph, graph_copy) = ctx.prepare_graph(&scratch).await?;
     let site = IsolationSite {
@@ -1142,16 +1145,21 @@ async fn verify_for(
     Ok(result.report(&ctx.config.pulse.name, LandlockSupport::detect().describe()))
 }
 
-/// Under the unit the export unit has left a fresh export. By hand (not
-/// confined) the loopback is open, so the check exports for itself.
-async fn export_unless_confined(
-    ctx: &ProbeContext,
-    confinement: &[Check],
-) -> Result<(), Box<dyn Error>> {
-    if confinement.iter().any(|c| !c.passed) && ctx.export_graph().await?.is_some() {
-        println!("  (not under the probe unit: exported the live graph for this check)");
+/// A confinement check that failed. The command stops before it exports
+/// the live graph or starts a CLI turn.
+fn refused_confinement(checks: &[Check]) -> Option<Report> {
+    if checks.iter().all(|c| c.passed) {
+        return None;
     }
-    Ok(())
+    let mut report = Report::default();
+    report.line(
+        "  probe isolation refused: not confined like the probe unit \
+         (no export, no CLI turn)",
+    );
+    for check in checks.iter().filter(|c| !c.passed) {
+        report.line(format!("    FAIL  {} — {}", check.name, check.detail));
+    }
+    Some(report.failing("probe isolation check failed"))
 }
 
 /// The scratch copy an isolation check runs its items in.
@@ -2532,10 +2540,42 @@ mod tests {
         assert!(set.is_ok(), "the flag was not set");
     }
 
+    #[tokio::test]
+    async fn verify_isolation_stops_before_export_or_a_turn_when_unconfined() {
+        let fixture = Fixture::new(None);
+        let request = VerifyRequest {
+            turn: true,
+            keep_scratch: true,
+        };
+        let report = verify_for(&fixture.ctx, &request, unconfined)
+            .await
+            .unwrap();
+        let text = plain(&report.text);
+        assert!(text.contains("no export, no CLI turn"), "{text}");
+        assert!(text.contains("unit: loopback refused"), "{text}");
+        assert!(!text.contains(CLI_STARTS), "{text}");
+        assert!(!text.contains(TURN_COMPLETED), "{text}");
+        assert!(!text.contains("exported"), "{text}");
+        assert_eq!(report.failure, Some("probe isolation check failed"));
+        assert!(
+            scratch_left(&fixture.ctx).is_empty(),
+            "no scratch is created"
+        );
+    }
+
     /// Outside the probe unit: one confinement check fails, as by hand.
     fn unconfined() -> VerifyHost {
         VerifyHost {
             confinement: vec![check("unit: loopback refused", false)],
+            has_env: &always,
+            unit_ports: &[],
+        }
+    }
+
+    /// The unit's confinement checks passed.
+    fn confined_host() -> VerifyHost {
+        VerifyHost {
+            confinement: vec![check("unit: loopback refused", true)],
             has_env: &always,
             unit_ports: &[],
         }
@@ -2568,7 +2608,7 @@ mod tests {
             turn: true,
             keep_scratch: false,
         };
-        let report = verify_for(&fixture.ctx, &request, unconfined)
+        let report = verify_for(&fixture.ctx, &request, confined_host)
             .await
             .unwrap();
         let text = plain(&report.text);
@@ -2583,7 +2623,7 @@ mod tests {
                 .to_string()
         };
         assert!(line("live pulse home").starts_with("    pass  "), "{text}");
-        assert!(line("unit: loopback refused").starts_with("    FAIL  "));
+        assert!(line("unit: loopback refused").starts_with("    pass  "));
         assert!(line(CLI_STARTS).starts_with("    pass  "), "{text}");
         assert!(
             line(TURN_COMPLETED).contains("reply \"probe ok\""),
@@ -2591,7 +2631,10 @@ mod tests {
         );
         assert!(line(FRESH_DATE_CHECK).starts_with("    pass  "), "{text}");
         assert!(line(FRESH_DATE_CHECK).contains("reply \"UNKNOWN\": no date of its own"));
-        // The fixture's failed confinement check fails the whole check.
+        // The fake CLI writes no vendor files, so that one check still fails
+        // the report. Confinement itself passed, and the turn ran.
+        let fails: Vec<_> = text.lines().filter(|l| l.contains("FAIL")).collect();
+        assert_eq!(fails, ["    FAIL  turn: the CLI's own files landed in scratch 0 → 0 files in the scratch vendor dir"], "{text}");
         assert_eq!(report.failure, Some("probe isolation check failed"));
         assert!(!text.contains("scratch kept at"));
         assert_eq!(scratch_left(&fixture.ctx), Vec::<PathBuf>::new());
@@ -2608,7 +2651,7 @@ mod tests {
             turn: false,
             keep_scratch: true,
         };
-        let report = verify_for(&fixture.ctx, &request, unconfined)
+        let report = verify_for(&fixture.ctx, &request, confined_host)
             .await
             .unwrap();
         let text = plain(&report.text);
@@ -2640,7 +2683,7 @@ mod tests {
             turn: true,
             keep_scratch: false,
         };
-        let report = verify_for(&fixture.ctx, &request, unconfined)
+        let report = verify_for(&fixture.ctx, &request, confined_host)
             .await
             .unwrap();
         let text = plain(&report.text);
@@ -2665,7 +2708,7 @@ mod tests {
         };
         let logged_out = || VerifyHost {
             has_env: &never,
-            ..unconfined()
+            ..confined_host()
         };
         let error = verify_for(&fixture.ctx, &request, logged_out)
             .await

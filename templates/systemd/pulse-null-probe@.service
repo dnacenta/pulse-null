@@ -56,9 +56,11 @@
 #   systemctl daemon-reload && systemctl enable --now pulse-null-probe@<pulse>.timer
 #
 # By hand: `systemctl start pulse-null-probe@<pulse>` (it runs the export
-# first). `pulse-null probe run` outside the unit refuses: it checks from the
-# inside that the loopback is denied, the host sockets are hidden and the
-# resolver is off the loopback.
+# first). `pulse-null probe run` and `verify-isolation` outside the unit
+# refuse: they check from the inside that the loopback and [::1]:443 are
+# denied, the host's public addresses are denied, the host sockets are
+# hidden and the resolver is off the loopback. verify-isolation stops
+# before any export or CLI turn.
 #
 # The run itself decides whether it is due (`--if-due`): enabled, a probe
 # day, inside [probe] quiet_start..quiet_end, under the weekly budget, not
@@ -111,6 +113,9 @@ InaccessiblePaths=-/home/pulse/.local/state
 # probe run needs them; the leading '-' skips one a host does not have.
 InaccessiblePaths=-/run/dbus -/run/tailscale -/run/snapd.socket -/run/snapd-snap.socket
 InaccessiblePaths=-/run/avahi-daemon -/run/uuidd
+# The live recall-echo socket lives under $XDG_RUNTIME_DIR (/run/user/<uid>).
+# Landlock does not mediate a named-socket connect, so the directory is hidden.
+InaccessiblePaths=-/run/user
 PrivateTmp=yes
 PrivateDevices=yes
 ProtectProc=invisible
@@ -133,16 +138,25 @@ SystemCallArchitectures=native
 # MemoryDenyWriteExecute= stays off: the agent CLIs run JIT engines.
 
 # --- Network -----------------------------------------------------------------
-# Probe children are held to TCP 443 and the run's throwaway graph port by
-# Landlock; this unit adds what Landlock cannot say, by address. Denied:
-# the whole IPv4 loopback (the live graph server, the pulses and the host's
-# nginx listen there), and this host's own non-loopback addresses (private,
-# CGNAT/Tailscale, ULA, link-local; public ones through the drop-in above).
-# Allowed: ::1, where only the run's throwaway graph listens on a port a
-# child may use (nothing on this host listens on ::1:443). The live graph
-# export happens in pulse-null-probe-export@, before this unit starts, and
-# names resolve through the probe resolver bound over /etc/resolv.conf.
+# Default deny. Landlock holds a probe child to TCP 443 and the throwaway
+# port; this unit adds addresses, which Landlock cannot. Allowed: the probe
+# resolvers, ::1 (the throwaway; nothing on this host listens on ::1:443),
+# and the public Internet so the child can open TCP 443 to the vendor API.
+# systemd cannot allow a port without the address, so UDP to those same
+# addresses stays open — Landlock does not cover UDP either. More specific
+# denies cover the IPv4 loopback, private, CGNAT, link-local and ULA
+# ranges. The host's own public addresses are a drop-in (systemctl edit),
+# more specific than the public allow. The live graph export happens in
+# pulse-null-probe-export@, before this unit starts, and names resolve
+# through the probe resolver bound over /etc/resolv.conf.
 RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
+IPAddressDeny=any
+IPAddressAllow=9.9.9.9
+IPAddressAllow=1.1.1.1
+IPAddressAllow=2620:fe::fe
+IPAddressAllow=::1
+IPAddressAllow=0.0.0.0/0
+IPAddressAllow=::/0
 IPAddressDeny=127.0.0.0/8
 IPAddressDeny=10.0.0.0/8 172.16.0.0/12 192.168.0.0/16 100.64.0.0/10 169.254.0.0/16
 IPAddressDeny=fc00::/7 fe80::/10 multicast
