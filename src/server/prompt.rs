@@ -2963,6 +2963,35 @@ mod tests {
         assert_eq!(chat.matches("SELF-WORK-RULE").count(), 1);
     }
 
+    /// Chat carries EPHEMERAL.md once. A scheduled task does not, and the
+    /// pulse's own hooks do not print it either.
+    #[test]
+    fn ephemeral_once_in_chat_absent_in_task() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::create_dir_all(root.join("memory")).unwrap();
+        let marker = "EPHEMERAL-BLOCK-PN139";
+        std::fs::write(root.join("memory/EPHEMERAL.md"), marker).unwrap();
+
+        let config = cli_config("claude");
+        let chat = build_system_prompt(root, &config).unwrap();
+        let task = build_task_system_prompt(root, &config).unwrap();
+        assert_eq!(chat.matches(marker).count(), 1, "{chat}");
+        assert_eq!(task.matches(marker).count(), 0, "{task}");
+
+        let adapter = crate::cli_provider::adapters::by_name("claude").unwrap();
+        adapter.integration().ensure(root, "recall-echo");
+        let settings = std::fs::read_to_string(root.join(".claude/settings.json")).unwrap();
+        assert!(
+            !settings.contains("SessionStart"),
+            "hook set injects a session-start command: {settings}"
+        );
+        assert!(
+            !settings.contains("consume"),
+            "hook set injects EPHEMERAL: {settings}"
+        );
+    }
+
     #[test]
     fn awareness_reaches_every_profile_for_every_adapter() {
         let mut configs = vec![("ollama", unbudgeted(minimal_config()))];

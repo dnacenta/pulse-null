@@ -15,8 +15,8 @@ use std::path::{Path, PathBuf};
 use super::claude_hooks;
 use crate::cli_provider::adapter::{
     AgentIntegration, CliAdapter, ExitClass, Invocation, Observed, OutputMode, Probe,
-    PromptDelivery, Reply, StreamLine, SystemPromptDelivery, Usage, VendorProfile, VendorScratch,
-    VendorScratchSpec,
+    PromptDelivery, Reply, StreamLine, SystemPromptDelivery, Usage, UserHookScan, VendorProfile,
+    VendorScratch, VendorScratchSpec,
 };
 use crate::init::agent_bootstrap::BootstrapItem;
 use crate::tool_surface::ToolSurface;
@@ -414,7 +414,7 @@ impl AgentIntegration for Claude {
         claude_hooks::legacy_home_links(pulse_root, home)
     }
 
-    fn user_hooks_missing_root(&self, home: &Path) -> Vec<String> {
+    fn user_hooks_missing_root(&self, home: &Path) -> UserHookScan {
         claude_hooks::user_hooks_missing_root(home)
     }
 
