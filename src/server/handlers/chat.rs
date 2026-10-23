@@ -373,7 +373,8 @@ async fn run_resolved_turn(
     let build_fallback = steps::fallback_builder(&turn, !fallback_capped);
     let progress = sink.map(|tx| {
         let mut progress = if hold_deltas {
-            ProgressSink::holding(tx)
+            let cap = tool_loop::hold_byte_cap(state.provider.name(), state.config.llm.max_tokens);
+            ProgressSink::holding_capped(tx, cap)
         } else {
             ProgressSink::new(tx)
         };

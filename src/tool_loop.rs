@@ -282,11 +282,30 @@ impl Drop for ControlClose {
 /// Sender half a streaming caller hands to the tool loop.
 pub type TurnSink = tokio::sync::mpsc::Sender<TurnEvent>;
 
+/// Bytes of held speech for a provider that does not honor `max_tokens`.
+const CLI_HOLD_BYTE_CAP: usize = 32 * 1024;
+
+/// Byte cap for one turn's held speech. Derived from the output budget
+/// (`max_tokens` times the chars/4 estimate used for prompt size). A CLI
+/// provider ignores that budget, and a zero budget has no estimate, so
+/// both use a fixed cap.
+pub fn hold_byte_cap(provider: &str, max_tokens: u32) -> usize {
+    if provider == "cli" || max_tokens == 0 {
+        CLI_HOLD_BYTE_CAP
+    } else {
+        (max_tokens as usize).saturating_mul(4).max(1)
+    }
+}
+
 /// Text and message boundaries held back until a round's guard has passed.
-#[derive(Default)]
 struct HeldSpeech {
     deltas: Vec<String>,
     segments: Vec<(u32, bool)>,
+    /// Bytes accepted into `deltas` this turn, including text already flushed.
+    bytes: usize,
+    cap: usize,
+    /// The cap was crossed. Further held text is dropped.
+    overflowed: bool,
 }
 
 /// A [`TurnSink`] that remembers whether any text delta was sent.
@@ -320,11 +339,25 @@ impl ProgressSink {
     }
 
     /// Hold deltas until the round's guard has kept them.
+    /// The cap is the fixed CLI budget. Production turns pass an explicit cap.
+    #[cfg(test)]
     pub fn holding(tx: TurnSink) -> Self {
+        Self::holding_capped(tx, CLI_HOLD_BYTE_CAP)
+    }
+
+    /// Hold deltas until the round's guard has kept them, up to `cap` bytes.
+    /// Past that the hold is discarded and one `reset` is delivered.
+    pub fn holding_capped(tx: TurnSink, cap: usize) -> Self {
         Self {
             tx,
             saw_delta: std::sync::atomic::AtomicBool::new(false),
-            held: std::sync::Mutex::new(Some(HeldSpeech::default())),
+            held: std::sync::Mutex::new(Some(HeldSpeech {
+                deltas: Vec::new(),
+                segments: Vec::new(),
+                bytes: 0,
+                cap,
+                overflowed: false,
+            })),
             control: None,
         }
     }
@@ -350,10 +383,25 @@ impl ProgressSink {
         if let Some(buf) = held.as_mut() {
             match event {
                 TurnEvent::Delta(text) => {
+                    if buf.overflowed {
+                        return true;
+                    }
+                    let next = buf.bytes.saturating_add(text.len());
+                    if next > buf.cap {
+                        buf.deltas.clear();
+                        buf.segments.clear();
+                        buf.overflowed = true;
+                        drop(held);
+                        return self.deliver(TurnEvent::Reset(crate::wire::ResetReason::Guard));
+                    }
+                    buf.bytes = next;
                     buf.deltas.push(text);
                     return true;
                 }
                 TurnEvent::Segment { index, tool } => {
+                    if buf.overflowed {
+                        return false;
+                    }
                     buf.segments.push((index, tool));
                     return true;
                 }
@@ -429,6 +477,7 @@ impl ProgressSink {
         let dropped = buf.deltas.iter().any(|text| !text.is_empty());
         buf.deltas.clear();
         buf.segments.clear();
+        buf.bytes = 0;
         dropped
     }
 
@@ -1555,5 +1604,31 @@ mod streaming_tests {
             .await
             .unwrap();
         assert_eq!(r.text, "ok");
+    }
+
+    /// Past the hold cap the buffered text is dropped and one guard reset
+    /// is delivered. Later deltas do not bring the flood back.
+    #[tokio::test]
+    async fn held_speech_discards_past_the_output_budget() {
+        assert_eq!(hold_byte_cap("cli", 4096), 32 * 1024);
+        assert_eq!(hold_byte_cap("cli", 0), 32 * 1024);
+        assert_eq!(hold_byte_cap("screen", 8), 32);
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        let sink = ProgressSink::holding_capped(tx, 4);
+        assert!(sink.try_send(TurnEvent::Delta("ab".into())));
+        assert!(sink.try_send(TurnEvent::Delta("cdef".into())));
+        assert!(sink.try_send(TurnEvent::Delta("nope".into())));
+        sink.flush_held();
+        drop(sink);
+
+        let mut events = Vec::new();
+        while let Some(event) = rx.recv().await {
+            events.push(event);
+        }
+        assert_eq!(
+            events,
+            vec![TurnEvent::Reset(crate::wire::ResetReason::Guard)]
+        );
     }
 }
