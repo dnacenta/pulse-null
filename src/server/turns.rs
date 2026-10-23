@@ -220,6 +220,9 @@ struct Shared {
         allow(dead_code)
     )]
     budgets: Mutex<HashMap<&'static str, Budget>>,
+    /// HTTP voice guest turns. Kept off the plugin-name map, so a plugin
+    /// cannot be given this ledger, and the credential gets no pool or rate bucket.
+    http_voice_guests: Mutex<GuestLedger>,
     #[cfg_attr(
         not(any(feature = "voice", feature = "discord-text")),
         allow(dead_code)
@@ -258,6 +261,7 @@ impl TurnRunner {
                 in_flight: AtomicUsize::new(0),
                 drained: Notify::new(),
                 budgets: Mutex::new(HashMap::new()),
+                http_voice_guests: Mutex::new(GuestLedger::default()),
                 ready_timeout,
             }),
         }
@@ -338,6 +342,12 @@ impl TurnRunner {
             .or_insert_with(Budget::new)
             .guests
             .clone()
+    }
+
+    /// The HTTP voice credential's guest ledger. Not a plugin budget: no
+    /// pool and no rate limiter, and not reachable by a plugin name.
+    pub(crate) fn http_voice_ledger(&self) -> &Mutex<GuestLedger> {
+        &self.shared.http_voice_guests
     }
 }
 
@@ -623,6 +633,39 @@ impl PluginTurns {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn http_voice_ledger_is_not_a_plugin_budget() {
+        use crate::config::PluginTurnsConfig;
+        use crate::server::guest_budget::GuestKind;
+
+        let runner = TurnRunner::new();
+        let limits = PluginTurnsConfig {
+            daily_turns: 1,
+            voice_turns_per_call: 0,
+            guest_burst: 0,
+            guest_per_minute: 0.0,
+        };
+        let now = std::time::Instant::now();
+        let today = chrono::Utc::now().date_naive();
+        let plugin = runner.guest_ledger("http-voice");
+        plugin
+            .lock()
+            .unwrap()
+            .admit("guest:a", GuestKind::Call, &limits, now, today)
+            .unwrap();
+        assert!(plugin
+            .lock()
+            .unwrap()
+            .admit("guest:b", GuestKind::Call, &limits, now, today)
+            .is_err());
+        runner
+            .http_voice_ledger()
+            .lock()
+            .unwrap()
+            .admit("guest:a", GuestKind::Call, &limits, now, today)
+            .unwrap();
+    }
 
     #[test]
     fn reserved_channels_are_refused_case_insensitively() {

@@ -182,22 +182,28 @@ fn count_guest(
     } else {
         GuestKind::Sender
     };
-    state
-        .turns
-        .guest_ledger(ledger)
-        .lock()
-        .unwrap_or_else(|error| error.into_inner())
-        .admit(
-            key.as_str(),
-            kind,
-            &state.config.plugin_turns,
-            std::time::Instant::now(),
-            chrono::Utc::now().date_naive(),
-        )
-        .map_err(|refusal| {
-            tracing::warn!("guest turn for {key:?} refused on {ledger}: {refusal:?}");
-            AdmitError::Guest(refusal)
-        })
+    let limits = &state.config.plugin_turns;
+    let now = tokio::time::Instant::now().into_std();
+    let today = chrono::Utc::now().date_naive();
+    let outcome = match who {
+        AuthIdentity::Plugin { name, .. } => state
+            .turns
+            .guest_ledger(name)
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .admit(key.as_str(), kind, limits, now, today),
+        AuthIdentity::Voice => state
+            .turns
+            .http_voice_ledger()
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .admit(key.as_str(), kind, limits, now, today),
+        AuthIdentity::Owner | AuthIdentity::Peer(_) => return Ok(()),
+    };
+    outcome.map_err(|refusal| {
+        tracing::warn!("guest turn for {key:?} refused on {ledger}: {refusal:?}");
+        AdmitError::Guest(refusal)
+    })
 }
 
 #[cfg(test)]
