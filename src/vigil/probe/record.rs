@@ -104,13 +104,16 @@ pub struct Record {
 }
 
 /// What a stream's file looked like after its last append.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 struct Tail {
     len: u64,
     /// SHA-256 of the whole file as this record left it: any edit, of any
     /// length and at any time, changes it.
     digest: [u8; 32],
     hash: String,
+    /// SHA-256 state over those bytes. The next append extends it with the
+    /// new line instead of reading the file a second time.
+    hasher: Sha256,
 }
 
 /// Held while a run is in progress; released on drop.
@@ -163,27 +166,47 @@ impl Record {
         &self.dir
     }
 
-    /// The hash to chain the next row of `stream` to: the cached tail when
-    /// the file is as this record left it, else the file's last verified row.
-    fn tail_hash(&self, stream: Stream, path: &Path) -> io::Result<String> {
-        let now = file_stamp(path);
+    /// The hash to chain the next row of `stream` to, and a hasher over the
+    /// file's current bytes. The file is read once, so a same-length splice
+    /// still misses the cache (audit #21). A hit returns the cached row
+    /// hash; a miss re-verifies the chain.
+    fn tail_hash(&self, stream: Stream, path: &Path) -> io::Result<(String, Sha256, u64)> {
+        let (len, hasher) = hash_file(path);
+        let digest: [u8; 32] = hasher.clone().finalize().into();
         let tails = self.tails.lock().unwrap_or_else(|e| e.into_inner());
-        if let (Some(tail), Some((len, digest))) = (tails.get(stream.file()), now) {
+        if let Some(tail) = tails.get(stream.file()) {
             if tail.len == len && tail.digest == digest {
-                return Ok(tail.hash.clone());
+                // The stored state hashed these same bytes. Extending it
+                // with the new line is the file the append will leave.
+                return Ok((tail.hash.clone(), tail.hasher.clone(), len));
             }
         }
         drop(tails);
-        last_hash(path)
+        Ok((last_hash(path)?, hasher, len))
     }
 
-    fn remember_tail(&self, stream: Stream, path: &Path, hash: String) {
-        if let Some((len, digest)) = file_stamp(path) {
-            self.tails
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .insert(stream.file(), Tail { len, digest, hash });
-        }
+    /// Remember the file as this append left it: the hasher from
+    /// [`Self::tail_hash`] plus the bytes just written. No second read.
+    fn remember_tail(
+        &self,
+        stream: Stream,
+        mut hasher: Sha256,
+        len: u64,
+        line: &[u8],
+        hash: String,
+    ) {
+        hasher.update(line);
+        let digest = hasher.clone().finalize().into();
+        let len = len.saturating_add(u64::try_from(line.len()).unwrap_or(u64::MAX));
+        self.tails.lock().unwrap_or_else(|e| e.into_inner()).insert(
+            stream.file(),
+            Tail {
+                len,
+                digest,
+                hash,
+                hasher,
+            },
+        );
     }
 
     /// Take the run lock without waiting. `None` when another run holds it.
@@ -203,7 +226,7 @@ impl Record {
         fields.remove("prev");
         fields.remove("hash");
         let path = self.dir.join(stream.file());
-        let prev = self.tail_hash(stream, &path)?;
+        let (prev, hasher, len) = self.tail_hash(stream, &path)?;
         fields.insert("prev".into(), Value::String(prev));
         let hash = row_hash(&fields);
         fields.insert("hash".into(), Value::String(hash.clone()));
@@ -224,7 +247,7 @@ impl Record {
         file.write_all(line.as_bytes())?;
         file.sync_data()?;
         drop(file);
-        self.remember_tail(stream, &path, hash.clone());
+        self.remember_tail(stream, hasher, len, line.as_bytes(), hash.clone());
         Ok(hash)
     }
 
@@ -366,11 +389,16 @@ fn row_hash(fields: &Map<String, Value>) -> String {
     ))
 }
 
-/// A file's length and the SHA-256 of its bytes, when it exists.
-fn file_stamp(path: &Path) -> Option<(u64, [u8; 32])> {
-    let bytes = std::fs::read(path).ok()?;
-    let len = u64::try_from(bytes.len()).ok()?;
-    Some((len, Sha256::digest(&bytes).into()))
+/// A hasher over the file's bytes, and its length. A missing file is an
+/// empty hasher and length 0.
+fn hash_file(path: &Path) -> (u64, Sha256) {
+    let mut hasher = Sha256::new();
+    let Ok(bytes) = std::fs::read(path) else {
+        return (0, hasher);
+    };
+    hasher.update(&bytes);
+    let len = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
+    (len, hasher)
 }
 
 /// The hash of the file's last verified row, or the genesis marker.

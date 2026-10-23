@@ -516,7 +516,9 @@ mod tests {
         assert!(PROBE_UNIT.contains("Requires=pulse-null-probe-export@%i.service"));
         assert!(EXPORT_UNIT.contains("IPAddressDeny=any"));
         assert!(EXPORT_UNIT.contains("IPAddressAllow=127.0.0.1/32"));
-        assert!(EXPORT_UNIT.contains("ExecStart=/usr/local/bin/pulse-null probe export-graph"));
+        assert!(
+            EXPORT_UNIT.contains("ExecStart=/usr/local/bin/pulse-null probe export-graph --if-due")
+        );
     }
 
     #[test]

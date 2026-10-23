@@ -198,13 +198,16 @@ instructions or memory, only what the CLI needs to log in.
   throwaway graph's password (removed beneath the item, as above); each
   kept pulse item holds its copy of the pulse, the model cache included.
 - **Graph, in two units.** The live graph is exported by
-  `pulse-null-probe-export@<pulse>` (`probe export-graph`), which the probe
+  `pulse-null-probe-export@<pulse>` (`probe export-graph --if-due`), which the probe
   unit requires and runs first: the only probe step that reaches the live
   server, over 127.0.0.1 and nothing else (`IPAddressDeny=any`,
   `IPAddressAllow=127.0.0.1/32`), and it only reads: an export without users
   or access methods, renamed into place as
   `/var/lib/pulse-null-probe/s/exports/<pulse>.surql` (0600, owned by the
-  probe user; the pulse user cannot write that directory). Its root
+  probe user; the pulse user cannot write that directory). With `--if-due`
+  the export exits 0 without contacting the server when a scheduled run
+  would be refused (not a probe day, outside the quiet window, or over the
+  weekly budget for a full run). Its root
   credential goes only to a loopback address, and only for the `nullarc`
   namespace and this pulse's own database (anything else in the
   pulse-writable recall-echo config refuses it). The run then starts its

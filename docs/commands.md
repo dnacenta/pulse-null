@@ -24,7 +24,7 @@ pulse-null probe status           probe spend vs budget, cost per run, results b
 pulse-null probe verify-isolation [--turn]   show a probe writes nowhere live (--turn: two real turns)
 pulse-null probe facts draw|plant FACT VALUE|list   paired facts for "Remembers" (needs the unit's credentials: run via systemd-run, see methods/probe-runner.md)
 pulse-null probe sets install --from DIR --pulse NAME   (root) install the sealed sets into /etc/pulse-null-probe/sets/NAME
-pulse-null probe export-graph     export the live graph for the next run (the export unit's step)
+pulse-null probe export-graph [--if-due]  export the live graph for the next run; --if-due exits 0 without contacting the server when a scheduled run would be refused
 ```
 
 Probes are described in [methods/probe-runner.md](methods/probe-runner.md); they refuse to run

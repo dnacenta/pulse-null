@@ -7,8 +7,12 @@
 # /var/lib/pulse-null-probe/s/exports/<pulse>.surql (0600, probe user) for
 # the run, which takes it if it is under 3 hours old. The directory is not
 # writable by the pulse user, so the pulse cannot replace the export before
-# import. Network: loopback to the live server only. It runs whether or not
-# the probe run turns out to be due.
+# import. Network: loopback to the live server only. `--if-due` exits 0
+# without contacting the server when a scheduled run would be refused
+# (not a probe day, outside the quiet window, over the weekly budget for a
+# full run, or another gate refusal). A run that is due still exports first
+# (`Requires=` on the probe unit). A hand-started run that finds no fresh
+# export fails closed.
 
 [Unit]
 Description=pulse-null probe graph export (%i)
@@ -19,7 +23,7 @@ Type=oneshot
 User=pulse-probe
 Group=pulse-probe
 WorkingDirectory=/home/pulse/pulse-null/%i
-ExecStart=/usr/local/bin/pulse-null probe export-graph
+ExecStart=/usr/local/bin/pulse-null probe export-graph --if-due
 Environment=RUST_LOG=info
 Environment=PULSE_NULL_PROBE_STATE=/var/lib/pulse-null-probe
 UMask=0077

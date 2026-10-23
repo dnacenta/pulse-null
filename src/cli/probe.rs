@@ -1096,12 +1096,23 @@ fn installed_report(dir: &Path, written: &[String], from: &Path) -> Report {
 /// `pulse-null probe export-graph`: export the live graph for the next
 /// probe run. The export unit runs it, just before the probe unit; it is the
 /// only probe step that reaches the live graph server, and it only reads.
-pub async fn export_graph() -> CliResult {
+/// With `if_due`, a scheduled run that would be refused exits 0 and does
+/// not contact the server.
+pub async fn export_graph(if_due: bool) -> CliResult {
     let ctx = ProbeContext::load()?;
-    emit(export_for(&ctx).await)
+    emit(export_for(&ctx, if_due, chrono::Utc::now()).await)
 }
 
-async fn export_for(ctx: &ProbeContext) -> Result<Report, Box<dyn Error>> {
+async fn export_for(
+    ctx: &ProbeContext,
+    if_due: bool,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Result<Report, Box<dyn Error>> {
+    if if_due {
+        if let Some(reason) = skip_export(ctx, now)? {
+            return Ok(export_skipped(&ctx.config.pulse.name, &reason));
+        }
+    }
     let stats = ctx.export_graph().await?;
     if let Some(stats) = &stats {
         tracing::info!(
@@ -1115,6 +1126,38 @@ async fn export_for(ctx: &ProbeContext) -> Result<Report, Box<dyn Error>> {
         &ctx.export_path(),
         stats.as_ref(),
     ))
+}
+
+/// Why a scheduled run would be refused, from the config and the record
+/// only. `None` when the run would go ahead. The weekly budget is checked
+/// against a full run (`max_turns_per_run`): a week that cannot hold one
+/// does not export.
+fn skip_export(
+    ctx: &ProbeContext,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Result<Option<String>, Box<dyn Error>> {
+    let tz = ctx.timezone()?;
+    let record = Record::existing(&ctx.record_root()?);
+    let history = crate::vigil::probe::schedule::History::from_record(record.as_ref())?;
+    let gate = crate::vigil::probe::schedule::check(&crate::vigil::probe::schedule::GateInput {
+        config: &ctx.config.probe,
+        tz,
+        now,
+        if_due: true,
+        isolated: crate::server::isolation::is_active(&ctx.live_root),
+        landlock: LandlockSupport::detect(),
+        history: &history,
+        planned_turns: ctx.config.probe.max_turns_per_run,
+    });
+    Ok(gate.err().map(|reason| reason.to_string()))
+}
+
+fn export_skipped(pulse: &str, reason: &str) -> Report {
+    let mut report = Report::default();
+    report.line(format!(
+        "  {pulse}'s graph was not exported: a scheduled run would be refused ({reason})"
+    ));
+    report
 }
 
 fn export_report(pulse: &str, export: &Path, stats: Option<&graph::ExportStats>) -> Report {
@@ -2336,6 +2379,41 @@ mod tests {
         assert!(ctx.live_graph.is_none(), "no recall-echo config: embedded");
     }
 
+    /// A day that is not a probe day does not contact the live server, even
+    /// when the graph config names one.
+    #[tokio::test]
+    async fn an_export_skips_the_server_when_a_scheduled_run_is_not_due() {
+        let pulse = pulse_dir_with(&format!(
+            "{}\n[probe]\nenabled = true\n",
+            pulse_toml(CLI_LLM)
+        ));
+        std::fs::create_dir_all(pulse.path().join("memory")).unwrap();
+        std::fs::write(
+            pulse.path().join("memory/.recall-echo.toml"),
+            "[graph]\nmode = \"server\"\nurl = \"127.0.0.1:1\"\nnamespace = \"nullarc\"\n\
+             database = \"Fixture\"\nusername = \"fixture\"\n\
+             password_file = \"secrets/graph-password\"\n",
+        )
+        .unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let ctx = ProbeContext::at(
+            &pulse.path().join("pulse-null.toml"),
+            Some(home.path().into()),
+        )
+        .unwrap();
+        assert!(ctx.live_graph.is_some());
+        let thursday = chrono_tz::Europe::Madrid
+            .with_ymd_and_hms(2026, 10, 22, 3, 0, 0)
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        let skipped = export_for(&ctx, true, thursday).await.unwrap();
+        assert!(skipped.failure.is_none());
+        let text = plain(&skipped.text);
+        assert!(text.contains("not exported"), "{text}");
+        assert!(text.contains("not a probe day"), "{text}");
+        assert!(!text.contains("127.0.0.1"), "{text}");
+    }
+
     #[test]
     fn a_probe_context_needs_a_home_an_agent_cli_and_a_readable_graph_config() {
         let config = |dir: &tempfile::TempDir| dir.path().join("pulse-null.toml");
@@ -2578,7 +2656,9 @@ mod tests {
     #[tokio::test]
     async fn a_pulse_without_a_graph_server_has_nothing_to_export() {
         let fixture = Fixture::new(None);
-        let report = export_for(&fixture.ctx).await.unwrap();
+        let report = export_for(&fixture.ctx, false, chrono::Utc::now())
+            .await
+            .unwrap();
         assert_eq!(
             report.text,
             "  Fixture's graph is not on a server: nothing to export\n"

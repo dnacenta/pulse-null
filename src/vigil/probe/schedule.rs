@@ -73,8 +73,13 @@ impl History {
             return Ok(Self::default());
         };
         let runs = record.read(Stream::Runs)?;
-        let broken = broken_streams(record, &runs)?;
         let budget = record.read(Stream::Budget)?;
+        let facts = record.read(Stream::Facts)?;
+        let broken = broken_chains(&[
+            (Stream::Runs, &runs),
+            (Stream::Budget, &budget),
+            (Stream::Facts, &facts),
+        ]);
         Ok(Self {
             runs: past_runs(&runs.rows),
             turns: budget
@@ -87,23 +92,13 @@ impl History {
     }
 }
 
-/// The streams whose chain is broken, with the first bad line: runs (read
-/// already), budget and facts, in that order.
-fn broken_streams(
-    record: &Record,
-    runs: &ChainRead,
-) -> std::io::Result<Vec<(&'static str, usize)>> {
-    let mut broken = Vec::new();
-    for (stream, chain) in [
-        (Stream::Runs, runs),
-        (Stream::Budget, &record.read(Stream::Budget)?),
-        (Stream::Facts, &record.read(Stream::Facts)?),
-    ] {
-        if let Some(line) = chain.broken_at {
-            broken.push((stream.label(), line));
-        }
-    }
-    Ok(broken)
+/// The streams whose chain is broken, with the first bad line, in the order
+/// given. Each chain is one the caller already read.
+fn broken_chains(chains: &[(Stream, &ChainRead)]) -> Vec<(&'static str, usize)> {
+    chains
+        .iter()
+        .filter_map(|(stream, chain)| chain.broken_at.map(|line| (stream.label(), line)))
+        .collect()
 }
 
 /// The runs the run rows describe, in start order.

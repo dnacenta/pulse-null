@@ -223,7 +223,12 @@ enum ProbeAction {
         action: ProbeSetsAction,
     },
     /// Export the live graph for the next probe run (the export unit's step)
-    ExportGraph,
+    ExportGraph {
+        /// Export only when a scheduled run would go ahead. A refusal exits 0
+        /// and does not contact the live server (the export unit's mode).
+        #[arg(long)]
+        if_due: bool,
+    },
     /// Show that a probe item writes nowhere live (sandbox self-test; --turn adds two real turns)
     VerifyIsolation {
         /// Also run a canned turn in the scratch copy and a fresh-arm date check (two turns)
@@ -726,7 +731,7 @@ fn probe_command(action: ProbeAction) -> CommandFuture {
         } => Box::pin(cli::probe::run(if_due, only, keep_scratch)),
         ProbeAction::Status => Box::pin(cli::probe::status()),
         ProbeAction::Facts { action } => probe_facts_command(action),
-        ProbeAction::ExportGraph => Box::pin(cli::probe::export_graph()),
+        ProbeAction::ExportGraph { if_due } => Box::pin(cli::probe::export_graph(if_due)),
         ProbeAction::Sets { action } => probe_sets_command(action),
         ProbeAction::VerifyIsolation { turn, keep_scratch } => {
             Box::pin(cli::probe::verify_isolation(turn, keep_scratch))
@@ -825,6 +830,7 @@ mod tests {
         &["probe", "facts", "plant", "fact-1", "value"],
         &["probe", "facts", "list"],
         &["probe", "export-graph"],
+        &["probe", "export-graph", "--if-due"],
         &[
             "probe", "sets", "install", "--from", "dir", "--pulse", "echo",
         ],
