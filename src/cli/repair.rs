@@ -46,7 +46,9 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
     for item in &results {
         println!("  {item}");
         match &item.status {
-            ItemStatus::Created | ItemStatus::Updated => changed += 1,
+            ItemStatus::Created | ItemStatus::Updated | ItemStatus::UpdatedWithWarning(_) => {
+                changed += 1
+            }
             ItemStatus::Exists => existing += 1,
             ItemStatus::Skipped(_) => skipped += 1,
             _ => {}

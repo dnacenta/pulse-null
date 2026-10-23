@@ -457,6 +457,12 @@ fn ensure_settings(path: &Path, ours: &serde_json::Value, within: &Path) -> Boot
         Err(e) => return item(ItemStatus::Skipped(format!("could not serialise: {e}"))),
     };
     match write_regular_file(path, &rendered, within) {
+        Ok(()) if was_present && has_wrapped_consume(&merged) => item(
+            ItemStatus::UpdatedWithWarning(WRAPPED_CONSUME_REASON.into()),
+        ),
+        Ok(()) if was_present && consume_left_in_place(&merged) => item(
+            ItemStatus::UpdatedWithWarning("retired consume still runs; left in place".into()),
+        ),
         Ok(()) if was_present => item(ItemStatus::Updated),
         Ok(()) => item(ItemStatus::Created),
         Err(e) => item(ItemStatus::Skipped(e)),
@@ -1479,6 +1485,74 @@ mod tests {
         let settings = again.iter().find(|item| item.path == path).unwrap();
         assert_eq!(settings.status, ItemStatus::Exists, "{settings:?}");
         assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
+    }
+
+    #[test]
+    fn wrapper_warning_survives_a_precompact_rewrite() {
+        let dir = pulse();
+        let root = dir.path().canonicalize().unwrap();
+        let bin = find_recall_echo_bin();
+        let path = root.join(".claude/settings.json");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let wrapper = "sh -c 'recall-echo consume /e'";
+        let mut hooks = render_hooks(&bin, &root);
+        hooks["SessionStart"] = serde_json::json!([{
+            "hooks": [{"type": "command", "command": wrapper}]
+        }]);
+        hooks["PreCompact"] = serde_json::json!([{
+            "hooks": [{"type": "command", "command": "recall-echo checkpoint --trigger precompact"}]
+        }]);
+        std::fs::write(
+            &path,
+            serde_json::to_string_pretty(&serde_json::json!({ "hooks": hooks })).unwrap() + "\n",
+        )
+        .unwrap();
+
+        let item = ensure_settings(&path, &render_hooks(&bin, &root), &root);
+        match &item.status {
+            ItemStatus::UpdatedWithWarning(reason) => assert_eq!(reason, WRAPPED_CONSUME_REASON),
+            other => panic!("expected an update that keeps the warning, got {other:?}"),
+        }
+        let rendered = item.to_string();
+        assert!(rendered.contains(WRAPPED_CONSUME_REASON), "{rendered}");
+        let doc = read_settings(&root);
+        assert!(
+            each_hook_command(&doc).contains(&wrapper),
+            "wrapper was deleted: {doc}"
+        );
+        let quoted = shell_quote(&root);
+        assert!(commands(&doc, "PreCompact")[0].ends_with(&format!(
+            "checkpoint --trigger precompact --pulse-root {quoted}"
+        )));
+
+        // A glued consume stays, and the status still names it, when another
+        // hook is rewritten.
+        let glued = "recall-echo consume||true";
+        let mut hooks = render_hooks(&bin, &root);
+        hooks["SessionStart"] = serde_json::json!([{
+            "hooks": [{"type": "command", "command": glued}]
+        }]);
+        hooks["PreCompact"] = serde_json::json!([{
+            "hooks": [{"type": "command", "command": "recall-echo checkpoint --trigger precompact"}]
+        }]);
+        std::fs::write(
+            &path,
+            serde_json::to_string_pretty(&serde_json::json!({ "hooks": hooks })).unwrap() + "\n",
+        )
+        .unwrap();
+        let item = ensure_settings(&path, &render_hooks(&bin, &root), &root);
+        match &item.status {
+            ItemStatus::UpdatedWithWarning(reason) => {
+                assert_eq!(reason, "retired consume still runs; left in place")
+            }
+            other => panic!("expected an update that keeps the warning, got {other:?}"),
+        }
+        let doc = read_settings(&root);
+        assert!(
+            each_hook_command(&doc).contains(&glued),
+            "glued consume was deleted: {doc}"
+        );
+        assert!(commands(&doc, "PreCompact")[0].contains("--pulse-root"));
     }
 
     /// Spellings the precise shell parser does not treat as `consume`, but
