@@ -43,7 +43,7 @@ The same turn as `POST /chat`, delivered as server-sent events. The request body
 { "message": "Hello, how are you?", "channel": "tui" }
 ```
 
-`channel` defaults to `chat`. It selects the session, not the stream pool.
+`channel` defaults to `chat`. It does not select the stream pool, and a value of `voice` does not select the call session. Both follow the caller's identity.
 
 The voice stream pool is taken only by a voice identity. That is the in-process voice plugin bound to the `voice` channel (any case), or a client that presents `[security] voice_secret` in the `X-Echo-Secret` header. The credential is configured on the server and must differ from `[security] secret`. A voice credential may speak only on the `voice` channel; any other channel is `403` and takes no permit.
 
