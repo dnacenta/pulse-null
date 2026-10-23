@@ -234,7 +234,7 @@ impl LoadedSet {
         format!("{}/v{}", self.set.set, self.set.version)
     }
 
-    /// The items one run asks, as [`draw`](Self::draw), skipping what
+    /// The items one run asks, as [`draw_scorable`](Self::draw_scorable), skipping what
     /// could not be scored: for a per-item set, a family's variants are
     /// tried from the hash pick onwards and the first whose truth the run
     /// has is asked; a family with none is not asked at all, so no turn is

@@ -1,5 +1,5 @@
 mod probe;
-mod validate;
+pub(crate) mod validate;
 
 pub use probe::{ProbeCadence, ProbeConfig};
 

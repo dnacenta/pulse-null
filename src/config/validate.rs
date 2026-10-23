@@ -27,10 +27,27 @@ pub fn validate(config: &Config) -> Result<(), ConfigError> {
     validate_probe(&config.probe)
 }
 
+/// A pulse name safe as one path component: letters, digits, `-` or `_`,
+/// not empty, and not hidden. The same rule as a probe database name.
+#[must_use]
+pub(crate) fn is_plain_pulse_name(name: &str) -> bool {
+    !name.is_empty()
+        && !name.starts_with('.')
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+}
+
 /// The pulse's name, its owner's, and its rules directory (when set).
 fn validate_pulse(pulse: &super::PulseConfig) -> Result<(), ConfigError> {
     if pulse.name.is_empty() {
         return Err(ConfigError::Validation("Pulse name cannot be empty".into()));
+    }
+    if !is_plain_pulse_name(&pulse.name) {
+        return Err(ConfigError::Validation(format!(
+            "'{}' is not a plain pulse name (letters, digits, - or _)",
+            pulse.name
+        )));
     }
     if pulse.owner_name.is_empty() {
         return Err(ConfigError::Validation("Owner name cannot be empty".into()));
@@ -215,6 +232,11 @@ mod tests {
         };
         assert!(super::validate(&minimal_config()).is_ok());
         assert!(error(&|c| c.pulse.name.clear()).ends_with("Pulse name cannot be empty"));
+        assert!(error(&|c| c.pulse.name = "my pulse".into())
+            .ends_with("'my pulse' is not a plain pulse name (letters, digits, - or _)"));
+        let mut hyphen = minimal_config();
+        hyphen.pulse.name = "my-pulse".into();
+        assert!(super::validate(&hyphen).is_ok(), "a hyphen is a plain name");
         assert!(error(&|c| c.pulse.owner_name.clear()).ends_with("Owner name cannot be empty"));
         assert!(error(&|c| c.pulse.rules_dir = Some("/nonexistent/rules".into()))
             .ends_with("rules_dir '/nonexistent/rules' does not exist. Create it or remove the config entry."));

@@ -910,13 +910,9 @@ fn is_scratch_id(name: &str) -> bool {
             .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase())
 }
 
-/// A name that is safe as one path component.
+/// A name that is safe as one path component. The config rule.
 fn is_plain_name(name: &str) -> bool {
-    !name.is_empty()
-        && !name.starts_with('.')
-        && name
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+    crate::config::validate::is_plain_pulse_name(name)
 }
 
 /// Hex encoding of a digest.

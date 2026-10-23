@@ -245,12 +245,7 @@ impl InstalledSets {
 
 /// The install directory of `pulse` beneath `root` (normally [`SETS_ROOT`]).
 pub fn pulse_dir(root: &Path, pulse: &str) -> Result<PathBuf, SealError> {
-    let plain = !pulse.is_empty()
-        && !pulse.starts_with('.')
-        && pulse
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_');
-    if plain {
+    if crate::config::validate::is_plain_pulse_name(pulse) {
         Ok(root.join(pulse.to_ascii_lowercase()))
     } else {
         Err(SealError::Registry(format!(

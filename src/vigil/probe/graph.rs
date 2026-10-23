@@ -71,7 +71,7 @@ pub enum GraphError {
     Statement(String),
     #[error("{0}")]
     Io(#[from] std::io::Error),
-    #[error("'{0}' cannot be used in a probe database name (letters, digits and _ only)")]
+    #[error("{0}")]
     BadName(String),
     #[error("the pulse's recall-echo [graph] config is refused for probes: {0}")]
     Unsafe(String),
@@ -372,19 +372,37 @@ pub struct ProbeNames {
     pub username: String,
 }
 
-/// `probe_<pulse>_<run>` and `probe_<run>`; refused unless both are plain
-/// identifiers, so nothing needs quoting in SurrealQL.
+/// `probe_<pulse>_<run>` and `probe_<run>`. The pulse name is the same plain
+/// name config accepts (letters, digits, `-` or `_`). A run id stays
+/// `[a-z0-9_]`. The database name is quoted where it is interpolated,
+/// because a hyphen is not an unquoted identifier.
 pub fn probe_names(pulse: &str, run_id: &str) -> Result<ProbeNames, GraphError> {
     let pulse = pulse.to_ascii_lowercase();
-    for part in [&pulse, &run_id.to_string()] {
-        if part.is_empty() || !is_identifier(part) {
-            return Err(GraphError::BadName(part.clone()));
-        }
+    if !crate::config::validate::is_plain_pulse_name(&pulse) {
+        return Err(GraphError::BadName(format!(
+            "'{pulse}' is not a plain pulse name (letters, digits, - or _)"
+        )));
+    }
+    if run_id.is_empty() || !is_identifier(run_id) {
+        return Err(GraphError::BadName(format!(
+            "'{run_id}' cannot be used in a probe database name (letters, digits and _ only)"
+        )));
     }
     Ok(ProbeNames {
         database: format!("{PROBE_DB_PREFIX}{pulse}_{run_id}"),
         username: format!("{PROBE_DB_PREFIX}{run_id}"),
     })
+}
+
+/// Backtick-quote a name whose characters are already a plain pulse name.
+/// The charset has no backtick, so the quotes cannot be closed early.
+fn quote_ident(name: &str) -> Result<String, GraphError> {
+    if !crate::config::validate::is_plain_pulse_name(name) {
+        return Err(GraphError::Unsafe(
+            "probe database name is not a plain identifier".into(),
+        ));
+    }
+    Ok(format!("`{name}`"))
 }
 
 fn is_identifier(s: &str) -> bool {
@@ -403,14 +421,14 @@ fn define_sql(names: &ProbeNames, password: &str) -> Result<String, GraphError> 
             "probe database password is not alphanumeric".into(),
         ));
     }
+    let db = quote_ident(&names.database)?;
+    let user = quote_ident(&names.username)?;
     Ok(format!(
         "DEFINE NAMESPACE IF NOT EXISTS {PROBE_NAMESPACE};\n\
          USE NS {PROBE_NAMESPACE};\n\
          DEFINE DATABASE {db};\n\
          USE DB {db};\n\
          DEFINE USER {user} ON DATABASE PASSWORD '{password}' ROLES OWNER;",
-        db = names.database,
-        user = names.username,
     ))
 }
 
@@ -1095,6 +1113,22 @@ mod tests {
         assert!(probe_names("echo; REMOVE NAMESPACE nullarc", "x").is_err());
         assert!(probe_names("echo", "a-b").is_err());
         assert!(probe_names("", "abc").is_err());
+        let hyphen = probe_names("My-Pulse", "abc123").unwrap();
+        assert_eq!(hyphen.database, "probe_my-pulse_abc123");
+        let define = define_sql(&hyphen, "pw").unwrap();
+        assert!(
+            define.contains("DEFINE DATABASE `probe_my-pulse_abc123`;"),
+            "{define}"
+        );
+        assert!(
+            define.contains("USE DB `probe_my-pulse_abc123`;"),
+            "{define}"
+        );
+        let mut crafted = hyphen;
+        crafted.database = "probe`; REMOVE".into();
+        let err = define_sql(&crafted, "pw").unwrap_err().to_string();
+        assert!(!err.contains("REMOVE"), "{err}");
+        assert!(err.contains("plain identifier"), "{err}");
     }
 
     #[test]
@@ -1102,8 +1136,10 @@ mod tests {
         let names = probe_names("synth", "abc123").unwrap();
         let define = define_sql(&names, "pw").unwrap();
         assert!(define.contains("USE NS nullarc_probe;"));
-        assert!(define.contains("DEFINE DATABASE probe_synth_abc123;"));
-        assert!(define.contains("DEFINE USER probe_abc123 ON DATABASE PASSWORD 'pw' ROLES OWNER;"));
+        assert!(define.contains("DEFINE DATABASE `probe_synth_abc123`;"));
+        assert!(
+            define.contains("DEFINE USER `probe_abc123` ON DATABASE PASSWORD 'pw' ROLES OWNER;")
+        );
         assert!(EXPORT_OPTIONS.contains(r#""users":false"#));
         assert!(EXPORT_OPTIONS.contains(r#""accesses":false"#));
     }
