@@ -308,11 +308,11 @@ async fn a_full_run_records_every_arm_and_writes_nothing_live() {
         panic!("the run should go ahead: {outcome:?}");
     };
     assert_eq!(summary.status, RunStatus::Complete, "{summary:?}");
-    // known-answer: 3 batched turns (11 items each); situation-use: 4 drawn
-    // items × 3 arms, one turn each.
-    assert_eq!(summary.turns, 15);
-    assert_eq!(summary.items_recorded, 33 + 12);
-    assert_eq!(summary.input_tokens, 15_000);
+    // known-answer: 3 batched turns (input-only asks the 10 template facts);
+    // situation-use: 4 families on pulse and fresh, 3 on input-only.
+    assert_eq!(summary.turns, 14, "input-only skips the served model");
+    assert_eq!(summary.items_recorded, 32 + 11);
+    assert_eq!(summary.input_tokens, 14_000);
     assert!(summary.alerts.is_empty(), "{:?}", summary.alerts);
 
     let runs = h.rows(Stream::Runs);
@@ -323,27 +323,33 @@ async fn a_full_run_records_every_arm_and_writes_nothing_live() {
         crate::vigil::probe::baseline(&h.config).unwrap()
     );
     assert_eq!(runs[1]["status"], "complete");
-    assert_eq!(h.rows(Stream::Budget).len(), 15);
+    assert_eq!(h.rows(Stream::Budget).len(), 14);
 
     let items = h.rows(Stream::Items);
-    assert_eq!(items.len(), 45);
+    assert_eq!(items.len(), 43);
     let situation: Vec<&Value> = items
         .iter()
         .filter(|r| r["set"] == "situation-use")
         .collect();
-    assert_eq!(situation.len(), 12);
+    assert_eq!(situation.len(), 11);
     let families: std::collections::BTreeSet<&str> = situation
         .iter()
         .filter_map(|r| r["family"].as_str())
         .collect();
     assert_eq!(families.len(), 4, "one item per family");
-    for arm in ["pulse", "input-only", "fresh"] {
+    for arm in ["pulse", "fresh"] {
         assert_eq!(
             situation.iter().filter(|r| r["arm"] == arm).count(),
             4,
             "{arm}"
         );
     }
+    let ceiling: Vec<&&Value> = situation
+        .iter()
+        .filter(|r| r["arm"] == "input-only")
+        .collect();
+    assert_eq!(ceiling.len(), 3, "the model family is not in the ceiling");
+    assert!(ceiling.iter().all(|r| r["family"] != "model"));
     let outcome = |arm: &str, item: &str| -> String {
         items
             .iter()
@@ -396,7 +402,7 @@ async fn a_full_run_records_every_arm_and_writes_nothing_live() {
     );
 
     let receipts = root.join("record/probes/receipts").join(&summary.run);
-    assert_eq!(std::fs::read_dir(&receipts).unwrap().count(), 15);
+    assert_eq!(std::fs::read_dir(&receipts).unwrap().count(), 14);
     let receipt: Value = serde_json::from_str(
         &std::fs::read_to_string(receipts.join("known-answer-pulse.json")).unwrap(),
     )
@@ -629,7 +635,7 @@ async fn a_later_failing_turn_records_its_items_as_errors_and_the_run_goes_on() 
     assert_eq!(summary.turns, 3, "every arm still asked");
     let items = h.rows(Stream::Items);
     let failed: Vec<&Value> = items.iter().filter(|r| r["arm"] == "input-only").collect();
-    assert_eq!(failed.len(), 11);
+    assert_eq!(failed.len(), 10, "input-only is not asked the served model");
     for row in &failed {
         assert_eq!(row["outcome"], "error", "{row}");
         assert!(
@@ -642,7 +648,7 @@ async fn a_later_failing_turn_records_its_items_as_errors_and_the_run_goes_on() 
         .iter()
         .filter(|r| r["arm"] != "input-only")
         .all(|r| r["outcome"] != "error"));
-    assert_eq!(summary.items_recorded, 33);
+    assert_eq!(summary.items_recorded, 32);
     assert_eq!(
         h.rows(Stream::Budget).len(),
         3,
@@ -1016,7 +1022,10 @@ async fn families_without_a_truth_spend_no_turns() {
     else {
         panic!("runs");
     };
-    assert_eq!(summary.turns, 6, "tomorrow and model only, three arms each");
+    assert_eq!(
+        summary.turns, 5,
+        "tomorrow on three arms, the model family on pulse and fresh only"
+    );
     let items = h.rows(Stream::Items);
     assert!(items
         .iter()
@@ -1249,19 +1258,23 @@ async fn a_set_that_differs_from_its_sealed_digest_refuses_the_run() {
 #[test]
 fn the_plan_counts_turns_per_set() {
     let sets = sets::all(&crate::vigil::probe::sealed::tests::fixture_sets()).unwrap();
-    let turns: u32 = sets.iter().map(|s| s.turns_for(s.draw("r").len())).sum();
-    assert_eq!(turns, 15, "3 known-answer + 12 situation-use");
+    let turns: u32 = sets.iter().map(|s| s.turns_for(&s.draw("r"))).sum();
+    assert_eq!(
+        turns, 14,
+        "3 known-answer + 11 situation-use (input-only skips the served model)"
+    );
     let _ = Path::new("/");
 }
 
-/// R3-A: four asks per due fact. The worst case, every item set (15 turns)
-/// and `max_active` due facts (3 × 4 = 12), fits the default cap of 27 (D
-/// 2026-10-21; paired-facts.md, "Why `max_active` is 3"), and three such
-/// runs fit the weekly budget. A change to the cap, `max_active` or the
-/// asks per fact must revisit that reasoning; this fails first.
+/// R3-A: four asks per due fact. The worst case, every item set (14 turns:
+/// known-answer's three arms, and situation-use's four families on the
+/// pulse and fresh arms plus three on input-only) and `max_active` due
+/// facts (3 × 4 = 12), fits the default cap of 27, and three such runs fit
+/// the weekly budget. A change to the cap, `max_active` or the asks per
+/// fact must revisit that reasoning; this fails first.
 #[test]
 fn three_due_facts_and_every_set_fit_the_default_cap() {
-    let item_sets: u32 = 15;
+    let item_sets: u32 = 14;
     let config = crate::config::ProbeConfig::default();
     let per_fact = u32::try_from(paired::ASKS_PER_FACT).unwrap();
     let max_active = u32::try_from(LoadedPairs::fixture().set.max_active).unwrap();

@@ -1319,6 +1319,12 @@ pub(crate) mod tests {
                 Outcome::Wrong,
                 AnswerKind::Value,
             ),
+            (
+                "maybe lychee",
+                Outcome::Correct,
+                Outcome::Wrong,
+                AnswerKind::HedgedWithValue,
+            ),
             ("Carrots", Outcome::Wrong, Outcome::Wrong, AnswerKind::Value),
         ];
         for (answer, planted_outcome, twin_outcome, kind) in cases {

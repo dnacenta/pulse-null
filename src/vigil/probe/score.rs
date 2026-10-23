@@ -13,8 +13,11 @@ use super::sets::Rule;
 /// comparing name words and version parts exactly (audit R2-4); 5 whole-word
 /// abstentions and dates written with "of", "the" or a time (R2-8); 6 an
 /// abstention that goes on to name something offers a value, and a paired
-/// answer counts as remembered only when it is not an abstention (R3-B).
-pub const SCORER_VERSION: u32 = 6;
+/// answer counts as remembered only when it is not an abstention (R3-B);
+/// 7 a listed guess phrase is a hedge even when the answer does not
+/// abstain, so it is remembered when the value matches and it is not an
+/// unhedged hit. Rows scored earlier stay on their own version.
+pub const SCORER_VERSION: u32 = 7;
 use super::truth::Truth;
 
 /// How one answer scored.
@@ -110,8 +113,9 @@ pub fn score(rule: Rule, truth: Option<&Truth>, answer: Option<&str>) -> Outcome
     }
 }
 
-/// Phrases that, in an answer, mean "I was not told" (pre-registered on the
-/// paired-facts methods page).
+/// Phrases that, in an answer, mean "I was not told". An initial coding
+/// frame: not calibrated against labelled replies (paired-facts methods
+/// page, "Scoring").
 const ABSTENTIONS: &[&str] = &[
     "don't know",
     "do not know",
@@ -128,8 +132,9 @@ const ABSTENTIONS: &[&str] = &[
     "was not told",
 ];
 
-/// Phrases that, beside an abstention, offer a value anyway (pre-registered
-/// on the paired-facts methods page).
+/// Phrases that mark a guess. An answer that carries one is hedged, whether
+/// or not it also abstains, and is not an unhedged hit. An initial coding
+/// frame, same as [`ABSTENTIONS`].
 const GUESSES: &[&str] = &[
     "maybe",
     "perhaps",
@@ -150,8 +155,9 @@ const GUESSES: &[&str] = &[
 ];
 
 /// Words that, beside an abstention, name nothing: function words and the
-/// vocabulary of "I was never told" (pre-registered on the paired-facts
-/// methods page). Any other word left after an abstention offers a value.
+/// vocabulary of "I was never told". Any other word left after an
+/// abstention offers a value. An initial coding frame, same as
+/// [`ABSTENTIONS`].
 const NO_VALUE_WORDS: &[&str] = &[
     "a",
     "an",
@@ -308,20 +314,26 @@ fn says_unknown(answer: &str) -> bool {
 }
 
 /// Classify an answer to `question` three ways. An abstention (UNKNOWN at
-/// its start, or a pre-registered "not told" phrase) is `Abstained` only
-/// when it offers nothing: one that carries a guess phrase, or goes on to
-/// name something ([`names_something`]: "not sure, but lychee"), is
-/// `HedgedWithValue`. Anything else is a `Value`.
+/// its start, or a listed "not told" phrase) is `Abstained` only when it
+/// offers nothing: one that carries a guess phrase, or goes on to name
+/// something ([`names_something`]: "not sure, but lychee"), is
+/// `HedgedWithValue`. A listed guess phrase with no abstention ("maybe
+/// lychee") is also `HedgedWithValue`: it can still be remembered, and it
+/// is not an unhedged hit. Anything else is a `Value`.
 #[must_use]
 pub fn answer_kind(answer: &str, question: &str) -> AnswerKind {
     let lower = answer.to_lowercase().replace('’', "'");
     // Whole words, in order: "no ideas" or "no recordings" are not
     // abstentions.
     let abstains = says_unknown(answer) || ABSTENTIONS.iter().any(|p| contains_words(&lower, p));
-    if !abstains {
-        return AnswerKind::Value;
-    }
     let guesses = GUESSES.iter().any(|g| contains_words(&lower, g));
+    if !abstains {
+        return if guesses {
+            AnswerKind::HedgedWithValue
+        } else {
+            AnswerKind::Value
+        };
+    }
     if guesses || names_something(&lower, question) {
         AnswerKind::HedgedWithValue
     } else {
@@ -1164,6 +1176,20 @@ mod tests {
         for value in ["Carrots", "I know: carrots", "Known: Lychee"] {
             assert_eq!(answer_kind(value, ""), AnswerKind::Value, "{value}");
         }
+    }
+
+    /// A listed guess phrase is a hedge even when the answer never abstains,
+    /// so "maybe lychee" is not an unhedged value (scorer version 7).
+    #[test]
+    fn a_guess_phrase_without_an_abstention_is_hedged() {
+        for hedged in ["maybe lychee?", "probably lychee", "I'd say lychee"] {
+            assert_eq!(
+                answer_kind(hedged, "What is your owner's favourite fruit?"),
+                AnswerKind::HedgedWithValue,
+                "{hedged}"
+            );
+        }
+        assert_eq!(answer_kind("Lychee", ""), AnswerKind::Value);
     }
 
     /// Audit #11: "not sure, but probably carrots" offers a value.

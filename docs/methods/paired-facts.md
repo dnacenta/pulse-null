@@ -107,7 +107,9 @@ read against it: remembering the planted side means little if the pulse also
   possibly, likely, might be, could be, my guess, best guess, I guess, I'd
   guess, I would guess, if I had to, I'd say, I think it, I believe it*),
   or it names something, whether or not a guess phrase appears ("not sure,
-  but lychee"). It names something when a word is left after taking away
+  but lychee"). A listed guess phrase with no abstention ("maybe lychee")
+  is the same kind of hedge: remembered when the value matches, and not an
+  unhedged hit. It names something when a word is left after taking away
   `UNKNOWN`, the words of the abstention phrases, the words of the
   question it was asked (the set's instructions and the side's question:
   "I don't know your favourite sundial" names nothing), and these words,
@@ -126,9 +128,11 @@ read against it: remembering the planted side means little if the pulse also
   nothing is a **bare abstention**; anything that is not an abstention is
   a **value**. A long-winded abstention may name a word not on the list
   and be read as a hedge: on the twin side that counts against the pulse
-  (made up), never for it. This rule and its word list are settled (D,
-  2026-10-21; scorer version 6); a change to either is a new scorer
-  version.
+  (made up), never for it. The three lists are an initial coding frame,
+  not a calibrated coding manual. "Made up" is not read until a labelled
+  check of real replies exists. A change to a list or to this rule is a
+  new scorer version (the guess-phrase rule above is version 7; rows
+  scored earlier stay on version 6).
 - **Planted side** (and the fresh arm's two asks of it): remembered
   (correct) only when the answer is not an abstention (a value, or hedged
   with a value) and the planted value's words appear in it, in order,
@@ -163,14 +167,15 @@ any data and changed only as a new set version.
 |---|---|---|
 | `offsets_days` | 1, 7, 30, 90 | a day, a week, a month, a quarter: from "still in the session" to "long past it" |
 | `max_active` (facts in flight) | 3 | the turn budget and the owner (below) |
-| `min_n` (per side and offset) | 10 | the smallest n at which a large gap shows: 9 of 10 remembered (95% Wilson 0.60–0.98) against 2 of 10 guessed by chance (0.06–0.51) do not overlap; anything smaller cannot separate them, anything larger pushes the first result past a year |
+| `min_n` (per side and offset) | 10 | an initial guess for one batch. Up to three facts share a run, so a batch of 10 is several runs. "Remembers" is a t interval on the run means of the paired differences, read only when that interval lies above zero; it is not read from Wilson intervals on the separate arms |
 | plant window | 14 days | long enough to bring a topic up in normal conversation without forcing it, short enough that an abandoned draw does not hold a slot for long |
 
 **Why `max_active` is 3, and the cap that fits it.** Each due fact takes
 four asks (planted, twin, volunteered, forced guess), and facts drawn in
 the same week come due in the same runs, so the worst case is every item
-set (up to 15 turns) and three due facts (12): 27 turns. The default cap
-is set to that, `max_turns_per_run` = 27, with `weekly_turns` = 81 for
+set (up to 14 turns: the input-only arm is not asked the served model)
+and three due facts (12): 26 turns. The default cap
+is `max_turns_per_run` = 27, which still holds that, with `weekly_turns` = 81 for
 three `max` runs (D, 2026-10-21; settled, it was 24 and 72 before the
 forced guess). The gate refuses a run over the cap outright (it never runs
 part of one), so a fourth fact in flight would push such runs over it and
@@ -209,10 +214,16 @@ digests' first eight characters. "Made up"
 counts the twin's wrong answers only; an empty answer counts in n and is
 neither correct nor made up. Per group, by side and offset (`planted 7d`,
 `twin 7d`, `chance 7d`, `guess 7d`): the planted side as "remembered k of
-n"; the twin as "made up m of n it was never told"; the fresh arm's
+n"; the twin as "made up m of n it was never told" with a 95% Wilson
+interval on those wrong answers (not on abstentions); the fresh arm's
 UNKNOWN-allowed ask as "volunteered with no memory k of n"; the forced
-guess as its unhedged hits, "chance k of n unhedged" (the chance rate);
-each with a 95% Wilson interval. Labels name the
+guess as its unhedged hits, "chance k of n unhedged" (the chance rate).
+The decision is not those marginal intervals. For each fact, status scores
+the planted unhedged hit minus the forced guess's unhedged hit, and the
+planted hit minus the twin's made-up answer, averages within a run, and
+prints a 95% t interval on the run means (`vs chance`, `vs twin`). It
+decides only when that interval lies above zero. One run is not a
+decision. Labels name the
 pre-registered offset; status also shows how many days after the plant
 the asks actually came (`elapsed_days` on every row), since a missed run
 makes an ask late. For the planted side and the
@@ -220,7 +231,9 @@ volunteered ask the **unhedged hits** (the value given without an
 abstention or guess phrase, `answer_kind` = value) are reported
 separately, out of the same n: a hedged "maybe lychee?" counts as
 remembered but is not an unhedged hit. For the forced guess they are its
-number. **Minimum n = 10** per side and offset
+number. When the rows say where the answer came from, the planted line
+breaks **lookup** out of n, so a pass by archive or graph search is not
+pooled with context. **Minimum n = 10** per side and offset
 before a number is shown ("not enough yet · k of 10").
 
 ## Limits
@@ -235,11 +248,18 @@ before a number is shown ("not enough yet · k of 10").
   the owner mentioned outside the owner session's WAL and the archives (in
   a session that was never archived, another channel, a file the pulse
   read) is invisible to the contamination check.
-- A pulse can read its own conversation history, so "remembers" includes
-  finding the mention again; `answered_from` separates the two.
-- Fail branch: if, at 1 or 7 days, the planted side's hit rate is not
-  above the twin's made-up rate, or its **unhedged hits** are not above the
-  **chance rate** (the forced guess's unhedged hits), by more than the
-  intervals, "Remembers" reads as not yet shown. What a model with no
-  memory volunteers is shown and never decides it. The 30- and 90-day
-  offsets are exploratory and never decide it.
+- A 1-day hit is present in the graph snapshot, the copied files, or an
+  archive. The planting conversation is `sessions/wal/owner.jsonl`. The
+  probe copy excludes `sessions/` and shares `archives/` read-only, so
+  that WAL is invisible until the session is archived. `answered_from`
+  stays on the row (`lookup` when a tool result held the value or a call
+  named the slot, `context` otherwise) and `probe status` breaks lookup
+  out on the planted line.
+- Fail branch: if, at 1 or 7 days, the t interval on the run means of
+  (planted unhedged hit − forced-guess unhedged hit) does not lie above
+  zero, or the t interval on (planted hit − twin made-up) does not,
+  "Remembers" reads as not yet shown. Lookup is shown apart from context
+  and does not decide by itself. What a model with no memory volunteers
+  is shown and never decides it. The 30- and 90-day offsets are
+  exploratory and never decide it. "Made up" is not read until a labelled
+  check of the coding frame exists.

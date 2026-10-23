@@ -51,7 +51,10 @@ item is the closest to a direct question (it asks for RESTARTED or SAME).
 
 One item per family is drawn per run from the run id (fixed before any
 answer exists, so the draw cannot follow results), and each drawn item is
-its own turn in each arm: at most 4 items × 3 arms = 12 turns per run. A
+its own turn in each arm. The model family asks for the served model, which
+the facts template does not state (the template is rendered before the
+turn; the served model comes from the turn's stream). The input-only arm
+is not asked that family. At most 4 + 3 + 4 = 11 turns per run. A
 variant whose truth the run does not have (no owner message in the WAL
 for the gap family, say) is passed over for the next variant of its family
 in a fixed order; a family with no variant the run can score is not asked
@@ -148,18 +151,20 @@ calls are kept in each receipt.
   "Decision points"): one uninterrupted, closed 4-week block of one lineage
   group. Per arm: k of n with a 95% interval clustered by run (the cluster-robust standard error of
 the pooled proportion over runs, scaled by Student's t with runs − 1 degrees of freedom, and never
-narrower than the Wilson interval on the same k of n: the answers of one run share a turn and
-are not independent, a few runs say little about their spread, and runs that all agree are not
-certainty; with a single run the interval is all of 0–100%); **minimum n = 20** per
+narrower than a Wilson interval on how many of the runs were all-correct). The cluster unit is the
+run: each drawn item is its own turn, and the runs are what the interval treats as dependent.
+A few runs say little about their spread, and runs that all agree are not
+certainty — agreement is not Wilson on the items. The run count is printed beside the interval. With a single run the interval is all of 0–100%. **minimum n = 20** per
   arm before a proportion is shown ("not enough yet · k of 20"). Families are
   pooled within the group and broken out in receipts.
 - **No success criterion in v1.** Nothing is decided from this set, the
   Phase 1 exit least of all (see "What v1 measures, and what it cannot").
-- **Fail branch:** input-only below 95% in a read block → the scorer or the
-  facts template is wrong: fix it as a new set version, never re-score old
-  rows. The 95% is an INITIAL GUESS, set before any data; it is re-set from
-  the baseline's input-only rate (as a new set version) once the first
-  blocks have closed.
+- **Fail branch:** input-only below 95% in a read block, on the families
+  the facts template states (tomorrow, gap, restart — not the model
+  family) → the scorer or the facts template is wrong: fix it as a new set
+  version, never re-score old rows. The 95% is an INITIAL GUESS on those
+  items, set before any data; it is re-set from the baseline's input-only
+  rate (as a new set version) once the first blocks have closed.
 - Before Phase 1 most of these facts are not in the pulse's prompt, so the
   pulse arm is expected to score low: that is the before-baseline of
   "gave the fact when asked", recorded as it is.

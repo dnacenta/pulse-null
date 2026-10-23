@@ -574,7 +574,7 @@ impl<'a> Planner<'a> {
     fn planned(&self, asks: &[paired::Ask], truths: &Truths) -> u32 {
         self.sets
             .iter()
-            .map(|set| set.turns_for(draw(set, "plan", truths).len()))
+            .map(|set| set.turns_for(&draw(set, "plan", truths)))
             .sum::<u32>()
             + u32::try_from(asks.len()).unwrap_or(u32::MAX)
     }
@@ -950,7 +950,23 @@ impl TurnContext<'_> {
         for set in &plan.sets {
             for (items, prompt) in &questions(set, self.run_id, self.plan_truths) {
                 for arm in &set.set.arms {
-                    self.run_turn(set, *arm, items, prompt, tally).await?;
+                    let asked: Vec<&Item> = items
+                        .iter()
+                        .copied()
+                        .filter(|item| set.asks(*arm, item))
+                        .collect();
+                    if asked.is_empty() {
+                        continue;
+                    }
+                    let ceiling;
+                    let prompt = if *arm == Arm::InputOnly && set.set.delivery == Delivery::Batched
+                    {
+                        ceiling = set.prompt_for(&asked);
+                        ceiling.as_str()
+                    } else {
+                        prompt.as_str()
+                    };
+                    self.run_turn(set, *arm, &asked, prompt, tally).await?;
                     if tally.stopped.is_some() {
                         return Ok(());
                     }

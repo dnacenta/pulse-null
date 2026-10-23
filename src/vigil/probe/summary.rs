@@ -155,6 +155,38 @@ pub struct ArmResult {
     /// A paired-fact offset read as exploratory only in v1 (30 and 90
     /// days): shown, never decided on.
     pub exploratory: bool,
+    /// Runs the interval is clustered over (item sets). Printed beside it.
+    pub runs: u32,
+    /// Counted answers whose `answered_from` is `lookup`.
+    pub lookup: u32,
+    /// The rows say where the answer came from.
+    pub from_known: bool,
+}
+
+/// A 95% Student's t interval on the mean of per-run mean paired
+/// differences, in [-1, 1]. One difference is one fact: the planted
+/// unhedged hit minus the forced guess's, or the planted hit minus the
+/// twin's made-up answer. "Remembers" is read only when the interval lies
+/// above zero, and never from exploratory offsets.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PairedGap {
+    pub offset_days: i64,
+    /// `chance` (the forced guess) or `twin`.
+    pub against: &'static str,
+    pub runs: u32,
+    pub mean: f64,
+    pub low: f64,
+    pub high: f64,
+    pub exploratory: bool,
+}
+
+impl PairedGap {
+    /// The decision the interval supports: entirely above zero, on a
+    /// confirmatory offset, with more than one run.
+    #[must_use]
+    pub fn above_zero(&self) -> bool {
+        !self.exploratory && self.runs >= 2 && self.low > 0.0
+    }
 }
 
 impl ArmResult {
@@ -174,6 +206,8 @@ pub struct Summary {
     pub runs: Vec<RunLine>,
     pub cost_per_run: Option<CostPerRun>,
     pub groups: BTreeMap<GroupKey, Vec<ArmResult>>,
+    /// Paired-fact decisions for a group: t intervals on run means.
+    pub decisions: BTreeMap<GroupKey, Vec<PairedGap>>,
     /// Groups whose 4-week block holds rows of more than one lineage: a
     /// lineage changed inside the block, so none of its parts is read as a
     /// result (Concept v2 D10).
@@ -265,7 +299,7 @@ pub fn summarize(
         }
     });
 
-    let groups = group_items(&reads["items"], min_n);
+    let (groups, decisions) = group_items(&reads["items"], min_n);
     Ok(Summary {
         chains,
         week,
@@ -273,6 +307,7 @@ pub fn summarize(
         cost_per_run,
         interrupted: interrupted_blocks(&groups),
         groups,
+        decisions,
     })
 }
 
@@ -281,17 +316,22 @@ pub fn summarize(
 fn group_items(
     items: &[Value],
     min_n: &BTreeMap<String, u32>,
-) -> BTreeMap<GroupKey, Vec<ArmResult>> {
+) -> (
+    BTreeMap<GroupKey, Vec<ArmResult>>,
+    BTreeMap<GroupKey, Vec<PairedGap>>,
+) {
     let mut grouping = Grouping {
         min_n,
         anchors: block_anchors(items),
         batches: BTreeMap::new(),
         tallies: BTreeMap::new(),
+        facts: BTreeMap::new(),
     };
     for row in items {
         grouping.add(row);
     }
-    arm_results(grouping.tallies, min_n)
+    let decisions = pairing_gaps(&grouping.facts);
+    (arm_results(grouping.tallies, min_n), decisions)
 }
 
 /// The tallies so far, by (group, arm), and what places a row in its block.
@@ -302,6 +342,37 @@ struct Grouping<'a> {
     /// Scored answers so far per paired-fact group and side, for batches.
     batches: BTreeMap<(GroupKey, String), u32>,
     tallies: BTreeMap<(GroupKey, String), Tally>,
+    /// One fact's sides, so a paired difference can be scored.
+    facts: BTreeMap<FactKey, OpenFact>,
+}
+
+/// Which fact a paired row belongs to, apart from the batch it landed in.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct FactKey {
+    lineage: GroupKey,
+    offset: i64,
+    fact: String,
+    run: String,
+}
+
+/// The sides of one fact in one run.
+#[derive(Debug, Default)]
+struct OpenFact {
+    planted: Option<(GroupKey, SideBits)>,
+    guess: Option<SideBits>,
+    twin: Option<SideBits>,
+    exploratory: bool,
+}
+
+/// One counted answer, as the paired differences need it.
+#[derive(Debug, Clone, Copy)]
+struct SideBits {
+    /// Correct and `answer_kind` = value.
+    unhedged: f64,
+    /// Correct, hedges included.
+    hit: f64,
+    /// Wrong. On a twin, made up.
+    made_up: f64,
 }
 
 impl Grouping<'_> {
@@ -318,11 +389,47 @@ impl Grouping<'_> {
         } else {
             weeks_block(row, &self.anchors, &key.baseline).unwrap_or(Block::Facts { batch: 1 })
         };
-        let tally = self.tallies.entry((key, label)).or_default();
+        let tally = self.tallies.entry((key.clone(), label)).or_default();
         tally.add_outcome(row, outcome);
         tally.add_row_kind(row, paired);
         if outcome.counts() {
             tally.count(row, outcome);
+            if paired {
+                self.note_fact(row, &key, outcome);
+            }
+        }
+    }
+
+    /// Keep this fact's side so the planted row can be paired with its
+    /// forced guess and its twin.
+    fn note_fact(&mut self, row: &Value, key: &GroupKey, outcome: Outcome) {
+        let Some(offset) = row["offset_days"].as_i64() else {
+            return;
+        };
+        let mut lineage = key.clone();
+        lineage.block = Block::Facts { batch: 0 };
+        let bits = SideBits {
+            unhedged: f64::from(u8::from(
+                outcome == Outcome::Correct && row["answer_kind"].as_str() == Some("value"),
+            )),
+            hit: f64::from(u8::from(outcome == Outcome::Correct)),
+            made_up: f64::from(u8::from(outcome == Outcome::Wrong)),
+        };
+        let open = self
+            .facts
+            .entry(FactKey {
+                lineage,
+                offset,
+                fact: text(row, "fact"),
+                run: text(row, "run"),
+            })
+            .or_default();
+        open.exploratory = super::paired::is_exploratory(offset);
+        match row["side"].as_str() {
+            Some("planted") => open.planted = Some((key.clone(), bits)),
+            Some("guess") => open.guess = Some(bits),
+            Some("twin") => open.twin = Some(bits),
+            _ => {}
         }
     }
 
@@ -437,9 +544,10 @@ fn arm_result(key: &GroupKey, arm: String, tally: &Tally, min_n: Option<u32>) ->
         .any(|side| arm.starts_with(side));
     let unhedged =
         (remembers && tally.kinds_known).then(|| wilson(tally.unhedged_correct, tally.counted));
-    // Item-set answers from one run share a turn (known-answer asks all its
-    // items in one), so they are not independent: their interval is
-    // clustered by run. Paired-fact answers are one per fact and turn.
+    // Item-set answers are clustered by run. Known-answer asks its items in
+    // one turn; situation-use asks each drawn item as its own turn. The
+    // cluster unit is the run either way. Paired facts are decided from
+    // the run means of paired differences, not from this proportion.
     let proportion = if key.set.starts_with(PAIRED_FACTS) {
         wilson(tally.correct, tally.counted)
     } else {
@@ -455,7 +563,99 @@ fn arm_result(key: &GroupKey, arm: String, tally: &Tally, min_n: Option<u32>) ->
         unhedged,
         wrong: tally.wrong,
         exploratory: tally.exploratory,
+        runs: u32::try_from(tally.by_run.len()).unwrap_or(u32::MAX),
+        lookup: tally.lookup,
+        from_known: tally.from_known,
     }
+}
+
+/// One paired comparison, before its runs are averaged.
+#[derive(Debug, PartialEq, Eq, PartialOrd, Ord)]
+struct GapKey {
+    group: GroupKey,
+    offset: i64,
+    against: &'static str,
+}
+
+/// The per-run differences of one comparison.
+#[derive(Debug)]
+struct GapRuns {
+    exploratory: bool,
+    by_run: BTreeMap<String, Vec<f64>>,
+}
+
+/// t intervals on the run means of the paired differences.
+fn pairing_gaps(facts: &BTreeMap<FactKey, OpenFact>) -> BTreeMap<GroupKey, Vec<PairedGap>> {
+    let mut by_run: BTreeMap<GapKey, GapRuns> = BTreeMap::new();
+    for (key, open) in facts {
+        let Some((group, planted)) = &open.planted else {
+            continue;
+        };
+        let mut push = |against: &'static str, diff: f64| {
+            by_run
+                .entry(GapKey {
+                    group: group.clone(),
+                    offset: key.offset,
+                    against,
+                })
+                .or_insert_with(|| GapRuns {
+                    exploratory: open.exploratory,
+                    by_run: BTreeMap::new(),
+                })
+                .by_run
+                .entry(key.run.clone())
+                .or_default()
+                .push(diff);
+        };
+        if let Some(guess) = &open.guess {
+            push("chance", planted.unhedged - guess.unhedged);
+        }
+        if let Some(twin) = &open.twin {
+            push("twin", planted.hit - twin.made_up);
+        }
+    }
+    let mut gaps: BTreeMap<GroupKey, Vec<PairedGap>> = BTreeMap::new();
+    for (key, runs) in by_run {
+        let means: Vec<f64> = runs
+            .by_run
+            .values()
+            .map(|diffs| diffs.iter().sum::<f64>() / diffs.len() as f64)
+            .collect();
+        let (mean, low, high) = run_mean_interval(&means);
+        gaps.entry(key.group).or_default().push(PairedGap {
+            offset_days: key.offset,
+            against: key.against,
+            runs: u32::try_from(means.len()).unwrap_or(u32::MAX),
+            mean,
+            low,
+            high,
+            exploratory: runs.exploratory,
+        });
+    }
+    for list in gaps.values_mut() {
+        list.sort_by(|a, b| {
+            a.offset_days
+                .cmp(&b.offset_days)
+                .then(a.against.cmp(b.against))
+        });
+    }
+    gaps
+}
+
+/// The mean of `means` and a 95% t interval on it, clipped to [-1, 1].
+/// One run has no spread, so the interval is the whole of the range.
+fn run_mean_interval(means: &[f64]) -> (f64, f64, f64) {
+    let runs = means.len();
+    if runs == 0 {
+        return (0.0, -1.0, 1.0);
+    }
+    let mean = means.iter().sum::<f64>() / runs as f64;
+    if runs < 2 {
+        return (mean, -1.0, 1.0);
+    }
+    let variance = means.iter().map(|x| (x - mean).powi(2)).sum::<f64>() / (runs - 1) as f64;
+    let half = t_975(runs - 1) * (variance / runs as f64).sqrt();
+    (mean, (mean - half).max(-1.0), (mean + half).min(1.0))
 }
 
 /// The first day of each baseline's rows (UTC): where its 4-week blocks
@@ -525,6 +725,10 @@ struct Tally {
     by_run: BTreeMap<String, (u32, u32)>,
     /// The fewest and most days after the plant a paired fact was asked.
     elapsed: Option<(i64, i64)>,
+    /// Counted answers that came from a lookup.
+    lookup: u32,
+    /// A row carried `answered_from`.
+    from_known: bool,
 }
 
 impl Tally {
@@ -570,6 +774,14 @@ impl Tally {
         if let Some(days) = row["elapsed_days"].as_i64() {
             self.elapsed = Some(widened(self.elapsed, days));
         }
+        match row["answered_from"].as_str() {
+            Some("lookup") => {
+                self.from_known = true;
+                self.lookup += 1;
+            }
+            Some(_) => self.from_known = true,
+            None => {}
+        }
         if row["rule"].as_str() == Some("choice") {
             *self.choice_truths.entry(text(row, "truth")).or_default() += 1;
         }
@@ -588,11 +800,12 @@ fn widened(range: Option<(i64, i64)>, days: i64) -> (i64, i64) {
 /// k of n, with a 95% interval from the cluster-robust (ratio estimator)
 /// standard error over runs, scaled by Student's t with runs − 1 degrees
 /// of freedom (a handful of runs says little about their spread: z = 1.96
-/// would be far too narrow), and never narrower than the Wilson interval
-/// on the same k of n: runs that agree have no spread between them, which
-/// is not certainty (R3-D). Clipped to [0, 1]. With a single run nothing is
-/// known about the spread between runs, and the interval is all of [0, 1]
-/// (audit R2-13).
+/// would be far too narrow). Runs that agree have no spread between them,
+/// which is not certainty: the interval is never narrower than the Wilson
+/// interval on how many of the runs were all-correct (a run-level floor,
+/// not Wilson on the items). Clipped to [0, 1]. With a single run nothing
+/// is known about the spread between runs, and the interval is all of
+/// [0, 1] (audit R2-13).
 #[must_use]
 pub fn clustered(by_run: &BTreeMap<String, (u32, u32)>) -> Proportion {
     let k: u32 = by_run.values().map(|(k, _)| k).sum();
@@ -614,7 +827,9 @@ pub fn clustered(by_run: &BTreeMap<String, (u32, u32)>) -> Proportion {
     let r = runs as f64;
     let variance = r / (r - 1.0) * squares / f64::from(n).powi(2);
     let half = t_975(runs - 1) * variance.sqrt();
-    let floor = wilson(k, n);
+    let all_correct = u32::try_from(by_run.values().filter(|(k, n)| k == n && *n > 0).count())
+        .unwrap_or(u32::MAX);
+    let floor = wilson(all_correct, u32::try_from(runs).unwrap_or(u32::MAX));
     Proportion {
         k,
         n,
@@ -1112,12 +1327,12 @@ mod tests {
             "one run says nothing of spread"
         );
         let same = clustered(&runs(&[(9, 11), (9, 11), (9, 11)]));
-        let floor = wilson(27, 33);
-        assert_eq!(
-            (same.low, same.high),
-            (floor.low, floor.high),
-            "no spread between runs: the Wilson interval, never zero width"
+        let items = wilson(27, 33);
+        assert!(
+            same.low < items.low,
+            "agreement is not Wilson on the items: {same:?} vs {items:?}"
         );
+        assert!(same.high > same.low, "never zero width");
         let mixed = clustered(&runs(&[(11, 11), (0, 11), (11, 11), (0, 11)]));
         let naive = wilson(22, 44);
         assert!(
@@ -1182,9 +1397,9 @@ mod tests {
             .collect();
         let many = clustered(&runs_of(&pairs));
         let (low, high) = by_hand(&pairs, t_975(99));
-        let floor = wilson(many.k, many.n);
-        assert!((many.low - low.min(floor.low)).abs() < 1e-12, "{many:?}");
-        assert!((many.high - high.max(floor.high)).abs() < 1e-12, "{many:?}");
+        let floor = wilson(0, u32::try_from(pairs.len()).unwrap());
+        assert!((many.low - low.min(floor.low)).abs() < 1e-9, "{many:?}");
+        assert!((many.high - high.max(floor.high)).abs() < 1e-9, "{many:?}");
         let (z_low, z_high) = by_hand(&pairs, 1.96);
         let ratio = (high - low) / (z_high - z_low);
         assert!(
@@ -1193,30 +1408,100 @@ mod tests {
         );
     }
 
-    /// R3-D: runs that all agree have no spread between them, which is not
-    /// certainty: the interval is at least the Wilson interval on the same
-    /// k of n, never zero width, and never narrower than Wilson in general.
+    /// Agreement is not certainty, and it is not Wilson on the items. The
+    /// floor is Wilson on how many runs were all-correct.
     #[test]
-    fn runs_that_agree_keep_the_wilson_interval() {
-        for pairs in [
-            vec![(11, 11), (11, 11)],
-            vec![(0, 11), (0, 11), (0, 11)],
-            vec![(5, 10); 12],
-        ] {
-            let agreed = clustered(&runs_of(&pairs));
-            let floor = wilson(agreed.k, agreed.n);
-            assert_eq!(
-                (agreed.low, agreed.high),
-                (floor.low, floor.high),
-                "{pairs:?}"
-            );
-            assert!(agreed.high > agreed.low, "never zero width: {pairs:?}");
-        }
+    fn runs_that_agree_are_floored_by_the_runs() {
+        let perfect = clustered(&runs_of(&[(11, 11), (11, 11), (11, 11)]));
+        let runs = wilson(3, 3);
+        let items = wilson(33, 33);
+        assert!((perfect.low - runs.low).abs() < 1e-12, "{perfect:?}");
+        assert!((perfect.high - 1.0).abs() < 1e-12, "{perfect:?}");
+        assert!(perfect.low < items.low, "wider than Wilson on 33 of 33");
+
+        let same = clustered(&runs_of(&[(9, 11), (9, 11), (9, 11)]));
+        let none = wilson(0, 3);
+        let point = 9.0_f64 / 11.0;
+        assert!((same.low - 0.0).abs() < 1e-12, "{same:?}");
+        assert!((same.high - point.max(none.high)).abs() < 1e-12, "{same:?}");
+        assert!(same.low < wilson(27, 33).low);
+
         for pairs in [vec![(6, 11), (8, 11)], vec![(11, 11), (0, 11), (5, 11)]] {
             let any = clustered(&runs_of(&pairs));
-            let floor = wilson(any.k, any.n);
-            assert!(any.low <= floor.low && any.high >= floor.high, "{pairs:?}");
+            let all_correct = u32::try_from(pairs.iter().filter(|(k, n)| k == n).count()).unwrap();
+            let floor = wilson(all_correct, u32::try_from(pairs.len()).unwrap());
+            assert!(
+                any.low <= floor.low + 1e-12 && any.high + 1e-12 >= floor.high,
+                "{pairs:?} {any:?} floor {floor:?}"
+            );
         }
+    }
+
+    /// The paired decision is a t interval on run means, above zero only
+    /// when that whole interval is. One run is not a decision.
+    #[test]
+    fn paired_decisions_use_the_run_mean_interval() {
+        let dir = tempfile::tempdir().unwrap();
+        let record = Record::open(dir.path()).unwrap();
+        let row = |run: &str, side: &str, outcome: &str, kind: &str, fact: &str| {
+            let mut row = item("pulse", outcome, "claude-opus-5-5");
+            row["run"] = run.into();
+            row["set"] = "paired-facts".into();
+            row["side"] = side.into();
+            row["offset_days"] = 7.into();
+            row["fact"] = fact.into();
+            row["answer_kind"] = kind.into();
+            row["answered_from"] = "lookup".into();
+            row
+        };
+        for (run, fact) in [("r1", "f1"), ("r2", "f2")] {
+            for (side, outcome, kind) in [
+                ("planted", "correct", "value"),
+                ("guess", "wrong", "value"),
+                ("twin", "wrong", "value"),
+            ] {
+                record
+                    .append(Stream::Items, row(run, side, outcome, kind, fact))
+                    .unwrap();
+            }
+        }
+        let summary = summary_of(&record);
+        let (key, gaps) = summary
+            .decisions
+            .iter()
+            .find(|(k, _)| k.set == "paired-facts/v1")
+            .unwrap();
+        let chance = gaps.iter().find(|g| g.against == "chance").unwrap();
+        assert_eq!(chance.runs, 2);
+        assert!((chance.mean - 1.0).abs() < 1e-12, "{chance:?}");
+        assert!(chance.above_zero(), "{chance:?}");
+        let twin = gaps.iter().find(|g| g.against == "twin").unwrap();
+        assert!((twin.mean - 0.0).abs() < 1e-12, "{twin:?}");
+        assert!(!twin.above_zero(), "{twin:?}");
+        let planted = summary.groups[key]
+            .iter()
+            .find(|a| a.arm == "planted 7d")
+            .unwrap();
+        assert_eq!(planted.lookup, 2);
+        assert!(planted.from_known);
+
+        let one = tempfile::tempdir().unwrap();
+        let record = Record::open(one.path()).unwrap();
+        for (side, outcome, kind) in [("planted", "correct", "value"), ("guess", "wrong", "value")]
+        {
+            record
+                .append(Stream::Items, row("r1", side, outcome, kind, "f1"))
+                .unwrap();
+        }
+        let summary = summary_of(&record);
+        let gap = summary
+            .decisions
+            .values()
+            .flatten()
+            .find(|g| g.against == "chance")
+            .unwrap();
+        assert_eq!((gap.low, gap.high), (-1.0, 1.0));
+        assert!(!gap.above_zero());
     }
 
     #[test]

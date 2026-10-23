@@ -36,10 +36,10 @@ asking changes nothing the pulse lives in.
 
 | Set | Delivery | Turns per run | Methods |
 |---|---|---|---|
-| `known-answer/v1` | all 11 items in one numbered turn per arm | 3 | [known-answer.md](known-answer.md) |
-| `situation-use/v1` | one item per family (4 families), drawn from the run id among the variants the run has a truth for; each item its own turn per arm | up to 12 | [situation-use.md](situation-use.md) |
+| `known-answer/v1` | all 11 items in one numbered turn on the pulse and fresh arms; the input-only arm asks the 10 the facts template states (not the served model) | 3 | [known-answer.md](known-answer.md) |
+| `situation-use/v1` | one item per family (4 families), drawn from the run id among the variants the run has a truth for; each item its own turn per arm, except the model family is not asked on input-only | up to 11 | [situation-use.md](situation-use.md) |
 
-`paired-facts/v1` adds its due questions per run, four turns per due fact (the planted side and the twin of the pulse; the planted side of the fresh arm as the pulse is asked it, "volunteered with no memory", and as a forced guess, the chance rate), at most three facts in flight. Three due facts beside every item set need 27 turns, which the default cap allows ([paired-facts.md](paired-facts.md), "Why `max_active` is 3").
+`paired-facts/v1` adds its due questions per run, four turns per due fact (the planted side and the twin of the pulse; the planted side of the fresh arm as the pulse is asked it, "volunteered with no memory", and as a forced guess, the chance rate), at most three facts in flight. Three due facts beside every item set need 26 turns, which the default cap of 27 allows ([paired-facts.md](paired-facts.md), "Why `max_active` is 3").
 
 **The item texts are sealed** (mobile-app spec §1a.1 G7 note, D
 2026-10-18): pulses work on this repo, and a pulse that could study its
@@ -176,7 +176,11 @@ instructions or memory, only what the CLI needs to log in.
 - **What the copy leaves out:** `secrets/`, `record/`, `sessions/`,
   `coordinator/`, `logs/`, `pulse-null.toml` and its backups, the pidfile, the
   isolation marker, lock files, `.env*`, `*.pem`, `*.key`, and the embedded
-  graph store `memory/graph/surreal/`.
+  graph store `memory/graph/surreal/`. Excluding `sessions/` hides the
+  planting WAL (`sessions/wal/owner.jsonl`) until that session is archived;
+  `archives/` is shared read-only. A 1-day paired hit is therefore present
+  in the graph snapshot, the copied files, or an archive, not in the WAL
+  the plant was written to.
 - **What the copy rewrites:** recall-echo's config (capture off, pipeline
   sync off, background extraction off, its socket inside the scratch, its
   graph pointed at the run's copy); the CLI's project hooks (only
@@ -341,7 +345,7 @@ but the run's rows.
 - The probe builds the system prompt fresh from the copy; the live daemon
   uses the prompt it built at boot.
 - No channel context buffer, no session history, no `pulse-null.toml` in the
-  working copy.
+  working copy. The planting WAL is not in the copy until it is archived.
 - Only port 443 and the throwaway graph port are reachable: a tool call
   that needs anything else (ssh to a forge, a local service) fails.
 - The graph is a snapshot taken at run start, in memory; a turn's writes to
@@ -357,7 +361,7 @@ but the run's rows.
 - **Quiet window** `[probe] quiet_start`–`quiet_end` (default 02:00–06:00,
   may wrap midnight). Every run, scheduled or by hand, must start inside it.
 - **Budget:** `[probe] weekly_turns` (default 81: three `max` runs of up to 27) model turns per Monday-to-
-  Sunday week, `max_turns_per_run` (default 27: every item set, 15, and
+  Sunday week, `max_turns_per_run` (default 27: every item set, 14, and
   three due paired facts of four asks, 12). A run that would exceed
   either is refused before it starts.
 - **One run at a time** per pulse (`record/probes/run.lock`), and one on
@@ -521,7 +525,9 @@ The one rule set every measure page refers to:
 - **What each measure decides** (and nothing else): known-answer, whether the
   facts reach the prompt (its fail branch); situation-use v1, nothing (no
   success criterion; its input-only arm is a ceiling check); paired facts,
-  "Remembers" (planted above chance and above made-up). Each page states its
+  "Remembers" (the run-mean paired differences above zero: planted unhedged
+  above the forced guess, and planted hits above the twin's made-up rate).
+  Each page states its
   thresholds against this rule set.
 
 ## A broken record
@@ -543,9 +549,14 @@ shown.
 budget, the measured cost per complete run (mean turns and tokens), each
 record file's chain state, and each measure by lineage group, block and
 arm: k of n with a 95% interval (clustered by run for the item sets, with
-Student's t on runs − 1 degrees of freedom and never narrower than Wilson;
-Wilson for paired facts, one answer per fact and ask) once the block has closed, or "not
-enough yet · k of N" below the set's pre-registered minimum (G5). There is
+Student's t on runs − 1 degrees of freedom and never narrower than a Wilson
+interval on how many runs were all-correct, the run count printed beside
+it; for paired facts, a t interval on the run means of the paired
+differences, decided only when it lies above zero, and Wilson on the twin's
+wrong answers) once the block has closed, or "not
+enough yet · k of N" below the set's pre-registered minimum (G5). Planted
+rows that say where the answer came from break lookup out of the count.
+There is
 no composite score (G9).
 
 ## Cost

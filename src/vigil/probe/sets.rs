@@ -285,13 +285,33 @@ impl LoadedSet {
         self.draw_scorable(run_id, |_| true)
     }
 
-    /// Model turns asking `drawn` items of this set spends.
+    /// Whether `arm` asks `item`. The input-only arm is handed the facts
+    /// template, which is rendered before the turn. The served model is
+    /// known only from that turn's stream, so the ceiling does not ask for
+    /// it: it covers the facts the template states.
     #[must_use]
-    pub fn turns_for(&self, drawn: usize) -> u32 {
-        let arms = u32::try_from(self.set.arms.len()).unwrap_or(u32::MAX);
+    pub fn asks(&self, arm: Arm, item: &Item) -> bool {
+        !(arm == Arm::InputOnly && item.truth == TruthKey::ServedModel)
+    }
+
+    /// Model turns asking `drawn` items. An input-only arm skips the served
+    /// model, so a per-item set spends one fewer turn for each such item.
+    #[must_use]
+    pub fn turns_for(&self, drawn: &[&Item]) -> u32 {
+        let arms = self.set.arms.len();
         match self.set.delivery {
-            Delivery::Batched => arms,
-            Delivery::PerItem => arms.saturating_mul(u32::try_from(drawn).unwrap_or(u32::MAX)),
+            Delivery::Batched => u32::try_from(arms).unwrap_or(u32::MAX),
+            Delivery::PerItem => {
+                let mut turns = arms.saturating_mul(drawn.len());
+                if self.set.arms.contains(&Arm::InputOnly) {
+                    let skipped = drawn
+                        .iter()
+                        .filter(|item| !self.asks(Arm::InputOnly, item))
+                        .count();
+                    turns = turns.saturating_sub(skipped);
+                }
+                u32::try_from(turns).unwrap_or(u32::MAX)
+            }
         }
     }
 
@@ -304,9 +324,16 @@ impl LoadedSet {
     /// The one batched prompt that asks every item at once.
     #[must_use]
     pub fn batched_prompt(&self) -> String {
+        let items: Vec<&Item> = self.set.items.iter().collect();
+        self.prompt_for(&items)
+    }
+
+    /// A batched prompt for `items`, numbered from 1 in this order.
+    #[must_use]
+    pub fn prompt_for(&self, items: &[&Item]) -> String {
         let mut prompt = self.set.instructions.trim().to_string();
         prompt.push_str("\n\n");
-        for (index, item) in self.set.items.iter().enumerate() {
+        for (index, item) in items.iter().enumerate() {
             prompt.push_str(&format!("{}. {}\n", index + 1, item.question));
         }
         prompt
@@ -396,12 +423,19 @@ mod tests {
         let situation = &sets[1];
         assert_eq!(situation.label(), "situation-use/v1");
         assert_eq!(situation.set.delivery, Delivery::PerItem);
+        let drawn = situation.draw("r");
         assert_eq!(
-            situation.turns_for(situation.draw("r").len()),
-            12,
-            "four families × three arms"
+            situation.turns_for(&drawn),
+            11,
+            "four families × three arms, minus the served model on input-only"
         );
-        assert_eq!(sets[0].turns_for(sets[0].draw("r").len()), 3);
+        assert_eq!(sets[0].turns_for(&sets[0].draw("r")), 3);
+        assert!(drawn.iter().any(|item| item.truth == TruthKey::ServedModel));
+        assert!(drawn.iter().all(|item| situation.asks(Arm::Pulse, item)));
+        assert!(drawn
+            .iter()
+            .filter(|item| item.truth == TruthKey::ServedModel)
+            .all(|item| !situation.asks(Arm::InputOnly, item)));
         let drawn = situation.draw("3fa2b1c4d5e6");
         let families: Vec<&str> = drawn.iter().filter_map(|i| i.family.as_deref()).collect();
         assert_eq!(families, ["tomorrow", "gap", "restart", "model"]);

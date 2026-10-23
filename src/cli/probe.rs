@@ -30,8 +30,8 @@ use crate::vigil::probe::scratch::{
 };
 use crate::vigil::probe::sealed::{self, InstalledSets, Registry, SealError};
 use crate::vigil::probe::summary::{
-    minimum_n, summarize, ArmResult, ChainState, CostPerRun, GroupKey, RunLine, WeekSpend,
-    NOT_GROUPED,
+    minimum_n, summarize, ArmResult, ChainState, CostPerRun, GroupKey, PairedGap, RunLine,
+    WeekSpend, NOT_GROUPED,
 };
 use crate::vigil::probe::verify::{self, Check, LiveTargets};
 
@@ -528,7 +528,8 @@ fn status_report(
     report.line(format!("    chain    {}", chains_line(&summary.chains)));
     for (key, arms) in &summary.groups {
         let interrupted = summary.interrupted.contains(key);
-        for line in group_lines(key, arms, interrupted, now) {
+        let decisions = summary.decisions.get(key).map(Vec::as_slice).unwrap_or(&[]);
+        for line in group_lines(key, arms, decisions, interrupted, now) {
             report.line(line);
         }
     }
@@ -614,10 +615,12 @@ struct BlockState {
     readable: bool,
 }
 
-/// One results group: its lineage line, then a line per arm.
+/// One results group: its lineage line, then a line per arm, then the
+/// paired differences the decision actually uses.
 fn group_lines(
     key: &GroupKey,
     arms: &[ArmResult],
+    decisions: &[PairedGap],
     interrupted: bool,
     now: chrono::DateTime<chrono::Utc>,
 ) -> Vec<String> {
@@ -628,6 +631,14 @@ fn group_lines(
     };
     let mut lines = vec![format!("    {lineage}")];
     lines.extend(arms.iter().map(|arm| arm_line(&key.set, arm, block)));
+    if block.readable && !block.interrupted {
+        lines.extend(
+            decisions
+                .iter()
+                .filter(|gap| gap_shown(gap, arms))
+                .map(gap_line),
+        );
+    }
     lines
 }
 
@@ -687,12 +698,25 @@ fn arm_reading(arm: &ArmResult, block: BlockState) -> String {
     } else if !block.readable {
         format!("{} answers so far (read when the block closes)", p.n)
     } else if arm.enough() && arm.arm.starts_with("twin") {
-        format!("made up {} of {} it was never told", arm.wrong, p.n)
+        let made = crate::vigil::probe::score::wilson(arm.wrong, p.n);
+        format!(
+            "made up {} of {} it was never told · {:.0}% ({:.0}–{:.0})",
+            arm.wrong,
+            p.n,
+            100.0 * f64::from(arm.wrong) / f64::from(p.n.max(1)),
+            100.0 * made.low,
+            100.0 * made.high
+        )
     } else if arm.enough() && arm.arm.starts_with("guess") {
         chance_rate(arm)
     } else if arm.enough() {
+        let runs = if arm.runs > 0 && !paired_side(&arm.arm) {
+            format!(" · {} runs", arm.runs)
+        } else {
+            String::new()
+        };
         format!(
-            "{} of {} · {:.0}% ({:.0}–{:.0})",
+            "{} of {} · {:.0}% ({:.0}–{:.0}){runs}",
             p.k,
             p.n,
             100.0 * f64::from(p.k) / f64::from(p.n.max(1)),
@@ -736,6 +760,9 @@ fn arm_notes(arm: &ArmResult, readable: bool) -> String {
     if let Some(u) = arm.unhedged.filter(|_| shown) {
         notes.push_str(&format!(" · unhedged {} of {}", u.k, u.n));
     }
+    if shown && arm.from_known && arm.arm.starts_with("planted") {
+        notes.push_str(&format!(" · lookup {} of {}", arm.lookup, arm.proportion.n));
+    }
     if let Some(c) = arm.constant_answer {
         notes.push_str(&format!(
             " · RESTARTED/SAME: a constant answer gets {} of {}",
@@ -743,6 +770,39 @@ fn arm_notes(arm: &ArmResult, readable: bool) -> String {
         ));
     }
     notes
+}
+
+fn paired_side(arm: &str) -> bool {
+    ["planted", "twin", "chance", "guess"]
+        .iter()
+        .any(|side| arm.starts_with(side))
+}
+
+/// A paired difference is shown once its planted arm has enough answers.
+fn gap_shown(gap: &PairedGap, arms: &[ArmResult]) -> bool {
+    let planted = format!("planted {}d", gap.offset_days);
+    arms.iter().any(|arm| arm.arm == planted && arm.enough())
+}
+
+fn gap_line(gap: &PairedGap) -> String {
+    let decision = if gap.exploratory {
+        "exploratory, not a decision"
+    } else if gap.above_zero() {
+        "above zero"
+    } else if gap.runs < 2 {
+        "one run, not a decision"
+    } else {
+        "not above zero"
+    };
+    format!(
+        "      {:<11} {:<27} {:+.0}% ({:+.0}–{:+.0}) over {} runs · {decision}",
+        format!("vs {}", gap.against),
+        format!("{}d paired difference", gap.offset_days),
+        100.0 * gap.mean,
+        100.0 * gap.low,
+        100.0 * gap.high,
+        gap.runs
+    )
 }
 
 fn asked_after((low, high): (i64, i64)) -> String {
@@ -1911,6 +1971,9 @@ mod tests {
             wrong: 0,
             elapsed_days: None,
             exploratory: false,
+            runs: 3,
+            lookup: 0,
+            from_known: false,
         }
     }
 
@@ -1951,6 +2014,7 @@ mod tests {
         let lines = group_lines(
             &key(Block::Facts { batch: 1 }),
             &[arm("pulse", 7, 10), arm("input-only", 10, 10)],
+            &[],
             false,
             now,
         );
@@ -1959,7 +2023,7 @@ mod tests {
         assert_eq!(
             lines[1],
             format!(
-                "      {:<11} {:<27} 7 of 10 · 70% (25–75)",
+                "      {:<11} {:<27} 7 of 10 · 70% (25–75) · 3 runs",
                 "pulse", "gave the fact when asked"
             )
         );
@@ -1973,7 +2037,10 @@ mod tests {
             readable: true,
         };
         let pulse = arm("pulse", 7, 10);
-        assert_eq!(arm_reading(&pulse, readable), "7 of 10 · 70% (25–75)");
+        assert_eq!(
+            arm_reading(&pulse, readable),
+            "7 of 10 · 70% (25–75) · 3 runs"
+        );
         assert_eq!(
             arm_reading(
                 &pulse,
@@ -1996,9 +2063,15 @@ mod tests {
         );
         let mut twin = arm("twin-7d", 0, 10);
         twin.wrong = 3;
+        let made = crate::vigil::probe::score::wilson(3, 10);
         assert_eq!(
             arm_reading(&twin, readable),
-            "made up 3 of 10 it was never told"
+            format!(
+                "made up 3 of 10 it was never told · {:.0}% ({:.0}–{:.0})",
+                30.0,
+                100.0 * made.low,
+                100.0 * made.high
+            )
         );
         let few = arm("planted-7d", 2, 4);
         assert_eq!(arm_reading(&few, readable), "not enough yet · 4 of 10");
@@ -2049,6 +2122,10 @@ mod tests {
         let mut planted = arm("planted 7d", 8, 10);
         planted.unhedged = Some(proportion(6, 10));
         assert!(arm_notes(&planted, true).contains(" · unhedged 6 of 10"));
+        planted.from_known = true;
+        planted.lookup = 2;
+        assert!(arm_notes(&planted, true).contains(" · lookup 2 of 10"));
+        assert!(!arm_notes(&arm("pulse", 7, 10), true).contains("lookup"));
     }
 
     #[test]

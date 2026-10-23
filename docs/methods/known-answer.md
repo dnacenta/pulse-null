@@ -54,7 +54,10 @@ and `UNKNOWN` rather than a guess. Tools are not forbidden; every tool call
 is kept in the receipt and an item whose turn reads a held-out store is void.
 Arms: `pulse`, `input-only` (gets the facts block, so it should score near
 100%: a ceiling check of the scorer and of the facts, never a baseline),
-`fresh` (labelled reference).
+`fresh` (labelled reference). The facts template is rendered before the
+turn and does not state the served model, which is known only from that
+turn's stream. The input-only arm is not asked `served-model`. The ceiling,
+and the 95% guess below, are the other ten items the template does state.
 
 ## Scoring (rule only, no judge)
 
@@ -89,19 +92,20 @@ Read under the runner's decision rules ([probe-runner.md](probe-runner.md),
 "Decision points"): one uninterrupted, closed 4-week block of one lineage
 group. Per arm: k correct of n counted, with a 95% interval clustered by run (the cluster-robust standard error of
 the pooled proportion over runs, scaled by Student's t with runs − 1 degrees of freedom, and never
-narrower than the Wilson interval on the same k of n: the answers of one run share a turn and
+narrower than a Wilson interval on how many of the runs were all-correct: the answers of one run share a turn and
 are not independent, a few runs say little about their spread, and runs that all agree are not
-certainty; with a single run the interval is all of 0–100%).
+certainty — agreement is not Wilson on the items). The run count is printed beside the interval. With a single run the interval is all of 0–100%.
 **Minimum n = 30** counted answers (about three runs) before a proportion is
 shown; below it: "not enough yet · k of 30" (G5).
 
 ## Fail branch
 
-- `input-only` below 95% in a read block: the scorer or the facts template
-  is wrong. Fix it as a new set version; never re-score old rows. The 95%
-  is an INITIAL GUESS, set before any data; it is re-set from the
-  baseline's input-only rate (as a new set version) once the first blocks
-  have closed.
+- `input-only` below 95% in a read block, on the ten items the facts
+  template states: the scorer or the facts template is wrong. Fix it as a
+  new set version; never re-score old rows. The 95% is an INITIAL GUESS on
+  those ten items, set before any data; it is re-set from the baseline's
+  input-only rate (as a new set version) once the first blocks have closed.
+  `served-model` is not part of that ceiling.
 - In the first read block after Phase 1, `pulse` below 90%: the situation
   block's rendering is missing or wrong (Concept v2 Phase 1 exit), an
   integration bug, not a property of the pulse.
