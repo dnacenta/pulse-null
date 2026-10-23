@@ -342,9 +342,12 @@ impl CliAdapter for Claude {
         })
     }
 
-    /// Only the `consume` hook survives, pointed at the scratch copy.
-    fn scratch_project(&self, item_root: &Path, recall_bin: &str) -> Vec<BootstrapItem> {
-        claude_hooks::scratch_settings(item_root, recall_bin)
+    /// Project hooks do not survive into the scratch. `consume` would print
+    /// the session summary a second time (the prompt already carries it),
+    /// and `checkpoint` and `archive-session` would write the probe into
+    /// the archive.
+    fn scratch_project(&self, item_root: &Path, _recall_bin: &str) -> Vec<BootstrapItem> {
+        claude_hooks::scratch_settings(item_root)
     }
 
     fn vendor_home(&self, home: &Path) -> Option<PathBuf> {

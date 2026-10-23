@@ -189,9 +189,10 @@ instructions or memory, only what the CLI needs to log in.
   the plant was written to.
 - **What the copy rewrites:** recall-echo's config (capture off, pipeline
   sync off, background extraction off, its socket inside the scratch, its
-  graph pointed at the run's copy); the CLI's project hooks (only
-  recall-echo's `consume` stays, pointed at the copy; `checkpoint` and
-  `archive-session` go); absolute links into the live home.
+  graph pointed at the run's copy); the CLI's project hooks (all of them
+  go: `consume` would print the session summary a second time, and
+  `checkpoint` and `archive-session` would write the probe into the
+  archive); absolute links into the live home.
 - **Vendor state.** Claude Code: `CLAUDE_CONFIG_DIR` in the scratch, holding
   the user's settings without hooks, user rules and instructions, and the
   pulse's auto-memory re-keyed to the copy; login comes from the unit's

@@ -16,7 +16,7 @@
 //! with its secrets, the embedded graph). Each working copy then gets the
 //! rewrites that keep the probe's own writes inside it: recall-echo capture,
 //! sync and background extraction off, its socket and graph inside the
-//! scratch, and the CLI's project hooks reduced to `consume`. The Landlock
+//! scratch, and the CLI's project hooks removed. The Landlock
 //! sandbox built here makes the item the only place the child can write,
 //! and the item and the read fence ([`super::fence`]) the only places it can
 //! read.
@@ -1153,8 +1153,8 @@ pub(crate) mod tests {
         let settings = std::fs::read_to_string(root.join(".claude/settings.json")).unwrap();
         assert!(!settings.contains("archive-session"), "{settings}");
         assert!(!settings.contains("checkpoint"), "{settings}");
+        assert!(!settings.contains("consume"), "{settings}");
         assert!(!settings.contains(&fixture.root().display().to_string()));
-        assert!(settings.contains("consume"));
 
         let link = std::fs::read_link(root.join("journal-link")).unwrap();
         assert_eq!(
