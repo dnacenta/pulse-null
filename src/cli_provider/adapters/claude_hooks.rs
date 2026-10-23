@@ -7,6 +7,7 @@
 
 use std::path::{Path, PathBuf};
 
+use crate::cli_provider::adapter::{ReportedUserHook, UserHookScan};
 use crate::init::agent_bootstrap::{
     ensure_config, ensure_dir, find_recall_echo_bin, read_small_file, shell_quote,
     write_regular_file, BootstrapItem, ItemKind, ItemStatus,
@@ -16,21 +17,48 @@ use crate::init::agent_bootstrap::{
 /// Claude Code's hooks, so CLIs that inline the rules directory skip it.
 pub(super) const RECALL_ECHO_RULES_FILE: &str = "recall-echo.md";
 
+/// First line of the rules file this module generates. A file that still
+/// starts with it is ours to refresh; anything else was edited by hand.
+const RULES_HEADER: &str = "# recall-echo — Memory Protocol";
+
+#[cfg(test)]
+thread_local! {
+    static HOME_OVERRIDE: std::cell::RefCell<Option<PathBuf>> = const { std::cell::RefCell::new(None) };
+}
+
 fn home_dir() -> Option<PathBuf> {
+    #[cfg(test)]
+    {
+        if let Some(path) = HOME_OVERRIDE.with(|slot| slot.borrow().clone()) {
+            return Some(path);
+        }
+    }
     std::env::var_os("HOME").map(PathBuf::from)
 }
 
-/// The three recall-echo hook subcommands, in the event order Claude Code
-/// fires them. `consume` takes the root positionally; the other two take
-/// `--pulse-root` — matching what `recall-echo init` itself writes. Hooks
-/// written before PN-115 spell it `--pulse-root` (recall-echo ≥ 4.6.0 reads
-/// both); `ensure` rewrites them to the canonical form like any other stale
-/// recall-echo hook.
-const RECALL_HOOKS: [(&str, &str); 3] = [
-    ("SessionStart", "consume"),
+#[cfg(test)]
+fn set_home_override(path: Option<PathBuf>) {
+    HOME_OVERRIDE.with(|slot| *slot.borrow_mut() = path);
+}
+
+/// The recall-echo hooks a pulse installs, in the event order Claude Code
+/// fires them. Both take `--pulse-root` — matching what `recall-echo init`
+/// itself writes. Hooks written before PN-115 spell it `--entity-root`
+/// (recall-echo ≥ 4.6.0 reads both); `ensure` rewrites them to the canonical
+/// form like any other stale recall-echo hook.
+///
+/// SessionStart `consume` is not one of them. The runtime loads
+/// EPHEMERAL.md into the chat prompt, so a SessionStart hook delivered it a
+/// second time, and into task and intent runs that leave it out on purpose.
+const RECALL_HOOKS: [(&str, &str); 2] = [
     ("PreCompact", "checkpoint"),
     ("SessionEnd", "archive-session"),
 ];
+
+/// Hooks earlier pulses installed and that repair now removes. `merge_hooks`
+/// only rewrites the subcommands in [`RECALL_HOOKS`], so without this list a
+/// retired `consume` hook would stay in settings.json.
+const RETIRED_RECALL_HOOKS: [(&str, &str); 1] = [("SessionStart", "consume")];
 
 /// The canonical hook command for one subcommand.
 fn hook_command(recall_bin: &str, sub: &str, root: &Path) -> String {
@@ -47,56 +75,97 @@ fn hook_command(recall_bin: &str, sub: &str, root: &Path) -> String {
 fn render_hooks(recall_bin: &str, root: &Path) -> serde_json::Value {
     let mut hooks = serde_json::Map::new();
     for (event, sub) in RECALL_HOOKS {
-        let mut entry = serde_json::Map::new();
-        if event == "SessionStart" {
-            entry.insert("matcher".into(), "startup|resume".into());
-        }
-        entry.insert(
-            "hooks".into(),
-            serde_json::json!([{
+        let entry = serde_json::json!({
+            "hooks": [{
                 "type": "command",
                 "command": hook_command(recall_bin, sub, root)
-            }]),
-        );
-        hooks.insert(event.into(), serde_json::Value::Array(vec![entry.into()]));
+            }]
+        });
+        hooks.insert(event.into(), serde_json::Value::Array(vec![entry]));
     }
     serde_json::Value::Object(hooks)
 }
 
-/// The first two shell words of a hook command, honouring single quotes
-/// (the only quoting `hook_command` emits). Enough to recognise our own
-/// output whatever the binary path contains; not a general shell parser.
-fn first_two_words(command: &str) -> Option<(String, String)> {
+struct ShellWord {
+    text: String,
+    /// The word was single-quoted, so it is a literal even when its text
+    /// looks like a redirect or an operator.
+    quoted: bool,
+}
+
+/// Shell words of a hook command, honouring single quotes (the only quoting
+/// `hook_command` emits). An unquoted `#` starts a comment and ends the
+/// scan. Outside quotes a backslash escapes the next character — this is
+/// how `shell_quote` spells a literal quote (`'\''`). Not a general shell
+/// parser.
+fn shell_words(command: &str) -> Vec<ShellWord> {
     let mut words = Vec::new();
     let mut cur = String::new();
     let mut in_quote = false;
+    let mut quoted = false;
     let mut chars = command.chars();
     while let Some(c) = chars.next() {
         match c {
-            '\'' => in_quote = !in_quote,
-            // Outside quotes a backslash escapes the next character — this is
-            // how `shell_quote` spells a literal quote (`'\''`).
+            '\'' => {
+                in_quote = !in_quote;
+                quoted = true;
+            }
             '\\' if !in_quote => {
                 if let Some(next) = chars.next() {
                     cur.push(next);
                 }
             }
             c if c.is_whitespace() && !in_quote => {
-                if !cur.is_empty() {
-                    words.push(std::mem::take(&mut cur));
-                    if words.len() == 2 {
-                        break;
-                    }
+                if !cur.is_empty() || quoted {
+                    words.push(ShellWord {
+                        text: std::mem::take(&mut cur),
+                        quoted,
+                    });
+                    quoted = false;
                 }
             }
+            '#' if !in_quote && cur.is_empty() && !quoted => break,
             c => cur.push(c),
         }
     }
-    if !cur.is_empty() && words.len() < 2 {
-        words.push(cur);
+    if !cur.is_empty() || quoted {
+        words.push(ShellWord { text: cur, quoted });
     }
-    let mut it = words.into_iter();
-    Some((it.next()?, it.next()?))
+    words
+}
+
+/// The first two shell words of a hook command. Enough to recognise our own
+/// output whatever the binary path contains.
+fn first_two_words(command: &str) -> Option<(String, String)> {
+    let words = shell_words(command);
+    Some((words.first()?.text.clone(), words.get(1)?.text.clone()))
+}
+
+/// An unquoted word that is a shell operator or a redirect, not a path.
+fn is_operator_or_redirect(word: &str) -> bool {
+    matches!(
+        word,
+        "|" | "||" | "&" | "&&" | ";" | ";;" | "|&" | "(" | ")"
+    ) || is_redirect(word)
+}
+
+/// `>`, `2>`, `2>&1`, `&>`, and the same forms with a target glued on.
+fn is_redirect(word: &str) -> bool {
+    if word.is_empty() {
+        return false;
+    }
+    if word.starts_with("&>") {
+        return true;
+    }
+    let rest = word.trim_start_matches(|c: char| c.is_ascii_digit());
+    rest.starts_with('>') || rest.starts_with('<')
+}
+
+fn is_root_flag(word: &str) -> bool {
+    word == "--pulse-root"
+        || word == "--entity-root"
+        || word.starts_with("--pulse-root=")
+        || word.starts_with("--entity-root=")
 }
 
 /// Is this command a recall-echo `sub` invocation? Anchored: the *first*
@@ -111,6 +180,119 @@ fn is_recall_command(command: &str, sub: &str) -> bool {
             && first_arg == sub
     })
 }
+
+/// Whether a hook command runs recall-echo `consume`. Report-only: quotes
+/// are stripped and operators are word breaks, so a `recall-echo` program
+/// word (any path) followed later by the word `consume` counts. False
+/// positives are cheap. Rewrites still use [`is_recall_command`].
+fn command_runs_consume(command: &str) -> bool {
+    let stripped: String = command
+        .chars()
+        .filter(|c| *c != '\'' && *c != '"')
+        .collect();
+    let mut seen_recall = false;
+    for word in stripped
+        .split(|c: char| c.is_whitespace() || matches!(c, '|' | '&' | ';' | '<' | '>' | '(' | ')'))
+    {
+        if word.is_empty() {
+            continue;
+        }
+        if seen_recall && word == "consume" {
+            return true;
+        }
+        if Path::new(word)
+            .file_name()
+            .is_some_and(|name| name == "recall-echo")
+        {
+            seen_recall = true;
+        }
+    }
+    false
+}
+
+/// Hook commands under `hooks`, including a flat `{type, command}` object
+/// directly under an event and the nested `{hooks: [{command}]}` shape.
+fn each_hook_command(doc: &serde_json::Value) -> Vec<&str> {
+    let mut commands = Vec::new();
+    let Some(events) = doc.get("hooks").and_then(|value| value.as_object()) else {
+        return commands;
+    };
+    for entries in events.values() {
+        for entry in entries.as_array().into_iter().flatten() {
+            if let Some(command) = entry.get("command").and_then(|value| value.as_str()) {
+                commands.push(command);
+            }
+            for hook in entry
+                .get("hooks")
+                .and_then(|value| value.as_array())
+                .into_iter()
+                .flatten()
+            {
+                if let Some(command) = hook.get("command").and_then(|value| value.as_str()) {
+                    commands.push(command);
+                }
+            }
+        }
+    }
+    commands
+}
+
+/// A `consume` hook [`merge_hooks`] will not delete. A nested command the
+/// precise parser recognises is stripped, so it is stale rather than left
+/// in place. Flat `{type, command}` objects and every other spelling stay.
+fn consume_left_in_place(doc: &serde_json::Value) -> bool {
+    let Some(events) = doc.get("hooks").and_then(|value| value.as_object()) else {
+        return false;
+    };
+    for entries in events.values() {
+        for entry in entries.as_array().into_iter().flatten() {
+            if let Some(command) = entry.get("command").and_then(|value| value.as_str()) {
+                if command_runs_consume(command) {
+                    return true;
+                }
+            }
+            for hook in entry
+                .get("hooks")
+                .and_then(|value| value.as_array())
+                .into_iter()
+                .flatten()
+            {
+                if let Some(command) = hook.get("command").and_then(|value| value.as_str()) {
+                    if command_runs_consume(command) && !is_recall_command(command, "consume") {
+                        return true;
+                    }
+                }
+            }
+        }
+    }
+    false
+}
+
+/// `sh -c` / `bash -c` whose script is itself a recall-echo `consume`.
+/// Reported, never deleted: a wrapper is a hand-written command.
+fn is_wrapped_consume(command: &str) -> bool {
+    let words = shell_words(command);
+    let (Some(bin), Some(flag), Some(script)) = (words.first(), words.get(1), words.get(2)) else {
+        return false;
+    };
+    if flag.quoted || flag.text != "-c" {
+        return false;
+    }
+    let name = Path::new(&bin.text).file_name().and_then(|n| n.to_str());
+    if !matches!(name, Some("sh" | "bash")) {
+        return false;
+    }
+    is_recall_command(&script.text, "consume")
+}
+
+fn has_wrapped_consume(existing: &serde_json::Value) -> bool {
+    each_hook_command(existing)
+        .into_iter()
+        .any(is_wrapped_consume)
+}
+
+const WRAPPED_CONSUME_REASON: &str =
+    "retired consume still runs inside an sh -c or bash -c wrapper; left in place";
 
 /// Drop recall-echo `sub` hooks from one event entry, keeping every other
 /// hook in it. `None` when nothing is left worth keeping.
@@ -136,53 +318,103 @@ fn strip_recall_hooks(mut entry: serde_json::Value, sub: &str) -> Option<serde_j
 
 /// Merge our hooks into an existing settings document: every other key and
 /// every foreign hook survives; each recall-echo hook appears exactly once,
-/// in its canonical form.
+/// in its canonical form. Retired hooks are stripped. An event left with no
+/// hooks is removed, and a `hooks` object this function created that ends
+/// up empty is removed too — a `hooks` key the user already had is kept.
 fn merge_hooks(mut existing: serde_json::Value, ours: &serde_json::Value) -> serde_json::Value {
     if !existing.is_object() {
         existing = serde_json::json!({});
     }
     let root = existing.as_object_mut().expect("object");
-    let hooks_value = root.entry("hooks").or_insert_with(|| serde_json::json!({}));
-    if !hooks_value.is_object() {
-        *hooks_value = serde_json::json!({});
-    }
-    let hooks = hooks_value.as_object_mut().expect("object");
-
-    for (event, sub) in RECALL_HOOKS {
-        let mut entries: Vec<serde_json::Value> = hooks
-            .get(event)
-            .and_then(|v| v.as_array())
-            .cloned()
-            .unwrap_or_default()
-            .into_iter()
-            .filter_map(|entry| strip_recall_hooks(entry, sub))
-            .collect();
-        if let Some(canonical) = ours[event].as_array().and_then(|a| a.first()) {
-            entries.push(canonical.clone());
+    let created_hooks = !root.contains_key("hooks");
+    let hooks_empty = {
+        let hooks_value = root.entry("hooks").or_insert_with(|| serde_json::json!({}));
+        if !hooks_value.is_object() {
+            *hooks_value = serde_json::json!({});
         }
-        hooks.insert(event.to_string(), serde_json::Value::Array(entries));
+        let hooks = hooks_value.as_object_mut().expect("object");
+
+        for (event, sub) in RETIRED_RECALL_HOOKS {
+            let Some(raw) = hooks.get(event).and_then(|v| v.as_array()).cloned() else {
+                continue;
+            };
+            let kept: Vec<serde_json::Value> = raw
+                .into_iter()
+                .filter_map(|entry| strip_recall_hooks(entry, sub))
+                .collect();
+            if kept.is_empty() {
+                hooks.remove(event);
+            } else {
+                hooks.insert(event.to_string(), serde_json::Value::Array(kept));
+            }
+        }
+
+        for (event, sub) in RECALL_HOOKS {
+            let mut entries: Vec<serde_json::Value> = hooks
+                .get(event)
+                .and_then(|v| v.as_array())
+                .cloned()
+                .unwrap_or_default()
+                .into_iter()
+                .filter_map(|entry| strip_recall_hooks(entry, sub))
+                .collect();
+            if let Some(canonical) = ours[event].as_array().and_then(|a| a.first()) {
+                entries.push(canonical.clone());
+            }
+            hooks.insert(event.to_string(), serde_json::Value::Array(entries));
+        }
+        hooks.is_empty()
+    };
+    if created_hooks && hooks_empty {
+        root.remove("hooks");
     }
     existing
 }
 
 /// Does `existing` already carry our hooks — each event with exactly one
-/// recall-echo hook for its subcommand, in canonical form? Order among an
-/// event's entries does not matter; only `merge_hooks` normalises it.
+/// recall-echo hook for its subcommand, in canonical form — and no retired
+/// recall hook? Order among an event's entries does not matter; only
+/// `merge_hooks` normalises it.
 fn has_canonical_hooks(existing: &serde_json::Value, ours: &serde_json::Value) -> bool {
-    RECALL_HOOKS.iter().all(|(event, sub)| {
+    let installed = RECALL_HOOKS.iter().all(|(event, sub)| {
         let Some(canonical) = ours[event][0]["hooks"][0]["command"].as_str() else {
             return false;
         };
-        let commands: Vec<&str> = existing["hooks"][event]
-            .as_array()
-            .into_iter()
-            .flatten()
-            .flat_map(|entry| entry["hooks"].as_array().into_iter().flatten())
-            .filter_map(|h| h["command"].as_str())
-            .filter(|c| is_recall_command(c, sub))
-            .collect();
-        commands == [canonical]
-    })
+        recall_commands(existing, event, sub) == [canonical]
+    });
+    let retired_absent = RETIRED_RECALL_HOOKS
+        .iter()
+        .all(|(event, sub)| recall_commands(existing, event, sub).is_empty())
+        && !has_wrapped_consume(existing)
+        && !consume_left_in_place(existing);
+    installed && retired_absent
+}
+
+/// recall-echo `sub` commands under one event.
+fn recall_commands<'a>(existing: &'a serde_json::Value, event: &str, sub: &str) -> Vec<&'a str> {
+    existing["hooks"][event]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .flat_map(|entry| entry["hooks"].as_array().into_iter().flatten())
+        .filter_map(|h| h["command"].as_str())
+        .filter(|c| is_recall_command(c, sub))
+        .collect()
+}
+
+/// A parsed settings document we must not rewrite. Invalid JSON is rejected
+/// by the caller; a value that parses but is not an object would otherwise
+/// be replaced and its other keys discarded.
+fn settings_shape_error(value: &serde_json::Value) -> Option<String> {
+    if !value.is_object() {
+        return Some("settings.json root is not a JSON object".into());
+    }
+    if let Some(hooks) = value.get("hooks") {
+        if !hooks.is_object() {
+            return Some("hooks is not a JSON object".into());
+        }
+    }
+    None
 }
 
 /// Bring `.claude/settings.json` up to date without clobbering anything else
@@ -201,9 +433,23 @@ fn ensure_settings(path: &Path, ours: &serde_json::Value, within: &Path) -> Boot
         Ok(None) => None,
         Err(e) => return item(ItemStatus::Skipped(e)),
     };
+    if let Some(value) = &existing {
+        if let Some(reason) = settings_shape_error(value) {
+            return item(ItemStatus::Skipped(reason));
+        }
+    }
     let was_present = existing.is_some();
+    let wrapped = existing.as_ref().is_some_and(has_wrapped_consume);
     let merged = merge_hooks(existing.clone().unwrap_or(serde_json::json!({})), ours);
     if existing.as_ref() == Some(&merged) {
+        if wrapped {
+            return item(ItemStatus::Skipped(WRAPPED_CONSUME_REASON.into()));
+        }
+        if consume_left_in_place(&merged) {
+            return item(ItemStatus::Skipped(
+                "retired consume still runs; left in place".into(),
+            ));
+        }
         return item(ItemStatus::Exists);
     }
     let rendered = match serde_json::to_string_pretty(&merged) {
@@ -211,6 +457,12 @@ fn ensure_settings(path: &Path, ours: &serde_json::Value, within: &Path) -> Boot
         Err(e) => return item(ItemStatus::Skipped(format!("could not serialise: {e}"))),
     };
     match write_regular_file(path, &rendered, within) {
+        Ok(()) if was_present && has_wrapped_consume(&merged) => item(
+            ItemStatus::UpdatedWithWarning(WRAPPED_CONSUME_REASON.into()),
+        ),
+        Ok(()) if was_present && consume_left_in_place(&merged) => item(
+            ItemStatus::UpdatedWithWarning("retired consume still runs; left in place".into()),
+        ),
         Ok(()) if was_present => item(ItemStatus::Updated),
         Ok(()) => item(ItemStatus::Created),
         Err(e) => item(ItemStatus::Skipped(e)),
@@ -221,6 +473,73 @@ fn ensure_settings(path: &Path, ours: &serde_json::Value, within: &Path) -> Boot
 /// pulse root, which is the cwd Claude Code runs in for this pulse.
 fn render_rules_md() -> &'static str {
     r#"# recall-echo — Memory Protocol
+
+You have a persistent four-layer memory system. Use it to maintain continuity across sessions.
+All paths below are relative to your pulse directory, which is the working directory you run in.
+
+## Memory Layers
+
+### Layer 0 — Knowledge Graph (structured, semantic)
+- Embedded SurrealDB graph database with FastEmbed local embeddings.
+- Stores pulses, relationships, and conversation episodes.
+- Bayesian confidence scoring on relationships — corroborated knowledge gains confidence over time.
+- Semantic search finds memories by meaning, not just keywords.
+- Queried via `recall-echo graph search`, `graph query`, or `graph traverse`.
+
+### Layer 1 — Curated Memory (memory/MEMORY.md)
+- Your source of truth. Distilled facts, preferences, patterns, key decisions.
+- Loaded into your system prompt at startup.
+- Keep under 200 lines. Only write confirmed, stable information.
+- Before adding, check if an existing entry should be updated. No duplicates.
+
+### Layer 2 — Recent Sessions (memory/EPHEMERAL.md)
+- Rolling window of your last 5 session summaries.
+- Loaded into your chat system prompt by pulse-null; not in scheduled task runs; written by the runtime at session end; do not edit.
+- Each entry has a pointer to the full archive.
+
+### Layer 3 — Full Archive (archives/conversations/)
+- Index: `memory/ARCHIVE.md`
+- Full conversations: `archives/conversations/conversation-NNN.md`
+- NOT loaded into context. Search on demand using Grep.
+- To search: `Grep pattern="search term" path="archives/conversations/"`
+
+## Session Lifecycle
+
+### During the session:
+- Update memory/MEMORY.md when you learn stable facts.
+- When the user references past work, search the archive first.
+- Do NOT update MEMORY.md with speculative or session-specific info.
+
+### On PreCompact (context about to be compressed):
+The PreCompact hook runs `recall-echo checkpoint --trigger precompact`, which writes the full conversation automatically. There is nothing to write by hand.
+
+### On session end:
+The SessionEnd hook runs `recall-echo archive-session` and archives this conversation automatically.
+
+## Commands
+
+- `recall-echo init` — Initialize or upgrade the memory system
+- `recall-echo checkpoint --trigger precompact` — Write the conversation before context compression (PreCompact hook)
+- `recall-echo archive-session` — Archive the conversation from its transcript (SessionEnd hook)
+- `recall-echo search <query>` — Search conversation archives
+- `recall-echo search <query> --ranked` — Ranked search with relevance scoring
+- `recall-echo graph search <query>` — Semantic search across graph entities
+- `recall-echo graph query <query>` — Hybrid search (semantic + graph expansion + episodes)
+- `recall-echo graph traverse <pulse>` — Graph traversal with confidence display
+
+## Rules
+
+- Never write duplicates to MEMORY.md. Check first, update if exists.
+- When MEMORY.md approaches 200 lines, distill it.
+- Archive conversations are immutable. Never modify them.
+- When the user says "we discussed this before" — search archives before saying you don't remember.
+"#
+}
+
+/// The rules file this module wrote before the 4.x lifecycle rewrite.
+/// Repair refreshes a file only when it is still this text, or the
+/// current template. Anything else was edited by hand.
+const OLD_GENERATED_RULES: &str = r#"# recall-echo — Memory Protocol
 
 You have a persistent four-layer memory system. Use it to maintain continuity across sessions.
 All paths below are relative to your pulse directory, which is the working directory you run in.
@@ -291,7 +610,59 @@ current conversation.
 - When MEMORY.md approaches 200 lines, distill it.
 - Archive conversations are immutable. Never modify them.
 - When the user says "we discussed this before" — search archives before saying you don't remember.
-"#
+"#;
+
+/// The first line equals `header` exactly. A `\n` or `\r\n` may follow it.
+/// One trailing `\r` on that line is ignored; anything else on the line is
+/// not the header.
+fn first_line_is_header(text: &str, header: &str) -> bool {
+    let mut line = text.split('\n').next().unwrap_or("");
+    if let Some(stripped) = line.strip_suffix('\r') {
+        line = stripped;
+    }
+    line == header
+}
+
+/// A generated file we may replace: one leading BOM stripped, the first
+/// line exactly `header`, and the body (CRLF normalised) equal to the
+/// current template or [`OLD_GENERATED_RULES`].
+fn is_known_generated(text: &str, content: &str, header: &str) -> bool {
+    let stripped = text.strip_prefix('\u{FEFF}').unwrap_or(text);
+    if !first_line_is_header(stripped, header) {
+        return false;
+    }
+    let normalized = stripped.replace("\r\n", "\n");
+    normalized == content || normalized == OLD_GENERATED_RULES
+}
+
+/// Write a generated file. Refresh it only when it is still the current
+/// template or the known previous one, allowing one leading BOM and CRLF
+/// line endings. Every other file is hand-edited: leave it byte-for-byte
+/// and report why.
+fn ensure_generated(path: &Path, content: &str, header: &str, within: &Path) -> BootstrapItem {
+    let item = |status| BootstrapItem {
+        path: path.to_path_buf(),
+        kind: ItemKind::ConfigFile,
+        status,
+    };
+    let existing = match read_small_file(path) {
+        Ok(text) => text,
+        Err(e) => return item(ItemStatus::Skipped(e)),
+    };
+    match existing {
+        None => match write_regular_file(path, content, within) {
+            Ok(()) => item(ItemStatus::Created),
+            Err(e) => item(ItemStatus::Skipped(e)),
+        },
+        Some(text) if text == content => item(ItemStatus::Exists),
+        Some(text) if is_known_generated(&text, content, header) => {
+            match write_regular_file(path, content, within) {
+                Ok(()) => item(ItemStatus::Updated),
+                Err(e) => item(ItemStatus::Skipped(e)),
+            }
+        }
+        Some(_) => item(ItemStatus::Skipped("hand-edited; left as is".into())),
+    }
 }
 
 /// Create all Claude Code integration files for one pulse.
@@ -337,9 +708,10 @@ pub(super) fn ensure_files(pulse_root: &Path, recall_bin: &str) -> Vec<Bootstrap
             &pulse_root,
         ));
         if rules_ok {
-            items.push(ensure_config(
+            items.push(ensure_generated(
                 &claude_dir.join("rules").join(RECALL_ECHO_RULES_FILE),
                 render_rules_md(),
+                RULES_HEADER,
                 &pulse_root,
             ));
         }
@@ -357,13 +729,17 @@ pub(super) fn verify_files(pulse_root: &Path) -> Vec<BootstrapItem> {
     let recall_bin = find_recall_echo_bin();
     let mut items = Vec::new();
 
-    // settings.json: present and carrying all three canonical hooks.
+    // settings.json: present, carrying the canonical hooks, and no retired one.
     let settings = claude_dir.join("settings.json");
     let status = match read_small_file(&settings) {
         Ok(Some(text)) => match serde_json::from_str::<serde_json::Value>(&text) {
             Ok(existing) => {
                 let ours = render_hooks(&recall_bin, &pulse_root);
-                if has_canonical_hooks(&existing, &ours) {
+                if has_wrapped_consume(&existing) {
+                    ItemStatus::Wrong(WRAPPED_CONSUME_REASON.into())
+                } else if consume_left_in_place(&existing) {
+                    ItemStatus::Wrong("retired consume still runs; left in place".into())
+                } else if has_canonical_hooks(&existing, &ours) {
                     ItemStatus::Exists
                 } else {
                     ItemStatus::Wrong("recall-echo hooks missing or stale".into())
@@ -381,14 +757,16 @@ pub(super) fn verify_files(pulse_root: &Path) -> Vec<BootstrapItem> {
     });
 
     let rules = claude_dir.join("rules").join(RECALL_ECHO_RULES_FILE);
+    let rules_status = match read_small_file(&rules) {
+        Ok(Some(text)) if text == render_rules_md() => ItemStatus::Exists,
+        Ok(Some(_)) => ItemStatus::Wrong("differs from the current template".into()),
+        Ok(None) => ItemStatus::Missing,
+        Err(e) => ItemStatus::Wrong(e),
+    };
     items.push(BootstrapItem {
-        status: if rules.exists() {
-            ItemStatus::Exists
-        } else {
-            ItemStatus::Missing
-        },
         path: rules,
         kind: ItemKind::ConfigFile,
+        status: rules_status,
     });
 
     if let Some(home) = home_dir() {
@@ -400,6 +778,28 @@ pub(super) fn verify_files(pulse_root: &Path) -> Vec<BootstrapItem> {
                     "legacy user-level link into this pulse — run 'pulse-null repair'".into(),
                 ),
             });
+        }
+        // User-level consume prints one pulse's EPHEMERAL.md into every
+        // Claude Code session. The file stays untouched. A file that cannot
+        // be inspected is not clean either: verify names the file and why.
+        match user_hooks_missing_root(&home) {
+            UserHookScan::NotInspected { path, reason } => {
+                items.push(BootstrapItem {
+                    path,
+                    kind: ItemKind::ConfigFile,
+                    status: ItemStatus::Wrong(format!("not inspected: {reason}")),
+                });
+            }
+            UserHookScan::Inspected(hooks) if hooks.iter().any(|hook| hook.consume) => {
+                items.push(BootstrapItem {
+                    path: home.join(".claude/settings.json"),
+                    kind: ItemKind::ConfigFile,
+                    status: ItemStatus::Wrong(
+                        "user-level consume still runs in every session; the path picks which file is printed but does not limit which sessions the hook runs in. recall-echo init writes `<recall-bin> consume '<pulse-root>'` — remove that hook by hand".into(),
+                    ),
+                });
+            }
+            UserHookScan::Inspected(_) => {}
         }
     }
 
@@ -435,48 +835,118 @@ pub(super) fn legacy_home_links(pulse_root: &Path, home: &Path) -> Vec<PathBuf> 
         .collect()
 }
 
-/// recall-echo hook commands in the *user-level* `$HOME/.claude/settings.json`
-/// that carry no pulse root. Under one pulse per user they worked by
-/// accident of cwd; with several they fire for every pulse and resolve to
-/// the wrong one. Reported for the operator to remove — never edited here.
-pub(super) fn user_hooks_missing_root(home: &Path) -> Vec<String> {
-    let path = home.join(".claude/settings.json");
-    let Ok(Some(text)) = read_small_file(&path) else {
-        return Vec::new();
+/// Whether `command` names a pulse root. The repair message uses this to
+/// choose its wording; a rooted `consume` is still reported.
+///
+/// `consume` takes the root as the next positional word. A comment (`#`),
+/// a redirect (`>`, `2>`, `2>&1`, `&>`), or a shell operator in that
+/// position is not a root. Other subcommands carry a root only when
+/// `--pulse-root` or `--entity-root` is its own word, not a substring.
+fn command_carries_root(command: &str) -> bool {
+    let words = shell_words(command);
+    let Some(bin) = words.first() else {
+        return false;
     };
-    let Ok(doc) = serde_json::from_str::<serde_json::Value>(&text) else {
-        return Vec::new();
+    let Some(sub) = words.get(1) else {
+        return false;
     };
-    let mut found = Vec::new();
-    if let Some(events) = doc["hooks"].as_object() {
-        for entries in events.values() {
-            for entry in entries.as_array().into_iter().flatten() {
-                for hook in entry["hooks"].as_array().into_iter().flatten() {
-                    let Some(command) = hook["command"].as_str() else {
-                        continue;
-                    };
-                    let ours = RECALL_HOOKS
-                        .iter()
-                        .any(|(_, sub)| is_recall_command(command, sub));
-                    if !ours {
-                        continue;
-                    }
-                    let carries_root = command.contains("--pulse-root")
-                        || command.contains("--entity-root")
-                        || (is_recall_command(command, "consume")
-                            && command
-                                .split_whitespace()
-                                .skip_while(|w| *w != "consume")
-                                .nth(1)
-                                .is_some_and(|arg| !arg.starts_with(['|', '&', ';', '>', '<'])));
-                    if !carries_root {
-                        found.push(command.to_string());
-                    }
-                }
+    let recall = Path::new(&bin.text)
+        .file_name()
+        .is_some_and(|name| name == "recall-echo");
+    if !recall {
+        return false;
+    }
+    if sub.text == "consume" {
+        if let Some(next) = words.get(2) {
+            if next.quoted || !is_operator_or_redirect(&next.text) {
+                return true;
             }
         }
     }
-    found
+    words
+        .iter()
+        .any(|word| !word.quoted && is_root_flag(&word.text))
+}
+
+/// Read the user-level settings file. A symlink is followed only when its
+/// target canonicalises to a path under `home`; the target is then opened
+/// without following a further link. The file is never written.
+fn read_user_level_settings(home: &Path) -> Result<Option<String>, String> {
+    let path = home.join(".claude/settings.json");
+    let meta = match path.symlink_metadata() {
+        Ok(meta) => meta,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e.to_string()),
+    };
+    if !meta.file_type().is_symlink() {
+        return read_small_file(&path);
+    }
+    let link = std::fs::read_link(&path).map_err(|e| e.to_string())?;
+    let joined = if link.is_absolute() {
+        link
+    } else {
+        path.parent().unwrap_or(home).join(link)
+    };
+    let target = joined
+        .canonicalize()
+        .map_err(|e| format!("symlink target could not be resolved: {e}"))?;
+    let home_real = home
+        .canonicalize()
+        .map_err(|e| format!("home directory: {e}"))?;
+    if !target.starts_with(&home_real) {
+        return Err("symlink target is outside the home directory".into());
+    }
+    read_small_file(&target)
+}
+
+/// recall-echo hook commands in the user-level `$HOME/.claude/settings.json`
+/// that repair reports and does not edit.
+///
+/// Every `consume` hook is reported, with or without a positional root.
+/// `recall-echo init` writes `<recall-bin> consume '<pulse-root>'` there.
+/// The path chooses which `memory/EPHEMERAL.md` is printed; Claude Code
+/// runs user-level hooks in every session, so the path does not limit
+/// which sessions the hook runs in. Other recall-echo hooks are reported
+/// only when they name no pulse root. A file that is present but cannot
+/// be read or parsed is [`UserHookScan::NotInspected`], not an empty list.
+pub(super) fn user_hooks_missing_root(home: &Path) -> UserHookScan {
+    let path = home.join(".claude/settings.json");
+    let text = match read_user_level_settings(home) {
+        Ok(None) => return UserHookScan::Inspected(Vec::new()),
+        Ok(Some(text)) => text,
+        Err(reason) => {
+            return UserHookScan::NotInspected { path, reason };
+        }
+    };
+    let doc = match serde_json::from_str::<serde_json::Value>(&text) {
+        Ok(doc) => doc,
+        Err(e) => {
+            return UserHookScan::NotInspected {
+                path,
+                reason: format!("not valid JSON: {e}"),
+            };
+        }
+    };
+    let mut found = Vec::new();
+    for command in each_hook_command(&doc) {
+        let consume = command_runs_consume(command);
+        let ours = consume
+            || RECALL_HOOKS
+                .iter()
+                .any(|(_, sub)| is_recall_command(command, sub));
+        if !ours {
+            continue;
+        }
+        let carries_root = command_carries_root(command);
+        if consume || !carries_root {
+            found.push(ReportedUserHook {
+                command: command.to_string(),
+                carries_root,
+                consume,
+            });
+        }
+    }
+    UserHookScan::Inspected(found)
 }
 
 #[cfg(test)]
@@ -532,14 +1002,13 @@ mod tests {
 
         let doc = read_settings(&root);
         let quoted = shell_quote(&root);
-        assert_eq!(commands(&doc, "SessionStart").len(), 1);
-        assert!(commands(&doc, "SessionStart")[0].ends_with(&format!("consume {quoted}")));
+        assert!(doc["hooks"].get("SessionStart").is_none(), "{doc}");
+        assert!(!doc.to_string().contains("consume"), "{doc}");
         assert!(commands(&doc, "PreCompact")[0].ends_with(&format!(
             "checkpoint --trigger precompact --pulse-root {quoted}"
         )));
         assert!(commands(&doc, "SessionEnd")[0]
             .ends_with(&format!("archive-session --pulse-root {quoted}")));
-        assert_eq!(doc["hooks"]["SessionStart"][0]["matcher"], "startup|resume");
 
         assert!(root.join(".claude/rules/recall-echo.md").exists());
         assert!(root.join("memory/.recall-echo.toml").exists());
@@ -605,7 +1074,7 @@ mod tests {
         let pre = commands(&doc, "PreCompact");
         assert_eq!(pre.len(), 1);
         assert!(pre[0].contains("--pulse-root"));
-        assert_eq!(commands(&doc, "SessionStart").len(), 1);
+        assert!(doc["hooks"].get("SessionStart").is_none(), "{doc}");
     }
 
     /// PN-115: hooks written by a pre-rename binary carry `--entity-root`.
@@ -722,8 +1191,37 @@ mod tests {
         );
     }
 
+    fn inspected(home: &Path) -> Vec<ReportedUserHook> {
+        match user_hooks_missing_root(home) {
+            UserHookScan::Inspected(hooks) => hooks,
+            UserHookScan::NotInspected { path, reason } => {
+                panic!("{} was not inspected: {reason}", path.display())
+            }
+        }
+    }
+
+    fn reported_commands(home: &Path) -> Vec<String> {
+        let mut found: Vec<String> = inspected(home)
+            .into_iter()
+            .map(|hook| hook.command)
+            .collect();
+        found.sort();
+        found
+    }
+
+    struct HomeOverride;
+    impl Drop for HomeOverride {
+        fn drop(&mut self) {
+            set_home_override(None);
+        }
+    }
+    fn override_home(path: &Path) -> HomeOverride {
+        set_home_override(Some(path.to_path_buf()));
+        HomeOverride
+    }
+
     #[test]
-    fn user_hooks_without_root_are_reported_not_edited() {
+    fn every_consume_hook_is_reported_and_other_hooks_only_when_rootless() {
         let home = tempfile::tempdir().unwrap();
         let claude = home.path().join(".claude");
         std::fs::create_dir_all(&claude).unwrap();
@@ -739,18 +1237,97 @@ mod tests {
         .to_string();
         std::fs::write(claude.join("settings.json"), &original).unwrap();
 
-        let mut found = user_hooks_missing_root(home.path());
-        found.sort();
+        let found = inspected(home.path());
         assert_eq!(
-            found,
+            reported_commands(home.path()),
             vec![
                 "/usr/local/bin/recall-echo archive-session || true".to_string(),
                 "/usr/local/bin/recall-echo checkpoint --trigger precompact".to_string(),
+                "/usr/local/bin/recall-echo consume '/srv/e'".to_string(),
             ]
         );
+        let consume = found
+            .iter()
+            .find(|hook| hook.command.contains("consume"))
+            .unwrap();
+        assert!(consume.consume && consume.carries_root, "{consume:?}");
+        assert!(found
+            .iter()
+            .filter(|hook| !hook.consume)
+            .all(|hook| !hook.carries_root));
         assert_eq!(
             std::fs::read_to_string(claude.join("settings.json")).unwrap(),
             original
+        );
+    }
+
+    /// `recall-echo init` writes this SessionStart command into the user-level
+    /// settings file: an unquoted binary, `consume`, and the pulse root in
+    /// single quotes. The root picks the file that is printed. It does not
+    /// limit which sessions the hook runs in, and the file is not edited.
+    #[test]
+    fn user_level_recall_echo_init_consume_is_reported_and_verify_is_not_clean() {
+        let home = tempfile::tempdir().unwrap();
+        let claude = home.path().join(".claude");
+        std::fs::create_dir_all(&claude).unwrap();
+        let command = "/usr/local/bin/recall-echo consume '/srv/pulse-a'";
+        let original = serde_json::json!({
+            "hooks": {
+                "SessionStart": [{
+                    "matcher": "startup|resume",
+                    "hooks": [{"type": "command", "command": command}]
+                }],
+                "SessionEnd": [{"hooks": [{"type": "command", "command": "/usr/local/bin/recall-echo archive-session --pulse-root '/srv/pulse-a'"}]}],
+                "PreCompact": [{"hooks": [{"type": "command", "command": "/usr/local/bin/recall-echo checkpoint --trigger precompact --pulse-root '/srv/pulse-a'"}]}]
+            }
+        })
+        .to_string();
+        std::fs::write(claude.join("settings.json"), &original).unwrap();
+
+        let found = inspected(home.path());
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert_eq!(found[0].command, command);
+        assert!(found[0].consume && found[0].carries_root, "{found:?}");
+        assert_eq!(
+            std::fs::read_to_string(claude.join("settings.json")).unwrap(),
+            original
+        );
+
+        let dir = pulse();
+        let root = dir.path().canonicalize().unwrap();
+        ensure_files(&root, "recall-echo");
+        let _home = override_home(home.path());
+        let items = verify_files(&root);
+        let user = items
+            .iter()
+            .find(|item| item.path == home.path().join(".claude/settings.json"))
+            .expect("user-level settings are part of verify");
+        match &user.status {
+            ItemStatus::Wrong(reason) => {
+                assert!(
+                    reason.contains(
+                        "the path picks which file is printed but does not limit which sessions the hook runs in"
+                    ),
+                    "{reason}"
+                );
+                assert!(
+                    reason
+                        .contains("recall-echo init writes `<recall-bin> consume '<pulse-root>'`"),
+                    "{reason}"
+                );
+            }
+            other => panic!("verify reported clean for a user-level consume hook: {other:?}"),
+        }
+        assert!(
+            items
+                .iter()
+                .any(|item| !matches!(item.status, ItemStatus::Exists)),
+            "verify reported clean: {items:?}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(claude.join("settings.json")).unwrap(),
+            original,
+            "verify must not edit the user-level file"
         );
     }
 
@@ -836,6 +1413,347 @@ mod tests {
             "sh -c 'recall-echo consume /e'",
             "consume"
         ));
+        assert!(is_wrapped_consume("sh -c 'recall-echo consume /e'"));
+        assert!(is_wrapped_consume("bash -c 'recall-echo consume /e'"));
+        assert!(is_wrapped_consume("/bin/sh -c 'recall-echo consume /e'"));
+        assert!(is_wrapped_consume(
+            "/usr/bin/bash -c 'recall-echo consume /e || true'"
+        ));
+        assert!(!is_wrapped_consume("sh -c 'echo hi'"));
+        assert!(!is_wrapped_consume("sh -lc 'recall-echo consume /e'"));
+        assert!(!is_wrapped_consume("sh -c 'echo recall-echo consume'"));
+    }
+
+    #[test]
+    fn wrapped_consume_is_flagged_not_deleted() {
+        let dir = pulse();
+        let root = dir.path().canonicalize().unwrap();
+        let bin = "recall-echo";
+        let path = root.join(".claude/settings.json");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+
+        for command in [
+            "sh -c 'recall-echo consume /e'",
+            "bash -c 'recall-echo consume /e'",
+            "/bin/sh -c 'recall-echo consume /e'",
+        ] {
+            let mut hooks = render_hooks(bin, &root);
+            hooks["SessionStart"] = serde_json::json!([{
+                "hooks": [{"type": "command", "command": command}]
+            }]);
+            let original = serde_json::to_string_pretty(&serde_json::json!({ "hooks": hooks }))
+                .unwrap()
+                + "\n";
+            std::fs::write(&path, &original).unwrap();
+
+            let before = verify_files(&root)
+                .into_iter()
+                .find(|item| item.path == path)
+                .unwrap();
+            assert!(
+                matches!(before.status, ItemStatus::Wrong(ref reason) if reason == WRAPPED_CONSUME_REASON),
+                "{command}: {before:?}"
+            );
+
+            let items = ensure_files(&root, bin);
+            let settings = items.iter().find(|item| item.path == path).unwrap();
+            assert!(
+                matches!(settings.status, ItemStatus::Skipped(ref reason) if reason == WRAPPED_CONSUME_REASON),
+                "{command}: {settings:?}"
+            );
+            assert_eq!(
+                std::fs::read_to_string(&path).unwrap(),
+                original,
+                "{command} was edited"
+            );
+        }
+
+        // A wrapper that is not consume does not make a canonical file unhealthy.
+        let mut hooks = render_hooks(bin, &root);
+        hooks["Stop"] = serde_json::json!([{
+            "hooks": [{"type": "command", "command": "sh -c 'echo hi'"}]
+        }]);
+        let original =
+            serde_json::to_string_pretty(&serde_json::json!({ "hooks": hooks })).unwrap() + "\n";
+        std::fs::write(&path, &original).unwrap();
+        let healthy = verify_files(&root)
+            .into_iter()
+            .find(|item| item.path == path)
+            .unwrap();
+        assert_eq!(healthy.status, ItemStatus::Exists, "{healthy:?}");
+        let again = ensure_files(&root, bin);
+        let settings = again.iter().find(|item| item.path == path).unwrap();
+        assert_eq!(settings.status, ItemStatus::Exists, "{settings:?}");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
+    }
+
+    #[test]
+    fn wrapper_warning_survives_a_precompact_rewrite() {
+        let dir = pulse();
+        let root = dir.path().canonicalize().unwrap();
+        let bin = find_recall_echo_bin();
+        let path = root.join(".claude/settings.json");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let wrapper = "sh -c 'recall-echo consume /e'";
+        let mut hooks = render_hooks(&bin, &root);
+        hooks["SessionStart"] = serde_json::json!([{
+            "hooks": [{"type": "command", "command": wrapper}]
+        }]);
+        hooks["PreCompact"] = serde_json::json!([{
+            "hooks": [{"type": "command", "command": "recall-echo checkpoint --trigger precompact"}]
+        }]);
+        std::fs::write(
+            &path,
+            serde_json::to_string_pretty(&serde_json::json!({ "hooks": hooks })).unwrap() + "\n",
+        )
+        .unwrap();
+
+        let item = ensure_settings(&path, &render_hooks(&bin, &root), &root);
+        match &item.status {
+            ItemStatus::UpdatedWithWarning(reason) => assert_eq!(reason, WRAPPED_CONSUME_REASON),
+            other => panic!("expected an update that keeps the warning, got {other:?}"),
+        }
+        let rendered = item.to_string();
+        assert!(rendered.contains(WRAPPED_CONSUME_REASON), "{rendered}");
+        let doc = read_settings(&root);
+        assert!(
+            each_hook_command(&doc).contains(&wrapper),
+            "wrapper was deleted: {doc}"
+        );
+        let quoted = shell_quote(&root);
+        assert!(commands(&doc, "PreCompact")[0].ends_with(&format!(
+            "checkpoint --trigger precompact --pulse-root {quoted}"
+        )));
+
+        // A glued consume stays, and the status still names it, when another
+        // hook is rewritten.
+        let glued = "recall-echo consume||true";
+        let mut hooks = render_hooks(&bin, &root);
+        hooks["SessionStart"] = serde_json::json!([{
+            "hooks": [{"type": "command", "command": glued}]
+        }]);
+        hooks["PreCompact"] = serde_json::json!([{
+            "hooks": [{"type": "command", "command": "recall-echo checkpoint --trigger precompact"}]
+        }]);
+        std::fs::write(
+            &path,
+            serde_json::to_string_pretty(&serde_json::json!({ "hooks": hooks })).unwrap() + "\n",
+        )
+        .unwrap();
+        let item = ensure_settings(&path, &render_hooks(&bin, &root), &root);
+        match &item.status {
+            ItemStatus::UpdatedWithWarning(reason) => {
+                assert_eq!(reason, "retired consume still runs; left in place")
+            }
+            other => panic!("expected an update that keeps the warning, got {other:?}"),
+        }
+        let doc = read_settings(&root);
+        assert!(
+            each_hook_command(&doc).contains(&glued),
+            "glued consume was deleted: {doc}"
+        );
+        assert!(commands(&doc, "PreCompact")[0].contains("--pulse-root"));
+    }
+
+    /// Spellings the precise shell parser does not treat as `consume`, but
+    /// that still run it. Report-only: neither file is rewritten to delete
+    /// them.
+    fn consume_spellings() -> &'static [&'static str] {
+        &[
+            "recall-echo consume||true",
+            "recall-echo consume;true",
+            "recall-echo consume&>/dev/null",
+            "env recall-echo consume '/e'",
+            "exec recall-echo consume '/e'",
+            "FOO=1 recall-echo consume '/e'",
+            "sh -lc 'recall-echo consume /e'",
+            "dash -c 'recall-echo consume /e'",
+            "sh -c \"recall-echo consume /e\"",
+        ]
+    }
+
+    #[test]
+    fn consume_spellings_are_reported_in_the_user_level_file() {
+        let home = tempfile::tempdir().unwrap();
+        let claude = home.path().join(".claude");
+        std::fs::create_dir_all(&claude).unwrap();
+        let path = claude.join("settings.json");
+        for command in consume_spellings() {
+            assert!(command_runs_consume(command), "{command}");
+            assert!(
+                !is_recall_command(command, "consume"),
+                "{command} is safe to delete"
+            );
+            let original = serde_json::json!({
+                "hooks": {
+                    "SessionStart": [{"hooks": [{"type": "command", "command": command}]}]
+                }
+            })
+            .to_string();
+            std::fs::write(&path, &original).unwrap();
+            let found = inspected(home.path());
+            assert!(
+                found
+                    .iter()
+                    .any(|hook| hook.command == *command && hook.consume),
+                "{command}: {found:?}"
+            );
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
+        }
+    }
+
+    #[test]
+    fn consume_spellings_are_reported_in_pulse_settings() {
+        let dir = pulse();
+        let root = dir.path().canonicalize().unwrap();
+        let bin = find_recall_echo_bin();
+        let path = root.join(".claude/settings.json");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        for command in consume_spellings() {
+            let mut hooks = render_hooks(&bin, &root);
+            hooks["SessionStart"] = serde_json::json!([{
+                "hooks": [{"type": "command", "command": command}]
+            }]);
+            let original = serde_json::to_string_pretty(&serde_json::json!({ "hooks": hooks }))
+                .unwrap()
+                + "\n";
+            std::fs::write(&path, &original).unwrap();
+
+            let before = verify_files(&root)
+                .into_iter()
+                .find(|item| item.path == path)
+                .unwrap();
+            match &before.status {
+                ItemStatus::Wrong(reason) => assert!(
+                    reason.contains("retired consume still runs"),
+                    "{command}: {reason}"
+                ),
+                other => panic!("{command}: verify looked clean: {other:?}"),
+            }
+
+            let item = ensure_settings(&path, &render_hooks(&bin, &root), &root);
+            assert!(
+                !matches!(item.status, ItemStatus::Exists),
+                "{command}: ensure called it clean: {:?}",
+                item.status
+            );
+            assert_eq!(
+                std::fs::read_to_string(&path).unwrap(),
+                original,
+                "{command} was rewritten"
+            );
+        }
+    }
+
+    #[test]
+    fn flat_hook_object_consume_is_reported_in_both_files() {
+        let command = "recall-echo consume '/e'";
+        let home = tempfile::tempdir().unwrap();
+        let claude = home.path().join(".claude");
+        std::fs::create_dir_all(&claude).unwrap();
+        let user_path = claude.join("settings.json");
+        let user_original = serde_json::json!({
+            "hooks": {
+                "SessionStart": [{"type": "command", "command": command}]
+            }
+        })
+        .to_string();
+        std::fs::write(&user_path, &user_original).unwrap();
+        let found = inspected(home.path());
+        assert!(
+            found
+                .iter()
+                .any(|hook| hook.command == command && hook.consume),
+            "{found:?}"
+        );
+        assert_eq!(std::fs::read_to_string(&user_path).unwrap(), user_original);
+
+        let dir = pulse();
+        let root = dir.path().canonicalize().unwrap();
+        let bin = find_recall_echo_bin();
+        let path = root.join(".claude/settings.json");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let mut hooks = render_hooks(&bin, &root);
+        hooks["SessionStart"] = serde_json::json!([{
+            "type": "command",
+            "command": command
+        }]);
+        let original =
+            serde_json::to_string_pretty(&serde_json::json!({ "hooks": hooks })).unwrap() + "\n";
+        std::fs::write(&path, &original).unwrap();
+        let before = verify_files(&root)
+            .into_iter()
+            .find(|item| item.path == path)
+            .unwrap();
+        match &before.status {
+            ItemStatus::Wrong(reason) => {
+                assert!(reason.contains("retired consume still runs"), "{reason}")
+            }
+            other => panic!("verify looked clean: {other:?}"),
+        }
+        let item = ensure_settings(&path, &render_hooks(&bin, &root), &root);
+        assert!(
+            !matches!(item.status, ItemStatus::Exists),
+            "ensure called a flat consume clean: {:?}",
+            item.status
+        );
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
+    }
+
+    #[test]
+    fn consume_lookalikes_stay_unreported() {
+        let lookalikes = [
+            "echo recall-echo-consume-notes",
+            "/usr/bin/other consume /e",
+        ];
+        for command in lookalikes {
+            assert!(!command_runs_consume(command), "{command}");
+        }
+
+        let home = tempfile::tempdir().unwrap();
+        let claude = home.path().join(".claude");
+        std::fs::create_dir_all(&claude).unwrap();
+        let user_path = claude.join("settings.json");
+        let user_original = serde_json::json!({
+            "hooks": {
+                "SessionStart": [{"hooks": [
+                    {"type": "command", "command": lookalikes[0]},
+                    {"type": "command", "command": lookalikes[1]}
+                ]}]
+            }
+        })
+        .to_string();
+        std::fs::write(&user_path, &user_original).unwrap();
+        assert!(
+            inspected(home.path()).is_empty(),
+            "{:?}",
+            inspected(home.path())
+        );
+        assert_eq!(std::fs::read_to_string(&user_path).unwrap(), user_original);
+
+        let dir = pulse();
+        let root = dir.path().canonicalize().unwrap();
+        let bin = find_recall_echo_bin();
+        let path = root.join(".claude/settings.json");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let mut hooks = render_hooks(&bin, &root);
+        hooks["Stop"] = serde_json::json!([{
+            "hooks": [
+                {"type": "command", "command": lookalikes[0]},
+                {"type": "command", "command": lookalikes[1]}
+            ]
+        }]);
+        let original =
+            serde_json::to_string_pretty(&serde_json::json!({ "hooks": hooks })).unwrap() + "\n";
+        std::fs::write(&path, &original).unwrap();
+        let before = verify_files(&root)
+            .into_iter()
+            .find(|item| item.path == path)
+            .unwrap();
+        assert_eq!(before.status, ItemStatus::Exists, "{before:?}");
+        let item = ensure_settings(&path, &render_hooks(&bin, &root), &root);
+        assert_eq!(item.status, ItemStatus::Exists, "{:?}", item.status);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
     }
 
     #[test]
@@ -915,8 +1833,647 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            user_hooks_missing_root(home.path()),
+            reported_commands(home.path()),
             vec!["recall-echo consume || true".to_string()]
         );
+        assert!(!inspected(home.path())[0].carries_root);
+    }
+
+    #[test]
+    fn redirects_comments_and_operators_are_not_a_root() {
+        let rootless = [
+            "recall-echo consume 2>/dev/null",
+            "recall-echo consume 2>&1",
+            "recall-echo consume &>/dev/null",
+            "recall-echo consume >/dev/null",
+            "recall-echo consume > /dev/null",
+            "recall-echo consume # comment",
+            "recall-echo consume # --pulse-root",
+            "recall-echo consume || true",
+            "recall-echo consume && true",
+            "recall-echo consume | cat",
+            "recall-echo consume &",
+            "recall-echo consume ; echo hi",
+            "recall-echo archive-session # --pulse-root",
+            "recall-echo checkpoint --trigger precompact # --pulse-root /e",
+            "recall-echo archive-session --not-pulse-root",
+        ];
+        for command in rootless {
+            assert!(!command_carries_root(command), "{command}");
+        }
+        let rooted = [
+            "recall-echo consume '/srv/e'",
+            "/usr/local/bin/recall-echo consume '/srv/pulse-a'",
+            "recall-echo consume /srv/e",
+            "recall-echo consume '/srv/e' || true",
+            "recall-echo consume '2>/dev/null'",
+            "recall-echo archive-session --pulse-root '/srv/e'",
+            "recall-echo archive-session --entity-root '/srv/e'",
+            "recall-echo checkpoint --trigger precompact --pulse-root=/srv/e",
+            "'/opt/my tools/recall-echo' consume '/e'",
+        ];
+        for command in rooted {
+            assert!(command_carries_root(command), "{command}");
+        }
+    }
+
+    #[test]
+    fn user_level_redirect_and_comment_consume_are_rootless() {
+        let home = tempfile::tempdir().unwrap();
+        let claude = home.path().join(".claude");
+        std::fs::create_dir_all(&claude).unwrap();
+        let original = serde_json::json!({
+            "hooks": {
+                "SessionStart": [{"hooks": [
+                    {"type": "command", "command": "recall-echo consume 2>/dev/null"},
+                    {"type": "command", "command": "recall-echo consume 2>&1"},
+                    {"type": "command", "command": "recall-echo consume &>/dev/null"},
+                    {"type": "command", "command": "recall-echo consume # --pulse-root"}
+                ]}]
+            }
+        })
+        .to_string();
+        std::fs::write(claude.join("settings.json"), &original).unwrap();
+
+        let found = inspected(home.path());
+        assert_eq!(found.len(), 4, "{found:?}");
+        assert!(
+            found.iter().all(|hook| hook.consume && !hook.carries_root),
+            "{found:?}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(claude.join("settings.json")).unwrap(),
+            original
+        );
+    }
+
+    #[test]
+    fn fresh_pulse_has_no_session_start_hook() {
+        let dir = pulse();
+        let root = dir.path().canonicalize().unwrap();
+        let items = ensure_files(&root, "recall-echo");
+        let settings = items
+            .iter()
+            .find(|i| i.path.ends_with("settings.json"))
+            .unwrap();
+        assert_eq!(settings.status, ItemStatus::Created);
+
+        let doc = read_settings(&root);
+        assert!(doc["hooks"].get("SessionStart").is_none(), "{doc}");
+        assert!(!doc.to_string().contains("consume"), "{doc}");
+        let quoted = shell_quote(&root);
+        assert!(commands(&doc, "PreCompact")[0].ends_with(&format!(
+            "checkpoint --trigger precompact --pulse-root {quoted}"
+        )));
+        assert!(commands(&doc, "SessionEnd")[0]
+            .ends_with(&format!("archive-session --pulse-root {quoted}")));
+    }
+
+    #[test]
+    fn repair_strips_consume_keeps_foreign_hook() {
+        let dir = pulse();
+        let root = dir.path().canonicalize().unwrap();
+        std::fs::create_dir_all(root.join(".claude")).unwrap();
+        std::fs::write(
+            root.join(".claude/settings.json"),
+            serde_json::json!({
+                "hooks": {
+                    "SessionStart": [{
+                        "matcher": "startup|resume",
+                        "hooks": [
+                            {"type": "command", "command": format!("recall-echo consume {}", shell_quote(&root))},
+                            {"type": "command", "command": "echo foreign"}
+                        ]
+                    }],
+                    "PreCompact": [{"hooks": [{"type": "command", "command": "recall-echo checkpoint --trigger precompact"}]}],
+                    "SessionEnd": [{"hooks": [{"type": "command", "command": "recall-echo archive-session || true"}]}]
+                }
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        let before = verify_files(&root)
+            .into_iter()
+            .find(|i| i.path.ends_with("settings.json"))
+            .unwrap();
+        assert!(
+            matches!(before.status, ItemStatus::Wrong(ref reason) if reason.contains("stale")),
+            "{before:?}"
+        );
+
+        let items = ensure_files(&root, "recall-echo");
+        let settings = items
+            .iter()
+            .find(|i| i.path.ends_with("settings.json"))
+            .unwrap();
+        assert_eq!(settings.status, ItemStatus::Updated);
+
+        let doc = read_settings(&root);
+        assert_eq!(
+            commands(&doc, "SessionStart"),
+            vec!["echo foreign".to_string()]
+        );
+        assert!(!doc.to_string().contains("consume"), "{doc}");
+        let quoted = shell_quote(&root);
+        assert!(commands(&doc, "PreCompact")[0].ends_with(&format!(
+            "checkpoint --trigger precompact --pulse-root {quoted}"
+        )));
+        assert!(commands(&doc, "SessionEnd")[0]
+            .ends_with(&format!("archive-session --pulse-root {quoted}")));
+
+        let after = verify_files(&root)
+            .into_iter()
+            .find(|i| i.path.ends_with("settings.json"))
+            .unwrap();
+        assert_eq!(after.status, ItemStatus::Exists, "{after:?}");
+    }
+
+    #[test]
+    fn verify_flags_leftover_consume() {
+        let dir = pulse();
+        let root = dir.path().canonicalize().unwrap();
+        let bin = find_recall_echo_bin();
+        let mut hooks = render_hooks(&bin, &root);
+        hooks["SessionStart"] = serde_json::json!([{
+            "matcher": "startup|resume",
+            "hooks": [{"type": "command", "command": hook_command(&bin, "consume", &root)}]
+        }]);
+        std::fs::create_dir_all(root.join(".claude")).unwrap();
+        std::fs::write(
+            root.join(".claude/settings.json"),
+            serde_json::to_string_pretty(&serde_json::json!({ "hooks": hooks })).unwrap() + "\n",
+        )
+        .unwrap();
+
+        let before = verify_files(&root)
+            .into_iter()
+            .find(|i| i.path.ends_with("settings.json"))
+            .unwrap();
+        assert!(
+            matches!(before.status, ItemStatus::Wrong(ref reason) if reason.contains("stale")),
+            "{before:?}"
+        );
+
+        let items = ensure_files(&root, &bin);
+        let settings = items
+            .iter()
+            .find(|i| i.path.ends_with("settings.json"))
+            .unwrap();
+        assert_eq!(settings.status, ItemStatus::Updated);
+        let doc = read_settings(&root);
+        assert!(doc["hooks"].get("SessionStart").is_none(), "{doc}");
+        assert!(!doc.to_string().contains("consume"), "{doc}");
+
+        let after = verify_files(&root)
+            .into_iter()
+            .find(|i| i.path.ends_with("settings.json"))
+            .unwrap();
+        assert_eq!(after.status, ItemStatus::Exists, "{after:?}");
+    }
+
+    #[test]
+    fn empty_event_removed_after_strip() {
+        let dir = pulse();
+        let root = dir.path().canonicalize().unwrap();
+        std::fs::create_dir_all(root.join(".claude")).unwrap();
+        std::fs::write(
+            root.join(".claude/settings.json"),
+            serde_json::json!({
+                "permissions": {"allow": ["Bash(ls:*)"]},
+                "hooks": {
+                    "SessionStart": [{"hooks": [
+                        {"type": "command", "command": format!("recall-echo consume {}", shell_quote(&root))}
+                    ]}]
+                }
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        let items = ensure_files(&root, "recall-echo");
+        let settings = items
+            .iter()
+            .find(|i| i.path.ends_with("settings.json"))
+            .unwrap();
+        assert_eq!(settings.status, ItemStatus::Updated);
+
+        let doc = read_settings(&root);
+        assert!(
+            doc["hooks"].get("SessionStart").is_none(),
+            "empty event removed: {doc}"
+        );
+        assert!(doc["hooks"]["PreCompact"].is_array(), "{doc}");
+        assert!(doc["hooks"]["SessionEnd"].is_array(), "{doc}");
+        assert_eq!(doc["permissions"]["allow"][0], "Bash(ls:*)");
+    }
+
+    #[test]
+    fn user_level_rootless_consume_still_reported() {
+        let home = tempfile::tempdir().unwrap();
+        let claude = home.path().join(".claude");
+        std::fs::create_dir_all(&claude).unwrap();
+        let original = serde_json::json!({
+            "hooks": {
+                "SessionStart": [{"hooks": [
+                    {"type": "command", "command": "recall-echo consume || true"}
+                ]}]
+            }
+        })
+        .to_string();
+        std::fs::write(claude.join("settings.json"), &original).unwrap();
+
+        assert_eq!(
+            reported_commands(home.path()),
+            vec!["recall-echo consume || true".to_string()]
+        );
+        assert_eq!(
+            std::fs::read_to_string(claude.join("settings.json")).unwrap(),
+            original
+        );
+    }
+
+    #[test]
+    fn ensure_twice_is_idempotent() {
+        let dir = pulse();
+        let root = dir.path();
+        let first = ensure_files(root, "recall-echo");
+        assert!(
+            first
+                .iter()
+                .any(|i| { i.path.ends_with("settings.json") && i.status == ItemStatus::Created }),
+            "{first:?}"
+        );
+        let second = ensure_files(root, "recall-echo");
+        assert!(
+            second.iter().all(|i| i.status == ItemStatus::Exists),
+            "{second:?}"
+        );
+        let doc = read_settings(root);
+        assert!(doc["hooks"].get("SessionStart").is_none(), "{doc}");
+        assert!(!doc.to_string().contains("consume"), "{doc}");
+    }
+
+    /// The rules file pulses carried before the 4.x lifecycle rewrite.
+    fn rules_item(items: &[BootstrapItem]) -> &BootstrapItem {
+        items
+            .iter()
+            .find(|i| i.path.ends_with("recall-echo.md"))
+            .expect("rules item")
+    }
+
+    #[test]
+    fn rules_template_has_no_manual_checkpoint_or_consume() {
+        let rules = render_rules_md();
+        assert!(rules.starts_with(RULES_HEADER));
+        assert!(!rules.contains("fill in"), "{rules}");
+        assert!(!rules.contains("consume"), "{rules}");
+        assert!(!rules.contains("entitys"));
+        assert!(rules.contains("graph entities"));
+        assert!(rules.contains(
+            "Loaded into your chat system prompt by pulse-null; not in scheduled task runs; written by the runtime at session end; do not edit."
+        ));
+        assert!(rules.contains("writes the full conversation automatically"));
+        assert!(rules.contains("archive-session"));
+        assert!(rules.contains("memory/MEMORY.md"));
+        assert!(rules.contains("archives/conversations/"));
+    }
+
+    #[test]
+    fn stale_generated_rules_rewritten() {
+        let dir = pulse();
+        let root = dir.path().canonicalize().unwrap();
+        let path = root.join(".claude/rules/recall-echo.md");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, OLD_GENERATED_RULES).unwrap();
+
+        let items = ensure_files(&root, "recall-echo");
+        assert_eq!(rules_item(&items).status, ItemStatus::Updated);
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(text, render_rules_md());
+        assert!(!text.contains("fill in"), "{text}");
+        assert!(!text.contains("consume"), "{text}");
+
+        let again = verify_files(&root);
+        assert_eq!(rules_item(&again).status, ItemStatus::Exists);
+    }
+
+    #[test]
+    fn hand_edited_rules_left_alone() {
+        let dir = pulse();
+        let root = dir.path().canonicalize().unwrap();
+        let path = root.join(".claude/rules/recall-echo.md");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let original = "# My own memory notes\nDo not replace this.\n";
+        std::fs::write(&path, original).unwrap();
+
+        let items = ensure_files(&root, "recall-echo");
+        assert!(
+            matches!(
+                &rules_item(&items).status,
+                ItemStatus::Skipped(reason) if reason == "hand-edited; left as is"
+            ),
+            "{items:?}"
+        );
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
+
+        let verified = verify_files(&root);
+        assert!(
+            matches!(
+                &rules_item(&verified).status,
+                ItemStatus::Wrong(reason) if reason == "differs from the current template"
+            ),
+            "{verified:?}"
+        );
+    }
+
+    #[test]
+    fn longer_rules_title_is_kept() {
+        let dir = pulse();
+        let root = dir.path().canonicalize().unwrap();
+        let path = root.join(".claude/rules/recall-echo.md");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let original = "# recall-echo — Memory Protocol (local notes)\nKeep this.\n";
+        std::fs::write(&path, original).unwrap();
+
+        let items = ensure_files(&root, "recall-echo");
+        assert!(
+            matches!(
+                &rules_item(&items).status,
+                ItemStatus::Skipped(reason) if reason == "hand-edited; left as is"
+            ),
+            "{items:?}"
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), original.as_bytes());
+    }
+
+    #[test]
+    fn exact_rules_title_with_extra_notes_is_kept() {
+        let dir = pulse();
+        let root = dir.path().canonicalize().unwrap();
+        let path = root.join(".claude/rules/recall-echo.md");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let original = "# recall-echo — Memory Protocol\n\nLocal notes that must stay.\n";
+        std::fs::write(&path, original).unwrap();
+
+        let items = ensure_files(&root, "recall-echo");
+        assert!(
+            matches!(
+                &rules_item(&items).status,
+                ItemStatus::Skipped(reason) if reason == "hand-edited; left as is"
+            ),
+            "{items:?}"
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), original.as_bytes());
+    }
+
+    #[test]
+    fn bom_stock_rules_are_refreshed() {
+        let dir = pulse();
+        let root = dir.path().canonicalize().unwrap();
+        let path = root.join(".claude/rules/recall-echo.md");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let original = format!("\u{FEFF}{OLD_GENERATED_RULES}");
+        std::fs::write(&path, &original).unwrap();
+
+        let items = ensure_files(&root, "recall-echo");
+        assert_eq!(rules_item(&items).status, ItemStatus::Updated);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), render_rules_md());
+    }
+
+    #[test]
+    fn crlf_stock_rules_are_refreshed() {
+        let dir = pulse();
+        let root = dir.path().canonicalize().unwrap();
+        let path = root.join(".claude/rules/recall-echo.md");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let original = render_rules_md().replace('\n', "\r\n");
+        std::fs::write(&path, &original).unwrap();
+
+        let items = ensure_files(&root, "recall-echo");
+        assert_eq!(rules_item(&items).status, ItemStatus::Updated);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), render_rules_md());
+    }
+
+    #[test]
+    fn verify_reports_stale_rules() {
+        let dir = pulse();
+        let root = dir.path().canonicalize().unwrap();
+        let path = root.join(".claude/rules/recall-echo.md");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, OLD_GENERATED_RULES).unwrap();
+
+        let items = verify_files(&root);
+        assert!(
+            matches!(
+                &rules_item(&items).status,
+                ItemStatus::Wrong(reason) if reason == "differs from the current template"
+            ),
+            "{items:?}"
+        );
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), OLD_GENERATED_RULES);
+    }
+
+    #[test]
+    fn no_hook_injects_ephemeral() {
+        assert!(
+            RECALL_HOOKS.iter().all(|(_, sub)| *sub != "consume"),
+            "RECALL_HOOKS installs consume: {RECALL_HOOKS:?}"
+        );
+        let dir = pulse();
+        let root = dir.path().canonicalize().unwrap();
+        ensure_files(&root, "recall-echo");
+        let doc = read_settings(&root);
+        assert!(doc["hooks"].get("SessionStart").is_none(), "{doc}");
+        let hooks = doc["hooks"].as_object().expect("hooks object");
+        for event in hooks.keys() {
+            for command in commands(&doc, event) {
+                assert!(
+                    !is_recall_command(&command, "consume"),
+                    "{event} injects EPHEMERAL via {command}"
+                );
+            }
+        }
+    }
+
+    fn assert_settings_skipped(original: &str, reason_has: &str) {
+        let dir = pulse();
+        let root = dir.path().canonicalize().unwrap();
+        let path = root.join(".claude/settings.json");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, original).unwrap();
+        let items = ensure_files(&root, "recall-echo");
+        let settings = items.iter().find(|item| item.path == path).unwrap();
+        match &settings.status {
+            ItemStatus::Skipped(reason) => {
+                assert!(reason.contains(reason_has), "{original}: {reason}")
+            }
+            other => panic!("{original}: expected Skipped, got {other:?}"),
+        }
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            original,
+            "{original} was rewritten"
+        );
+    }
+
+    #[test]
+    fn truncated_settings_are_skipped_unchanged() {
+        assert_settings_skipped("{\"hooks\":", "not valid JSON");
+    }
+
+    #[test]
+    fn array_root_is_skipped_unchanged() {
+        assert_settings_skipped("[]", "not a JSON object");
+    }
+
+    #[test]
+    fn hooks_array_is_skipped_unchanged() {
+        assert_settings_skipped(
+            "{\"hooks\":[],\"permissions\":{\"allow\":[\"Bash(ls:*)\"]}}",
+            "hooks is not a JSON object",
+        );
+    }
+
+    fn assert_user_file_not_inspected(home: &Path, reason_has: &str) {
+        let path = home.join(".claude/settings.json");
+        match user_hooks_missing_root(home) {
+            UserHookScan::NotInspected { path: got, reason } => {
+                assert_eq!(got, path);
+                assert!(reason.contains(reason_has), "{reason}");
+            }
+            other => panic!("expected not inspected, got {other:?}"),
+        }
+        let dir = pulse();
+        let root = dir.path().canonicalize().unwrap();
+        ensure_files(&root, "recall-echo");
+        let _home = override_home(home);
+        let items = verify_files(&root);
+        let user = items
+            .iter()
+            .find(|item| item.path == path)
+            .expect("verify records the user-level file");
+        let rendered = user.to_string();
+        assert!(rendered.contains(&path.display().to_string()), "{rendered}");
+        assert!(rendered.contains("not inspected"), "{rendered}");
+        assert!(rendered.contains(reason_has), "{rendered}");
+        assert!(
+            matches!(user.status, ItemStatus::Wrong(_)),
+            "verify looked clean: {user:?}"
+        );
+    }
+
+    #[test]
+    fn user_level_symlink_outside_home_is_not_inspected() {
+        let home = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let claude = home.path().join(".claude");
+        std::fs::create_dir_all(&claude).unwrap();
+        let foreign = outside.path().join("settings.json");
+        std::fs::write(
+            &foreign,
+            serde_json::json!({"hooks": {"SessionStart": [{"hooks": [
+                {"type": "command", "command": "/usr/local/bin/recall-echo consume '/srv/pulse-a'"}
+            ]}]}})
+            .to_string(),
+        )
+        .unwrap();
+        std::os::unix::fs::symlink(&foreign, claude.join("settings.json")).unwrap();
+        assert_user_file_not_inspected(home.path(), "outside the home directory");
+        assert!(std::fs::read_to_string(&foreign)
+            .unwrap()
+            .contains("consume"));
+    }
+
+    #[test]
+    fn user_level_non_regular_file_is_not_inspected() {
+        let home = tempfile::tempdir().unwrap();
+        let claude = home.path().join(".claude");
+        std::fs::create_dir_all(&claude).unwrap();
+        std::fs::create_dir(claude.join("settings.json")).unwrap();
+        assert_user_file_not_inspected(home.path(), "not a regular file");
+    }
+
+    #[test]
+    fn user_level_unreadable_settings_are_not_inspected() {
+        use std::os::unix::fs::PermissionsExt;
+        let home = tempfile::tempdir().unwrap();
+        let claude = home.path().join(".claude");
+        std::fs::create_dir_all(&claude).unwrap();
+        let path = claude.join("settings.json");
+        std::fs::write(&path, "{\"hooks\":{}}\n").unwrap();
+        let _restore = RestoreMode(path.clone());
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o0)).unwrap();
+        assert_user_file_not_inspected(home.path(), "Permission denied");
+    }
+
+    #[test]
+    fn user_level_oversize_settings_are_not_inspected() {
+        let home = tempfile::tempdir().unwrap();
+        let claude = home.path().join(".claude");
+        std::fs::create_dir_all(&claude).unwrap();
+        let path = claude.join("settings.json");
+        let file = std::fs::File::create(&path).unwrap();
+        file.set_len(1024 * 1024 + 1).unwrap();
+        assert_user_file_not_inspected(home.path(), "larger than");
+    }
+
+    #[test]
+    fn user_level_invalid_json_is_not_inspected() {
+        let home = tempfile::tempdir().unwrap();
+        let claude = home.path().join(".claude");
+        std::fs::create_dir_all(&claude).unwrap();
+        std::fs::write(claude.join("settings.json"), "{").unwrap();
+        assert_user_file_not_inspected(home.path(), "not valid JSON");
+    }
+
+    #[test]
+    fn user_level_symlink_under_home_reports_init_consume() {
+        let home = tempfile::tempdir().unwrap();
+        let claude = home.path().join(".claude");
+        std::fs::create_dir_all(&claude).unwrap();
+        let command = "/usr/local/bin/recall-echo consume '/srv/pulse-a'";
+        let original = serde_json::json!({
+            "hooks": {"SessionStart": [{
+                "matcher": "startup|resume",
+                "hooks": [{"type": "command", "command": command}]
+            }]}
+        })
+        .to_string();
+        let real = claude.join("real-settings.json");
+        std::fs::write(&real, &original).unwrap();
+        let link = claude.join("settings.json");
+        std::os::unix::fs::symlink("real-settings.json", &link).unwrap();
+
+        let found = inspected(home.path());
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert_eq!(found[0].command, command);
+        assert!(found[0].consume && found[0].carries_root, "{found:?}");
+        assert!(link.symlink_metadata().unwrap().file_type().is_symlink());
+        assert_eq!(std::fs::read_to_string(&real).unwrap(), original);
+
+        let dir = pulse();
+        let root = dir.path().canonicalize().unwrap();
+        ensure_files(&root, "recall-echo");
+        let _home = override_home(home.path());
+        let items = verify_files(&root);
+        let user = items.iter().find(|item| item.path == link).unwrap();
+        match &user.status {
+            ItemStatus::Wrong(reason) => {
+                assert!(reason.contains("consume"), "{reason}");
+                assert!(!reason.contains("not inspected"), "{reason}");
+            }
+            other => panic!("{other:?}"),
+        }
+        assert!(link.symlink_metadata().unwrap().file_type().is_symlink());
+        assert_eq!(std::fs::read_to_string(&real).unwrap(), original);
+    }
+
+    struct RestoreMode(PathBuf);
+    impl Drop for RestoreMode {
+        fn drop(&mut self) {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(&self.0, std::fs::Permissions::from_mode(0o644));
+        }
     }
 }

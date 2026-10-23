@@ -303,9 +303,34 @@ pub trait AgentIntegration: Send + Sync {
         false
     }
 
-    /// User-level hook commands for this CLI that carry no pulse root and
-    /// therefore fire for the wrong pulse. Reported, never edited.
-    fn user_hooks_missing_root(&self, _home: &Path) -> Vec<String> {
-        Vec::new()
+    /// User-level hook commands `repair` reports and never edits.
+    ///
+    /// Every `consume` hook is included. A positional root picks which file
+    /// that hook prints; it does not limit which sessions run the hook.
+    /// Other hooks are included only when they name no pulse root.
+    /// A file that cannot be inspected is [`UserHookScan::NotInspected`],
+    /// never an empty list.
+    fn user_hooks_missing_root(&self, _home: &Path) -> UserHookScan {
+        UserHookScan::Inspected(Vec::new())
     }
+}
+
+/// One user-level hook command `repair` prints and does not edit.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReportedUserHook {
+    pub command: String,
+    /// The command names a pulse root. For `consume` that is a positional
+    /// path; for other subcommands it is a `--pulse-root` or `--entity-root`
+    /// word.
+    pub carries_root: bool,
+    /// True when the command is a recall-echo `consume` hook.
+    pub consume: bool,
+}
+
+/// Result of reading the user-level hook file. Absence is `Inspected` with
+/// an empty list. A present file that cannot be read or parsed is not clean.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum UserHookScan {
+    Inspected(Vec<ReportedUserHook>),
+    NotInspected { path: PathBuf, reason: String },
 }
