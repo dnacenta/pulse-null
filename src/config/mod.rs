@@ -211,8 +211,38 @@ impl LlmConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SecurityConfig {
     pub secret: Option<String>,
+    /// Credential for the HTTP voice stream pool, sent as `X-Echo-Secret`.
+    /// Must differ from [`Self::secret`] when both are set. Absent means
+    /// there is no voice credential: the owner secret never selects that pool.
+    #[serde(default)]
+    pub voice_secret: Option<String>,
     #[serde(default = "default_true")]
     pub injection_detection: bool,
+}
+
+impl SecurityConfig {
+    /// The voice-stream credential, when one is set and it is not the same
+    /// string as [`Self::secret`].
+    ///
+    /// An equal pair is not a voice credential, so the owner secret cannot
+    /// select the voice pool. Startup validation rejects that pair; this
+    /// still returns `None` for a config built by hand.
+    #[must_use]
+    pub fn voice_credential(&self) -> Option<&str> {
+        let voice = self
+            .voice_secret
+            .as_deref()
+            .filter(|secret| !secret.trim().is_empty())?;
+        let collides = self
+            .secret
+            .as_deref()
+            .is_some_and(|owner| !owner.trim().is_empty() && owner == voice);
+        if collides {
+            None
+        } else {
+            Some(voice)
+        }
+    }
 }
 
 /// Owner identity configuration for sender resolution.
@@ -1293,6 +1323,7 @@ pub mod test_support {
             },
             security: SecurityConfig {
                 secret: None,
+                voice_secret: None,
                 injection_detection: true,
             },
             trust: TrustConfig::default(),

@@ -129,6 +129,34 @@ fn is_owner_channel(channel: &str) -> bool {
     matches!(channel, "tui" | "system" | "reflection")
 }
 
+/// A voice credential speaks only on the voice channel. Any other channel
+/// is 403 before a stream permit is taken, so the refusal is an HTTP status.
+fn refuse_voice_off_channel(who: &AuthIdentity, channel: &str) -> Result<(), (StatusCode, String)> {
+    if matches!(who, AuthIdentity::Voice)
+        && !channel.eq_ignore_ascii_case(crate::server::turns::VOICE_CHANNEL)
+    {
+        tracing::warn!("voice credential posted to {channel:?}");
+        return Err((
+            StatusCode::FORBIDDEN,
+            "a voice credential may only speak on the voice channel".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+/// The voice stream pool belongs to a voice identity. The body `channel`
+/// does not select it: an owner or a peer, including the owner admitted
+/// because no secret is configured, stays on the chat pool.
+fn uses_voice_pool(who: &AuthIdentity) -> bool {
+    match who {
+        AuthIdentity::Voice => true,
+        AuthIdentity::Plugin { channel, .. } => {
+            channel.eq_ignore_ascii_case(crate::server::turns::VOICE_CHANNEL)
+        }
+        AuthIdentity::Owner | AuthIdentity::Peer(_) => false,
+    }
+}
+
 /// A peer credential never reaches an owner channel — 403 before anything
 /// else (the stream endpoint checks this before it opens the stream, so the
 /// refusal is an HTTP status, not an event inside a 200).
@@ -222,6 +250,12 @@ pub(crate) async fn run_turn(
         }
         AuthIdentity::Plugin { name, channel } => {
             resolve_plugin_key(name, channel, &req, &state.config)?
+        }
+        AuthIdentity::Voice => {
+            refuse_voice_off_channel(&who, &req.channel)?;
+            // Same rule as the voice plugin: the transport's credential is
+            // not proof of the person on the call.
+            SessionKey::guest(req.sender.as_deref().unwrap_or("anonymous"))
         }
     };
 
@@ -494,8 +528,13 @@ fn error_to_sse(status: StatusCode, message: String) -> Event {
 /// `error {status, message}`. Dropping the connection aborts the turn: the
 /// provider child is killed and the user message is rolled back.
 ///
-/// Voice-channel requests (`channel` equal to `voice`, case-insensitive)
-/// take a pool of their own, so a full screen client cannot refuse a call.
+/// The voice stream pool is taken only for a voice identity: the voice
+/// plugin bound to that channel, or a client that presented
+/// `[security] voice_secret`. Every other caller, including the owner,
+/// draws from the chat pool whatever `channel` says. A non-voice caller
+/// that sends `channel: voice` is not rejected; the turn runs on the chat
+/// pool and the channel still routes the session. A voice credential on
+/// any other channel is `403` before a permit is taken.
 ///
 /// Client contract: deltas are best-effort and unvalidated. A consumer that
 /// stops reading loses deltas rather than stalling the turn, and a reply the
@@ -509,10 +548,8 @@ pub async fn chat_stream(
 ) -> Result<Sse<impl Stream<Item = Result<Event, Infallible>>>, (StatusCode, String)> {
     validate_request(&req)?;
     refuse_peer_on_owner_channel(&who, &req.channel)?;
-    let permits = if req
-        .channel
-        .eq_ignore_ascii_case(crate::server::turns::VOICE_CHANNEL)
-    {
+    refuse_voice_off_channel(&who, &req.channel)?;
+    let permits = if uses_voice_pool(&who) {
         Arc::clone(&state.voice_permits)
     } else {
         Arc::clone(&state.chat_permits)
@@ -1051,6 +1088,27 @@ mod channel_style_tests {
     fn channel_match_is_case_insensitive() {
         assert!(apply_channel_style("P".to_string(), "Voice").contains("<voice-call>"));
         assert!(apply_channel_style("P".to_string(), "VOICE").contains("<voice-call>"));
+    }
+}
+
+#[cfg(test)]
+mod voice_pool_tests {
+    use super::uses_voice_pool;
+    use crate::server::auth::AuthIdentity;
+
+    #[test]
+    fn voice_pool_follows_identity_not_a_channel_string() {
+        assert!(uses_voice_pool(&AuthIdentity::Voice));
+        assert!(uses_voice_pool(&AuthIdentity::Plugin {
+            name: "voice",
+            channel: "Voice".into(),
+        }));
+        assert!(!uses_voice_pool(&AuthIdentity::Plugin {
+            name: "text",
+            channel: "discord".into(),
+        }));
+        assert!(!uses_voice_pool(&AuthIdentity::Owner));
+        assert!(!uses_voice_pool(&AuthIdentity::Peer("peer".into())));
     }
 }
 

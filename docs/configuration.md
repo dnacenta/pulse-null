@@ -44,7 +44,8 @@ Every key:
 | `llm` | `context_budget` | `150000` | Estimated-token ceiling before conversation compaction |
 | `llm` | `fallback_model` | — | Model retried on a usage-policy refusal (empty disables) |
 | `llm` | `fallback_on_refusal` | `true` | Master switch for the refusal fallback |
-| `security` | `secret` | — | Enables the `X-Echo-Secret` header check |
+| `security` | `secret` | — | Enables the `X-Echo-Secret` header check (the owner) |
+| `security` | `voice_secret` | — | Separate `X-Echo-Secret` value for the voice stream pool. Must differ from `secret`. Unset means no voice credential |
 | `security` | `injection_detection` | `true` | Prompt-injection scanning |
 | `trust` | `trusted` | init: `["reflection", "system"]` | Channels with full access |
 | `trust` | `verified` | init: `["chat", "voice", "web"]` | Channels with limited access |

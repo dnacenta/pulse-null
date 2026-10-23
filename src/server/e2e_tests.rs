@@ -354,6 +354,7 @@ fn test_config() -> Config {
         },
         security: SecurityConfig {
             secret: None,
+            voice_secret: None,
             injection_detection: false,
         },
         trust: TrustConfig::default(),
@@ -456,6 +457,7 @@ async fn build_state_with_buffer(
     session_store.set_coordinator(Arc::clone(&persist_coordinator));
     let plugin_manager = crate::plugins::manager::PluginManager::new(&config);
     let alert_queue = crate::scheduler::alerts::AlertQueue::load(&root_dir);
+    let pools = crate::server::stream_pools();
     Arc::new(AppState {
         config,
         provider,
@@ -474,10 +476,10 @@ async fn build_state_with_buffer(
         alert_queue: tokio::sync::Mutex::new(alert_queue),
         provider_status: crate::provider_status::new_shared(),
         leadership: std::sync::atomic::AtomicBool::new(false),
-        event_permits: crate::server::stream_pools().0,
+        event_permits: pools.event,
         comms_permits: crate::server::comms_pool(),
-        chat_permits: crate::server::stream_pools().1,
-        voice_permits: crate::server::stream_pools().2,
+        chat_permits: pools.chat,
+        voice_permits: pools.voice,
         comms: crate::comms::Slot::new(),
         graph_extractor: None,
         ledger: Arc::new(crate::ledger::LedgerRing::new(64)),
@@ -1408,14 +1410,35 @@ async fn post_chat_stream_on(
     channel: &str,
     message: &str,
 ) -> axum::response::Response {
+    post_chat_stream_secret(app, channel, message, None).await
+}
+
+async fn post_chat_stream_secret(
+    app: &Router,
+    channel: &str,
+    message: &str,
+    secret: Option<&str>,
+) -> axum::response::Response {
     let body = serde_json::json!({ "message": message, "channel": channel });
-    let req = Request::builder()
+    let mut builder = Request::builder()
         .method("POST")
         .uri("/api/chat/stream")
-        .header("Content-Type", "application/json")
+        .header("Content-Type", "application/json");
+    if let Some(secret) = secret {
+        builder = builder.header("X-Echo-Secret", secret);
+    }
+    let req = builder
         .body(Body::from(serde_json::to_string(&body).unwrap()))
         .unwrap();
     app.clone().oneshot(req).await.unwrap()
+}
+
+const VOICE_CREDENTIAL: &str = "voice-credential";
+
+fn config_with_voice_credential() -> Config {
+    let mut config = test_config();
+    config.security.voice_secret = Some(VOICE_CREDENTIAL.to_string());
+    config
 }
 
 /// A buffered provider streams through the default adapter as one delta, and
@@ -1710,8 +1733,9 @@ async fn e2e_chat_stream_reset_on_guard() {
     assert!(!done_data.contains("[User]:"), "{done_data}");
 }
 
-/// Four open screen streams fill the chat pool. A voice stream still opens,
-/// and a fifth screen stream is refused.
+/// Four open screen streams fill the chat pool. A voice identity still
+/// opens on its own pool. An owner request whose body says `voice`, and a
+/// fifth screen stream, are both refused on the chat pool.
 #[tokio::test]
 async fn e2e_voice_stream_has_own_pool() {
     let dir = tempfile::tempdir().unwrap();
@@ -1719,10 +1743,20 @@ async fn e2e_voice_stream_has_own_pool() {
         dir.path().to_path_buf(),
         Box::new(HangingProvider),
         ToolRegistry::new(),
-        test_config(),
+        config_with_voice_credential(),
     )
     .await;
-    let app = build_app(state);
+    let app = build_app(Arc::clone(&state));
+    let off_channel = within_test_wait(
+        "voice credential off channel",
+        post_chat_stream_secret(&app, "tui", "hi", Some(VOICE_CREDENTIAL)),
+    )
+    .await;
+    assert_eq!(off_channel.status(), StatusCode::FORBIDDEN);
+    assert_eq!(
+        state.voice_permits.available_permits(),
+        crate::server::MAX_VOICE_STREAMS
+    );
     let mut held = Vec::new();
     for n in 0..4 {
         let response = within_test_wait(
@@ -1733,11 +1767,72 @@ async fn e2e_voice_stream_has_own_pool() {
         assert_eq!(response.status(), StatusCode::OK, "tui stream {n}");
         held.push(response);
     }
-    let voice = within_test_wait("voice stream", post_chat_stream_on(&app, "Voice", "hi")).await;
+    let owner_voice =
+        within_test_wait("owner body voice", post_chat_stream_on(&app, "Voice", "hi")).await;
+    assert_eq!(owner_voice.status(), StatusCode::SERVICE_UNAVAILABLE);
+    let voice = within_test_wait(
+        "voice identity",
+        post_chat_stream_secret(&app, "Voice", "hi", Some(VOICE_CREDENTIAL)),
+    )
+    .await;
     assert_eq!(voice.status(), StatusCode::OK);
     let fifth = within_test_wait("fifth tui stream", post_chat_stream_on(&app, "tui", "hi")).await;
     assert_eq!(fifth.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(
+        state.voice_permits.available_permits(),
+        crate::server::MAX_VOICE_STREAMS - 1
+    );
     drop(held);
+    drop(voice);
+    drop(owner_voice);
+}
+
+/// Four owner streams whose body says `voice` fill the chat pool and leave
+/// the voice pool free for a voice identity.
+#[tokio::test]
+async fn e2e_owner_voice_channel_does_not_exhaust_voice_pool() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = build_state_boxed_with_config(
+        dir.path().to_path_buf(),
+        Box::new(HangingProvider),
+        ToolRegistry::new(),
+        config_with_voice_credential(),
+    )
+    .await;
+    let app = build_app(Arc::clone(&state));
+    let mut held = Vec::new();
+    for n in 0..4 {
+        let response = within_test_wait(
+            &format!("owner voice body {n}"),
+            post_chat_stream_on(&app, "voice", "hi"),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK, "owner voice body {n}");
+        held.push(response);
+    }
+    assert_eq!(state.chat_permits.available_permits(), 0);
+    assert_eq!(
+        state.voice_permits.available_permits(),
+        crate::server::MAX_VOICE_STREAMS
+    );
+    let fifth = within_test_wait(
+        "fifth owner voice body",
+        post_chat_stream_on(&app, "voice", "hi"),
+    )
+    .await;
+    assert_eq!(fifth.status(), StatusCode::SERVICE_UNAVAILABLE);
+    let voice = within_test_wait(
+        "voice identity after owner bodies",
+        post_chat_stream_secret(&app, "voice", "hi", Some(VOICE_CREDENTIAL)),
+    )
+    .await;
+    assert_eq!(voice.status(), StatusCode::OK);
+    assert_eq!(
+        state.voice_permits.available_permits(),
+        crate::server::MAX_VOICE_STREAMS - 1
+    );
+    drop(held);
+    drop(fifth);
     drop(voice);
 }
 

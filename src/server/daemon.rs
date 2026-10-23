@@ -194,6 +194,7 @@ async fn assemble_state(
     // Alert queue (Phase 5: Task Isolation)
     let alert_queue = crate::scheduler::alerts::AlertQueue::load(&root_dir);
 
+    let pools = super::stream_pools();
     let state = Arc::new(AppState {
         config: config.clone(),
         provider,
@@ -212,10 +213,10 @@ async fn assemble_state(
         alert_queue: tokio::sync::Mutex::new(alert_queue),
         provider_status: crate::provider_status::new_shared(),
         leadership: std::sync::atomic::AtomicBool::new(false),
-        event_permits: super::stream_pools().0,
+        event_permits: pools.event,
         comms_permits: super::comms_pool(),
-        chat_permits: super::stream_pools().1,
-        voice_permits: super::stream_pools().2,
+        chat_permits: pools.chat,
+        voice_permits: pools.voice,
         comms: crate::comms::Slot::new(),
         ledger,
         graph_extractor: crate::graph_extract::GraphExtractor::for_pulse(&config, &root_dir),

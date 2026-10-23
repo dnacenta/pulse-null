@@ -43,7 +43,13 @@ The same turn as `POST /chat`, delivered as server-sent events. The request body
 { "message": "Hello, how are you?", "channel": "tui" }
 ```
 
-`channel` defaults to `chat`. A channel equal to `voice`, in any case, draws from the voice stream pool. Every other channel draws from the chat stream pool. Each pool allows 4 streams at once; a further request gets `503` with `too many open streams; try again shortly`. The response is `text/event-stream`, with a comment keep-alive every 15 seconds.
+`channel` defaults to `chat`. It selects the session, not the stream pool.
+
+The voice stream pool is taken only by a voice identity. That is the in-process voice plugin bound to the `voice` channel (any case), or a client that presents `[security] voice_secret` in the `X-Echo-Secret` header. The credential is configured on the server and must differ from `[security] secret`. A voice credential may speak only on the `voice` channel; any other channel is `403` and takes no permit.
+
+Every other caller uses the chat stream pool, whatever `channel` says. That includes the owner, a peer, and every caller when `[security] secret` is unset (those requests are the owner). A non-voice caller that sends `channel` equal to `voice` is not rejected. The turn runs on the chat pool, and `channel` still routes the session.
+
+Each pool allows 4 streams at once. A further request gets `503` with `too many open streams; try again shortly`. The response is `text/event-stream`, with a comment keep-alive every 15 seconds.
 
 Each event is one SSE frame: the `event` line names it, and the `data` line is the JSON below, with no extra whitespace and with object keys in alphabetical order. A stream ends with exactly one of `done` or `error`.
 
@@ -107,7 +113,7 @@ Closing the connection cancels the turn. Nothing from that turn is saved: the us
   different security context. Channels per tier: `[trust]`.
 - **Prompt-injection detection**: non-trusted messages are scanned with regex patterns
   before reaching the model; hits are blocked and logged.
-- **Authentication**: optional `X-Echo-Secret` header, from `[security] secret`.
+- **Authentication**: optional `X-Echo-Secret` header. It matches `[security] secret` (the owner) or, when set and different, `[security] voice_secret` (the voice stream pool).
 - **Rate limiting**: token bucket on authenticated endpoints.
 
 ## Plugins

@@ -22,7 +22,13 @@ use super::AppState;
 pub enum AuthIdentity {
     Owner,
     Peer(String),
-    Plugin { name: &'static str, channel: String },
+    Plugin {
+        name: &'static str,
+        channel: String,
+    },
+    /// Presented `[security] voice_secret`. The voice stream pool, and only
+    /// the `voice` channel. Not the owner.
+    Voice,
 }
 
 impl AuthIdentity {
@@ -37,6 +43,10 @@ impl AuthIdentity {
             }
             Self::Plugin { name, .. } => {
                 tracing::warn!("plugin {name} asked for an owner-only endpoint");
+                Err(StatusCode::FORBIDDEN)
+            }
+            Self::Voice => {
+                tracing::warn!("voice credential asked for an owner-only endpoint");
                 Err(StatusCode::FORBIDDEN)
             }
         }
@@ -57,8 +67,10 @@ fn ct_eq(a: &str, b: &str) -> bool {
 /// Checks authentication in this order:
 /// 1. Skip auth for /health endpoint
 /// 2. If `X-Peer-Name` header is present, validate against that peer's configured secret
-/// 3. If no peer match, fall back to global `security.secret` check
-/// 4. If no global secret configured, allow all requests
+/// 3. If `X-Echo-Secret` matches `[security] voice_secret` (set, and
+///    distinct from the owner secret), the caller is the voice transport
+/// 4. If no peer match, fall back to global `security.secret` check
+/// 5. If no global secret configured, allow the request as the owner
 pub async fn require_auth(
     state: axum::extract::State<Arc<AppState>>,
     mut req: Request,
@@ -111,28 +123,16 @@ pub async fn require_auth(
         // X-Peer-Name present but not a known peer — fall through to global auth
     }
 
-    // Fall back to global secret check
-    let secret = match state.config.security.secret.as_deref() {
-        Some(s) if !s.trim().is_empty() => s,
-        _ => {
-            req.extensions_mut().insert(AuthIdentity::Owner);
-            return Ok(next.run(req).await);
-        }
-    };
-
-    // Check X-Echo-Secret header against global secret
-    let accepted = req
+    let presented = req
         .headers()
         .get("X-Echo-Secret")
-        .and_then(|v| v.to_str().ok())
-        .is_some_and(|value| ct_eq(value, secret));
-
-    match accepted {
-        true => {
-            req.extensions_mut().insert(AuthIdentity::Owner);
+        .and_then(|v| v.to_str().ok());
+    match identity_for_global_secret(&state.config.security, presented) {
+        Ok(who) => {
+            req.extensions_mut().insert(who);
             Ok(next.run(req).await)
         }
-        false => {
+        Err(status) => {
             tracing::warn!(
                 "Unauthorized request to {} from {:?}",
                 req.uri().path(),
@@ -140,8 +140,34 @@ pub async fn require_auth(
                     .get("x-forwarded-for")
                     .or(req.headers().get("host"))
             );
-            Err(StatusCode::UNAUTHORIZED)
+            Err(status)
         }
+    }
+}
+
+/// Owner secret, voice credential, or the open-loopback owner.
+///
+/// The voice credential is checked first, and only when it is distinct from
+/// the owner secret. A request admitted because no owner secret is configured
+/// is the owner, unless it presented the voice credential.
+fn identity_for_global_secret(
+    security: &crate::config::SecurityConfig,
+    presented: Option<&str>,
+) -> Result<AuthIdentity, StatusCode> {
+    if let Some(voice) = security.voice_credential() {
+        if presented.is_some_and(|value| ct_eq(value, voice)) {
+            return Ok(AuthIdentity::Voice);
+        }
+    }
+    match security.secret.as_deref() {
+        Some(secret) if !secret.trim().is_empty() => {
+            if presented.is_some_and(|value| ct_eq(value, secret)) {
+                Ok(AuthIdentity::Owner)
+            } else {
+                Err(StatusCode::UNAUTHORIZED)
+            }
+        }
+        _ => Ok(AuthIdentity::Owner),
     }
 }
 
@@ -166,6 +192,13 @@ mod tests {
     use crate::tools::ToolRegistry;
 
     async fn test_state(secret: Option<String>) -> Arc<AppState> {
+        test_state_with(secret, None).await
+    }
+
+    async fn test_state_with(
+        secret: Option<String>,
+        voice_secret: Option<String>,
+    ) -> Arc<AppState> {
         let root_dir = std::env::temp_dir();
         let config = Config {
             pulse: PulseConfig {
@@ -190,6 +223,7 @@ mod tests {
             },
             security: SecurityConfig {
                 secret,
+                voice_secret,
                 injection_detection: true,
             },
             trust: TrustConfig::default(),
@@ -222,6 +256,7 @@ mod tests {
         .await;
         let plugin_manager = crate::plugins::manager::PluginManager::new(&config);
         let alert_queue = crate::scheduler::alerts::AlertQueue::load(&root_dir);
+        let pools = crate::server::stream_pools();
         Arc::new(AppState {
             config,
             provider: Box::new(crate::anthropic_provider::AnthropicProvider::new(
@@ -243,10 +278,10 @@ mod tests {
             alert_queue: tokio::sync::Mutex::new(alert_queue),
             provider_status: crate::provider_status::new_shared(),
             leadership: std::sync::atomic::AtomicBool::new(false),
-            event_permits: crate::server::stream_pools().0,
+            event_permits: pools.event,
             comms_permits: crate::server::comms_pool(),
-            chat_permits: crate::server::stream_pools().1,
-            voice_permits: crate::server::stream_pools().2,
+            chat_permits: pools.chat,
+            voice_permits: pools.voice,
             comms: crate::comms::Slot::new(),
             graph_extractor: None,
             ledger: Arc::new(crate::ledger::LedgerRing::new(16)),
@@ -348,6 +383,101 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::OK);
     }
 
+    async fn owner_only(
+        axum::Extension(who): axum::Extension<AuthIdentity>,
+    ) -> Result<&'static str, StatusCode> {
+        who.require_owner()?;
+        Ok("owner")
+    }
+
+    fn owner_app(state: Arc<AppState>) -> Router {
+        Router::new()
+            .route("/owner", get(owner_only))
+            .route_layer(middleware::from_fn_with_state(
+                Arc::clone(&state),
+                require_auth,
+            ))
+            .with_state(state)
+    }
+
+    #[tokio::test]
+    async fn test_voice_secret_is_not_the_owner() {
+        let state = test_state_with(Some("owner-secret".into()), Some("voice-secret".into())).await;
+        let app = owner_app(state);
+
+        let voice = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/owner")
+                    .header("X-Echo-Secret", "voice-secret")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(voice.status(), StatusCode::FORBIDDEN);
+
+        let owner = app
+            .oneshot(
+                Request::builder()
+                    .uri("/owner")
+                    .header("X-Echo-Secret", "owner-secret")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(owner.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn test_open_loopback_stays_owner_unless_it_presents_the_voice_credential() {
+        let state = test_state_with(None, Some("voice-secret".into())).await;
+        let app = owner_app(state);
+
+        let open = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/owner")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(open.status(), StatusCode::OK);
+
+        let voice = app
+            .oneshot(
+                Request::builder()
+                    .uri("/owner")
+                    .header("X-Echo-Secret", "voice-secret")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(voice.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn test_voice_secret_equal_to_owner_secret_stays_the_owner() {
+        let state = test_state_with(Some("same-secret".into()), Some("same-secret".into())).await;
+        let app = owner_app(state);
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/owner")
+                    .header("X-Echo-Secret", "same-secret")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
     // ─── Peer authentication tests ──────────────────────────────────────────
 
     async fn test_state_with_peers(
@@ -378,6 +508,7 @@ mod tests {
             },
             security: SecurityConfig {
                 secret: global_secret,
+                voice_secret: None,
                 injection_detection: true,
             },
             trust: TrustConfig::default(),
@@ -410,6 +541,7 @@ mod tests {
         .await;
         let plugin_manager = crate::plugins::manager::PluginManager::new(&config);
         let alert_queue = crate::scheduler::alerts::AlertQueue::load(&root_dir);
+        let pools = crate::server::stream_pools();
         Arc::new(AppState {
             config,
             provider: Box::new(crate::anthropic_provider::AnthropicProvider::new(
@@ -431,10 +563,10 @@ mod tests {
             alert_queue: tokio::sync::Mutex::new(alert_queue),
             provider_status: crate::provider_status::new_shared(),
             leadership: std::sync::atomic::AtomicBool::new(false),
-            event_permits: crate::server::stream_pools().0,
+            event_permits: pools.event,
             comms_permits: crate::server::comms_pool(),
-            chat_permits: crate::server::stream_pools().1,
-            voice_permits: crate::server::stream_pools().2,
+            chat_permits: pools.chat,
+            voice_permits: pools.voice,
             comms: crate::comms::Slot::new(),
             graph_extractor: None,
             ledger: Arc::new(crate::ledger::LedgerRing::new(16)),
