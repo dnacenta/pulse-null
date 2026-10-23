@@ -393,8 +393,17 @@ fn is_identifier(s: &str) -> bool {
 }
 
 /// The statements that create the probe database and its user.
-fn define_sql(names: &ProbeNames, password: &str) -> String {
-    format!(
+///
+/// The password is interpolated. It is refused unless every character is
+/// in the alphanumeric alphabet [`crate::surrealdb_manager::generate_password`]
+/// emits, so a quote or statement break cannot land in the text.
+fn define_sql(names: &ProbeNames, password: &str) -> Result<String, GraphError> {
+    if password.is_empty() || !password.chars().all(|c| c.is_ascii_alphanumeric()) {
+        return Err(GraphError::Unsafe(
+            "probe database password is not alphanumeric".into(),
+        ));
+    }
+    Ok(format!(
         "DEFINE NAMESPACE IF NOT EXISTS {PROBE_NAMESPACE};\n\
          USE NS {PROBE_NAMESPACE};\n\
          DEFINE DATABASE {db};\n\
@@ -402,7 +411,7 @@ fn define_sql(names: &ProbeNames, password: &str) -> String {
          DEFINE USER {user} ON DATABASE PASSWORD '{password}' ROLES OWNER;",
         db = names.database,
         user = names.username,
-    )
+    ))
 }
 
 /// What the live export leaves out: users (their password hashes) and
@@ -941,7 +950,7 @@ impl ScratchGraph {
             write_private(&password_file, &password)?;
             server
                 .endpoint
-                .sql(&define_sql(&names, &password))
+                .sql(&define_sql(&names, &password)?)
                 .await
                 .map_err(|e| redact(e, &password))?;
             server
@@ -1091,12 +1100,27 @@ mod tests {
     #[test]
     fn statements_create_in_the_probe_namespace_only() {
         let names = probe_names("synth", "abc123").unwrap();
-        let define = define_sql(&names, "pw");
+        let define = define_sql(&names, "pw").unwrap();
         assert!(define.contains("USE NS nullarc_probe;"));
         assert!(define.contains("DEFINE DATABASE probe_synth_abc123;"));
         assert!(define.contains("DEFINE USER probe_abc123 ON DATABASE PASSWORD 'pw' ROLES OWNER;"));
         assert!(EXPORT_OPTIONS.contains(r#""users":false"#));
         assert!(EXPORT_OPTIONS.contains(r#""accesses":false"#));
+    }
+
+    /// A password outside the generator's alphabet is refused before it is
+    /// placed in the statement.
+    #[test]
+    fn a_password_outside_the_alphabet_is_not_interpolated() {
+        let names = probe_names("synth", "abc123").unwrap();
+        for password in ["pw'", "pw; REMOVE", "pw password", "päss"] {
+            let err = define_sql(&names, password).unwrap_err();
+            let msg = err.to_string();
+            assert!(!msg.contains(password), "{msg}");
+            assert!(msg.contains("alphanumeric"), "{msg}");
+        }
+        assert!(define_sql(&names, "").is_err());
+        assert!(define_sql(&names, "Ab3").is_ok());
     }
 
     fn config(url: &str, namespace: &str, database: &str) -> String {
