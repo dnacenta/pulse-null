@@ -1803,7 +1803,8 @@ async fn e2e_chat_stream_reset_on_guard() {
     )
     .await;
     let app = build_app(state);
-    let response = post_chat_stream_secret(&app, "voice", "hi", Some(VOICE_CREDENTIAL)).await;
+    let response =
+        post_chat_stream_from(&app, "voice", Some("caller"), Some(VOICE_CREDENTIAL)).await;
     assert_eq!(response.status(), StatusCode::OK);
     let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
         .await
@@ -2175,7 +2176,8 @@ async fn e2e_chat_stream_flushed_segment_keeps_its_place() {
     )
     .await;
     let app = build_app(Arc::clone(&state));
-    let response = post_chat_stream_secret(&app, "voice", "hi", Some(VOICE_CREDENTIAL)).await;
+    let response =
+        post_chat_stream_from(&app, "voice", Some("caller"), Some(VOICE_CREDENTIAL)).await;
     assert_eq!(response.status(), StatusCode::OK);
     within_test_wait(
         "held segment flushed onto a full channel",
@@ -2226,7 +2228,7 @@ async fn e2e_voice_stream_has_own_pool() {
     assert_eq!(owner_voice.status(), StatusCode::SERVICE_UNAVAILABLE);
     let voice = within_test_wait(
         "voice identity",
-        post_chat_stream_secret(&app, "Voice", "hi", Some(VOICE_CREDENTIAL)),
+        post_chat_stream_from(&app, "Voice", Some("caller"), Some(VOICE_CREDENTIAL)),
     )
     .await;
     assert_eq!(voice.status(), StatusCode::OK);
@@ -2277,7 +2279,7 @@ async fn e2e_owner_voice_channel_does_not_exhaust_voice_pool() {
     assert_eq!(fifth.status(), StatusCode::SERVICE_UNAVAILABLE);
     let voice = within_test_wait(
         "voice identity after owner bodies",
-        post_chat_stream_secret(&app, "voice", "hi", Some(VOICE_CREDENTIAL)),
+        post_chat_stream_from(&app, "voice", Some("caller"), Some(VOICE_CREDENTIAL)),
     )
     .await;
     assert_eq!(voice.status(), StatusCode::OK);
@@ -2291,8 +2293,8 @@ async fn e2e_owner_voice_channel_does_not_exhaust_voice_pool() {
 }
 
 /// A demoted `channel: voice` body hangs on the owner's ordinary session.
-/// A voice-credential turn for the same sender, and for no sender, still
-/// produces a frame: it does not share that lock.
+/// A voice-credential turn for the same sender still produces a frame: it
+/// does not share that lock. A voice credential with no sender is refused.
 async fn demoted_voice_body_does_not_block_a_call(sender: Option<&str>) {
     use tokio_stream::StreamExt as _;
 
@@ -2335,6 +2337,11 @@ async fn demoted_voice_body_does_not_block_a_call(sender: Option<&str>) {
         post_chat_stream_from(&app, "voice", sender, Some(VOICE_CREDENTIAL)),
     )
     .await;
+    if sender.is_none() {
+        assert_eq!(voice.status(), StatusCode::BAD_REQUEST);
+        drop(demoted_body);
+        return;
+    }
     assert_eq!(voice.status(), StatusCode::OK);
     let mut voice_body = voice.into_body().into_data_stream();
     let mut voice_seen = String::new();

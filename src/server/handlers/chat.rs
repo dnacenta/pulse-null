@@ -112,6 +112,12 @@ pub(crate) fn validate_request(req: &ChatRequest) -> Result<(), (StatusCode, Str
                 ),
             ));
         }
+        if sender.chars().any(|c| c.is_ascii_control()) {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                "Sender name contains invalid characters".to_string(),
+            ));
+        }
     }
 
     Ok(())

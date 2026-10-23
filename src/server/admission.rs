@@ -120,9 +120,16 @@ pub(crate) fn admit_turn(
         }
         AuthIdentity::Voice => {
             refuse_voice_off_channel(&who, &req.channel).map_err(http_error)?;
-            // Same rule as the voice plugin: the transport's credential is
-            // not proof of the person on the call.
-            SessionKey::guest(req.sender.as_deref().unwrap_or("anonymous"))
+            // The credential is not the person on the call, and a blank
+            // sender would collapse every such call onto one key.
+            let sender = req.sender.as_deref().unwrap_or("");
+            if sender.trim().is_empty() {
+                return Err(AdmitError::Http(
+                    StatusCode::BAD_REQUEST,
+                    "a voice turn needs a sender".to_string(),
+                ));
+            }
+            SessionKey::guest(sender)
         }
     };
     // The call set is only a voice identity. A demoted body that says
@@ -181,7 +188,7 @@ fn count_guest(
             chrono::Utc::now().date_naive(),
         )
         .map_err(|refusal| {
-            tracing::warn!("guest turn for {key} refused on {ledger}: {refusal:?}");
+            tracing::warn!("guest turn for {key:?} refused on {ledger}: {refusal:?}");
             AdmitError::Guest(refusal)
         })
 }
@@ -247,7 +254,10 @@ mod tests {
     }
 
     async fn state_in(root: &std::path::Path) -> Arc<AppState> {
-        let config = test_config();
+        state_from(root, test_config()).await
+    }
+
+    async fn state_from(root: &std::path::Path, config: Config) -> Arc<AppState> {
         let session_store =
             crate::session_store::SessionStore::new(root, &config.sessions, &config.pulse.name)
                 .await;
@@ -337,5 +347,54 @@ mod tests {
             .expect_err("invalid channel");
         let (status, _) = error.into_http();
         assert_eq!(status, StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn voice_without_a_sender_is_400_and_not_charged() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = test_config();
+        config.plugin_turns.daily_turns = 1;
+        config.plugin_turns.voice_turns_per_call = 0;
+        let state = state_from(dir.path(), config).await;
+        for sender in [None, Some(""), Some("   ")] {
+            let error = admit_turn(&state, AuthIdentity::Voice, request("voice", sender))
+                .expect_err("blank voice sender");
+            let (status, message) = error.into_http();
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{sender:?}");
+            assert_eq!(message, "a voice turn needs a sender");
+        }
+        admit_turn(&state, AuthIdentity::Voice, request("voice", Some("one")))
+            .expect("the blank turns were not charged");
+        let error = admit_turn(&state, AuthIdentity::Voice, request("voice", Some("two")))
+            .expect_err("the day holds one guest turn");
+        assert!(matches!(
+            error,
+            AdmitError::Guest(GuestRefusal::DailyBudgetSpent)
+        ));
+    }
+
+    #[tokio::test]
+    async fn a_sender_with_a_newline_is_400() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = state_in(dir.path()).await;
+        let cases = [
+            (AuthIdentity::Owner, "chat"),
+            (AuthIdentity::Voice, "voice"),
+            (AuthIdentity::Peer("Synth".to_string()), "chat"),
+            (
+                AuthIdentity::Plugin {
+                    name: "voice-echo",
+                    channel: "voice".to_string(),
+                },
+                "voice",
+            ),
+        ];
+        for (who, channel) in cases {
+            let error = admit_turn(&state, who, request(channel, Some("a\nb")))
+                .expect_err("newline in sender");
+            let (status, message) = error.into_http();
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{channel}");
+            assert_eq!(message, "Sender name contains invalid characters");
+        }
     }
 }
