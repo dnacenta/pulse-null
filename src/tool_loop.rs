@@ -555,6 +555,21 @@ pub async fn invoke_with_tool_loop_streaming(
         )
         .await?;
         let tool_names = round.tool_names;
+        // The guard has to accept the round before a speaker hears it, and
+        // the boundary has to be on the wire before the tool call blocks.
+        let announce = announce_tools_before_execution(
+            &round.response,
+            segments.from_provider,
+            rs.rounds,
+            max_rounds,
+        );
+        if announce {
+            sink.flush_held();
+            segments.push_kept(sink, true);
+            for name in &tool_names {
+                sink.try_send(TurnEvent::Status(TurnStatus::Tool(name.clone())));
+            }
+        }
         match finish_round(&mut rs, round.response, tools, messages, max_rounds).await {
             RoundOutcome::Done(done) => {
                 // A cut reply leaves the held segment for the caller to
@@ -570,16 +585,39 @@ pub async fn invoke_with_tool_loop_streaming(
                 return Ok(done);
             }
             RoundOutcome::Continue => {
-                sink.flush_held();
-                if !segments.from_provider {
-                    segments.push_kept(sink, true);
-                }
-                for name in tool_names {
-                    sink.try_send(TurnEvent::Status(TurnStatus::Tool(name)));
+                if !announce {
+                    sink.flush_held();
+                    if !segments.from_provider {
+                        segments.push_kept(sink, true);
+                    }
+                    for name in tool_names {
+                        sink.try_send(TurnEvent::Status(TurnStatus::Tool(name)));
+                    }
                 }
             }
         }
     }
+}
+
+/// True when this round will run tools and the provider did not already
+/// close the message. The synthesized `segment` and `status tool` go out
+/// before [`finish_round`] awaits the calls. A truncated round does not:
+/// the held text stays buffered for the caller to drop.
+fn announce_tools_before_execution(
+    response: &LlmResponse,
+    from_provider: bool,
+    rounds_so_far: u32,
+    max_rounds: u32,
+) -> bool {
+    if from_provider || !matches!(response.stop_reason, StopReason::ToolUse) {
+        return false;
+    }
+    // `finish_round` increments first and skips the calls once past the cap.
+    if rounds_so_far >= max_rounds {
+        return false;
+    }
+    let (_sanitized, was_truncated, _marker) = validate_content_blocks_adapter(&response.content);
+    !was_truncated
 }
 
 /// One provider round as the stream delivered it.
@@ -1122,6 +1160,89 @@ mod streaming_tests {
                 },
             ]
         );
+    }
+
+    /// A provider that does not emit `SegmentEnd` still publishes the
+    /// synthesized tool boundary before the tool call blocks.
+    #[tokio::test]
+    async fn synthesized_segment_is_readable_before_the_tool_returns() {
+        use std::sync::Arc;
+        use tokio::sync::Notify;
+
+        struct HoldTool {
+            entered: Arc<Notify>,
+            release: Arc<Notify>,
+        }
+
+        impl crate::tools::Tool for HoldTool {
+            fn name(&self) -> &str {
+                "file_read"
+            }
+            fn description(&self) -> &str {
+                "blocks until released"
+            }
+            fn input_schema(&self) -> serde_json::Value {
+                serde_json::json!({})
+            }
+            fn execute(&self, _input: serde_json::Value) -> crate::tools::ToolResult<'_> {
+                let entered = Arc::clone(&self.entered);
+                let release = Arc::clone(&self.release);
+                Box::pin(async move {
+                    entered.notify_one();
+                    release.notified().await;
+                    Ok("ok".to_string())
+                })
+            }
+        }
+
+        let entered = Arc::new(Notify::new());
+        let release = Arc::new(Notify::new());
+        let mut tools = ToolRegistry::new();
+        tools.register(Box::new(HoldTool {
+            entered: Arc::clone(&entered),
+            release: Arc::clone(&release),
+        }));
+        let provider = Scripted::new(
+            vec![tool_round("look ", "file_read"), end_turn("found")],
+            true,
+        );
+        let (tx, mut rx) = tokio::sync::mpsc::channel(64);
+        let sink = ProgressSink::new(tx);
+        let mut messages = vec![user("hi")];
+        let invoke =
+            invoke_with_tool_loop_streaming(&provider, &tools, "sys", &mut messages, 100, 5, &sink);
+        tokio::pin!(invoke);
+
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            tokio::select! {
+                _ = &mut invoke => {
+                    panic!("turn finished before the boundary was read")
+                }
+                _ = async {
+                    let mut saw_segment = false;
+                    let mut saw_status = false;
+                    while !saw_segment || !saw_status {
+                        match rx.recv().await {
+                            Some(TurnEvent::Segment { tool: true, .. }) => saw_segment = true,
+                            Some(TurnEvent::Status(TurnStatus::Tool(name))) if name == "file_read" => {
+                                saw_status = true;
+                            }
+                            Some(_) => {}
+                            None => panic!("stream closed before the tool boundary"),
+                        }
+                    }
+                    entered.notified().await;
+                } => {}
+            }
+        })
+        .await
+        .expect("segment was not readable before the tool returned");
+
+        release.notify_one();
+        tokio::time::timeout(std::time::Duration::from_secs(2), invoke)
+            .await
+            .expect("turn did not finish")
+            .unwrap();
     }
 
     /// A provider that already closed each message must not get a second
