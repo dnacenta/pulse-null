@@ -47,6 +47,8 @@ The same turn as `POST /chat`, delivered as server-sent events. The request body
 
 The voice stream pool is taken only by a voice identity. That is the in-process voice plugin bound to the `voice` channel (any case), or a client that presents `[security] voice_secret` in the `X-Echo-Secret` header. The credential is configured on the server and must differ from `[security] secret`. A voice credential may speak only on the `voice` channel; any other channel is `403` and takes no permit.
 
+A voice identity is a guest call under `[plugin_turns]`. `voice_turns_per_call` bounds that call. `daily_turns` bounds the credential's own UTC day, `http-voice`, separate from any plugin. Past a cap, `POST /chat` and this stream answer `429` with a short sentence and, on the stream, no event frame. A turn counts once it is admitted, even if the provider fails or the client disconnects.
+
 Every other caller uses the chat stream pool, whatever `channel` says. That includes the owner, a peer, and every caller when `[security] secret` is unset (those requests are the owner). A non-voice caller that sends `channel` equal to `voice` is not rejected. The turn runs on the chat pool, in that principal's ordinary session, and does not enter the call set.
 
 Each pool allows 4 streams at once. A further request gets `503` with `too many open streams; try again shortly`. The response is `text/event-stream`, with a comment keep-alive every 15 seconds.
@@ -117,6 +119,7 @@ Closing the connection cancels the turn. Nothing from that turn is saved: the us
 - **Prompt-injection detection**: non-trusted messages are scanned with regex patterns
   before reaching the model; hits are blocked and logged.
 - **Authentication**: optional `X-Echo-Secret` header. It matches `[security] secret` (the owner) or, when set and different, `[security] voice_secret` (the voice stream pool).
+- **Voice guest caps**: a voice identity is a guest call under `[plugin_turns]`. `voice_turns_per_call` bounds the call, and `daily_turns` applies to that credential's own `http-voice` day. Past a cap, `POST /chat` and `POST /api/chat/stream` answer `429` with a short sentence, before any server-sent event. A turn counts once admitted, even if it fails or the client disconnects.
 - **Rate limiting**: token bucket on authenticated endpoints.
 
 ## Plugins
