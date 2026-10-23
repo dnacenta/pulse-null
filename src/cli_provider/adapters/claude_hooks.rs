@@ -319,6 +319,21 @@ fn recall_commands<'a>(existing: &'a serde_json::Value, event: &str, sub: &str) 
         .collect()
 }
 
+/// A parsed settings document we must not rewrite. Invalid JSON is rejected
+/// by the caller; a value that parses but is not an object would otherwise
+/// be replaced and its other keys discarded.
+fn settings_shape_error(value: &serde_json::Value) -> Option<String> {
+    if !value.is_object() {
+        return Some("settings.json root is not a JSON object".into());
+    }
+    if let Some(hooks) = value.get("hooks") {
+        if !hooks.is_object() {
+            return Some("hooks is not a JSON object".into());
+        }
+    }
+    None
+}
+
 /// Bring `.claude/settings.json` up to date without clobbering anything else
 /// in it.
 fn ensure_settings(path: &Path, ours: &serde_json::Value, within: &Path) -> BootstrapItem {
@@ -335,6 +350,11 @@ fn ensure_settings(path: &Path, ours: &serde_json::Value, within: &Path) -> Boot
         Ok(None) => None,
         Err(e) => return item(ItemStatus::Skipped(e)),
     };
+    if let Some(value) = &existing {
+        if let Some(reason) = settings_shape_error(value) {
+            return item(ItemStatus::Skipped(reason));
+        }
+    }
     let was_present = existing.is_some();
     let wrapped = existing.as_ref().is_some_and(has_wrapped_consume);
     let merged = merge_hooks(existing.clone().unwrap_or(serde_json::json!({})), ours);
@@ -1860,5 +1880,44 @@ mod tests {
                 );
             }
         }
+    }
+
+    fn assert_settings_skipped(original: &str, reason_has: &str) {
+        let dir = pulse();
+        let root = dir.path().canonicalize().unwrap();
+        let path = root.join(".claude/settings.json");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, original).unwrap();
+        let items = ensure_files(&root, "recall-echo");
+        let settings = items.iter().find(|item| item.path == path).unwrap();
+        match &settings.status {
+            ItemStatus::Skipped(reason) => {
+                assert!(reason.contains(reason_has), "{original}: {reason}")
+            }
+            other => panic!("{original}: expected Skipped, got {other:?}"),
+        }
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            original,
+            "{original} was rewritten"
+        );
+    }
+
+    #[test]
+    fn truncated_settings_are_skipped_unchanged() {
+        assert_settings_skipped("{\"hooks\":", "not valid JSON");
+    }
+
+    #[test]
+    fn array_root_is_skipped_unchanged() {
+        assert_settings_skipped("[]", "not a JSON object");
+    }
+
+    #[test]
+    fn hooks_array_is_skipped_unchanged() {
+        assert_settings_skipped(
+            "{\"hooks\":[],\"permissions\":{\"allow\":[\"Bash(ls:*)\"]}}",
+            "hooks is not a JSON object",
+        );
     }
 }
