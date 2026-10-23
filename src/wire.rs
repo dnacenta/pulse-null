@@ -434,6 +434,38 @@ mod tests {
         assert!(ChatStreamEvent::from_sse_parts("status", r#"{"status":"dreaming"}"#).is_none());
     }
 
+    /// The stream contract in `docs/http-api.md` is the wire form: each
+    /// documented frame parses, and serializing it again is the same JSON.
+    #[test]
+    fn documented_examples_round_trip() {
+        let doc = include_str!("../docs/http-api.md");
+        let block = doc
+            .split("```sse\n")
+            .nth(1)
+            .and_then(|rest| rest.split("```").next())
+            .expect("the stream section documents an sse block");
+        let mut name = None;
+        let mut seen = 0;
+        for line in block.lines() {
+            if let Some(rest) = line.strip_prefix("event:") {
+                name = Some(rest.trim());
+            } else if let Some(rest) = line.strip_prefix("data:") {
+                let event = name.take().expect("data line without an event");
+                let data = rest.trim();
+                let parsed = ChatStreamEvent::from_sse_parts(event, data)
+                    .unwrap_or_else(|| panic!("documented {event} did not parse: {data}"));
+                let (back_name, back_data) = parsed.to_sse_parts();
+                assert_eq!(back_name, event, "{data}");
+                assert_eq!(back_data.to_string(), data, "{event}");
+                let again =
+                    ChatStreamEvent::from_sse_parts(&back_name, &back_data.to_string()).unwrap();
+                assert_eq!(again, parsed);
+                seen += 1;
+            }
+        }
+        assert_eq!(seen, 10, "every documented frame was checked");
+    }
+
     #[test]
     fn cognitive_status_labels_match_serde() {
         for s in [
