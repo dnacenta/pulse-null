@@ -86,40 +86,86 @@ fn render_hooks(recall_bin: &str, root: &Path) -> serde_json::Value {
     serde_json::Value::Object(hooks)
 }
 
-/// The first two shell words of a hook command, honouring single quotes
-/// (the only quoting `hook_command` emits). Enough to recognise our own
-/// output whatever the binary path contains; not a general shell parser.
-fn first_two_words(command: &str) -> Option<(String, String)> {
+struct ShellWord {
+    text: String,
+    /// The word was single-quoted, so it is a literal even when its text
+    /// looks like a redirect or an operator.
+    quoted: bool,
+}
+
+/// Shell words of a hook command, honouring single quotes (the only quoting
+/// `hook_command` emits). An unquoted `#` starts a comment and ends the
+/// scan. Outside quotes a backslash escapes the next character — this is
+/// how `shell_quote` spells a literal quote (`'\''`). Not a general shell
+/// parser.
+fn shell_words(command: &str) -> Vec<ShellWord> {
     let mut words = Vec::new();
     let mut cur = String::new();
     let mut in_quote = false;
+    let mut quoted = false;
     let mut chars = command.chars();
     while let Some(c) = chars.next() {
         match c {
-            '\'' => in_quote = !in_quote,
-            // Outside quotes a backslash escapes the next character — this is
-            // how `shell_quote` spells a literal quote (`'\''`).
+            '\'' => {
+                in_quote = !in_quote;
+                quoted = true;
+            }
             '\\' if !in_quote => {
                 if let Some(next) = chars.next() {
                     cur.push(next);
                 }
             }
             c if c.is_whitespace() && !in_quote => {
-                if !cur.is_empty() {
-                    words.push(std::mem::take(&mut cur));
-                    if words.len() == 2 {
-                        break;
-                    }
+                if !cur.is_empty() || quoted {
+                    words.push(ShellWord {
+                        text: std::mem::take(&mut cur),
+                        quoted,
+                    });
+                    quoted = false;
                 }
             }
+            '#' if !in_quote && cur.is_empty() && !quoted => break,
             c => cur.push(c),
         }
     }
-    if !cur.is_empty() && words.len() < 2 {
-        words.push(cur);
+    if !cur.is_empty() || quoted {
+        words.push(ShellWord { text: cur, quoted });
     }
-    let mut it = words.into_iter();
-    Some((it.next()?, it.next()?))
+    words
+}
+
+/// The first two shell words of a hook command. Enough to recognise our own
+/// output whatever the binary path contains.
+fn first_two_words(command: &str) -> Option<(String, String)> {
+    let words = shell_words(command);
+    Some((words.first()?.text.clone(), words.get(1)?.text.clone()))
+}
+
+/// An unquoted word that is a shell operator or a redirect, not a path.
+fn is_operator_or_redirect(word: &str) -> bool {
+    matches!(
+        word,
+        "|" | "||" | "&" | "&&" | ";" | ";;" | "|&" | "(" | ")"
+    ) || is_redirect(word)
+}
+
+/// `>`, `2>`, `2>&1`, `&>`, and the same forms with a target glued on.
+fn is_redirect(word: &str) -> bool {
+    if word.is_empty() {
+        return false;
+    }
+    if word.starts_with("&>") {
+        return true;
+    }
+    let rest = word.trim_start_matches(|c: char| c.is_ascii_digit());
+    rest.starts_with('>') || rest.starts_with('<')
+}
+
+fn is_root_flag(word: &str) -> bool {
+    word == "--pulse-root"
+        || word == "--entity-root"
+        || word.starts_with("--pulse-root=")
+        || word.starts_with("--entity-root=")
 }
 
 /// Is this command a recall-echo `sub` invocation? Anchored: the *first*
@@ -528,16 +574,35 @@ pub(super) fn legacy_home_links(pulse_root: &Path, home: &Path) -> Vec<PathBuf> 
 
 /// Whether `command` names a pulse root. The repair message uses this to
 /// choose its wording; a rooted `consume` is still reported.
+///
+/// `consume` takes the root as the next positional word. A comment (`#`),
+/// a redirect (`>`, `2>`, `2>&1`, `&>`), or a shell operator in that
+/// position is not a root. Other subcommands carry a root only when
+/// `--pulse-root` or `--entity-root` is its own word, not a substring.
 fn command_carries_root(command: &str) -> bool {
-    if command.contains("--pulse-root") || command.contains("--entity-root") {
-        return true;
+    let words = shell_words(command);
+    let Some(bin) = words.first() else {
+        return false;
+    };
+    let Some(sub) = words.get(1) else {
+        return false;
+    };
+    let recall = Path::new(&bin.text)
+        .file_name()
+        .is_some_and(|name| name == "recall-echo");
+    if !recall {
+        return false;
     }
-    is_recall_command(command, "consume")
-        && command
-            .split_whitespace()
-            .skip_while(|w| *w != "consume")
-            .nth(1)
-            .is_some_and(|arg| !arg.starts_with(['|', '&', ';', '>', '<']))
+    if sub.text == "consume" {
+        if let Some(next) = words.get(2) {
+            if next.quoted || !is_operator_or_redirect(&next.text) {
+                return true;
+            }
+        }
+    }
+    words
+        .iter()
+        .any(|word| !word.quoted && is_root_flag(&word.text))
 }
 
 /// recall-echo hook commands in the user-level `$HOME/.claude/settings.json`
@@ -1126,6 +1191,74 @@ mod tests {
             vec!["recall-echo consume || true".to_string()]
         );
         assert!(!user_hooks_missing_root(home.path())[0].carries_root);
+    }
+
+    #[test]
+    fn redirects_comments_and_operators_are_not_a_root() {
+        let rootless = [
+            "recall-echo consume 2>/dev/null",
+            "recall-echo consume 2>&1",
+            "recall-echo consume &>/dev/null",
+            "recall-echo consume >/dev/null",
+            "recall-echo consume > /dev/null",
+            "recall-echo consume # comment",
+            "recall-echo consume # --pulse-root",
+            "recall-echo consume || true",
+            "recall-echo consume && true",
+            "recall-echo consume | cat",
+            "recall-echo consume &",
+            "recall-echo consume ; echo hi",
+            "recall-echo archive-session # --pulse-root",
+            "recall-echo checkpoint --trigger precompact # --pulse-root /e",
+            "recall-echo archive-session --not-pulse-root",
+        ];
+        for command in rootless {
+            assert!(!command_carries_root(command), "{command}");
+        }
+        let rooted = [
+            "recall-echo consume '/srv/e'",
+            "/usr/local/bin/recall-echo consume '/srv/pulse-a'",
+            "recall-echo consume /srv/e",
+            "recall-echo consume '/srv/e' || true",
+            "recall-echo consume '2>/dev/null'",
+            "recall-echo archive-session --pulse-root '/srv/e'",
+            "recall-echo archive-session --entity-root '/srv/e'",
+            "recall-echo checkpoint --trigger precompact --pulse-root=/srv/e",
+            "'/opt/my tools/recall-echo' consume '/e'",
+        ];
+        for command in rooted {
+            assert!(command_carries_root(command), "{command}");
+        }
+    }
+
+    #[test]
+    fn user_level_redirect_and_comment_consume_are_rootless() {
+        let home = tempfile::tempdir().unwrap();
+        let claude = home.path().join(".claude");
+        std::fs::create_dir_all(&claude).unwrap();
+        let original = serde_json::json!({
+            "hooks": {
+                "SessionStart": [{"hooks": [
+                    {"type": "command", "command": "recall-echo consume 2>/dev/null"},
+                    {"type": "command", "command": "recall-echo consume 2>&1"},
+                    {"type": "command", "command": "recall-echo consume &>/dev/null"},
+                    {"type": "command", "command": "recall-echo consume # --pulse-root"}
+                ]}]
+            }
+        })
+        .to_string();
+        std::fs::write(claude.join("settings.json"), &original).unwrap();
+
+        let found = user_hooks_missing_root(home.path());
+        assert_eq!(found.len(), 4, "{found:?}");
+        assert!(
+            found.iter().all(|hook| hook.consume && !hook.carries_root),
+            "{found:?}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(claude.join("settings.json")).unwrap(),
+            original
+        );
     }
 
     #[test]

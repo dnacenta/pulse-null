@@ -208,4 +208,26 @@ mod tests {
             "{text}"
         );
     }
+
+    #[test]
+    fn rootless_consume_warning_names_the_working_directory() {
+        let warning = user_hook_warning(
+            "/home/u/.claude/settings.json",
+            &[ReportedUserHook {
+                command: "recall-echo consume 2>/dev/null".into(),
+                carries_root: false,
+                consume: true,
+            }],
+        );
+        let text = warning.details.join("\n");
+        assert!(text.contains("working directory"), "{text}");
+        assert!(
+            !text.contains("The path picks which file is printed"),
+            "{text}"
+        );
+        assert!(
+            text.contains("recall-echo init writes `<recall-bin> consume '<pulse-root>'`"),
+            "{text}"
+        );
+    }
 }
