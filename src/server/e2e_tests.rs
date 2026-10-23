@@ -1448,6 +1448,127 @@ async fn e2e_chat_stream_emits_delta_then_done() {
     assert_eq!(trunk_len(&state).await, 2);
 }
 
+/// SSE frames in arrival order: `(event name, data JSON)`.
+fn sse_frames(body: &str) -> Vec<(String, String)> {
+    let mut frames = Vec::new();
+    let mut name = None;
+    let mut data = String::new();
+    for line in body.lines() {
+        if let Some(rest) = line.strip_prefix("event:") {
+            name = Some(rest.trim().to_string());
+        } else if let Some(rest) = line.strip_prefix("data:") {
+            if !data.is_empty() {
+                data.push('\n');
+            }
+            data.push_str(rest.trim());
+        } else if line.is_empty() {
+            if let Some(event) = name.take() {
+                frames.push((event, std::mem::take(&mut data)));
+            }
+        }
+    }
+    frames
+}
+
+/// AC1: text, a tool call, then the final message. The boundary sits before
+/// the tool status, and the last message is a segment with `tool: false`.
+#[tokio::test]
+async fn e2e_chat_stream_segments_around_tool_round() {
+    let dir = tempfile::tempdir().unwrap();
+    let provider = MockProvider::new(vec![
+        LlmResponse {
+            content: vec![
+                ContentBlock::Text {
+                    text: "I'll look.".to_string(),
+                },
+                ContentBlock::ToolUse {
+                    id: "tu_1".to_string(),
+                    name: "file_read".to_string(),
+                    input: serde_json::json!({ "path": "a.txt" }),
+                },
+            ],
+            stop_reason: StopReason::ToolUse,
+            model: "mock-model".to_string(),
+            input_tokens: Some(10),
+            output_tokens: Some(4),
+        },
+        LlmResponse {
+            content: vec![ContentBlock::Text {
+                text: "Found it.".to_string(),
+            }],
+            stop_reason: StopReason::EndTurn,
+            model: "mock-model".to_string(),
+            input_tokens: Some(12),
+            output_tokens: Some(3),
+        },
+    ]);
+    let state = build_state_in(dir.path().to_path_buf(), provider, ToolRegistry::new()).await;
+    let app = build_app(state);
+
+    let response = post_chat_stream(&app, "read a.txt").await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let frames = sse_frames(&String::from_utf8_lossy(&bytes));
+    let trace: Vec<String> = frames
+        .iter()
+        .map(|(name, data)| match name.as_str() {
+            "delta" => format!("delta:{data}"),
+            "segment" => format!("segment:{data}"),
+            "status" => {
+                let v: serde_json::Value = serde_json::from_str(data).unwrap();
+                if v["status"] == "tool" {
+                    format!("tool:{}", v["name"].as_str().unwrap_or(""))
+                } else {
+                    format!("status:{}", v["status"].as_str().unwrap_or(""))
+                }
+            }
+            "done" => "done".to_string(),
+            other => other.to_string(),
+        })
+        .collect();
+    assert_eq!(
+        trace,
+        vec![
+            "status:thinking".to_string(),
+            "status:responding".to_string(),
+            r#"delta:{"text":"I'll look."}"#.to_string(),
+            r#"segment:{"index":0,"tool":true}"#.to_string(),
+            "tool:file_read".to_string(),
+            "status:thinking".to_string(),
+            "status:responding".to_string(),
+            r#"delta:{"text":"Found it."}"#.to_string(),
+            r#"segment:{"index":1,"tool":false}"#.to_string(),
+            "done".to_string(),
+        ],
+        "{trace:?}"
+    );
+}
+
+/// AC2: `POST /chat` for the same kind of turn stays the JSON it is today.
+#[tokio::test]
+async fn e2e_chat_body_unchanged() {
+    let provider = MockProvider::new(vec![LlmResponse {
+        content: vec![ContentBlock::Text {
+            text: "Hello from mock!".to_string(),
+        }],
+        stop_reason: StopReason::EndTurn,
+        model: "mock-model".to_string(),
+        input_tokens: Some(10),
+        output_tokens: Some(5),
+    }]);
+    let state = build_state(provider, ToolRegistry::new()).await;
+    let app = build_app(state);
+
+    let (status, body) = post_chat(&app, "Hello").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        body,
+        r#"{"response":"Hello from mock!","model":"mock-model","input_tokens":10,"output_tokens":5}"#
+    );
+}
+
 /// Dropping the SSE response mid-turn aborts the turn and rolls the user
 /// message back, exactly like a failed turn — no dangling user turn, no
 /// partial assistant message.

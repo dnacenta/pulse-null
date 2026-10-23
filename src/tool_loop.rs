@@ -135,6 +135,43 @@ pub enum TurnStatus {
 pub enum TurnEvent {
     Status(TurnStatus),
     Delta(String),
+    /// An assistant message ended. `index` counts from 0 within the turn.
+    /// `tool` is true when a tool call follows.
+    Segment {
+        index: u32,
+        tool: bool,
+    },
+    /// Text already sent on this turn is void.
+    ///
+    /// The chat handler sends this when a streamed draft is superseded.
+    /// Nothing constructs it until that path exists, and a binary crate
+    /// warns on an unbuilt variant.
+    #[allow(dead_code)]
+    Reset(crate::wire::ResetReason),
+}
+
+/// Counts `segment` events for one turn, and remembers when the provider
+/// reported the boundaries itself so the loop does not add a second set.
+struct Segments {
+    next: u32,
+    from_provider: bool,
+}
+
+impl Segments {
+    fn new() -> Self {
+        Self {
+            next: 0,
+            from_provider: false,
+        }
+    }
+
+    fn push(&mut self, sink: &TurnSink, tool: bool) {
+        let _ = sink.try_send(TurnEvent::Segment {
+            index: self.next,
+            tool,
+        });
+        self.next = self.next.saturating_add(1);
+    }
 }
 
 /// Sender half a streaming caller hands to the tool loop.
@@ -248,23 +285,48 @@ pub async fn invoke_with_tool_loop_streaming(
     };
     let tool_defs_ref = tool_defs.as_deref();
     let mut rs = RoundState::new();
+    let mut segments = Segments::new();
 
     loop {
         let _ = sink.try_send(TurnEvent::Status(TurnStatus::Thinking));
-        let result = stream_one_round(
+        let round = stream_one_round(
             provider,
             system_prompt,
             messages,
             max_tokens,
             tool_defs_ref,
             sink,
+            &mut segments,
         )
         .await?;
-        match finish_round(&mut rs, result, tools, messages, max_rounds).await {
-            RoundOutcome::Done(done) => return Ok(done),
-            RoundOutcome::Continue => {}
+        let tool_names = round.tool_names;
+        match finish_round(&mut rs, round.response, tools, messages, max_rounds).await {
+            RoundOutcome::Done(done) => {
+                // A provider that reported no boundaries and never called a
+                // tool stays `delta` then `done`, the same as before.
+                if !segments.from_provider && done.tool_rounds > 0 {
+                    segments.push(sink, false);
+                }
+                return Ok(done);
+            }
+            RoundOutcome::Continue => {
+                if !segments.from_provider {
+                    segments.push(sink, true);
+                }
+                for name in tool_names {
+                    let _ = sink.try_send(TurnEvent::Status(TurnStatus::Tool(name)));
+                }
+            }
         }
     }
+}
+
+/// One provider round as the stream delivered it.
+struct StreamedRound {
+    response: LlmResponse,
+    /// Tools the model asked for, held until the message boundary so a
+    /// client sees `segment` before `status tool`.
+    tool_names: Vec<String>,
 }
 
 /// Drive one provider round through its stream, forwarding progress to
@@ -276,11 +338,13 @@ async fn stream_one_round(
     max_tokens: u32,
     tool_defs: Option<&[serde_json::Value]>,
     sink: &TurnSink,
-) -> Result<LlmResponse, BoxError> {
+    segments: &mut Segments,
+) -> Result<StreamedRound, BoxError> {
     use tokio_stream::StreamExt as _;
 
     let mut stream = provider.invoke_streaming(system_prompt, messages, max_tokens, tool_defs);
     let mut responding = false;
+    let mut tool_names = Vec::new();
     while let Some(event) = stream.next().await {
         match event {
             StreamEvent::TextDelta(text) => {
@@ -291,9 +355,18 @@ async fn stream_one_round(
                 let _ = sink.try_send(TurnEvent::Delta(text));
             }
             StreamEvent::ToolUse { name, .. } => {
-                let _ = sink.try_send(TurnEvent::Status(TurnStatus::Tool(name)));
+                tool_names.push(name);
             }
-            StreamEvent::Done(response) => return Ok(response),
+            StreamEvent::SegmentEnd { tool_use } => {
+                segments.from_provider = true;
+                segments.push(sink, tool_use);
+            }
+            StreamEvent::Done(response) => {
+                return Ok(StreamedRound {
+                    response,
+                    tool_names,
+                });
+            }
             StreamEvent::Refused { model, detail } => {
                 return Err(Box::new(crate::errors::RefusalError { model, detail }));
             }
@@ -716,6 +789,76 @@ mod streaming_tests {
             })
             .collect();
         assert_eq!(joined, "the quick brown fox");
+        assert!(
+            events
+                .iter()
+                .all(|e| !matches!(e, TurnEvent::Segment { .. })),
+            "a round with no tool call and no provider boundary emits no segment: {events:?}"
+        );
+    }
+
+    fn tool_round(text: &str, name: &str) -> LlmResponse {
+        LlmResponse {
+            content: vec![
+                ContentBlock::Text { text: text.into() },
+                ContentBlock::ToolUse {
+                    id: "t1".into(),
+                    name: name.into(),
+                    input: serde_json::json!({}),
+                },
+            ],
+            stop_reason: StopReason::ToolUse,
+            model: "scripted".into(),
+            input_tokens: Some(1),
+            output_tokens: Some(1),
+        }
+    }
+
+    #[tokio::test]
+    async fn segments_mark_tool_rounds() {
+        let p = Scripted::new(
+            vec![tool_round("look ", "file_read"), end_turn("found")],
+            true,
+        );
+        let tools = ToolRegistry::new();
+        let (tx, mut rx) = tokio::sync::mpsc::channel(64);
+        let mut messages = vec![user("hi")];
+        invoke_with_tool_loop_streaming(&p, &tools, "sys", &mut messages, 100, 5, &tx)
+            .await
+            .unwrap();
+        drop(tx);
+
+        let mut events = Vec::new();
+        while let Some(e) = rx.recv().await {
+            events.push(e);
+        }
+        let marked: Vec<TurnEvent> = events
+            .into_iter()
+            .filter(|e| {
+                matches!(
+                    e,
+                    TurnEvent::Delta(_)
+                        | TurnEvent::Segment { .. }
+                        | TurnEvent::Status(TurnStatus::Tool(_))
+                )
+            })
+            .collect();
+        assert_eq!(
+            marked,
+            vec![
+                TurnEvent::Delta("look ".into()),
+                TurnEvent::Segment {
+                    index: 0,
+                    tool: true,
+                },
+                TurnEvent::Status(TurnStatus::Tool("file_read".into())),
+                TurnEvent::Delta("found".into()),
+                TurnEvent::Segment {
+                    index: 1,
+                    tool: false,
+                },
+            ]
+        );
     }
 
     #[tokio::test]

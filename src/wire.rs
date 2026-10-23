@@ -18,6 +18,16 @@ pub enum TurnPhase {
     Responding,
 }
 
+/// Why already-streamed text is being superseded.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ResetReason {
+    /// A refusal fallback replaced a draft that had already been streamed.
+    Fallback,
+    /// The hallucination guard cut the reply short.
+    Guard,
+}
+
 /// One server-sent event of `POST /api/chat/stream`. On the wire the tag is
 /// the SSE event name and the content is its `data:` JSON.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -31,6 +41,17 @@ pub enum ChatStreamEvent {
     /// Best-effort, unvalidated text as the provider yields it.
     Delta {
         text: String,
+    },
+    /// An assistant message ended. `index` counts from 0 within the turn.
+    /// `tool` is true when a tool call follows this message.
+    Segment {
+        index: u32,
+        tool: bool,
+    },
+    /// Text already streamed on this turn is void. A speech client drops
+    /// what it has not yet said.
+    Reset {
+        reason: ResetReason,
     },
     /// The validated, complete reply. Always replaces what streamed.
     Done {
@@ -377,6 +398,16 @@ mod tests {
                 name: Some("file_read".into()),
             },
             ChatStreamEvent::Delta { text: "hi".into() },
+            ChatStreamEvent::Segment {
+                index: 0,
+                tool: true,
+            },
+            ChatStreamEvent::Reset {
+                reason: ResetReason::Fallback,
+            },
+            ChatStreamEvent::Reset {
+                reason: ResetReason::Guard,
+            },
             ChatStreamEvent::Done {
                 text: "hi there".into(),
                 model: "m".into(),

@@ -429,10 +429,10 @@ fn sse_event(ev: &crate::wire::ChatStreamEvent) -> Event {
         .unwrap_or_else(|_| Event::default().event(name).data("{}"))
 }
 
-/// Encode one turn event for the wire.
-fn turn_event_to_sse(event: TurnEvent) -> Event {
+/// Encode one turn event as the shared wire type.
+fn turn_event_to_wire(event: TurnEvent) -> crate::wire::ChatStreamEvent {
     use crate::wire::{ChatStreamEvent, TurnPhase};
-    let ev = match event {
+    match event {
         TurnEvent::Status(TurnStatus::Thinking) => ChatStreamEvent::Status {
             status: TurnPhase::Thinking,
             name: None,
@@ -446,8 +446,14 @@ fn turn_event_to_sse(event: TurnEvent) -> Event {
             name: Some(name),
         },
         TurnEvent::Delta(text) => ChatStreamEvent::Delta { text },
-    };
-    sse_event(&ev)
+        TurnEvent::Segment { index, tool } => ChatStreamEvent::Segment { index, tool },
+        TurnEvent::Reset(reason) => ChatStreamEvent::Reset { reason },
+    }
+}
+
+/// Encode one turn event for the wire.
+fn turn_event_to_sse(event: TurnEvent) -> Event {
+    sse_event(&turn_event_to_wire(event))
 }
 
 fn done_to_sse(resp: ChatResponse) -> Event {
@@ -471,7 +477,9 @@ fn error_to_sse(status: StatusCode, message: String) -> Event {
 /// `POST /api/chat/stream` — the same turn as [`chat`], delivered as SSE.
 ///
 /// Events: `status {status: thinking|responding|tool, name?}`, `delta {text}`
-/// (as the provider yields them; the client coalesces), then exactly one of
+/// (as the provider yields them; the client coalesces), `segment {index, tool}`
+/// when an assistant message ends and the server knows whether a tool call
+/// follows, then exactly one of
 /// `done {text, model, tokens_in, tokens_out, isolation, truncated}` or
 /// `error {status, message}`. Dropping the connection aborts the turn: the
 /// provider child is killed and the user message is rolled back.
@@ -1026,6 +1034,33 @@ mod channel_style_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn segment_and_reset_map_onto_the_wire() {
+        use crate::wire::{ChatStreamEvent, ResetReason};
+        assert_eq!(
+            turn_event_to_wire(TurnEvent::Segment {
+                index: 2,
+                tool: false,
+            }),
+            ChatStreamEvent::Segment {
+                index: 2,
+                tool: false,
+            }
+        );
+        assert_eq!(
+            turn_event_to_wire(TurnEvent::Reset(ResetReason::Guard)),
+            ChatStreamEvent::Reset {
+                reason: ResetReason::Guard,
+            }
+        );
+        assert_eq!(
+            turn_event_to_wire(TurnEvent::Reset(ResetReason::Fallback)),
+            ChatStreamEvent::Reset {
+                reason: ResetReason::Fallback,
+            }
+        );
+    }
 
     #[test]
     fn owner_prompt_unchanged() {
