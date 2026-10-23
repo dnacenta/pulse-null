@@ -7,7 +7,7 @@
 
 use std::path::{Path, PathBuf};
 
-use crate::cli_provider::adapter::ReportedUserHook;
+use crate::cli_provider::adapter::{ReportedUserHook, UserHookScan};
 use crate::init::agent_bootstrap::{
     ensure_config, ensure_dir, find_recall_echo_bin, read_small_file, shell_quote,
     write_regular_file, BootstrapItem, ItemKind, ItemStatus,
@@ -684,19 +684,26 @@ pub(super) fn verify_files(pulse_root: &Path) -> Vec<BootstrapItem> {
             });
         }
         // User-level consume prints one pulse's EPHEMERAL.md into every
-        // Claude Code session. The file stays untouched; verify is not
-        // clean while the hook is there.
-        if user_hooks_missing_root(&home)
-            .iter()
-            .any(|hook| hook.consume)
-        {
-            items.push(BootstrapItem {
-                path: home.join(".claude/settings.json"),
-                kind: ItemKind::ConfigFile,
-                status: ItemStatus::Wrong(
-                    "user-level consume still runs in every session; the path picks which file is printed but does not limit which sessions the hook runs in. recall-echo init writes `<recall-bin> consume '<pulse-root>'` — remove that hook by hand".into(),
-                ),
-            });
+        // Claude Code session. The file stays untouched. A file that cannot
+        // be inspected is not clean either: verify names the file and why.
+        match user_hooks_missing_root(&home) {
+            UserHookScan::NotInspected { path, reason } => {
+                items.push(BootstrapItem {
+                    path,
+                    kind: ItemKind::ConfigFile,
+                    status: ItemStatus::Wrong(format!("not inspected: {reason}")),
+                });
+            }
+            UserHookScan::Inspected(hooks) if hooks.iter().any(|hook| hook.consume) => {
+                items.push(BootstrapItem {
+                    path: home.join(".claude/settings.json"),
+                    kind: ItemKind::ConfigFile,
+                    status: ItemStatus::Wrong(
+                        "user-level consume still runs in every session; the path picks which file is printed but does not limit which sessions the hook runs in. recall-echo init writes `<recall-bin> consume '<pulse-root>'` — remove that hook by hand".into(),
+                    ),
+                });
+            }
+            UserHookScan::Inspected(_) => {}
         }
     }
 
@@ -765,6 +772,37 @@ fn command_carries_root(command: &str) -> bool {
         .any(|word| !word.quoted && is_root_flag(&word.text))
 }
 
+/// Read the user-level settings file. A symlink is followed only when its
+/// target canonicalises to a path under `home`; the target is then opened
+/// without following a further link. The file is never written.
+fn read_user_level_settings(home: &Path) -> Result<Option<String>, String> {
+    let path = home.join(".claude/settings.json");
+    let meta = match path.symlink_metadata() {
+        Ok(meta) => meta,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e.to_string()),
+    };
+    if !meta.file_type().is_symlink() {
+        return read_small_file(&path);
+    }
+    let link = std::fs::read_link(&path).map_err(|e| e.to_string())?;
+    let joined = if link.is_absolute() {
+        link
+    } else {
+        path.parent().unwrap_or(home).join(link)
+    };
+    let target = joined
+        .canonicalize()
+        .map_err(|e| format!("symlink target could not be resolved: {e}"))?;
+    let home_real = home
+        .canonicalize()
+        .map_err(|e| format!("home directory: {e}"))?;
+    if !target.starts_with(&home_real) {
+        return Err("symlink target is outside the home directory".into());
+    }
+    read_small_file(&target)
+}
+
 /// recall-echo hook commands in the user-level `$HOME/.claude/settings.json`
 /// that repair reports and does not edit.
 ///
@@ -773,14 +811,25 @@ fn command_carries_root(command: &str) -> bool {
 /// The path chooses which `memory/EPHEMERAL.md` is printed; Claude Code
 /// runs user-level hooks in every session, so the path does not limit
 /// which sessions the hook runs in. Other recall-echo hooks are reported
-/// only when they name no pulse root.
-pub(super) fn user_hooks_missing_root(home: &Path) -> Vec<ReportedUserHook> {
+/// only when they name no pulse root. A file that is present but cannot
+/// be read or parsed is [`UserHookScan::NotInspected`], not an empty list.
+pub(super) fn user_hooks_missing_root(home: &Path) -> UserHookScan {
     let path = home.join(".claude/settings.json");
-    let Ok(Some(text)) = read_small_file(&path) else {
-        return Vec::new();
+    let text = match read_user_level_settings(home) {
+        Ok(None) => return UserHookScan::Inspected(Vec::new()),
+        Ok(Some(text)) => text,
+        Err(reason) => {
+            return UserHookScan::NotInspected { path, reason };
+        }
     };
-    let Ok(doc) = serde_json::from_str::<serde_json::Value>(&text) else {
-        return Vec::new();
+    let doc = match serde_json::from_str::<serde_json::Value>(&text) {
+        Ok(doc) => doc,
+        Err(e) => {
+            return UserHookScan::NotInspected {
+                path,
+                reason: format!("not valid JSON: {e}"),
+            };
+        }
     };
     let mut found = Vec::new();
     if let Some(events) = doc["hooks"].as_object() {
@@ -810,7 +859,7 @@ pub(super) fn user_hooks_missing_root(home: &Path) -> Vec<ReportedUserHook> {
             }
         }
     }
-    found
+    UserHookScan::Inspected(found)
 }
 
 #[cfg(test)]
@@ -1055,8 +1104,17 @@ mod tests {
         );
     }
 
+    fn inspected(home: &Path) -> Vec<ReportedUserHook> {
+        match user_hooks_missing_root(home) {
+            UserHookScan::Inspected(hooks) => hooks,
+            UserHookScan::NotInspected { path, reason } => {
+                panic!("{} was not inspected: {reason}", path.display())
+            }
+        }
+    }
+
     fn reported_commands(home: &Path) -> Vec<String> {
-        let mut found: Vec<String> = user_hooks_missing_root(home)
+        let mut found: Vec<String> = inspected(home)
             .into_iter()
             .map(|hook| hook.command)
             .collect();
@@ -1092,7 +1150,7 @@ mod tests {
         .to_string();
         std::fs::write(claude.join("settings.json"), &original).unwrap();
 
-        let found = user_hooks_missing_root(home.path());
+        let found = inspected(home.path());
         assert_eq!(
             reported_commands(home.path()),
             vec![
@@ -1139,7 +1197,7 @@ mod tests {
         .to_string();
         std::fs::write(claude.join("settings.json"), &original).unwrap();
 
-        let found = user_hooks_missing_root(home.path());
+        let found = inspected(home.path());
         assert_eq!(found.len(), 1, "{found:?}");
         assert_eq!(found[0].command, command);
         assert!(found[0].consume && found[0].carries_root, "{found:?}");
@@ -1422,7 +1480,7 @@ mod tests {
             reported_commands(home.path()),
             vec!["recall-echo consume || true".to_string()]
         );
-        assert!(!user_hooks_missing_root(home.path())[0].carries_root);
+        assert!(!inspected(home.path())[0].carries_root);
     }
 
     #[test]
@@ -1481,7 +1539,7 @@ mod tests {
         .to_string();
         std::fs::write(claude.join("settings.json"), &original).unwrap();
 
-        let found = user_hooks_missing_root(home.path());
+        let found = inspected(home.path());
         assert_eq!(found.len(), 4, "{found:?}");
         assert!(
             found.iter().all(|hook| hook.consume && !hook.carries_root),
@@ -1919,5 +1977,147 @@ mod tests {
             "{\"hooks\":[],\"permissions\":{\"allow\":[\"Bash(ls:*)\"]}}",
             "hooks is not a JSON object",
         );
+    }
+
+    fn assert_user_file_not_inspected(home: &Path, reason_has: &str) {
+        let path = home.join(".claude/settings.json");
+        match user_hooks_missing_root(home) {
+            UserHookScan::NotInspected { path: got, reason } => {
+                assert_eq!(got, path);
+                assert!(reason.contains(reason_has), "{reason}");
+            }
+            other => panic!("expected not inspected, got {other:?}"),
+        }
+        let dir = pulse();
+        let root = dir.path().canonicalize().unwrap();
+        ensure_files(&root, "recall-echo");
+        let _home = override_home(home);
+        let items = verify_files(&root);
+        let user = items
+            .iter()
+            .find(|item| item.path == path)
+            .expect("verify records the user-level file");
+        let rendered = user.to_string();
+        assert!(rendered.contains(&path.display().to_string()), "{rendered}");
+        assert!(rendered.contains("not inspected"), "{rendered}");
+        assert!(rendered.contains(reason_has), "{rendered}");
+        assert!(
+            matches!(user.status, ItemStatus::Wrong(_)),
+            "verify looked clean: {user:?}"
+        );
+    }
+
+    #[test]
+    fn user_level_symlink_outside_home_is_not_inspected() {
+        let home = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let claude = home.path().join(".claude");
+        std::fs::create_dir_all(&claude).unwrap();
+        let foreign = outside.path().join("settings.json");
+        std::fs::write(
+            &foreign,
+            serde_json::json!({"hooks": {"SessionStart": [{"hooks": [
+                {"type": "command", "command": "/usr/local/bin/recall-echo consume '/srv/pulse-a'"}
+            ]}]}})
+            .to_string(),
+        )
+        .unwrap();
+        std::os::unix::fs::symlink(&foreign, claude.join("settings.json")).unwrap();
+        assert_user_file_not_inspected(home.path(), "outside the home directory");
+        assert!(std::fs::read_to_string(&foreign)
+            .unwrap()
+            .contains("consume"));
+    }
+
+    #[test]
+    fn user_level_non_regular_file_is_not_inspected() {
+        let home = tempfile::tempdir().unwrap();
+        let claude = home.path().join(".claude");
+        std::fs::create_dir_all(&claude).unwrap();
+        std::fs::create_dir(claude.join("settings.json")).unwrap();
+        assert_user_file_not_inspected(home.path(), "not a regular file");
+    }
+
+    #[test]
+    fn user_level_unreadable_settings_are_not_inspected() {
+        use std::os::unix::fs::PermissionsExt;
+        let home = tempfile::tempdir().unwrap();
+        let claude = home.path().join(".claude");
+        std::fs::create_dir_all(&claude).unwrap();
+        let path = claude.join("settings.json");
+        std::fs::write(&path, "{\"hooks\":{}}\n").unwrap();
+        let _restore = RestoreMode(path.clone());
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o0)).unwrap();
+        assert_user_file_not_inspected(home.path(), "Permission denied");
+    }
+
+    #[test]
+    fn user_level_oversize_settings_are_not_inspected() {
+        let home = tempfile::tempdir().unwrap();
+        let claude = home.path().join(".claude");
+        std::fs::create_dir_all(&claude).unwrap();
+        let path = claude.join("settings.json");
+        let file = std::fs::File::create(&path).unwrap();
+        file.set_len(1024 * 1024 + 1).unwrap();
+        assert_user_file_not_inspected(home.path(), "larger than");
+    }
+
+    #[test]
+    fn user_level_invalid_json_is_not_inspected() {
+        let home = tempfile::tempdir().unwrap();
+        let claude = home.path().join(".claude");
+        std::fs::create_dir_all(&claude).unwrap();
+        std::fs::write(claude.join("settings.json"), "{").unwrap();
+        assert_user_file_not_inspected(home.path(), "not valid JSON");
+    }
+
+    #[test]
+    fn user_level_symlink_under_home_reports_init_consume() {
+        let home = tempfile::tempdir().unwrap();
+        let claude = home.path().join(".claude");
+        std::fs::create_dir_all(&claude).unwrap();
+        let command = "/usr/local/bin/recall-echo consume '/srv/pulse-a'";
+        let original = serde_json::json!({
+            "hooks": {"SessionStart": [{
+                "matcher": "startup|resume",
+                "hooks": [{"type": "command", "command": command}]
+            }]}
+        })
+        .to_string();
+        let real = claude.join("real-settings.json");
+        std::fs::write(&real, &original).unwrap();
+        let link = claude.join("settings.json");
+        std::os::unix::fs::symlink("real-settings.json", &link).unwrap();
+
+        let found = inspected(home.path());
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert_eq!(found[0].command, command);
+        assert!(found[0].consume && found[0].carries_root, "{found:?}");
+        assert!(link.symlink_metadata().unwrap().file_type().is_symlink());
+        assert_eq!(std::fs::read_to_string(&real).unwrap(), original);
+
+        let dir = pulse();
+        let root = dir.path().canonicalize().unwrap();
+        ensure_files(&root, "recall-echo");
+        let _home = override_home(home.path());
+        let items = verify_files(&root);
+        let user = items.iter().find(|item| item.path == link).unwrap();
+        match &user.status {
+            ItemStatus::Wrong(reason) => {
+                assert!(reason.contains("consume"), "{reason}");
+                assert!(!reason.contains("not inspected"), "{reason}");
+            }
+            other => panic!("{other:?}"),
+        }
+        assert!(link.symlink_metadata().unwrap().file_type().is_symlink());
+        assert_eq!(std::fs::read_to_string(&real).unwrap(), original);
+    }
+
+    struct RestoreMode(PathBuf);
+    impl Drop for RestoreMode {
+        fn drop(&mut self) {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(&self.0, std::fs::Permissions::from_mode(0o644));
+        }
     }
 }

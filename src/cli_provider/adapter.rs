@@ -308,8 +308,10 @@ pub trait AgentIntegration: Send + Sync {
     /// Every `consume` hook is included. A positional root picks which file
     /// that hook prints; it does not limit which sessions run the hook.
     /// Other hooks are included only when they name no pulse root.
-    fn user_hooks_missing_root(&self, _home: &Path) -> Vec<ReportedUserHook> {
-        Vec::new()
+    /// A file that cannot be inspected is [`UserHookScan::NotInspected`],
+    /// never an empty list.
+    fn user_hooks_missing_root(&self, _home: &Path) -> UserHookScan {
+        UserHookScan::Inspected(Vec::new())
     }
 }
 
@@ -323,4 +325,12 @@ pub struct ReportedUserHook {
     pub carries_root: bool,
     /// True when the command is a recall-echo `consume` hook.
     pub consume: bool,
+}
+
+/// Result of reading the user-level hook file. Absence is `Inspected` with
+/// an empty list. A present file that cannot be read or parsed is not clean.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum UserHookScan {
+    Inspected(Vec<ReportedUserHook>),
+    NotInspected { path: PathBuf, reason: String },
 }

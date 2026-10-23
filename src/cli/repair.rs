@@ -1,6 +1,8 @@
 use console::style;
 
-use crate::cli_provider::adapter::ReportedUserHook;
+use std::path::Path;
+
+use crate::cli_provider::adapter::{ReportedUserHook, UserHookScan};
 use crate::config::Config;
 use crate::init::agent_bootstrap::{self, printable, ItemStatus};
 
@@ -87,21 +89,31 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
 
-        let stale = integration.user_hooks_missing_root(&home);
-        if !stale.is_empty() {
-            let settings = integration
-                .user_hooks_location(&home)
-                .map(|p| p.display().to_string())
-                .unwrap_or_else(|| "the user-level hook file".to_string());
-            let warning = user_hook_warning(&settings, &stale);
-            println!();
-            println!("  {} {}", style("⚠").yellow(), warning.headline);
-            for line in &warning.details {
-                println!("    {line}");
+        match integration.user_hooks_missing_root(&home) {
+            UserHookScan::NotInspected { path, reason } => {
+                println!();
+                println!(
+                    "  {} {}",
+                    style("⚠").yellow(),
+                    user_level_not_inspected_line(&path, &reason)
+                );
             }
-            for command in &warning.commands {
-                println!("      {}", printable(command));
+            UserHookScan::Inspected(stale) if !stale.is_empty() => {
+                let settings = integration
+                    .user_hooks_location(&home)
+                    .map(|p| p.display().to_string())
+                    .unwrap_or_else(|| "the user-level hook file".to_string());
+                let warning = user_hook_warning(&settings, &stale);
+                println!();
+                println!("  {} {}", style("⚠").yellow(), warning.headline);
+                for line in &warning.details {
+                    println!("    {line}");
+                }
+                for command in &warning.commands {
+                    println!("      {}", printable(command));
+                }
             }
+            UserHookScan::Inspected(_) => {}
         }
     }
 
@@ -142,6 +154,10 @@ struct UserHookWarning {
 /// `recall-echo init` writes `<recall-bin> consume '<pulse-root>'`, and that
 /// path picks which file is printed without limiting which sessions run the
 /// hook. A hook that names no root gets the working-directory sentence.
+fn user_level_not_inspected_line(path: &Path, reason: &str) -> String {
+    format!("{} was not inspected: {reason}", path.display())
+}
+
 fn user_hook_warning(settings: &str, hooks: &[ReportedUserHook]) -> UserHookWarning {
     let mut details = Vec::new();
     if hooks.iter().any(|h| h.consume) {
@@ -229,5 +245,19 @@ mod tests {
             text.contains("recall-echo init writes `<recall-bin> consume '<pulse-root>'`"),
             "{text}"
         );
+    }
+
+    #[test]
+    fn not_inspected_line_names_the_file_and_the_reason() {
+        let line = user_level_not_inspected_line(
+            Path::new("/home/u/.claude/settings.json"),
+            "symlink target is outside the home directory",
+        );
+        assert!(line.contains("/home/u/.claude/settings.json"), "{line}");
+        assert!(
+            line.contains("symlink target is outside the home directory"),
+            "{line}"
+        );
+        assert!(line.contains("was not inspected"), "{line}");
     }
 }
