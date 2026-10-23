@@ -242,7 +242,7 @@ Consult it. Reference it. Let it guide your responses.
 
 You have a persistent memory system:
 - memory/MEMORY.md — your curated knowledge (always in context)
-- memory/EPHEMERAL.md — session summaries (consumed at start, written at end)
+- memory/EPHEMERAL.md — session summaries (loaded into chat by the runtime, written at session end)
 - memory/ARCHIVE.md — index of long-term archive logs
 
 Use your memory. Build on previous conversations. You are not starting fresh.

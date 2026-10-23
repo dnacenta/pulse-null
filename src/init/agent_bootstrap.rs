@@ -36,6 +36,9 @@ pub enum ItemStatus {
     /// Existed with other content and was brought up to date (settings.json
     /// merge, absolute → relative symlink).
     Updated,
+    /// Brought up to date, and a reason that still needs a person. Repair
+    /// prints the reason on the same run as the edit.
+    UpdatedWithWarning(String),
     Exists,
     Missing,
     Wrong(String),
@@ -46,6 +49,7 @@ impl fmt::Display for BootstrapItem {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let icon = match &self.status {
             ItemStatus::Created | ItemStatus::Updated => "\x1b[32m✓\x1b[0m",
+            ItemStatus::UpdatedWithWarning(_) => "\x1b[33m⚠\x1b[0m",
             ItemStatus::Exists => "\x1b[2m·\x1b[0m",
             ItemStatus::Missing => "\x1b[33m✗\x1b[0m",
             ItemStatus::Wrong(_) => "\x1b[33m✗\x1b[0m",
@@ -54,6 +58,7 @@ impl fmt::Display for BootstrapItem {
         let detail = match &self.status {
             ItemStatus::Created => " created".to_string(),
             ItemStatus::Updated => " updated".to_string(),
+            ItemStatus::UpdatedWithWarning(reason) => format!(" updated: {reason}"),
             ItemStatus::Exists => " ok".to_string(),
             ItemStatus::Missing => " missing".to_string(),
             ItemStatus::Wrong(reason) => format!(" wrong: {reason}"),

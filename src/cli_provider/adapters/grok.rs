@@ -28,7 +28,7 @@ use serde_json::Value;
 
 use crate::cli_provider::adapter::{
     assistant_message_end, AgentIntegration, CliAdapter, Invocation, OutputMode, PromptDelivery,
-    Reply, StreamLine, SystemPromptDelivery, Usage,
+    Reply, StreamLine, SystemPromptDelivery, Usage, UserHookScan,
 };
 use crate::init::agent_bootstrap::{ensure_config, BootstrapItem, ItemKind, ItemStatus};
 use crate::tool_surface::ToolSurface;
@@ -331,7 +331,7 @@ impl AgentIntegration for Grok {
             .user_hooks_location(home)
     }
 
-    fn user_hooks_missing_root(&self, home: &Path) -> Vec<String> {
+    fn user_hooks_missing_root(&self, home: &Path) -> UserHookScan {
         super::claude::Claude
             .integration()
             .user_hooks_missing_root(home)
