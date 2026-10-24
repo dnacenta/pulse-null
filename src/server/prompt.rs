@@ -1481,7 +1481,7 @@ const MAX_PULSE_RULE_FILES: usize = 32;
 /// [`MAX_RULE_FILE_BYTES`] of a file are read; a longer one is truncated with
 /// a marker. The pulse's own rules are also held to [`MAX_PULSE_RULE_FILES`]
 /// files, to [`PULSE_RULES_MAX_BYTES`] read in total, and to files with one
-/// link that the running user owns.
+/// link that the running user or root owns.
 fn load_rule_files(
     dir: &Path,
     exclude: &[&str],
@@ -1560,7 +1560,8 @@ fn load_rule_files(
 }
 
 /// Read one rule file: a regular file only, at most [`MAX_RULE_FILE_BYTES`].
-/// A pulse rule must also have a single link and belong to the running user.
+/// A pulse rule must also have a single link and belong to the running user
+/// or to root. The mode is not consulted.
 fn read_rule_file(path: &Path, source: RulesSource) -> Result<String, String> {
     use std::io::Read;
     use std::os::unix::fs::MetadataExt;
@@ -1573,7 +1574,7 @@ fn read_rule_file(path: &Path, source: RulesSource) -> Result<String, String> {
         }
         // SAFETY: geteuid has no preconditions and cannot fail.
         let me = unsafe { libc::geteuid() };
-        if meta.uid() != me {
+        if !pulse_rule_owner_ok(meta.uid(), me) {
             return Err("not owned by the running user".into());
         }
     }
@@ -1591,6 +1592,14 @@ fn read_rule_file(path: &Path, source: RulesSource) -> Result<String, String> {
         return Ok(truncate_to_byte_cap(&text, MAX_RULE_FILE_BYTES));
     }
     Ok(text.into_owned())
+}
+
+/// A pulse rule may be owned by the user running the process, or by root.
+/// Any other uid is rejected. Mode is not an input: a world-writable file
+/// is still read when the owner is one of those two.
+#[must_use]
+fn pulse_rule_owner_ok(file_uid: u32, running_uid: u32) -> bool {
+    file_uid == running_uid || file_uid == 0
 }
 
 // ---------------------------------------------------------------------------
@@ -2870,6 +2879,53 @@ mod tests {
         let loaded = load_rule_files(&rules, &[], RulesSource::Pulse).unwrap();
         let names: Vec<&str> = loaded.iter().map(|(n, _)| n.as_str()).collect();
         assert_eq!(names, ["a-first", "recall-echo", "self-work"]);
+    }
+
+    #[test]
+    fn pulse_rule_owner_accepts_the_running_user_and_root_only() {
+        let running = 4_242;
+        assert!(pulse_rule_owner_ok(running, running));
+        assert!(pulse_rule_owner_ok(0, running));
+        assert!(!pulse_rule_owner_ok(running.wrapping_add(1), running));
+    }
+
+    #[test]
+    fn a_pulse_rule_with_more_than_one_link_is_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("rule.md");
+        std::fs::write(&path, "LINKED").unwrap();
+        std::fs::hard_link(&path, dir.path().join("other.md")).unwrap();
+        let err = read_rule_file(&path, RulesSource::Pulse).unwrap_err();
+        assert_eq!(err, "has more than one link");
+    }
+
+    /// Mode is not a rule. A world-writable file is read when its owner is
+    /// the running user or root. chown to root is attempted so the read path
+    /// itself sees uid 0 when this process is allowed to; otherwise the
+    /// predicate above is what accepts root.
+    #[test]
+    fn a_world_writable_root_owned_rule_is_still_read() {
+        use std::os::unix::ffi::OsStrExt;
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        // SAFETY: geteuid has no preconditions and cannot fail.
+        let me = unsafe { libc::geteuid() };
+        assert!(pulse_rule_owner_ok(0, me));
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("open.md");
+        std::fs::write(&path, "WORLD-WRITABLE-RULE").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o666)).unwrap();
+        let c_path = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
+        // SAFETY: `c_path` is a NUL-terminated path. gid -1 leaves the group unchanged.
+        let _ = unsafe { libc::chown(c_path.as_ptr(), 0, u32::MAX) };
+        let meta = std::fs::metadata(&path).unwrap();
+        assert_eq!(meta.permissions().mode() & 0o777, 0o666);
+        assert!(
+            pulse_rule_owner_ok(meta.uid(), me),
+            "uid {} is not an accepted owner",
+            meta.uid()
+        );
+        let text = read_rule_file(&path, RulesSource::Pulse).unwrap();
+        assert_eq!(text, "WORLD-WRITABLE-RULE");
     }
 
     /// E3-2: when `.claude` or `.claude/rules` is itself a symlink, the
