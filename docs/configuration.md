@@ -67,8 +67,8 @@ Every key:
 | `graph` | `extract_daily_token_budget` | init: `2000000` | Extraction token cap per UTC day (`0` = none) |
 | `context_buffer` | `pulse_filter` | `true` | On shared channels, drop other pulses' messages from context |
 | `tui` | `theme`, `motion`, `nerd_font` | `gruvbox`, `full`, `auto` | See [tui.md](tui.md) |
-| `plugin_turns` | `daily_turns` | `500` | Guest turns per plugin, and HTTP voice turns as their own day, per UTC day; the owner's turns don't count; in memory, so a restart starts the day again (`0` = no cap) |
-| `plugin_turns` | `voice_turns_per_call` | `60` | Turns one voice call may take, per plugin and for HTTP voice turns as their own (`0` = no cap) |
+| `plugin_turns` | `daily_turns` | `150` | Guest turns per plugin, and HTTP voice turns as their own day, per UTC day; counted in memory, so a restart starts the day again; the owner's turns don't count (`0` = no cap) |
+| `plugin_turns` | `voice_turns_per_call` | `20` | Turns one voice call may take, per plugin and for HTTP voice turns as their own (`0` = no cap) |
 | `plugin_turns` | `guest_burst`, `guest_per_minute` | `5`, `6` | Per-sender token bucket for text-channel guests, per plugin (`guest_burst = 0` = no bucket). HTTP voice turns are calls on their own ledger, not this bucket |
 | `probe` | `enabled` | `false` | Growth-record probe runs ([methods](methods/probe-runner.md)) |
 | `probe` | `cadence` | `max` | `max`: due Mon/Wed/Fri · `pro`: every 14 days |

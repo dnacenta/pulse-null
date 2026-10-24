@@ -91,8 +91,8 @@ pub struct PluginTurnsConfig {
 impl Default for PluginTurnsConfig {
     fn default() -> Self {
         Self {
-            daily_turns: 500,
-            voice_turns_per_call: 60,
+            daily_turns: 150,
+            voice_turns_per_call: 20,
             guest_burst: 5,
             guest_per_minute: 6.0,
         }
@@ -1682,8 +1682,8 @@ mod plugin_turns_config_tests {
     fn a_missing_section_takes_the_defaults() {
         let cfg: PluginTurnsConfig = toml::from_str("").unwrap();
         assert_eq!(cfg, PluginTurnsConfig::default());
-        assert_eq!(cfg.daily_turns, 500);
-        assert_eq!(cfg.voice_turns_per_call, 60);
+        assert_eq!(cfg.daily_turns, 150);
+        assert_eq!(cfg.voice_turns_per_call, 20);
         assert_eq!(cfg.guest_burst, 5);
         assert!((cfg.guest_per_minute - 6.0).abs() < f64::EPSILON);
     }
@@ -1692,7 +1692,7 @@ mod plugin_turns_config_tests {
     fn one_key_overrides_and_the_rest_default() {
         let cfg: PluginTurnsConfig = toml::from_str("daily_turns = 0\n").unwrap();
         assert_eq!(cfg.daily_turns, 0);
-        assert_eq!(cfg.voice_turns_per_call, 60);
+        assert_eq!(cfg.voice_turns_per_call, 20);
     }
 
     #[test]
