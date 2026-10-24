@@ -28,6 +28,10 @@ pub enum ResetReason {
     Guard,
     /// Held speech crossed the turn's output budget and was discarded.
     Budget,
+    /// Speech already left, then the turn was declined.
+    Refusal,
+    /// Speech already left, then the turn failed.
+    Error,
 }
 
 /// One server-sent event of `POST /api/chat/stream`. On the wire the tag is
@@ -159,6 +163,8 @@ fn reset_name(reason: ResetReason) -> &'static str {
         ResetReason::Fallback => "fallback",
         ResetReason::Guard => "guard",
         ResetReason::Budget => "budget",
+        ResetReason::Refusal => "refusal",
+        ResetReason::Error => "error",
     }
 }
 
@@ -494,6 +500,12 @@ mod tests {
             ChatStreamEvent::Reset {
                 reason: ResetReason::Budget,
             },
+            ChatStreamEvent::Reset {
+                reason: ResetReason::Refusal,
+            },
+            ChatStreamEvent::Reset {
+                reason: ResetReason::Error,
+            },
             ChatStreamEvent::Done {
                 text: "hi there".into(),
                 model: "m".into(),
@@ -548,7 +560,7 @@ mod tests {
                 seen += 1;
             }
         }
-        assert_eq!(seen, 11, "every documented frame was checked");
+        assert_eq!(seen, 13, "every documented frame was checked");
     }
 
     #[test]

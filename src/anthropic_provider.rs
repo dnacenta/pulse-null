@@ -351,6 +351,8 @@ pub(crate) struct SseDecoder {
     input_tokens: Option<u32>,
     output_tokens: Option<u32>,
     stop_reason: StopReason,
+    /// A `message_delta` with a known stop reason was accepted.
+    saw_message_delta: bool,
     finished: bool,
 }
 
@@ -367,6 +369,7 @@ impl SseDecoder {
             input_tokens: None,
             output_tokens: None,
             stop_reason: StopReason::EndTurn,
+            saw_message_delta: false,
             finished: false,
         }
     }
@@ -419,6 +422,10 @@ impl SseDecoder {
 
         if data.is_empty() || event_type == "ping" {
             return None;
+        }
+
+        if event_type == "message_delta" {
+            return self.message_delta_event(&data);
         }
 
         let json: serde_json::Value = serde_json::from_str(&data).ok()?;
@@ -486,22 +493,13 @@ impl SseDecoder {
                 self.current_tool_input.clear();
                 Some(event)
             }
-            "message_delta" => {
-                let stop_reason = json["delta"]["stop_reason"].as_str();
-                let stop_details = &json["delta"]["stop_details"];
-                if let Some(refusal) = refusal_from(stop_reason, stop_details, &self.model) {
-                    warn_refusal(&refusal.model, stop_details);
-                    self.finished = true;
-                    return Some(StreamEvent::Refused {
-                        model: refusal.model,
-                        detail: refusal.detail,
-                    });
-                }
-                self.stop_reason = stop_reason_from(stop_reason);
-                self.output_tokens = json["usage"]["output_tokens"].as_u64().map(|v| v as u32);
-                None
-            }
             "message_stop" => {
+                if !self.saw_message_delta {
+                    self.finished = true;
+                    return Some(StreamEvent::Error(
+                        "stream ended without a stop reason".into(),
+                    ));
+                }
                 let response = streaming::assemble_response(
                     self.text_parts.clone(),
                     self.tool_uses.clone(),
@@ -514,6 +512,41 @@ impl SseDecoder {
             }
             _ => None,
         }
+    }
+
+    /// A broken or unknown `message_delta` ends the stream. A later
+    /// `message_stop` must not become a clean end of turn.
+    fn message_delta_event(&mut self, data: &str) -> Option<StreamEvent> {
+        let json: serde_json::Value = match serde_json::from_str(data) {
+            Ok(json) => json,
+            Err(_) => {
+                self.finished = true;
+                return Some(StreamEvent::Error("message_delta did not parse".into()));
+            }
+        };
+        let stop_reason = json["delta"]["stop_reason"].as_str();
+        let stop_details = &json["delta"]["stop_details"];
+        if let Some(refusal) = refusal_from(stop_reason, stop_details, &self.model) {
+            warn_refusal(&refusal.model, stop_details);
+            self.saw_message_delta = true;
+            self.finished = true;
+            return Some(StreamEvent::Refused {
+                model: refusal.model,
+                detail: refusal.detail,
+            });
+        }
+        let known = matches!(
+            stop_reason,
+            Some("end_turn" | "tool_use" | "max_tokens" | "stop_sequence")
+        );
+        if !known {
+            self.finished = true;
+            return Some(StreamEvent::Error("unknown stop reason".into()));
+        }
+        self.saw_message_delta = true;
+        self.stop_reason = stop_reason_from(stop_reason);
+        self.output_tokens = json["usage"]["output_tokens"].as_u64().map(|v| v as u32);
+        None
     }
 }
 
@@ -716,6 +749,34 @@ mod tests {
                 assert!(matches!(response.stop_reason, StopReason::EndTurn));
                 match &response.content[..] {
                     [ContentBlock::Text { text }] => assert_eq!(text, "Hello caf\u{e9}"),
+                    other => panic!("{other:?}"),
+                }
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn two_text_blocks_join_into_one_reply() {
+        let sse_text = format!(
+            "{}{}{}{}{}{}{}{}{}",
+            message_start("m", 4),
+            text_block_start(),
+            text_delta("Hello "),
+            block_stop(),
+            text_block_start(),
+            text_delta("there."),
+            block_stop(),
+            message_delta("end_turn", 2),
+            message_stop(),
+        );
+        let events = decode(&sse_text);
+        match &events[..] {
+            [StreamEvent::TextDelta(a), StreamEvent::TextDelta(b), StreamEvent::Done(response)] => {
+                assert_eq!(a, "Hello ");
+                assert_eq!(b, "there.");
+                match &response.content[..] {
+                    [ContentBlock::Text { text }] => assert_eq!(text, "Hello there."),
                     other => panic!("{other:?}"),
                 }
             }
@@ -959,5 +1020,106 @@ mod tests {
             [ContentBlock::Text { text }] => assert_eq!(text, "Hello"),
             other => panic!("{other:?}"),
         }
+    }
+
+    #[test]
+    fn message_delta_that_does_not_parse_is_an_error() {
+        let sse_text = format!(
+            "{}{}event: message_delta\ndata: {{not-json\n\n{}",
+            message_start("m", 4),
+            text_delta("Hello there, this is text."),
+            message_stop(),
+        );
+        let events = decode(&sse_text);
+        assert!(
+            matches!(events.last(), Some(StreamEvent::Error(message)) if message == "message_delta did not parse"),
+            "{events:?}"
+        );
+        assert!(
+            events
+                .iter()
+                .all(|event| !matches!(event, StreamEvent::Done(_))),
+            "{events:?}"
+        );
+    }
+
+    #[test]
+    fn known_stop_reasons_end_in_done() {
+        for raw in ["end_turn", "tool_use", "max_tokens", "stop_sequence"] {
+            let sse_text = format!(
+                "{}{}{}{}",
+                message_start("m", 4),
+                text_delta("Hello there, this is text."),
+                message_delta(raw, 3),
+                message_stop(),
+            );
+            let events = decode(&sse_text);
+            assert!(
+                events
+                    .iter()
+                    .all(|event| !matches!(event, StreamEvent::Error(_))),
+                "{raw}: {events:?}"
+            );
+            let Some(StreamEvent::Done(response)) = events.last() else {
+                panic!("{raw}: {events:?}");
+            };
+            assert!(
+                matches!(
+                    (&response.stop_reason, raw),
+                    (StopReason::EndTurn, "end_turn")
+                        | (StopReason::ToolUse, "tool_use")
+                        | (StopReason::MaxTokens, "max_tokens")
+                        | (StopReason::StopSequence, "stop_sequence")
+                ),
+                "{raw}: {:?}",
+                response.stop_reason
+            );
+        }
+    }
+
+    #[test]
+    fn unknown_stop_reason_is_an_error() {
+        let sse_text = format!(
+            "{}{}{}{}",
+            message_start("m", 4),
+            text_delta("Hello there, this is text."),
+            message_delta("pause", 3),
+            message_stop(),
+        );
+        let events = decode(&sse_text);
+        assert!(
+            matches!(events.last(), Some(StreamEvent::Error(message)) if message == "unknown stop reason"),
+            "{events:?}"
+        );
+        assert!(
+            events
+                .iter()
+                .all(|event| !matches!(event, StreamEvent::Done(_))),
+            "{events:?}"
+        );
+    }
+
+    #[test]
+    fn message_stop_without_message_delta_is_an_error() {
+        let sse_text = format!(
+            "{}{}{}",
+            message_start("m", 4),
+            text_delta("Hello there, this is text."),
+            message_stop(),
+        );
+        let events = decode(&sse_text);
+        assert!(
+            matches!(
+                events.last(),
+                Some(StreamEvent::Error(message)) if message == "stream ended without a stop reason"
+            ),
+            "{events:?}"
+        );
+        assert!(
+            events
+                .iter()
+                .all(|event| !matches!(event, StreamEvent::Done(_))),
+            "{events:?}"
+        );
     }
 }

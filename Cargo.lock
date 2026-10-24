@@ -4243,6 +4243,7 @@ dependencies = [
  "ratatui",
  "recall-echo",
  "regex",
+ "regex-automata",
  "reqwest",
  "response-validator",
  "serde",

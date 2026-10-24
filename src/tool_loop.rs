@@ -48,6 +48,17 @@ fn convert_from_rv(block: response_validator::ContentBlock) -> ContentBlock {
     }
 }
 
+/// Sanitized text blocks joined with nothing between them.
+fn text_blocks_concat(blocks: &[ContentBlock]) -> String {
+    let mut kept = String::new();
+    for block in blocks {
+        if let ContentBlock::Text { text } = block {
+            kept.push_str(text);
+        }
+    }
+    kept
+}
+
 /// Adapter: validate pulse_system_types ContentBlocks using the response-validator crate.
 pub fn validate_content_blocks_adapter(
     blocks: &[ContentBlock],
@@ -333,6 +344,11 @@ struct HeldSpeech {
     cap: usize,
     /// The cap was crossed. Further held text is dropped.
     overflowed: bool,
+    gate: crate::speech_gate::SpeechGate,
+    /// A clause from an earlier block or round was already spoken.
+    ever_released: bool,
+    /// `finish_cut` accepted the kept tail, so the caller must not reset.
+    cut_handled: bool,
 }
 
 /// A [`TurnSink`] that remembers whether any text delta was sent.
@@ -341,9 +357,9 @@ struct HeldSpeech {
 /// client may already have. Every send is `try_send`: a full or closed
 /// channel drops the event and never stalls the turn.
 ///
-/// A voice-pool sink holds the open segment's deltas (and any provider
-/// boundary) until [`Self::flush_held`]. A cut or a refusal calls
-/// [`Self::discard_held`] instead, so the raw tail never reaches the speaker.
+/// A voice-pool sink releases a clause once the guard can no longer cut it,
+/// and holds the rest of the open segment until [`Self::flush_held`]. A cut
+/// before any release, or a refusal, calls [`Self::discard_held`].
 pub struct ProgressSink {
     tx: TurnSink,
     saw_delta: std::sync::atomic::AtomicBool,
@@ -384,6 +400,9 @@ impl ProgressSink {
                 bytes: 0,
                 cap,
                 overflowed: false,
+                gate: crate::speech_gate::SpeechGate::new(),
+                ever_released: false,
+                cut_handled: false,
             })),
             control: None,
         }
@@ -422,7 +441,15 @@ impl ProgressSink {
                         return self.deliver(TurnEvent::Reset(crate::wire::ResetReason::Budget));
                     }
                     buf.bytes = next;
+                    let piece = buf.gate.push(&text, tokio::time::Instant::now());
+                    if piece.is_some() {
+                        buf.ever_released = true;
+                    }
                     buf.deltas.push(text);
+                    drop(held);
+                    if let Some(piece) = piece {
+                        self.deliver(TurnEvent::Delta(piece));
+                    }
                     return true;
                 }
                 TurnEvent::Segment { index, tool } => {
@@ -496,26 +523,132 @@ impl ProgressSink {
         }
     }
 
-    /// Forward the held segment. No-op when this sink does not hold.
+    /// Forward the held segment, skipping bytes a clause release already sent.
+    /// No-op when this sink does not hold.
     pub fn flush_held(&self) {
         let pending = {
             let mut held = self.lock();
             held.as_mut().map(|buf| {
+                let held_bytes = buf.deltas.iter().map(String::len).sum::<usize>();
+                let skip = buf
+                    .gate
+                    .released_len()
+                    .saturating_sub(buf.gate.buf_len().saturating_sub(held_bytes));
+                buf.gate.note_raw_flush();
                 (
                     std::mem::take(&mut buf.deltas),
                     std::mem::take(&mut buf.segments),
+                    skip,
                 )
             })
         };
-        let Some((deltas, segments)) = pending else {
+        let Some((deltas, segments, mut skip)) = pending else {
             return;
         };
         for text in deltas {
-            self.deliver(TurnEvent::Delta(text));
+            if skip >= text.len() {
+                skip -= text.len();
+                continue;
+            }
+            let piece = if skip == 0 {
+                text
+            } else {
+                match text.get(skip..) {
+                    Some(rest) => {
+                        skip = 0;
+                        rest.to_string()
+                    }
+                    None => {
+                        tracing::error!(
+                            "held speech flush skipped a byte that is not a character boundary"
+                        );
+                        skip = 0;
+                        continue;
+                    }
+                }
+            };
+            if !piece.is_empty() {
+                self.deliver(TurnEvent::Delta(piece));
+            }
         }
         for (index, tool) in segments {
             self.deliver(TurnEvent::Segment { index, tool });
         }
+    }
+
+    /// True once a clause has been delivered from the voice hold.
+    #[must_use]
+    pub fn released_any(&self) -> bool {
+        self.lock()
+            .as_ref()
+            .is_some_and(|buf| buf.ever_released || buf.gate.released_any())
+    }
+
+    /// A closed text block. Later text stays held for the guard.
+    pub fn begin_text_block(&self) {
+        if let Some(buf) = self.lock().as_mut() {
+            buf.gate.begin_block();
+        }
+    }
+
+    /// A later round must not keep releasing against the previous buffer.
+    pub fn begin_next_round(&self) {
+        let mut held = self.lock();
+        let Some(buf) = held.as_mut() else {
+            return;
+        };
+        if buf.gate.released_any() {
+            buf.ever_released = true;
+        }
+        buf.gate.restart_round();
+    }
+
+    /// Settle a guard cut after a release. True when the kept tail was accepted,
+    /// so the caller must not send `reset` or the raw hold.
+    ///
+    /// A hold that already overflowed has sent `reset{budget}`. Nothing else
+    /// from this round may be spoken; the caller takes the ordinary cut path.
+    pub fn finish_cut(&self, kept: &str) -> bool {
+        let rest = {
+            let mut held = self.lock();
+            let Some(buf) = held.as_mut() else {
+                return false;
+            };
+            if buf.overflowed {
+                return false;
+            }
+            if !buf.gate.released_any() {
+                if buf.ever_released {
+                    buf.cut_handled = true;
+                    return true;
+                }
+                return false;
+            }
+            match buf.gate.finish(kept) {
+                Ok(rest) => {
+                    buf.cut_handled = true;
+                    rest
+                }
+                Err(err) => {
+                    buf.cut_handled = false;
+                    tracing::error!(
+                        error = %err,
+                        "voice release cut failed; released bytes are not a prefix of the guarded text"
+                    );
+                    return false;
+                }
+            }
+        };
+        if let Some(text) = rest {
+            self.deliver(TurnEvent::Delta(text));
+        }
+        true
+    }
+
+    /// True when [`Self::finish_cut`] accepted the kept tail.
+    #[must_use]
+    pub fn cut_was_handled(&self) -> bool {
+        self.lock().as_ref().is_some_and(|buf| buf.cut_handled)
     }
 
     /// Drop the held segment without sending it. True when any text was dropped.
@@ -648,6 +781,9 @@ pub async fn invoke_with_tool_loop_streaming(
     let mut segments = Segments::new();
 
     loop {
+        if rs.rounds > 0 {
+            sink.begin_next_round();
+        }
         sink.try_send(TurnEvent::Status(TurnStatus::Thinking));
         let round = stream_one_round(
             provider,
@@ -676,10 +812,17 @@ pub async fn invoke_with_tool_loop_streaming(
         } else if survives && segments.from_provider && sink.is_holding() {
             sink.flush_held();
         }
+        if sink.released_any() {
+            let (sanitized, was_truncated, _) =
+                validate_content_blocks_adapter(&round.response.content);
+            if was_truncated {
+                sink.finish_cut(&text_blocks_concat(&sanitized));
+            }
+        }
         match finish_round(&mut rs, round.response, tools, messages, max_rounds).await {
             RoundOutcome::Done(done) => {
-                // A cut reply leaves the held segment for the caller to
-                // drop. Reset goes out before any kept text.
+                // A cut with nothing released leaves the hold for the caller
+                // to drop. Reset goes out before any kept text.
                 if !done.was_truncated {
                     sink.flush_held();
                     // A provider that reported no boundaries and never called a
@@ -749,6 +892,9 @@ async fn stream_one_round(
                     sink.try_send(TurnEvent::Status(TurnStatus::Responding));
                 }
                 sink.try_send(TurnEvent::Delta(text));
+            }
+            StreamEvent::TextBlockEnd => {
+                sink.begin_text_block();
             }
             StreamEvent::ToolUse { name, .. } => {
                 tool_names.push(name);
@@ -1679,6 +1825,41 @@ mod streaming_tests {
         assert_eq!(
             events,
             vec![TurnEvent::Reset(crate::wire::ResetReason::Budget)]
+        );
+    }
+
+    /// A clause that already left is followed by one budget reset and nothing else.
+    #[tokio::test(start_paused = true)]
+    async fn voice_stream_budget_after_release() {
+        let clause = "Budget clause is long enough. ";
+        assert!(
+            clause.len() < 40 && clause.len() + 20 > 40,
+            "{}",
+            clause.len()
+        );
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        let sink = ProgressSink::holding_capped(tx, 40);
+        assert!(sink.try_send(TurnEvent::Delta(clause.into())));
+        assert!(rx.try_recv().is_err());
+
+        tokio::time::advance(std::time::Duration::from_millis(250)).await;
+        assert!(sink.try_send(TurnEvent::Delta(String::new())));
+        assert!(sink.try_send(TurnEvent::Delta("x".repeat(20))));
+        assert!(sink.try_send(TurnEvent::Delta("yyyy".into())));
+        sink.flush_held();
+        drop(sink);
+
+        let mut events = Vec::new();
+        while let Ok(event) = rx.try_recv() {
+            events.push(event);
+        }
+        assert_eq!(
+            events,
+            vec![
+                TurnEvent::Delta("Budget clause is long enough.".into()),
+                TurnEvent::Reset(crate::wire::ResetReason::Budget),
+            ]
         );
     }
 }
