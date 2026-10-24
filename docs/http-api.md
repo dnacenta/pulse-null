@@ -100,6 +100,7 @@ Ordering:
 - `reset` is written before any delta the client has not yet received, including deltas already sitting in the progress channel. `reason` `fallback` comes before the fallback reply's delta. On a screen stream it is sent only when a delta was produced. On a voice-pool stream a held draft is dropped, and `reset` is sent with no raw tail before it.
 - On a screen stream, `reset` with `reason` `guard` still leaves the raw tail in the stream, and it comes before `done`. On a voice-pool stream the raw tail is not sent: `reset` comes first, then a delta of the kept text, then `done`. `done.text` is the cut reply, and `truncated` is true. A speech client discards unspoken text on `reset` and speaks `done.text` after it.
 - A provider error after deltas ends the stream with exactly one `error`. The user turn is rolled back.
+- A provider refusal on a voice-credential stream ends with `error` and no `delta` of the refused draft; on an owner stream the fallback follows `reset` with reason `fallback`.
 
 Closing the connection cancels the turn. Nothing from that turn is saved: the user message is rolled back the same way a failed turn is.
 

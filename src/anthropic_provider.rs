@@ -335,7 +335,7 @@ fn interpret_message(
 ///
 /// Bytes are buffered and split on `\n\n` before UTF-8 decoding, so a
 /// character or a separator that straddles two network chunks stays intact.
-struct SseDecoder {
+pub(crate) struct SseDecoder {
     buffer: Vec<u8>,
     text_parts: Vec<String>,
     tool_uses: Vec<ContentBlock>,
@@ -350,7 +350,7 @@ struct SseDecoder {
 }
 
 impl SseDecoder {
-    fn new(model: &str) -> Self {
+    pub(crate) fn new(model: &str) -> Self {
         Self {
             buffer: Vec::new(),
             text_parts: Vec::new(),
@@ -368,7 +368,7 @@ impl SseDecoder {
 
     /// Events completed by `bytes`. After a refusal, nothing further is decoded.
     #[must_use]
-    fn feed(&mut self, bytes: &[u8]) -> Vec<StreamEvent> {
+    pub(crate) fn feed(&mut self, bytes: &[u8]) -> Vec<StreamEvent> {
         if self.finished {
             return Vec::new();
         }
