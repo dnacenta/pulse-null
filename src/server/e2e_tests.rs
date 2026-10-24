@@ -2012,6 +2012,7 @@ async fn owner_http_refusal_takes_the_fallback() {
     assert_eq!(status, StatusCode::OK);
     assert!(body.contains("the fallback answer"), "{body}");
     assert!(!body.contains("draft one"), "{body}");
+    assert!(!body.contains("partial draft"), "{body}");
     assert!(!body.contains("do-not-leak-explanation"), "{body}");
 }
 
@@ -2669,6 +2670,264 @@ async fn voice_stream_budget_after_release() {
         frames.iter().any(|(event, _)| event == "done"),
         "{frames:?}"
     );
+}
+
+const SPOKEN_CLAUSE: &str = "Here is one complete clause. ";
+const SPOKEN_RELEASED: &str = "Here is one complete clause.";
+
+fn clause_prefix_sse() -> String {
+    format!(
+        "event: message_start\ndata: {{\"type\":\"message_start\",\"message\":{{\"model\":\"m\",\"usage\":{{\"input_tokens\":4,\"output_tokens\":1}}}}}}\n\n\
+         event: content_block_delta\ndata: {{\"type\":\"content_block_delta\",\"index\":0,\"delta\":{{\"type\":\"text_delta\",\"text\":\"{SPOKEN_CLAUSE}\"}}}}\n\n"
+    )
+}
+
+fn refusal_suffix_sse() -> String {
+    "\
+event: message_delta
+data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"refusal\",\"stop_sequence\":null,\"stop_details\":{\"type\":\"refusal\",\"category\":\"cyber\",\"explanation\":\"do-not-leak-explanation\"}},\"usage\":{\"output_tokens\":0}}
+
+event: message_stop
+data: {\"type\":\"message_stop\"}
+
+"
+    .to_string()
+}
+
+fn broken_delta_sse() -> String {
+    "event: message_delta\ndata: {not-json\n\n".to_string()
+}
+
+#[derive(Clone, Copy)]
+enum AfterRelease {
+    HttpRefusal,
+    CliRefusal,
+    ProviderError,
+    BrokenEnd,
+}
+
+struct ReleaseThenFail {
+    kind: AfterRelease,
+    clause_visible: Arc<Notify>,
+}
+
+impl LmProvider for ReleaseThenFail {
+    fn invoke(
+        &self,
+        _system_prompt: &str,
+        _messages: &[Message],
+        _max_tokens: u32,
+        _tools: Option<&[serde_json::Value]>,
+    ) -> LlmResult<'_> {
+        Box::pin(async { Err("unused".into()) })
+    }
+
+    fn name(&self) -> &str {
+        "release-then-fail"
+    }
+}
+
+impl crate::streaming::StreamingProvider for ReleaseThenFail {
+    fn supports_streaming(&self) -> bool {
+        true
+    }
+
+    fn invoke_streaming(
+        &self,
+        _system_prompt: &str,
+        _messages: &[Message],
+        _max_tokens: u32,
+        _tools: Option<&[serde_json::Value]>,
+    ) -> crate::streaming::StreamResult<'_> {
+        use crate::streaming::StreamEvent;
+        let kind = self.kind;
+        let clause_visible = Arc::clone(&self.clause_visible);
+        Box::pin(async_stream::stream! {
+            let start = tokio::time::Instant::now();
+            let mut decoder = crate::anthropic_provider::SseDecoder::new("m");
+            let prefix = match kind {
+                AfterRelease::HttpRefusal | AfterRelease::BrokenEnd => clause_prefix_sse(),
+                AfterRelease::CliRefusal | AfterRelease::ProviderError => String::new(),
+            };
+            if prefix.is_empty() {
+                yield StreamEvent::TextDelta(SPOKEN_CLAUSE.into());
+            } else {
+                for event in decoder.feed(prefix.as_bytes()) {
+                    yield event;
+                }
+            }
+            let hold = std::time::Duration::from_millis(250);
+            let waited = start.elapsed();
+            if waited < hold {
+                tokio::time::sleep(hold - waited).await;
+            }
+            yield StreamEvent::TextDelta(String::new());
+            clause_visible.notified().await;
+            match kind {
+                AfterRelease::HttpRefusal => {
+                    for event in decoder.feed(refusal_suffix_sse().as_bytes()) {
+                        yield event;
+                    }
+                }
+                AfterRelease::BrokenEnd => {
+                    for event in decoder.feed(broken_delta_sse().as_bytes()) {
+                        yield event;
+                    }
+                }
+                AfterRelease::CliRefusal => {
+                    yield StreamEvent::Refused {
+                        model: "m".into(),
+                        detail: "Usage Policy".into(),
+                    };
+                }
+                AfterRelease::ProviderError => {
+                    yield StreamEvent::Error("network drop".into());
+                }
+            }
+        })
+    }
+}
+
+async fn read_until_terminal(
+    response: axum::response::Response,
+    needle: &str,
+    visible: &Notify,
+) -> String {
+    use tokio_stream::StreamExt as _;
+
+    let mut incoming = response.into_body().into_data_stream();
+    let mut seen = String::new();
+    let mut noted = false;
+    loop {
+        if !noted && seen.contains(needle) {
+            noted = true;
+            visible.notify_waiters();
+        }
+        let terminal = seen.contains("event: error") || seen.contains("event: done");
+        if terminal && seen.ends_with("\n\n") {
+            break;
+        }
+        let Some(chunk) = incoming.next().await else {
+            break;
+        };
+        seen.push_str(&String::from_utf8_lossy(&chunk.expect("body error")));
+    }
+    seen
+}
+
+async fn voice_release_then(
+    kind: AfterRelease,
+    sender: &str,
+) -> (String, Arc<AppState>, tempfile::TempDir) {
+    let clause_visible = Arc::new(Notify::new());
+    let dir = tempfile::tempdir().unwrap();
+    let state = build_state_boxed_with_config(
+        dir.path().to_path_buf(),
+        Box::new(ReleaseThenFail {
+            kind,
+            clause_visible: Arc::clone(&clause_visible),
+        }),
+        ToolRegistry::new(),
+        config_with_voice_credential(),
+    )
+    .await;
+    let app = build_app(Arc::clone(&state));
+    let sender = sender.to_string();
+    let body = pause_drive(async move {
+        let response =
+            post_chat_stream_from(&app, "voice", Some(&sender), Some(VOICE_CREDENTIAL)).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        read_until_terminal(response, SPOKEN_RELEASED, &clause_visible).await
+    })
+    .await;
+    (body, state, dir)
+}
+
+fn assert_released_then_reset(body: &str, reason: &str, message: &str) {
+    let frames = sse_frames(body);
+    let reset = frame_index(&frames, |event, data| {
+        event == "reset" && data.contains(&format!(r#""reason":"{reason}""#))
+    });
+    let error = frame_index(&frames, |event, data| {
+        event == "error" && data.contains(message)
+    });
+    assert!(reset < error, "{frames:?}");
+    assert!(
+        frames.iter().all(|(event, _)| event != "done"),
+        "{frames:?}"
+    );
+    let mut spoken = String::new();
+    for (event, data) in &frames[..reset] {
+        if event == "delta" {
+            spoken.push_str(&delta_text(data).unwrap_or_default());
+        }
+    }
+    assert_eq!(spoken, SPOKEN_RELEASED, "{frames:?}");
+    assert!(
+        frames[reset + 1..error]
+            .iter()
+            .all(|(event, _)| event != "delta"),
+        "{frames:?}"
+    );
+    assert!(!body.contains("do-not-leak-explanation"), "{body}");
+}
+
+/// A voice stream refused after a released clause sends `reset` then `error`.
+#[tokio::test(start_paused = true)]
+async fn voice_refusal_after_release_resets_then_errors() {
+    let (http_body, http_state, _http_dir) =
+        voice_release_then(AfterRelease::HttpRefusal, "http-late").await;
+    assert_released_then_reset(&http_body, "refusal", "the model declined this request");
+    assert_eq!(messages_len(&http_state, "guest:http-late").await, 0);
+
+    let (cli_body, cli_state, _cli_dir) =
+        voice_release_then(AfterRelease::CliRefusal, "cli-late").await;
+    assert_released_then_reset(&cli_body, "refusal", "the model declined this request");
+    assert_eq!(messages_len(&cli_state, "guest:cli-late").await, 0);
+}
+
+/// A provider failure after a released clause sends `reset` then `error`.
+#[tokio::test(start_paused = true)]
+async fn voice_error_after_release_resets_then_errors() {
+    let (body, state, _dir) = voice_release_then(AfterRelease::ProviderError, "err-late").await;
+    assert_released_then_reset(&body, "error", "upstream model error");
+    assert_eq!(messages_len(&state, "guest:err-late").await, 0);
+}
+
+/// A refusal that arrives before the hold elapses sends no `reset`.
+#[tokio::test]
+async fn voice_refusal_before_release_has_no_reset() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = build_state_boxed_with_config(
+        dir.path().to_path_buf(),
+        Box::new(DecoderReplay::from_sse(REFUSAL_AFTER_DELTAS)),
+        ToolRegistry::new(),
+        config_with_voice_credential(),
+    )
+    .await;
+    let app = build_app(Arc::clone(&state));
+    let response =
+        post_chat_stream_from(&app, "voice", Some("early-refuse"), Some(VOICE_CREDENTIAL)).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let body = String::from_utf8_lossy(&bytes);
+    assert_refusal_stream_speaks_nothing(&body);
+    let frames = sse_frames(&body);
+    assert!(
+        frames.iter().all(|(event, _)| event != "reset"),
+        "{frames:?}"
+    );
+    assert_eq!(messages_len(&state, "guest:early-refuse").await, 0);
+}
+
+/// A broken stream end after a release is a failure, not a clean end.
+#[tokio::test(start_paused = true)]
+async fn voice_broken_stream_end_after_release_resets_error() {
+    let (body, state, _dir) = voice_release_then(AfterRelease::BrokenEnd, "broken").await;
+    assert_released_then_reset(&body, "error", "upstream model error");
+    assert_eq!(messages_len(&state, "guest:broken").await, 0);
 }
 
 /// A guard cut still delivers `reset` when the delta channel is already

@@ -359,6 +359,25 @@ async fn run_resolved_turn(
     )
     .await;
     record_provider_outcome(&state, resolved_key, &outcome).await;
+    if let Err(err) = &outcome {
+        if hold_deltas {
+            if let Some(progress) = progress.as_ref() {
+                if progress.released_any() {
+                    let reason = if err.downcast_ref::<crate::errors::RefusalError>().is_some() {
+                        crate::wire::ResetReason::Refusal
+                    } else {
+                        crate::wire::ResetReason::Error
+                    };
+                    if !progress.try_send(TurnEvent::Reset(reason)) {
+                        return Err((
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            "reset was not delivered".to_string(),
+                        ));
+                    }
+                }
+            }
+        }
+    }
     let outcome = outcome.map_err(|e| steps::turn_failure(&turn, fallback_capped, e.as_ref()))?;
 
     // The guard already replaced the stored reply. A screen client has the
@@ -544,7 +563,7 @@ fn error_to_sse(status: StatusCode, message: String) -> Event {
 /// Events: `status {status: thinking|responding|tool, name?}`, `delta {text}`
 /// (as the provider yields them; the client coalesces), `segment {index, tool}`
 /// when an assistant message ends and the server knows whether a tool call
-/// follows, `reset {reason: fallback|guard|budget}` when text already sent is void,
+/// follows, `reset {reason: fallback|guard|budget|refusal|error}` when text already sent is void,
 /// then exactly one of
 /// `done {text, model, tokens_in, tokens_out, isolation, truncated}` or
 /// `error {status, message}`. Dropping the connection aborts the turn: the
