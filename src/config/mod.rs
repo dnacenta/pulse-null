@@ -107,6 +107,12 @@ pub struct PulseConfig {
     /// Path to shared rule/protocol files (*.md). Loaded into system prompt.
     #[serde(default)]
     pub rules_dir: Option<String>,
+    /// When true, the pulse's own rules load only from root-owned files, and
+    /// only when every directory from the pulse root down to that rules
+    /// directory is root-owned and not group- or world-writable. False reads
+    /// a file the running user or root owns.
+    #[serde(default)]
+    pub rules_require_root: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1312,6 +1318,7 @@ pub mod test_support {
                 owner_name: "Owner".into(),
                 owner_alias: "O".into(),
                 rules_dir: None,
+                rules_require_root: false,
             },
             server: ServerConfig::default(),
             llm: LlmConfig {
@@ -1661,6 +1668,18 @@ mod pulse_rename_tests {
             let cfg = Config::from_toml_str(&text).unwrap();
             assert!(!cfg.context_buffer.pulse_filter, "{key}");
         }
+    }
+
+    #[test]
+    fn rules_require_root_defaults_false_and_can_be_set() {
+        let cfg = Config::from_toml_str(&format!("{}{REST}", identity("pulse"))).unwrap();
+        assert!(!cfg.pulse.rules_require_root);
+        let cfg = Config::from_toml_str(&format!(
+            "{}rules_require_root = true\n{REST}",
+            identity("pulse")
+        ))
+        .unwrap();
+        assert!(cfg.pulse.rules_require_root);
     }
 
     #[test]

@@ -337,6 +337,7 @@ fn test_config() -> Config {
             owner_name: "Tester".to_string(),
             owner_alias: "T".to_string(),
             rules_dir: None,
+            rules_require_root: false,
         },
         server: ServerConfig::default(),
         llm: LlmConfig {

@@ -1280,6 +1280,15 @@ fn rules_components(root_dir: &Path, config: &Config) -> Vec<PromptComponent> {
         );
         return components;
     }
+    let blocked = config
+        .pulse
+        .rules_require_root
+        .then(|| strict_rules_dir_block(root_dir, &dir))
+        .flatten();
+    if let Some((path, reason)) = blocked {
+        warn!("Skipping pulse rules: {}: {reason}", path.display());
+        return components;
+    }
     components.extend(rules_component(
         &dir,
         adapter.project_rules_exclude(),
@@ -1309,6 +1318,51 @@ fn untrusted_rules_path(root: &Path, dir: &Path) -> Option<PathBuf> {
     None
 }
 
+/// In strict mode, the first directory from just under `root` through `dir`
+/// that root does not own, or that is group- or world-writable. The pulse
+/// root itself is not one of them: a pulse-owned home can still rename
+/// `.claude`, and the replacement then fails this check. Missing paths are
+/// not a rejection. The reason never includes file contents.
+fn strict_rules_dir_block(root: &Path, dir: &Path) -> Option<(PathBuf, String)> {
+    use std::os::unix::fs::MetadataExt;
+    let Ok(below) = dir.strip_prefix(root) else {
+        return Some((dir.to_path_buf(), "not under the pulse root".to_string()));
+    };
+    let mut current = root.to_path_buf();
+    for part in below.components() {
+        current.push(part);
+        let meta = match std::fs::symlink_metadata(&current) {
+            Ok(meta) => meta,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return None,
+            Err(e) => return Some((current, e.to_string())),
+        };
+        if let Some(reason) = pulse_rules_dir_reject(meta.uid(), meta.mode()) {
+            return Some((current, reason.to_string()));
+        }
+    }
+    None
+}
+
+/// A directory on the way to the pulse rules, in strict mode. `mode` may
+/// include the file-type bits. `None` means root owns it and it is not
+/// group- or world-writable.
+#[must_use]
+fn pulse_rules_dir_reject(uid: u32, mode: u32) -> Option<&'static str> {
+    if uid != 0 {
+        return Some("not owned by root");
+    }
+    if mode & 0o022 != 0 {
+        return Some("group- or world-writable");
+    }
+    None
+}
+
+/// In strict mode a pulse rule file is read only when root owns it.
+#[must_use]
+fn strict_pulse_file_uid_ok(file_uid: u32) -> bool {
+    file_uid == 0
+}
+
 /// One rules directory as an Essential component.
 ///
 /// The operator's rules are token-capped by `rules_cap` when the budget is
@@ -1322,7 +1376,8 @@ fn rules_component(
     source: RulesSource,
     config: &Config,
 ) -> Option<PromptComponent> {
-    let rules = match load_rule_files(dir, exclude, source) {
+    let strict = source == RulesSource::Pulse && config.pulse.rules_require_root;
+    let rules = match load_rule_files(dir, exclude, source, strict) {
         Ok(rules) => rules,
         Err(e) => {
             warn!("Failed to load rule files from '{}': {}", dir.display(), e);
@@ -1481,11 +1536,13 @@ const MAX_PULSE_RULE_FILES: usize = 32;
 /// [`MAX_RULE_FILE_BYTES`] of a file are read; a longer one is truncated with
 /// a marker. The pulse's own rules are also held to [`MAX_PULSE_RULE_FILES`]
 /// files, to [`PULSE_RULES_MAX_BYTES`] read in total, and to files with one
-/// link that the running user or root owns.
+/// link that the running user or root owns. `strict` narrows that to files
+/// root owns; the directories were already checked by the caller.
 fn load_rule_files(
     dir: &Path,
     exclude: &[&str],
     source: RulesSource,
+    strict: bool,
 ) -> Result<Vec<(String, String)>, crate::errors::PromptError> {
     if !dir.is_dir() {
         return Ok(Vec::new());
@@ -1541,7 +1598,7 @@ fn load_rule_files(
             );
             continue;
         }
-        match read_rule_file(&path, source) {
+        match read_rule_file(&path, source, strict) {
             Ok(content) => {
                 total_bytes += content.len();
                 rules.push((protocol_name, content));
@@ -1561,8 +1618,8 @@ fn load_rule_files(
 
 /// Read one rule file: a regular file only, at most [`MAX_RULE_FILE_BYTES`].
 /// A pulse rule must also have a single link and belong to the running user
-/// or to root. The mode is not consulted.
-fn read_rule_file(path: &Path, source: RulesSource) -> Result<String, String> {
+/// or to root. `strict` accepts only root. The mode is not consulted.
+fn read_rule_file(path: &Path, source: RulesSource, strict: bool) -> Result<String, String> {
     use std::io::Read;
     use std::os::unix::fs::MetadataExt;
     let (file, meta) = crate::fs_safe::open_regular(path)
@@ -1574,7 +1631,11 @@ fn read_rule_file(path: &Path, source: RulesSource) -> Result<String, String> {
         }
         // SAFETY: geteuid has no preconditions and cannot fail.
         let me = unsafe { libc::geteuid() };
-        if !pulse_rule_owner_ok(meta.uid(), me) {
+        if strict {
+            if !strict_pulse_file_uid_ok(meta.uid()) {
+                return Err("strict mode wants root".into());
+            }
+        } else if !pulse_rule_owner_ok(meta.uid(), me) {
             return Err("not owned by the running user".into());
         }
     }
@@ -2128,6 +2189,7 @@ mod tests {
                 owner_name: "Tester".into(),
                 owner_alias: "T".into(),
                 rules_dir: None,
+                rules_require_root: false,
             },
             server: ServerConfig::default(),
             llm: LlmConfig {
@@ -2828,7 +2890,7 @@ mod tests {
             std::fs::write(rules.join(format!("z-{i}.md")), "z".repeat(15 * 1024)).unwrap();
         }
 
-        let loaded = load_rule_files(&rules, &[], RulesSource::Pulse).unwrap();
+        let loaded = load_rule_files(&rules, &[], RulesSource::Pulse, false).unwrap();
         let (_, huge) = loaded.iter().find(|(name, _)| name == "huge").unwrap();
         assert!(huge.len() <= MAX_RULE_FILE_BYTES);
         assert!(huge.contains("byte ceiling"));
@@ -2860,7 +2922,8 @@ mod tests {
     fn excluded_rule_files_are_filtered_by_the_loader() {
         let dir = tempfile::tempdir().unwrap();
         let rules = seed_pulse_rules(dir.path());
-        let loaded = load_rule_files(&rules, &["recall-echo.md"], RulesSource::Pulse).unwrap();
+        let loaded =
+            load_rule_files(&rules, &["recall-echo.md"], RulesSource::Pulse, false).unwrap();
         let names: Vec<&str> = loaded.iter().map(|(n, _)| n.as_str()).collect();
         assert_eq!(names, ["a-first", "self-work"]);
     }
@@ -2876,7 +2939,7 @@ mod tests {
         std::fs::hard_link(&outside, rules.join("hard.md")).unwrap();
         std::fs::write(rules.join("bad name\".md"), "ODD-NAME").unwrap();
 
-        let loaded = load_rule_files(&rules, &[], RulesSource::Pulse).unwrap();
+        let loaded = load_rule_files(&rules, &[], RulesSource::Pulse, false).unwrap();
         let names: Vec<&str> = loaded.iter().map(|(n, _)| n.as_str()).collect();
         assert_eq!(names, ["a-first", "recall-echo", "self-work"]);
     }
@@ -2890,12 +2953,73 @@ mod tests {
     }
 
     #[test]
+    fn strict_rejects_a_pulse_owned_file() {
+        let running = 4_242;
+        assert!(!strict_pulse_file_uid_ok(running));
+        assert!(!strict_pulse_file_uid_ok(running.wrapping_add(1)));
+    }
+
+    #[test]
+    fn strict_accepts_a_root_owned_file_under_root_owned_dirs() {
+        assert!(strict_pulse_file_uid_ok(0));
+        assert!(pulse_rules_dir_reject(0, 0o755).is_none());
+        // Directory metadata carries the file-type bits above the mode.
+        assert!(pulse_rules_dir_reject(0, 0o040755).is_none());
+    }
+
+    /// A pulse-owned parent of the rules directory can be renamed and replaced.
+    /// Root-owned files inside it do not make that directory trustworthy.
+    #[test]
+    fn strict_rejects_a_pulse_owned_rules_directory_with_a_root_owned_file() {
+        let pulse_uid = 4_242;
+        assert!(strict_pulse_file_uid_ok(0));
+        assert!(pulse_rules_dir_reject(0, 0o755).is_none());
+        assert_eq!(
+            pulse_rules_dir_reject(pulse_uid, 0o755),
+            Some("not owned by root")
+        );
+    }
+
+    #[test]
+    fn strict_rejects_a_group_writable_root_owned_directory() {
+        assert_eq!(
+            pulse_rules_dir_reject(0, 0o775),
+            Some("group- or world-writable")
+        );
+        assert_eq!(
+            pulse_rules_dir_reject(0, 0o040775),
+            Some("group- or world-writable")
+        );
+        assert_eq!(
+            pulse_rules_dir_reject(0, 0o707),
+            Some("group- or world-writable")
+        );
+    }
+
+    #[test]
+    fn strict_mode_skips_a_pulse_owned_rules_tree_and_non_strict_does_not() {
+        let dir = tempfile::tempdir().unwrap();
+        seed_pulse_rules(dir.path());
+        let mut config = cli_config("grok");
+        config.system_prompt_budget.enabled = false;
+
+        let open = build_system_prompt(dir.path(), &config).unwrap();
+        assert!(open.contains("SELF-WORK-RULE"), "{open}");
+
+        config.pulse.rules_require_root = true;
+        let closed = build_system_prompt(dir.path(), &config).unwrap();
+        assert!(!closed.contains("SELF-WORK-RULE"), "{closed}");
+        assert!(!closed.contains("FIRST-RULE"), "{closed}");
+        assert!(!closed.contains("RECALL-HOOK-RULE"), "{closed}");
+    }
+
+    #[test]
     fn a_pulse_rule_with_more_than_one_link_is_rejected() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("rule.md");
         std::fs::write(&path, "LINKED").unwrap();
         std::fs::hard_link(&path, dir.path().join("other.md")).unwrap();
-        let err = read_rule_file(&path, RulesSource::Pulse).unwrap_err();
+        let err = read_rule_file(&path, RulesSource::Pulse, false).unwrap_err();
         assert_eq!(err, "has more than one link");
     }
 
@@ -2924,7 +3048,7 @@ mod tests {
             "uid {} is not an accepted owner",
             meta.uid()
         );
-        let text = read_rule_file(&path, RulesSource::Pulse).unwrap();
+        let text = read_rule_file(&path, RulesSource::Pulse, false).unwrap();
         assert_eq!(text, "WORLD-WRITABLE-RULE");
     }
 
@@ -2964,7 +3088,7 @@ mod tests {
         for i in 0..(MAX_PULSE_RULE_FILES + 8) {
             std::fs::write(rules.join(format!("r{i:03}.md")), "x").unwrap();
         }
-        let loaded = load_rule_files(&rules, &[], RulesSource::Pulse).unwrap();
+        let loaded = load_rule_files(&rules, &[], RulesSource::Pulse, false).unwrap();
         assert_eq!(loaded.len(), MAX_PULSE_RULE_FILES);
     }
 

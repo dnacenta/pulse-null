@@ -53,6 +53,7 @@ name = "{pulse_name}"
 owner_name = "{owner_name}"
 owner_alias = "{owner_alias}"
 {rules_dir_line}
+# rules_require_root = false  # pulse rules only when the files and the directories down to them are root-owned and those directories are not group- or world-writable
 
 [server]
 host = "127.0.0.1"

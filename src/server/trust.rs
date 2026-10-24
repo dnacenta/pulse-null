@@ -88,6 +88,7 @@ mod tests {
                 owner_name: "Owner".into(),
                 owner_alias: "O".into(),
                 rules_dir: None,
+                rules_require_root: false,
             },
             server: ServerConfig::default(),
             llm: LlmConfig {

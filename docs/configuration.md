@@ -8,6 +8,7 @@ everything below has a default. The core:
 name = "atlas"
 owner_name = "Ada"
 owner_alias = "Ada"
+# rules_require_root = false
 
 [server]
 host = "127.0.0.1"
@@ -31,6 +32,7 @@ Every key:
 | `pulse` | `owner_name` | — | Your name |
 | `pulse` | `owner_alias` | — | How the pulse addresses you |
 | `pulse` | `rules_dir` | — | Shared protocol files directory |
+| `pulse` | `rules_require_root` | `false` | Pulse rules load only from root-owned files under directories (from the pulse root down to the rules directory) that root owns and that are not group- or world-writable. `false` still reads a file the pulse user or root owns |
 | `server` | `host` | `127.0.0.1` | Bind address |
 | `server` | `port` | `3100` (init suggests from 3200) | Bind port |
 | `llm` | `provider` | set at init (`anthropic` if missing) | `cli`, `anthropic`, `ollama` |
