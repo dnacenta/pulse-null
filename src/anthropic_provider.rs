@@ -251,6 +251,11 @@ fn parse_content_blocks(response_json: &serde_json::Value) -> Vec<ContentBlock> 
 /// handle that case first and return [`RefusalError`] instead.
 #[must_use]
 fn stop_reason_from(raw: Option<&str>) -> StopReason {
+    debug_assert_ne!(
+        raw,
+        Some("refusal"),
+        "a refusal must be handled before the stop-reason mapping"
+    );
     match raw {
         Some("end_turn") => StopReason::EndTurn,
         Some("tool_use") => StopReason::ToolUse,
@@ -905,6 +910,15 @@ mod tests {
         let tool_use = tool_use_fixture();
         let refusal = refusal_after_deltas_fixture();
         prove_chunking(&[(&end_turn, false), (&tool_use, false), (&refusal, true)]);
+    }
+
+    /// A caller that skips the refusal check must fail here, in tests,
+    /// instead of mapping the turn to `Other` and then a normal end.
+    #[cfg(debug_assertions)]
+    #[test]
+    #[should_panic(expected = "a refusal must be handled before the stop-reason mapping")]
+    fn stop_reason_from_rejects_refusal() {
+        let _ = stop_reason_from(Some("refusal"));
     }
 
     #[test]
