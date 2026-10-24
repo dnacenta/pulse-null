@@ -1590,7 +1590,8 @@ const MAX_PULSE_RULE_FILES: usize = 32;
 /// a marker. The pulse's own rules are also held to [`MAX_PULSE_RULE_FILES`]
 /// files, to [`PULSE_RULES_MAX_BYTES`] read in total, and to files with one
 /// link that the running user or root owns. `strict` narrows that to files
-/// root owns; the directories were already checked by the caller.
+/// root owns that are not group- or world-writable; the directories were
+/// already checked by the caller.
 fn load_rule_files(
     dir: &Path,
     exclude: &[&str],
@@ -1674,7 +1675,7 @@ fn load_rule_files(
 /// Read one rule file: a regular file only, at most [`MAX_RULE_FILE_BYTES`].
 /// A pulse rule must also pass [`pulse_rule_meta_ok`]. In strict mode the
 /// open file must not sit on a FUSE filesystem (`fstatfs` of that descriptor).
-/// The mode is not consulted.
+/// In strict mode the file mode must not be group- or world-writable.
 fn read_rule_file(
     path: &Path,
     source: RulesSource,
@@ -1708,7 +1709,9 @@ fn read_rule_file_fs(
         }
     }
     if source == RulesSource::Pulse {
-        if let Err(reason) = pulse_rule_meta_ok(meta.uid(), meta.nlink(), running_uid, strict) {
+        if let Err(reason) =
+            pulse_rule_meta_ok(meta.uid(), meta.mode(), meta.nlink(), running_uid, strict)
+        {
             return Err(reason.to_string());
         }
     }
@@ -1728,12 +1731,15 @@ fn read_rule_file_fs(
     Ok(text.into_owned())
 }
 
-/// Whether a pulse rule file's link count and owner are acceptable.
+/// Whether a pulse rule file's link count, owner, and (in strict mode) mode
+/// are acceptable.
 ///
 /// One link is required. Without `strict`, the owner is the running user or
-/// root. With `strict`, the owner is root. Mode is not an input.
+/// root and the mode is ignored. With `strict`, the owner is root and the
+/// mode is not group- or world-writable (`mode & 0o022 == 0`).
 fn pulse_rule_meta_ok(
     file_uid: u32,
+    mode: u32,
     nlink: u64,
     running_uid: u32,
     strict: bool,
@@ -1742,11 +1748,13 @@ fn pulse_rule_meta_ok(
         return Err("has more than one link");
     }
     if strict {
-        return if file_uid == 0 {
-            Ok(())
-        } else {
-            Err("strict mode wants root")
-        };
+        if file_uid != 0 {
+            return Err("strict mode wants root");
+        }
+        if mode & 0o022 != 0 {
+            return Err("group- or world-writable");
+        }
+        return Ok(());
     }
     if file_uid == running_uid || file_uid == 0 {
         Ok(())
@@ -3039,11 +3047,11 @@ mod tests {
     #[test]
     fn pulse_rule_meta_accepts_the_running_user_and_root_only() {
         let running = 4_242;
-        assert!(pulse_rule_meta_ok(running, 1, running, false).is_ok());
-        assert!(pulse_rule_meta_ok(0, 1, running, false).is_ok());
-        assert!(pulse_rule_meta_ok(running.wrapping_add(1), 1, running, false).is_err());
+        assert!(pulse_rule_meta_ok(running, 0o644, 1, running, false).is_ok());
+        assert!(pulse_rule_meta_ok(0, 0o644, 1, running, false).is_ok());
+        assert!(pulse_rule_meta_ok(running.wrapping_add(1), 0o644, 1, running, false).is_err());
         assert_eq!(
-            pulse_rule_meta_ok(running, 2, running, false),
+            pulse_rule_meta_ok(running, 0o644, 2, running, false),
             Err("has more than one link")
         );
     }
@@ -3081,11 +3089,11 @@ mod tests {
     fn strict_rejects_a_pulse_owned_file() {
         let running = 4_242;
         assert_eq!(
-            pulse_rule_meta_ok(running, 1, running, true),
+            pulse_rule_meta_ok(running, 0o644, 1, running, true),
             Err("strict mode wants root")
         );
         assert_eq!(
-            pulse_rule_meta_ok(running.wrapping_add(1), 1, running, true),
+            pulse_rule_meta_ok(running.wrapping_add(1), 0o644, 1, running, true),
             Err("strict mode wants root")
         );
 
@@ -3125,7 +3133,7 @@ mod tests {
 
     #[test]
     fn strict_accepts_a_root_owned_file_under_root_owned_dirs() {
-        assert!(pulse_rule_meta_ok(0, 1, 4_242, true).is_ok());
+        assert!(pulse_rule_meta_ok(0, 0o644, 1, 4_242, true).is_ok());
         assert!(pulse_rules_dir_reject(0, 0o755).is_none());
         // Directory metadata carries the file-type bits above the mode.
         assert!(pulse_rules_dir_reject(0, 0o040755).is_none());
@@ -3136,7 +3144,7 @@ mod tests {
     #[test]
     fn strict_rejects_a_pulse_owned_rules_directory_with_a_root_owned_file() {
         let pulse_uid = 4_242;
-        assert!(pulse_rule_meta_ok(0, 1, pulse_uid, true).is_ok());
+        assert!(pulse_rule_meta_ok(0, 0o644, 1, pulse_uid, true).is_ok());
         assert!(pulse_rules_dir_reject(0, 0o755).is_none());
         assert_eq!(
             pulse_rules_dir_reject(pulse_uid, 0o755),
@@ -3198,6 +3206,25 @@ mod tests {
     }
 
     #[test]
+    fn strict_rejects_a_group_or_world_writable_root_owned_file() {
+        assert_eq!(
+            pulse_rule_meta_ok(0, 0o666, 1, 4_242, true),
+            Err("group- or world-writable")
+        );
+        assert_eq!(
+            pulse_rule_meta_ok(0, 0o664, 1, 4_242, true),
+            Err("group- or world-writable")
+        );
+        assert_eq!(
+            pulse_rule_meta_ok(0, 0o100666, 1, 4_242, true),
+            Err("group- or world-writable")
+        );
+        assert!(pulse_rule_meta_ok(0, 0o644, 1, 4_242, true).is_ok());
+        assert!(pulse_rule_meta_ok(0, 0o100644, 1, 4_242, true).is_ok());
+        assert!(pulse_rule_meta_ok(4_242, 0o666, 1, 4_242, false).is_ok());
+    }
+
+    #[test]
     fn strict_rejects_a_group_writable_root_owned_directory() {
         assert_eq!(
             pulse_rules_dir_reject(0, 0o775),
@@ -3247,7 +3274,7 @@ mod tests {
     #[test]
     fn read_rule_file_rejects_an_injected_third_uid() {
         assert_eq!(
-            pulse_rule_meta_ok(4_242, 1, 1, false),
+            pulse_rule_meta_ok(4_242, 0o644, 1, 1, false),
             Err("owned by neither the running user nor root")
         );
         // SAFETY: geteuid has no preconditions and cannot fail.
@@ -3262,12 +3289,12 @@ mod tests {
         assert!(!err.contains("OWNED-BY-THIS-USER"));
     }
 
-    /// Mode is not an input. A world-writable file the running user owns is
-    /// still read. Root is accepted by [`pulse_rule_meta_ok`], which takes no mode.
+    /// Non-strict mode ignores the file mode. A world-writable file the
+    /// running user owns is still read, and root is still accepted.
     #[test]
     fn a_world_writable_rule_owned_by_the_running_user_is_still_read() {
         use std::os::unix::fs::PermissionsExt;
-        assert!(pulse_rule_meta_ok(0, 1, 4_242, false).is_ok());
+        assert!(pulse_rule_meta_ok(0, 0o666, 1, 4_242, false).is_ok());
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("open.md");
         std::fs::write(&path, "WORLD-WRITABLE-RULE").unwrap();

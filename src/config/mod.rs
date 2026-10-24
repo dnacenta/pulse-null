@@ -109,8 +109,10 @@ pub struct PulseConfig {
     pub rules_dir: Option<String>,
     /// When true, the pulse's own rules load only from root-owned files, and
     /// only when every directory from the pulse root down to that rules
-    /// directory is root-owned and not group- or world-writable. Strict mode
-    /// also rejects a rules path on a FUSE filesystem. Where the pulse user
+    /// directory is root-owned and not group- or world-writable. The rule file
+    /// itself must not be group- or world-writable either, so strict mode
+    /// enforces mode 0644. Strict mode also rejects a rules path on a FUSE
+    /// filesystem. Where the pulse user
     /// can still mount filesystems, deny that too (`NoNewPrivileges=yes`,
     /// `PrivateDevices=yes` or no `/dev/fuse`, no setuid fusermount for the
     /// pulse user): the loader can only check what it can see. False reads
