@@ -2015,6 +2015,65 @@ async fn owner_http_refusal_takes_the_fallback() {
     assert!(!body.contains("do-not-leak-explanation"), "{body}");
 }
 
+/// A peer `/chat` turn refused by the HTTP decoder is declined. The
+/// fallback that would answer an owner is not called, and the peer
+/// session stays empty.
+#[tokio::test]
+async fn peer_http_refusal_is_declined_and_leaves_the_session() {
+    let dir = tempfile::tempdir().unwrap();
+    let bin = dir.path().join("fake-cli");
+    let marker = dir.path().join("fallback-ran");
+    crate::cli_provider::fake_cli::write_script(
+        &bin,
+        &format!(
+            "touch '{}'\nprintf '%s\\n' '{{\"result\":\"the fallback answer\"}}'",
+            marker.display()
+        ),
+    );
+    let mut config = test_config();
+    config.peers.insert(
+        "nova".to_string(),
+        crate::config::PeerConfig {
+            host: "127.0.0.1".to_string(),
+            port: 3201,
+            secret: Some("peer-secret".to_string()),
+        },
+    );
+    config.llm.provider = "cli".into();
+    // vendor-ok: the fallback builder only constructs a real CLI adapter
+    config.llm.adapter = Some("claude".into());
+    config.llm.cli_bin = Some(bin.display().to_string());
+    config.llm.fallback_model = Some("opus".into());
+    let state = build_state_boxed_with_config(
+        dir.path().to_path_buf(),
+        Box::new(DecoderReplay::from_sse(REFUSAL_AFTER_DELTAS)),
+        ToolRegistry::new(),
+        config,
+    )
+    .await;
+    let app = build_app(Arc::clone(&state));
+    let req = Request::builder()
+        .method("POST")
+        .uri("/chat")
+        .header("Content-Type", "application/json")
+        .header("X-Peer-Name", "nova")
+        .header("X-Echo-Secret", "peer-secret")
+        .body(Body::from(
+            serde_json::json!({"channel": "chat", "message": "hello"}).to_string(),
+        ))
+        .unwrap();
+    let response = app.oneshot(req).await.unwrap();
+    let status = response.status();
+    let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let body = String::from_utf8(bytes.to_vec()).unwrap();
+    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+    assert_eq!(body, "the model declined this request");
+    assert!(!marker.exists(), "the fallback was called");
+    assert_eq!(messages_len(&state, "peer:nova").await, 0);
+}
+
 fn guard_cut_provider(raw: &str) -> MockProvider {
     MockProvider::new(vec![LlmResponse {
         content: vec![ContentBlock::Text { text: raw.into() }],
