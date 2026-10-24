@@ -3367,6 +3367,218 @@ async fn voice_cli_refusal_before_release_has_no_reset() {
     assert_eq!(messages_len(&state, "guest:cli-early").await, 0);
 }
 
+/// Lines copied from the CLI adapter tests. The parse path has to see a
+/// recorded result, not a shape made up for this test.
+const RECORDED_REFUSAL_RESULT: &str = r#"{"type":"result","subtype":"success","is_error":true,"result":"This request violates the Usage Policy and cannot be completed."}"#;
+const RECORDED_BILLING_DELTA: &str = r#"{"type":"stream_event","event":{"type":"content_block_delta","delta":{"type":"text_delta","text":"Your credit balance is low; payment required (402)."}}}"#;
+const RECORDED_SHORT_DELTA: &str = r#"{"type":"stream_event","event":{"type":"content_block_delta","delta":{"type":"text_delta","text":"Hel"}}}"#;
+const RELEASED_BILLING_CLAUSE: &str = "Your credit balance is low;";
+
+fn printf_line(line: &str) -> String {
+    format!("/usr/bin/printf '%s\\n' '{line}'")
+}
+
+fn make_fifo(path: &std::path::Path) {
+    let c = std::ffi::CString::new(path.to_string_lossy().into_owned()).expect("fifo path");
+    // SAFETY: `c` is a valid NUL-terminated path; mkfifo only creates a node.
+    assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o600) }, 0, "mkfifo");
+}
+
+/// Open the fifo once its reader is there and write one line. A blocking
+/// open would stick a worker if the child never arrived; `O_NONBLOCK`
+/// returns, and the wait is bounded.
+fn unblock_fifo(path: &std::path::Path) {
+    let c = std::ffi::CString::new(path.to_string_lossy().into_owned()).expect("fifo path");
+    let start = std::time::Instant::now();
+    let limit = std::time::Duration::from_secs(5);
+    loop {
+        // SAFETY: `c` is a NUL-terminated path. `O_NONBLOCK` returns at once
+        // when no reader has the fifo open.
+        let fd = unsafe { libc::open(c.as_ptr(), libc::O_WRONLY | libc::O_NONBLOCK) };
+        if fd >= 0 {
+            // SAFETY: `fd` is open, the byte outlives the call, and close
+            // releases the descriptor.
+            let n = unsafe { libc::write(fd, b"\n".as_ptr().cast(), 1) };
+            unsafe { libc::close(fd) };
+            assert_eq!(n, 1, "fifo write");
+            return;
+        }
+        let err = std::io::Error::last_os_error();
+        assert!(
+            err.raw_os_error() == Some(libc::ENXIO) && start.elapsed() < limit,
+            "fifo had no reader: {err}"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+}
+
+fn recorded_cli_provider(
+    root: &std::path::Path,
+    bin: &std::path::Path,
+) -> crate::cli_provider::CliProvider {
+    let adapter = crate::cli_provider::adapters::by_name({
+        // vendor-ok: recorded refusal output is parsed by the real adapter
+        "claude"
+    })
+    .expect("adapter");
+    crate::cli_provider::CliProvider::new(
+        adapter,
+        Some(bin.display().to_string()),
+        "m".to_string(),
+        root.to_path_buf(),
+    )
+}
+
+enum RecordedCase {
+    BeforeRelease,
+    AfterRelease,
+}
+
+fn recorded_tail(case: &RecordedCase, fifo: &std::path::Path) -> String {
+    match case {
+        RecordedCase::BeforeRelease => format!("{}\n", printf_line(RECORDED_REFUSAL_RESULT)),
+        // The first-release hold is 250ms of tokio time, and it starts when
+        // the first line is read. The second recorded delta has to be
+        // written after that hold; the script sleeps on the same clock.
+        RecordedCase::AfterRelease => format!(
+            "{}\nsleep 0.5\n{}\nread -r _ < '{}'\n{}\n",
+            printf_line(RECORDED_BILLING_DELTA),
+            printf_line(RECORDED_SHORT_DELTA),
+            fifo.display(),
+            printf_line(RECORDED_REFUSAL_RESULT),
+        ),
+    }
+}
+
+async fn read_recorded_refusal(
+    response: axum::response::Response,
+    release: Option<(std::path::PathBuf, &'static str)>,
+) -> String {
+    use tokio_stream::StreamExt as _;
+
+    let mut incoming = response.into_body().into_data_stream();
+    let mut seen = String::new();
+    let mut released = release.is_none();
+    loop {
+        let terminal = seen.contains("event: error") || seen.contains("event: done");
+        if terminal && seen.ends_with("\n\n") && released {
+            break;
+        }
+        if let Some((fifo, needle)) = &release {
+            if !released && seen.contains(needle) {
+                let fifo = fifo.clone();
+                tokio::task::spawn_blocking(move || unblock_fifo(&fifo))
+                    .await
+                    .expect("fifo task");
+                released = true;
+            }
+        }
+        let Some(chunk) = incoming.next().await else {
+            break;
+        };
+        seen.push_str(&String::from_utf8_lossy(&chunk.expect("body error")));
+    }
+    assert!(
+        released,
+        "released clause never reached the stream:\n{seen}"
+    );
+    seen
+}
+
+async fn voice_recorded_refusal(
+    case: RecordedCase,
+    sender: &str,
+) -> (String, Arc<AppState>, tempfile::TempDir) {
+    let dir = tempfile::tempdir().unwrap();
+    let fifo = dir.path().join("release");
+    if matches!(case, RecordedCase::AfterRelease) {
+        make_fifo(&fifo);
+    }
+    let bin = dir.path().join("fake-cli");
+    let script = format!(
+        "if [[ \" $* \" != *\" stream-json \"* ]]; then exit 0; fi\n\
+         set -euo pipefail\n\
+         cat >/dev/null\n\
+         {}",
+        recorded_tail(&case, &fifo)
+    );
+    crate::cli_provider::fake_cli::write_script(&bin, &script);
+    let state = build_state_boxed_with_config(
+        dir.path().to_path_buf(),
+        Box::new(recorded_cli_provider(dir.path(), &bin)),
+        ToolRegistry::new(),
+        config_with_voice_credential(),
+    )
+    .await;
+    let app = build_app(Arc::clone(&state));
+    let response = post_chat_stream_from(&app, "voice", Some(sender), Some(VOICE_CREDENTIAL)).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let release = match case {
+        RecordedCase::BeforeRelease => None,
+        RecordedCase::AfterRelease => Some((fifo, RELEASED_BILLING_CLAUSE)),
+    };
+    let body = tokio::time::timeout(
+        std::time::Duration::from_secs(20),
+        read_recorded_refusal(response, release),
+    )
+    .await
+    .unwrap_or_else(|_| panic!("recorded refusal did not finish for {sender}"));
+    (body, state, dir)
+}
+
+fn assert_clause_then_refusal_reset(body: &str, clause: &str) {
+    let frames = sse_frames(body);
+    let reset = frame_index(&frames, |event, data| {
+        event == "reset" && data.contains(r#""reason":"refusal""#)
+    });
+    let error = frame_index(&frames, |event, data| {
+        event == "error" && data.contains("the model declined this request")
+    });
+    assert!(reset < error, "{frames:?}");
+    assert!(
+        frames.iter().all(|(event, _)| event != "done"),
+        "{frames:?}"
+    );
+    let mut spoken = String::new();
+    for (event, data) in &frames[..reset] {
+        if event == "delta" {
+            spoken.push_str(&delta_text(data).unwrap_or_default());
+        }
+    }
+    assert_eq!(spoken, clause, "{frames:?}");
+    assert!(
+        frames[reset + 1..error]
+            .iter()
+            .all(|(event, _)| event != "delta"),
+        "{frames:?}"
+    );
+    assert!(!body.contains("Usage Policy"), "{body}");
+}
+
+/// A guest voice turn whose CLI prints a recorded refusal. Nothing released
+/// means no reset; a clause already on the wire means `reset` before
+/// `error`. Either way the turn is rolled back.
+#[tokio::test]
+async fn voice_guest_recorded_cli_refusal_resets_only_after_release() {
+    let (early_body, early_state, _early_dir) =
+        voice_recorded_refusal(RecordedCase::BeforeRelease, "rec-early").await;
+    assert_refusal_stream_speaks_nothing(&early_body);
+    let early_frames = sse_frames(&early_body);
+    assert!(
+        early_frames.iter().all(|(event, _)| event != "reset"),
+        "{early_frames:?}"
+    );
+    assert!(!early_body.contains("Usage Policy"), "{early_body}");
+    assert_eq!(messages_len(&early_state, "guest:rec-early").await, 0);
+
+    let (late_body, late_state, _late_dir) =
+        voice_recorded_refusal(RecordedCase::AfterRelease, "rec-late").await;
+    assert_clause_then_refusal_reset(&late_body, RELEASED_BILLING_CLAUSE);
+    assert!(!late_body.contains("payment required"), "{late_body}");
+    assert!(!late_body.contains("Hel"), "{late_body}");
+    assert_eq!(messages_len(&late_state, "guest:rec-late").await, 0);
+}
+
 struct ReleaseThenPark {
     wrote_more: Arc<AtomicBool>,
     dropped: Arc<AtomicBool>,
