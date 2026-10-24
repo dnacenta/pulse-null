@@ -583,6 +583,14 @@ mod tests {
             chat_event_from_sse(&ev("reset", r#"{"reason":"guard"}"#)),
             None
         );
+        assert_eq!(
+            chat_event_from_sse(&ev("reset", r#"{"reason":"refusal"}"#)),
+            None
+        );
+        assert_eq!(
+            chat_event_from_sse(&ev("reset", r#"{"reason":"error"}"#)),
+            None
+        );
         assert_eq!(chat_event_from_sse(&ev("nope", "{}")), None);
     }
 
