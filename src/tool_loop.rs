@@ -580,12 +580,18 @@ impl ProgressSink {
 
     /// Settle a guard cut after a release. True when the kept tail was accepted,
     /// so the caller must not send `reset` or the raw hold.
+    ///
+    /// A hold that already overflowed has sent `reset{budget}`. Nothing else
+    /// from this round may be spoken; the caller takes the ordinary cut path.
     pub fn finish_cut(&self, kept: &str) -> bool {
         let rest = {
             let mut held = self.lock();
             let Some(buf) = held.as_mut() else {
                 return false;
             };
+            if buf.overflowed {
+                return false;
+            }
             if !buf.gate.released_any() {
                 return false;
             }

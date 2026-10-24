@@ -2672,6 +2672,158 @@ async fn voice_stream_budget_after_release() {
     );
 }
 
+const BUDGET_KEPT: &str = "Budget clause is long enough.";
+
+/// A clause is spoken, the hold cap trips, then the guard cuts. After
+/// `reset{budget}` the frames are the ordinary cut: `reset{guard}`, then
+/// the kept text, with no delta between the two resets.
+#[tokio::test(start_paused = true)]
+async fn voice_stream_budget_then_guard_cut() {
+    use tokio_stream::StreamExt as _;
+
+    let clause_visible = Arc::new(Notify::new());
+    let dir = tempfile::tempdir().unwrap();
+    let state = build_state_boxed_with_config(
+        dir.path().to_path_buf(),
+        Box::new(BudgetThenGuard {
+            clause_visible: Arc::clone(&clause_visible),
+        }),
+        ToolRegistry::new(),
+        config_with_voice_credential(),
+    )
+    .await;
+    let app = build_app(state);
+    let body = pause_drive(async move {
+        let response =
+            post_chat_stream_from(&app, "voice", Some("budget-cut"), Some(VOICE_CREDENTIAL)).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let mut incoming = response.into_body().into_data_stream();
+        let mut seen = String::new();
+        let mut noted = false;
+        loop {
+            if !noted && seen.contains(BUDGET_KEPT) {
+                noted = true;
+                clause_visible.notify_waiters();
+            }
+            if seen.contains("event: done") && seen.ends_with("\n\n") {
+                break;
+            }
+            let Some(chunk) = incoming.next().await else {
+                break;
+            };
+            seen.push_str(&String::from_utf8_lossy(&chunk.expect("body error")));
+        }
+        seen
+    })
+    .await;
+
+    assert!(!body.contains("xxxxx"), "{body}");
+    assert!(!body.contains("[User]"), "{body}");
+    let frames = sse_frames(&body);
+    let budget = frame_index(&frames, |event, data| {
+        event == "reset" && data.contains(r#""reason":"budget""#)
+    });
+    let guard = frame_index(&frames, |event, data| {
+        event == "reset" && data.contains(r#""reason":"guard""#)
+    });
+    assert!(budget < guard, "{frames:?}");
+    assert!(
+        frames[budget + 1..guard]
+            .iter()
+            .all(|(event, _)| event != "delta"),
+        "{frames:?}"
+    );
+    let kept = frame_index(&frames, |event, data| {
+        event == "delta" && data.contains(BUDGET_KEPT)
+    });
+    // The spoken clause is ahead of the budget reset. The kept text follows
+    // the guard reset and is the only delta after it.
+    assert!(kept < budget, "{frames:?}");
+    assert_eq!(
+        frames
+            .iter()
+            .filter(|(event, data)| event == "delta" && data.contains(BUDGET_KEPT))
+            .count(),
+        2,
+        "{frames:?}"
+    );
+    let after = frames
+        .iter()
+        .enumerate()
+        .filter(|(index, (event, _))| *index > guard && event == "delta")
+        .map(|(_, (_, data))| delta_text(data).unwrap_or_default())
+        .collect::<Vec<_>>();
+    assert_eq!(after, vec![BUDGET_KEPT.to_string()], "{frames:?}");
+    let done = frame_index(&frames, |event, _data| event == "done");
+    assert!(guard < done, "{frames:?}");
+    assert!(frames[done].1.contains(r#""truncated":true"#), "{frames:?}");
+    assert!(frames[done].1.contains(BUDGET_KEPT), "{frames:?}");
+}
+
+struct BudgetThenGuard {
+    clause_visible: Arc<Notify>,
+}
+
+impl BudgetThenGuard {
+    fn reply() -> LlmResponse {
+        LlmResponse {
+            content: vec![ContentBlock::Text {
+                text: format!("{BUDGET_KEPT}\n[User]: hidden tail"),
+            }],
+            stop_reason: StopReason::EndTurn,
+            model: "mock".into(),
+            input_tokens: Some(1),
+            output_tokens: Some(1),
+        }
+    }
+}
+
+impl LmProvider for BudgetThenGuard {
+    fn invoke(
+        &self,
+        _system_prompt: &str,
+        _messages: &[Message],
+        _max_tokens: u32,
+        _tools: Option<&[serde_json::Value]>,
+    ) -> LlmResult<'_> {
+        Box::pin(async { Ok(Self::reply()) })
+    }
+
+    fn name(&self) -> &str {
+        "budget-then-guard"
+    }
+}
+
+impl crate::streaming::StreamingProvider for BudgetThenGuard {
+    fn supports_streaming(&self) -> bool {
+        true
+    }
+
+    fn invoke_streaming(
+        &self,
+        _system_prompt: &str,
+        _messages: &[Message],
+        _max_tokens: u32,
+        _tools: Option<&[serde_json::Value]>,
+    ) -> crate::streaming::StreamResult<'_> {
+        use crate::streaming::StreamEvent;
+        let clause_visible = Arc::clone(&self.clause_visible);
+        Box::pin(async_stream::stream! {
+            let start = tokio::time::Instant::now();
+            yield StreamEvent::TextDelta(format!("{BUDGET_KEPT} "));
+            let hold = std::time::Duration::from_millis(250);
+            let waited = start.elapsed();
+            if waited < hold {
+                tokio::time::sleep(hold - waited).await;
+            }
+            yield StreamEvent::TextDelta(String::new());
+            clause_visible.notified().await;
+            yield StreamEvent::TextDelta("x".repeat(5000));
+            yield StreamEvent::Done(BudgetThenGuard::reply());
+        })
+    }
+}
+
 const SPOKEN_CLAUSE: &str = "Here is one complete clause. ";
 const SPOKEN_RELEASED: &str = "Here is one complete clause.";
 
