@@ -802,48 +802,109 @@ mod tests {
         .into_bytes()
     }
 
+    fn tool_use_fixture() -> Vec<u8> {
+        format!(
+            "{}{}{}{}{}{}{}",
+            message_start("m", 10),
+            sse(
+                "content_block_start",
+                r#"{"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"toolu_1","name":"file_read","input":{}}}"#,
+            ),
+            input_json_delta(r#"{"path":"#),
+            input_json_delta(r#""a.txt"}"#),
+            block_stop(),
+            message_delta("tool_use", 8),
+            message_stop(),
+        )
+        .into_bytes()
+    }
+
+    fn refusal_after_deltas_fixture() -> Vec<u8> {
+        format!(
+            "{}{}{}{}{}",
+            message_start("m", 20),
+            text_delta("draft one"),
+            text_delta(" draft two"),
+            refusal_delta(Some("cyber")),
+            message_stop(),
+        )
+        .into_bytes()
+    }
+
+    fn deltas_then_refused(events: &[StreamEvent]) -> bool {
+        let Some(StreamEvent::Refused { .. }) = events.last() else {
+            return false;
+        };
+        if events
+            .iter()
+            .any(|event| matches!(event, StreamEvent::Done(_)))
+        {
+            return false;
+        }
+        let before = &events[..events.len() - 1];
+        !before.is_empty()
+            && before
+                .iter()
+                .all(|event| matches!(event, StreamEvent::TextDelta(_)))
+    }
+
+    /// One cut-loop and one proptest, applied to every fixture.
+    /// A refusal fixture must end on `Refused`, with its text deltas before that and no `Done`.
+    fn prove_chunking(fixtures: &[(&[u8], bool)]) {
+        for (bytes, refusal) in fixtures {
+            let whole = fingerprint(&decode_cuts(bytes, &[]));
+            for cut in 0..=bytes.len() {
+                let events = decode_cuts(bytes, &[cut]);
+                assert_eq!(fingerprint(&events), whole, "cut {cut}");
+                if *refusal {
+                    assert!(deltas_then_refused(&events), "cut {cut}: {events:?}");
+                }
+            }
+
+            let len = bytes.len();
+            let strategy = prop::collection::vec(0..=len, 0..8);
+            let mut runner = TestRunner::new(ProptestConfig::with_cases(64));
+            runner
+                .run(&strategy, |cuts| {
+                    let events = decode_cuts(bytes, &cuts);
+                    let got = fingerprint(&events);
+                    prop_assert_eq!(&got, &whole);
+                    if *refusal {
+                        prop_assert!(deltas_then_refused(&events));
+                    }
+                    Ok(())
+                })
+                .unwrap();
+        }
+    }
+
     #[test]
     fn decoding_is_independent_of_chunking() {
-        let bytes = end_turn_fixture();
-        let whole = fingerprint(&decode_cuts(&bytes, &[]));
+        let end_turn = end_turn_fixture();
         // These two cuts are the ones a per-chunk decode gets wrong: inside
         // a multibyte character, and between the two bytes of `\n\n`.
-        let multibyte = bytes
+        let multibyte = end_turn
             .windows(2)
             .position(|pair| pair == [0xC3, 0xA9])
             .expect("fixture contains a multibyte character")
             + 1;
-        let separator = bytes
+        let separator = end_turn
             .windows(2)
             .position(|pair| pair == b"\n\n")
             .expect("fixture contains a separator")
             + 1;
         assert!(
-            multibyte < bytes.len(),
+            multibyte < end_turn.len(),
             "multibyte cut sits inside the fixture"
         );
         assert!(
-            separator < bytes.len(),
+            separator < end_turn.len(),
             "separator cut sits inside the fixture"
         );
-        for cut in 0..=bytes.len() {
-            assert_eq!(
-                fingerprint(&decode_cuts(&bytes, &[cut])),
-                whole,
-                "cut {cut}"
-            );
-        }
 
-        let len = bytes.len();
-        let strategy = prop::collection::vec(0..=len, 0..8);
-        let mut runner = TestRunner::new(ProptestConfig::with_cases(64));
-        runner
-            .run(&strategy, |cuts| {
-                let got = fingerprint(&decode_cuts(&bytes, &cuts));
-                prop_assert_eq!(&got, &whole);
-                Ok(())
-            })
-            .unwrap();
+        let tool_use = tool_use_fixture();
+        let refusal = refusal_after_deltas_fixture();
+        prove_chunking(&[(&end_turn, false), (&tool_use, false), (&refusal, true)]);
     }
 
     #[test]
