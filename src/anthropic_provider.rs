@@ -377,10 +377,11 @@ impl SseDecoder {
         while let Some(end) = self.buffer.windows(2).position(|pair| pair == b"\n\n") {
             let event_bytes: Vec<u8> = self.buffer.drain(..end).collect();
             self.buffer.drain(..2);
-            let Ok(event_text) = std::str::from_utf8(&event_bytes) else {
-                continue;
-            };
-            if let Some(event) = self.decode_event(event_text) {
+            // The event is already complete, so a bad byte is inside it.
+            // Dropping it would skip a refusal and let a later message_stop
+            // become a normal end of turn.
+            let event_text = String::from_utf8_lossy(&event_bytes);
+            if let Some(event) = self.decode_event(&event_text) {
                 let finished = self.finished;
                 events.push(event);
                 if finished {
@@ -658,6 +659,24 @@ mod tests {
             }
             other => panic!("{other:?}"),
         }
+    }
+
+    #[test]
+    fn refusal_with_invalid_utf8_is_still_typed() {
+        let mut bytes = message_start("m", 4).into_bytes();
+        bytes.extend(
+            b"event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"refusal\",\"stop_sequence\":null,\"stop_details\":{\"type\":\"refusal\",\"category\":\"cyber\",\"explanation\":\"bad",
+        );
+        bytes.push(0xFF);
+        bytes.extend(b"byte\"}},\"usage\":{\"output_tokens\":0}}\n\n");
+        bytes.extend(message_stop().into_bytes());
+
+        let events = {
+            let mut decoder = SseDecoder::new(CONFIGURED);
+            decoder.feed(&bytes)
+        };
+        assert_eq!(events.len(), 1, "{events:?}");
+        assert_refused(&events[0], "refusal (cyber)");
     }
 
     #[test]
