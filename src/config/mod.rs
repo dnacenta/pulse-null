@@ -108,8 +108,9 @@ pub struct PulseConfig {
     #[serde(default)]
     pub rules_dir: Option<String>,
     /// When true, the pulse's own rules load only from root-owned files, and
-    /// only when every directory from the pulse root down to that rules
-    /// directory is root-owned and not group- or world-writable. The rule file
+    /// only when every directory below the pulse root, through that rules
+    /// directory, is root-owned and not group- or world-writable. The pulse
+    /// root itself is not checked, because the pulse owns its home. The rule file
     /// itself must not be group- or world-writable either, so strict mode
     /// enforces mode 0644. Strict mode also rejects a rules path on a FUSE
     /// filesystem. Where the pulse user

@@ -91,8 +91,8 @@ To close that for pulses that use the inlined-rules path (grok, codex), set
 `rules_require_root = true` and make `.claude` and `.claude/rules` `root:pulse`,
 directories `0755`, with root-owned `0644` files. Strict mode enforces that file
 mode: a group- or world-writable rule file is skipped. A file is then read only when root owns
-it and every directory from the pulse root down to the rules directory is root-owned and
-not group- or world-writable. Strict mode also rejects a rules path on a FUSE filesystem.
+it and every directory below the pulse root, through the rules directory, is root-owned and
+not group- or world-writable. The pulse root itself is not checked, because the pulse owns its home. Strict mode also rejects a rules path on a FUSE filesystem.
 Where the pulse user can still mount filesystems, deny that too (`NoNewPrivileges=yes`,
 `PrivateDevices=yes` or no `/dev/fuse`, no setuid fusermount for the pulse user): the
 loader can only check what it can see. Anything else is skipped, and the warning names

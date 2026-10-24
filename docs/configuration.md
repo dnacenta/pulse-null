@@ -32,7 +32,7 @@ Every key:
 | `pulse` | `owner_name` | — | Your name |
 | `pulse` | `owner_alias` | — | How the pulse addresses you |
 | `pulse` | `rules_dir` | — | Shared protocol files directory |
-| `pulse` | `rules_require_root` | `false` | Pulse rules load only from root-owned files under directories (from the pulse root down to the rules directory) that root owns and that are not group- or world-writable. Strict mode enforces the same on the rule file (0644). Strict mode also rejects a path on a FUSE filesystem. Where the pulse user can still mount filesystems, deny that too (`NoNewPrivileges=yes`, `PrivateDevices=yes` or no `/dev/fuse`, no setuid fusermount for the pulse user): the loader can only check what it can see. `false` still reads a file the pulse user or root owns |
+| `pulse` | `rules_require_root` | `false` | Pulse rules load only from root-owned files under directories below the pulse root (through the rules directory) that root owns and that are not group- or world-writable. The pulse root itself is not checked because the pulse owns its home. Strict mode enforces the same on the rule file (0644). Strict mode also rejects a path on a FUSE filesystem. Where the pulse user can still mount filesystems, deny that too (`NoNewPrivileges=yes`, `PrivateDevices=yes` or no `/dev/fuse`, no setuid fusermount for the pulse user): the loader can only check what it can see. `false` still reads a file the pulse user or root owns |
 | `server` | `host` | `127.0.0.1` | Bind address |
 | `server` | `port` | `3100` (init suggests from 3200) | Bind port |
 | `llm` | `provider` | set at init (`anthropic` if missing) | `cli`, `anthropic`, `ollama` |
