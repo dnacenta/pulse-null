@@ -1770,16 +1770,34 @@ data: {\"type\":\"message_stop\"}
 
 ";
 
-/// Replays fixture SSE through the HTTP decoder, so the handler sees the
-/// same events a live stream would produce. No network.
+/// Buffered refusal body: partial content and an explanation that must not
+/// reach the client. `/chat` parses this through the real mapping.
+fn buffered_refusal_body() -> serde_json::Value {
+    serde_json::json!({
+        "model": "m",
+        "stop_reason": "refusal",
+        "stop_details": {
+            "type": "refusal",
+            "category": "cyber",
+            "explanation": "do-not-leak-explanation",
+        },
+        "content": [{"type": "text", "text": "partial draft"}],
+        "usage": {"input_tokens": 3, "output_tokens": 1}
+    })
+}
+
+/// Replays fixture SSE through the stream decoder, and a buffered refusal
+/// body through the message mapping. No network.
 struct DecoderReplay {
     sse: &'static [u8],
+    body: serde_json::Value,
 }
 
 impl DecoderReplay {
     fn from_sse(sse: &'static str) -> Self {
         Self {
             sse: sse.as_bytes(),
+            body: buffered_refusal_body(),
         }
     }
 
@@ -1797,21 +1815,8 @@ impl LmProvider for DecoderReplay {
         _max_tokens: u32,
         _tools: Option<&[serde_json::Value]>,
     ) -> LlmResult<'_> {
-        let events = self.events();
-        Box::pin(async move {
-            for event in events {
-                match event {
-                    crate::streaming::StreamEvent::Refused { model, detail } => {
-                        return Err(Box::new(crate::errors::RefusalError { model, detail })
-                            as Box<dyn std::error::Error + Send + Sync>);
-                    }
-                    crate::streaming::StreamEvent::Done(response) => return Ok(response),
-                    crate::streaming::StreamEvent::Error(message) => return Err(message.into()),
-                    _ => {}
-                }
-            }
-            Err("provider stream ended without a final response".into())
-        })
+        let body = self.body.clone();
+        Box::pin(async move { crate::anthropic_provider::interpret_message(&body, "configured") })
     }
 
     fn name(&self) -> &str {

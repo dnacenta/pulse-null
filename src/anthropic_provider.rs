@@ -315,7 +315,7 @@ fn response_from_body(body: &serde_json::Value, configured_model: &str) -> LlmRe
 
 /// Buffered message body. A refusal is an error before any [`LlmResponse`]
 /// is built, so partial content is discarded.
-fn interpret_message(
+pub(crate) fn interpret_message(
     body: &serde_json::Value,
     configured_model: &str,
 ) -> Result<LlmResponse, Box<dyn std::error::Error + Send + Sync>> {
