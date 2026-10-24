@@ -362,19 +362,22 @@ async fn run_resolved_turn(
     let outcome = outcome.map_err(|e| steps::turn_failure(&turn, fallback_capped, e.as_ref()))?;
 
     // The guard already replaced the stored reply. A screen client has the
-    // raw deltas and must drop them. A voice-pool client never received
-    // them: the held segment is discarded, then `reset`, then the kept text.
+    // raw deltas and must drop them. A voice-pool client that has not heard
+    // a clause yet drops the hold, then `reset`, then the kept text. A cut
+    // that follows a release was already settled and sends neither.
     if outcome.result.was_truncated {
         if let Some(progress) = progress.as_ref() {
-            progress.discard_held();
-            if !progress.try_send(TurnEvent::Reset(crate::wire::ResetReason::Guard)) {
-                return Err((
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    "reset was not delivered".to_string(),
-                ));
-            }
-            if hold_deltas && !outcome.result.text.is_empty() {
-                progress.send_now(TurnEvent::Delta(outcome.result.text.clone()));
+            if !progress.cut_was_handled() {
+                progress.discard_held();
+                if !progress.try_send(TurnEvent::Reset(crate::wire::ResetReason::Guard)) {
+                    return Err((
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        "reset was not delivered".to_string(),
+                    ));
+                }
+                if hold_deltas && !outcome.result.text.is_empty() {
+                    progress.send_now(TurnEvent::Delta(outcome.result.text.clone()));
+                }
             }
         }
     }
@@ -557,10 +560,11 @@ fn error_to_sse(status: StatusCode, message: String) -> Event {
 /// any other channel is `403` before a permit is taken.
 ///
 /// Client contract: deltas are best-effort. A screen stream forwards them
-/// as the provider yields them, unvalidated. A voice-pool stream holds the
-/// open segment and forwards a delta only after that round's guard has
-/// kept it; a cut or a refusal drops the hold and sends `reset` with no
-/// raw tail before the kept text. `reset` is delivered on a side channel
+/// as the provider yields them, unvalidated. A voice-pool stream releases
+/// a guarded clause after the first-release hold and holds the rest of the
+/// open segment until the round's guard has kept it; a cut before any
+/// release drops the hold and sends `reset` with no raw tail before the
+/// kept text. `reset` is delivered on a side channel
 /// and written before any event the client has not yet received. A
 /// `segment` that does not fit is written after the events already
 /// accepted into the channel and before anything accepted later. A

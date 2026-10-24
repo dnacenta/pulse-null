@@ -2158,6 +2158,519 @@ async fn e2e_chat_stream_reset_on_guard() {
     assert!(!done_data.contains("[User]:"), "{done_data}");
 }
 
+/// Drive `fut` on a paused clock, stepping 40 ms whenever it is waiting.
+async fn pause_drive<T>(fut: impl std::future::Future<Output = T>) -> T {
+    tokio::pin!(fut);
+    loop {
+        tokio::select! {
+            biased;
+            out = &mut fut => return out,
+            _ = tokio::time::advance(std::time::Duration::from_millis(40)) => {}
+        }
+    }
+}
+
+fn early_clause(n: u32) -> String {
+    format!("Clause {n} stands complete. ")
+}
+
+const EARLY_LAST: &str = "Final clause stands complete. ";
+
+fn early_reply() -> String {
+    let mut full = String::new();
+    for n in 0..4 {
+        full.push_str(&early_clause(n));
+    }
+    full.push_str(EARLY_LAST);
+    full
+}
+
+fn delta_text(data: &str) -> Option<String> {
+    let value: serde_json::Value = serde_json::from_str(data).ok()?;
+    value
+        .get("text")
+        .and_then(|text| text.as_str())
+        .map(str::to_string)
+}
+
+/// Clauses 40 ms apart. The hold is waited out before the last clause, so the
+/// first spoken delta lands at or after 250 ms and still ahead of that clause.
+struct PacedClauses {
+    last_started: Arc<std::sync::atomic::AtomicBool>,
+    release_ms: Arc<std::sync::atomic::AtomicU64>,
+}
+
+impl PacedClauses {
+    fn reply() -> LlmResponse {
+        LlmResponse {
+            content: vec![ContentBlock::Text {
+                text: early_reply(),
+            }],
+            stop_reason: StopReason::EndTurn,
+            model: "mock".into(),
+            input_tokens: Some(4),
+            output_tokens: Some(8),
+        }
+    }
+}
+
+impl LmProvider for PacedClauses {
+    fn invoke(
+        &self,
+        _system_prompt: &str,
+        _messages: &[Message],
+        _max_tokens: u32,
+        _tools: Option<&[serde_json::Value]>,
+    ) -> LlmResult<'_> {
+        Box::pin(async { Ok(Self::reply()) })
+    }
+
+    fn name(&self) -> &str {
+        "paced-clauses"
+    }
+}
+
+impl crate::streaming::StreamingProvider for PacedClauses {
+    fn supports_streaming(&self) -> bool {
+        true
+    }
+
+    fn invoke_streaming(
+        &self,
+        _system_prompt: &str,
+        _messages: &[Message],
+        _max_tokens: u32,
+        _tools: Option<&[serde_json::Value]>,
+    ) -> crate::streaming::StreamResult<'_> {
+        use crate::streaming::StreamEvent;
+        let last_started = Arc::clone(&self.last_started);
+        let release_ms = Arc::clone(&self.release_ms);
+        Box::pin(async_stream::stream! {
+            let start = tokio::time::Instant::now();
+            for n in 0..4 {
+                yield StreamEvent::TextDelta(early_clause(n));
+                tokio::time::sleep(std::time::Duration::from_millis(40)).await;
+            }
+            let hold = std::time::Duration::from_millis(250);
+            let waited = start.elapsed();
+            if waited < hold {
+                tokio::time::sleep(hold - waited).await;
+            }
+            release_ms.store(start.elapsed().as_millis() as u64, Ordering::SeqCst);
+            yield StreamEvent::TextDelta(String::new());
+            tokio::time::sleep(std::time::Duration::from_millis(40)).await;
+            last_started.store(true, Ordering::SeqCst);
+            yield StreamEvent::TextDelta(EARLY_LAST.into());
+            yield StreamEvent::Done(PacedClauses::reply());
+        })
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn voice_stream_releases_first_clause_early() {
+    use std::sync::atomic::AtomicBool;
+    use tokio_stream::StreamExt as _;
+
+    let last_started = Arc::new(AtomicBool::new(false));
+    let release_ms = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let saw_before_last = Arc::new(AtomicBool::new(false));
+    let dir = tempfile::tempdir().unwrap();
+    let state = build_state_boxed_with_config(
+        dir.path().to_path_buf(),
+        Box::new(PacedClauses {
+            last_started: Arc::clone(&last_started),
+            release_ms: Arc::clone(&release_ms),
+        }),
+        ToolRegistry::new(),
+        config_with_voice_credential(),
+    )
+    .await;
+    let app = build_app(Arc::clone(&state));
+    let saw = Arc::clone(&saw_before_last);
+    let started = Arc::clone(&last_started);
+
+    let body = pause_drive(async move {
+        let response =
+            post_chat_stream_from(&app, "voice", Some("early"), Some(VOICE_CREDENTIAL)).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let mut incoming = response.into_body().into_data_stream();
+        let mut seen = String::new();
+        let mut noted = false;
+        loop {
+            if !noted && seen.contains("Clause 0") {
+                noted = true;
+                if !started.load(Ordering::SeqCst) {
+                    saw.store(true, Ordering::SeqCst);
+                }
+            }
+            if seen.contains("event: done") && seen.ends_with("\n\n") {
+                break;
+            }
+            let Some(chunk) = incoming.next().await else {
+                break;
+            };
+            seen.push_str(&String::from_utf8_lossy(&chunk.expect("body error")));
+        }
+        let (status, chat) = post_chat_secret(
+            &app,
+            "voice",
+            Some("early-chat"),
+            "hi",
+            Some(VOICE_CREDENTIAL),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        (seen, chat)
+    })
+    .await;
+    let (stream_body, chat_body) = body;
+    assert!(
+        saw_before_last.load(Ordering::SeqCst),
+        "first clause delta was not ahead of the last clause"
+    );
+    let frames = sse_frames(&stream_body);
+    let mut spoken = String::new();
+    let mut saw_clause = false;
+    for (event, data) in &frames {
+        assert_ne!(event, "reset", "{frames:?}");
+        if event == "delta" {
+            let text = delta_text(data).unwrap_or_default();
+            if !saw_clause && text.contains("Clause 0") {
+                saw_clause = true;
+                assert!(
+                    !text.contains(EARLY_LAST.trim()),
+                    "first clause delta included the last clause: {text:?}"
+                );
+            }
+            spoken.push_str(&text);
+        }
+    }
+    assert!(saw_clause, "{frames:?}");
+    assert!(
+        release_ms.load(Ordering::SeqCst) >= 250,
+        "first release at {} ms",
+        release_ms.load(Ordering::SeqCst)
+    );
+    assert_eq!(spoken, early_reply());
+    let chat: serde_json::Value = serde_json::from_str(&chat_body).unwrap();
+    let done = frames
+        .iter()
+        .find(|(event, _)| event == "done")
+        .map(|(_, data)| serde_json::from_str::<serde_json::Value>(data).unwrap())
+        .expect("done");
+    assert_eq!(done["text"], chat["response"]);
+    assert_eq!(
+        done["truncated"].as_bool().unwrap_or(false),
+        chat["truncated"].as_bool().unwrap_or(false)
+    );
+    assert_eq!(done["truncated"], false);
+}
+
+const KEPT_HEAD: &str = "Here is one complete clause. ";
+const KEPT_TAIL: &str = "More kept words follow here.";
+
+fn cut_after_release_raw() -> String {
+    format!("{KEPT_HEAD}{KEPT_TAIL}\n[User]: secret tail")
+}
+
+fn cut_after_release_kept() -> String {
+    format!("{KEPT_HEAD}{KEPT_TAIL}")
+}
+
+struct CutAfterRelease;
+
+impl CutAfterRelease {
+    fn reply() -> LlmResponse {
+        LlmResponse {
+            content: vec![ContentBlock::Text {
+                text: cut_after_release_raw(),
+            }],
+            stop_reason: StopReason::EndTurn,
+            model: "mock".into(),
+            input_tokens: Some(4),
+            output_tokens: Some(8),
+        }
+    }
+}
+
+impl LmProvider for CutAfterRelease {
+    fn invoke(
+        &self,
+        _system_prompt: &str,
+        _messages: &[Message],
+        _max_tokens: u32,
+        _tools: Option<&[serde_json::Value]>,
+    ) -> LlmResult<'_> {
+        Box::pin(async { Ok(Self::reply()) })
+    }
+
+    fn name(&self) -> &str {
+        "cut-after-release"
+    }
+}
+
+impl crate::streaming::StreamingProvider for CutAfterRelease {
+    fn supports_streaming(&self) -> bool {
+        true
+    }
+
+    fn invoke_streaming(
+        &self,
+        _system_prompt: &str,
+        _messages: &[Message],
+        _max_tokens: u32,
+        _tools: Option<&[serde_json::Value]>,
+    ) -> crate::streaming::StreamResult<'_> {
+        use crate::streaming::StreamEvent;
+        Box::pin(async_stream::stream! {
+            let start = tokio::time::Instant::now();
+            yield StreamEvent::TextDelta(KEPT_HEAD.into());
+            let hold = std::time::Duration::from_millis(250);
+            let waited = start.elapsed();
+            if waited < hold {
+                tokio::time::sleep(hold - waited).await;
+            }
+            yield StreamEvent::TextDelta(String::new());
+            yield StreamEvent::TextDelta(format!("{KEPT_TAIL}\n[User]: secret tail"));
+            yield StreamEvent::Done(CutAfterRelease::reply());
+        })
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn voice_stream_guard_cut_after_release_sends_kept_rest() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = build_state_boxed_with_config(
+        dir.path().to_path_buf(),
+        Box::new(CutAfterRelease),
+        ToolRegistry::new(),
+        config_with_voice_credential(),
+    )
+    .await;
+    let app = build_app(Arc::clone(&state));
+    let (stream_body, chat_body) = pause_drive(async {
+        let response =
+            post_chat_stream_from(&app, "voice", Some("cut"), Some(VOICE_CREDENTIAL)).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let (status, chat) = post_chat_secret(
+            &app,
+            "voice",
+            Some("cut-chat"),
+            "hi",
+            Some(VOICE_CREDENTIAL),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        (String::from_utf8(bytes.to_vec()).unwrap(), chat)
+    })
+    .await;
+    let frames = sse_frames(&stream_body);
+    assert!(
+        frames.iter().all(|(event, _)| event != "reset"),
+        "{frames:?}"
+    );
+    let mut spoken = String::new();
+    for (event, data) in &frames {
+        if event == "delta" {
+            let text = delta_text(data).unwrap_or_default();
+            assert!(!text.contains("[User]:"), "{text}");
+            spoken.push_str(&text);
+        }
+    }
+    assert_eq!(spoken, cut_after_release_kept());
+    let chat: serde_json::Value = serde_json::from_str(&chat_body).unwrap();
+    let done = frames
+        .iter()
+        .find(|(event, _)| event == "done")
+        .map(|(_, data)| serde_json::from_str::<serde_json::Value>(data).unwrap())
+        .expect("done");
+    assert_eq!(done["text"], chat["response"]);
+    assert_eq!(done["text"], cut_after_release_kept());
+    assert_eq!(done["truncated"], true);
+    assert_eq!(chat["truncated"], true);
+}
+
+/// The whole reply arrives before the hold elapses, so the cut is unchanged:
+/// `reset`, then the kept text, and no delta ahead of the reset.
+#[tokio::test]
+async fn voice_stream_guard_cut_before_release_unchanged() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = build_state_boxed_with_config(
+        dir.path().to_path_buf(),
+        Box::new(guard_cut_provider(GUARD_RAW)),
+        ToolRegistry::new(),
+        config_with_voice_credential(),
+    )
+    .await;
+    let app = build_app(state);
+    let response = post_chat_stream_from(&app, "voice", Some("fast"), Some(VOICE_CREDENTIAL)).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let frames = sse_frames(&String::from_utf8_lossy(&bytes));
+    let reset = frame_index(&frames, |event, data| {
+        event == "reset" && data.contains(r#""reason":"guard""#)
+    });
+    let kept = frame_index(&frames, |event, data| {
+        event == "delta" && data.contains(GUARD_KEPT)
+    });
+    let done = frame_index(&frames, |event, data| {
+        event == "done" && data.contains(r#""truncated":true"#)
+    });
+    assert!(reset < kept && kept < done, "{frames:?}");
+    assert!(
+        frames[..reset].iter().all(|(event, _)| event != "delta"),
+        "{frames:?}"
+    );
+    assert!(
+        frames
+            .iter()
+            .all(|(event, data)| !(event == "delta" && data.contains("[User]:"))),
+        "{frames:?}"
+    );
+}
+
+struct BudgetAfterRelease {
+    /// Signalled once the spoken clause is on the wire, before the cap is crossed.
+    clause_visible: Arc<Notify>,
+}
+
+impl BudgetAfterRelease {
+    fn reply() -> LlmResponse {
+        LlmResponse {
+            content: vec![ContentBlock::Text {
+                text: "Budget clause is long enough.".into(),
+            }],
+            stop_reason: StopReason::EndTurn,
+            model: "mock".into(),
+            input_tokens: Some(1),
+            output_tokens: Some(1),
+        }
+    }
+}
+
+impl LmProvider for BudgetAfterRelease {
+    fn invoke(
+        &self,
+        _system_prompt: &str,
+        _messages: &[Message],
+        _max_tokens: u32,
+        _tools: Option<&[serde_json::Value]>,
+    ) -> LlmResult<'_> {
+        Box::pin(async { Ok(Self::reply()) })
+    }
+
+    fn name(&self) -> &str {
+        "budget-after-release"
+    }
+}
+
+impl crate::streaming::StreamingProvider for BudgetAfterRelease {
+    fn supports_streaming(&self) -> bool {
+        true
+    }
+
+    fn invoke_streaming(
+        &self,
+        _system_prompt: &str,
+        _messages: &[Message],
+        _max_tokens: u32,
+        _tools: Option<&[serde_json::Value]>,
+    ) -> crate::streaming::StreamResult<'_> {
+        use crate::streaming::StreamEvent;
+        let clause_visible = Arc::clone(&self.clause_visible);
+        Box::pin(async_stream::stream! {
+            let start = tokio::time::Instant::now();
+            yield StreamEvent::TextDelta("Budget clause is long enough. ".into());
+            let hold = std::time::Duration::from_millis(250);
+            let waited = start.elapsed();
+            if waited < hold {
+                tokio::time::sleep(hold - waited).await;
+            }
+            yield StreamEvent::TextDelta(String::new());
+            clause_visible.notified().await;
+            yield StreamEvent::TextDelta("x".repeat(5000));
+            yield StreamEvent::TextDelta("yyyy".into());
+            yield StreamEvent::Done(BudgetAfterRelease::reply());
+        })
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn voice_stream_budget_after_release() {
+    use tokio_stream::StreamExt as _;
+
+    let clause_visible = Arc::new(Notify::new());
+    let dir = tempfile::tempdir().unwrap();
+    let state = build_state_boxed_with_config(
+        dir.path().to_path_buf(),
+        Box::new(BudgetAfterRelease {
+            clause_visible: Arc::clone(&clause_visible),
+        }),
+        ToolRegistry::new(),
+        config_with_voice_credential(),
+    )
+    .await;
+    let app = build_app(state);
+    let body = pause_drive(async move {
+        let response =
+            post_chat_stream_from(&app, "voice", Some("budget"), Some(VOICE_CREDENTIAL)).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let mut incoming = response.into_body().into_data_stream();
+        let mut seen = String::new();
+        let mut noted = false;
+        loop {
+            if !noted && seen.contains("Budget clause is long enough.") {
+                noted = true;
+                clause_visible.notify_waiters();
+            }
+            if seen.contains("event: done") && seen.ends_with("\n\n") {
+                break;
+            }
+            let Some(chunk) = incoming.next().await else {
+                break;
+            };
+            seen.push_str(&String::from_utf8_lossy(&chunk.expect("body error")));
+        }
+        seen
+    })
+    .await;
+    assert!(!body.contains("xxxxx"), "{body}");
+    assert!(!body.contains("yyyy"), "{body}");
+    let frames = sse_frames(&body);
+    let reset = frame_index(&frames, |event, data| {
+        event == "reset" && data.contains(r#""reason":"budget""#)
+    });
+    assert_eq!(
+        frames
+            .iter()
+            .filter(|(event, data)| event == "reset" && data.contains("budget"))
+            .count(),
+        1,
+        "{frames:?}"
+    );
+    assert!(
+        frames[reset + 1..]
+            .iter()
+            .all(|(event, _)| event != "delta"),
+        "{frames:?}"
+    );
+    assert!(
+        frames[..reset].iter().any(|(event, data)| {
+            event == "delta" && data.contains("Budget clause is long enough.")
+        }),
+        "{frames:?}"
+    );
+    assert!(
+        frames.iter().any(|(event, _)| event == "done"),
+        "{frames:?}"
+    );
+}
+
 /// A guard cut still delivers `reset` when the delta channel is already
 /// full. The body is not read until the turn has committed, so every slot
 /// is occupied; the first frame after that is `reset`, ahead of the deltas

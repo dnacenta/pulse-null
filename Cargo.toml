@@ -110,6 +110,7 @@ all-plugins = ["voice", "discord-text"]
 proptest = "1"
 tempfile = "3"
 tower = { version = "0.5.3", features = ["util"] }
+tokio = { version = "1", features = ["full", "test-util"] }
 
 [profile.release]
 strip = true

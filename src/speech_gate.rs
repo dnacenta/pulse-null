@@ -1,7 +1,6 @@
 //! Clause-sized release of voice text the reply guard can no longer cut.
 //!
 //! The hold is measured on tokio's clock so a paused runtime can drive it.
-#![cfg_attr(not(test), allow(dead_code))]
 
 use std::sync::LazyLock;
 use std::time::Duration;
@@ -157,6 +156,21 @@ impl SpeechGate {
     #[must_use]
     pub(crate) fn released_any(&self) -> bool {
         self.released > 0
+    }
+
+    #[must_use]
+    pub(crate) fn released_len(&self) -> usize {
+        self.released
+    }
+
+    #[must_use]
+    pub(crate) fn buf_len(&self) -> usize {
+        self.buf.len()
+    }
+
+    /// The unreleased tail was handed out raw. Later pushes must not speak it again.
+    pub(crate) fn note_raw_flush(&mut self) {
+        self.released = self.buf.len();
     }
 
     fn take_release(&mut self, now: Instant) -> Option<String> {
