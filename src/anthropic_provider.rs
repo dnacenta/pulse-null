@@ -1029,6 +1029,40 @@ mod tests {
     }
 
     #[test]
+    fn known_stop_reasons_end_in_done() {
+        for raw in ["end_turn", "tool_use", "max_tokens", "stop_sequence"] {
+            let sse_text = format!(
+                "{}{}{}{}",
+                message_start("m", 4),
+                text_delta("Hello there, this is text."),
+                message_delta(raw, 3),
+                message_stop(),
+            );
+            let events = decode(&sse_text);
+            assert!(
+                events
+                    .iter()
+                    .all(|event| !matches!(event, StreamEvent::Error(_))),
+                "{raw}: {events:?}"
+            );
+            let Some(StreamEvent::Done(response)) = events.last() else {
+                panic!("{raw}: {events:?}");
+            };
+            assert!(
+                matches!(
+                    (&response.stop_reason, raw),
+                    (StopReason::EndTurn, "end_turn")
+                        | (StopReason::ToolUse, "tool_use")
+                        | (StopReason::MaxTokens, "max_tokens")
+                        | (StopReason::StopSequence, "stop_sequence")
+                ),
+                "{raw}: {:?}",
+                response.stop_reason
+            );
+        }
+    }
+
+    #[test]
     fn unknown_stop_reason_is_an_error() {
         let sse_text = format!(
             "{}{}{}{}",
