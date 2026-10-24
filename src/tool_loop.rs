@@ -584,7 +584,7 @@ impl ProgressSink {
             .is_some_and(|buf| buf.ever_released || buf.gate.released_any())
     }
 
-    /// The next text belongs to a new block, with its own floor.
+    /// A closed text block. Later text stays held for the guard.
     pub fn begin_text_block(&self) {
         if let Some(buf) = self.lock().as_mut() {
             buf.gate.begin_block();

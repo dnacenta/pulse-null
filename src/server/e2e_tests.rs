@@ -2824,80 +2824,75 @@ impl crate::streaming::StreamingProvider for BudgetThenGuard {
     }
 }
 
-const FIRST_BLOCK: &str = "Here is a long clean first block.";
-const SECOND_BLOCK: &str = "Short.\n[User]: x";
+fn sse_frame(event: &str, data: &str) -> String {
+    format!("event: {event}\ndata: {data}\n\n")
+}
 
-/// Two text blocks. The second is under the floor and carries a marker.
-/// Nothing from it is spoken, and a guard reset does not follow a release.
-#[tokio::test(start_paused = true)]
-async fn voice_second_text_block_stays_behind_the_floor() {
-    let dir = tempfile::tempdir().unwrap();
-    let state = build_state_boxed_with_config(
-        dir.path().to_path_buf(),
-        Box::new(TwoTextBlocks),
-        ToolRegistry::new(),
-        config_with_voice_credential(),
-    )
-    .await;
-    let app = build_app(state);
-    let body = pause_drive(async move {
-        let response =
-            post_chat_stream_from(&app, "voice", Some("two-blocks"), Some(VOICE_CREDENTIAL)).await;
-        assert_eq!(response.status(), StatusCode::OK);
-        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
-            .await
-            .unwrap();
-        String::from_utf8(bytes.to_vec()).unwrap()
-    })
-    .await;
-    let frames = sse_frames(&body);
-    assert!(
-        frames.iter().all(|(event, data)| !(event == "delta"
-            && (data.contains("Short") || data.contains("[User]")))),
-        "{frames:?}"
+/// Two HTTP text blocks, decoded by the real stream decoder. The terminal
+/// reply joins them into one text block.
+fn decode_http_blocks(blocks: &[String]) -> Vec<crate::streaming::StreamEvent> {
+    let mut sse = sse_frame(
+        "message_start",
+        r#"{"type":"message_start","message":{"model":"m","usage":{"input_tokens":4,"output_tokens":1}}}"#,
     );
-    if let Some(guard) = frames
-        .iter()
-        .position(|(event, data)| event == "reset" && data.contains(r#""reason":"guard""#))
-    {
-        assert!(
-            frames[..guard].iter().all(|(event, _)| event != "delta"),
-            "guard reset followed a release: {frames:?}"
-        );
+    for (index, text) in blocks.iter().enumerate() {
+        let start = serde_json::json!({
+            "type": "content_block_start",
+            "index": index,
+            "content_block": {"type": "text", "text": ""}
+        });
+        sse.push_str(&sse_frame("content_block_start", &start.to_string()));
+        let delta = serde_json::json!({
+            "type": "content_block_delta",
+            "index": index,
+            "delta": {"type": "text_delta", "text": text}
+        });
+        sse.push_str(&sse_frame("content_block_delta", &delta.to_string()));
+        let stop = serde_json::json!({
+            "type": "content_block_stop",
+            "index": index
+        });
+        sse.push_str(&sse_frame("content_block_stop", &stop.to_string()));
     }
-    let done = frames
-        .iter()
-        .find(|(event, _)| event == "done")
-        .map(|(_, data)| data.as_str())
-        .expect("done");
-    assert!(done.contains(FIRST_BLOCK), "{done}");
-    assert!(done.contains(r#""truncated":true"#), "{done}");
-    assert!(!done.contains("Short"), "{done}");
-    assert!(!done.contains("[User]"), "{done}");
+    sse.push_str(&sse_frame(
+        "message_delta",
+        r#"{"type":"message_delta","delta":{"stop_reason":"end_turn","stop_sequence":null},"usage":{"output_tokens":8}}"#,
+    ));
+    sse.push_str(&sse_frame("message_stop", r#"{"type":"message_stop"}"#));
+    let mut decoder = crate::anthropic_provider::SseDecoder::new("m");
+    decoder.feed(sse.as_bytes())
 }
 
-struct TwoTextBlocks;
-
-impl TwoTextBlocks {
-    fn reply() -> LlmResponse {
-        LlmResponse {
-            content: vec![
-                ContentBlock::Text {
-                    text: FIRST_BLOCK.into(),
-                },
-                ContentBlock::Text {
-                    text: SECOND_BLOCK.into(),
-                },
-            ],
-            stop_reason: StopReason::EndTurn,
-            model: "mock".into(),
-            input_tokens: Some(1),
-            output_tokens: Some(1),
+/// Replay decoder events, then let the hold elapse once every block is buffered.
+fn stream_decoded_blocks(blocks: Vec<String>) -> crate::streaming::StreamResult<'static> {
+    use crate::streaming::StreamEvent;
+    let events = decode_http_blocks(&blocks);
+    Box::pin(async_stream::stream! {
+        let mut events = events;
+        let done = match events.pop() {
+            Some(StreamEvent::Done(response)) => Some(response),
+            Some(other) => {
+                events.push(other);
+                None
+            }
+            None => None,
+        };
+        for event in events {
+            yield event;
         }
-    }
+        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+        yield StreamEvent::TextDelta(String::new());
+        if let Some(response) = done {
+            yield StreamEvent::Done(response);
+        }
+    })
 }
 
-impl LmProvider for TwoTextBlocks {
+struct DecodedBlocks {
+    blocks: Vec<String>,
+}
+
+impl LmProvider for DecodedBlocks {
     fn invoke(
         &self,
         _system_prompt: &str,
@@ -2905,15 +2900,24 @@ impl LmProvider for TwoTextBlocks {
         _max_tokens: u32,
         _tools: Option<&[serde_json::Value]>,
     ) -> LlmResult<'_> {
-        Box::pin(async { Ok(Self::reply()) })
+        let blocks = self.blocks.clone();
+        Box::pin(async move {
+            decode_http_blocks(&blocks)
+                .into_iter()
+                .find_map(|event| match event {
+                    crate::streaming::StreamEvent::Done(response) => Some(Ok(response)),
+                    _ => None,
+                })
+                .unwrap_or_else(|| Err("decoded blocks had no terminal reply".into()))
+        })
     }
 
     fn name(&self) -> &str {
-        "two-blocks"
+        "decoded-blocks"
     }
 }
 
-impl crate::streaming::StreamingProvider for TwoTextBlocks {
+impl crate::streaming::StreamingProvider for DecodedBlocks {
     fn supports_streaming(&self) -> bool {
         true
     }
@@ -2925,20 +2929,163 @@ impl crate::streaming::StreamingProvider for TwoTextBlocks {
         _max_tokens: u32,
         _tools: Option<&[serde_json::Value]>,
     ) -> crate::streaming::StreamResult<'_> {
-        use crate::streaming::StreamEvent;
-        Box::pin(async_stream::stream! {
-            let start = tokio::time::Instant::now();
-            yield StreamEvent::TextDelta(FIRST_BLOCK.into());
-            let hold = std::time::Duration::from_millis(250);
-            let waited = start.elapsed();
-            if waited < hold {
-                tokio::time::sleep(hold - waited).await;
-            }
-            yield StreamEvent::TextBlockEnd;
-            yield StreamEvent::TextDelta(SECOND_BLOCK.into());
-            yield StreamEvent::Done(TwoTextBlocks::reply());
-        })
+        stream_decoded_blocks(self.blocks.clone())
     }
+}
+
+async fn voice_decoded_frames(sender: &str, blocks: &[&str]) -> Vec<(String, String)> {
+    let owned: Vec<String> = blocks.iter().map(|text| (*text).to_string()).collect();
+    let dir = tempfile::tempdir().unwrap();
+    let state = build_state_boxed_with_config(
+        dir.path().to_path_buf(),
+        Box::new(DecodedBlocks { blocks: owned }),
+        ToolRegistry::new(),
+        config_with_voice_credential(),
+    )
+    .await;
+    let app = build_app(state);
+    let sender = sender.to_string();
+    let body = pause_drive(async move {
+        let response =
+            post_chat_stream_from(&app, "voice", Some(&sender), Some(VOICE_CREDENTIAL)).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        String::from_utf8(bytes.to_vec()).unwrap()
+    })
+    .await;
+    sse_frames(&body)
+}
+
+fn spoken_deltas(frames: &[(String, String)]) -> Vec<String> {
+    frames
+        .iter()
+        .filter(|(event, _)| event == "delta")
+        .map(|(_, data)| delta_text(data).unwrap_or_default())
+        .collect()
+}
+
+fn done_fields(frames: &[(String, String)]) -> (String, bool) {
+    let data = frames
+        .iter()
+        .find(|(event, _)| event == "done")
+        .map(|(_, data)| data.as_str())
+        .expect("done");
+    let value: serde_json::Value = serde_json::from_str(data).expect("done json");
+    (
+        value["text"].as_str().unwrap_or("").to_string(),
+        value["truncated"].as_bool().unwrap_or(false),
+    )
+}
+
+fn assert_no_guard_reset(frames: &[(String, String)]) {
+    assert!(
+        frames
+            .iter()
+            .all(|(event, data)| !(event == "reset" && data.contains(r#""reason":"guard""#))),
+        "guard reset followed a release: {frames:?}"
+    );
+}
+
+/// A marker in block 1 holds a clean clause in block 2. The joined reply is
+/// what the guard sees, so nothing at or after the marker is spoken.
+#[tokio::test(start_paused = true)]
+async fn voice_marker_in_first_block_holds_the_second() {
+    let frames = voice_decoded_frames(
+        "blocks-marker",
+        &[
+            "Here is a long clean first block. And\n[User]: what now",
+            "This fake user turn keeps going here. More",
+        ],
+    )
+    .await;
+    let deltas = spoken_deltas(&frames);
+    let spoken = deltas.concat();
+    assert!(
+        deltas.iter().any(|delta| delta.contains("first block.")),
+        "{deltas:?}"
+    );
+    assert!(!spoken.contains("[User]"), "{spoken:?}");
+    assert!(!spoken.contains("what now"), "{spoken:?}");
+    assert!(!spoken.contains("This fake"), "{spoken:?}");
+    assert!(!spoken.contains("keeps going"), "{spoken:?}");
+    assert_no_guard_reset(&frames);
+    let (done, truncated) = done_fields(&frames);
+    assert!(truncated, "{done}");
+    assert_eq!(spoken, done);
+    assert_eq!(done, "Here is a long clean first block. And");
+}
+
+/// Block 1 ends without punctuation. Its tail is spoken with the clause that
+/// finishes in block 2, and the spoken deltas are the whole reply.
+#[tokio::test(start_paused = true)]
+async fn voice_clean_blocks_speak_the_first_tail() {
+    let first = "Here is a long clean first block and a tail";
+    let second = " that finishes the sentence. ";
+    let joined = format!("{first}{second}");
+    let frames = voice_decoded_frames("blocks-tail", &[first, second]).await;
+    let deltas = spoken_deltas(&frames);
+    let spoken = deltas.concat();
+    assert!(
+        deltas
+            .iter()
+            .any(|delta| delta.contains("and a tail") && delta.contains("finishes the sentence.")),
+        "tail of block 1 was not spoken with the clause: {deltas:?}"
+    );
+    assert_no_guard_reset(&frames);
+    let (done, truncated) = done_fields(&frames);
+    assert!(!truncated, "{done}");
+    assert_eq!(spoken, done);
+    assert_eq!(spoken, joined);
+}
+
+/// Block 2 is the marker and is under 20 bytes. None of it is spoken.
+#[tokio::test(start_paused = true)]
+async fn voice_short_marker_block_is_unspoken() {
+    let second = "\n[User]: zz";
+    assert!(second.len() < 20, "{}", second.len());
+    let frames = voice_decoded_frames(
+        "blocks-short",
+        &["Here is a long clean first block. ", second],
+    )
+    .await;
+    let deltas = spoken_deltas(&frames);
+    let spoken = deltas.concat();
+    assert!(!spoken.contains("[User]"), "{spoken:?}");
+    assert!(!spoken.contains("zz"), "{spoken:?}");
+    assert!(spoken.contains("first block."), "{deltas:?}");
+    assert_no_guard_reset(&frames);
+    let (done, truncated) = done_fields(&frames);
+    assert!(truncated, "{done}");
+    assert_eq!(spoken, done);
+    assert_eq!(done, "Here is a long clean first block.");
+}
+
+/// The marker starts in block 1 and finishes in block 2. No byte at or after
+/// that offset is spoken, and the kept prefix is flushed.
+#[tokio::test(start_paused = true)]
+async fn voice_marker_straddling_blocks_stays_unreleased() {
+    let first = "Here is a long clean first block. And\n[Us";
+    let second = "er]: what now stays hidden. More sentence here.";
+    let joined = format!("{first}{second}");
+    let offset = response_validator::validate_text(&joined)
+        .truncation_offset
+        .expect("marker");
+    let frames = voice_decoded_frames("blocks-straddle", &[first, second]).await;
+    let deltas = spoken_deltas(&frames);
+    let spoken = deltas.concat();
+    assert!(spoken.len() <= offset, "{spoken:?} at {offset}");
+    assert!(joined.starts_with(&spoken), "{spoken:?}");
+    assert!(!spoken.contains("[User]"), "{spoken:?}");
+    assert!(!spoken.contains("er]:"), "{spoken:?}");
+    assert!(!spoken.contains("\n[Us"), "{spoken:?}");
+    assert!(spoken.contains("first block."), "{deltas:?}");
+    assert_no_guard_reset(&frames);
+    let (done, truncated) = done_fields(&frames);
+    assert!(truncated, "{done}");
+    assert_eq!(spoken, done);
+    assert_eq!(done, "Here is a long clean first block. And");
 }
 
 const SPOKEN_CLAUSE: &str = "Here is one complete clause. ";
@@ -3346,6 +3493,9 @@ async fn voice_broken_stream_end_after_release_resets_error() {
 struct ProofScript {
     parts: Vec<String>,
     done: String,
+    /// Two HTTP text blocks. When set, the stream is those blocks run
+    /// through the real decoder, and `done` is their concatenation.
+    http_blocks: Option<(String, String)>,
 }
 
 struct ProofProvider {
@@ -3392,21 +3542,29 @@ impl crate::streaming::StreamingProvider for ProofProvider {
         use crate::streaming::StreamEvent;
         let script = self.slot.lock().expect("script").clone();
         Box::pin(async_stream::stream! {
-            if let Some((first, rest)) = script.parts.split_first() {
-                yield StreamEvent::TextDelta(first.clone());
-                tokio::time::sleep(std::time::Duration::from_millis(250)).await;
-                for part in rest {
-                    yield StreamEvent::TextDelta(part.clone());
+            if let Some((first, second)) = script.http_blocks {
+                use tokio_stream::StreamExt as _;
+                let mut decoded = stream_decoded_blocks(vec![first, second]);
+                while let Some(event) = decoded.next().await {
+                    yield event;
                 }
-                yield StreamEvent::TextDelta(String::new());
+            } else {
+                if let Some((first, rest)) = script.parts.split_first() {
+                    yield StreamEvent::TextDelta(first.clone());
+                    tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+                    for part in rest {
+                        yield StreamEvent::TextDelta(part.clone());
+                    }
+                    yield StreamEvent::TextDelta(String::new());
+                }
+                yield StreamEvent::Done(LlmResponse {
+                    content: vec![ContentBlock::Text { text: script.done }],
+                    stop_reason: StopReason::EndTurn,
+                    model: "mock".into(),
+                    input_tokens: Some(1),
+                    output_tokens: Some(1),
+                });
             }
-            yield StreamEvent::Done(LlmResponse {
-                content: vec![ContentBlock::Text { text: script.done }],
-                stop_reason: StopReason::EndTurn,
-                model: "mock".into(),
-                input_tokens: Some(1),
-                output_tokens: Some(1),
-            });
         })
     }
 }
@@ -3416,6 +3574,7 @@ impl Clone for ProofScript {
         Self {
             parts: self.parts.clone(),
             done: self.done.clone(),
+            http_blocks: self.http_blocks.clone(),
         }
     }
 }
@@ -3581,6 +3740,7 @@ async fn play_proof(
         let mut script = slot.lock().expect("script");
         script.parts = chunk_text(text, chunk);
         script.done = done.to_string();
+        script.http_blocks = None;
     }
     let app_stream = app.clone();
     let sender_stream = sender.to_string();
@@ -3604,6 +3764,7 @@ async fn play_proof(
         let mut script = slot.lock().expect("script");
         script.parts = chunk_text(text, chunk);
         script.done = done.to_string();
+        script.http_blocks = None;
     }
     let app_chat = app.clone();
     let sender_chat = format!("{sender}-chat");
@@ -3628,6 +3789,97 @@ async fn play_proof(
     (view, chat_text, chat_truncated)
 }
 
+fn split_blocks(text: &str) -> Option<(String, String)> {
+    if text.len() < 2 {
+        return None;
+    }
+    let mut mid = text.len() / 2;
+    while mid < text.len() && !text.is_char_boundary(mid) {
+        mid += 1;
+    }
+    if mid == 0 || mid >= text.len() {
+        return None;
+    }
+    Some((text[..mid].to_string(), text[mid..].to_string()))
+}
+
+/// Cut two bytes into `marker` so the marker straddles the block boundary.
+fn split_straddle(text: &str, marker: &str) -> Option<(String, String)> {
+    let start = text.find(marker)?;
+    if marker.len() < 2 || start + 2 >= text.len() {
+        return None;
+    }
+    let mut cut = start + 2;
+    while cut < text.len() && !text.is_char_boundary(cut) {
+        cut += 1;
+    }
+    if cut >= text.len() {
+        return None;
+    }
+    Some((text[..cut].to_string(), text[cut..].to_string()))
+}
+
+async fn play_http_blocks(
+    app: &Router,
+    slot: &Arc<std::sync::Mutex<ProofScript>>,
+    sender: &str,
+    block1: &str,
+    block2: &str,
+) -> ProofView {
+    let joined = format!("{block1}{block2}");
+    {
+        let mut script = slot.lock().expect("script");
+        script.parts.clear();
+        script.done = joined.clone();
+        script.http_blocks = Some((block1.to_string(), block2.to_string()));
+    }
+    let app_stream = app.clone();
+    let sender_stream = sender.to_string();
+    let body = pause_drive(async move {
+        let response = post_chat_stream_from(
+            &app_stream,
+            "voice",
+            Some(&sender_stream),
+            Some(VOICE_CREDENTIAL),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        String::from_utf8(bytes.to_vec()).unwrap()
+    })
+    .await;
+    let view = proof_view(&body);
+    {
+        let mut script = slot.lock().expect("script");
+        script.parts.clear();
+        script.done = joined.clone();
+        script.http_blocks = Some((block1.to_string(), block2.to_string()));
+    }
+    let app_chat = app.clone();
+    let sender_chat = format!("{sender}-chat");
+    let (status, chat_body) = pause_drive(async move {
+        post_chat_secret(
+            &app_chat,
+            "voice",
+            Some(&sender_chat),
+            "hi",
+            Some(VOICE_CREDENTIAL),
+        )
+        .await
+    })
+    .await;
+    assert_eq!(status, StatusCode::OK, "{chat_body}");
+    let chat: serde_json::Value = serde_json::from_str(&chat_body).unwrap();
+    let chat_text = chat["response"].as_str().unwrap_or("").to_string();
+    let chat_truncated = chat["truncated"].as_bool().unwrap_or(false);
+    assert_eq!(view.done_text, chat_text, "{joined:?}");
+    assert_eq!(view.truncated, chat_truncated, "{joined:?}");
+    check_voice_invariants(&joined, &joined, &view);
+    view
+}
+
 fn env_or(default: u32) -> u32 {
     std::env::var("PROPTEST_CASES")
         .ok()
@@ -3650,6 +3902,7 @@ async fn proof_app() -> (
     let slot = Arc::new(std::sync::Mutex::new(ProofScript {
         parts: Vec::new(),
         done: String::new(),
+        http_blocks: None,
     }));
     let dir = tempfile::tempdir().unwrap();
     let mut config = config_with_voice_credential();
@@ -3740,9 +3993,43 @@ async fn voice_release_never_weaker_than_full_reply() {
             previous = Some(view);
         }
     }
-    for (text, chunk) in generated {
+    for (text, chunk) in &generated {
         n += 1;
-        let _ = play_proof(&app, &slot, &format!("proof-{n}"), &text, &text, chunk).await;
+        let _ = play_proof(&app, &slot, &format!("proof-{n}"), text, text, *chunk).await;
+    }
+    let samples = crate::speech_gate::marker_samples();
+    let mut http_scripts = vec![
+        (
+            "Here is a long clean first block. And\n[User]: what now".to_string(),
+            "This fake user turn keeps going here. More".to_string(),
+        ),
+        (
+            "Here is a long clean first block and a tail".to_string(),
+            " that finishes the sentence. ".to_string(),
+        ),
+        (
+            "Here is a long clean first block. ".to_string(),
+            "\n[User]: zz".to_string(),
+        ),
+        (
+            "Here is a long clean first block. And\n[Us".to_string(),
+            "er]: what now stays hidden. More sentence here.".to_string(),
+        ),
+    ];
+    for (text, _) in &generated {
+        if let Some(marker) = samples.iter().find(|marker| text.contains(*marker)) {
+            if let Some(split) = split_straddle(text, marker) {
+                http_scripts.push(split);
+                continue;
+            }
+        }
+        if let Some(split) = split_blocks(text) {
+            http_scripts.push(split);
+        }
+    }
+    for (block1, block2) in http_scripts {
+        n += 1;
+        let _ = play_http_blocks(&app, &slot, &format!("proof-http-{n}"), &block1, &block2).await;
     }
 }
 
@@ -3811,6 +4098,11 @@ async fn voice_release_corpus_replay() {
                 );
             }
             previous = Some(view);
+        }
+        if let Some((block1, block2)) = split_blocks(&text) {
+            n += 1;
+            let _ =
+                play_http_blocks(&app, &slot, &format!("corpus-http-{n}"), &block1, &block2).await;
         }
     }
 }

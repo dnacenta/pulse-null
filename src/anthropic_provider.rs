@@ -353,8 +353,6 @@ pub(crate) struct SseDecoder {
     stop_reason: StopReason,
     /// A `message_delta` with a known stop reason was accepted.
     saw_message_delta: bool,
-    /// The open block has produced text and has not ended.
-    text_open: bool,
     finished: bool,
 }
 
@@ -372,7 +370,6 @@ impl SseDecoder {
             output_tokens: None,
             stop_reason: StopReason::EndTurn,
             saw_message_delta: false,
-            text_open: false,
             finished: false,
         }
     }
@@ -456,17 +453,12 @@ impl SseDecoder {
                         .to_string();
                     self.current_tool_input.clear();
                 }
-                if self.text_open {
-                    self.text_open = false;
-                    return Some(StreamEvent::TextBlockEnd);
-                }
                 None
             }
             "content_block_delta" => {
                 let delta_type = json["delta"]["type"].as_str().unwrap_or("");
                 match delta_type {
                     "text_delta" => json["delta"]["text"].as_str().map(|text| {
-                        self.text_open = true;
                         self.text_parts.push(text.to_string());
                         StreamEvent::TextDelta(text.to_string())
                     }),
@@ -481,10 +473,6 @@ impl SseDecoder {
             }
             "content_block_stop" => {
                 if self.current_tool_name.is_empty() {
-                    if self.text_open {
-                        self.text_open = false;
-                        return Some(StreamEvent::TextBlockEnd);
-                    }
                     return None;
                 }
                 let input: serde_json::Value = serde_json::from_str(&self.current_tool_input)
@@ -752,8 +740,7 @@ mod tests {
         );
         let events = decode(&sse_text);
         match &events[..] {
-            [StreamEvent::TextDelta(a), StreamEvent::TextDelta(b), StreamEvent::TextBlockEnd, StreamEvent::Done(response)] =>
-            {
+            [StreamEvent::TextDelta(a), StreamEvent::TextDelta(b), StreamEvent::Done(response)] => {
                 assert_eq!(a, "Hello ");
                 assert_eq!(b, "caf\u{e9}");
                 assert_eq!(response.model, "m");
@@ -762,6 +749,34 @@ mod tests {
                 assert!(matches!(response.stop_reason, StopReason::EndTurn));
                 match &response.content[..] {
                     [ContentBlock::Text { text }] => assert_eq!(text, "Hello caf\u{e9}"),
+                    other => panic!("{other:?}"),
+                }
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn two_text_blocks_join_into_one_reply() {
+        let sse_text = format!(
+            "{}{}{}{}{}{}{}{}{}",
+            message_start("m", 4),
+            text_block_start(),
+            text_delta("Hello "),
+            block_stop(),
+            text_block_start(),
+            text_delta("there."),
+            block_stop(),
+            message_delta("end_turn", 2),
+            message_stop(),
+        );
+        let events = decode(&sse_text);
+        match &events[..] {
+            [StreamEvent::TextDelta(a), StreamEvent::TextDelta(b), StreamEvent::Done(response)] => {
+                assert_eq!(a, "Hello ");
+                assert_eq!(b, "there.");
+                match &response.content[..] {
+                    [ContentBlock::Text { text }] => assert_eq!(text, "Hello there."),
                     other => panic!("{other:?}"),
                 }
             }

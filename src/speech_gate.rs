@@ -87,9 +87,7 @@ impl ReleaseSwitches {
 pub(crate) struct SpeechGate {
     buf: String,
     released: usize,
-    /// Start of the open text block. The floor is measured from here.
-    block_at: usize,
-    /// A later round is held until the guard, not spoken early.
+    /// A later block or round is held until the guard, not spoken early.
     sealed: bool,
     first_delta_at: Option<Instant>,
     closed: bool,
@@ -103,7 +101,6 @@ impl SpeechGate {
         Self {
             buf: String::new(),
             released: 0,
-            block_at: 0,
             sealed: false,
             first_delta_at: None,
             closed: false,
@@ -179,18 +176,20 @@ impl SpeechGate {
         self.released = self.buf.len();
     }
 
-    /// The next push belongs to a new text block. Its floor starts at zero.
+    /// Hold every later push. Bytes already buffered stay where they are.
+    ///
+    /// The scan never moves past text that has not been released, and a new
+    /// block does not get its own floor. The HTTP decoder joins every text
+    /// part into one block and does not signal here. A reply that keeps
+    /// separate blocks seals instead, and the guard settles the rest.
     pub(crate) fn begin_block(&mut self) {
-        if self.buf.len() > self.block_at {
-            self.block_at = self.buf.len();
-        }
+        self.sealed = true;
     }
 
     /// Drop this round's buffer. Further text is held, not released early.
     pub(crate) fn restart_round(&mut self) {
         self.buf.clear();
         self.released = 0;
-        self.block_at = 0;
         self.closed = false;
         self.sealed = true;
     }
@@ -199,15 +198,13 @@ impl SpeechGate {
         if self.sealed || self.hold_open(now) {
             return None;
         }
-        let from = self.released.max(self.block_at);
+        let from = self.released;
         let safe = self.safe_end(from);
         let candidate = self.release_candidate(from, safe)?;
         if candidate <= from || !self.buf.is_char_boundary(candidate) {
             return None;
         }
-        if self.floor_on()
-            && self.buf[self.block_at..candidate].trim_end().len() < MIN_RELEASE_BYTES
-        {
+        if self.floor_on() && self.buf[..candidate].trim_end().len() < MIN_RELEASE_BYTES {
             return None;
         }
         let piece = self.buf[from..candidate].to_string();
@@ -760,6 +757,46 @@ mod tests {
             }
         )
         .is_err());
+    }
+
+    #[test]
+    fn joined_blocks_release_the_unreleased_tail() {
+        let t0 = Instant::now();
+        let later = t0 + FIRST_RELEASE_HOLD;
+        let mut gate = SpeechGate::new();
+        let first = "Here is a long clean first block and a tail";
+        let second = " that finishes the sentence. ";
+        assert!(gate.push(first, t0).is_none());
+        let released = gate.push(second, later).expect("clause across the blocks");
+        assert!(
+            released.contains("and a tail"),
+            "unreleased tail was skipped: {released:?}"
+        );
+        assert!(released.ends_with("sentence."), "{released:?}");
+        assert!(!released.contains('\n'));
+    }
+
+    #[test]
+    fn second_block_is_held_not_refloored() {
+        let t0 = Instant::now();
+        let later = t0 + FIRST_RELEASE_HOLD;
+        let mut gate = SpeechGate::new();
+        let first = "Here is a long clean first block. ";
+        assert!(gate.push(first, t0).is_none());
+        let clause = gate.push("", later).expect("first clause");
+        assert_eq!(clause, "Here is a long clean first block.");
+        let at = gate.released_len();
+        gate.begin_block();
+        assert!(
+            gate.push("This fake user turn keeps going here. More", later)
+                .is_none(),
+            "a later block was given its own floor"
+        );
+        assert_eq!(gate.released_len(), at, "scan moved past unreleased bytes");
+        let rest = gate
+            .finish("Here is a long clean first block.")
+            .expect("kept tail");
+        assert!(rest.is_none());
     }
 }
 

@@ -16,7 +16,7 @@ pub enum StreamEvent {
     /// A chunk of text content.
     TextDelta(String),
 
-    /// The current text block ended. Later text is a separate block.
+    /// A text block closed. Later text is held for the guard, not given a new floor.
     TextBlockEnd,
 
     /// The model wants to use a tool.
