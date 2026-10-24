@@ -3284,16 +3284,27 @@ fn check_voice_invariants(stream_text: &str, done_text: &str, view: &ProofView) 
         );
     }
     let mismatch = !kept.starts_with(&released);
+    let same_script = stream_text == done_text;
     if view.guard_resets == 0 {
         assert!(!mismatch, "cut was not settled for {stream_text:?}");
         assert_eq!(view.spoken, kept, "{stream_text:?}");
         assert!(view.after_guard.is_empty());
     } else {
         assert_eq!(view.guard_resets, 1, "{stream_text:?}");
-        assert!(
-            released.is_empty() || mismatch,
-            "guard reset followed a release of {released:?}"
-        );
+        // P4: a guard reset never follows a release when the stream and the
+        // terminal text are the same script. A differing terminal record is
+        // the one case that still takes the ordinary cut.
+        if same_script {
+            assert!(
+                released.is_empty(),
+                "guard reset followed a release of {released:?}"
+            );
+        } else {
+            assert!(
+                released.is_empty() || mismatch,
+                "guard reset followed a release of {released:?}"
+            );
+        }
     }
 }
 
