@@ -1,7 +1,7 @@
 #![cfg(test)]
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use axum::body::Body;
@@ -3191,6 +3191,150 @@ async fn voice_refusal_before_release_has_no_reset() {
     assert_eq!(messages_len(&state, "guest:early-refuse").await, 0);
 }
 
+/// A guest refusal in the terminal-record shape, before any release, sends
+/// no `reset`.
+#[tokio::test]
+async fn voice_cli_refusal_before_release_has_no_reset() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = build_state_boxed_with_config(
+        dir.path().to_path_buf(),
+        Box::new(DeltaThenRefuse),
+        ToolRegistry::new(),
+        config_with_voice_credential(),
+    )
+    .await;
+    let app = build_app(Arc::clone(&state));
+    let response =
+        post_chat_stream_from(&app, "voice", Some("cli-early"), Some(VOICE_CREDENTIAL)).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let body = String::from_utf8_lossy(&bytes);
+    assert_refusal_stream_speaks_nothing(&body);
+    let frames = sse_frames(&body);
+    assert!(
+        frames.iter().all(|(event, _)| event != "reset"),
+        "{frames:?}"
+    );
+    assert_eq!(messages_len(&state, "guest:cli-early").await, 0);
+}
+
+struct ReleaseThenPark {
+    wrote_more: Arc<AtomicBool>,
+    dropped: Arc<AtomicBool>,
+}
+
+struct ParkFlag(Arc<AtomicBool>);
+
+impl Drop for ParkFlag {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::SeqCst);
+    }
+}
+
+impl LmProvider for ReleaseThenPark {
+    fn invoke(
+        &self,
+        _system_prompt: &str,
+        _messages: &[Message],
+        _max_tokens: u32,
+        _tools: Option<&[serde_json::Value]>,
+    ) -> LlmResult<'_> {
+        Box::pin(async { Err("unused".into()) })
+    }
+
+    fn name(&self) -> &str {
+        "release-then-park"
+    }
+}
+
+impl crate::streaming::StreamingProvider for ReleaseThenPark {
+    fn supports_streaming(&self) -> bool {
+        true
+    }
+
+    fn invoke_streaming(
+        &self,
+        _system_prompt: &str,
+        _messages: &[Message],
+        _max_tokens: u32,
+        _tools: Option<&[serde_json::Value]>,
+    ) -> crate::streaming::StreamResult<'_> {
+        use crate::streaming::StreamEvent;
+        let wrote_more = Arc::clone(&self.wrote_more);
+        let dropped = Arc::clone(&self.dropped);
+        Box::pin(async_stream::stream! {
+            let _flag = ParkFlag(dropped);
+            let start = tokio::time::Instant::now();
+            yield StreamEvent::TextDelta(SPOKEN_CLAUSE.into());
+            let hold = std::time::Duration::from_millis(250);
+            let waited = start.elapsed();
+            if waited < hold {
+                tokio::time::sleep(hold - waited).await;
+            }
+            yield StreamEvent::TextDelta(String::new());
+            std::future::pending::<()>().await;
+            wrote_more.store(true, Ordering::SeqCst);
+            yield StreamEvent::TextDelta("later".into());
+        })
+    }
+}
+
+/// Dropping the voice stream after a spoken clause rolls the turn back
+/// and writes nothing further.
+#[tokio::test(start_paused = true)]
+async fn voice_disconnect_after_release_rolls_back() {
+    use tokio_stream::StreamExt as _;
+
+    let wrote_more = Arc::new(AtomicBool::new(false));
+    let dropped = Arc::new(AtomicBool::new(false));
+    let dir = tempfile::tempdir().unwrap();
+    let state = build_state_boxed_with_config(
+        dir.path().to_path_buf(),
+        Box::new(ReleaseThenPark {
+            wrote_more: Arc::clone(&wrote_more),
+            dropped: Arc::clone(&dropped),
+        }),
+        ToolRegistry::new(),
+        config_with_voice_credential(),
+    )
+    .await;
+    let app = build_app(Arc::clone(&state));
+    let incoming = pause_drive(async move {
+        let response =
+            post_chat_stream_from(&app, "voice", Some("release-drop"), Some(VOICE_CREDENTIAL))
+                .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let mut incoming = response.into_body().into_data_stream();
+        let mut seen = String::new();
+        loop {
+            if seen.contains(SPOKEN_RELEASED) {
+                break;
+            }
+            let Some(chunk) = incoming.next().await else {
+                panic!("stream ended before the clause: {seen}");
+            };
+            seen.push_str(&String::from_utf8_lossy(&chunk.expect("body error")));
+        }
+        assert!(!seen.contains("later"), "{seen}");
+        incoming
+    })
+    .await;
+    drop(incoming);
+
+    let mut rolled_back = false;
+    for _ in 0..50 {
+        if messages_len(&state, "guest:release-drop").await == 0 && dropped.load(Ordering::SeqCst) {
+            rolled_back = true;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    assert!(rolled_back, "disconnect left the turn in place");
+    assert!(!wrote_more.load(Ordering::SeqCst));
+}
+
 /// A broken stream end after a release is a failure, not a clean end.
 #[tokio::test(start_paused = true)]
 async fn voice_broken_stream_end_after_release_resets_error() {
@@ -3484,6 +3628,13 @@ async fn play_proof(
     (view, chat_text, chat_truncated)
 }
 
+fn env_or(default: u32) -> u32 {
+    std::env::var("PROPTEST_CASES")
+        .ok()
+        .and_then(|raw| raw.parse().ok())
+        .unwrap_or(default)
+}
+
 fn same_verdict(left: &ProofView, right: &ProofView) -> bool {
     left.spoken == right.spoken
         && left.guard_resets == right.guard_resets
@@ -3554,7 +3705,7 @@ async fn voice_release_never_weaker_than_full_reply() {
         Some("A different kept sentence.\n[User]: record tail".into()),
     ));
 
-    let mut runner = TestRunner::new(PropConfig::with_cases(8));
+    let mut runner = TestRunner::new(PropConfig::with_cases(env_or(8)));
     let samples = crate::speech_gate::marker_samples().to_vec();
     let generated = std::sync::Mutex::new(Vec::new());
     runner

@@ -794,8 +794,15 @@ mod property_tests {
         ]
     }
 
+    fn env_or(default: u32) -> u32 {
+        std::env::var("PROPTEST_CASES")
+            .ok()
+            .and_then(|raw| raw.parse().ok())
+            .unwrap_or(default)
+    }
+
     proptest! {
-        #![proptest_config(ProptestConfig::with_cases(48))]
+        #![proptest_config(ProptestConfig::with_cases(env_or(48)))]
 
         #[test]
         fn released_is_prefix_of_guard_kept(text in speech_case()) {
