@@ -2824,6 +2824,123 @@ impl crate::streaming::StreamingProvider for BudgetThenGuard {
     }
 }
 
+const FIRST_BLOCK: &str = "Here is a long clean first block.";
+const SECOND_BLOCK: &str = "Short.\n[User]: x";
+
+/// Two text blocks. The second is under the floor and carries a marker.
+/// Nothing from it is spoken, and a guard reset does not follow a release.
+#[tokio::test(start_paused = true)]
+async fn voice_second_text_block_stays_behind_the_floor() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = build_state_boxed_with_config(
+        dir.path().to_path_buf(),
+        Box::new(TwoTextBlocks),
+        ToolRegistry::new(),
+        config_with_voice_credential(),
+    )
+    .await;
+    let app = build_app(state);
+    let body = pause_drive(async move {
+        let response =
+            post_chat_stream_from(&app, "voice", Some("two-blocks"), Some(VOICE_CREDENTIAL)).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        String::from_utf8(bytes.to_vec()).unwrap()
+    })
+    .await;
+    let frames = sse_frames(&body);
+    assert!(
+        frames.iter().all(|(event, data)| !(event == "delta"
+            && (data.contains("Short") || data.contains("[User]")))),
+        "{frames:?}"
+    );
+    if let Some(guard) = frames
+        .iter()
+        .position(|(event, data)| event == "reset" && data.contains(r#""reason":"guard""#))
+    {
+        assert!(
+            frames[..guard].iter().all(|(event, _)| event != "delta"),
+            "guard reset followed a release: {frames:?}"
+        );
+    }
+    let done = frames
+        .iter()
+        .find(|(event, _)| event == "done")
+        .map(|(_, data)| data.as_str())
+        .expect("done");
+    assert!(done.contains(FIRST_BLOCK), "{done}");
+    assert!(done.contains(r#""truncated":true"#), "{done}");
+    assert!(!done.contains("Short"), "{done}");
+    assert!(!done.contains("[User]"), "{done}");
+}
+
+struct TwoTextBlocks;
+
+impl TwoTextBlocks {
+    fn reply() -> LlmResponse {
+        LlmResponse {
+            content: vec![
+                ContentBlock::Text {
+                    text: FIRST_BLOCK.into(),
+                },
+                ContentBlock::Text {
+                    text: SECOND_BLOCK.into(),
+                },
+            ],
+            stop_reason: StopReason::EndTurn,
+            model: "mock".into(),
+            input_tokens: Some(1),
+            output_tokens: Some(1),
+        }
+    }
+}
+
+impl LmProvider for TwoTextBlocks {
+    fn invoke(
+        &self,
+        _system_prompt: &str,
+        _messages: &[Message],
+        _max_tokens: u32,
+        _tools: Option<&[serde_json::Value]>,
+    ) -> LlmResult<'_> {
+        Box::pin(async { Ok(Self::reply()) })
+    }
+
+    fn name(&self) -> &str {
+        "two-blocks"
+    }
+}
+
+impl crate::streaming::StreamingProvider for TwoTextBlocks {
+    fn supports_streaming(&self) -> bool {
+        true
+    }
+
+    fn invoke_streaming(
+        &self,
+        _system_prompt: &str,
+        _messages: &[Message],
+        _max_tokens: u32,
+        _tools: Option<&[serde_json::Value]>,
+    ) -> crate::streaming::StreamResult<'_> {
+        use crate::streaming::StreamEvent;
+        Box::pin(async_stream::stream! {
+            let start = tokio::time::Instant::now();
+            yield StreamEvent::TextDelta(FIRST_BLOCK.into());
+            let hold = std::time::Duration::from_millis(250);
+            let waited = start.elapsed();
+            if waited < hold {
+                tokio::time::sleep(hold - waited).await;
+            }
+            yield StreamEvent::TextBlockEnd;
+            yield StreamEvent::TextDelta(SECOND_BLOCK.into());
+            yield StreamEvent::Done(TwoTextBlocks::reply());
+        })
+    }
+}
+
 const SPOKEN_CLAUSE: &str = "Here is one complete clause. ";
 const SPOKEN_RELEASED: &str = "Here is one complete clause.";
 

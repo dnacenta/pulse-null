@@ -16,6 +16,9 @@ pub enum StreamEvent {
     /// A chunk of text content.
     TextDelta(String),
 
+    /// The current text block ended. Later text is a separate block.
+    TextBlockEnd,
+
     /// The model wants to use a tool.
     ToolUse {
         id: String,

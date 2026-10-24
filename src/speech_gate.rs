@@ -87,6 +87,10 @@ impl ReleaseSwitches {
 pub(crate) struct SpeechGate {
     buf: String,
     released: usize,
+    /// Start of the open text block. The floor is measured from here.
+    block_at: usize,
+    /// A later round is held until the guard, not spoken early.
+    sealed: bool,
     first_delta_at: Option<Instant>,
     closed: bool,
     #[cfg(test)]
@@ -99,6 +103,8 @@ impl SpeechGate {
         Self {
             buf: String::new(),
             released: 0,
+            block_at: 0,
+            sealed: false,
             first_delta_at: None,
             closed: false,
             #[cfg(test)]
@@ -173,19 +179,38 @@ impl SpeechGate {
         self.released = self.buf.len();
     }
 
+    /// The next push belongs to a new text block. Its floor starts at zero.
+    pub(crate) fn begin_block(&mut self) {
+        if self.buf.len() > self.block_at {
+            self.block_at = self.buf.len();
+        }
+    }
+
+    /// Drop this round's buffer. Further text is held, not released early.
+    pub(crate) fn restart_round(&mut self) {
+        self.buf.clear();
+        self.released = 0;
+        self.block_at = 0;
+        self.closed = false;
+        self.sealed = true;
+    }
+
     fn take_release(&mut self, now: Instant) -> Option<String> {
-        if self.hold_open(now) {
+        if self.sealed || self.hold_open(now) {
             return None;
         }
-        let safe = self.safe_end();
-        let candidate = self.release_candidate(safe)?;
-        if candidate <= self.released || !self.buf.is_char_boundary(candidate) {
+        let from = self.released.max(self.block_at);
+        let safe = self.safe_end(from);
+        let candidate = self.release_candidate(from, safe)?;
+        if candidate <= from || !self.buf.is_char_boundary(candidate) {
             return None;
         }
-        if self.floor_on() && self.buf[..candidate].trim_end().len() < MIN_RELEASE_BYTES {
+        if self.floor_on()
+            && self.buf[self.block_at..candidate].trim_end().len() < MIN_RELEASE_BYTES
+        {
             return None;
         }
-        let piece = self.buf[self.released..candidate].to_string();
+        let piece = self.buf[from..candidate].to_string();
         if piece.is_empty() {
             return None;
         }
@@ -203,25 +228,25 @@ impl SpeechGate {
         now.saturating_duration_since(start) < FIRST_RELEASE_HOLD
     }
 
-    fn safe_end(&self) -> usize {
+    fn safe_end(&self, from: usize) -> usize {
         if !self.lookahead_on() {
             return self.buf.len();
         }
-        earliest_viable(&self.buf, self.released)
+        earliest_viable(&self.buf, from)
     }
 
-    fn release_candidate(&self, safe: usize) -> Option<usize> {
-        if safe <= self.released {
+    fn release_candidate(&self, from: usize, safe: usize) -> Option<usize> {
+        if safe <= from {
             return None;
         }
         if !self.whitespace_on() {
             return Some(safe);
         }
-        if let Some(end) = last_clause_boundary(&self.buf, self.released, safe) {
+        if let Some(end) = last_clause_boundary(&self.buf, from, safe) {
             return Some(end);
         }
-        if safe - self.released >= NO_CLAUSE_RELEASE_BYTES {
-            return last_space_boundary(&self.buf, self.released, safe);
+        if safe - from >= NO_CLAUSE_RELEASE_BYTES {
+            return last_space_boundary(&self.buf, from, safe);
         }
         None
     }

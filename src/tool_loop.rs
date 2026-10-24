@@ -345,6 +345,8 @@ struct HeldSpeech {
     /// The cap was crossed. Further held text is dropped.
     overflowed: bool,
     gate: crate::speech_gate::SpeechGate,
+    /// A clause from an earlier block or round was already spoken.
+    ever_released: bool,
     /// `finish_cut` accepted the kept tail, so the caller must not reset.
     cut_handled: bool,
 }
@@ -399,6 +401,7 @@ impl ProgressSink {
                 cap,
                 overflowed: false,
                 gate: crate::speech_gate::SpeechGate::new(),
+                ever_released: false,
                 cut_handled: false,
             })),
             control: None,
@@ -439,6 +442,9 @@ impl ProgressSink {
                     }
                     buf.bytes = next;
                     let piece = buf.gate.push(&text, tokio::time::Instant::now());
+                    if piece.is_some() {
+                        buf.ever_released = true;
+                    }
                     buf.deltas.push(text);
                     drop(held);
                     if let Some(piece) = piece {
@@ -575,7 +581,26 @@ impl ProgressSink {
     pub fn released_any(&self) -> bool {
         self.lock()
             .as_ref()
-            .is_some_and(|buf| buf.gate.released_any())
+            .is_some_and(|buf| buf.ever_released || buf.gate.released_any())
+    }
+
+    /// The next text belongs to a new block, with its own floor.
+    pub fn begin_text_block(&self) {
+        if let Some(buf) = self.lock().as_mut() {
+            buf.gate.begin_block();
+        }
+    }
+
+    /// A later round must not keep releasing against the previous buffer.
+    pub fn begin_next_round(&self) {
+        let mut held = self.lock();
+        let Some(buf) = held.as_mut() else {
+            return;
+        };
+        if buf.gate.released_any() {
+            buf.ever_released = true;
+        }
+        buf.gate.restart_round();
     }
 
     /// Settle a guard cut after a release. True when the kept tail was accepted,
@@ -593,6 +618,10 @@ impl ProgressSink {
                 return false;
             }
             if !buf.gate.released_any() {
+                if buf.ever_released {
+                    buf.cut_handled = true;
+                    return true;
+                }
                 return false;
             }
             match buf.gate.finish(kept) {
@@ -752,6 +781,9 @@ pub async fn invoke_with_tool_loop_streaming(
     let mut segments = Segments::new();
 
     loop {
+        if rs.rounds > 0 {
+            sink.begin_next_round();
+        }
         sink.try_send(TurnEvent::Status(TurnStatus::Thinking));
         let round = stream_one_round(
             provider,
@@ -860,6 +892,9 @@ async fn stream_one_round(
                     sink.try_send(TurnEvent::Status(TurnStatus::Responding));
                 }
                 sink.try_send(TurnEvent::Delta(text));
+            }
+            StreamEvent::TextBlockEnd => {
+                sink.begin_text_block();
             }
             StreamEvent::ToolUse { name, .. } => {
                 tool_names.push(name);
