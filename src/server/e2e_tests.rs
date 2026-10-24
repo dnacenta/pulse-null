@@ -2930,6 +2930,572 @@ async fn voice_broken_stream_end_after_release_resets_error() {
     assert_eq!(messages_len(&state, "guest:broken").await, 0);
 }
 
+struct ProofScript {
+    parts: Vec<String>,
+    done: String,
+}
+
+struct ProofProvider {
+    slot: Arc<std::sync::Mutex<ProofScript>>,
+}
+
+impl LmProvider for ProofProvider {
+    fn invoke(
+        &self,
+        _system_prompt: &str,
+        _messages: &[Message],
+        _max_tokens: u32,
+        _tools: Option<&[serde_json::Value]>,
+    ) -> LlmResult<'_> {
+        let done = self.slot.lock().expect("script").done.clone();
+        Box::pin(async move {
+            Ok(LlmResponse {
+                content: vec![ContentBlock::Text { text: done }],
+                stop_reason: StopReason::EndTurn,
+                model: "mock".into(),
+                input_tokens: Some(1),
+                output_tokens: Some(1),
+            })
+        })
+    }
+
+    fn name(&self) -> &str {
+        "proof"
+    }
+}
+
+impl crate::streaming::StreamingProvider for ProofProvider {
+    fn supports_streaming(&self) -> bool {
+        true
+    }
+
+    fn invoke_streaming(
+        &self,
+        _system_prompt: &str,
+        _messages: &[Message],
+        _max_tokens: u32,
+        _tools: Option<&[serde_json::Value]>,
+    ) -> crate::streaming::StreamResult<'_> {
+        use crate::streaming::StreamEvent;
+        let script = self.slot.lock().expect("script").clone();
+        Box::pin(async_stream::stream! {
+            if let Some((first, rest)) = script.parts.split_first() {
+                yield StreamEvent::TextDelta(first.clone());
+                tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+                for part in rest {
+                    yield StreamEvent::TextDelta(part.clone());
+                }
+                yield StreamEvent::TextDelta(String::new());
+            }
+            yield StreamEvent::Done(LlmResponse {
+                content: vec![ContentBlock::Text { text: script.done }],
+                stop_reason: StopReason::EndTurn,
+                model: "mock".into(),
+                input_tokens: Some(1),
+                output_tokens: Some(1),
+            });
+        })
+    }
+}
+
+impl Clone for ProofScript {
+    fn clone(&self) -> Self {
+        Self {
+            parts: self.parts.clone(),
+            done: self.done.clone(),
+        }
+    }
+}
+
+fn chunk_text(text: &str, size: usize) -> Vec<String> {
+    if text.is_empty() {
+        return Vec::new();
+    }
+    let size = size.max(1);
+    if size >= text.len() {
+        return vec![text.to_string()];
+    }
+    let mut parts = Vec::new();
+    let mut start = 0;
+    while start < text.len() {
+        let mut end = (start + size).min(text.len());
+        while end < text.len() && !text.is_char_boundary(end) {
+            end += 1;
+        }
+        if end == start {
+            end = text.len();
+        }
+        parts.push(text[start..end].to_string());
+        start = end;
+    }
+    parts
+}
+
+fn kept_of(text: &str) -> String {
+    let blocks = [response_validator::ContentBlock::Text {
+        text: text.to_string(),
+    }];
+    let (sanitized, _, _) = response_validator::validate_content_blocks(&blocks);
+    let mut kept = String::new();
+    for block in sanitized {
+        if let response_validator::ContentBlock::Text { text } = block {
+            kept.push_str(&text);
+        }
+    }
+    kept
+}
+
+#[derive(Debug)]
+struct ProofView {
+    spoken: String,
+    early: String,
+    after_guard: String,
+    guard_resets: usize,
+    done_text: String,
+    truncated: bool,
+}
+
+fn proof_view(body: &str) -> ProofView {
+    let frames = sse_frames(body);
+    assert!(frames.iter().all(|(event, _)| event != "error"), "{body}");
+    let mut spoken = String::new();
+    let mut early = String::new();
+    let mut after_guard = String::new();
+    let mut guard_resets = 0;
+    let mut saw_guard = false;
+    let mut done_text = String::new();
+    let mut truncated = false;
+    let mut saw_done = false;
+    for (event, data) in &frames {
+        if event == "delta" {
+            let text = delta_text(data).unwrap_or_default();
+            spoken.push_str(&text);
+            if saw_guard {
+                after_guard.push_str(&text);
+            } else {
+                early.push_str(&text);
+            }
+        } else if event == "reset" {
+            let reason = serde_json::from_str::<serde_json::Value>(data)
+                .ok()
+                .and_then(|value| value.get("reason")?.as_str().map(str::to_string))
+                .unwrap_or_default();
+            if reason == "guard" {
+                guard_resets += 1;
+                saw_guard = true;
+            }
+        } else if event == "done" {
+            let value: serde_json::Value = serde_json::from_str(data).expect("done");
+            done_text = value["text"].as_str().unwrap_or("").to_string();
+            truncated = value["truncated"].as_bool().unwrap_or(false);
+            saw_done = true;
+        }
+    }
+    assert!(saw_done, "{body}");
+    ProofView {
+        spoken,
+        early,
+        after_guard,
+        guard_resets,
+        done_text,
+        truncated,
+    }
+}
+
+fn check_voice_invariants(stream_text: &str, done_text: &str, view: &ProofView) {
+    let kept = kept_of(done_text);
+    assert_eq!(view.done_text, kept, "done text {stream_text:?}");
+    // A guard reset is written before any delta still queued, so a clause
+    // released before the cut can sit after `reset` on the wire. The kept
+    // delta is the last one; everything before it was released.
+    let released = if view.guard_resets == 0 {
+        view.early.clone()
+    } else if kept.is_empty() {
+        view.spoken.clone()
+    } else {
+        assert!(
+            view.spoken.ends_with(&kept),
+            "kept text is not the final delta of {stream_text:?}: {:?}",
+            view.spoken
+        );
+        view.spoken[..view.spoken.len() - kept.len()].to_string()
+    };
+    let marker = response_validator::validate_text(stream_text).truncation_offset;
+    if let Some(offset) = marker {
+        assert!(
+            released.len() <= offset,
+            "released {released:?} at or after marker {offset} in {stream_text:?}"
+        );
+        assert!(
+            stream_text.starts_with(&released),
+            "released {released:?} is not a prefix of the stream"
+        );
+    }
+    let mismatch = !kept.starts_with(&released);
+    if view.guard_resets == 0 {
+        assert!(!mismatch, "cut was not settled for {stream_text:?}");
+        assert_eq!(view.spoken, kept, "{stream_text:?}");
+        assert!(view.after_guard.is_empty());
+    } else {
+        assert_eq!(view.guard_resets, 1, "{stream_text:?}");
+        assert!(
+            released.is_empty() || mismatch,
+            "guard reset followed a release of {released:?}"
+        );
+    }
+}
+
+async fn play_proof(
+    app: &Router,
+    slot: &Arc<std::sync::Mutex<ProofScript>>,
+    sender: &str,
+    text: &str,
+    done: &str,
+    chunk: usize,
+) -> (ProofView, String, bool) {
+    {
+        let mut script = slot.lock().expect("script");
+        script.parts = chunk_text(text, chunk);
+        script.done = done.to_string();
+    }
+    let app_stream = app.clone();
+    let sender_stream = sender.to_string();
+    let body = pause_drive(async move {
+        let response = post_chat_stream_from(
+            &app_stream,
+            "voice",
+            Some(&sender_stream),
+            Some(VOICE_CREDENTIAL),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        String::from_utf8(bytes.to_vec()).unwrap()
+    })
+    .await;
+    let view = proof_view(&body);
+    {
+        let mut script = slot.lock().expect("script");
+        script.parts = chunk_text(text, chunk);
+        script.done = done.to_string();
+    }
+    let app_chat = app.clone();
+    let sender_chat = format!("{sender}-chat");
+    let (status, chat_body) = pause_drive(async move {
+        post_chat_secret(
+            &app_chat,
+            "voice",
+            Some(&sender_chat),
+            "hi",
+            Some(VOICE_CREDENTIAL),
+        )
+        .await
+    })
+    .await;
+    assert_eq!(status, StatusCode::OK, "{chat_body}");
+    let chat: serde_json::Value = serde_json::from_str(&chat_body).unwrap();
+    let chat_text = chat["response"].as_str().unwrap_or("").to_string();
+    let chat_truncated = chat["truncated"].as_bool().unwrap_or(false);
+    assert_eq!(view.done_text, chat_text, "{text:?}");
+    assert_eq!(view.truncated, chat_truncated, "{text:?}");
+    check_voice_invariants(text, done, &view);
+    (view, chat_text, chat_truncated)
+}
+
+fn same_verdict(left: &ProofView, right: &ProofView) -> bool {
+    left.spoken == right.spoken
+        && left.guard_resets == right.guard_resets
+        && left.done_text == right.done_text
+        && left.truncated == right.truncated
+}
+
+async fn proof_app() -> (
+    Router,
+    Arc<std::sync::Mutex<ProofScript>>,
+    tempfile::TempDir,
+) {
+    let slot = Arc::new(std::sync::Mutex::new(ProofScript {
+        parts: Vec::new(),
+        done: String::new(),
+    }));
+    let dir = tempfile::tempdir().unwrap();
+    let mut config = config_with_voice_credential();
+    config.plugin_turns.daily_turns = 0;
+    config.plugin_turns.voice_turns_per_call = 0;
+    let state = build_state_boxed_with_config(
+        dir.path().to_path_buf(),
+        Box::new(ProofProvider {
+            slot: Arc::clone(&slot),
+        }),
+        ToolRegistry::new(),
+        config,
+    )
+    .await;
+    (build_app(state), slot, dir)
+}
+
+#[tokio::test(start_paused = true)]
+async fn voice_release_never_weaker_than_full_reply() {
+    use proptest::prelude::*;
+    use proptest::test_runner::{Config as PropConfig, TestRunner};
+
+    let (app, slot, _dir) = proof_app().await;
+    let mut n = 0usize;
+    let mut scripts = Vec::new();
+    for sample in crate::speech_gate::marker_samples() {
+        for offset in [0usize, 20, 25] {
+            let prefix = "a".repeat(offset);
+            scripts.push((format!("{prefix}{sample} tail"), None));
+        }
+    }
+    for variant in [
+        "\n## User",
+        "\n## Username",
+        "\n>   \n  User:",
+        "<abcdef:function_calls>",
+        "<invoke   name=",
+        "[antml:thinking]",
+    ] {
+        scripts.push((format!("Here is one complete clause. {variant} tail"), None));
+    }
+    scripts.push((
+        "Alpha sentence is long enough. Beta sentence is long enough. ".into(),
+        None,
+    ));
+    scripts.push((
+        "The café opens at nine, and 日本語 follows it. ".into(),
+        None,
+    ));
+    scripts.push(("Sure thing.\nUser: hi".into(), None));
+    scripts.push((
+        "Here is one complete clause. \n[User]: streamed tail".into(),
+        Some("A different kept sentence.\n[User]: record tail".into()),
+    ));
+
+    let mut runner = TestRunner::new(PropConfig::with_cases(8));
+    let samples = crate::speech_gate::marker_samples().to_vec();
+    let generated = std::sync::Mutex::new(Vec::new());
+    runner
+        .run(
+            &(
+                0..26usize,
+                0..samples.len(),
+                prop::sample::select(vec![1usize, 3, 8]),
+            ),
+            |(offset, index, chunk)| {
+                let prefix = "b".repeat(offset);
+                generated
+                    .lock()
+                    .expect("cases")
+                    .push((format!("{prefix}{} more", samples[index]), chunk));
+                Ok(())
+            },
+        )
+        .expect("case generation");
+    let generated = generated.into_inner().expect("cases");
+
+    for (text, done_override) in scripts {
+        let done = done_override.unwrap_or_else(|| text.clone());
+        let mut previous = None;
+        for chunk in [1usize, 3, usize::MAX] {
+            n += 1;
+            let (view, _, _) =
+                play_proof(&app, &slot, &format!("proof-{n}"), &text, &done, chunk).await;
+            if let Some(prev) = &previous {
+                assert!(same_verdict(prev, &view), "chunking changed {text:?}");
+            }
+            previous = Some(view);
+        }
+    }
+    for (text, chunk) in generated {
+        n += 1;
+        let _ = play_proof(&app, &slot, &format!("proof-{n}"), &text, &text, chunk).await;
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn voice_release_corpus_replay() {
+    let (app, slot, _dir) = proof_app().await;
+    let mut texts = vec![
+        GUARD_RAW.to_string(),
+        "Sure thing.\nUser: hi".into(),
+        format!("\n>{}", " ".repeat(500)),
+        format!("<{}", "a".repeat(500)),
+    ];
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures");
+    let mut files = Vec::new();
+    fn collect(dir: &std::path::Path, files: &mut Vec<std::path::PathBuf>) {
+        let Ok(read) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for entry in read.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                collect(&path, files);
+            } else {
+                files.push(path);
+            }
+        }
+    }
+    collect(&root, &mut files);
+    files.sort();
+    for path in files {
+        let Ok(bytes) = std::fs::read(&path) else {
+            continue;
+        };
+        let Ok(text) = String::from_utf8(bytes) else {
+            continue;
+        };
+        let text = text.trim();
+        if text.is_empty() {
+            continue;
+        }
+        let mut end = text.len().min(180);
+        while end > 0 && !text.is_char_boundary(end) {
+            end -= 1;
+        }
+        if end == 0 {
+            continue;
+        }
+        texts.push(text[..end].to_string());
+    }
+    let mut n = 0usize;
+    for text in texts {
+        let mut previous = None;
+        let chunks: &[usize] = if text.len() > 200 {
+            &[usize::MAX]
+        } else {
+            &[1, usize::MAX]
+        };
+        for chunk in chunks {
+            n += 1;
+            let (view, _, _) =
+                play_proof(&app, &slot, &format!("corpus-{n}"), &text, &text, *chunk).await;
+            if let Some(prev) = &previous {
+                assert!(
+                    same_verdict(prev, &view),
+                    "corpus chunking changed {text:?}"
+                );
+            }
+            previous = Some(view);
+        }
+    }
+}
+
+#[tokio::test]
+async fn voice_first_delta_latency() {
+    use std::sync::atomic::AtomicU64;
+
+    let release_ms = Arc::new(AtomicU64::new(0));
+    let seen_ms = Arc::new(AtomicU64::new(0));
+    let started = std::time::Instant::now();
+    let release_for_provider = Arc::clone(&release_ms);
+    let clause_visible = Arc::new(Notify::new());
+    let visible = Arc::clone(&clause_visible);
+
+    struct LatencyProvider {
+        release_ms: Arc<AtomicU64>,
+        started: std::time::Instant,
+        visible: Arc<Notify>,
+    }
+    impl LmProvider for LatencyProvider {
+        fn invoke(
+            &self,
+            _s: &str,
+            _m: &[Message],
+            _t: u32,
+            _tools: Option<&[serde_json::Value]>,
+        ) -> LlmResult<'_> {
+            Box::pin(async { Err("unused".into()) })
+        }
+        fn name(&self) -> &str {
+            "latency"
+        }
+    }
+    impl crate::streaming::StreamingProvider for LatencyProvider {
+        fn supports_streaming(&self) -> bool {
+            true
+        }
+        fn invoke_streaming(
+            &self,
+            _s: &str,
+            _m: &[Message],
+            _t: u32,
+            _tools: Option<&[serde_json::Value]>,
+        ) -> crate::streaming::StreamResult<'_> {
+            use crate::streaming::StreamEvent;
+            let release_ms = Arc::clone(&self.release_ms);
+            let started = self.started;
+            let visible = Arc::clone(&self.visible);
+            Box::pin(async_stream::stream! {
+                yield StreamEvent::TextDelta(SPOKEN_CLAUSE.into());
+                tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+                release_ms.store(started.elapsed().as_millis() as u64, Ordering::SeqCst);
+                yield StreamEvent::TextDelta(String::new());
+                visible.notified().await;
+                yield StreamEvent::Done(LlmResponse {
+                    content: vec![ContentBlock::Text {
+                        text: SPOKEN_CLAUSE.into(),
+                    }],
+                    stop_reason: StopReason::EndTurn,
+                    model: "mock".into(),
+                    input_tokens: Some(1),
+                    output_tokens: Some(1),
+                });
+            })
+        }
+    }
+
+    let dir = tempfile::tempdir().unwrap();
+    let state = build_state_boxed_with_config(
+        dir.path().to_path_buf(),
+        Box::new(LatencyProvider {
+            release_ms: release_for_provider,
+            started,
+            visible,
+        }),
+        ToolRegistry::new(),
+        config_with_voice_credential(),
+    )
+    .await;
+    let app = build_app(state);
+    let seen = Arc::clone(&seen_ms);
+    let body = {
+        use tokio_stream::StreamExt as _;
+        let response =
+            post_chat_stream_from(&app, "voice", Some("latency"), Some(VOICE_CREDENTIAL)).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let mut incoming = response.into_body().into_data_stream();
+        let mut acc = String::new();
+        let mut noted = false;
+        loop {
+            if !noted && acc.contains(SPOKEN_RELEASED) {
+                noted = true;
+                seen.store(started.elapsed().as_millis() as u64, Ordering::SeqCst);
+                clause_visible.notify_waiters();
+            }
+            if acc.contains("event: done") && acc.ends_with("\n\n") {
+                break;
+            }
+            let Some(chunk) = incoming.next().await else {
+                break;
+            };
+            acc.push_str(&String::from_utf8_lossy(&chunk.expect("body error")));
+        }
+        acc
+    };
+    let release_at = release_ms.load(Ordering::SeqCst);
+    let seen_at = seen_ms.load(Ordering::SeqCst);
+    let latency = seen_at.saturating_sub(release_at);
+    eprintln!(
+        "voice_first_delta_latency release_ms={release_at} delta_ms={seen_at} latency_ms={latency}"
+    );
+    assert!(body.contains(SPOKEN_RELEASED), "{body}");
+    assert!(latency < 50, "latency {latency} ms");
+}
+
 /// A guard cut still delivers `reset` when the delta channel is already
 /// full. The body is not read until the turn has committed, so every slot
 /// is occupied; the first frame after that is `reset`, ahead of the deltas

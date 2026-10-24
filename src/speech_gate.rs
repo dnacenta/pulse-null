@@ -778,3 +778,8 @@ mod property_tests {
         }
     }
 }
+
+#[cfg(test)]
+pub(crate) fn marker_samples() -> &'static [&'static str] {
+    &tests::SAMPLES
+}
