@@ -798,6 +798,26 @@ mod tests {
             .expect("kept tail");
         assert!(rest.is_none());
     }
+
+    #[test]
+    fn later_round_stays_sealed() {
+        let t0 = Instant::now();
+        let later = t0 + FIRST_RELEASE_HOLD;
+        let mut gate = SpeechGate::new();
+        assert!(gate
+            .push("Here is a complete sentence about the work. ", t0)
+            .is_none());
+        assert!(gate.push("", later).is_some());
+        gate.restart_round();
+        let long = "Another sentence is also long enough. And a second clause follows it. ";
+        let piece = gate.push(long, later);
+        assert!(piece.is_none(), "a later round released {piece:?}");
+        assert!(
+            gate.push("", later + FIRST_RELEASE_HOLD).is_none(),
+            "a later round released after the hold"
+        );
+        assert_eq!(gate.released_len(), 0);
+    }
 }
 
 #[cfg(test)]
