@@ -38,6 +38,7 @@ mod session;
 mod session_health;
 mod session_key;
 mod session_store;
+mod speech_gate;
 mod streaming;
 mod surrealdb_manager;
 mod task_context;
