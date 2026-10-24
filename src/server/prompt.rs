@@ -1669,7 +1669,7 @@ fn pulse_rule_meta_ok(
     if file_uid == running_uid || file_uid == 0 {
         Ok(())
     } else {
-        Err("not owned by the running user")
+        Err("owned by neither the running user nor root")
     }
 }
 
@@ -3051,7 +3051,7 @@ mod tests {
     fn read_rule_file_rejects_an_injected_third_uid() {
         assert_eq!(
             pulse_rule_meta_ok(4_242, 1, 1, false),
-            Err("not owned by the running user")
+            Err("owned by neither the running user nor root")
         );
         // SAFETY: geteuid has no preconditions and cannot fail.
         if unsafe { libc::geteuid() } == 0 {
@@ -3061,7 +3061,7 @@ mod tests {
         let path = dir.path().join("rule.md");
         std::fs::write(&path, "OWNED-BY-THIS-USER").unwrap();
         let err = read_rule_file(&path, RulesSource::Pulse, false, 1).unwrap_err();
-        assert_eq!(err, "not owned by the running user");
+        assert_eq!(err, "owned by neither the running user nor root");
         assert!(!err.contains("OWNED-BY-THIS-USER"));
     }
 
