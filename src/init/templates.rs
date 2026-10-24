@@ -53,7 +53,7 @@ name = "{pulse_name}"
 owner_name = "{owner_name}"
 owner_alias = "{owner_alias}"
 {rules_dir_line}
-# rules_require_root = false  # pulse rules only when the files and the directories down to them are root-owned and those directories are not group- or world-writable
+# rules_require_root = false  # pulse rules only when the files and the directories down to them are root-owned and those directories are not group- or world-writable. Strict mode rejects a FUSE-mounted rules path. Where the pulse user can still mount filesystems, also set NoNewPrivileges=yes, PrivateDevices=yes (or no /dev/fuse) and no setuid fusermount: the loader can only check what it can see.
 
 [server]
 host = "127.0.0.1"

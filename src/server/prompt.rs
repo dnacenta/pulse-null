@@ -1318,12 +1318,61 @@ fn untrusted_rules_path(root: &Path, dir: &Path) -> Option<PathBuf> {
     None
 }
 
+/// Linux `FUSE_SUPER_MAGIC`.
+const FUSE_SUPER_MAGIC: i64 = 0x65735546;
+/// Linux super magic for a block-backed FUSE mount.
+const FUSEBLK_SUPER_MAGIC: i64 = 0x65735543;
+
+/// Strict mode accepts a filesystem type that is not FUSE.
+#[must_use]
+fn fs_type_ok_for_strict(f_type: i64) -> bool {
+    f_type != FUSE_SUPER_MAGIC && f_type != FUSEBLK_SUPER_MAGIC
+}
+
+fn fs_type_of_stat(stat: impl FnOnce(*mut libc::statfs) -> libc::c_int) -> Result<i64, String> {
+    let mut buf = std::mem::MaybeUninit::<libc::statfs>::zeroed();
+    if stat(buf.as_mut_ptr()) != 0 {
+        return Err(std::io::Error::last_os_error().to_string());
+    }
+    // SAFETY: the call returned 0, so it wrote a `statfs` into `buf`.
+    let buf = unsafe { buf.assume_init() };
+    Ok(buf.f_type)
+}
+
+fn fs_type_of_path(path: &Path) -> Result<i64, String> {
+    let c =
+        std::ffi::CString::new(path.as_os_str().as_encoded_bytes()).map_err(|e| e.to_string())?;
+    fs_type_of_stat(|buf| {
+        // SAFETY: `c` is a NUL-terminated path and `buf` points at a `statfs`.
+        unsafe { libc::statfs(c.as_ptr(), buf) }
+    })
+}
+
+fn fs_type_of_file(file: &std::fs::File) -> Result<i64, String> {
+    use std::os::unix::io::AsRawFd;
+    let fd = file.as_raw_fd();
+    fs_type_of_stat(|buf| {
+        // SAFETY: `fd` stays open for this call and `buf` points at a `statfs`.
+        unsafe { libc::fstatfs(fd, buf) }
+    })
+}
+
 /// In strict mode, the first directory from just under `root` through `dir`
-/// that root does not own, or that is group- or world-writable. The pulse
-/// root itself is not one of them: a pulse-owned home can still rename
-/// `.claude`, and the replacement then fails this check. Missing paths are
-/// not a rejection. The reason never includes file contents.
+/// that root does not own, that is group- or world-writable, or that is on
+/// a FUSE filesystem. The pulse root itself is not one of them: a pulse-owned
+/// home can still rename `.claude`, and the replacement then fails this check.
+/// Missing paths are not a rejection. The reason never includes file contents.
 fn strict_rules_dir_block(root: &Path, dir: &Path) -> Option<(PathBuf, String)> {
+    strict_rules_dir_block_fs(root, dir, None)
+}
+
+/// `fs_type`, when set, is the filesystem magic every component reports.
+/// Production passes `None` and reads it with `statfs`.
+fn strict_rules_dir_block_fs(
+    root: &Path,
+    dir: &Path,
+    fs_type: Option<i64>,
+) -> Option<(PathBuf, String)> {
     use std::os::unix::fs::MetadataExt;
     let Ok(below) = dir.strip_prefix(root) else {
         return Some((dir.to_path_buf(), "not under the pulse root".to_string()));
@@ -1336,6 +1385,16 @@ fn strict_rules_dir_block(root: &Path, dir: &Path) -> Option<(PathBuf, String)> 
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return None,
             Err(e) => return Some((current, e.to_string())),
         };
+        let kind = match fs_type {
+            Some(kind) => kind,
+            None => match fs_type_of_path(&current) {
+                Ok(kind) => kind,
+                Err(e) => return Some((current, e)),
+            },
+        };
+        if !fs_type_ok_for_strict(kind) {
+            return Some((current, "on a FUSE filesystem".to_string()));
+        }
         if let Some(reason) = pulse_rules_dir_reject(meta.uid(), meta.mode()) {
             return Some((current, reason.to_string()));
         }
@@ -1613,18 +1672,41 @@ fn load_rule_files(
 }
 
 /// Read one rule file: a regular file only, at most [`MAX_RULE_FILE_BYTES`].
-/// A pulse rule must also pass [`pulse_rule_meta_ok`]. The mode is not consulted.
+/// A pulse rule must also pass [`pulse_rule_meta_ok`]. In strict mode the
+/// open file must not sit on a FUSE filesystem (`fstatfs` of that descriptor).
+/// The mode is not consulted.
 fn read_rule_file(
     path: &Path,
     source: RulesSource,
     strict: bool,
     running_uid: u32,
 ) -> Result<String, String> {
+    read_rule_file_fs(path, source, strict, running_uid, None)
+}
+
+/// `fs_type`, when set, is the filesystem magic the open file reports.
+/// Production passes `None` and reads it with `fstatfs`.
+fn read_rule_file_fs(
+    path: &Path,
+    source: RulesSource,
+    strict: bool,
+    running_uid: u32,
+    fs_type: Option<i64>,
+) -> Result<String, String> {
     use std::io::Read;
     use std::os::unix::fs::MetadataExt;
     let (file, meta) = crate::fs_safe::open_regular(path)
         .map_err(|e| e.to_string())?
         .ok_or_else(|| "vanished".to_string())?;
+    if source == RulesSource::Pulse && strict {
+        let kind = match fs_type {
+            Some(kind) => kind,
+            None => fs_type_of_file(&file)?,
+        };
+        if !fs_type_ok_for_strict(kind) {
+            return Err("on a FUSE filesystem".to_string());
+        }
+    }
     if source == RulesSource::Pulse {
         if let Err(reason) = pulse_rule_meta_ok(meta.uid(), meta.nlink(), running_uid, strict) {
             return Err(reason.to_string());
@@ -2998,6 +3080,59 @@ mod tests {
             pulse_rules_dir_reject(pulse_uid, 0o755),
             Some("not owned by root")
         );
+    }
+
+    #[test]
+    fn fs_type_ok_for_strict_rejects_fuse_only() {
+        assert!(fs_type_ok_for_strict(0xef53));
+        assert!(fs_type_ok_for_strict(0x0102_1994));
+        assert!(!fs_type_ok_for_strict(FUSE_SUPER_MAGIC));
+        assert!(!fs_type_ok_for_strict(FUSEBLK_SUPER_MAGIC));
+    }
+
+    #[test]
+    fn strict_skips_rules_when_a_directory_reports_fuse() {
+        let dir = tempfile::tempdir().unwrap();
+        let rules = seed_pulse_rules(dir.path());
+        let (path, reason) = strict_rules_dir_block_fs(dir.path(), &rules, Some(FUSE_SUPER_MAGIC))
+            .expect("a fuse directory is rejected");
+        assert_eq!(reason, "on a FUSE filesystem");
+        assert!(path.starts_with(dir.path()), "{}", path.display());
+        let (path, reason) =
+            strict_rules_dir_block_fs(dir.path(), &rules, Some(FUSEBLK_SUPER_MAGIC))
+                .expect("fuseblk is rejected");
+        assert_eq!(reason, "on a FUSE filesystem");
+        assert!(path.starts_with(dir.path()), "{}", path.display());
+    }
+
+    #[test]
+    fn strict_skips_a_rule_file_when_the_open_file_reports_fuse() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("rule.md");
+        std::fs::write(&path, "FUSE-RULE").unwrap();
+        for magic in [FUSE_SUPER_MAGIC, FUSEBLK_SUPER_MAGIC] {
+            let err =
+                read_rule_file_fs(&path, RulesSource::Pulse, true, 0, Some(magic)).unwrap_err();
+            assert_eq!(err, "on a FUSE filesystem");
+            assert!(!err.contains("FUSE-RULE"), "{err}");
+        }
+    }
+
+    #[test]
+    fn non_strict_reads_a_rule_file_even_when_told_it_is_fuse() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("rule.md");
+        std::fs::write(&path, "PLAIN-RULE").unwrap();
+        // SAFETY: geteuid has no preconditions and cannot fail.
+        let text = read_rule_file_fs(
+            &path,
+            RulesSource::Pulse,
+            false,
+            unsafe { libc::geteuid() },
+            Some(FUSE_SUPER_MAGIC),
+        )
+        .unwrap();
+        assert_eq!(text, "PLAIN-RULE");
     }
 
     #[test]
