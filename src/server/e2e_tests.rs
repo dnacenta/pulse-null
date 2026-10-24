@@ -1750,6 +1750,330 @@ async fn e2e_chat_stream_reset_on_fallback() {
     );
 }
 
+/// SSE text the HTTP decoder reads as two text deltas and then a refusal.
+/// The explanation and the draft must never reach the client.
+const REFUSAL_AFTER_DELTAS: &str = "\
+event: message_start
+data: {\"type\":\"message_start\",\"message\":{\"model\":\"m\",\"usage\":{\"input_tokens\":20,\"output_tokens\":1}}}
+
+event: content_block_delta
+data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"draft one\"}}
+
+event: content_block_delta
+data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\" draft two\"}}
+
+event: message_delta
+data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"refusal\",\"stop_sequence\":null,\"stop_details\":{\"type\":\"refusal\",\"category\":\"cyber\",\"explanation\":\"do-not-leak-explanation\"}},\"usage\":{\"output_tokens\":0}}
+
+event: message_stop
+data: {\"type\":\"message_stop\"}
+
+";
+
+/// Buffered refusal body: partial content and an explanation that must not
+/// reach the client. `/chat` parses this through the real mapping.
+fn buffered_refusal_body() -> serde_json::Value {
+    serde_json::json!({
+        "model": "m",
+        "stop_reason": "refusal",
+        "stop_details": {
+            "type": "refusal",
+            "category": "cyber",
+            "explanation": "do-not-leak-explanation",
+        },
+        "content": [{"type": "text", "text": "partial draft"}],
+        "usage": {"input_tokens": 3, "output_tokens": 1}
+    })
+}
+
+/// Replays fixture SSE through the stream decoder, and a buffered refusal
+/// body through the message mapping. No network.
+struct DecoderReplay {
+    sse: &'static [u8],
+    body: serde_json::Value,
+}
+
+impl DecoderReplay {
+    fn from_sse(sse: &'static str) -> Self {
+        Self {
+            sse: sse.as_bytes(),
+            body: buffered_refusal_body(),
+        }
+    }
+
+    fn events(&self) -> Vec<crate::streaming::StreamEvent> {
+        let mut decoder = crate::anthropic_provider::SseDecoder::new("configured");
+        decoder.feed(self.sse)
+    }
+}
+
+impl LmProvider for DecoderReplay {
+    fn invoke(
+        &self,
+        _system_prompt: &str,
+        _messages: &[Message],
+        _max_tokens: u32,
+        _tools: Option<&[serde_json::Value]>,
+    ) -> LlmResult<'_> {
+        let body = self.body.clone();
+        Box::pin(async move { crate::anthropic_provider::interpret_message(&body, "configured") })
+    }
+
+    fn name(&self) -> &str {
+        "decoder-replay"
+    }
+}
+
+impl crate::streaming::StreamingProvider for DecoderReplay {
+    fn supports_streaming(&self) -> bool {
+        true
+    }
+
+    fn invoke_streaming(
+        &self,
+        _system_prompt: &str,
+        _messages: &[Message],
+        _max_tokens: u32,
+        _tools: Option<&[serde_json::Value]>,
+    ) -> crate::streaming::StreamResult<'_> {
+        let events = self.events();
+        Box::pin(async_stream::stream! {
+            for event in events {
+                yield event;
+            }
+        })
+    }
+}
+
+/// Text, then a typed refusal, the shape the CLI provider already emits.
+struct DeltaThenRefuse;
+
+impl LmProvider for DeltaThenRefuse {
+    fn invoke(
+        &self,
+        _system_prompt: &str,
+        _messages: &[Message],
+        _max_tokens: u32,
+        _tools: Option<&[serde_json::Value]>,
+    ) -> LlmResult<'_> {
+        Box::pin(async { Err("unused".into()) })
+    }
+
+    fn name(&self) -> &str {
+        "delta-then-refuse"
+    }
+}
+
+impl crate::streaming::StreamingProvider for DeltaThenRefuse {
+    fn supports_streaming(&self) -> bool {
+        true
+    }
+
+    fn invoke_streaming(
+        &self,
+        _system_prompt: &str,
+        _messages: &[Message],
+        _max_tokens: u32,
+        _tools: Option<&[serde_json::Value]>,
+    ) -> crate::streaming::StreamResult<'_> {
+        use crate::streaming::StreamEvent;
+        Box::pin(async_stream::stream! {
+            yield StreamEvent::TextDelta("I cannot ".into());
+            yield StreamEvent::Refused {
+                model: "m".into(),
+                detail: "Usage Policy".into(),
+            };
+        })
+    }
+}
+
+async fn messages_len(state: &Arc<AppState>, key: &str) -> usize {
+    match state.session_store.get_existing_by_key(key).await {
+        Some(arc) => arc.read().await.data.messages.len(),
+        None => 0,
+    }
+}
+
+fn assert_refusal_stream_speaks_nothing(body: &str) {
+    let frames = sse_frames(body);
+    assert!(
+        frames.iter().all(|(event, _)| event != "delta"),
+        "refused draft was spoken: {frames:?}"
+    );
+    assert!(
+        frames
+            .iter()
+            .any(|(event, data)| event == "error"
+                && data.contains("the model declined this request")),
+        "{frames:?}"
+    );
+    assert!(
+        frames.iter().all(|(event, _)| event != "done"),
+        "{frames:?}"
+    );
+}
+
+/// A voice-credential stream whose draft is refused after two deltas speaks
+/// nothing: the held text is dropped, and the turn is rolled back.
+#[tokio::test]
+async fn voice_stream_refused_after_deltas_speaks_nothing() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = build_state_boxed_with_config(
+        dir.path().to_path_buf(),
+        Box::new(DecoderReplay::from_sse(REFUSAL_AFTER_DELTAS)),
+        ToolRegistry::new(),
+        config_with_voice_credential(),
+    )
+    .await;
+    let app = build_app(Arc::clone(&state));
+    let response =
+        post_chat_stream_from(&app, "voice", Some("caller"), Some(VOICE_CREDENTIAL)).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let body = String::from_utf8_lossy(&bytes);
+    assert_refusal_stream_speaks_nothing(&body);
+    assert!(!body.contains("draft one"), "{body}");
+    assert!(!body.contains("do-not-leak-explanation"), "{body}");
+    assert_eq!(messages_len(&state, "guest:caller").await, 0);
+}
+
+/// The same voice stream, driven by the CLI refusal shape rather than SSE.
+#[tokio::test]
+async fn voice_stream_cli_refusal_speaks_nothing() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = build_state_boxed_with_config(
+        dir.path().to_path_buf(),
+        Box::new(DeltaThenRefuse),
+        ToolRegistry::new(),
+        config_with_voice_credential(),
+    )
+    .await;
+    let app = build_app(Arc::clone(&state));
+    let response =
+        post_chat_stream_from(&app, "voice", Some("caller"), Some(VOICE_CREDENTIAL)).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let body = String::from_utf8_lossy(&bytes);
+    assert_refusal_stream_speaks_nothing(&body);
+    assert!(!body.contains("I cannot "), "{body}");
+    assert!(!body.contains("Usage Policy"), "{body}");
+    assert_eq!(messages_len(&state, "guest:caller").await, 0);
+}
+
+/// A guest `/chat` turn refused by the HTTP decoder is a 500 and leaves
+/// the session untouched.
+#[tokio::test]
+async fn guest_chat_refusal_is_declined_and_rolled_back() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = build_state_boxed_with_config(
+        dir.path().to_path_buf(),
+        Box::new(DecoderReplay::from_sse(REFUSAL_AFTER_DELTAS)),
+        ToolRegistry::new(),
+        config_with_voice_credential(),
+    )
+    .await;
+    let app = build_app(Arc::clone(&state));
+    let (status, body) =
+        post_chat_secret(&app, "voice", Some("caller"), "hi", Some(VOICE_CREDENTIAL)).await;
+    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+    assert_eq!(body, "the model declined this request");
+    assert_eq!(messages_len(&state, "guest:caller").await, 0);
+}
+
+/// An owner `/chat` turn refused by the HTTP decoder takes the configured
+/// fallback and answers with that text.
+#[tokio::test]
+async fn owner_http_refusal_takes_the_fallback() {
+    let dir = tempfile::tempdir().unwrap();
+    let bin = dir.path().join("fake-cli");
+    crate::cli_provider::fake_cli::write_script(
+        &bin,
+        r#"printf '%s\n' '{"result":"the fallback answer"}'"#,
+    );
+    let mut config = test_config();
+    config.llm.provider = "cli".into();
+    // vendor-ok: the fallback builder only constructs a real CLI adapter
+    config.llm.adapter = Some("claude".into());
+    config.llm.cli_bin = Some(bin.display().to_string());
+    config.llm.fallback_model = Some("opus".into());
+    let state = build_state_boxed_with_config(
+        dir.path().to_path_buf(),
+        Box::new(DecoderReplay::from_sse(REFUSAL_AFTER_DELTAS)),
+        ToolRegistry::new(),
+        config,
+    )
+    .await;
+    let app = build_app(state);
+    let (status, body) = post_chat_on(&app, "tui", "hello").await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(body.contains("the fallback answer"), "{body}");
+    assert!(!body.contains("draft one"), "{body}");
+    assert!(!body.contains("do-not-leak-explanation"), "{body}");
+}
+
+/// A peer `/chat` turn refused by the HTTP decoder is declined. The
+/// fallback that would answer an owner is not called, and the peer
+/// session stays empty.
+#[tokio::test]
+async fn peer_http_refusal_is_declined_and_leaves_the_session() {
+    let dir = tempfile::tempdir().unwrap();
+    let bin = dir.path().join("fake-cli");
+    let marker = dir.path().join("fallback-ran");
+    crate::cli_provider::fake_cli::write_script(
+        &bin,
+        &format!(
+            "touch '{}'\nprintf '%s\\n' '{{\"result\":\"the fallback answer\"}}'",
+            marker.display()
+        ),
+    );
+    let mut config = test_config();
+    config.peers.insert(
+        "nova".to_string(),
+        crate::config::PeerConfig {
+            host: "127.0.0.1".to_string(),
+            port: 3201,
+            secret: Some("peer-secret".to_string()),
+        },
+    );
+    config.llm.provider = "cli".into();
+    // vendor-ok: the fallback builder only constructs a real CLI adapter
+    config.llm.adapter = Some("claude".into());
+    config.llm.cli_bin = Some(bin.display().to_string());
+    config.llm.fallback_model = Some("opus".into());
+    let state = build_state_boxed_with_config(
+        dir.path().to_path_buf(),
+        Box::new(DecoderReplay::from_sse(REFUSAL_AFTER_DELTAS)),
+        ToolRegistry::new(),
+        config,
+    )
+    .await;
+    let app = build_app(Arc::clone(&state));
+    let req = Request::builder()
+        .method("POST")
+        .uri("/chat")
+        .header("Content-Type", "application/json")
+        .header("X-Peer-Name", "nova")
+        .header("X-Echo-Secret", "peer-secret")
+        .body(Body::from(
+            serde_json::json!({"channel": "chat", "message": "hello"}).to_string(),
+        ))
+        .unwrap();
+    let response = app.oneshot(req).await.unwrap();
+    let status = response.status();
+    let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let body = String::from_utf8(bytes.to_vec()).unwrap();
+    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+    assert_eq!(body, "the model declined this request");
+    assert!(!marker.exists(), "the fallback was called");
+    assert_eq!(messages_len(&state, "peer:nova").await, 0);
+}
+
 fn guard_cut_provider(raw: &str) -> MockProvider {
     MockProvider::new(vec![LlmResponse {
         content: vec![ContentBlock::Text { text: raw.into() }],

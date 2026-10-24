@@ -4,6 +4,7 @@ use pulse_system_types::llm::{
 use reqwest::header;
 use tokio_stream::StreamExt;
 
+use crate::errors::RefusalError;
 use crate::session::strip_system_prefixes;
 use crate::streaming::{self, StreamEvent, StreamResult, StreamingProvider};
 
@@ -132,36 +133,7 @@ impl LmProvider for AnthropicProvider {
             let response_json: serde_json::Value = serde_json::from_str(&response_text)
                 .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
 
-            let content_blocks = parse_content_blocks(&response_json);
-
-            let stop_reason = match response_json["stop_reason"].as_str() {
-                Some("end_turn") => StopReason::EndTurn,
-                Some("tool_use") => StopReason::ToolUse,
-                Some("max_tokens") => StopReason::MaxTokens,
-                Some("stop_sequence") => StopReason::StopSequence,
-                Some(other) => StopReason::Other(other.to_string()),
-                None => StopReason::EndTurn,
-            };
-
-            let model = response_json["model"]
-                .as_str()
-                .unwrap_or(&self.model)
-                .to_string();
-
-            let input_tokens = response_json["usage"]["input_tokens"]
-                .as_u64()
-                .map(|v| v as u32);
-            let output_tokens = response_json["usage"]["output_tokens"]
-                .as_u64()
-                .map(|v| v as u32);
-
-            Ok(LlmResponse {
-                content: content_blocks,
-                stop_reason,
-                model,
-                input_tokens,
-                output_tokens,
-            })
+            interpret_message(&response_json, &self.model)
         })
     }
 
@@ -223,18 +195,8 @@ impl StreamingProvider for AnthropicProvider {
                 return;
             }
 
-            // Parse SSE stream
             let mut byte_stream = response.bytes_stream();
-            let mut buffer = String::new();
-            let mut text_parts: Vec<String> = Vec::new();
-            let mut tool_uses: Vec<ContentBlock> = Vec::new();
-            let mut current_tool_id = String::new();
-            let mut current_tool_name = String::new();
-            let mut current_tool_input = String::new();
-            let mut model = self.model.clone();
-            let mut input_tokens: Option<u32> = None;
-            let mut output_tokens: Option<u32> = None;
-            let mut stop_reason = StopReason::EndTurn;
+            let mut decoder = SseDecoder::new(&self.model);
 
             while let Some(chunk) = byte_stream.next().await {
                 let chunk = match chunk {
@@ -245,129 +207,12 @@ impl StreamingProvider for AnthropicProvider {
                     }
                 };
 
-                buffer.push_str(&String::from_utf8_lossy(&chunk));
-
-                // Process complete SSE events from buffer
-                while let Some(event_end) = buffer.find("\n\n") {
-                    let event_text = buffer[..event_end].to_string();
-                    buffer = buffer[event_end + 2..].to_string();
-
-                    // Parse SSE event
-                    let mut event_type = "";
-                    let mut data = String::new();
-                    for line in event_text.lines() {
-                        if let Some(val) = line.strip_prefix("event: ") {
-                            event_type = match val.trim() {
-                                "message_start" => "message_start",
-                                "content_block_start" => "content_block_start",
-                                "content_block_delta" => "content_block_delta",
-                                "content_block_stop" => "content_block_stop",
-                                "message_delta" => "message_delta",
-                                "message_stop" => "message_stop",
-                                "ping" => "ping",
-                                _ => "unknown",
-                            };
-                        } else if let Some(val) = line.strip_prefix("data: ") {
-                            data = val.to_string();
-                        }
-                    }
-
-                    if data.is_empty() || event_type == "ping" {
-                        continue;
-                    }
-
-                    let json: serde_json::Value = match serde_json::from_str(&data) {
-                        Ok(v) => v,
-                        Err(_) => continue,
-                    };
-
-                    match event_type {
-                        "message_start" => {
-                            if let Some(m) = json["message"]["model"].as_str() {
-                                model = m.to_string();
-                            }
-                            input_tokens = json["message"]["usage"]["input_tokens"]
-                                .as_u64()
-                                .map(|v| v as u32);
-                        }
-                        "content_block_start" => {
-                            let block_type = json["content_block"]["type"].as_str().unwrap_or("");
-                            if block_type == "tool_use" {
-                                current_tool_id = json["content_block"]["id"]
-                                    .as_str()
-                                    .unwrap_or("")
-                                    .to_string();
-                                current_tool_name = json["content_block"]["name"]
-                                    .as_str()
-                                    .unwrap_or("")
-                                    .to_string();
-                                current_tool_input.clear();
-                            }
-                        }
-                        "content_block_delta" => {
-                            let delta_type = json["delta"]["type"].as_str().unwrap_or("");
-                            match delta_type {
-                                "text_delta" => {
-                                    if let Some(text) = json["delta"]["text"].as_str() {
-                                        text_parts.push(text.to_string());
-                                        yield StreamEvent::TextDelta(text.to_string());
-                                    }
-                                }
-                                "input_json_delta" => {
-                                    if let Some(partial) = json["delta"]["partial_json"].as_str() {
-                                        current_tool_input.push_str(partial);
-                                    }
-                                }
-                                _ => {}
-                            }
-                        }
-                        "content_block_stop" => {
-                            if !current_tool_name.is_empty() {
-                                let input: serde_json::Value =
-                                    serde_json::from_str(&current_tool_input)
-                                        .unwrap_or(serde_json::Value::Object(Default::default()));
-                                let tool = ContentBlock::ToolUse {
-                                    id: current_tool_id.clone(),
-                                    name: current_tool_name.clone(),
-                                    input: input.clone(),
-                                };
-                                tool_uses.push(tool);
-                                yield StreamEvent::ToolUse {
-                                    id: current_tool_id.clone(),
-                                    name: current_tool_name.clone(),
-                                    input,
-                                };
-                                current_tool_name.clear();
-                                current_tool_id.clear();
-                                current_tool_input.clear();
-                            }
-                        }
-                        "message_delta" => {
-                            stop_reason = match json["delta"]["stop_reason"].as_str() {
-                                Some("end_turn") => StopReason::EndTurn,
-                                Some("tool_use") => StopReason::ToolUse,
-                                Some("max_tokens") => StopReason::MaxTokens,
-                                Some("stop_sequence") => StopReason::StopSequence,
-                                Some(other) => StopReason::Other(other.to_string()),
-                                None => StopReason::EndTurn,
-                            };
-                            output_tokens = json["usage"]["output_tokens"]
-                                .as_u64()
-                                .map(|v| v as u32);
-                        }
-                        "message_stop" => {
-                            // Assemble final response
-                            let response = streaming::assemble_response(
-                                text_parts.clone(),
-                                tool_uses.clone(),
-                                model.clone(),
-                                input_tokens,
-                                output_tokens,
-                                stop_reason.clone(),
-                            );
-                            yield StreamEvent::Done(response);
-                        }
-                        _ => {}
+                for event in decoder.feed(&chunk) {
+                    let terminal =
+                        matches!(event, StreamEvent::Refused { .. } | StreamEvent::Done(_));
+                    yield event;
+                    if terminal {
+                        return;
                     }
                 }
             }
@@ -400,4 +245,719 @@ fn parse_content_blocks(response_json: &serde_json::Value) -> Vec<ContentBlock> 
             }
         })
         .collect()
+}
+
+/// Today's stop-reason mapping. A refusal is never passed here: callers
+/// handle that case first and return [`RefusalError`] instead.
+#[must_use]
+fn stop_reason_from(raw: Option<&str>) -> StopReason {
+    debug_assert_ne!(
+        raw,
+        Some("refusal"),
+        "a refusal must be handled before the stop-reason mapping"
+    );
+    match raw {
+        Some("end_turn") => StopReason::EndTurn,
+        Some("tool_use") => StopReason::ToolUse,
+        Some("max_tokens") => StopReason::MaxTokens,
+        Some("stop_sequence") => StopReason::StopSequence,
+        Some(other) => StopReason::Other(other.to_string()),
+        None => StopReason::EndTurn,
+    }
+}
+
+/// `Some` only when `stop_reason` is `"refusal"`.
+///
+/// `detail` is `"refusal"`, plus `" (<category>)"` when `stop_details.category`
+/// is a string. The explanation is not copied: it can quote the refused text.
+#[must_use]
+fn refusal_from(
+    stop_reason: Option<&str>,
+    stop_details: &serde_json::Value,
+    model: &str,
+) -> Option<RefusalError> {
+    if stop_reason != Some("refusal") {
+        return None;
+    }
+    let detail = match stop_details["category"].as_str() {
+        Some(category) => format!("refusal ({category})"),
+        None => "refusal".to_string(),
+    };
+    Some(RefusalError {
+        model: model.to_string(),
+        detail,
+    })
+}
+
+/// Model and category only. The refused text and the explanation stay out.
+fn warn_refusal(model: &str, stop_details: &serde_json::Value) {
+    tracing::warn!(
+        model,
+        category = stop_details["category"].as_str().unwrap_or(""),
+        "provider refused the turn"
+    );
+}
+
+/// The body → [`LlmResponse`] step, with no I/O. A refusal must already have
+/// been taken out: this mapping has no refusal arm.
+#[must_use]
+fn response_from_body(body: &serde_json::Value, configured_model: &str) -> LlmResponse {
+    let stop_reason = stop_reason_from(body["stop_reason"].as_str());
+    let model = body["model"]
+        .as_str()
+        .unwrap_or(configured_model)
+        .to_string();
+    let input_tokens = body["usage"]["input_tokens"].as_u64().map(|v| v as u32);
+    let output_tokens = body["usage"]["output_tokens"].as_u64().map(|v| v as u32);
+    LlmResponse {
+        content: parse_content_blocks(body),
+        stop_reason,
+        model,
+        input_tokens,
+        output_tokens,
+    }
+}
+
+/// Buffered message body. A refusal is an error before any [`LlmResponse`]
+/// is built, so partial content is discarded.
+pub(crate) fn interpret_message(
+    body: &serde_json::Value,
+    configured_model: &str,
+) -> Result<LlmResponse, Box<dyn std::error::Error + Send + Sync>> {
+    let model = body["model"]
+        .as_str()
+        .unwrap_or(configured_model)
+        .to_string();
+    if let Some(refusal) = refusal_from(body["stop_reason"].as_str(), &body["stop_details"], &model)
+    {
+        warn_refusal(&model, &body["stop_details"]);
+        return Err(Box::new(refusal));
+    }
+    Ok(response_from_body(body, configured_model))
+}
+
+/// Per-event state of one server-sent message stream.
+///
+/// Bytes are buffered and split on `\n\n` before UTF-8 decoding, so a
+/// character or a separator that straddles two network chunks stays intact.
+pub(crate) struct SseDecoder {
+    buffer: Vec<u8>,
+    text_parts: Vec<String>,
+    tool_uses: Vec<ContentBlock>,
+    current_tool_id: String,
+    current_tool_name: String,
+    current_tool_input: String,
+    model: String,
+    input_tokens: Option<u32>,
+    output_tokens: Option<u32>,
+    stop_reason: StopReason,
+    finished: bool,
+}
+
+impl SseDecoder {
+    pub(crate) fn new(model: &str) -> Self {
+        Self {
+            buffer: Vec::new(),
+            text_parts: Vec::new(),
+            tool_uses: Vec::new(),
+            current_tool_id: String::new(),
+            current_tool_name: String::new(),
+            current_tool_input: String::new(),
+            model: model.to_string(),
+            input_tokens: None,
+            output_tokens: None,
+            stop_reason: StopReason::EndTurn,
+            finished: false,
+        }
+    }
+
+    /// Events completed by `bytes`. After a refusal, nothing further is decoded.
+    #[must_use]
+    pub(crate) fn feed(&mut self, bytes: &[u8]) -> Vec<StreamEvent> {
+        if self.finished {
+            return Vec::new();
+        }
+        self.buffer.extend_from_slice(bytes);
+        let mut events = Vec::new();
+        while let Some(end) = self.buffer.windows(2).position(|pair| pair == b"\n\n") {
+            let event_bytes: Vec<u8> = self.buffer.drain(..end).collect();
+            self.buffer.drain(..2);
+            // The event is already complete, so a bad byte is inside it.
+            // Dropping it would skip a refusal and let a later message_stop
+            // become a normal end of turn.
+            let event_text = String::from_utf8_lossy(&event_bytes);
+            if let Some(event) = self.decode_event(&event_text) {
+                let finished = self.finished;
+                events.push(event);
+                if finished {
+                    break;
+                }
+            }
+        }
+        events
+    }
+
+    fn decode_event(&mut self, event_text: &str) -> Option<StreamEvent> {
+        let mut event_type = "";
+        let mut data = String::new();
+        for line in event_text.lines() {
+            if let Some(val) = line.strip_prefix("event: ") {
+                event_type = match val.trim() {
+                    "message_start" => "message_start",
+                    "content_block_start" => "content_block_start",
+                    "content_block_delta" => "content_block_delta",
+                    "content_block_stop" => "content_block_stop",
+                    "message_delta" => "message_delta",
+                    "message_stop" => "message_stop",
+                    "ping" => "ping",
+                    _ => "unknown",
+                };
+            } else if let Some(val) = line.strip_prefix("data: ") {
+                data = val.to_string();
+            }
+        }
+
+        if data.is_empty() || event_type == "ping" {
+            return None;
+        }
+
+        let json: serde_json::Value = serde_json::from_str(&data).ok()?;
+
+        match event_type {
+            "message_start" => {
+                if let Some(m) = json["message"]["model"].as_str() {
+                    self.model = m.to_string();
+                }
+                self.input_tokens = json["message"]["usage"]["input_tokens"]
+                    .as_u64()
+                    .map(|v| v as u32);
+                None
+            }
+            "content_block_start" => {
+                let block_type = json["content_block"]["type"].as_str().unwrap_or("");
+                if block_type == "tool_use" {
+                    self.current_tool_id = json["content_block"]["id"]
+                        .as_str()
+                        .unwrap_or("")
+                        .to_string();
+                    self.current_tool_name = json["content_block"]["name"]
+                        .as_str()
+                        .unwrap_or("")
+                        .to_string();
+                    self.current_tool_input.clear();
+                }
+                None
+            }
+            "content_block_delta" => {
+                let delta_type = json["delta"]["type"].as_str().unwrap_or("");
+                match delta_type {
+                    "text_delta" => json["delta"]["text"].as_str().map(|text| {
+                        self.text_parts.push(text.to_string());
+                        StreamEvent::TextDelta(text.to_string())
+                    }),
+                    "input_json_delta" => {
+                        if let Some(partial) = json["delta"]["partial_json"].as_str() {
+                            self.current_tool_input.push_str(partial);
+                        }
+                        None
+                    }
+                    _ => None,
+                }
+            }
+            "content_block_stop" => {
+                if self.current_tool_name.is_empty() {
+                    return None;
+                }
+                let input: serde_json::Value = serde_json::from_str(&self.current_tool_input)
+                    .unwrap_or(serde_json::Value::Object(Default::default()));
+                let tool = ContentBlock::ToolUse {
+                    id: self.current_tool_id.clone(),
+                    name: self.current_tool_name.clone(),
+                    input: input.clone(),
+                };
+                self.tool_uses.push(tool);
+                let event = StreamEvent::ToolUse {
+                    id: self.current_tool_id.clone(),
+                    name: self.current_tool_name.clone(),
+                    input,
+                };
+                self.current_tool_name.clear();
+                self.current_tool_id.clear();
+                self.current_tool_input.clear();
+                Some(event)
+            }
+            "message_delta" => {
+                let stop_reason = json["delta"]["stop_reason"].as_str();
+                let stop_details = &json["delta"]["stop_details"];
+                if let Some(refusal) = refusal_from(stop_reason, stop_details, &self.model) {
+                    warn_refusal(&refusal.model, stop_details);
+                    self.finished = true;
+                    return Some(StreamEvent::Refused {
+                        model: refusal.model,
+                        detail: refusal.detail,
+                    });
+                }
+                self.stop_reason = stop_reason_from(stop_reason);
+                self.output_tokens = json["usage"]["output_tokens"].as_u64().map(|v| v as u32);
+                None
+            }
+            "message_stop" => {
+                let response = streaming::assemble_response(
+                    self.text_parts.clone(),
+                    self.tool_uses.clone(),
+                    self.model.clone(),
+                    self.input_tokens,
+                    self.output_tokens,
+                    self.stop_reason.clone(),
+                );
+                Some(StreamEvent::Done(response))
+            }
+            _ => None,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use proptest::prelude::*;
+    use proptest::test_runner::TestRunner;
+
+    const CONFIGURED: &str = "configured";
+    const EXPLANATION: &str = "do-not-leak-explanation";
+
+    fn sse(event: &str, data: &str) -> String {
+        format!("event: {event}\ndata: {data}\n\n")
+    }
+
+    fn message_start(model: &str, input_tokens: u32) -> String {
+        sse(
+            "message_start",
+            &format!(
+                r#"{{"type":"message_start","message":{{"model":"{model}","usage":{{"input_tokens":{input_tokens},"output_tokens":1}}}}}}"#
+            ),
+        )
+    }
+
+    fn text_block_start() -> String {
+        sse(
+            "content_block_start",
+            r#"{"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}"#,
+        )
+    }
+
+    fn block_stop() -> String {
+        sse(
+            "content_block_stop",
+            r#"{"type":"content_block_stop","index":0}"#,
+        )
+    }
+
+    /// `text` is written as raw UTF-8, not a `\u` escape, so a multibyte
+    /// character can land across two chunks.
+    fn text_delta(text: &str) -> String {
+        format!(
+            "event: content_block_delta\ndata: {{\"type\":\"content_block_delta\",\"index\":0,\"delta\":{{\"type\":\"text_delta\",\"text\":\"{text}\"}}}}\n\n"
+        )
+    }
+
+    fn input_json_delta(partial: &str) -> String {
+        let data = serde_json::json!({
+            "type": "content_block_delta",
+            "index": 0,
+            "delta": {"type": "input_json_delta", "partial_json": partial}
+        });
+        sse("content_block_delta", &data.to_string())
+    }
+
+    fn message_delta(stop_reason: &str, output_tokens: u32) -> String {
+        sse(
+            "message_delta",
+            &format!(
+                r#"{{"type":"message_delta","delta":{{"stop_reason":"{stop_reason}","stop_sequence":null}},"usage":{{"output_tokens":{output_tokens}}}}}"#
+            ),
+        )
+    }
+
+    fn refusal_delta(category: Option<&str>) -> String {
+        let details = match category {
+            Some(category) => serde_json::json!({
+                "type": "refusal",
+                "category": category,
+                "explanation": EXPLANATION,
+            }),
+            None => serde_json::json!({
+                "type": "refusal",
+                "category": null,
+                "explanation": EXPLANATION,
+            }),
+        };
+        let data = serde_json::json!({
+            "type": "message_delta",
+            "delta": {
+                "stop_reason": "refusal",
+                "stop_sequence": null,
+                "stop_details": details,
+            },
+            "usage": {"output_tokens": 0}
+        });
+        sse("message_delta", &data.to_string())
+    }
+
+    fn message_stop() -> String {
+        sse("message_stop", r#"{"type":"message_stop"}"#)
+    }
+
+    fn ping() -> String {
+        sse("ping", r#"{"type":"ping"}"#)
+    }
+
+    fn decode(sse_text: &str) -> Vec<StreamEvent> {
+        let mut decoder = SseDecoder::new(CONFIGURED);
+        decoder.feed(sse_text.as_bytes())
+    }
+
+    fn assert_refused(event: &StreamEvent, detail: &str) {
+        match event {
+            StreamEvent::Refused { model, detail: got } => {
+                assert_eq!(model, "m");
+                assert_eq!(got, detail);
+                assert!(!got.contains(EXPLANATION));
+            }
+            other => panic!("expected Refused, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn refusal_before_output_is_typed() {
+        let sse_text = format!(
+            "{}{}{}{}{}",
+            message_start("m", 20),
+            text_block_start(),
+            block_stop(),
+            refusal_delta(Some("cyber")),
+            message_stop(),
+        );
+        let events = decode(&sse_text);
+        assert_eq!(events.len(), 1, "{events:?}");
+        assert_refused(&events[0], "refusal (cyber)");
+    }
+
+    #[test]
+    fn refusal_after_partial_text_is_typed() {
+        let sse_text = format!(
+            "{}{}{}{}{}{}",
+            message_start("m", 20),
+            text_delta("draft one"),
+            text_delta(" draft two"),
+            refusal_delta(Some("cyber")),
+            message_stop(),
+            text_delta("after"),
+        );
+        let events = decode(&sse_text);
+        assert_eq!(events.len(), 3, "{events:?}");
+        match &events[..] {
+            [StreamEvent::TextDelta(a), StreamEvent::TextDelta(b), refused] => {
+                assert_eq!(a, "draft one");
+                assert_eq!(b, " draft two");
+                assert_refused(refused, "refusal (cyber)");
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn refusal_with_invalid_utf8_is_still_typed() {
+        let mut bytes = message_start("m", 4).into_bytes();
+        bytes.extend(
+            b"event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"refusal\",\"stop_sequence\":null,\"stop_details\":{\"type\":\"refusal\",\"category\":\"cyber\",\"explanation\":\"bad",
+        );
+        bytes.push(0xFF);
+        bytes.extend(b"byte\"}},\"usage\":{\"output_tokens\":0}}\n\n");
+        bytes.extend(message_stop().into_bytes());
+
+        let events = {
+            let mut decoder = SseDecoder::new(CONFIGURED);
+            decoder.feed(&bytes)
+        };
+        assert_eq!(events.len(), 1, "{events:?}");
+        assert_refused(&events[0], "refusal (cyber)");
+    }
+
+    #[test]
+    fn refusal_with_null_category() {
+        let sse_text = format!("{}{}", message_start("m", 4), refusal_delta(None));
+        let events = decode(&sse_text);
+        assert_eq!(events.len(), 1, "{events:?}");
+        assert_refused(&events[0], "refusal");
+    }
+
+    #[test]
+    fn end_turn_stream_is_unchanged() {
+        let sse_text = format!(
+            "{}{}{}{}{}{}{}{}",
+            message_start("m", 25),
+            text_block_start(),
+            text_delta("Hello "),
+            text_delta("caf\u{e9}"),
+            block_stop(),
+            ping(),
+            message_delta("end_turn", 12),
+            message_stop(),
+        );
+        let events = decode(&sse_text);
+        match &events[..] {
+            [StreamEvent::TextDelta(a), StreamEvent::TextDelta(b), StreamEvent::Done(response)] => {
+                assert_eq!(a, "Hello ");
+                assert_eq!(b, "caf\u{e9}");
+                assert_eq!(response.model, "m");
+                assert_eq!(response.input_tokens, Some(25));
+                assert_eq!(response.output_tokens, Some(12));
+                assert!(matches!(response.stop_reason, StopReason::EndTurn));
+                match &response.content[..] {
+                    [ContentBlock::Text { text }] => assert_eq!(text, "Hello caf\u{e9}"),
+                    other => panic!("{other:?}"),
+                }
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn tool_use_stream_is_unchanged() {
+        let sse_text = format!(
+            "{}{}{}{}{}{}{}",
+            message_start("m", 10),
+            sse(
+                "content_block_start",
+                r#"{"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"toolu_1","name":"file_read","input":{}}}"#,
+            ),
+            input_json_delta(r#"{"path":"#),
+            input_json_delta(r#""a.txt"}"#),
+            block_stop(),
+            message_delta("tool_use", 8),
+            message_stop(),
+        );
+        let events = decode(&sse_text);
+        assert_eq!(events.len(), 2, "{events:?}");
+        match &events[0] {
+            StreamEvent::ToolUse { id, name, input } => {
+                assert_eq!(id, "toolu_1");
+                assert_eq!(name, "file_read");
+                assert_eq!(input["path"], "a.txt");
+            }
+            other => panic!("{other:?}"),
+        }
+        match &events[1] {
+            StreamEvent::Done(response) => {
+                assert_eq!(response.model, "m");
+                assert_eq!(response.input_tokens, Some(10));
+                assert_eq!(response.output_tokens, Some(8));
+                assert!(matches!(response.stop_reason, StopReason::ToolUse));
+                match &response.content[..] {
+                    [ContentBlock::ToolUse { id, name, input }] => {
+                        assert_eq!(id, "toolu_1");
+                        assert_eq!(name, "file_read");
+                        assert_eq!(input["path"], "a.txt");
+                    }
+                    other => panic!("{other:?}"),
+                }
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    fn fingerprint(events: &[StreamEvent]) -> String {
+        format!("{events:?}")
+    }
+
+    fn decode_cuts(bytes: &[u8], cuts: &[usize]) -> Vec<StreamEvent> {
+        let mut decoder = SseDecoder::new(CONFIGURED);
+        let mut out = Vec::new();
+        let mut start = 0usize;
+        let mut points: Vec<usize> = cuts
+            .iter()
+            .copied()
+            .filter(|cut| *cut <= bytes.len())
+            .collect();
+        points.sort_unstable();
+        points.dedup();
+        for cut in points {
+            if cut < start {
+                continue;
+            }
+            out.extend(decoder.feed(&bytes[start..cut]));
+            start = cut;
+        }
+        out.extend(decoder.feed(&bytes[start..]));
+        out
+    }
+
+    fn end_turn_fixture() -> Vec<u8> {
+        format!(
+            "{}{}{}{}{}{}{}",
+            message_start("m", 25),
+            text_block_start(),
+            text_delta("Hello "),
+            text_delta("caf\u{e9}"),
+            block_stop(),
+            message_delta("end_turn", 12),
+            message_stop(),
+        )
+        .into_bytes()
+    }
+
+    fn tool_use_fixture() -> Vec<u8> {
+        format!(
+            "{}{}{}{}{}{}{}",
+            message_start("m", 10),
+            sse(
+                "content_block_start",
+                r#"{"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"toolu_1","name":"file_read","input":{}}}"#,
+            ),
+            input_json_delta(r#"{"path":"#),
+            input_json_delta(r#""a.txt"}"#),
+            block_stop(),
+            message_delta("tool_use", 8),
+            message_stop(),
+        )
+        .into_bytes()
+    }
+
+    fn refusal_after_deltas_fixture() -> Vec<u8> {
+        format!(
+            "{}{}{}{}{}",
+            message_start("m", 20),
+            text_delta("draft one"),
+            text_delta(" draft two"),
+            refusal_delta(Some("cyber")),
+            message_stop(),
+        )
+        .into_bytes()
+    }
+
+    fn deltas_then_refused(events: &[StreamEvent]) -> bool {
+        let Some(StreamEvent::Refused { .. }) = events.last() else {
+            return false;
+        };
+        if events
+            .iter()
+            .any(|event| matches!(event, StreamEvent::Done(_)))
+        {
+            return false;
+        }
+        let before = &events[..events.len() - 1];
+        !before.is_empty()
+            && before
+                .iter()
+                .all(|event| matches!(event, StreamEvent::TextDelta(_)))
+    }
+
+    /// One cut-loop and one proptest, applied to every fixture.
+    /// A refusal fixture must end on `Refused`, with its text deltas before that and no `Done`.
+    fn prove_chunking(fixtures: &[(&[u8], bool)]) {
+        for (bytes, refusal) in fixtures {
+            let whole = fingerprint(&decode_cuts(bytes, &[]));
+            for cut in 0..=bytes.len() {
+                let events = decode_cuts(bytes, &[cut]);
+                assert_eq!(fingerprint(&events), whole, "cut {cut}");
+                if *refusal {
+                    assert!(deltas_then_refused(&events), "cut {cut}: {events:?}");
+                }
+            }
+
+            let len = bytes.len();
+            let strategy = prop::collection::vec(0..=len, 0..8);
+            let mut runner = TestRunner::new(ProptestConfig::with_cases(64));
+            runner
+                .run(&strategy, |cuts| {
+                    let events = decode_cuts(bytes, &cuts);
+                    let got = fingerprint(&events);
+                    prop_assert_eq!(&got, &whole);
+                    if *refusal {
+                        prop_assert!(deltas_then_refused(&events));
+                    }
+                    Ok(())
+                })
+                .unwrap();
+        }
+    }
+
+    #[test]
+    fn decoding_is_independent_of_chunking() {
+        let end_turn = end_turn_fixture();
+        // These two cuts are the ones a per-chunk decode gets wrong: inside
+        // a multibyte character, and between the two bytes of `\n\n`.
+        let multibyte = end_turn
+            .windows(2)
+            .position(|pair| pair == [0xC3, 0xA9])
+            .expect("fixture contains a multibyte character")
+            + 1;
+        let separator = end_turn
+            .windows(2)
+            .position(|pair| pair == b"\n\n")
+            .expect("fixture contains a separator")
+            + 1;
+        assert!(
+            multibyte < end_turn.len(),
+            "multibyte cut sits inside the fixture"
+        );
+        assert!(
+            separator < end_turn.len(),
+            "separator cut sits inside the fixture"
+        );
+
+        let tool_use = tool_use_fixture();
+        let refusal = refusal_after_deltas_fixture();
+        prove_chunking(&[(&end_turn, false), (&tool_use, false), (&refusal, true)]);
+    }
+
+    /// A caller that skips the refusal check must fail here, in tests,
+    /// instead of mapping the turn to `Other` and then a normal end.
+    #[cfg(debug_assertions)]
+    #[test]
+    #[should_panic(expected = "a refusal must be handled before the stop-reason mapping")]
+    fn stop_reason_from_rejects_refusal() {
+        let _ = stop_reason_from(Some("refusal"));
+    }
+
+    #[test]
+    fn buffered_refusal_is_a_refusal_error() {
+        let body = serde_json::json!({
+            "model": "m",
+            "stop_reason": "refusal",
+            "stop_details": {
+                "type": "refusal",
+                "category": "cyber",
+                "explanation": EXPLANATION,
+            },
+            "content": [{"type": "text", "text": "partial draft"}],
+            "usage": {"input_tokens": 3, "output_tokens": 1}
+        });
+        let err = interpret_message(&body, CONFIGURED).unwrap_err();
+        let refusal = err.downcast_ref::<RefusalError>().expect("RefusalError");
+        assert_eq!(refusal.model, "m");
+        assert_eq!(refusal.detail, "refusal (cyber)");
+        assert!(!refusal.detail.contains(EXPLANATION));
+        assert!(!refusal.detail.contains("partial draft"));
+    }
+
+    #[test]
+    fn buffered_end_turn_is_unchanged() {
+        let body = serde_json::json!({
+            "model": "m",
+            "stop_reason": "end_turn",
+            "content": [{"type": "text", "text": "Hello"}],
+            "usage": {"input_tokens": 4, "output_tokens": 2}
+        });
+        let response = interpret_message(&body, CONFIGURED).unwrap();
+        assert_eq!(response.model, "m");
+        assert_eq!(response.input_tokens, Some(4));
+        assert_eq!(response.output_tokens, Some(2));
+        assert!(matches!(response.stop_reason, StopReason::EndTurn));
+        match &response.content[..] {
+            [ContentBlock::Text { text }] => assert_eq!(text, "Hello"),
+            other => panic!("{other:?}"),
+        }
+    }
 }
