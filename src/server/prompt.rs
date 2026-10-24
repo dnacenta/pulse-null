@@ -3048,6 +3048,35 @@ mod tests {
         );
     }
 
+    /// Lines `warn!` wrote while `body` ran.
+    fn warnings_from(body: impl FnOnce()) -> String {
+        let buf = std::sync::Arc::new(std::sync::Mutex::new(Vec::<u8>::new()));
+        let sink = std::sync::Arc::clone(&buf);
+        let subscriber = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::WARN)
+            .with_ansi(false)
+            .without_time()
+            .with_target(false)
+            .with_writer(move || LogSink(std::sync::Arc::clone(&sink)))
+            .finish();
+        tracing::subscriber::with_default(subscriber, body);
+        let guard = buf.lock().unwrap();
+        String::from_utf8(guard.clone()).unwrap()
+    }
+
+    struct LogSink(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for LogSink {
+        fn write(&mut self, data: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(data);
+            Ok(data.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
     #[test]
     fn strict_rejects_a_pulse_owned_file() {
         let running = 4_242;
@@ -3058,6 +3087,39 @@ mod tests {
         assert_eq!(
             pulse_rule_meta_ok(running.wrapping_add(1), 1, running, true),
             Err("strict mode wants root")
+        );
+
+        // The directory walk is what says "not owned by root". The file check
+        // says "strict mode wants root", so this warning fails if the walk is
+        // removed even though the file check still drops the text.
+        let dir = tempfile::tempdir().unwrap();
+        seed_pulse_rules(dir.path());
+        let mut config = cli_config("grok");
+        config.system_prompt_budget.enabled = false;
+        config.pulse.rules_require_root = true;
+        let log = warnings_from(|| {
+            let closed = build_system_prompt(dir.path(), &config).unwrap();
+            assert!(!closed.contains("SELF-WORK-RULE"), "{closed}");
+        });
+        assert!(
+            log.contains("Skipping pulse rules:") && log.contains("not owned by root"),
+            "{log}"
+        );
+    }
+
+    /// File strictness, reached without the directory walk.
+    #[test]
+    fn strict_load_rule_files_skips_a_pulse_owned_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let rules = dir.path().join("rules");
+        std::fs::create_dir_all(&rules).unwrap();
+        std::fs::write(rules.join("owned.md"), "PULSE-OWNED-RULE").unwrap();
+        let strict = load_rule_files(&rules, &[], RulesSource::Pulse, true).unwrap();
+        assert!(strict.is_empty(), "{strict:?}");
+        let open = load_rule_files(&rules, &[], RulesSource::Pulse, false).unwrap();
+        assert_eq!(
+            open,
+            vec![("owned".to_string(), "PULSE-OWNED-RULE".to_string())]
         );
     }
 
