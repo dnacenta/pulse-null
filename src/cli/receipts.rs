@@ -49,6 +49,9 @@ pub async fn show(
     limit: Option<u64>,
     json: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    if let Some(message) = reject_filters(since.as_deref(), kind.as_deref()) {
+        return unverified(json, message);
+    }
     let path = match resolve_path(file) {
         Ok(path) => path,
         Err(err) => return unverified(json, &err.to_string()),
@@ -71,7 +74,7 @@ pub async fn show(
         );
     } else {
         for row in &rows {
-            println!("{}", row.line);
+            println!("{}", escape_show(&row.line));
         }
     }
     Ok(())
@@ -274,6 +277,58 @@ fn notes(items: &[crate::oneself::chain::VerifyNote]) -> Vec<Value> {
         .iter()
         .map(|note| json!({"line": note.line, "reason": note.reason}))
         .collect()
+}
+
+fn reject_filters(since: Option<&str>, kind: Option<&str>) -> Option<&'static str> {
+    if let Some(since) = since {
+        if !since_ok(since) {
+            return Some("since must be RFC3339 or a prefix of YYYY-MM-DDTHH:MM:SS.mmmZ");
+        }
+    }
+    if let Some(kind) = kind {
+        if !kind_ok(kind) {
+            return Some("kind must be one of genesis, boot, open, close, shutdown, recover, gap");
+        }
+    }
+    None
+}
+
+fn since_ok(since: &str) -> bool {
+    if chrono::DateTime::parse_from_rfc3339(since).is_ok() {
+        return true;
+    }
+    const FORM: &[u8] = b"YYYY-MM-DDTHH:MM:SS.mmmZ";
+    let bytes = since.as_bytes();
+    if bytes.is_empty() || bytes.len() > FORM.len() {
+        return false;
+    }
+    bytes.iter().zip(FORM).all(|(byte, slot)| match slot {
+        b'Y' | b'M' | b'D' | b'H' | b'S' | b'm' => byte.is_ascii_digit(),
+        other => byte == other,
+    })
+}
+
+fn kind_ok(kind: &str) -> bool {
+    matches!(
+        kind,
+        "genesis" | "boot" | "open" | "close" | "shutdown" | "recover" | "gap"
+    )
+}
+
+fn escape_show(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    for ch in text.chars() {
+        if ch.is_control() || is_bidi_override(ch) {
+            out.push_str(&format!("\\u{{{:X}}}", u32::from(ch)));
+        } else {
+            out.push(ch);
+        }
+    }
+    out
+}
+
+fn is_bidi_override(ch: char) -> bool {
+    matches!(ch, '\u{202A}'..='\u{202E}' | '\u{2066}'..='\u{2069}')
 }
 
 fn state_name(state: VerifyState) -> &'static str {
@@ -660,5 +715,104 @@ mod tests {
         .unwrap();
         assert_eq!(from_name(flagged.from), "--file");
         assert!(flagged.path_warn.is_none());
+    }
+
+    #[test]
+    fn an_empty_file_is_warn() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("receipts.jsonl");
+        std::fs::write(&path, b"").unwrap();
+        let inspected = store::inspect(&path).unwrap();
+        assert_eq!(inspected.report.state(), VerifyState::Warn);
+        assert_eq!(inspected.report.rows, 0);
+        assert_eq!(inspected.report.warns.len(), 1);
+        assert_eq!(inspected.report.warns[0].reason, "empty");
+        assert!(inspected.report.first_break.is_none());
+        assert!(block(verify(Some(path), true)).is_ok());
+    }
+
+    #[test]
+    fn a_symlink_and_an_oversize_file_are_unverified() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("target.jsonl");
+        std::fs::write(&target, b"keep").unwrap();
+        let link = dir.path().join("link.jsonl");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        let started = std::time::Instant::now();
+        let err = store::inspect(&link).unwrap_err();
+        assert!(started.elapsed() < std::time::Duration::from_secs(2));
+        assert!(matches!(err, store::StoreError::NotFile { .. }), "{err}");
+        assert_json_unverified(&err.to_string(), "not a regular file");
+        let exit = block(verify(Some(link), true)).unwrap_err();
+        assert_eq!(exit.downcast_ref::<PrintedExit>().unwrap().0, 2);
+        assert_eq!(std::fs::read(&target).unwrap(), b"keep");
+
+        let huge = dir.path().join("huge.jsonl");
+        let file = std::fs::File::create(&huge).unwrap();
+        file.set_len(store::MAX_RECEIPT_BYTES + 1).unwrap();
+        drop(file);
+        let err = store::inspect(&huge).unwrap_err();
+        assert_json_unverified(&err.to_string(), "256 MiB");
+        let exit = block(show(Some(huge), None, None, None, true)).unwrap_err();
+        assert_eq!(exit.downcast_ref::<PrintedExit>().unwrap().0, 2);
+    }
+
+    #[test]
+    fn show_escapes_controls_and_bidi_overrides() {
+        let raw = "alpha\u{1b}\u{7f}\u{9b}\u{202e}\u{2066}omega";
+        let escaped = escape_show(raw);
+        assert!(escaped.contains("\\u{1B}"));
+        assert!(escaped.contains("\\u{7F}"));
+        assert!(escaped.contains("\\u{9B}"));
+        assert!(escaped.contains("\\u{202E}"));
+        assert!(escaped.contains("\\u{2066}"));
+        assert!(!escaped.chars().any(char::is_control));
+        assert!(!escaped.contains('\u{202e}'));
+        assert!(raw.contains('\u{202e}'));
+        let shown = ShownRow {
+            seq: 1,
+            ts: "2026-10-25T03:00:00.000Z".to_string(),
+            kind: "shutdown".to_string(),
+            line: raw.to_string(),
+        };
+        let text = serde_json::to_string(&json!({"rows": [shown]})).unwrap();
+        let parsed: Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(parsed["rows"][0]["line"], raw);
+    }
+
+    #[test]
+    fn a_bad_since_or_kind_exits_2() {
+        assert!(since_ok("2026-10-25T03:00:00.000Z"));
+        assert!(since_ok("2026-10-25T03:00:00.000+00:00"));
+        assert!(since_ok("2026-10-25"));
+        assert!(!since_ok("yesterday"));
+        assert!(!since_ok(""));
+        assert!(kind_ok("recover"));
+        assert!(!kind_ok("bogus"));
+        let since_message = reject_filters(Some("yesterday"), None).unwrap();
+        assert_json_unverified(since_message, "since");
+        let kind_message = reject_filters(None, Some("bogus")).unwrap();
+        assert_json_unverified(kind_message, "kind");
+        let dir = tempfile::tempdir().unwrap();
+        let path = sample(dir.path());
+        let since = block(show(
+            Some(path.clone()),
+            Some("yesterday".to_string()),
+            None,
+            None,
+            true,
+        ))
+        .unwrap_err();
+        assert_eq!(since.downcast_ref::<PrintedExit>().unwrap().0, 2);
+        let kind = block(show(
+            Some(path),
+            None,
+            Some("bogus".to_string()),
+            None,
+            false,
+        ))
+        .unwrap_err();
+        assert_eq!(kind.downcast_ref::<PrintedExit>().unwrap().0, 2);
+        assert!(reject_filters(Some("2026-10-25T04"), Some("gap")).is_none());
     }
 }

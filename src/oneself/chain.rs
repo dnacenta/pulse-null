@@ -197,6 +197,12 @@ fn verify_bytes(buf: &[u8]) -> VerifyReport {
             }
         }
     }
+    if lines.is_empty() && report.first_break.is_none() {
+        report.warns.push(VerifyNote {
+            line: 1,
+            reason: "empty",
+        });
+    }
     report
 }
 
@@ -1317,5 +1323,17 @@ mod tests {
             assert_eq!(note(&report), expect, "{text}");
             assert!(report.warns.is_empty(), "{text}");
         }
+    }
+
+    #[test]
+    fn an_empty_buffer_warns_empty() {
+        let report = verify_lines(&b""[..]);
+        assert_eq!(report.state(), VerifyState::Warn);
+        assert_eq!(report.rows, 0);
+        assert!(report.seq.is_none());
+        assert!(report.first_break.is_none());
+        assert_eq!(report.warns.len(), 1);
+        assert_eq!(report.warns[0].line, 1);
+        assert_eq!(report.warns[0].reason, "empty");
     }
 }

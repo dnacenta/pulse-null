@@ -20,12 +20,52 @@ use super::chain::{self, VerifyNote, VerifyReport, GENESIS_PREV};
 use super::event::ReceiptEvent;
 use super::protect::{Protection, ProtectionProbe};
 
+/// `LISTEN_PID`, `LISTEN_FDS`, and `LISTEN_FDNAMES` captured before the runtime.
+#[derive(Debug, Clone)]
+pub struct ListenEnv {
+    #[cfg_attr(not(test), expect(dead_code, reason = "wired in increment 3"))]
+    pub pid: Option<String>,
+    #[cfg_attr(not(test), expect(dead_code, reason = "wired in increment 3"))]
+    pub fds: Option<String>,
+    #[cfg_attr(not(test), expect(dead_code, reason = "wired in increment 3"))]
+    pub names: Option<String>,
+}
+
+/// Read the systemd listen variables and clear them.
+///
+/// Call this before any runtime thread exists. Later opens take the returned
+/// value; they do not read the process environment again.
+#[must_use]
+pub fn take_listen_env() -> ListenEnv {
+    let listen = ListenEnv {
+        pid: std::env::var("LISTEN_PID").ok(),
+        fds: std::env::var("LISTEN_FDS").ok(),
+        names: std::env::var("LISTEN_FDNAMES").ok(),
+    };
+    clear_listen_env();
+    listen
+}
+
+/// Held for the daemon open in a later slice. Tests pass [`ListenEnv`] into
+/// [`StoreSource`] instead of using this.
+pub fn retain_listen(listen: ListenEnv) {
+    let mut slot = RETAINED_LISTEN
+        .lock()
+        .unwrap_or_else(|err| err.into_inner());
+    *slot = Some(listen);
+}
+
+static RETAINED_LISTEN: std::sync::Mutex<Option<ListenEnv>> = std::sync::Mutex::new(None);
+
 /// Where the bytes live.
 #[derive(Debug, Clone)]
 #[cfg_attr(not(test), expect(dead_code, reason = "wired in increment 3"))]
 pub enum StoreSource {
     /// systemd `OpenFile=` fd whose name is `name` (`receipts`).
-    SystemdFd { name: &'static str },
+    SystemdFd {
+        name: &'static str,
+        listen: ListenEnv,
+    },
     /// Dev path. Created if missing.
     Path(PathBuf),
 }
@@ -48,9 +88,14 @@ pub struct Opened {
     pub repaired_newline: bool,
     /// Path mode replaced a file that held no complete row.
     pub recreated: bool,
+    /// Streams with an `open` and no later `close`.
+    pub orphans: Vec<String>,
     pub protection: Protection,
     pub report: VerifyReport,
 }
+
+/// A receipt file larger than this is refused. 256 MiB.
+pub const MAX_RECEIPT_BYTES: u64 = 256 * 1024 * 1024;
 
 /// A file read by `verify` and `show`. Not locked, not repaired.
 #[derive(Debug, Clone)]
@@ -95,6 +140,8 @@ pub enum StoreError {
     Row,
     #[error("receipt path {path} is not a regular file")]
     NotFile { path: String },
+    #[error("receipt file {path} is {bytes} bytes, over the 256 MiB cap")]
+    TooLarge { path: String, bytes: u64 },
     #[error(transparent)]
     Io(#[from] std::io::Error),
 }
@@ -113,11 +160,7 @@ pub fn default_receipts_path(pulse: &str) -> PathBuf {
 /// or stream forever.
 pub fn inspect(path: &Path) -> Result<Inspected, StoreError> {
     let meta = std::fs::symlink_metadata(path)?;
-    if !meta.file_type().is_file() {
-        return Err(StoreError::NotFile {
-            path: path.display().to_string(),
-        });
-    }
+    check_regular(path, &meta)?;
     let bytes = std::fs::read(path)?;
     let report = chain::verify_lines(bytes.as_slice());
     Ok(Inspected { bytes, report })
@@ -290,6 +333,7 @@ impl ReceiptStore {
             }
         }
         let bytes = read_all(&mut file)?;
+        let orphans = orphan_streams(&bytes);
         let report = chain::verify_lines(bytes.as_slice());
         if let Some(note) = &report.first_break {
             return Err(StoreError::Broken {
@@ -318,6 +362,7 @@ impl ReceiptStore {
                 recovered,
                 repaired_newline,
                 recreated,
+                orphans,
                 protection,
                 report,
             },
@@ -702,32 +747,68 @@ fn adopt(source: StoreSource) -> Result<(File, bool, String), StoreError> {
             if let Some(dir) = path.parent() {
                 std::fs::create_dir_all(dir)?;
             }
+            match std::fs::symlink_metadata(&path) {
+                Ok(meta) => check_regular(&path, &meta)?,
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+                Err(err) => return Err(StoreError::Io(err)),
+            }
             let file = OpenOptions::new()
                 .create(true)
                 .read(true)
                 .append(true)
                 .mode(0o640)
-                .open(&path)?;
+                .custom_flags(libc::O_NOFOLLOW)
+                .open(&path)
+                .map_err(|err| {
+                    if err.raw_os_error() == Some(libc::ELOOP) {
+                        StoreError::NotFile {
+                            path: path.display().to_string(),
+                        }
+                    } else {
+                        StoreError::Io(err)
+                    }
+                })?;
+            let meta = file.metadata()?;
+            check_regular(&path, &meta)?;
             let display = path.display().to_string();
             Ok((file, false, display))
         }
-        StoreSource::SystemdFd { name } => {
-            let file = take_systemd(name)?;
+        StoreSource::SystemdFd { name, listen } => {
+            let file = take_systemd(name, &listen)?;
             let path = fd_path(file.as_raw_fd());
+            let meta = file.metadata()?;
+            if meta.len() > MAX_RECEIPT_BYTES {
+                return Err(StoreError::TooLarge {
+                    path: path.clone(),
+                    bytes: meta.len(),
+                });
+            }
             Ok((file, true, path))
         }
     }
 }
 
+fn check_regular(path: &Path, meta: &std::fs::Metadata) -> Result<(), StoreError> {
+    if !meta.is_file() {
+        return Err(StoreError::NotFile {
+            path: path.display().to_string(),
+        });
+    }
+    if meta.len() > MAX_RECEIPT_BYTES {
+        return Err(StoreError::TooLarge {
+            path: path.display().to_string(),
+            bytes: meta.len(),
+        });
+    }
+    Ok(())
+}
+
 #[cfg_attr(not(test), expect(dead_code, reason = "wired in increment 3"))]
-fn take_systemd(name: &str) -> Result<File, StoreError> {
-    let pid = std::env::var("LISTEN_PID").ok();
-    let fds = std::env::var("LISTEN_FDS").ok();
-    let names = std::env::var("LISTEN_FDNAMES").ok();
+fn take_systemd(name: &str, listen: &ListenEnv) -> Result<File, StoreError> {
     let Some(listed) = listen_fd(
-        pid.as_deref(),
-        fds.as_deref(),
-        names.as_deref(),
+        listen.pid.as_deref(),
+        listen.fds.as_deref(),
+        listen.names.as_deref(),
         std::process::id(),
         name,
     ) else {
@@ -760,11 +841,9 @@ fn take_systemd(name: &str) -> Result<File, StoreError> {
     // SAFETY: `fd` is open, validated, and systemd handed it to this process.
     // `File` is now the only owner.
     let file = unsafe { File::from_raw_fd(fd) };
-    clear_listen_env();
     Ok(file)
 }
 
-#[cfg_attr(not(test), expect(dead_code, reason = "wired in increment 3"))]
 fn clear_listen_env() {
     std::env::remove_var("LISTEN_PID");
     std::env::remove_var("LISTEN_FDS");
@@ -775,7 +854,6 @@ fn clear_listen_env() {
 fn release_refused(fd: i32) {
     // SAFETY: validation failed before `File::from_raw_fd`, so `fd` is still ours.
     unsafe { libc::close(fd) };
-    clear_listen_env();
 }
 
 #[cfg_attr(not(test), expect(dead_code, reason = "wired in increment 3"))]
@@ -833,8 +911,15 @@ fn lock_exclusive(file: &File) -> Result<(), StoreError> {
 #[cfg_attr(not(test), expect(dead_code, reason = "wired in increment 3"))]
 fn read_all(file: &mut File) -> Result<Vec<u8>, StoreError> {
     file.seek(SeekFrom::Start(0))?;
+    let bytes = file.metadata()?.len();
+    if bytes > MAX_RECEIPT_BYTES {
+        return Err(StoreError::TooLarge {
+            path: fd_path(file.as_raw_fd()),
+            bytes,
+        });
+    }
     let mut buf = Vec::new();
-    file.read_to_end(&mut buf)?;
+    file.take(MAX_RECEIPT_BYTES).read_to_end(&mut buf)?;
     Ok(buf)
 }
 
@@ -891,47 +976,60 @@ mod tests {
             listen_fd(Some("99"), Some("1"), Some("receipts"), 99, "receipts"),
             Some(3)
         );
-        let _guard = FD_LOCK.lock().unwrap_or_else(|err| err.into_inner());
-        std::env::set_var("LISTEN_PID", "1");
-        std::env::set_var("LISTEN_FDS", "1");
-        std::env::set_var("LISTEN_FDNAMES", "receipts");
-        let err = match ReceiptStore::open(
-            StoreSource::SystemdFd { name: "receipts" },
+        let err = ReceiptStore::open(
+            StoreSource::SystemdFd {
+                name: "receipts",
+                listen: ListenEnv {
+                    pid: Some("1".to_string()),
+                    fds: Some("1".to_string()),
+                    names: Some("receipts".to_string()),
+                },
+            },
             &LiveProbe,
             "echo",
-        ) {
-            Ok(_) => panic!("fd was used"),
-            Err(err) => err,
-        };
+        )
+        .unwrap_err();
         assert!(matches!(err, StoreError::NotUsed { .. }), "{err}");
-        assert!(std::env::var("LISTEN_PID").is_ok());
-        std::env::remove_var("LISTEN_PID");
-        std::env::remove_var("LISTEN_FDS");
-        std::env::remove_var("LISTEN_FDNAMES");
+        let missing = ReceiptStore::open(
+            StoreSource::SystemdFd {
+                name: "receipts",
+                listen: ListenEnv {
+                    pid: Some(std::process::id().to_string()),
+                    fds: Some("1".to_string()),
+                    names: Some("other".to_string()),
+                },
+            },
+            &LiveProbe,
+            "echo",
+        )
+        .unwrap_err();
+        assert!(matches!(missing, StoreError::NotUsed { .. }), "{missing}");
+    }
+
+    fn our_listen() -> ListenEnv {
+        ListenEnv {
+            pid: Some(std::process::id().to_string()),
+            fds: Some("1".to_string()),
+            names: Some("receipts".to_string()),
+        }
     }
 
     /// Dup `file` and offer that fd as the systemd socket. Does not touch fd 3.
     ///
-    /// The store takes the dup only after the fd checks pass. If it does, it
-    /// clears `LISTEN_PID` and owns the close. Otherwise this closes the dup.
+    /// The caller passes [`our_listen`] on the source. This closes the dup
+    /// when the store did not take ownership.
     fn with_forced_fd(file: &File, body: impl FnOnce()) {
         let _guard = FD_LOCK.lock().unwrap_or_else(|err| err.into_inner());
         // SAFETY: `file` is open for the duration of this call.
         let duped = unsafe { libc::dup(file.as_raw_fd()) };
         assert!(duped >= 0, "dup: {}", std::io::Error::last_os_error());
         FORCED_FD.store(duped, std::sync::atomic::Ordering::SeqCst);
-        std::env::set_var("LISTEN_PID", std::process::id().to_string());
-        std::env::set_var("LISTEN_FDS", "1");
-        std::env::set_var("LISTEN_FDNAMES", "receipts");
         struct Reset(i32);
         impl Drop for Reset {
             fn drop(&mut self) {
                 FORCED_FD.store(-1, std::sync::atomic::Ordering::SeqCst);
-                let taken = std::env::var("LISTEN_PID").is_err();
-                std::env::remove_var("LISTEN_PID");
-                std::env::remove_var("LISTEN_FDS");
-                std::env::remove_var("LISTEN_FDNAMES");
-                if !taken {
+                let flags = unsafe { libc::fcntl(self.0, libc::F_GETFD) };
+                if flags >= 0 {
                     // SAFETY: the store did not take this dup, so it is still open.
                     unsafe { libc::close(self.0) };
                 }
@@ -954,13 +1052,15 @@ mod tests {
         with_forced_fd(&plain, || {
             let fd = FORCED_FD.load(std::sync::atomic::Ordering::SeqCst);
             let err = ReceiptStore::open(
-                StoreSource::SystemdFd { name: "receipts" },
+                StoreSource::SystemdFd {
+                    name: "receipts",
+                    listen: our_listen(),
+                },
                 &LiveProbe,
                 "echo",
             )
             .unwrap_err();
             assert!(matches!(err, StoreError::NotAppend { .. }), "{err}");
-            assert!(std::env::var("LISTEN_PID").is_err());
             let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
             assert!(flags < 0, "refused fd still open: {flags}");
         });
@@ -976,7 +1076,10 @@ mod tests {
             .unwrap();
         with_forced_fd(&appending, || {
             let (store, opened) = ReceiptStore::open(
-                StoreSource::SystemdFd { name: "receipts" },
+                StoreSource::SystemdFd {
+                    name: "receipts",
+                    listen: our_listen(),
+                },
                 &LiveProbe,
                 "echo",
             )
@@ -984,7 +1087,6 @@ mod tests {
             assert!(!opened.recreated);
             let flags = unsafe { libc::fcntl(store.file.as_raw_fd(), libc::F_GETFD) };
             assert!(flags & libc::FD_CLOEXEC != 0, "{flags}");
-            assert!(std::env::var("LISTEN_PID").is_err());
             drop(store);
         });
 
@@ -992,14 +1094,16 @@ mod tests {
         with_forced_fd(&write_only, || {
             let fd = FORCED_FD.load(std::sync::atomic::Ordering::SeqCst);
             let err = ReceiptStore::open(
-                StoreSource::SystemdFd { name: "receipts" },
+                StoreSource::SystemdFd {
+                    name: "receipts",
+                    listen: our_listen(),
+                },
                 &LiveProbe,
                 "echo",
             )
             .unwrap_err();
             assert!(matches!(err, StoreError::NotReadWrite { .. }), "{err}");
             assert!(err.to_string().contains("reading and writing"), "{err}");
-            assert!(std::env::var("LISTEN_PID").is_err());
             let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
             assert!(flags < 0, "refused fd still open: {flags}");
         });
@@ -1121,7 +1225,10 @@ mod tests {
             .unwrap();
         with_forced_fd(&appending, || {
             let err = ReceiptStore::open(
-                StoreSource::SystemdFd { name: "receipts" },
+                StoreSource::SystemdFd {
+                    name: "receipts",
+                    listen: our_listen(),
+                },
                 &LiveProbe,
                 "echo",
             )
@@ -1382,7 +1489,10 @@ mod tests {
             .unwrap();
         with_forced_fd(&appending, || {
             let err = ReceiptStore::open(
-                StoreSource::SystemdFd { name: "receipts" },
+                StoreSource::SystemdFd {
+                    name: "receipts",
+                    listen: our_listen(),
+                },
                 &LiveProbe,
                 "echo",
             )
@@ -1395,7 +1505,8 @@ mod tests {
     #[test]
     fn an_open_without_a_close_is_an_orphan() {
         let dir = tempfile::tempdir().unwrap();
-        let (mut store, _) = open_path(dir.path());
+        let (mut store, opened) = open_path(dir.path());
+        assert!(opened.orphans.is_empty());
         store
             .append(ReceiptEvent::Open {
                 stream: "s1".to_string(),
@@ -1407,7 +1518,67 @@ mod tests {
             })
             .unwrap();
         drop(store);
-        let bytes = std::fs::read(dir.path().join("receipts.jsonl")).unwrap();
+        let path = dir.path().join("receipts.jsonl");
+        let bytes = std::fs::read(&path).unwrap();
         assert_eq!(orphan_streams(&bytes), vec!["s1".to_string()]);
+        let (_store, opened) =
+            ReceiptStore::open(StoreSource::Path(path), &LiveProbe, "echo").unwrap();
+        assert_eq!(opened.orphans, vec!["s1".to_string()]);
+    }
+
+    #[test]
+    fn a_symlink_is_not_opened_or_followed() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("target.jsonl");
+        std::fs::write(&target, b"keep").unwrap();
+        let link = dir.path().join("receipts.jsonl");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        let err = ReceiptStore::open(StoreSource::Path(link), &LiveProbe, "echo").unwrap_err();
+        assert!(matches!(err, StoreError::NotFile { .. }), "{err}");
+        assert_eq!(std::fs::read(&target).unwrap(), b"keep");
+    }
+
+    #[test]
+    fn a_fifo_is_refused_without_blocking() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("receipts.fifo");
+        let c_path = std::ffi::CString::new(path.to_str().unwrap()).unwrap();
+        // SAFETY: `c_path` is a NUL-terminated path in the temp directory.
+        let rc = unsafe { libc::mkfifo(c_path.as_ptr(), 0o644) };
+        assert_eq!(rc, 0, "{}", std::io::Error::last_os_error());
+        let started = std::time::Instant::now();
+        let err =
+            ReceiptStore::open(StoreSource::Path(path.clone()), &LiveProbe, "echo").unwrap_err();
+        assert!(started.elapsed() < std::time::Duration::from_secs(2));
+        assert!(matches!(err, StoreError::NotFile { .. }), "{err}");
+        let inspected = inspect(&path).unwrap_err();
+        assert!(
+            matches!(inspected, StoreError::NotFile { .. }),
+            "{inspected}"
+        );
+    }
+
+    #[test]
+    fn an_oversize_file_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("receipts.jsonl");
+        let file = File::create(&path).unwrap();
+        file.set_len(MAX_RECEIPT_BYTES + 1).unwrap();
+        drop(file);
+        let started = std::time::Instant::now();
+        let err = inspect(&path).unwrap_err();
+        assert!(started.elapsed() < std::time::Duration::from_secs(2));
+        assert!(err.to_string().contains("256 MiB"), "{err}");
+        let StoreError::TooLarge { bytes, .. } = err else {
+            panic!("not too large");
+        };
+        assert_eq!(bytes, MAX_RECEIPT_BYTES + 1);
+        let err =
+            ReceiptStore::open(StoreSource::Path(path.clone()), &LiveProbe, "echo").unwrap_err();
+        assert!(matches!(err, StoreError::TooLarge { .. }), "{err}");
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().len(),
+            MAX_RECEIPT_BYTES + 1
+        );
     }
 }

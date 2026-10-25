@@ -515,8 +515,17 @@ type CommandResult = Result<(), Box<dyn std::error::Error>>;
 /// routing can be checked without touching a pulse.
 type CommandFuture = std::pin::Pin<Box<dyn std::future::Future<Output = CommandResult>>>;
 
-#[tokio::main]
-async fn main() {
+fn main() {
+    let listen = oneself::store::take_listen_env();
+    oneself::store::retain_listen(listen);
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .expect("tokio runtime");
+    runtime.block_on(async_main());
+}
+
+async fn async_main() {
     let cli = Cli::parse();
     init_tracing(&cli.command);
     if let Err(message) = run_command(cli.command, cli::root_guard::refuse_root).await {
