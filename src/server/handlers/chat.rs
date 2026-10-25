@@ -52,6 +52,9 @@ pub struct ChatResponse {
     /// deltas it already showed.
     #[serde(skip_serializing_if = "std::ops::Not::not", default)]
     pub truncated: bool,
+    /// The turn ran on the configured fallback target. Not part of the wire.
+    #[serde(skip)]
+    pub fallback_used: bool,
 }
 
 fn default_channel() -> String {
@@ -274,19 +277,12 @@ pub(crate) async fn run_turn(
 }
 
 /// The open row for one turn. The sender string is hashed, never stored.
+///
+/// Receipts that are off return before the id, the copies, and the digest.
 fn open_receipt(state: &AppState, admitted: &Admitted) -> crate::oneself::receipt::StreamReceipt {
-    let req = admitted.request();
-    let (principal, principal_sha256) = crate::oneself::receipt::principal_of(admitted.key());
-    let fallback = state
-        .config
-        .llm
-        .fallback_model
-        .as_deref()
-        .map(str::trim)
-        .filter(|model| !model.is_empty())
-        .map(str::to_string);
-    crate::oneself::receipt::StreamReceipt::open(
-        &state.receipts,
+    crate::oneself::receipt::StreamReceipt::open_if_on(&state.receipts, || {
+        let req = admitted.request();
+        let (principal, principal_sha256) = crate::oneself::receipt::principal_of(admitted.key());
         crate::oneself::receipt::OpenInfo {
             stream: uuid::Uuid::new_v4().to_string(),
             channel: req.channel.clone(),
@@ -295,10 +291,9 @@ fn open_receipt(state: &AppState, admitted: &Admitted) -> crate::oneself::receip
             provider: state.provider.name().to_string(),
             adapter: state.config.llm.cli_adapter().unwrap_or("").to_string(),
             model: state.config.llm.model.clone(),
-            fallback_model: fallback,
-            input_sha256: crate::oneself::chain::sha256_hex(req.message.as_bytes()),
-        },
-    )
+            input_sha256: crate::oneself::receipt::digest(req.message.as_bytes()),
+        }
+    })
 }
 
 fn turn_record(
@@ -311,6 +306,7 @@ fn turn_record(
             isolation: response.isolation || response.model == "isolation-control",
             truncated: response.truncated,
             refused: false,
+            fallback_used: response.fallback_used,
             tokens_in: response.input_tokens,
             tokens_out: response.output_tokens,
         },
@@ -319,7 +315,11 @@ fn turn_record(
             model: None,
             isolation: false,
             truncated: false,
+            // `RefusalError` is the typed refusal. `steps::public_failure_message`
+            // turns it into this text, and may prefix the isolation banner,
+            // before `run_turn` sees a `(StatusCode, String)`.
             refused: message.contains("the model declined this request"),
+            fallback_used: false,
             tokens_in: None,
             tokens_out: None,
         },

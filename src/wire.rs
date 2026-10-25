@@ -381,9 +381,9 @@ pub struct HealthResponse {
 /// `/health`'s `receipts` object.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ReceiptsHealth {
-    /// `off`, `ok`, `degraded`, or `unprotected`.
+    /// `off`, `ok`, `degraded`, `unprotected`, or `unavailable`.
     pub state: String,
-    /// Last appended seq. Null when receipts are off or not writing.
+    /// Last appended seq. Null when receipts are off, unprotected, or unavailable.
     pub seq: Option<u64>,
 }
 

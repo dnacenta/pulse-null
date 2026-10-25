@@ -76,6 +76,10 @@ Every key:
 | `probe` | `cadence` | `max` | `max`: due Mon/Wed/Fri · `pro`: every 14 days |
 | `probe` | `quiet_start`, `quiet_end` | `02:00`, `06:00` | Window every run must start in (`[scheduler] timezone`) |
 | `probe` | `weekly_turns`, `max_turns_per_run` | `81`, `27` | Measurement budget in model turns (three `max` runs of up to 27: every item set and three due paired facts) |
+| `receipts` | `enabled` | `false` | Append a receipt file for this pulse. Off does no work per turn |
+| `receipts` | `path` | empty | File to open when receipts are on and protection is not required. Empty uses `/var/lib/pulse-null/<pulse>/receipts.jsonl`. The path must resolve under the pulse directory or that default directory. `..` and a symlink escape are refused. Ignored when protection is required |
+| `receipts` | `require_protected` | `true` | Write only through a protected systemd fd. A path is not opened |
+| `receipts` | `content` | `digest` | What a row stores. Only `digest` is accepted |
 
 Also present, with defaults: `[owner]`, `[prediction]`, `[tension]`, `[outreach]`,
 `[sessions]`, `[session_health]`, `[platform]`, `[system_prompt_budget]`, `[peers]`,
@@ -89,6 +93,7 @@ Also present, with defaults: `[owner]`, `[prediction]`, `[tension]`, `[outreach]
 | `PULSE_NULL_API_KEY` | Alternative API key variable |
 | `PULSE_CLI_BIN` | CLI binary when `[llm] cli_bin` is unset |
 | `PULSE_NULL_ALLOW_ROOT` | `1` lets `init` / `up` run as root (CI) |
+| `PULSE_NULL_RECEIPTS` | `required` forces receipts on and protection required. The file cannot turn that off, and `[receipts] path` is not opened. Any other non-empty value is ignored |
 | `RUST_LOG` | Log level, e.g. `pulse_null=debug` |
 
 ## Older configs

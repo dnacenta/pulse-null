@@ -696,16 +696,13 @@ fn die_with_runner(cmd: &mut tokio::process::Command) {
     // SAFETY: getpid has no preconditions.
     let parent = unsafe { libc::getpid() };
     // SAFETY: the hook runs in the forked child before exec and makes only
-    // raw syscalls on integers. Dumpable is set back to 1 so a daemon that
-    // cleared its own flag (receipts) does not hide this process: a
-    // non-dumpable child makes `/proc/<pid>/cwd` unreadable, and
-    // `kill_stale_server` would then leave it running.
+    // raw syscalls on integers. Exec of a normal program sets the dumpable
+    // flag to 1, so the child's `/proc/<pid>/cwd` stays readable and
+    // `kill_stale_server` can see this directory. Setting the flag here
+    // would repeat what exec already does.
     unsafe {
         cmd.pre_exec(move || {
             if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL, 0, 0, 0) != 0 {
-                return Err(std::io::Error::last_os_error());
-            }
-            if libc::prctl(libc::PR_SET_DUMPABLE, 1, 0, 0, 0) != 0 {
                 return Err(std::io::Error::last_os_error());
             }
             if libc::getppid() != parent {
@@ -1126,13 +1123,15 @@ mod tests {
             port_owned_by(std::process::id(), port),
             "this process holds the listening socket"
         );
-        let mut child = std::process::Command::new("/bin/sleep")
-            .arg("30")
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .spawn()
-            .unwrap();
+        let mut child = crate::process_state::during_fork(|| {
+            std::process::Command::new("/bin/sleep")
+                .arg("30")
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn()
+        })
+        .unwrap();
         assert!(
             !port_owned_by(child.id(), port),
             "the listener is not the child's"
@@ -1637,19 +1636,9 @@ except OSError:
             .arg("30")
             .current_dir(&server_dir)
             .kill_on_drop(true);
-        // A sibling test may have cleared the process dumpable flag. The
-        // child inherits it, `/proc/<pid>/cwd` is then hidden, and the kill
-        // below would not see this directory. Set the flag before exec.
-        // SAFETY: the hook runs in the child before exec and only sets an integer flag.
-        unsafe {
-            sleeper.pre_exec(|| {
-                if libc::prctl(libc::PR_SET_DUMPABLE, 1, 0, 0, 0) != 0 {
-                    return Err(std::io::Error::last_os_error());
-                }
-                Ok(())
-            });
-        }
-        let mut sleeper = sleeper.spawn().unwrap();
+        // Exec of sleep sets the dumpable flag to 1, so this child's cwd
+        // stays readable even when the parent cleared the flag for receipts.
+        let mut sleeper = crate::process_state::during_fork(|| sleeper.spawn()).unwrap();
         let pid = sleeper.id().unwrap();
         std::fs::write(server_dir.join(SERVER_PID_FILE), pid.to_string()).unwrap();
         // A pid whose process runs elsewhere is left alone.

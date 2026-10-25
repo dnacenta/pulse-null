@@ -6,7 +6,7 @@ burst of 10, then 2 per second.
 
 | Method | Path | Description |
 |---|---|---|
-| GET | `/health` | Health check (no auth) |
+| GET | `/health` | Health check (no auth). `receipts` is `{ "state", "seq" }`. `state` is `off` (the default), `ok`, `degraded`, `unprotected` (protection required, nothing written), or `unavailable` (the path was refused or the file is not this pulse's). `seq` is the last appended row, or null when nothing is being written |
 | GET | `/api/session-health` | Session health |
 | GET | `/api/status` | Pulse status |
 | GET | `/api/dashboard` | Pipeline and cognitive health |

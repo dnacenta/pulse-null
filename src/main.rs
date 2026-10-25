@@ -30,6 +30,7 @@ mod pidfile;
 mod plugins;
 mod praxis;
 mod prediction;
+mod process_state;
 mod provider_status;
 mod providers;
 mod registry;

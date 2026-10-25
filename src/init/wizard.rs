@@ -76,7 +76,9 @@ pub async fn run(target_dir: &Path) -> Result<(), Box<dyn std::error::Error>> {
             // Is the CLI installed? Honour the same override the runtime uses.
             let bin = std::env::var(crate::cli_provider::CLI_BIN_ENV)
                 .unwrap_or_else(|_| adapter.default_bin().to_string());
-            match std::process::Command::new(&bin).arg("--version").output() {
+            match crate::process_state::during_fork(|| {
+                std::process::Command::new(&bin).arg("--version").output()
+            }) {
                 Ok(output) if output.status.success() => {
                     let ver = String::from_utf8_lossy(&output.stdout);
                     println!(
@@ -493,7 +495,9 @@ fn collect_plugin_configs() -> Result<PluginConfigs, Box<dyn std::error::Error>>
 
 fn pick_ollama_model() -> Result<String, Box<dyn std::error::Error>> {
     // Try `ollama list` to get installed models
-    match std::process::Command::new("ollama").arg("list").output() {
+    match crate::process_state::during_fork(|| {
+        std::process::Command::new("ollama").arg("list").output()
+    }) {
         Ok(output) if output.status.success() => {
             let stdout = String::from_utf8_lossy(&output.stdout);
             let models: Vec<String> = stdout

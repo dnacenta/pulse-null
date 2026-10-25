@@ -5,6 +5,7 @@
 //! is counted and later written as one `gap` row. Receipts that are off
 //! do not open a file.
 
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
 use std::sync::Arc;
@@ -15,7 +16,9 @@ use tokio::sync::{mpsc, oneshot};
 use super::chain;
 use super::event::{ActionClass, FdSource, Identity, Outcome, ReceiptEvent};
 use super::protect::{Protection, ProtectionProbe};
-use super::store::{default_receipts_path, ListenEnv, OpenChoice, ReceiptStore, StoreSource};
+use super::store::{
+    default_receipts_path, ListenEnv, OpenChoice, ReceiptStore, StoreError, StoreSource,
+};
 use crate::config::{receipts_mode, Config};
 
 const CAPACITY: usize = 1024;
@@ -23,6 +26,28 @@ const STATE_OFF: u8 = 0;
 const STATE_OK: u8 = 1;
 const STATE_DEGRADED: u8 = 2;
 const STATE_UNPROTECTED: u8 = 3;
+const STATE_UNAVAILABLE: u8 = 4;
+
+/// Digests computed for a receipt row. Stays put when receipts are off.
+#[cfg(test)]
+pub(crate) static DIGESTS: AtomicU64 = AtomicU64::new(0);
+
+pub(crate) fn digest(bytes: &[u8]) -> String {
+    #[cfg(test)]
+    {
+        if FORBID_DIGEST.with(std::cell::Cell::get) {
+            panic!("digest while receipts are off");
+        }
+        DIGESTS.fetch_add(1, Ordering::Relaxed);
+    }
+    chain::sha256_hex(bytes)
+}
+
+// When set on this thread, `digest` panics. Other threads are unaffected.
+#[cfg(test)]
+thread_local! {
+    static FORBID_DIGEST: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
 
 /// What `/health` reports for receipts.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -65,6 +90,7 @@ impl Health {
         let seq = if self.has_seq.load(Ordering::Relaxed)
             && state != STATE_OFF
             && state != STATE_UNPROTECTED
+            && state != STATE_UNAVAILABLE
         {
             Some(self.seq.load(Ordering::Relaxed))
         } else {
@@ -82,6 +108,7 @@ fn state_name(state: u8) -> &'static str {
         STATE_OK => "ok",
         STATE_DEGRADED => "degraded",
         STATE_UNPROTECTED => "unprotected",
+        STATE_UNAVAILABLE => "unavailable",
         _ => "off",
     }
 }
@@ -107,6 +134,14 @@ enum Job {
 pub struct Appender {
     tx: Option<mpsc::Sender<Job>>,
     health: Arc<Health>,
+    /// Last clone restores the dumpable flag. Only set after it was cleared.
+    /// Owning the guard is the use; nothing reads the field.
+    #[cfg(test)]
+    #[expect(
+        dead_code,
+        reason = "dropped with the last appender to restore the dumpable flag"
+    )]
+    restore: Option<Arc<RestoreDumpable>>,
 }
 
 impl Appender {
@@ -116,7 +151,15 @@ impl Appender {
         Self {
             tx: None,
             health: Arc::new(Health::new(STATE_OFF)),
+            #[cfg(test)]
+            restore: None,
         }
+    }
+
+    /// Whether a turn should build a receipt. False does no hashing.
+    #[must_use]
+    pub fn is_on(&self) -> bool {
+        self.tx.is_some()
     }
 
     /// Open the store when the effective mode is on, and spawn the writer.
@@ -169,7 +212,19 @@ impl Appender {
             return Self::off();
         }
         disarm_core_dumps();
-        let source = store_source(config, listen);
+        let root_buf = root.to_path_buf();
+        let decision = decide_source(config, &root_buf, listen, mode.require_protected);
+        let source = match decision {
+            SourceDecision::Open(source) => source,
+            SourceDecision::Unprotected(reason) => {
+                tracing::warn!("{reason}");
+                return Self::unprotected();
+            }
+            SourceDecision::Unavailable(reason) => {
+                tracing::warn!("{reason}");
+                return Self::unavailable();
+            }
+        };
         if mode.require_protected && source_missing(&source) {
             tracing::warn!(
                 path = %path_of(&source),
@@ -178,33 +233,35 @@ impl Appender {
             return Self::unprotected();
         }
         let pulse = config.pulse.name.clone();
-        let boot = boot_event(config, root, provider_name);
+        let boot_config = config.clone();
         let probe_for_open = Arc::clone(&probe);
+        let require = mode.require_protected;
         let opened = tokio::task::spawn_blocking(move || {
-            ReceiptStore::open_for_daemon(
-                source,
-                probe_for_open.as_ref(),
-                &pulse,
-                mode.require_protected,
-            )
+            let ident = identity(&root_buf, &boot_config);
+            let opened =
+                ReceiptStore::open_for_daemon(source, probe_for_open.as_ref(), &pulse, require);
+            (opened, ident)
         })
         .await;
+        let (opened, ident) = match opened {
+            Ok(pair) => pair,
+            Err(err) => {
+                tracing::warn!("receipt store did not open: {err}");
+                return Self::degraded();
+            }
+        };
+        let boot = boot_event(config, provider_name, ident);
         let (store, opened) = match opened {
-            Ok(Ok(OpenChoice::Ready(pair))) => *pair,
-            Ok(Ok(OpenChoice::Unprotected(protection))) => {
+            Ok(OpenChoice::Ready(pair)) => *pair,
+            Ok(OpenChoice::Unprotected(protection)) => {
                 tracing::warn!(
                     reason = %protection.unmet(),
                     "receipt store is not protected; writing nothing"
                 );
                 return Self::unprotected();
             }
-            Ok(Err(err)) => {
-                tracing::warn!("receipt store did not open: {err}");
-                return Self::degraded();
-            }
             Err(err) => {
-                tracing::warn!("receipt store did not open: {err}");
-                return Self::degraded();
+                return open_error(err);
             }
         };
         tracing::info!(
@@ -232,6 +289,8 @@ impl Appender {
         Self {
             tx: Some(tx),
             health,
+            #[cfg(test)]
+            restore: take_restore(),
         }
     }
 
@@ -239,6 +298,8 @@ impl Appender {
         Self {
             tx: None,
             health: Arc::new(Health::new(STATE_UNPROTECTED)),
+            #[cfg(test)]
+            restore: take_restore(),
         }
     }
 
@@ -246,6 +307,17 @@ impl Appender {
         Self {
             tx: None,
             health: Arc::new(Health::new(STATE_DEGRADED)),
+            #[cfg(test)]
+            restore: take_restore(),
+        }
+    }
+
+    fn unavailable() -> Self {
+        Self {
+            tx: None,
+            health: Arc::new(Health::new(STATE_UNAVAILABLE)),
+            #[cfg(test)]
+            restore: take_restore(),
         }
     }
 
@@ -333,7 +405,39 @@ fn path_of(source: &StoreSource) -> String {
     }
 }
 
-fn store_source(config: &Config, listen: ListenEnv) -> StoreSource {
+enum SourceDecision {
+    Open(StoreSource),
+    /// Keep serving, write nothing. `/health` says unprotected.
+    Unprotected(String),
+    /// Keep serving, write nothing. `/health` says unavailable.
+    Unavailable(String),
+}
+
+fn open_error(err: StoreError) -> Appender {
+    match err {
+        StoreError::NotUsed { .. } => {
+            tracing::warn!(
+                "systemd receipts fd is already in use by another pulse; this pulse will not write"
+            );
+            Appender::unprotected()
+        }
+        StoreError::Foreign { .. } | StoreError::NotLedger { .. } => {
+            tracing::warn!("{err}");
+            Appender::unavailable()
+        }
+        other => {
+            tracing::warn!("receipt store did not open: {other}");
+            Appender::degraded()
+        }
+    }
+}
+
+fn decide_source(
+    config: &Config,
+    root: &Path,
+    listen: ListenEnv,
+    require_protected: bool,
+) -> SourceDecision {
     let named = super::store::listen_fd(
         listen.pid.as_deref(),
         listen.fds.as_deref(),
@@ -342,14 +446,88 @@ fn store_source(config: &Config, listen: ListenEnv) -> StoreSource {
         "receipts",
     );
     if named.is_some() {
-        StoreSource::SystemdFd {
+        return SourceDecision::Open(StoreSource::SystemdFd {
             name: "receipts",
             listen,
-        }
-    } else if !config.receipts.path.is_empty() {
-        StoreSource::Path(PathBuf::from(&config.receipts.path))
+        });
+    }
+    if require_protected {
+        return SourceDecision::Unprotected(
+            "receipts require protection; [receipts] path is ignored and nothing is opened"
+                .to_string(),
+        );
+    }
+    let requested = if config.receipts.path.is_empty() {
+        default_receipts_path(&config.pulse.name)
     } else {
-        StoreSource::Path(default_receipts_path(&config.pulse.name))
+        PathBuf::from(&config.receipts.path)
+    };
+    match confine_receipt_path(root, &config.pulse.name, &requested) {
+        Ok(path) => SourceDecision::Open(StoreSource::Path(path)),
+        Err(reason) => SourceDecision::Unavailable(reason),
+    }
+}
+
+/// The path is usable only under the pulse directory or `/var/lib/pulse-null/<pulse>/`.
+///
+/// The parent is canonicalised, so a symlink that leaves those directories is
+/// refused. `..` is refused. A symlink at the file itself is refused.
+fn confine_receipt_path(root: &Path, pulse: &str, requested: &Path) -> Result<PathBuf, String> {
+    // A relative path is inside the pulse directory, not the process cwd.
+    let requested = if requested.is_absolute() {
+        requested.to_path_buf()
+    } else {
+        root.join(requested)
+    };
+    if requested
+        .components()
+        .any(|component| matches!(component, std::path::Component::ParentDir))
+    {
+        return Err(format!(
+            "[receipts] path {} has a .. component; nothing was created",
+            requested.display()
+        ));
+    }
+    let parent = match requested.parent() {
+        Some(parent) if !parent.as_os_str().is_empty() => parent,
+        _ => Path::new("."),
+    };
+    let canon_parent = parent.canonicalize().map_err(|err| {
+        format!(
+            "[receipts] path {} is not under an allowed directory ({err}); nothing was created",
+            requested.display()
+        )
+    })?;
+    let Some(name) = requested.file_name() else {
+        return Err(format!(
+            "[receipts] path {} has no file name; nothing was created",
+            requested.display()
+        ));
+    };
+    if name == ".." || name == "." {
+        return Err(format!(
+            "[receipts] path {} has no file name; nothing was created",
+            requested.display()
+        ));
+    }
+    let full = canon_parent.join(name);
+    if std::fs::symlink_metadata(&full).is_ok_and(|meta| meta.file_type().is_symlink()) {
+        return Err(format!(
+            "[receipts] path {} is a symlink; nothing was created",
+            full.display()
+        ));
+    }
+    let root_canon = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
+    let var_dir = PathBuf::from("/var/lib/pulse-null").join(pulse);
+    let var_canon = var_dir.canonicalize().unwrap_or(var_dir);
+    let under = |base: &Path| full.starts_with(base) && full != base;
+    if under(&root_canon) || under(&var_canon) {
+        Ok(full)
+    } else {
+        Err(format!(
+            "[receipts] path {} is outside the pulse directory and /var/lib/pulse-null/{pulse}; nothing was created",
+            full.display()
+        ))
     }
 }
 
@@ -467,14 +645,8 @@ fn lost_close(stream: &str) -> ReceiptEvent {
     }
 }
 
-fn boot_event(config: &Config, root: &Path, provider_name: &str) -> ReceiptEvent {
-    let fallback = config
-        .llm
-        .fallback_model
-        .as_deref()
-        .map(str::trim)
-        .filter(|model| !model.is_empty())
-        .map(str::to_string);
+fn boot_event(config: &Config, provider_name: &str, ident: Identity) -> ReceiptEvent {
+    let fallback = config.llm.fallback_target().map(str::to_string);
     ReceiptEvent::Boot {
         pulse: config.pulse.name.clone(),
         version: env!("CARGO_PKG_VERSION").to_string(),
@@ -482,7 +654,7 @@ fn boot_event(config: &Config, root: &Path, provider_name: &str) -> ReceiptEvent
         adapter: adapter_name(config),
         model: config.llm.model.clone(),
         fallback_model: fallback,
-        identity: identity(root, config),
+        identity: ident,
         fd_source: FdSource::SelfOpened,
         protected: false,
         append_only: false,
@@ -536,10 +708,28 @@ fn identity(root: &Path, config: &Config) -> Identity {
     }
 }
 
+/// Hash a regular file. A fifo or other non-file is skipped so boot cannot block on it.
 fn sha_file(path: &Path) -> Option<String> {
-    std::fs::read(path)
-        .ok()
-        .map(|bytes| chain::sha256_hex(&bytes))
+    read_regular(path).map(|bytes| digest(&bytes))
+}
+
+fn read_regular(path: &Path) -> Option<Vec<u8>> {
+    let meta = std::fs::symlink_metadata(path).ok()?;
+    if !(meta.is_file() || meta.file_type().is_symlink()) {
+        return None;
+    }
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NONBLOCK)
+        .open(path)
+        .ok()?;
+    let meta = file.metadata().ok()?;
+    if !meta.is_file() {
+        return None;
+    }
+    let mut bytes = Vec::new();
+    std::io::Read::read_to_end(&mut &file, &mut bytes).ok()?;
+    Some(bytes)
 }
 
 fn hash_rules(root: &Path, dir: &str) -> Option<String> {
@@ -555,33 +745,61 @@ fn hash_rules(root: &Path, dir: &str) -> Option<String> {
         return None;
     }
     let mut files = Vec::new();
-    collect_files(&path, &path, &mut files).ok()?;
+    let mut unreadable = 0u64;
+    if collect_files(&path, &path, &mut files, &mut unreadable).is_err() && files.is_empty() {
+        return None;
+    }
     files.sort_by(|left, right| left.0.cmp(&right.0));
-    let pairs: Vec<serde_json::Value> = files
+    let mut pairs: Vec<serde_json::Value> = files
         .iter()
-        .map(|(rel, bytes)| serde_json::json!([rel, chain::sha256_hex(bytes)]))
+        .map(|(rel, bytes)| match bytes {
+            Some(bytes) => serde_json::json!([rel, digest(bytes)]),
+            None => serde_json::json!([rel, "unreadable"]),
+        })
         .collect();
+    if unreadable > 0 {
+        pairs.push(serde_json::json!(["unreadable", unreadable]));
+    }
     let text = serde_json::to_string(&serde_json::Value::Array(pairs)).ok()?;
-    Some(chain::sha256_hex(text.as_bytes()))
+    Some(digest(text.as_bytes()))
 }
 
-fn collect_files(dir: &Path, root: &Path, out: &mut Vec<(String, Vec<u8>)>) -> std::io::Result<()> {
+fn collect_files(
+    dir: &Path,
+    root: &Path,
+    out: &mut Vec<(String, Option<Vec<u8>>)>,
+    unreadable: &mut u64,
+) -> std::io::Result<()> {
     let mut names = Vec::new();
     for entry in std::fs::read_dir(dir)? {
         names.push(entry?.path());
     }
     names.sort();
     for path in names {
-        let meta = std::fs::symlink_metadata(&path)?;
-        if meta.is_dir() {
-            collect_files(&path, root, out)?;
-        } else if meta.is_file() {
-            let rel = path
-                .strip_prefix(root)
-                .unwrap_or(&path)
-                .to_string_lossy()
-                .replace('\\', "/");
-            out.push((rel, std::fs::read(&path)?));
+        let meta = match std::fs::symlink_metadata(&path) {
+            Ok(meta) => meta,
+            Err(_) => {
+                *unreadable += 1;
+                continue;
+            }
+        };
+        let rel = path
+            .strip_prefix(root)
+            .unwrap_or(&path)
+            .to_string_lossy()
+            .replace('\\', "/");
+        if meta.is_dir() && !meta.file_type().is_symlink() {
+            collect_files(&path, root, out, unreadable)?;
+            continue;
+        }
+        if meta.is_file() || meta.file_type().is_symlink() {
+            match read_regular(&path) {
+                Some(bytes) => out.push((rel, Some(bytes))),
+                None => {
+                    *unreadable += 1;
+                    out.push((rel, None));
+                }
+            }
         }
     }
     Ok(())
@@ -590,8 +808,13 @@ fn collect_files(dir: &Path, root: &Path, out: &mut Vec<(String, Vec<u8>)>) -> s
 /// Clear the dumpable flag so a crash does not write the process image.
 ///
 /// Called only when receipts are on, including when the store is left
-/// unwritten because it is not protected.
+/// unwritten because it is not protected. Exec of another program sets the
+/// flag back to 1; this process stays cleared until the test guard drops.
 fn disarm_core_dumps() {
+    // Same lock as a test that forks or reads the flag, so the two do not
+    // overlap. The guard restores the flag when the appender drops.
+    #[cfg(test)]
+    let _hold = crate::process_state::Hold::acquire();
     // SAFETY: `PR_SET_DUMPABLE` takes an integer argument and no pointer.
     // Zero disables core dumps for this process.
     let rc = unsafe { libc::prctl(libc::PR_SET_DUMPABLE, 0, 0, 0, 0) };
@@ -601,6 +824,39 @@ fn disarm_core_dumps() {
             std::io::Error::last_os_error()
         );
     }
+    #[cfg(test)]
+    arm_restore();
+}
+
+#[cfg(test)]
+struct RestoreDumpable;
+
+#[cfg(test)]
+impl Drop for RestoreDumpable {
+    fn drop(&mut self) {
+        let _hold = crate::process_state::Hold::acquire();
+        // SAFETY: integer flag only. 1 is the ordinary value for this process.
+        unsafe { libc::prctl(libc::PR_SET_DUMPABLE, 1, 0, 0, 0) };
+    }
+}
+
+#[cfg(test)]
+fn arm_restore() {
+    RESTORE.with(|slot| {
+        if slot.borrow().is_none() {
+            *slot.borrow_mut() = Some(Arc::new(RestoreDumpable));
+        }
+    });
+}
+
+#[cfg(test)]
+fn take_restore() -> Option<Arc<RestoreDumpable>> {
+    RESTORE.with(|slot| slot.borrow_mut().take())
+}
+
+#[cfg(test)]
+std::thread_local! {
+    static RESTORE: std::cell::RefCell<Option<Arc<RestoreDumpable>>> = const { std::cell::RefCell::new(None) };
 }
 
 /// What a finished turn tells the close row. The request text is not here.
@@ -610,6 +866,8 @@ pub struct TurnRecord<'a> {
     pub isolation: bool,
     pub truncated: bool,
     pub refused: bool,
+    /// The turn ran on the configured fallback target.
+    pub fallback_used: bool,
     pub tokens_in: Option<u32>,
     pub tokens_out: Option<u32>,
 }
@@ -623,7 +881,6 @@ pub struct OpenInfo {
     pub provider: String,
     pub adapter: String,
     pub model: String,
-    pub fallback_model: Option<String>,
     pub input_sha256: String,
 }
 
@@ -632,14 +889,38 @@ pub struct StreamReceipt {
     tx: Option<mpsc::Sender<Job>>,
     health: Arc<Health>,
     finished: bool,
-    info: OpenInfo,
+    info: Option<OpenInfo>,
     started: Instant,
 }
 
 impl StreamReceipt {
+    /// No row, no digest, no id. Drop and finish do nothing.
+    #[must_use]
+    pub fn inert() -> Self {
+        Self {
+            tx: None,
+            health: Arc::new(Health::new(STATE_OFF)),
+            finished: true,
+            info: None,
+            started: Instant::now(),
+        }
+    }
+
+    /// Build `info` only when `appender` is on.
+    #[must_use]
+    pub fn open_if_on(appender: &Appender, build: impl FnOnce() -> OpenInfo) -> Self {
+        if !appender.is_on() {
+            return Self::inert();
+        }
+        Self::open(appender, build())
+    }
+
     /// Queue the `open` row. A full channel counts toward a later `gap`.
     #[must_use]
     pub fn open(appender: &Appender, info: OpenInfo) -> Self {
+        if !appender.is_on() {
+            return Self::inert();
+        }
         appender.submit(ReceiptEvent::Open {
             stream: info.stream.clone(),
             channel: info.channel.clone(),
@@ -652,7 +933,7 @@ impl StreamReceipt {
             tx: appender.tx.clone(),
             health: Arc::clone(&appender.health),
             finished: false,
-            info,
+            info: Some(info),
             started: Instant::now(),
         }
     }
@@ -660,7 +941,14 @@ impl StreamReceipt {
     /// Queue the `close` row for a turn that produced a result.
     pub fn finish(mut self, end: TurnRecord<'_>) {
         self.finished = true;
-        self.send(close_event(&self.info, &end, self.started.elapsed()));
+        if self.tx.is_none() {
+            return;
+        }
+        let Some(info) = &self.info else {
+            return;
+        };
+        let event = close_event(info, &end, self.started.elapsed());
+        self.send(event);
     }
 
     fn send(&self, event: ReceiptEvent) {
@@ -678,18 +966,21 @@ impl StreamReceipt {
 
 impl Drop for StreamReceipt {
     fn drop(&mut self) {
-        if self.finished {
+        if self.finished || self.tx.is_none() {
             return;
         }
+        let Some(info) = &self.info else {
+            return;
+        };
         let event = ReceiptEvent::Close {
-            stream: self.info.stream.clone(),
+            stream: info.stream.clone(),
             outcome: Outcome::Aborted,
             action_class: ActionClass::None,
-            provider: self.info.provider.clone(),
-            adapter: self.info.adapter.clone(),
-            model: self.info.model.clone(),
+            provider: info.provider.clone(),
+            adapter: info.adapter.clone(),
+            model: info.model.clone(),
             fallback: false,
-            input_sha256: Some(self.info.input_sha256.clone()),
+            input_sha256: Some(info.input_sha256.clone()),
             output_sha256: None,
             tokens_in: None,
             tokens_out: None,
@@ -705,7 +996,7 @@ impl Drop for StreamReceipt {
 fn close_event(info: &OpenInfo, end: &TurnRecord<'_>, elapsed: Duration) -> ReceiptEvent {
     let model = end.model.unwrap_or(&info.model).to_string();
     let (outcome, action, output) = if let Some(text) = end.text {
-        let hash = Some(chain::sha256_hex(text.as_bytes()));
+        let hash = Some(digest(text.as_bytes()));
         if end.isolation {
             (Outcome::Isolated, ActionClass::Reply, hash)
         } else if end.truncated || end.refused {
@@ -718,10 +1009,6 @@ fn close_event(info: &OpenInfo, end: &TurnRecord<'_>, elapsed: Duration) -> Rece
     } else {
         (Outcome::Error, ActionClass::None, None)
     };
-    let fallback = info
-        .fallback_model
-        .as_deref()
-        .is_some_and(|item| !item.is_empty() && item == model);
     ReceiptEvent::Close {
         stream: info.stream.clone(),
         outcome,
@@ -729,7 +1016,7 @@ fn close_event(info: &OpenInfo, end: &TurnRecord<'_>, elapsed: Duration) -> Rece
         provider: info.provider.clone(),
         adapter: info.adapter.clone(),
         model,
-        fallback,
+        fallback: end.fallback_used,
         input_sha256: Some(info.input_sha256.clone()),
         output_sha256: output,
         tokens_in: end.tokens_in.map(u64::from),
@@ -750,16 +1037,15 @@ pub fn principal_of(key: &crate::session_key::SessionKey) -> (String, Option<Str
     match key.principal() {
         Principal::Owner => ("owner".to_string(), None),
         Principal::Peer(name) => (format!("peer:{name}"), None),
-        Principal::Guest(sender) => (
-            "guest".to_string(),
-            Some(chain::sha256_hex(sender.as_bytes())),
-        ),
+        Principal::Guest(sender) => ("guest".to_string(), Some(digest(sender.as_bytes()))),
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::os::unix::fs::PermissionsExt;
+
     use crate::config::{with_receipts_env, ReceiptsConfig, RECEIPTS_ENV};
     use crate::oneself::protect::{FakeProbe, LiveProbe};
 
@@ -857,8 +1143,21 @@ mod tests {
         assert_eq!(quiet.snapshot().state, "unprotected");
         assert_eq!(std::fs::read(&path).unwrap(), b"");
 
-        let writing = Appender::start(
+        // Protection required ignores the path, including a probe that would pass.
+        let skipped = Appender::start(
             &config,
+            dir.path(),
+            ListenEnv::empty(),
+            Arc::new(FakeProbe::protected()),
+            "mock",
+        )
+        .await;
+        assert_eq!(skipped.snapshot().state, "unprotected");
+        assert_eq!(std::fs::read(&path).unwrap(), b"");
+
+        let writing_config = config_at(&path, true, false);
+        let writing = Appender::start(
+            &writing_config,
             dir.path(),
             ListenEnv::empty(),
             Arc::new(FakeProbe::protected()),
@@ -899,7 +1198,6 @@ mod tests {
             provider: "mock".into(),
             adapter: String::new(),
             model: "mock-model".into(),
-            fallback_model: None,
             input_sha256: chain::sha256_hex(b"one"),
         };
         let first = StreamReceipt::open(&appender, info);
@@ -914,7 +1212,6 @@ mod tests {
                 provider: "mock".into(),
                 adapter: String::new(),
                 model: "mock-model".into(),
-                fallback_model: None,
                 input_sha256: chain::sha256_hex(b"two"),
             },
         );
@@ -940,5 +1237,358 @@ mod tests {
         );
         let rendered = format!("{principal} {hash:?}");
         assert!(!rendered.contains("zephyr-sender"));
+    }
+
+    #[test]
+    fn receipts_off_does_not_hash_or_build_a_row() {
+        FORBID_DIGEST.with(|flag| flag.set(true));
+        struct Allow;
+        impl Drop for Allow {
+            fn drop(&mut self) {
+                FORBID_DIGEST.with(|flag| flag.set(false));
+            }
+        }
+        let _allow = Allow;
+        let appender = Appender::off();
+        assert!(!appender.is_on());
+        let receipt = StreamReceipt::open_if_on(&appender, || {
+            let _ = digest(b"request");
+            OpenInfo {
+                stream: "unused".into(),
+                channel: "tui".into(),
+                principal: "owner".into(),
+                principal_sha256: None,
+                provider: "mock".into(),
+                adapter: String::new(),
+                model: "mock-model".into(),
+                input_sha256: digest(b"request"),
+            }
+        });
+        let inert = StreamReceipt::open(
+            &appender,
+            OpenInfo {
+                stream: "unused".into(),
+                channel: "tui".into(),
+                principal: "owner".into(),
+                principal_sha256: None,
+                provider: "mock".into(),
+                adapter: String::new(),
+                model: "mock-model".into(),
+                input_sha256: "nope".into(),
+            },
+        );
+        let end = TurnRecord {
+            text: Some("reply"),
+            model: Some("mock-model"),
+            isolation: false,
+            truncated: false,
+            refused: false,
+            fallback_used: false,
+            tokens_in: None,
+            tokens_out: None,
+        };
+        receipt.finish(end);
+        drop(inert);
+    }
+
+    fn close_fallback(path: &Path, used: bool, model: &str) -> bool {
+        let info = OpenInfo {
+            stream: "s-fallback".into(),
+            channel: "tui".into(),
+            principal: "owner".into(),
+            principal_sha256: None,
+            provider: "mock".into(),
+            adapter: String::new(),
+            model: model.to_string(),
+            input_sha256: chain::sha256_hex(b"in"),
+        };
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let config = config_at(path, true, false);
+            let appender = Appender::start(
+                &config,
+                path.parent().unwrap(),
+                ListenEnv::empty(),
+                Arc::new(LiveProbe),
+                "mock",
+            )
+            .await;
+            StreamReceipt::open(&appender, info).finish(TurnRecord {
+                text: Some("reply"),
+                model: Some(model),
+                isolation: false,
+                truncated: false,
+                refused: false,
+                fallback_used: used,
+                tokens_in: None,
+                tokens_out: None,
+            });
+            appender.drained().await;
+        });
+        let text = std::fs::read_to_string(path).unwrap();
+        let close = text
+            .lines()
+            .find(|line| line.contains("\"kind\":\"close\""))
+            .unwrap();
+        close.contains("\"fallback\":true")
+    }
+
+    #[test]
+    fn the_fallback_flag_follows_the_turn_not_the_model_string() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("receipts.jsonl");
+        assert!(!close_fallback(&path, false, "fallback-model"));
+        std::fs::remove_file(&path).unwrap();
+        assert!(close_fallback(&path, true, "fallback-model"));
+    }
+
+    #[tokio::test]
+    async fn a_disabled_fallback_is_not_named_on_the_boot_row() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("receipts.jsonl");
+        let mut config = config_at(&path, true, false);
+        config.llm.fallback_model = Some("fallback-model".into());
+        config.llm.fallback_on_refusal = false;
+        let appender = Appender::start(
+            &config,
+            dir.path(),
+            ListenEnv::empty(),
+            Arc::new(LiveProbe),
+            "mock",
+        )
+        .await;
+        appender.drained().await;
+        let text = std::fs::read_to_string(&path).unwrap();
+        let boot = text
+            .lines()
+            .find(|line| line.contains("\"kind\":\"boot\""))
+            .unwrap();
+        assert!(!boot.contains("fallback_model"), "{boot}");
+        assert!(!boot.contains("fallback-model"), "{boot}");
+    }
+
+    #[tokio::test]
+    async fn another_pulses_file_is_refused_and_left_unchanged() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("receipts.jsonl");
+        let bravo = config_at(&path, true, false);
+        let mut bravo = bravo;
+        bravo.pulse.name = "bravo".into();
+        let writer = Appender::start(
+            &bravo,
+            dir.path(),
+            ListenEnv::empty(),
+            Arc::new(LiveProbe),
+            "mock",
+        )
+        .await;
+        writer.drained().await;
+        drop(writer);
+        let before = std::fs::read(&path).unwrap();
+        assert!(std::str::from_utf8(&before).unwrap().contains("bravo"));
+        let mut alpha = config_at(&path, true, false);
+        alpha.pulse.name = "alpha".into();
+        let refused = Appender::start(
+            &alpha,
+            dir.path(),
+            ListenEnv::empty(),
+            Arc::new(LiveProbe),
+            "mock",
+        )
+        .await;
+        assert_eq!(refused.snapshot().state, "unavailable");
+        assert!(refused.snapshot().seq.is_none());
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+    }
+
+    #[tokio::test]
+    async fn a_non_empty_file_without_a_genesis_is_left_byte_identical() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("receipts.jsonl");
+        let torn = b"not-a-genesis-and-no-newline";
+        std::fs::write(&path, torn).unwrap();
+        let config = config_at(&path, true, false);
+        let appender = Appender::start(
+            &config,
+            dir.path(),
+            ListenEnv::empty(),
+            Arc::new(LiveProbe),
+            "mock",
+        )
+        .await;
+        assert_eq!(appender.snapshot().state, "unavailable");
+        assert_eq!(std::fs::read(&path).unwrap(), torn);
+    }
+
+    #[tokio::test]
+    async fn a_path_outside_the_pulse_is_refused_and_nothing_is_created() {
+        let pulse = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let target = outside.path().join("receipts.jsonl");
+        let config = config_at(&target, true, false);
+        let appender = Appender::start(
+            &config,
+            pulse.path(),
+            ListenEnv::empty(),
+            Arc::new(LiveProbe),
+            "mock",
+        )
+        .await;
+        assert_eq!(appender.snapshot().state, "unavailable");
+        assert!(!target.exists());
+
+        let link = pulse.path().join("escape");
+        std::os::unix::fs::symlink(outside.path(), &link).unwrap();
+        let via_link = link.join("via-link.jsonl");
+        let config = config_at(&via_link, true, false);
+        let appender = Appender::start(
+            &config,
+            pulse.path(),
+            ListenEnv::empty(),
+            Arc::new(LiveProbe),
+            "mock",
+        )
+        .await;
+        assert_eq!(appender.snapshot().state, "unavailable");
+        assert!(!outside.path().join("via-link.jsonl").exists());
+
+        let dotted = pulse.path().join("..").join("outside.jsonl");
+        let config = config_at(&dotted, true, false);
+        let appender = Appender::start(
+            &config,
+            pulse.path(),
+            ListenEnv::empty(),
+            Arc::new(LiveProbe),
+            "mock",
+        )
+        .await;
+        assert_eq!(appender.snapshot().state, "unavailable");
+        let escaped = pulse.path().parent().unwrap().join("outside.jsonl");
+        assert!(!escaped.exists());
+    }
+
+    #[test]
+    fn required_mode_ignores_the_configured_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("receipts.jsonl");
+        let bytes = b"leave-these-bytes";
+        std::fs::write(&path, bytes).unwrap();
+        let config = config_at(&path, false, false);
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let snapshot = with_receipts_env(|| {
+            std::env::set_var(RECEIPTS_ENV, "required");
+            struct Clear;
+            impl Drop for Clear {
+                fn drop(&mut self) {
+                    std::env::remove_var(RECEIPTS_ENV);
+                }
+            }
+            let _clear = Clear;
+            rt.block_on(async {
+                let appender = Appender::start(
+                    &config,
+                    dir.path(),
+                    ListenEnv::empty(),
+                    Arc::new(LiveProbe),
+                    "mock",
+                )
+                .await;
+                appender.snapshot()
+            })
+        });
+        assert_eq!(snapshot.state, "unprotected");
+        assert!(snapshot.seq.is_none());
+        assert_eq!(std::fs::read(&path).unwrap(), bytes);
+    }
+
+    #[tokio::test]
+    async fn a_second_pulse_does_not_adopt_the_systemd_fd() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("receipts.jsonl");
+        let config = config_at(&path, true, false);
+        let listen = ListenEnv::captured(
+            Some(std::process::id().to_string()),
+            Some("1".into()),
+            Some("receipts".into()),
+        );
+        assert!(listen.claim_for_test());
+        let appender =
+            Appender::start(&config, dir.path(), listen, Arc::new(LiveProbe), "mock").await;
+        assert_eq!(appender.snapshot().state, "unprotected");
+        assert!(appender.snapshot().seq.is_none());
+        assert!(!path.exists());
+    }
+
+    fn boot_identity(dir: &Path) -> serde_json::Value {
+        let path = dir.join("receipts.jsonl");
+        let config = config_at(&path, true, false);
+        let mut config = config;
+        config.pulse.rules_dir = Some(dir.join("rules").display().to_string());
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let appender = Appender::start(
+                &config,
+                dir,
+                ListenEnv::empty(),
+                Arc::new(LiveProbe),
+                "mock",
+            )
+            .await;
+            appender.drained().await;
+        });
+        let text = std::fs::read_to_string(path).unwrap();
+        let boot = text
+            .lines()
+            .find(|line| line.contains("\"kind\":\"boot\""))
+            .unwrap();
+        let row: serde_json::Value = serde_json::from_str(boot).unwrap();
+        row["e"]["identity"].clone()
+    }
+
+    #[test]
+    fn identity_follows_a_symlinked_rule_and_keeps_an_unreadable_one() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("SELF.md"), b"self-bytes").unwrap();
+        let rules = dir.path().join("rules");
+        std::fs::create_dir(&rules).unwrap();
+        let real = dir.path().join("real.md");
+        std::fs::write(&real, b"ay").unwrap();
+        std::os::unix::fs::symlink(&real, rules.join("a.md")).unwrap();
+        std::fs::write(rules.join("b.md"), b"secret").unwrap();
+        let mode = std::fs::Permissions::from_mode(0o000);
+        std::fs::set_permissions(rules.join("b.md"), mode).unwrap();
+        let ident = boot_identity(dir.path());
+        assert_eq!(ident["self_md"], chain::sha256_hex(b"self-bytes"));
+        let pairs = serde_json::json!([
+            ["a.md", chain::sha256_hex(b"ay")],
+            ["b.md", "unreadable"],
+            ["unreadable", 1],
+        ]);
+        let expect = chain::sha256_hex(serde_json::to_string(&pairs).unwrap().as_bytes());
+        assert_eq!(ident["rules"], expect);
+        std::fs::set_permissions(rules.join("b.md"), std::fs::Permissions::from_mode(0o644))
+            .unwrap();
+    }
+
+    #[test]
+    fn a_fifo_self_file_does_not_hang_boot() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("SELF.md");
+        let name = std::ffi::CString::new(path.to_str().unwrap()).unwrap();
+        let rc = unsafe { libc::mkfifo(name.as_ptr(), 0o644) };
+        assert_eq!(rc, 0, "{}", std::io::Error::last_os_error());
+        let started = Instant::now();
+        let ident = boot_identity(dir.path());
+        assert!(started.elapsed() < Duration::from_secs(2));
+        assert!(ident.get("self_md").is_none(), "{ident}");
     }
 }

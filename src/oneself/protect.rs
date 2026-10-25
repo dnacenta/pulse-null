@@ -77,7 +77,10 @@ impl ProtectionProbe for LiveProbe {
 }
 
 /// A fixed report. `from_systemd` is ignored so a test can set each flag.
-#[cfg_attr(not(test), expect(dead_code, reason = "wired in increment 3"))]
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "test double; the daemon uses LiveProbe")
+)]
 #[derive(Debug, Clone)]
 pub struct FakeProbe {
     pub systemd_fd: bool,
@@ -88,7 +91,10 @@ pub struct FakeProbe {
 }
 
 impl FakeProbe {
-    #[cfg_attr(not(test), expect(dead_code, reason = "wired in increment 3"))]
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "test double; the daemon uses LiveProbe")
+    )]
     #[must_use]
     pub fn protected() -> Self {
         Self {

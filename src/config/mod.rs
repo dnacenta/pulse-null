@@ -132,6 +132,9 @@ static RECEIPTS_ENV_LOCK: Mutex<()> = Mutex::new(());
 struct ReceiptsEnvHold {
     release: bool,
     _guard: Option<std::sync::MutexGuard<'static, ()>>,
+    /// Same lock as a test that forks or changes the dumpable flag.
+    #[cfg(test)]
+    _process: Option<crate::process_state::Hold>,
 }
 
 impl Drop for ReceiptsEnvHold {
@@ -149,8 +152,12 @@ fn hold_receipts_env() -> ReceiptsEnvHold {
         return ReceiptsEnvHold {
             release: false,
             _guard: None,
+            #[cfg(test)]
+            _process: None,
         };
     }
+    #[cfg(test)]
+    let process = crate::process_state::Hold::acquire();
     let guard = RECEIPTS_ENV_LOCK
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -158,6 +165,8 @@ fn hold_receipts_env() -> ReceiptsEnvHold {
     ReceiptsEnvHold {
         release: true,
         _guard: Some(guard),
+        #[cfg(test)]
+        _process: Some(process),
     }
 }
 
@@ -327,6 +336,9 @@ static RULES_ENV_LOCK: Mutex<()> = Mutex::new(());
 struct RulesEnvHold {
     release: bool,
     _guard: Option<std::sync::MutexGuard<'static, ()>>,
+    /// Same lock as a test that forks or changes the dumpable flag.
+    #[cfg(test)]
+    _process: Option<crate::process_state::Hold>,
 }
 
 impl Drop for RulesEnvHold {
@@ -345,8 +357,12 @@ fn hold_rules_env() -> RulesEnvHold {
         return RulesEnvHold {
             release: false,
             _guard: None,
+            #[cfg(test)]
+            _process: None,
         };
     }
+    #[cfg(test)]
+    let process = crate::process_state::Hold::acquire();
     let guard = RULES_ENV_LOCK
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -354,6 +370,8 @@ fn hold_rules_env() -> RulesEnvHold {
     RulesEnvHold {
         release: true,
         _guard: Some(guard),
+        #[cfg(test)]
+        _process: Some(process),
     }
 }
 

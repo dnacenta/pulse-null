@@ -1,6 +1,6 @@
 # Receipts
 
-The daemon does not open a receipt file yet. `pulse-null receipts verify` and `pulse-null receipts show` read one. The store below is what a later slice opens.
+The daemon opens a receipt file when receipts are on. They are off unless `[receipts] enabled` is true or `PULSE_NULL_RECEIPTS=required`. `pulse-null receipts verify` and `pulse-null receipts show` read a file and do not write one.
 
 ## Row
 
@@ -18,17 +18,23 @@ A stored line must be exactly the canonical form. A torn line is a line that is 
 
 ## Store
 
-`[receipts] path` is the file. When that key is absent or empty, the file is `/var/lib/pulse-null/<pulse>/receipts.jsonl`. `--file` wins. `verify` and `show` do not lock the file and do not repair it.
+`[receipts] path` is the file the daemon opens when receipts are on and protection is not required. When that key is absent or empty, the file is `/var/lib/pulse-null/<pulse>/receipts.jsonl`. `--file` wins for `verify` and `show`. Those commands do not lock the file and do not repair it.
 
-The process reads `LISTEN_PID`, `LISTEN_FDS`, and `LISTEN_FDNAMES` once, before the runtime starts, and the store takes that snapshot. It uses a systemd fd named `receipts` only when the pid is this process and the name is present. `FD_CLOEXEC` is set before the fd is checked. The fd must be a regular file open for reading and writing and for append. Any other fd is closed and refused. When that name was not passed in, open returns not-used and the caller chooses the path. A path open is dev mode: it refuses a symlink or anything that is not a regular file, creates a missing file, and refuses a file over 256 MiB. A second open fails while the first holds the lock.
+`PULSE_NULL_RECEIPTS=required` forces receipts on and protection required. The pulse-writable file cannot turn that off, and `[receipts] path` is not opened. Any other non-empty value of that variable is ignored. With `require_protected = true` and no systemd fd, the daemon serves and writes nothing.
 
-Path mode replaces a file only when it is empty, or when it contains no newline and the bytes are not a complete valid genesis. It logs that replacement. A newline-terminated damaged first line (a bit flip, a non-canonical genesis, a BOM) is broken at line 1 in both modes, and the file stays as it is. Systemd-fd mode never truncates. An empty file, or a first line with no newline that is not a complete genesis, is refused there: the message names the file and says to rotate it. A complete genesis with no newline gets that newline and opens.
+The daemon honours `[receipts] path` only when `require_protected` is false and the variable is not `required`, and only when the path resolves under the pulse directory or `/var/lib/pulse-null/<pulse>/`. The parent is canonicalised, so a symlink that leaves those directories is refused. A `..` component is refused. A symlink at the file itself is refused. The parent must already exist; a refused path creates nothing.
+
+The process reads `LISTEN_PID`, `LISTEN_FDS`, and `LISTEN_FDNAMES` once, before the runtime starts, and the store takes that snapshot. It uses a systemd fd named `receipts` only when the pid is this process and the name is present. One pulse adopts that fd. Another pulse in the same process logs that the fd is already in use and writes nothing. `FD_CLOEXEC` is set before the fd is checked. The fd must be a regular file open for reading and writing and for append. Any other fd is closed and refused. When that name was not passed in, open returns not-used and the caller chooses the path. A path open is dev mode: it refuses a symlink or anything that is not a regular file, creates a missing file in a directory that already exists, and refuses a file over 256 MiB. A second open fails while the first holds the lock.
+
+A non-empty file that does not start with this pulse's genesis row is left byte for byte as it was, including a bit-flipped, non-canonical, or BOM-prefixed first line. The daemon logs that, serves, and writes nothing. An empty path file gets a genesis row. Systemd-fd mode never truncates. An empty systemd fd, or a first line that is not this pulse's genesis, is refused: the message names the file and says to rotate it. A complete genesis with no newline gets that newline and opens. A damaged line after a valid genesis is broken at that line, and the file stays as it is.
 
 A row and its newline are one write, then `sync_all`. If the file is valid once a missing `\n` is added, the store appends that `\n` and writes no recover row. If the last line is torn (not valid UTF-8 JSON), the store appends a newline when it is missing and then a `recover` row, as one write when both are needed. A torn line that already has later rows stays where it is. A line that is valid JSON but not a valid row is not repaired.
 
-An append that fails poisons the store. The next append re-reads the tail and repairs it the same way open does, then writes a `gap` row (`dropped`, `first_at`, `last_at`) and the new row. A row that actually landed is not counted in `dropped`. The store does not truncate on that path. The daemon wires this up in a later slice.
+An append that fails poisons the store. The next append re-reads the tail and repairs it the same way open does, then writes a `gap` row (`dropped`, `first_at`, `last_at`) and the new row. A row that actually landed is not counted in `dropped`. The store does not truncate on that path. The daemon queues rows on a bounded channel and writes that gap when the channel overflowed or an append failed.
 
-Protection is five checks, all required: the fd came from systemd, the owner is uid 0, the mode is not group- or world-writable, the append-only flag is set, and the parent directory is owned by uid 0 and not group- or world-writable. A path open fails the systemd check, so it is not protected. That is reported, not refused, until a later slice.
+Protection is five checks, all required: the fd came from systemd, the owner is uid 0, the mode is not group- or world-writable, the append-only flag is set, and the parent directory is owned by uid 0 and not group- or world-writable. A path open fails the systemd check, so it is not protected. When protection is required and the file is not protected, the daemon serves and writes nothing. `/health` reports `receipts.state` as `off`, `ok`, `degraded`, `unprotected`, or `unavailable`, and `receipts.seq` when the writer is appending.
+
+The boot row's identity hashes `SELF.md`, `pulse-null.toml`, and the files under `[pulse] rules_dir`. A symlink to a regular file is followed. A fifo is skipped so boot does not block. A file that cannot be read stays in the hash as unreadable and does not drop the rest. The reads run off the runtime's worker.
 
 `verify` prints the file it checked, whether that path came from `--file`, `[receipts] path`, or the default, and those five checks. A `[receipts] path` the pulse can write can point `verify` at a decoy file. The printed path, where it came from, and the protection checks are how an operator notices. Production verification should use `--file` on the root-owned path.
 

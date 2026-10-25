@@ -40,6 +40,12 @@ pub fn validate(config: &Config) -> Result<(), ConfigError> {
 }
 
 /// `[receipts]`: `content` is `digest`, and a set path is a file path.
+///
+/// The path is opened only when receipts are on and protection is not
+/// required (`require_protected` is false and `PULSE_NULL_RECEIPTS` is not
+/// `required`). It must then resolve under the pulse directory or
+/// `/var/lib/pulse-null/<pulse>/`. A `..` component is refused here; the
+/// directory check happens when the daemon opens the file.
 fn validate_receipts(receipts: &super::ReceiptsConfig) -> Result<(), ConfigError> {
     if receipts.content != "digest" {
         return Err(ConfigError::Validation(format!(

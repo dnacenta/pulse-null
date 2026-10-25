@@ -9488,8 +9488,22 @@ mod receipt_turns {
         )
         .await;
         let app = build_app(state);
-        let (status, _) = post_chat(&app, "hello").await;
+        let (status, body) = post_chat(&app, "hello").await;
         assert_eq!(status, StatusCode::OK);
+        let reply: serde_json::Value = serde_json::from_str(&body).unwrap();
+        let allowed = [
+            "response",
+            "model",
+            "input_tokens",
+            "output_tokens",
+            "isolation",
+            "truncated",
+        ];
+        for key in reply.as_object().unwrap().keys() {
+            assert!(allowed.contains(&key.as_str()), "{key} {body}");
+        }
+        assert!(reply.get("receipts").is_none(), "{body}");
+        assert!(reply.get("fallback_used").is_none(), "{body}");
         assert!(!path.exists());
         let snap = health(&app).await;
         assert_eq!(snap["receipts"]["state"], "off");

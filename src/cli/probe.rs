@@ -488,15 +488,17 @@ fn run_status_word(status: RunStatus) -> console::StyledObject<&'static str> {
 /// What a paired-fact answer depends on besides the model: the recall-echo
 /// version and where the graph lives.
 async fn memory_components(recall_bin: &str, server_graph: bool) -> String {
-    let version = tokio::time::timeout(
-        std::time::Duration::from_secs(20),
-        tokio::process::Command::new(recall_bin)
-            .arg("--version")
-            .env_clear()
-            .stdin(std::process::Stdio::null())
-            .kill_on_drop(true)
-            .output(),
-    )
+    let version = tokio::time::timeout(std::time::Duration::from_secs(20), async {
+        let child = crate::process_state::during_fork(|| {
+            tokio::process::Command::new(recall_bin)
+                .arg("--version")
+                .env_clear()
+                .stdin(std::process::Stdio::null())
+                .kill_on_drop(true)
+                .spawn()
+        })?;
+        child.wait_with_output().await
+    })
     .await
     .ok()
     .and_then(Result::ok)

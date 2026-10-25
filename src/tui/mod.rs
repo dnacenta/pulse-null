@@ -444,10 +444,15 @@ async fn run_wizard(target: &std::path::Path) -> Result<(), String> {
     };
     let mut dir_arg = std::ffi::OsString::from("--dir=");
     dir_arg.push(target);
-    let status = tokio::process::Command::new(exe)
-        .arg("init")
-        .arg(dir_arg)
-        .status()
+    let mut child = crate::process_state::during_fork(|| {
+        tokio::process::Command::new(exe)
+            .arg("init")
+            .arg(dir_arg)
+            .spawn()
+    })
+    .map_err(|e| format!("could not start the wizard: {e}"))?;
+    let status = child
+        .wait()
         .await
         .map_err(|e| format!("could not start the wizard: {e}"))?;
     if status.success() {

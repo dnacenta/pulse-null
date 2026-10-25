@@ -128,6 +128,7 @@ pub(super) fn isolation_command_reply(
             output_tokens: None,
             isolation: isolated,
             truncated: false,
+            fallback_used: false,
         }),
         isolation::Intercept::None => None,
     }
@@ -681,7 +682,7 @@ pub(super) async fn commit_turn(
     );
     release_and_persist(turn, session).await;
     emit_post_interaction(turn, &interaction);
-    turn_response(turn, result)
+    turn_response(turn, result, quarantined)
 }
 
 /// A turn that flipped to isolated mid-flight must not write after the
@@ -1017,7 +1018,11 @@ fn audit_interaction(
 
 /// The response. The sticky isolation banner goes to trusted consumers; it
 /// is concealed from guests (the operating posture is not their business).
-fn turn_response(turn: &TurnScope<'_>, result: ToolLoopResult) -> ChatResponse {
+fn turn_response(
+    turn: &TurnScope<'_>,
+    result: ToolLoopResult,
+    fallback_used: bool,
+) -> ChatResponse {
     let reveal = turn.isolated && !turn.key.is_guest();
     let response = if reveal {
         isolation::banner_wrap(result.text)
@@ -1031,6 +1036,7 @@ fn turn_response(turn: &TurnScope<'_>, result: ToolLoopResult) -> ChatResponse {
         output_tokens: Some(result.output_tokens),
         isolation: reveal,
         truncated: result.was_truncated,
+        fallback_used,
     }
 }
 

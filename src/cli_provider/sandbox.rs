@@ -284,7 +284,7 @@ impl PreparedSandbox {
         // The child leads a process group of its own, so what it starts and
         // leaves running can be killed with it ([`GroupGuard`]).
         cmd.process_group(0);
-        let child = cmd.spawn();
+        let child = crate::process_state::during_fork(|| cmd.spawn());
         drop(self);
         child
     }

@@ -303,7 +303,7 @@ impl PulseCommand {
             Some(sandbox) => sandbox.spawn(self.cmd).await,
             None => {
                 let mut cmd = self.cmd;
-                cmd.spawn()
+                crate::process_state::during_fork(|| cmd.spawn())
             }
         }
     }
