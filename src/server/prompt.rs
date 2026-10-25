@@ -1774,6 +1774,45 @@ fn pulse_rule_meta_ok(
     }
 }
 
+/// Why `file` fails the strict config-file check. `None` when it passes.
+/// The check is [`pulse_rule_meta_ok`] with strict mode, plus `fstatfs` of
+/// this descriptor.
+pub(crate) fn strict_config_file_block(
+    file: &std::fs::File,
+    meta: &std::fs::Metadata,
+) -> Option<String> {
+    use std::os::unix::fs::MetadataExt;
+    strict_config_file_reject(meta.uid(), meta.mode(), meta.nlink(), fs_type_of_file(file))
+}
+
+/// Injectable form of [`strict_config_file_block`]. `fs` is the `fstatfs`
+/// result. Root-owned, one link, mode `0644`, and a non-FUSE type pass.
+#[must_use]
+pub(crate) fn strict_config_file_reject(
+    uid: u32,
+    mode: u32,
+    nlink: u64,
+    fs: Result<i64, String>,
+) -> Option<String> {
+    if let Err(reason) = pulse_rule_meta_ok(uid, mode, nlink, 0, true) {
+        return Some(reason.to_string());
+    }
+    fs_block_reason(true, fs)
+}
+
+/// Directories strictly below `pulse_root` and above `file`, checked the
+/// same way as the rules walk (root-owned, not group- or world-writable,
+/// not FUSE). The pulse root itself is not one of them.
+#[must_use]
+pub(crate) fn strict_config_dir_block(pulse_root: &Path, file: &Path) -> Option<(PathBuf, String)> {
+    let parent = file.parent()?;
+    match parent.strip_prefix(pulse_root) {
+        Ok(rest) if rest.as_os_str().is_empty() => None,
+        Ok(_) => strict_rules_dir_block(pulse_root, parent),
+        Err(_) => Some((parent.to_path_buf(), "not under the pulse root".to_string())),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Platform Awareness — AWARENESS.md manifest generation
 // ---------------------------------------------------------------------------
@@ -3162,6 +3201,20 @@ mod tests {
         let open = rules_component(&rules, &[], RulesSource::Pulse, &config)
             .expect("non-strict loads the file");
         assert!(open.content.contains("PULSE-OWNED-RULE"));
+    }
+
+    #[test]
+    fn strict_config_does_not_require_the_pulse_root_to_be_root_owned() {
+        let root = tempfile::tempdir().unwrap();
+        let file = root.path().join("pulse-null.toml");
+        assert!(strict_config_dir_block(root.path(), &file).is_none());
+
+        let nested = root.path().join("nested");
+        std::fs::create_dir(&nested).unwrap();
+        let (path, reason) =
+            strict_config_dir_block(root.path(), &nested.join("pulse-null.toml")).unwrap();
+        assert_eq!(path, nested);
+        assert_eq!(reason, "not owned by root");
     }
 
     #[test]

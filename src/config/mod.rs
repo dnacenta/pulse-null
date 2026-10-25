@@ -122,13 +122,20 @@ pub struct PulseConfig {
     /// pulse user): the loader can only check what it can see. False reads
     /// a file the running user or root owns.
     ///
-    /// This key lives in the pulse's `pulse-null.toml`. A pulse that owns its
-    /// home can edit it and turn strict mode off. For a real guarantee set
-    /// `Environment=PULSE_NULL_RULES_REQUIRE_ROOT=1` in the root-owned systemd
-    /// unit. `1`, `true`, and `yes` force strict mode; `0` and `false` leave
-    /// this key; any other value is ignored and warned once. Optionally make
-    /// `pulse-null.toml` root-owned and immutable (`chattr +i`, an operator
-    /// option, not verified here).
+    /// The environment variable is the guarantee, and it is decided before
+    /// this file is trusted. `PULSE_NULL_RULES_REQUIRE_ROOT` set to `1`,
+    /// `true`, or `yes` forces strict mode; `0` and `false` leave this key;
+    /// any other value is ignored and warned once. When strict mode is in
+    /// effect, `pulse-null.toml` must itself be root-owned, one link, not
+    /// group- or world-writable, and not on FUSE, or the pulse is skipped
+    /// and no key (`rules_dir`, the CLI adapter, this one) is taken from it.
+    /// This key counts only after that check passes. A strict deployment
+    /// keeps the file `root:pulse` `0644`. The pulse root is not required to
+    /// be root-owned, so the file must be immutable (`chattr +i`) or
+    /// otherwise non-renamable; that is an operator step and is not verified
+    /// here. A rename inside the pulse-owned directory can replace the file,
+    /// and the replacement fails this check, so the pulse is skipped
+    /// (unloadable) rather than run from the replacement.
     #[serde(default)]
     pub rules_require_root: bool,
 }
@@ -566,23 +573,30 @@ impl Default for ServerConfig {
 }
 
 impl Config {
-    /// Load config from echo-system.toml in the current directory
+    /// Load config from pulse-null.toml in the current directory
     pub fn load() -> Result<Self, crate::errors::ConfigError> {
         let path = Self::find_config()?;
-        let content = std::fs::read_to_string(&path)?;
-        let mut config = Self::from_toml_str(&content)?;
-        for notice in config.llm.normalize() {
-            tracing::warn!("{}: {}", path.display(), notice);
-        }
-        validate::validate(&config)?;
-        Ok(config)
+        Self::load_path(&path)
     }
 
     /// Load config from a specific directory
     pub fn load_from(dir: &std::path::Path) -> Result<Self, crate::errors::ConfigError> {
-        let path = dir.join(CONFIG_FILENAME);
-        let content = std::fs::read_to_string(&path)?;
+        Self::load_path(&dir.join(CONFIG_FILENAME))
+    }
+
+    fn load_path(path: &std::path::Path) -> Result<Self, crate::errors::ConfigError> {
+        // The environment is the guarantee: it is decided before the file is
+        // trusted. The file's own key counts only after the file passes.
+        if env_forces_strict_rules() {
+            let content = read_strict_config(path)?;
+            return finish_load(path, &content);
+        }
+        let content = std::fs::read_to_string(path)?;
         let mut config = Self::from_toml_str(&content)?;
+        if config.pulse.rules_require_root {
+            let checked = read_strict_config(path)?;
+            return finish_load(path, &checked);
+        }
         for notice in config.llm.normalize() {
             tracing::warn!("{}: {}", path.display(), notice);
         }
@@ -641,6 +655,60 @@ impl Config {
             .or_else(|| std::env::var("ANTHROPIC_API_KEY").ok())
             .or_else(|| std::env::var("PULSE_NULL_API_KEY").ok())
     }
+}
+
+fn finish_load(
+    path: &std::path::Path,
+    content: &str,
+) -> Result<Config, crate::errors::ConfigError> {
+    let mut config = Config::from_toml_str(content)?;
+    for notice in config.llm.normalize() {
+        tracing::warn!("{}: {}", path.display(), notice);
+    }
+    validate::validate(&config)?;
+    Ok(config)
+}
+
+/// `PULSE_NULL_RULES_REQUIRE_ROOT` forces strict mode. Logged once, same as
+/// [`rules_require_root`]. The file is not consulted.
+fn env_forces_strict_rules() -> bool {
+    let _hold = hold_rules_env();
+    let raw = std::env::var(RULES_REQUIRE_ROOT_ENV).ok();
+    log_rules_require_root_env(raw.as_deref());
+    matches!(rules_env_class(raw.as_deref()), RulesEnvClass::Force)
+}
+
+/// Read `path` only when it passes the strict file check, and every
+/// directory strictly below the pulse root and above the file passes the
+/// same directory walk as the rules loader. The pulse root itself is not
+/// checked: the pulse owns its home, so a strict deployment must make the
+/// file non-renamable. Bytes come from the opened descriptor.
+fn read_strict_config(path: &std::path::Path) -> Result<String, crate::errors::ConfigError> {
+    use std::io::Read;
+    let pulse_root = path.parent().unwrap_or(path);
+    if let Some((blocked, reason)) =
+        crate::server::prompt::strict_config_dir_block(pulse_root, path)
+    {
+        return Err(refuse_strict_config(&blocked, &reason));
+    }
+    let opened = crate::fs_safe::open_regular(path)?;
+    let Some((mut file, meta)) = opened else {
+        return Err(crate::errors::ConfigError::NotFound(format!(
+            "No {} found. Run `pulse-null init` first.",
+            CONFIG_FILENAME
+        )));
+    };
+    if let Some(reason) = crate::server::prompt::strict_config_file_block(&file, &meta) {
+        return Err(refuse_strict_config(path, &reason));
+    }
+    let mut content = String::new();
+    file.read_to_string(&mut content)?;
+    Ok(content)
+}
+
+fn refuse_strict_config(path: &std::path::Path, reason: &str) -> crate::errors::ConfigError {
+    tracing::warn!("Skipping pulse config: {}: {reason}", path.display());
+    crate::errors::ConfigError::Validation(format!("{}: {reason}", path.display()))
 }
 
 fn default_host() -> String {
@@ -1856,6 +1924,19 @@ mod pulse_rename_tests {
     }
 
     #[test]
+    fn strict_config_file_accepts_root_owned_0644() {
+        // ext4, not FUSE. No chown: the metadata is injected.
+        assert!(
+            crate::server::prompt::strict_config_file_reject(0, 0o644, 1, Ok(0xef53)).is_none()
+        );
+        assert_eq!(
+            crate::server::prompt::strict_config_file_reject(4_242, 0o644, 1, Ok(0xef53))
+                .as_deref(),
+            Some("strict mode wants root")
+        );
+    }
+
+    #[test]
     fn serialises_the_new_names() {
         let cfg = Config::from_toml_str(&format!("{}{REST}", identity("entity"))).unwrap();
         let text = toml::to_string(&cfg).unwrap();
@@ -1863,6 +1944,107 @@ mod pulse_rename_tests {
         assert!(text.contains("[caliber]"), "{text}");
         assert!(!text.contains("[entity]"), "{text}");
         assert!(text.contains("pulse_filter"), "{text}");
+    }
+}
+
+#[cfg(test)]
+mod strict_config_load_tests {
+    use super::*;
+
+    fn body(rules_require_root: bool) -> String {
+        format!(
+            "[pulse]\nname = \"Echo\"\nowner_name = \"D\"\nowner_alias = \"D\"\n\
+             rules_require_root = {rules_require_root}\n\
+             [server]\nport = 3200\n[llm]\nprovider = \"claude-code\"\n[security]\n" // vendor-ok: legacy provider under test
+        )
+    }
+
+    fn write_pulse(dir: &std::path::Path, rules_require_root: bool) -> std::path::PathBuf {
+        let path = dir.join("pulse-null.toml");
+        std::fs::write(&path, body(rules_require_root)).unwrap();
+        path
+    }
+
+    fn warnings_from(run: impl FnOnce()) -> String {
+        let buf = std::sync::Arc::new(std::sync::Mutex::new(Vec::<u8>::new()));
+        let sink = std::sync::Arc::clone(&buf);
+        let subscriber = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::WARN)
+            .with_ansi(false)
+            .without_time()
+            .with_target(false)
+            .with_writer(move || LogSink(std::sync::Arc::clone(&sink)))
+            .finish();
+        tracing::subscriber::with_default(subscriber, run);
+        let guard = buf.lock().unwrap();
+        String::from_utf8(guard.clone()).unwrap()
+    }
+
+    struct LogSink(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for LogSink {
+        fn write(&mut self, data: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(data);
+            Ok(data.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    fn assert_refused(dir: &std::path::Path) {
+        let path = dir.join("pulse-null.toml");
+        let err = Config::load_from(dir).unwrap_err().to_string();
+        assert!(err.contains(&path.display().to_string()), "{err}");
+        assert!(err.contains("strict mode wants root"), "{err}");
+    }
+
+    #[test]
+    fn strict_load_refuses_a_pulse_owned_config() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_pulse(dir.path(), true);
+        let log = warnings_from(|| assert_refused(dir.path()));
+        assert!(
+            log.contains("Skipping pulse config:")
+                && log.contains(&path.display().to_string())
+                && log.contains("strict mode wants root"),
+            "{log}"
+        );
+    }
+
+    #[test]
+    fn non_strict_load_accepts_a_pulse_owned_config() {
+        let dir = tempfile::tempdir().unwrap();
+        write_pulse(dir.path(), false);
+        let config = Config::load_from(dir.path()).unwrap();
+        assert_eq!(config.pulse.name, "Echo");
+        assert!(!config.pulse.rules_require_root);
+    }
+
+    #[test]
+    fn env_forces_strict_load_of_a_pulse_owned_config() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_pulse(dir.path(), false);
+        let log = warnings_from(|| {
+            with_rules_require_root_env(|| {
+                std::env::set_var(RULES_REQUIRE_ROOT_ENV, "1");
+                struct Clear;
+                impl Drop for Clear {
+                    fn drop(&mut self) {
+                        std::env::remove_var(RULES_REQUIRE_ROOT_ENV);
+                    }
+                }
+                let _clear = Clear;
+                assert_refused(dir.path());
+            });
+        });
+        assert!(
+            log.contains("Skipping pulse config:")
+                && log.contains(&path.display().to_string())
+                && log.contains("strict mode wants root"),
+            "{log}"
+        );
     }
 }
 
