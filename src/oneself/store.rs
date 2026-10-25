@@ -167,7 +167,7 @@ pub struct ReceiptStore {
     gap_first: Option<String>,
     gap_last: Option<String>,
     #[cfg(test)]
-    fail_writes: u32,
+    fault: Option<RecordFault>,
 }
 
 impl std::fmt::Debug for ReceiptStore {
@@ -219,37 +219,17 @@ impl ReceiptStore {
         let mut recovered = false;
         let mut repaired_newline = false;
         let mut recreated = false;
-        match class {
-            Class::Ready => {}
-            Class::MissingNewline => {
-                write_all_sync(&mut file, b"\n")?;
-                repaired_newline = true;
+        match repair_class(&mut file, class)? {
+            RepairKind::Ready => {}
+            RepairKind::Newline => repaired_newline = true,
+            RepairKind::Recovered => recovered = true,
+            RepairKind::Broken(note) => {
+                return Err(StoreError::Broken {
+                    line: note.line,
+                    reason: note.reason,
+                });
             }
-            Class::Torn {
-                offset,
-                torn,
-                needs_newline,
-                seq,
-                prev,
-            } => {
-                if needs_newline {
-                    write_all_sync(&mut file, b"\n")?;
-                }
-                let line = encode_line(
-                    seq,
-                    &prev,
-                    &now_ts(),
-                    &ReceiptEvent::Recover {
-                        torn_offset: offset,
-                        torn_len: u64::try_from(torn.len()).map_err(|_| StoreError::Row)?,
-                        torn_sha256: chain::sha256_hex(&torn),
-                    },
-                )?;
-                write_all_sync(&mut file, line.as_bytes())?;
-                write_all_sync(&mut file, b"\n")?;
-                recovered = true;
-            }
-            Class::NoRow => {
+            RepairKind::NoRow => {
                 if from_systemd {
                     return Err(StoreError::Rotate {
                         path: fd_path(file.as_raw_fd()),
@@ -281,12 +261,6 @@ impl ReceiptStore {
                 }
                 recreated = true;
             }
-            Class::Broken(note) => {
-                return Err(StoreError::Broken {
-                    line: note.line,
-                    reason: note.reason,
-                });
-            }
         }
         let bytes = read_all(&mut file)?;
         let report = chain::verify_lines(bytes.as_slice());
@@ -309,7 +283,7 @@ impl ReceiptStore {
             gap_first: None,
             gap_last: None,
             #[cfg(test)]
-            fail_writes: 0,
+            fault: None,
         };
         Ok((
             store,
@@ -334,19 +308,67 @@ impl ReceiptStore {
             return Err(StoreError::Row);
         }
         if self.poisoned {
-            self.write_gap()?;
+            self.resync()?;
+            if self.poisoned {
+                self.write_gap()?;
+            }
         }
         self.write_event(&event)
     }
 
     #[cfg(test)]
     fn fail_next_write(&mut self) {
-        self.fail_writes = 1;
+        self.fault = Some(RecordFault::Before);
+    }
+
+    #[cfg(test)]
+    fn fail_record(&mut self, fault: RecordFault) {
+        self.fault = Some(fault);
     }
 
     #[cfg(test)]
     fn is_poisoned(&self) -> bool {
         self.poisoned
+    }
+
+    /// Re-read the tail after a failed append and repair it the way open does.
+    /// A row that actually landed is not counted as dropped. Nothing is truncated.
+    fn resync(&mut self) -> Result<(), StoreError> {
+        let attempted = self.next_seq;
+        let bytes = read_all(&mut self.file)?;
+        let class = classify(&bytes)?;
+        match repair_class(&mut self.file, class)? {
+            RepairKind::NoRow => return Err(StoreError::Row),
+            RepairKind::Broken(note) => {
+                return Err(StoreError::Broken {
+                    line: note.line,
+                    reason: note.reason,
+                });
+            }
+            RepairKind::Ready | RepairKind::Newline | RepairKind::Recovered => {}
+        }
+        let bytes = read_all(&mut self.file)?;
+        let report = chain::verify_lines(bytes.as_slice());
+        if let Some(note) = &report.first_break {
+            return Err(StoreError::Broken {
+                line: note.line,
+                reason: note.reason,
+            });
+        }
+        if committed_attempt(&bytes, attempted) {
+            self.dropped = self.dropped.saturating_sub(1);
+            if self.dropped == 0 {
+                self.poisoned = false;
+                self.gap_first = None;
+                self.gap_last = None;
+            }
+        }
+        self.next_seq = match report.seq {
+            None => 0,
+            Some(seq) => seq.checked_add(1).ok_or(StoreError::Row)?,
+        };
+        self.prev = report.head.clone();
+        Ok(())
     }
 
     fn write_gap(&mut self) -> Result<(), StoreError> {
@@ -398,14 +420,117 @@ impl ReceiptStore {
 
     fn write_record(&mut self, line: &[u8]) -> std::io::Result<()> {
         #[cfg(test)]
-        if self.fail_writes > 0 {
-            self.fail_writes -= 1;
-            return Err(std::io::Error::other("injected append failure"));
+        if let Some(fault) = self.fault.take() {
+            return apply_fault(&mut self.file, line, fault);
         }
         write_all_sync(&mut self.file, line)?;
         write_all_sync(&mut self.file, b"\n")?;
         Ok(())
     }
+}
+
+#[cfg(test)]
+enum RecordFault {
+    /// The write returns before any byte of the record.
+    Before,
+    /// Half of the line is written, then the write returns a storage error.
+    Half,
+    /// The line is written and its newline is not.
+    NoNewline,
+    /// The line and its newline are written, then `sync` fails.
+    Sync,
+    /// No byte is written. The error is a full disk.
+    DiskFull,
+}
+
+#[cfg(test)]
+fn apply_fault(file: &mut File, line: &[u8], fault: RecordFault) -> std::io::Result<()> {
+    let full = || std::io::Error::new(std::io::ErrorKind::StorageFull, "injected short write");
+    match fault {
+        RecordFault::Before => Err(std::io::Error::other("injected append failure")),
+        RecordFault::DiskFull => Err(full()),
+        RecordFault::Half => {
+            let n = line.len() / 2;
+            if n > 0 {
+                file.write_all(&line[..n])?;
+            }
+            Err(full())
+        }
+        RecordFault::NoNewline => {
+            file.write_all(line)?;
+            Err(full())
+        }
+        RecordFault::Sync => {
+            let mut record = Vec::with_capacity(line.len() + 1);
+            record.extend_from_slice(line);
+            record.push(b'\n');
+            file.write_all(&record)?;
+            Err(std::io::Error::other("injected sync failure"))
+        }
+    }
+}
+
+enum RepairKind {
+    Ready,
+    Newline,
+    Recovered,
+    NoRow,
+    Broken(VerifyNote),
+}
+
+/// Tail repair shared by open and by a poisoned append. `NoRow` is not written
+/// here: only open may replace an empty file, and it never truncates a file
+/// that already has a finished line.
+fn repair_class(file: &mut File, class: Class) -> Result<RepairKind, StoreError> {
+    match class {
+        Class::Ready => Ok(RepairKind::Ready),
+        Class::MissingNewline => {
+            write_all_sync(file, b"\n")?;
+            Ok(RepairKind::Newline)
+        }
+        Class::Torn {
+            offset,
+            torn,
+            needs_newline,
+            seq,
+            prev,
+        } => {
+            if needs_newline {
+                write_all_sync(file, b"\n")?;
+            }
+            let line = encode_line(
+                seq,
+                &prev,
+                &now_ts(),
+                &ReceiptEvent::Recover {
+                    torn_offset: offset,
+                    torn_len: u64::try_from(torn.len()).map_err(|_| StoreError::Row)?,
+                    torn_sha256: chain::sha256_hex(&torn),
+                },
+            )?;
+            write_all_sync(file, line.as_bytes())?;
+            write_all_sync(file, b"\n")?;
+            Ok(RepairKind::Recovered)
+        }
+        Class::NoRow => Ok(RepairKind::NoRow),
+        Class::Broken(note) => Ok(RepairKind::Broken(note)),
+    }
+}
+
+fn committed_attempt(bytes: &[u8], attempted: u64) -> bool {
+    let Ok(text) = std::str::from_utf8(bytes) else {
+        return false;
+    };
+    let Some(line) = text.lines().rev().find(|line| !line.is_empty()) else {
+        return false;
+    };
+    let Ok(row) = serde_json::from_str::<chain::Row>(line) else {
+        return false;
+    };
+    let Ok(event) = serde_json::from_value::<ReceiptEvent>(row.e) else {
+        return false;
+    };
+    row.seq == attempted && !matches!(event, ReceiptEvent::Recover { .. })
 }
 
 enum Class {
@@ -918,6 +1043,103 @@ mod tests {
             chain::verify_lines(after.as_slice()).state(),
             VerifyState::Ok
         );
+    }
+
+    fn gap_dropped(bytes: &[u8]) -> Option<u64> {
+        let text = std::str::from_utf8(bytes).unwrap();
+        text.lines().find_map(|line| {
+            let row: chain::Row = serde_json::from_str(line).ok()?;
+            let event = serde_json::from_value::<ReceiptEvent>(row.e).ok()?;
+            match event {
+                ReceiptEvent::Gap { dropped, .. } => Some(dropped),
+                _ => None,
+            }
+        })
+    }
+
+    fn assert_accepts(path: &Path) {
+        let bytes = std::fs::read(path).unwrap();
+        let state = chain::verify_lines(bytes.as_slice()).state();
+        assert_ne!(state, VerifyState::Broken, "{state:?} {bytes:?}");
+        let _ =
+            ReceiptStore::open(StoreSource::Path(path.to_path_buf()), &LiveProbe, "echo").unwrap();
+    }
+
+    #[test]
+    fn a_short_write_is_repaired_before_the_gap() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("receipts.jsonl");
+        let (mut store, _) = open_path(dir.path());
+        store.fail_record(RecordFault::Half);
+        let err = store.append(shutdown()).unwrap_err();
+        assert!(err.to_string().contains("poisoned"), "{err}");
+        store.append(shutdown()).unwrap();
+        let bytes = std::fs::read(&path).unwrap();
+        assert_eq!(gap_dropped(&bytes), Some(1));
+        assert_eq!(
+            chain::verify_lines(bytes.as_slice()).state(),
+            VerifyState::Warn
+        );
+        drop(store);
+        assert_accepts(&path);
+    }
+
+    #[test]
+    fn a_row_missing_its_newline_is_kept_and_not_counted_dropped() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("receipts.jsonl");
+        let (mut store, _) = open_path(dir.path());
+        store.fail_record(RecordFault::NoNewline);
+        store.append(shutdown()).unwrap_err();
+        store.append(shutdown()).unwrap();
+        let bytes = std::fs::read(&path).unwrap();
+        assert_eq!(gap_dropped(&bytes), None);
+        assert_eq!(
+            chain::verify_lines(bytes.as_slice()).state(),
+            VerifyState::Ok
+        );
+        drop(store);
+        assert_accepts(&path);
+    }
+
+    #[test]
+    fn a_failed_sync_does_not_repeat_the_row() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("receipts.jsonl");
+        let (mut store, _) = open_path(dir.path());
+        store.fail_record(RecordFault::Sync);
+        store.append(shutdown()).unwrap_err();
+        store.append(shutdown()).unwrap();
+        let bytes = std::fs::read(&path).unwrap();
+        assert_eq!(gap_dropped(&bytes), None);
+        let report = chain::verify_lines(bytes.as_slice());
+        assert_eq!(report.state(), VerifyState::Ok, "{report:?}");
+        assert_eq!(report.rows, 3);
+        drop(store);
+        assert_accepts(&path);
+    }
+
+    #[test]
+    fn a_full_disk_counts_the_lost_append_in_the_gap() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("receipts.jsonl");
+        let (mut store, _) = open_path(dir.path());
+        store.fail_record(RecordFault::DiskFull);
+        let err = store.append(shutdown()).unwrap_err();
+        let StoreError::Append { source, dropped } = err else {
+            panic!("expected append");
+        };
+        assert_eq!(dropped, 1);
+        assert_eq!(source.kind(), std::io::ErrorKind::StorageFull);
+        store.append(shutdown()).unwrap();
+        let bytes = std::fs::read(&path).unwrap();
+        assert_eq!(gap_dropped(&bytes), Some(1));
+        assert_eq!(
+            chain::verify_lines(bytes.as_slice()).state(),
+            VerifyState::Ok
+        );
+        drop(store);
+        assert_accepts(&path);
     }
 
     #[test]
