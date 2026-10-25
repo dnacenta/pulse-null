@@ -1101,4 +1101,151 @@ mod tests {
             assert_eq!(note(&report), (2, "not canonical"), "{line}");
         }
     }
+
+    #[test]
+    fn edge_cases_are_pinned() {
+        let min = i64::MIN.to_string();
+        let max_i = i64::MAX.to_string();
+        let max_u = u64::MAX.to_string();
+        for text in [&min, &max_i, &max_u] {
+            let value: Value = serde_json::from_str(text).unwrap();
+            assert_eq!(canonical(&value).unwrap(), *text);
+            assert_eq!(crate::vigil::probe::record::canonical_json(&value), *text);
+        }
+        let past_u64 = (u128::from(u64::MAX) + 1).to_string();
+        for text in ["-0", "1e2", "1E2", "1.0", "1e23", past_u64.as_str()] {
+            let value: Value = serde_json::from_str(text).unwrap_or_else(|_| panic!("{text}"));
+            assert_eq!(canonical(&value), Err(ChainError::Float), "{text}");
+        }
+
+        let (genesis, prev) = line_of(
+            0,
+            GENESIS_PREV,
+            TS0,
+            &ReceiptEvent::Genesis {
+                pulse: "echo".to_string(),
+            },
+        );
+        let (wide, _) = line_of(
+            1,
+            &prev,
+            TS1,
+            &ReceiptEvent::Gap {
+                dropped: u64::MAX,
+                first_at: TS0.to_string(),
+                last_at: TS1.to_string(),
+            },
+        );
+        let ok = verify_lines(format!("{genesis}\n{wide}\n").as_bytes());
+        assert_eq!(ok.state(), VerifyState::Ok, "{ok:?}");
+        let blown = wide.replacen(&max_u, &past_u64, 1);
+        assert_eq!(
+            note(&verify_lines(format!("{genesis}\n{blown}\n").as_bytes())),
+            (2, "float")
+        );
+
+        let (base, row) = shutdown_after_genesis();
+        let dup_kind = row.replace(
+            "\"kind\":\"shutdown\"",
+            "\"kind\":\"genesis\",\"kind\":\"shutdown\"",
+        );
+        let dup_seq = row.replace("\"seq\":1", "\"seq\":99,\"seq\":1");
+        let spaced = row.replace(',', ", ");
+        let escaped = row.replace("\"reason\":\"stop\"", "\"reason\":\"\\u0073top\"");
+        let parsed: Value = serde_json::from_str(&row).unwrap();
+        let row_prev = parsed["prev"].as_str().unwrap();
+        let reordered = format!(
+            "{{\"v\":1,\"ts\":\"{TS1}\",\"seq\":1,\"prev\":\"{row_prev}\",\"e\":{{\"reason\":\"stop\",\"kind\":\"shutdown\"}}}}"
+        );
+        let seq0 = line_of(
+            0,
+            GENESIS_PREV,
+            TS0,
+            &ReceiptEvent::Shutdown {
+                reason: "x".to_string(),
+            },
+        )
+        .0;
+        let second = line_of(
+            1,
+            &prev,
+            TS1,
+            &ReceiptEvent::Genesis {
+                pulse: "other".to_string(),
+            },
+        )
+        .0;
+        let reserved = row_from_event(
+            1,
+            &prev,
+            TS1,
+            serde_json::json!({
+                "kind": "close",
+                "stream": "s1",
+                "outcome": "acted",
+                "action_class": "reply",
+                "provider": "cli",
+                "adapter": "recorded",
+                "model": "primary",
+                "fallback": false,
+                "duration_ms": 1,
+                "mailbox_head": {},
+                "folded": null,
+                "fence": null
+            }),
+        );
+        let close = line_of(
+            1,
+            &prev,
+            TS1,
+            &ReceiptEvent::Close {
+                stream: "s1".to_string(),
+                outcome: Outcome::Acted,
+                action_class: ActionClass::Reply,
+                provider: "cli".to_string(),
+                adapter: "recorded".to_string(),
+                model: "primary".to_string(),
+                fallback: false,
+                input_sha256: None,
+                output_sha256: None,
+                tokens_in: None,
+                tokens_out: None,
+                duration_ms: 1,
+                mailbox_head: (),
+                folded: (),
+                fence: (),
+            },
+        )
+        .0;
+        let recover = line_of(
+            1,
+            &prev,
+            TS2,
+            &ReceiptEvent::Recover {
+                torn_offset: u64::try_from(genesis.len() + 1).unwrap(),
+                torn_len: u64::try_from(close.len()).unwrap(),
+                torn_sha256: sha256_hex(close.as_bytes()),
+            },
+        )
+        .0;
+
+        let table = [
+            (format!("{base}\n{dup_kind}\n"), (2usize, "not canonical")),
+            (format!("{base}\n{dup_seq}\n"), (2, "not canonical")),
+            (format!("{base}\n{spaced}\n"), (2, "not canonical")),
+            (format!("{base}\n{escaped}\n"), (2, "not canonical")),
+            (format!("{base}\n{row}\r\n"), (2, "not canonical")),
+            (format!("{base}\n{row} \n"), (2, "not canonical")),
+            (format!("{base}\n{reordered}\n"), (2, "not canonical")),
+            (format!("{seq0}\n"), (1, "genesis")),
+            (format!("{genesis}\n{second}\n"), (2, "genesis")),
+            (format!("{genesis}\n{reserved}\n"), (2, "not a row")),
+            (format!("{genesis}\n{close}\n{recover}\n"), (3, "seq")),
+        ];
+        for (text, expect) in table {
+            let report = verify_lines(text.as_bytes());
+            assert_eq!(note(&report), expect, "{text}");
+            assert!(report.warns.is_empty(), "{text}");
+        }
+    }
 }
