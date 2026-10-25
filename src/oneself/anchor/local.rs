@@ -87,13 +87,15 @@ pub fn lock_ledger(dir: &Path) -> Result<File, AnchorError> {
     Ok(file)
 }
 
-/// `LOCK_NB` once in production, so a second real run fails immediately.
-/// Tests retry for about two seconds: a forked child can hold the descriptor
-/// until it execs, and that window is not a second anchor run.
+/// `LOCK_NB` once, so a second run fails immediately.
 fn flock_exclusive(file: &File) -> Result<(), AnchorError> {
     #[cfg(test)]
     {
-        flock_with_retry(file)
+        if lock_now(file)? {
+            Ok(())
+        } else {
+            Err(AnchorError::Busy)
+        }
     }
     #[cfg(not(test))]
     {
@@ -122,71 +124,6 @@ fn lock_now(file: &File) -> Result<bool, AnchorError> {
             "anchors.lock could not be locked".into(),
         ))
     }
-}
-
-/// About two seconds of `LOCK_NB` when another process holds the lock.
-///
-/// A forked child can inherit the descriptor until it execs. That is not a
-/// second anchor run. A lock already held in this process is refused at once,
-/// which is what a second real run looks like.
-#[cfg(test)]
-fn flock_with_retry(file: &File) -> Result<(), AnchorError> {
-    let mut left = 40u32;
-    loop {
-        if lock_now(file)? {
-            return Ok(());
-        }
-        if held_by_this_process(file) {
-            return Err(AnchorError::Busy);
-        }
-        left -= 1;
-        if left == 0 {
-            return Err(AnchorError::Busy);
-        }
-        std::thread::sleep(std::time::Duration::from_millis(50));
-    }
-}
-
-/// True when this process, not a child, is the one holding `file`'s lock.
-#[cfg(test)]
-fn held_by_this_process(file: &File) -> bool {
-    let Ok(meta) = file.metadata() else {
-        return false;
-    };
-    let inode = meta.ino();
-    let dev = meta.dev();
-    let major = libc::major(dev);
-    let minor = libc::minor(dev);
-    let me = std::process::id();
-    let Ok(text) = std::fs::read_to_string("/proc/locks") else {
-        return false;
-    };
-    for line in text.lines() {
-        let parts: Vec<&str> = line.split_whitespace().collect();
-        if parts.len() < 6 || parts[1] != "FLOCK" || parts[3] != "WRITE" {
-            continue;
-        }
-        let Ok(pid) = parts[4].parse::<u32>() else {
-            continue;
-        };
-        let mut id = parts[5].split(':');
-        let (Some(maj), Some(min), Some(ino)) = (id.next(), id.next(), id.next()) else {
-            continue;
-        };
-        let Ok(maj) = u32::from_str_radix(maj, 16) else {
-            continue;
-        };
-        let Ok(min) = u32::from_str_radix(min, 16) else {
-            continue;
-        };
-        let Ok(ino) = ino.parse::<u64>() else {
-            continue;
-        };
-        if pid == me && ino == inode && maj == major && min == minor {
-            return true;
-        }
-    }
-    false
 }
 
 fn read_history(dir: &Path, owner: Option<u32>) -> Result<Vec<AnchorLine>, AnchorError> {

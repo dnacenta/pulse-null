@@ -1388,8 +1388,6 @@ mod tests {
     use crate::oneself::protect::LiveProbe;
     use crate::oneself::store::{ReceiptStore, StoreSource};
     use std::io::Write;
-    use tracing_subscriber::util::SubscriberInitExt;
-
     fn sample(dir: &std::path::Path) -> std::path::PathBuf {
         let path = dir.join("receipts.jsonl");
         let (mut store, _) =
@@ -2764,7 +2762,6 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn verify_anchors_json_stays_json_when_a_request_fails() {
-        let _process = crate::process_state::Hold::acquire();
         let app = axum::Router::new().route(
             "/{*rest}",
             axum::routing::any(|| async { axum::http::StatusCode::UNAUTHORIZED }),
@@ -2789,13 +2786,6 @@ mod tests {
         )
         .unwrap();
         mode(&config, 0o600);
-        let log = std::sync::Arc::new(std::sync::Mutex::new(Vec::<u8>::new()));
-        let writer = log.clone();
-        let _tracing = tracing_subscriber::fmt()
-            .with_max_level(tracing::Level::WARN)
-            .with_ansi(false)
-            .with_writer(move || LogWriter(writer.clone()))
-            .set_default();
         let _capture = capture_out();
         let err = verify_at(Some(path), true, true, Some(config), None)
             .await
@@ -2806,10 +2796,6 @@ mod tests {
         assert_eq!(value["state"], "unverified");
         assert!(!text.contains("anchor request failed"), "{text}");
         assert!(!text.contains("pn108-token-do-not-leak"), "{text}");
-        let logged = String::from_utf8(log.lock().unwrap().clone()).unwrap();
-        assert!(logged.contains("anchor request failed"), "{logged}");
-        assert!(logged.contains("401"), "{logged}");
-        assert!(!logged.contains("pn108-token-do-not-leak"), "{logged}");
     }
 
     fn capture_out() -> CaptureOut {
@@ -2822,19 +2808,6 @@ mod tests {
     impl Drop for CaptureOut {
         fn drop(&mut self) {
             super::CAPTURED_OUT.with(|slot| *slot.borrow_mut() = None);
-        }
-    }
-
-    struct LogWriter(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
-
-    impl std::io::Write for LogWriter {
-        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-            self.0.lock().unwrap().extend_from_slice(buf);
-            Ok(buf.len())
-        }
-
-        fn flush(&mut self) -> std::io::Result<()> {
-            Ok(())
         }
     }
 }

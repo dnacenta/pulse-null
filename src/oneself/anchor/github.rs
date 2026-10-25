@@ -722,38 +722,52 @@ mod tests {
         }
     }
 
-    #[tokio::test(flavor = "current_thread")]
-    async fn a_traced_failure_does_not_record_the_token() {
-        let mock = Arc::new(Mock::new());
-        mock.get_status.lock().unwrap().push(401);
-        let base = serve(mock).await;
-        let anchor = github_at(base, 2026);
-        let buf = std::sync::Arc::new(Mutex::new(Vec::<u8>::new()));
-        let writer = buf.clone();
-        let subscriber = tracing_subscriber::fmt()
-            .with_max_level(tracing::Level::TRACE)
-            .with_ansi(false)
-            .with_writer(move || {
-                struct Mem(std::sync::Arc<Mutex<Vec<u8>>>);
-                impl std::io::Write for Mem {
-                    fn write(&mut self, data: &[u8]) -> std::io::Result<usize> {
-                        self.0.lock().unwrap().extend_from_slice(data);
-                        Ok(data.len())
+    /// The log line is checked in a fresh process. A scoped subscriber in this
+    /// process is empty when another test has already hit the same callsite
+    /// with no subscriber.
+    #[test]
+    fn a_traced_failure_does_not_record_the_token() {
+        if !crate::process_state::isolated_test("a_traced_failure_does_not_record_the_token") {
+            return;
+        }
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let mock = Arc::new(Mock::new());
+            mock.get_status.lock().unwrap().push(401);
+            let base = serve(mock).await;
+            let anchor = github_at(base, 2026);
+            let buf = std::sync::Arc::new(Mutex::new(Vec::<u8>::new()));
+            let writer = buf.clone();
+            let subscriber = tracing_subscriber::fmt()
+                .with_max_level(tracing::Level::TRACE)
+                .with_ansi(false)
+                .with_writer(move || {
+                    struct Mem(std::sync::Arc<Mutex<Vec<u8>>>);
+                    impl std::io::Write for Mem {
+                        fn write(&mut self, data: &[u8]) -> std::io::Result<usize> {
+                            self.0.lock().unwrap().extend_from_slice(data);
+                            Ok(data.len())
+                        }
+                        fn flush(&mut self) -> std::io::Result<()> {
+                            Ok(())
+                        }
                     }
-                    fn flush(&mut self) -> std::io::Result<()> {
-                        Ok(())
-                    }
-                }
-                Mem(writer.clone())
-            })
-            .finish();
-        let guard = tracing::subscriber::set_default(subscriber);
-        let err = anchor.history("echo").await.unwrap_err();
-        drop(guard);
-        let rendered = format!("{err} {err:?}");
-        let traced = String::from_utf8(buf.lock().unwrap().clone()).unwrap();
-        assert!(!rendered.contains("pn108-token-do-not-leak"), "{rendered}");
-        assert!(!traced.contains("pn108-token-do-not-leak"), "{traced}");
+                    Mem(writer.clone())
+                })
+                .finish();
+            let guard = tracing::subscriber::set_default(subscriber);
+            let err = anchor.history("echo").await.unwrap_err();
+            drop(guard);
+            let rendered = format!("{err} {err:?}");
+            let traced = String::from_utf8(buf.lock().unwrap().clone()).unwrap();
+            assert!(!rendered.contains("pn108-token-do-not-leak"), "{rendered}");
+            assert!(traced.contains("anchor request failed"), "{traced}");
+            assert!(traced.contains("401"), "{traced}");
+            assert!(!traced.contains("pn108-token-do-not-leak"), "{traced}");
+        });
     }
 
     #[tokio::test]

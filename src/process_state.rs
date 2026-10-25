@@ -94,6 +94,45 @@ thread_local! {
         const { std::cell::Cell::new(None) };
 }
 
+/// Run this test's body in a fresh process.
+///
+/// Returns true only in that process. The parent spawns the test binary with
+/// this test alone, waits, and returns false. A scoped tracing subscriber in
+/// the child is not racing another test on the same callsite.
+#[cfg(test)]
+#[must_use]
+pub fn isolated_test(test_name: &str) -> bool {
+    let key = "PN108_ISOLATED_TEST";
+    if std::env::var(key).ok().as_deref() == Some(test_name) {
+        return true;
+    }
+    let exe = std::env::current_exe().expect("the test executable");
+    let child = during_fork(|| {
+        std::process::Command::new(&exe)
+            .arg(test_name)
+            .arg("--test-threads=1")
+            .env(key, test_name)
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .unwrap_or_else(|err| panic!("could not start {test_name}: {err}"))
+    });
+    let output = child
+        .wait_with_output()
+        .unwrap_or_else(|err| panic!("{test_name}: {err}"));
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "{test_name} failed\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    assert!(
+        stdout.contains("test result: ok. 1 passed"),
+        "{test_name} did not run alone\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    false
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

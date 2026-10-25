@@ -3138,6 +3138,9 @@ mod tests {
 
     #[test]
     fn strict_rejects_a_pulse_owned_file() {
+        if !crate::process_state::isolated_test("strict_rejects_a_pulse_owned_file") {
+            return;
+        }
         let running = 4_242;
         assert_eq!(
             pulse_rule_meta_ok(running, 0o644, 1, running, true),
@@ -3416,6 +3419,10 @@ mod tests {
 
     #[test]
     fn env_forces_strict_when_the_config_file_says_false() {
+        if !crate::process_state::isolated_test("env_forces_strict_when_the_config_file_says_false")
+        {
+            return;
+        }
         let dir = tempfile::tempdir().unwrap();
         seed_pulse_rules(dir.path());
         let mut config = cli_config("grok");
