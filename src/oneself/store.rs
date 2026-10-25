@@ -68,6 +68,8 @@ pub enum StoreError {
     NotRegular { fd: i32 },
     #[error("systemd fd {fd} is not open for append")]
     NotAppend { fd: i32 },
+    #[error("systemd fd {fd} is not open for reading and writing")]
+    NotReadWrite { fd: i32 },
     #[error("receipt file {path} has no complete row and cannot be recovered; rotate the file")]
     Rotate { path: String },
     #[error("receipt file is broken at line {line}: {reason}")]
@@ -703,15 +705,32 @@ fn take_systemd(name: &str) -> Result<File, StoreError> {
     };
     #[cfg(not(test))]
     let fd = listed;
-    validate_fd(fd)?;
-    set_cloexec(fd)?;
+    // CLOEXEC before any check, so a refusal cannot leak the fd to a child.
+    if let Err(err) = set_cloexec(fd) {
+        release_refused(fd);
+        return Err(err);
+    }
+    if let Err(err) = validate_fd(fd) {
+        release_refused(fd);
+        return Err(err);
+    }
     // SAFETY: `fd` is open, validated, and systemd handed it to this process.
     // `File` is now the only owner.
     let file = unsafe { File::from_raw_fd(fd) };
+    clear_listen_env();
+    Ok(file)
+}
+
+fn clear_listen_env() {
     std::env::remove_var("LISTEN_PID");
     std::env::remove_var("LISTEN_FDS");
     std::env::remove_var("LISTEN_FDNAMES");
-    Ok(file)
+}
+
+fn release_refused(fd: i32) {
+    // SAFETY: validation failed before `File::from_raw_fd`, so `fd` is still ours.
+    unsafe { libc::close(fd) };
+    clear_listen_env();
 }
 
 fn validate_fd(fd: i32) -> Result<(), StoreError> {
@@ -730,6 +749,9 @@ fn validate_fd(fd: i32) -> Result<(), StoreError> {
     }
     if flags & libc::O_APPEND == 0 {
         return Err(StoreError::NotAppend { fd });
+    }
+    if flags & libc::O_ACCMODE != libc::O_RDWR {
+        return Err(StoreError::NotReadWrite { fd });
     }
     Ok(())
 }
@@ -879,6 +901,7 @@ mod tests {
             .open(&path)
             .unwrap();
         with_forced_fd(&plain, || {
+            let fd = FORCED_FD.load(std::sync::atomic::Ordering::SeqCst);
             let err = ReceiptStore::open(
                 StoreSource::SystemdFd { name: "receipts" },
                 &LiveProbe,
@@ -886,7 +909,9 @@ mod tests {
             )
             .unwrap_err();
             assert!(matches!(err, StoreError::NotAppend { .. }), "{err}");
-            assert!(std::env::var("LISTEN_PID").is_ok());
+            assert!(std::env::var("LISTEN_PID").is_err());
+            let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+            assert!(flags < 0, "refused fd still open: {flags}");
         });
         drop(plain);
 
@@ -910,6 +935,22 @@ mod tests {
             assert!(flags & libc::FD_CLOEXEC != 0, "{flags}");
             assert!(std::env::var("LISTEN_PID").is_err());
             drop(store);
+        });
+
+        let write_only = OpenOptions::new().append(true).open(&path).unwrap();
+        with_forced_fd(&write_only, || {
+            let fd = FORCED_FD.load(std::sync::atomic::Ordering::SeqCst);
+            let err = ReceiptStore::open(
+                StoreSource::SystemdFd { name: "receipts" },
+                &LiveProbe,
+                "echo",
+            )
+            .unwrap_err();
+            assert!(matches!(err, StoreError::NotReadWrite { .. }), "{err}");
+            assert!(err.to_string().contains("reading and writing"), "{err}");
+            assert!(std::env::var("LISTEN_PID").is_err());
+            let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+            assert!(flags < 0, "refused fd still open: {flags}");
         });
     }
 
