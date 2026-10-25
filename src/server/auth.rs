@@ -289,6 +289,7 @@ mod tests {
             graph_extractor: None,
             ledger: Arc::new(crate::ledger::LedgerRing::new(16)),
             turns: crate::server::turns::TurnRunner::new(),
+            receipts: crate::oneself::receipt::Appender::off(),
         })
     }
 
@@ -577,6 +578,7 @@ mod tests {
             graph_extractor: None,
             ledger: Arc::new(crate::ledger::LedgerRing::new(16)),
             turns: crate::server::turns::TurnRunner::new(),
+            receipts: crate::oneself::receipt::Appender::off(),
         })
     }
 

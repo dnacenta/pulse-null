@@ -82,6 +82,8 @@ pub struct AppState {
     /// In-process turns for plugins (PN-110), bound to this state once it
     /// exists. Plugins hold clones; shutdown closes and drains it.
     pub turns: turns::TurnRunner,
+    /// Receipt writer. Off, and touching no file, unless receipts are enabled.
+    pub receipts: crate::oneself::receipt::Appender,
 }
 
 /// Concurrent `/api/events` connections before a 503.
@@ -179,8 +181,11 @@ pub async fn awareness_listener(
     }
 }
 
-pub async fn start(config: Config) -> Result<(), Box<dyn std::error::Error>> {
-    start_with_shutdown(config, None).await
+pub async fn start(
+    config: Config,
+    listen: crate::oneself::store::ListenEnv,
+) -> Result<(), Box<dyn std::error::Error>> {
+    start_with_shutdown(config, None, listen).await
 }
 
 /// Like [`start`], plus an optional external stop: when `stop` flips to
@@ -190,9 +195,10 @@ pub async fn start(config: Config) -> Result<(), Box<dyn std::error::Error>> {
 pub async fn start_with_shutdown(
     config: Config,
     stop: Option<tokio::sync::watch::Receiver<bool>>,
+    listen: crate::oneself::store::ListenEnv,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let root_dir = config.root_dir()?;
-    start_in(config, root_dir, stop).await
+    start_in(config, root_dir, stop, listen).await
 }
 
 /// [`start_with_shutdown`] for a pulse that is not the current directory:
@@ -201,8 +207,9 @@ pub async fn start_in(
     config: Config,
     root_dir: PathBuf,
     stop: Option<tokio::sync::watch::Receiver<bool>>,
+    listen: crate::oneself::store::ListenEnv,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    daemon::run(config, root_dir, daemon::shutdown_signal(stop)).await
+    daemon::run(config, root_dir, daemon::shutdown_signal(stop), listen).await
 }
 
 /// Build the Axum router from AppState and optional plugin routes.

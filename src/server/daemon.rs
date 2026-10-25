@@ -33,8 +33,9 @@ pub(super) async fn run(
     config: Config,
     root_dir: PathBuf,
     shutdown: impl Future<Output = ()> + Send + 'static,
+    listen: crate::oneself::store::ListenEnv,
 ) -> Result<(), BoxError> {
-    let daemon = boot(config, root_dir).await?;
+    let daemon = boot(config, root_dir, listen).await?;
     serve_until(daemon, shutdown).await;
     Ok(())
 }
@@ -47,11 +48,15 @@ struct Daemon {
     listener: TcpListener,
 }
 
-async fn boot(config: Config, root_dir: PathBuf) -> Result<Daemon, BoxError> {
+async fn boot(
+    config: Config,
+    root_dir: PathBuf,
+    listen: crate::oneself::store::ListenEnv,
+) -> Result<Daemon, BoxError> {
     // The provider runs from inside the pulse (PN-104).
     let provider = crate::providers::create_streaming_provider(&config, &root_dir)?;
     prepare_pulse_dir(&config, &root_dir).await?;
-    let (state, plugin_routes) = assemble_state(config, root_dir, provider).await?;
+    let (state, plugin_routes) = assemble_state(config, root_dir, provider, listen).await?;
     let (coordinator, app) = start_services(&state, plugin_routes).await?;
     let (listener, addr) = bind_listener(&state.config).await?;
     // Write PID file so `pulse-null down` can find us
@@ -171,6 +176,7 @@ async fn assemble_state(
     config: Config,
     root_dir: PathBuf,
     provider: Box<dyn StreamingProvider>,
+    listen: crate::oneself::store::ListenEnv,
 ) -> Result<(Arc<AppState>, Router<()>), BoxError> {
     let monitors = setup::create_monitors(&config);
     let mut tools = setup::register_builtin_tools(&root_dir, &config);
@@ -195,6 +201,15 @@ async fn assemble_state(
     let alert_queue = crate::scheduler::alerts::AlertQueue::load(&root_dir);
 
     let pools = super::stream_pools();
+    let provider_name = provider.name().to_string();
+    let receipts = crate::oneself::receipt::Appender::start(
+        &config,
+        &root_dir,
+        listen,
+        Arc::new(crate::oneself::protect::LiveProbe),
+        &provider_name,
+    )
+    .await;
     let state = Arc::new(AppState {
         config: config.clone(),
         provider,
@@ -221,6 +236,7 @@ async fn assemble_state(
         ledger,
         graph_extractor: crate::graph_extract::GraphExtractor::for_pulse(&config, &root_dir),
         turns,
+        receipts,
     });
     state.turns.bind(&state);
     Ok((state, plugin_routes))
@@ -472,6 +488,7 @@ async fn shut_down(
     // Shut down SurrealDB server if we own it
     stop_graph_server(&state.config).await;
 
+    state.receipts.shutdown().await;
     pidfile::remove(&state.root_dir);
     tracing::info!("Shutdown complete");
 }
@@ -626,9 +643,14 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().to_path_buf();
         let (fire, trigger) = tokio::sync::oneshot::channel::<()>();
-        let daemon = run(offline_config(), root.clone(), async move {
-            let _ = trigger.await;
-        });
+        let daemon = run(
+            offline_config(),
+            root.clone(),
+            async move {
+                let _ = trigger.await;
+            },
+            crate::oneself::store::ListenEnv::empty(),
+        );
         // Watches the daemon from the same task (its error is not `Send`):
         // once it is up, check the boot and pull the trigger.
         let probe = async {
@@ -664,7 +686,13 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mut config = offline_config();
         config.llm.provider = "no-such-provider".to_string();
-        let outcome = run(config, dir.path().to_path_buf(), std::future::ready(())).await;
+        let outcome = run(
+            config,
+            dir.path().to_path_buf(),
+            std::future::ready(()),
+            crate::oneself::store::ListenEnv::empty(),
+        )
+        .await;
         assert!(outcome.is_err());
         assert!(!dir.path().join("memory").exists());
     }

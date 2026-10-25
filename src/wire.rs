@@ -372,6 +372,28 @@ pub struct HealthResponse {
     pub last_error_at: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub consecutive_failures: Option<u32>,
+    /// Receipt writer. `off` when receipts are not enabled. `seq` is absent
+    /// from the count when the writer is not appending.
+    #[serde(default)]
+    pub receipts: ReceiptsHealth,
+}
+
+/// `/health`'s `receipts` object.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReceiptsHealth {
+    /// `off`, `ok`, `degraded`, or `unprotected`.
+    pub state: String,
+    /// Last appended seq. Null when receipts are off or not writing.
+    pub seq: Option<u64>,
+}
+
+impl Default for ReceiptsHealth {
+    fn default() -> Self {
+        Self {
+            state: "off".to_string(),
+            seq: None,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -459,6 +481,7 @@ mod tests {
             error_kind: Some("quota".into()),
             last_error_at: None,
             consecutive_failures: Some(2),
+            receipts: ReceiptsHealth::default(),
         };
         let v = serde_json::to_value(&h).unwrap();
         assert_eq!(v["isolation"], true);

@@ -2,11 +2,9 @@
 //!
 //! One process holds an exclusive lock. A path open is the dev mode. A
 //! systemd fd named `receipts` is used only when it belongs to this process,
-//! is a regular file, and is open for append. The daemon calls [`ReceiptStore::open`]
-//! in a later slice. `verify` and `show` read through [`inspect`] and do not
-//! lock or repair.
-//!
-//! The writer is allowed to look unused in the binary until that slice.
+//! is a regular file, and is open for append. The daemon calls
+//! [`ReceiptStore::open_for_daemon`]. `verify` and `show` read through
+//! [`inspect`] and do not lock or repair.
 
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
@@ -27,21 +25,36 @@ use super::protect::{Protection, ProtectionProbe};
 pub struct ListenEnv {
     pub pid: Option<String>,
     pub fds: Option<String>,
-    #[cfg_attr(not(test), expect(dead_code, reason = "wired in increment 3"))]
     pub names: Option<String>,
     /// Shared by clones. The first open spends it, including a refusal.
-    #[cfg_attr(not(test), expect(dead_code, reason = "wired in increment 3"))]
     spent: Arc<AtomicBool>,
 }
 
 impl ListenEnv {
-    fn captured(pid: Option<String>, fds: Option<String>, names: Option<String>) -> Self {
+    pub(crate) fn captured(
+        pid: Option<String>,
+        fds: Option<String>,
+        names: Option<String>,
+    ) -> Self {
         Self {
             pid,
             fds,
             names,
             spent: Arc::new(AtomicBool::new(false)),
         }
+    }
+
+    /// No systemd fds. Tests and a pulse that does not own the snapshot use this.
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "in-process tests pass an empty snapshot; the daemon passes the one main captured"
+        )
+    )]
+    #[must_use]
+    pub(crate) fn empty() -> Self {
+        Self::captured(None, None, None)
     }
 }
 
@@ -63,8 +76,8 @@ pub fn take_listen_env() -> ListenEnv {
     listen
 }
 
-/// Held for the daemon open in a later slice. Tests pass [`ListenEnv`] into
-/// [`StoreSource`] instead of using this.
+/// Held so a test can take the snapshot [`take_listen_env`] captured.
+/// The daemon is given its own clone and does not call [`take_retained_listen`].
 pub fn retain_listen(listen: ListenEnv) {
     let mut slot = RETAINED_LISTEN
         .lock()
@@ -117,7 +130,6 @@ static RETAINED_LISTEN: std::sync::Mutex<Option<ListenEnv>> = std::sync::Mutex::
 
 /// Where the bytes live.
 #[derive(Debug, Clone)]
-#[cfg_attr(not(test), expect(dead_code, reason = "wired in increment 3"))]
 pub enum StoreSource {
     /// systemd `OpenFile=` fd whose name is `name` (`receipts`).
     SystemdFd {
@@ -130,15 +142,21 @@ pub enum StoreSource {
 
 /// The last accepted row.
 #[derive(Debug, Clone, PartialEq, Eq)]
-#[cfg_attr(not(test), expect(dead_code, reason = "wired in increment 3"))]
 pub struct Head {
     pub seq: u64,
     pub hash: String,
 }
 
+/// A store ready to append, or a probe that refused a protected open.
+pub enum OpenChoice {
+    /// The file is locked and repaired. Append to this store.
+    Ready(Box<(ReceiptStore, Opened)>),
+    /// Protection was required and the probe did not pass. Nothing was written.
+    Unprotected(Protection),
+}
+
 /// What open did to the tail, plus the protection report.
 #[derive(Debug, Clone)]
-#[cfg_attr(not(test), expect(dead_code, reason = "wired in increment 3"))]
 pub struct Opened {
     /// A `recover` row was appended for a torn tail.
     pub recovered: bool,
@@ -166,35 +184,26 @@ pub struct Inspected {
 #[derive(Debug, Error)]
 pub enum StoreError {
     #[error("receipt file is locked by another process")]
-    #[cfg_attr(not(test), expect(dead_code, reason = "wired in increment 3"))]
     Locked,
     #[error("systemd fd {name} was not passed to this process")]
-    #[cfg_attr(not(test), expect(dead_code, reason = "wired in increment 3"))]
     NotUsed { name: String },
     #[error("systemd fd {fd} is not a regular file")]
-    #[cfg_attr(not(test), expect(dead_code, reason = "wired in increment 3"))]
     NotRegular { fd: i32 },
     #[error("systemd fd {fd} is not open for append")]
-    #[cfg_attr(not(test), expect(dead_code, reason = "wired in increment 3"))]
     NotAppend { fd: i32 },
     #[error("systemd fd {fd} is not open for reading and writing")]
-    #[cfg_attr(not(test), expect(dead_code, reason = "wired in increment 3"))]
     NotReadWrite { fd: i32 },
     #[error("receipt file {path} has no complete row and cannot be recovered; rotate the file")]
-    #[cfg_attr(not(test), expect(dead_code, reason = "wired in increment 3"))]
     Rotate { path: String },
     #[error("receipt file is broken at line {line}: {reason}")]
-    #[cfg_attr(not(test), expect(dead_code, reason = "wired in increment 3"))]
     Broken { line: usize, reason: &'static str },
     #[error("receipt append failed and the store is poisoned ({dropped} dropped)")]
-    #[cfg_attr(not(test), expect(dead_code, reason = "wired in increment 3"))]
     Append {
         dropped: u64,
         #[source]
         source: std::io::Error,
     },
     #[error("receipt row could not be built")]
-    #[cfg_attr(not(test), expect(dead_code, reason = "wired in increment 3"))]
     Row,
     #[error("receipt path {path} is not a regular file")]
     NotFile { path: String },
@@ -303,7 +312,6 @@ pub fn orphan_streams(bytes: &[u8]) -> Vec<String> {
 /// Fds start at 3. A wrong pid or a missing name is "not used", not an error
 /// from this function.
 #[must_use]
-#[cfg_attr(not(test), expect(dead_code, reason = "wired in increment 3"))]
 pub fn listen_fd(
     pid_env: Option<&str>,
     fds_env: Option<&str>,
@@ -328,7 +336,6 @@ pub fn listen_fd(
 }
 
 /// One appender. Dropping it releases the lock and closes the fd.
-#[cfg_attr(not(test), expect(dead_code, reason = "wired in increment 3"))]
 pub struct ReceiptStore {
     file: File,
     next_seq: u64,
@@ -339,6 +346,9 @@ pub struct ReceiptStore {
     gap_last: Option<String>,
     #[cfg(test)]
     fault: Option<RecordFault>,
+    /// Appends that fail before any byte is written. The daemon's test hook.
+    #[cfg(test)]
+    fault_left: u64,
 }
 
 impl std::fmt::Debug for ReceiptStore {
@@ -364,12 +374,32 @@ impl ReceiptStore {
         // a reopen can see the previous lock for that window. The lock test's
         // child must not retry: it has to observe the held lock. A systemd
         // snapshot is single-use, so that retry stays on the path open.
+        Self::open_retry(source, probe, pulse, false).and_then(ready_store)
+    }
+
+    /// [`open`](Self::open), and when `stop_if_unprotected` the probe runs
+    /// before any repair or genesis. An unprotected file is not written.
+    pub fn open_for_daemon(
+        source: StoreSource,
+        probe: &dyn ProtectionProbe,
+        pulse: &str,
+        stop_if_unprotected: bool,
+    ) -> Result<OpenChoice, StoreError> {
+        Self::open_retry(source, probe, pulse, stop_if_unprotected)
+    }
+
+    fn open_retry(
+        source: StoreSource,
+        probe: &dyn ProtectionProbe,
+        pulse: &str,
+        stop_if_unprotected: bool,
+    ) -> Result<OpenChoice, StoreError> {
         #[cfg(test)]
         if std::env::var_os("RECEIPT_FLOCK_CHILD").is_none()
             && matches!(source, StoreSource::Path(_))
         {
             for _ in 0..40 {
-                match Self::open_once(source.clone(), probe, pulse) {
+                match Self::open_once(source.clone(), probe, pulse, stop_if_unprotected) {
                     Err(StoreError::Locked) => {
                         std::thread::sleep(std::time::Duration::from_millis(5));
                     }
@@ -377,17 +407,20 @@ impl ReceiptStore {
                 }
             }
         }
-        Self::open_once(source, probe, pulse)
+        Self::open_once(source, probe, pulse, stop_if_unprotected)
     }
 
-    #[cfg_attr(not(test), expect(dead_code, reason = "wired in increment 3"))]
     fn open_once(
         source: StoreSource,
         probe: &dyn ProtectionProbe,
         pulse: &str,
-    ) -> Result<(Self, Opened), StoreError> {
+        stop_if_unprotected: bool,
+    ) -> Result<OpenChoice, StoreError> {
         let (mut file, from_systemd, path) = adopt(source)?;
         let protection = probe.probe(&file, from_systemd);
+        if stop_if_unprotected && !protection.is_protected() {
+            return Ok(OpenChoice::Unprotected(protection));
+        }
         lock_exclusive(&file)?;
         let bytes = read_all(&mut file)?;
         let had_bytes = !bytes.is_empty();
@@ -460,8 +493,10 @@ impl ReceiptStore {
             gap_last: None,
             #[cfg(test)]
             fault: None,
+            #[cfg(test)]
+            fault_left: 0,
         };
-        Ok((
+        Ok(OpenChoice::Ready(Box::new((
             store,
             Opened {
                 recovered,
@@ -471,13 +506,12 @@ impl ReceiptStore {
                 protection,
                 report,
             },
-        ))
+        ))))
     }
 
     /// Append `event`. A poisoned store writes a `gap` row first.
     ///
     /// `genesis` and `recover` are written by open, not by this method.
-    #[cfg_attr(not(test), expect(dead_code, reason = "wired in increment 3"))]
     pub fn append(&mut self, event: ReceiptEvent) -> Result<Head, StoreError> {
         if matches!(
             event,
@@ -498,6 +532,24 @@ impl ReceiptStore {
         self.write_event(&event)
     }
 
+    /// Count `n` events that never reached the store. The next successful
+    /// append writes one `gap` row that includes them.
+    pub fn lose(&mut self, n: u64) {
+        if n == 0 {
+            return;
+        }
+        let ts = now_ts();
+        for _ in 0..n {
+            self.note_failure(ts.clone());
+        }
+    }
+
+    /// The next `n` appends fail before any byte is written.
+    #[cfg(test)]
+    pub fn fail_next_appends(&mut self, n: u64) {
+        self.fault_left = n;
+    }
+
     #[cfg(test)]
     fn fail_next_write(&mut self) {
         self.fault = Some(RecordFault::Before);
@@ -515,7 +567,6 @@ impl ReceiptStore {
 
     /// Re-read the tail after a failed append and repair it the way open does.
     /// A row that actually landed is not counted as dropped. Nothing is truncated.
-    #[cfg_attr(not(test), expect(dead_code, reason = "wired in increment 3"))]
     fn resync(&mut self) -> Result<(), StoreError> {
         let attempted = self.next_seq;
         let bytes = read_all(&mut self.file)?;
@@ -554,7 +605,6 @@ impl ReceiptStore {
         Ok(())
     }
 
-    #[cfg_attr(not(test), expect(dead_code, reason = "wired in increment 3"))]
     fn write_gap(&mut self) -> Result<(), StoreError> {
         let first = self.gap_first.clone().ok_or(StoreError::Row)?;
         let mut last = self.gap_last.clone().ok_or(StoreError::Row)?;
@@ -574,7 +624,6 @@ impl ReceiptStore {
         Ok(())
     }
 
-    #[cfg_attr(not(test), expect(dead_code, reason = "wired in increment 3"))]
     fn write_event(&mut self, event: &ReceiptEvent) -> Result<Head, StoreError> {
         let ts = now_ts();
         let line = encode_line(self.next_seq, &self.prev, &ts, event)?;
@@ -594,7 +643,6 @@ impl ReceiptStore {
         })
     }
 
-    #[cfg_attr(not(test), expect(dead_code, reason = "wired in increment 3"))]
     fn note_failure(&mut self, ts: String) {
         if self.gap_first.is_none() {
             self.gap_first = Some(ts.clone());
@@ -604,8 +652,12 @@ impl ReceiptStore {
         self.poisoned = true;
     }
 
-    #[cfg_attr(not(test), expect(dead_code, reason = "wired in increment 3"))]
     fn write_record(&mut self, line: &[u8]) -> std::io::Result<()> {
+        #[cfg(test)]
+        if self.fault_left > 0 {
+            self.fault_left -= 1;
+            return Err(std::io::Error::other("injected append failure"));
+        }
         #[cfg(test)]
         if let Some(fault) = self.fault.take() {
             return apply_fault(&mut self.file, line, fault);
@@ -615,7 +667,16 @@ impl ReceiptStore {
     }
 }
 
-#[cfg_attr(not(test), expect(dead_code, reason = "wired in increment 3"))]
+fn ready_store(choice: OpenChoice) -> Result<(ReceiptStore, Opened), StoreError> {
+    match choice {
+        OpenChoice::Ready(pair) => {
+            let (store, opened) = *pair;
+            Ok((store, opened))
+        }
+        OpenChoice::Unprotected(_) => Err(StoreError::Row),
+    }
+}
+
 fn with_newline(line: impl AsRef<[u8]>) -> Vec<u8> {
     let line = line.as_ref();
     let mut record = Vec::with_capacity(line.len() + 1);
@@ -665,7 +726,6 @@ fn apply_fault(file: &mut File, line: &[u8], fault: RecordFault) -> std::io::Res
     }
 }
 
-#[cfg_attr(not(test), expect(dead_code, reason = "wired in increment 3"))]
 enum RepairKind {
     Ready,
     Newline,
@@ -677,7 +737,6 @@ enum RepairKind {
 /// Tail repair shared by open and by a poisoned append. `NoRow` is not written
 /// here: only open may replace an empty file, and it never truncates a file
 /// that already has a finished line.
-#[cfg_attr(not(test), expect(dead_code, reason = "wired in increment 3"))]
 fn repair_class(file: &mut File, class: Class) -> Result<RepairKind, StoreError> {
     match class {
         Class::Ready => Ok(RepairKind::Ready),
@@ -722,7 +781,6 @@ fn repair_class(file: &mut File, class: Class) -> Result<RepairKind, StoreError>
 }
 
 /// A recover row or a missing newline must not push the file past the cap.
-#[cfg_attr(not(test), expect(dead_code, reason = "wired in increment 3"))]
 fn ensure_repair_fits(file: &File, extra: usize) -> Result<(), StoreError> {
     let len = file.metadata()?.len();
     let extra = u64::try_from(extra).unwrap_or(u64::MAX);
@@ -736,7 +794,6 @@ fn ensure_repair_fits(file: &File, extra: usize) -> Result<(), StoreError> {
     Ok(())
 }
 
-#[cfg_attr(not(test), expect(dead_code, reason = "wired in increment 3"))]
 fn committed_attempt(bytes: &[u8], attempted: u64) -> bool {
     let Ok(text) = std::str::from_utf8(bytes) else {
         return false;
@@ -753,7 +810,6 @@ fn committed_attempt(bytes: &[u8], attempted: u64) -> bool {
     row.seq == attempted && !matches!(event, ReceiptEvent::Recover { .. })
 }
 
-#[cfg_attr(not(test), expect(dead_code, reason = "wired in increment 3"))]
 enum Class {
     Ready,
     MissingNewline,
@@ -768,7 +824,6 @@ enum Class {
     Broken(VerifyNote),
 }
 
-#[cfg_attr(not(test), expect(dead_code, reason = "wired in increment 3"))]
 fn classify(bytes: &[u8]) -> Result<Class, StoreError> {
     // Replace a file only when it never held a finished line: empty, or a
     // torn genesis with no newline. Any newline-terminated byte is evidence.
@@ -831,7 +886,6 @@ fn classify(bytes: &[u8]) -> Result<Class, StoreError> {
 }
 
 /// Split into `(prefix including its trailing newline, last line, last has newline)`.
-#[cfg_attr(not(test), expect(dead_code, reason = "wired in increment 3"))]
 fn split_last(bytes: &[u8]) -> (&[u8], &[u8], bool) {
     match bytes.iter().rposition(|byte| *byte == b'\n') {
         None => (b"", bytes, false),
@@ -846,7 +900,6 @@ fn split_last(bytes: &[u8]) -> (&[u8], &[u8], bool) {
     }
 }
 
-#[cfg_attr(not(test), expect(dead_code, reason = "wired in increment 3"))]
 fn encode_line(seq: u64, prev: &str, ts: &str, event: &ReceiptEvent) -> Result<String, StoreError> {
     let row = chain::Row {
         v: 1,
@@ -866,14 +919,12 @@ fn encode_line(seq: u64, prev: &str, ts: &str, event: &ReceiptEvent) -> Result<S
     Ok(text)
 }
 
-#[cfg_attr(not(test), expect(dead_code, reason = "wired in increment 3"))]
 fn now_ts() -> String {
     let now = chrono::Utc::now();
     let millis = now.timestamp_subsec_millis();
     format!("{}.{:03}Z", now.format("%Y-%m-%dT%H:%M:%S"), millis)
 }
 
-#[cfg_attr(not(test), expect(dead_code, reason = "wired in increment 3"))]
 fn adopt(source: StoreSource) -> Result<(File, bool, String), StoreError> {
     match source {
         StoreSource::Path(path) => {
@@ -936,7 +987,6 @@ fn check_regular(path: &Path, meta: &std::fs::Metadata) -> Result<(), StoreError
     Ok(())
 }
 
-#[cfg_attr(not(test), expect(dead_code, reason = "wired in increment 3"))]
 fn take_systemd(name: &str, listen: &ListenEnv) -> Result<File, StoreError> {
     // Spend before touching an fd. A refusal closes it, and a later open
     // must not adopt a file that reused the number.
@@ -990,13 +1040,11 @@ fn clear_listen_env() {
     std::env::remove_var("LISTEN_FDNAMES");
 }
 
-#[cfg_attr(not(test), expect(dead_code, reason = "wired in increment 3"))]
 fn release_refused(fd: i32) {
     // SAFETY: validation failed before `File::from_raw_fd`, so `fd` is still ours.
     unsafe { libc::close(fd) };
 }
 
-#[cfg_attr(not(test), expect(dead_code, reason = "wired in increment 3"))]
 fn validate_fd(fd: i32) -> Result<(), StoreError> {
     let mut stat = unsafe { std::mem::zeroed::<libc::stat>() };
     // SAFETY: `stat` is a valid out-pointer and `fd` is still open.
@@ -1032,7 +1080,6 @@ fn set_cloexec(fd: i32) -> Result<(), StoreError> {
     Ok(())
 }
 
-#[cfg_attr(not(test), expect(dead_code, reason = "wired in increment 3"))]
 fn lock_exclusive(file: &File) -> Result<(), StoreError> {
     // SAFETY: `flock` on a descriptor this store owns.
     let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
@@ -1047,7 +1094,6 @@ fn lock_exclusive(file: &File) -> Result<(), StoreError> {
     }
 }
 
-#[cfg_attr(not(test), expect(dead_code, reason = "wired in increment 3"))]
 fn read_all(file: &mut File) -> Result<Vec<u8>, StoreError> {
     file.seek(SeekFrom::Start(0))?;
     let bytes = file.metadata()?.len();
@@ -1062,14 +1108,12 @@ fn read_all(file: &mut File) -> Result<Vec<u8>, StoreError> {
     Ok(buf)
 }
 
-#[cfg_attr(not(test), expect(dead_code, reason = "wired in increment 3"))]
 fn write_all_sync(file: &mut File, bytes: &[u8]) -> std::io::Result<()> {
     file.write_all(bytes)?;
     file.sync_all()?;
     Ok(())
 }
 
-#[cfg_attr(not(test), expect(dead_code, reason = "wired in increment 3"))]
 fn fd_path(fd: i32) -> String {
     std::fs::read_link(format!("/proc/self/fd/{fd}"))
         .map(|path| path.display().to_string())

@@ -122,16 +122,13 @@ impl ReceiptsConfig {
 }
 
 /// Environment variable that forces receipts on, with protection required.
-#[cfg_attr(not(test), expect(dead_code, reason = "read when the daemon starts"))]
 pub(crate) const RECEIPTS_ENV: &str = "PULSE_NULL_RECEIPTS";
 
 thread_local! {
     static RECEIPTS_ENV_LOCK_HELD: Cell<bool> = const { Cell::new(false) };
 }
-#[cfg_attr(not(test), expect(dead_code, reason = "read when the daemon starts"))]
 static RECEIPTS_ENV_LOCK: Mutex<()> = Mutex::new(());
 
-#[cfg_attr(not(test), expect(dead_code, reason = "read when the daemon starts"))]
 struct ReceiptsEnvHold {
     release: bool,
     _guard: Option<std::sync::MutexGuard<'static, ()>>,
@@ -147,7 +144,6 @@ impl Drop for ReceiptsEnvHold {
 
 /// Serialize reads of [`RECEIPTS_ENV`] with a test that sets it.
 /// Re-entrant on the thread that already holds it.
-#[cfg_attr(not(test), expect(dead_code, reason = "read when the daemon starts"))]
 fn hold_receipts_env() -> ReceiptsEnvHold {
     if RECEIPTS_ENV_LOCK_HELD.with(|held| held.get()) {
         return ReceiptsEnvHold {
@@ -177,7 +173,6 @@ pub(crate) fn with_receipts_env<T>(body: impl FnOnce() -> T) -> T {
 /// `PULSE_NULL_RECEIPTS=required` (case-insensitive, trimmed) forces
 /// receipts on and protection required. Any other non-empty value is
 /// warned once and ignored. The decision is [`effective_receipts`].
-#[cfg_attr(not(test), expect(dead_code, reason = "read when the daemon starts"))]
 pub(crate) fn receipts_mode(config: &ReceiptsConfig) -> ReceiptsMode {
     let _hold = hold_receipts_env();
     let raw = std::env::var(RECEIPTS_ENV).ok();
@@ -187,21 +182,18 @@ pub(crate) fn receipts_mode(config: &ReceiptsConfig) -> ReceiptsMode {
 
 /// Receipts after the environment override: on or off, and whether a write
 /// requires the protection probe to pass.
-#[cfg_attr(not(test), expect(dead_code, reason = "read when the daemon starts"))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct ReceiptsMode {
     pub enabled: bool,
     pub require_protected: bool,
 }
 
-#[cfg_attr(not(test), expect(dead_code, reason = "read when the daemon starts"))]
 enum ReceiptsEnvClass {
     Unset,
     Required,
     Other,
 }
 
-#[cfg_attr(not(test), expect(dead_code, reason = "read when the daemon starts"))]
 fn receipts_env_class(env: Option<&str>) -> ReceiptsEnvClass {
     let Some(raw) = env else {
         return ReceiptsEnvClass::Unset;
@@ -216,7 +208,6 @@ fn receipts_env_class(env: Option<&str>) -> ReceiptsEnvClass {
     ReceiptsEnvClass::Other
 }
 
-#[cfg_attr(not(test), expect(dead_code, reason = "read when the daemon starts"))]
 fn log_receipts_env(env: Option<&str>) {
     match receipts_env_class(env) {
         ReceiptsEnvClass::Required => {
@@ -242,7 +233,6 @@ fn log_receipts_env(env: Option<&str>) {
 /// `env` is the raw value, or `None` when the variable is unset. `required`
 /// forces both keys on. Anything else leaves the file's values.
 #[must_use]
-#[cfg_attr(not(test), expect(dead_code, reason = "read when the daemon starts"))]
 pub(crate) fn effective_receipts(config: &ReceiptsConfig, env: Option<&str>) -> ReceiptsMode {
     match receipts_env_class(env) {
         ReceiptsEnvClass::Required => ReceiptsMode {

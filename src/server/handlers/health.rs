@@ -33,6 +33,13 @@ pub async fn health(State(state): State<Arc<AppState>>) -> (StatusCode, Json<Hea
         error_kind: None,
         last_error_at: None,
         consecutive_failures: None,
+        receipts: {
+            let snap = state.receipts.snapshot();
+            crate::wire::ReceiptsHealth {
+                state: snap.state.to_string(),
+                seq: snap.seq,
+            }
+        },
     };
 
     if status.state != ProviderState::Healthy {

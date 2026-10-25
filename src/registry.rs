@@ -24,6 +24,8 @@ pub struct RunningPulse {
     pub persist_coordinator: Arc<PersistCoordinator>,
     /// The pulse's plugin turn runner.
     pub turns: crate::server::turns::TurnRunner,
+    /// Receipt writer. Shutdown appends the shutdown row through it.
+    pub receipts: crate::oneself::receipt::Appender,
 }
 
 /// In-memory registry of all running pulses.
@@ -95,6 +97,7 @@ impl PulseRegistry {
 async fn shut_down_pulse(name: &str, pulse: RunningPulse) {
     tracing::info!("Shutting down pulse: {}", name);
     flush_persistence(name, &pulse.persist_coordinator).await;
+    pulse.receipts.shutdown().await;
     pulse.server_handle.abort();
     pulse.coordinator.shutdown().await;
 }

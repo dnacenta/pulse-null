@@ -517,18 +517,18 @@ type CommandFuture = std::pin::Pin<Box<dyn std::future::Future<Output = CommandR
 
 fn main() {
     let listen = oneself::store::take_listen_env();
-    oneself::store::retain_listen(listen);
+    oneself::store::retain_listen(listen.clone());
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
         .expect("tokio runtime");
-    runtime.block_on(async_main());
+    runtime.block_on(async_main(listen));
 }
 
-async fn async_main() {
+async fn async_main(listen: oneself::store::ListenEnv) {
     let cli = Cli::parse();
     init_tracing(&cli.command);
-    if let Err(message) = run_command(cli.command, cli::root_guard::refuse_root).await {
+    if let Err(message) = run_command(cli.command, cli::root_guard::refuse_root, listen).await {
         eprintln!("{message}");
         std::process::exit(1);
     }
@@ -578,11 +578,12 @@ fn tui_log_writer(
 async fn run_command(
     command: Commands,
     refuse_root: impl FnOnce(&str) -> Result<(), String>,
+    listen: oneself::store::ListenEnv,
 ) -> Result<(), String> {
     if let Some(refusal) = root_check(&command).and_then(|check| check.refusal(refuse_root)) {
         return Err(refusal);
     }
-    dispatch(command).await.map_err(|err| {
+    dispatch(command, listen).await.map_err(|err| {
         if let Some(exit) = err.downcast_ref::<cli::receipts::PrintedExit>() {
             let code = exit.0;
             std::process::exit(code);
@@ -641,15 +642,33 @@ fn root_check(command: &Commands) -> Option<RootCheck> {
     }
 }
 
-fn dispatch(command: Commands) -> CommandFuture {
+fn dispatch(command: Commands, listen: oneself::store::ListenEnv) -> CommandFuture {
     match command {
-        Commands::Lifecycle(command) => lifecycle_command(command),
-        Commands::Work(command) => work_command(command),
-        Commands::Cognition(command) => cognition_command(command),
-        Commands::Repair => Box::pin(cli::repair::run()),
-        Commands::Isolate { action } => isolate_command(action),
-        Commands::Probe { action } => probe_command(action),
-        Commands::Receipts { action } => receipts_command(action),
+        Commands::Lifecycle(command) => lifecycle_command(command, listen),
+        Commands::Work(command) => {
+            drop(listen);
+            work_command(command)
+        }
+        Commands::Cognition(command) => {
+            drop(listen);
+            cognition_command(command)
+        }
+        Commands::Repair => {
+            drop(listen);
+            Box::pin(cli::repair::run())
+        }
+        Commands::Isolate { action } => {
+            drop(listen);
+            isolate_command(action)
+        }
+        Commands::Probe { action } => {
+            drop(listen);
+            probe_command(action)
+        }
+        Commands::Receipts { action } => {
+            drop(listen);
+            receipts_command(action)
+        }
     }
 }
 
@@ -666,13 +685,25 @@ fn receipts_command(action: ReceiptsAction) -> CommandFuture {
     }
 }
 
-fn lifecycle_command(command: LifecycleCommand) -> CommandFuture {
+fn lifecycle_command(
+    command: LifecycleCommand,
+    listen: oneself::store::ListenEnv,
+) -> CommandFuture {
     match command {
-        LifecycleCommand::Init { dir } => Box::pin(cli::init::run(dir)),
-        LifecycleCommand::Up { headless } => Box::pin(cli::up::run(headless)),
-        LifecycleCommand::Chat => Box::pin(cli::chat::run()),
-        LifecycleCommand::Down => Box::pin(cli::down::run()),
-        LifecycleCommand::Status => Box::pin(cli::status::run()),
+        LifecycleCommand::Init { dir } => {
+            drop(listen);
+            Box::pin(cli::init::run(dir))
+        }
+        LifecycleCommand::Up { headless } => Box::pin(cli::up::run(headless, listen)),
+        LifecycleCommand::Chat => Box::pin(cli::chat::run(listen)),
+        LifecycleCommand::Down => {
+            drop(listen);
+            Box::pin(cli::down::run())
+        }
+        LifecycleCommand::Status => {
+            drop(listen);
+            Box::pin(cli::status::run())
+        }
     }
 }
 
@@ -912,7 +943,7 @@ mod tests {
         for args in EVERY_COMMAND {
             // Building the future runs nothing; dropping it unpolled
             // leaves no trace.
-            drop(dispatch(parse(args)));
+            drop(dispatch(parse(args), oneself::store::ListenEnv::empty()));
         }
     }
 
@@ -982,9 +1013,19 @@ mod tests {
 
     #[tokio::test]
     async fn a_refused_command_stops_before_it_runs() {
-        let refused = run_command(parse(&["chat"]), |name| Err(format!("no {name}"))).await;
+        let refused = run_command(
+            parse(&["chat"]),
+            |name| Err(format!("no {name}")),
+            oneself::store::ListenEnv::empty(),
+        )
+        .await;
         assert_eq!(refused, Err("no chat".to_string()));
-        let refused = run_command(parse(&["init"]), |name| Err(format!("no {name}"))).await;
+        let refused = run_command(
+            parse(&["init"]),
+            |name| Err(format!("no {name}")),
+            oneself::store::ListenEnv::empty(),
+        )
+        .await;
         assert_eq!(refused, Err("Error: no init".to_string()));
     }
 
