@@ -2285,6 +2285,9 @@ mod strict_config_load_tests {
 
     #[test]
     fn unrecognised_rules_require_root_env_warns_once() {
+        if !crate::process_state::isolated_test("unrecognised_rules_require_root_env_warns_once") {
+            return;
+        }
         let pulse = PulseConfig {
             name: "Echo".into(),
             owner_name: "D".into(),
@@ -2311,6 +2314,9 @@ mod strict_config_load_tests {
 
     #[test]
     fn strict_load_refuses_a_pulse_owned_config() {
+        if !crate::process_state::isolated_test("strict_load_refuses_a_pulse_owned_config") {
+            return;
+        }
         let dir = tempfile::tempdir().unwrap();
         let path = write_pulse(dir.path(), true);
         let log = warnings_from(|| assert_refused(dir.path()));
@@ -2333,6 +2339,9 @@ mod strict_config_load_tests {
 
     #[test]
     fn env_forces_strict_load_of_a_pulse_owned_config() {
+        if !crate::process_state::isolated_test("env_forces_strict_load_of_a_pulse_owned_config") {
+            return;
+        }
         let dir = tempfile::tempdir().unwrap();
         let path = write_pulse(dir.path(), false);
         let log = warnings_from(|| {
@@ -2358,6 +2367,11 @@ mod strict_config_load_tests {
 
     #[test]
     fn unrecognised_receipts_env_warns_once_and_follows_the_file() {
+        if !crate::process_state::isolated_test(
+            "unrecognised_receipts_env_warns_once_and_follows_the_file",
+        ) {
+            return;
+        }
         let off = ReceiptsConfig {
             enabled: false,
             require_protected: false,
