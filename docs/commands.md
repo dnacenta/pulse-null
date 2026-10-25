@@ -25,13 +25,14 @@ pulse-null probe verify-isolation [--turn]   show a probe writes nowhere live (-
 pulse-null probe facts draw|plant FACT VALUE|list   paired facts for "Remembers" (needs the unit's credentials: run via systemd-run, see methods/probe-runner.md)
 pulse-null probe sets install --from DIR --pulse NAME   (root) install the sealed sets into /etc/pulse-null-probe/sets/NAME
 pulse-null probe export-graph [--if-due]  export the live graph for the next run; --if-due exits 0 without contacting the server when a scheduled run would be refused
-pulse-null receipts verify [--file P] [--json]   check a receipt file's hash chain
+pulse-null receipts verify [--file P] [--anchors] [--config C] [--json]   check a receipt file's hash chain
 pulse-null receipts show [--file P] [--since T] [--kind K] [--limit N] [--json]   print receipt rows
 pulse-null receipts overlaps [--file P] [--since T] [--limit N] [--json]   open intervals that overlap, including quiet_twin
 pulse-null receipts swaps [--file P] [--json]   provider, adapter, or model changes between boots or closes
+pulse-null receipts anchor --pulse NAME [--file P] [--config C] [--token-file T] [--dry-run]   append one anchor line when the file is ahead
 ```
 
-`receipts` reads a file and does not write one. The row format, the streams, and the exit codes are in [receipts.md](receipts.md).
+`verify`, `show`, `overlaps`, and `swaps` read a file and do not write one. `anchor` publishes one line and is not run by the daemon. The row format, the streams, and the exit codes are in [receipts.md](receipts.md).
 
 Probes are described in [methods/probe-runner.md](methods/probe-runner.md); they refuse to run
 without Landlock (kernel ABI 4) and refuse root.

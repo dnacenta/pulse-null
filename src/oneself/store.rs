@@ -1014,8 +1014,10 @@ fn adopt(source: StoreSource) -> Result<(File, bool, String), StoreError> {
 
 /// Open a path by walking every component from `/`.
 ///
-/// Each directory is opened with `openat`, `O_DIRECTORY`, and `O_NOFOLLOW`,
-/// so a symlink in the middle is refused and nothing is created through it.
+/// Each directory is opened with `openat`, `O_PATH`, `O_DIRECTORY`, and
+/// `O_NOFOLLOW`. `O_PATH` needs search permission only, so a mode such as
+/// `0311` still opens. A symlink in the middle is refused and nothing is
+/// created through it.
 /// A missing directory is created with `mkdirat` on the directory already
 /// opened, mode `0700`. A component that is a regular file is [`StoreError::NotFile`].
 /// The file itself is opened with `openat` and `O_NOFOLLOW`. A file with more
@@ -1047,11 +1049,20 @@ fn adopt_path(path: &Path) -> Result<(File, bool, String), StoreError> {
     let Some(file_name) = names.pop() else {
         return Err(StoreError::NotFile { path: shown });
     };
-    let mut dir = OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_DIRECTORY | libc::O_CLOEXEC)
-        .open("/")
-        .map_err(StoreError::Io)?;
+    // SAFETY: the path is the root directory, and the flags do not follow a
+    // symlink. The descriptor is owned below when `open` succeeds.
+    let root = unsafe {
+        libc::open(
+            c"/".as_ptr(),
+            libc::O_PATH | libc::O_DIRECTORY | libc::O_CLOEXEC,
+        )
+    };
+    if root < 0 {
+        return Err(StoreError::Io(std::io::Error::last_os_error()));
+    }
+    // SAFETY: `open` succeeded, so this process owns `root`. `O_PATH` is
+    // enough for `openat` and `mkdirat` on a child.
+    let mut dir = unsafe { File::from_raw_fd(root) };
     for name in &names {
         dir = descend(dir, name, &shown)?;
     }
@@ -1095,9 +1106,10 @@ fn c_name(name: &std::ffi::OsStr, path: &str) -> Result<CString, StoreError> {
 /// Open one directory component. `ENOENT` is returned as that errno so the
 /// caller can create it. A symlink or a non-directory is [`StoreError::NotFile`].
 fn open_dir_at(dirfd: i32, name: CString) -> Result<File, StoreError> {
-    let flags = libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC;
-    // SAFETY: `dirfd` is `AT_FDCWD` or an open directory, and `name` is
-    // nul-terminated. `O_NOFOLLOW` does not follow this component.
+    let flags = libc::O_PATH | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC;
+    // SAFETY: `dirfd` is an open directory, and `name` is nul-terminated.
+    // `O_PATH` does not read the directory. `O_NOFOLLOW` does not follow
+    // this component.
     let fd = unsafe { libc::openat(dirfd, name.as_ptr(), flags) };
     if fd >= 0 {
         // SAFETY: `openat` succeeded, so this process owns `fd`.
@@ -1953,6 +1965,19 @@ mod tests {
         let path = styled.join("receipts.jsonl");
         ReceiptStore::open(StoreSource::Path(path.clone()), &LiveProbe, "echo").unwrap();
         assert!(path.is_file());
+    }
+
+    #[test]
+    fn an_exec_only_ancestor_still_opens() {
+        let dir = tempfile::tempdir().unwrap();
+        let ancestor = dir.path().join("search");
+        let child = ancestor.join("child");
+        std::fs::create_dir_all(&child).unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&ancestor, std::fs::Permissions::from_mode(0o311)).unwrap();
+        let path = child.join("receipts.jsonl");
+        ReceiptStore::open(StoreSource::Path(path.clone()), &LiveProbe, "echo").unwrap();
+        assert!(path.is_file(), "a search-only ancestor must still open");
     }
 
     #[test]

@@ -81,6 +81,8 @@ Every key:
 | `receipts` | `require_protected` | `true` | Write only through a protected systemd fd. A path is not opened |
 | `receipts` | `content` | `digest` | What a row stores. Only `digest` is accepted |
 
+Anchor backends are not in this file. They are read from `/etc/pulse-null/anchor.toml` (see [receipts.md](receipts.md#anchors)). `pulse-null.toml` cannot name a repo or a token.
+
 Also present, with defaults: `[owner]`, `[prediction]`, `[tension]`, `[outreach]`,
 `[sessions]`, `[session_health]`, `[platform]`, `[system_prompt_budget]`, `[peers]`,
 `[plugins]`.
@@ -94,6 +96,9 @@ Also present, with defaults: `[owner]`, `[prediction]`, `[tension]`, `[outreach]
 | `PULSE_CLI_BIN` | CLI binary when `[llm] cli_bin` is unset |
 | `PULSE_NULL_ALLOW_ROOT` | `1` lets `init` / `up` run as root (CI) |
 | `PULSE_NULL_RECEIPTS` | `required` forces receipts on and protection required. The file cannot turn that off, and `[receipts] path` is not opened. Any other non-empty value is ignored |
+| `PULSE_NULL_ANCHOR_TOKEN_FILE` | Token file for `receipts anchor`, after `--token-file` and the backend's `token_file` |
+| `PULSE_NULL_ANCHOR_TOKEN` | Token string, used only when no token file is set. A file must not be group- or world-readable |
+| `CREDENTIALS_DIRECTORY` | When set, `anchor-token` in that directory is the token file after `PULSE_NULL_ANCHOR_TOKEN_FILE` |
 | `RUST_LOG` | Log level, e.g. `pulse_null=debug` |
 
 ## Older configs

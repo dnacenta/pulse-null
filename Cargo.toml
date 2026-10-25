@@ -80,6 +80,7 @@ libc = "0.2"
 # Probe sandbox (PN-144): Landlock on the probe child only
 landlock = "0.4"
 sha2 = "0.10"
+base64 = "0.22"
 
 # Shared types
 pulse-system-types = "0.7"

@@ -1,15 +1,18 @@
-//! `pulse-null receipts verify`, `show`, `overlaps`, and `swaps`.
+//! `pulse-null receipts verify`, `show`, `overlaps`, `swaps`, and `anchor`.
 //!
-//! Each reads a file. None of them locks it or repairs a torn tail. The store
-//! does that when it opens.
+//! `verify`, `show`, `overlaps`, and `swaps` read a file. `anchor` is the only
+//! one that publishes, and only from this command, never from the daemon.
+//! None of them locks the receipt file or repairs a torn tail. The store does
+//! that when it opens.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::PathBuf;
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
 use crate::config::Config;
+use crate::oneself::anchor::{self, Outcome};
 use crate::oneself::chain::{self, VerifyState};
 use crate::oneself::protect::{LiveProbe, Protection, ProtectionProbe};
 use crate::oneself::store::{self, Inspected};
@@ -27,6 +30,16 @@ impl std::fmt::Display for PrintedExit {
 impl std::error::Error for PrintedExit {}
 
 pub async fn verify(file: Option<PathBuf>, json: bool) -> Result<(), Box<dyn std::error::Error>> {
+    verify_at(file, json, false, None, None).await
+}
+
+pub async fn verify_at(
+    file: Option<PathBuf>,
+    json: bool,
+    anchors: bool,
+    config: Option<PathBuf>,
+    token_file: Option<PathBuf>,
+) -> Result<(), Box<dyn std::error::Error>> {
     let located = match resolve_with(file, || Ok(Config::load()?)) {
         Ok(located) => located,
         Err(err) => return unverified(json, &err.to_string()),
@@ -38,9 +51,101 @@ pub async fn verify(file: Option<PathBuf>, json: bool) -> Result<(), Box<dyn std
     // Protection looks at this fd. The path is not opened again.
     let protection = LiveProbe.probe(&file, false);
     drop(file);
-    let report = chain::verify_lines(bytes.as_slice());
+    let index = anchors.then(|| chain::index_bytes(bytes.as_slice()));
+    let report = match &index {
+        Some(index) => index.report.clone(),
+        None => chain::verify_lines(bytes.as_slice()),
+    };
+    let path = located.path.clone();
     let inspected = Inspected { bytes, report };
-    emit_verify(json, &inspected, &located, protection)
+    let compared = if let Some(index) = index
+        .as_ref()
+        .filter(|_| inspected.report.first_break.is_none())
+    {
+        match anchor::check(
+            index,
+            &match anchor::open_backends(
+                config.as_deref(),
+                token_file.as_deref(),
+                path.parent().unwrap_or(std::path::Path::new(".")),
+            ) {
+                Ok(backends) => backends,
+                Err(err) => return unverified(json, &err.to_string()),
+            },
+        )
+        .await
+        {
+            Ok(outcome) => Some(outcome),
+            Err(err) => return unverified(json, &err.to_string()),
+        }
+    } else {
+        None
+    };
+    emit_verify(json, &inspected, &located, protection, compared.as_ref())
+}
+
+/// Publish one anchor line when the local chain is ahead of every backend.
+///
+/// The receipt file is not locked. A trailing partial line is not part of
+/// the chain. A mismatch or a rewind publishes nothing.
+pub async fn anchor(
+    pulse: String,
+    file: Option<PathBuf>,
+    config: Option<PathBuf>,
+    token_file: Option<PathBuf>,
+    dry_run: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if pulse.is_empty() || pulse.split_whitespace().nth(1).is_some() {
+        return unverified(false, "pulse must be a single word");
+    }
+    let path = match resolve_path(file) {
+        Ok(path) => path,
+        Err(err) => return unverified(false, &err.to_string()),
+    };
+    let (bytes, _file) = match store::read_receipt(&path) {
+        Ok(opened) => opened,
+        Err(err) => return unverified(false, &err.to_string()),
+    };
+    let index = chain::index_bytes(anchor::complete_prefix(&bytes));
+    if let Some(broken) = &index.report.first_break {
+        println!("broken line {}: {}", broken.line, broken.reason);
+        return Err(Box::new(PrintedExit(1)));
+    }
+    if index.pulse.as_deref() != Some(pulse.as_str()) {
+        return unverified(false, "pulse does not match the genesis row");
+    }
+    let backends = match anchor::open_backends(
+        config.as_deref(),
+        token_file.as_deref(),
+        path.parent().unwrap_or(std::path::Path::new(".")),
+    ) {
+        Ok(backends) => backends,
+        Err(err) => return unverified(false, &err.to_string()),
+    };
+    let outcome = match anchor::sync(&index, &backends, dry_run).await {
+        Ok(outcome) => outcome,
+        Err(err) => return unverified(false, &err.to_string()),
+    };
+    for note in &outcome.notes {
+        println!("anchor {} {}", note.backend, note.state);
+    }
+    match outcome.state {
+        "mismatch" | "rewind" => {
+            println!("{} {}", outcome.state, outcome.backend);
+            Err(Box::new(PrintedExit(1)))
+        }
+        "published" | "dry-run" => {
+            println!("{}", outcome.state);
+            if let Some(line) = &outcome.line {
+                println!("{line}");
+            }
+            Ok(())
+        }
+        _ => {
+            println!("unchanged");
+            Ok(())
+        }
+    }
 }
 
 pub async fn show(
@@ -97,17 +202,12 @@ pub async fn overlaps(
     if inspected.report.first_break.is_some() {
         return emit(json, &inspected);
     }
-    let rows = accepted_rows(&inspected.bytes);
+    let state = state_name(inspected.report.state());
+    let spans = spans_of_bytes(&inspected.bytes);
+    drop(inspected);
     let stdout = std::io::stdout();
     let mut out = stdout.lock();
-    write_overlaps(
-        &mut out,
-        json,
-        state_name(inspected.report.state()),
-        &rows,
-        since.as_deref(),
-        limit,
-    )?;
+    write_overlaps(&mut out, json, state, &spans, since.as_deref(), limit)?;
     Ok(())
 }
 
@@ -119,8 +219,7 @@ pub async fn swaps(file: Option<PathBuf>, json: bool) -> Result<(), Box<dyn std:
     if inspected.report.first_break.is_some() {
         return emit(json, &inspected);
     }
-    let rows = accepted_rows(&inspected.bytes);
-    let found = find_swaps(&rows, state_name(inspected.report.state()));
+    let found = swaps_of_bytes(&inspected.bytes, state_name(inspected.report.state()));
     if json {
         println!(
             "{}",
@@ -140,23 +239,6 @@ pub async fn swaps(file: Option<PathBuf>, json: bool) -> Result<(), Box<dyn std:
 fn inspected_file(file: Option<PathBuf>) -> Result<Inspected, Box<dyn std::error::Error>> {
     let path = resolve_path(file)?;
     Ok(store::inspect(&path)?)
-}
-
-fn accepted_rows(bytes: &[u8]) -> Vec<chain::Row> {
-    let mut rows = Vec::new();
-    for line in bytes.split(|byte| *byte == b'\n') {
-        if line.is_empty() {
-            continue;
-        }
-        let Ok(text) = std::str::from_utf8(line) else {
-            continue;
-        };
-        let Ok(row) = serde_json::from_str::<chain::Row>(text) else {
-            continue;
-        };
-        rows.push(row);
-    }
-    rows
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -189,55 +271,105 @@ pub(crate) fn find_overlaps(
     limit: u64,
 ) -> (Vec<Overlap>, u64) {
     let mut found = Vec::new();
-    let truncated = visit_overlaps(rows, since, limit, |item| found.push(item.clone()));
+    let spans = spans_of(rows);
+    let truncated = visit_overlaps(&spans, since, limit, |item| found.push(item.clone()));
     (found, truncated)
+}
+
+/// Open spans still inside the sweep. Counts make a capped remainder exact
+/// without visiting each pair.
+struct LiveSpans {
+    by_close: BTreeMap<u64, Vec<Span>>,
+    total: u64,
+    by_stream: HashMap<String, u64>,
+}
+
+impl LiveSpans {
+    fn new() -> Self {
+        Self {
+            by_close: BTreeMap::new(),
+            total: 0,
+            by_stream: HashMap::new(),
+        }
+    }
+
+    fn expire(&mut self, open_seq: u64) {
+        while let Some(close_seq) = self.by_close.first_key_value().map(|(seq, _)| *seq) {
+            if close_seq > open_seq {
+                break;
+            }
+            let Some(spans) = self.by_close.remove(&close_seq) else {
+                break;
+            };
+            for span in spans {
+                self.total = self.total.saturating_sub(1);
+                if let Some(count) = self.by_stream.get_mut(&span.stream) {
+                    *count = count.saturating_sub(1);
+                    if *count == 0 {
+                        self.by_stream.remove(&span.stream);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Active spans on a different stream. A span kept here already ended at
+    /// or after `--since`, so each of these is an overlap.
+    fn overlaps_with(&self, span: &Span) -> u64 {
+        self.total
+            .saturating_sub(self.by_stream.get(&span.stream).copied().unwrap_or(0))
+    }
+
+    fn insert(&mut self, span: Span) {
+        self.total += 1;
+        *self.by_stream.entry(span.stream.clone()).or_default() += 1;
+        self.by_close.entry(span.close_seq).or_default().push(span);
+    }
 }
 
 /// Sweep spans in open-seq order. The active set is keyed by close seq.
 ///
-/// `emit` is called for each overlap that is shown. The returned count is
-/// how many further overlaps were not shown.
+/// `emit` is called for each overlap that is shown. Once `limit` overlaps
+/// have been shown, the rest are counted from the active-set size. A span
+/// that ended before `since` is not kept, so it adds no further pairs.
+/// The returned count is how many further overlaps were not shown.
 fn visit_overlaps(
-    rows: &[chain::Row],
+    spans: &[Span],
     since: Option<&str>,
     limit: u64,
     mut emit: impl FnMut(&Overlap),
 ) -> u64 {
     let bound = since.and_then(since_bound);
-    let mut spans = spans_of(rows);
+    let mut spans = spans.to_vec();
     spans.sort_by_key(|span| span.open_seq);
-    let mut active: BTreeMap<u64, Vec<Span>> = BTreeMap::new();
+    let mut live = LiveSpans::new();
     let mut shown = 0u64;
     let mut truncated = 0u64;
     for span in spans {
-        while let Some(close_seq) = active.first_key_value().map(|(seq, _)| *seq) {
-            if close_seq > span.open_seq {
-                break;
-            }
-            active.remove(&close_seq);
-        }
-        for open in active.values().flatten() {
-            if open.stream == span.stream {
-                continue;
-            }
-            if let Some(bound) = bound.as_deref() {
-                let end = if open.end.as_str() < span.end.as_str() {
-                    open.end.as_str()
-                } else {
-                    span.end.as_str()
-                };
-                if end < bound {
+        live.expire(span.open_seq);
+        let keep = bound
+            .as_deref()
+            .is_none_or(|bound| span.end.as_str() >= bound);
+        let mut rest = if keep { live.overlaps_with(&span) } else { 0 };
+        if rest > 0 && limit != 0 && shown >= limit {
+            truncated += rest;
+        } else if rest > 0 {
+            for open in live.by_close.values().flatten() {
+                if open.stream == span.stream {
                     continue;
                 }
+                if limit != 0 && shown >= limit {
+                    truncated += rest;
+                    break;
+                }
+                shown += 1;
+                rest -= 1;
+                emit(&overlap_of(open, &span));
             }
-            if limit != 0 && shown >= limit {
-                truncated += 1;
-                continue;
-            }
-            shown += 1;
-            emit(&overlap_of(open, &span));
         }
-        active.entry(span.close_seq).or_default().push(span);
+        if keep {
+            live.insert(span);
+        }
     }
     truncated
 }
@@ -246,7 +378,7 @@ fn write_overlaps(
     out: &mut impl std::io::Write,
     json: bool,
     state: &str,
-    rows: &[chain::Row],
+    spans: &[Span],
     since: Option<&str>,
     limit: u64,
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -254,9 +386,11 @@ fn write_overlaps(
     let mut first = true;
     if json {
         let state_json = serde_json::to_string(state)?;
-        write!(out, "{{\"state\":{state_json},\"overlaps\":[")?;
+        if let Err(err) = write!(out, "{{\"state\":{state_json},\"overlaps\":[") {
+            return pipe_or(err);
+        }
     }
-    let truncated = visit_overlaps(rows, since, limit, |item| {
+    let truncated = visit_overlaps(spans, since, limit, |item| {
         if failed.is_some() {
             return;
         }
@@ -282,16 +416,30 @@ fn write_overlaps(
         }
     });
     if let Some(err) = failed {
-        return Err(Box::new(err));
+        return pipe_or(err);
     }
     if json {
-        writeln!(out, "],\"truncated\":{truncated}}}")?;
+        if let Err(err) = writeln!(out, "],\"truncated\":{truncated}}}") {
+            return pipe_or(err);
+        }
     } else if truncated > 0 {
-        writeln!(out, "truncated, {truncated} more not shown")?;
+        if let Err(err) = writeln!(out, "truncated, {truncated} more not shown") {
+            return pipe_or(err);
+        }
     }
     Ok(())
 }
 
+/// A closed pipe is a successful short write, the same way `show` ends.
+fn pipe_or(err: std::io::Error) -> Result<(), Box<dyn std::error::Error>> {
+    if err.kind() == std::io::ErrorKind::BrokenPipe {
+        Ok(())
+    } else {
+        Err(Box::new(err))
+    }
+}
+
+#[cfg(test)]
 fn spans_of(rows: &[chain::Row]) -> Vec<Span> {
     let mut open_at: BTreeMap<String, (u64, String)> = BTreeMap::new();
     let mut spans = Vec::new();
@@ -327,6 +475,86 @@ fn spans_of(rows: &[chain::Row]) -> Vec<Span> {
         }
     }
     spans
+}
+
+/// Spans from a receipt file, one line at a time. The line is dropped before
+/// the next one is read.
+fn spans_of_bytes(bytes: &[u8]) -> Vec<Span> {
+    let mut open_at: BTreeMap<String, (u64, String)> = BTreeMap::new();
+    let mut spans = Vec::new();
+    each_slim(bytes, |row| {
+        if row.e.stream.is_empty() {
+            return;
+        }
+        match row.e.kind.as_str() {
+            "open" => {
+                open_at.insert(row.e.stream, (row.seq, row.ts));
+            }
+            "close" => {
+                let Some((open_seq, start)) = open_at.remove(&row.e.stream) else {
+                    return;
+                };
+                spans.push(Span {
+                    stream: row.e.stream,
+                    open_seq,
+                    close_seq: row.seq,
+                    start,
+                    end: row.ts,
+                    outcome: row.e.outcome,
+                });
+            }
+            _ => {}
+        }
+    });
+    spans
+}
+
+fn each_slim(bytes: &[u8], mut visit: impl FnMut(SlimRow)) {
+    for line in bytes.split(|byte| *byte == b'\n') {
+        if line.is_empty() {
+            continue;
+        }
+        let Ok(text) = std::str::from_utf8(line) else {
+            continue;
+        };
+        if let Ok(row) = serde_json::from_str::<SlimRow>(text) {
+            visit(row);
+        }
+    }
+}
+
+#[derive(Deserialize)]
+struct SlimRow {
+    seq: u64,
+    ts: String,
+    e: SlimEvent,
+}
+
+#[derive(Deserialize)]
+struct SlimEvent {
+    kind: String,
+    #[serde(default)]
+    stream: String,
+    #[serde(default)]
+    outcome: String,
+    #[serde(default)]
+    provider: String,
+    #[serde(default)]
+    adapter: String,
+    #[serde(default)]
+    model: Option<String>,
+    #[serde(default)]
+    identity: Option<SlimIdentity>,
+}
+
+#[derive(Deserialize)]
+struct SlimIdentity {
+    #[serde(default)]
+    self_md: Option<String>,
+    #[serde(default)]
+    rules: Option<String>,
+    #[serde(default)]
+    config: Option<String>,
 }
 
 fn overlap_of(left: &Span, right: &Span) -> Overlap {
@@ -381,54 +609,130 @@ fn overlap_line(item: &Overlap) -> String {
 /// between two equal successes is not a swap. Identity carry-over is whether
 /// the boot digests are the same. `chain` is the verified file's state. A
 /// broken file is not passed here.
-pub(crate) fn find_swaps(rows: &[chain::Row], chain: &str) -> Vec<Swap> {
-    let mut found = Vec::new();
-    push_swaps(&mut found, rows, "boot", true, chain);
-    push_swaps(&mut found, rows, "close", false, chain);
-    found
+#[cfg(test)]
+pub(crate) fn find_swaps(rows: &[chain::Row], chain_state: &str) -> Vec<Swap> {
+    let mut fold = SwapFold::new(chain_state);
+    for row in rows {
+        fold.observe(seen_of_row(row));
+    }
+    fold.found
 }
 
-fn push_swaps(found: &mut Vec<Swap>, rows: &[chain::Row], kind: &str, identity: bool, chain: &str) {
-    let chosen: Vec<&chain::Row> = rows
-        .iter()
-        .filter(|row| row.e.get("kind").and_then(Value::as_str) == Some(kind))
-        .filter(|row| kind != "close" || resolved_model(row).is_some())
-        .collect();
-    for pair in chosen.windows(2) {
-        let from = pair[0];
-        let to = pair[1];
-        let from_provider = field(from, "provider");
-        let to_provider = field(to, "provider");
-        let from_adapter = field(from, "adapter");
-        let to_adapter = field(to, "adapter");
-        let from_model = field(from, "model");
-        let to_model = field(to, "model");
-        if from_provider == to_provider && from_adapter == to_adapter && from_model == to_model {
-            continue;
+/// Swap pairs from a receipt file, one line at a time.
+fn swaps_of_bytes(bytes: &[u8], chain_state: &str) -> Vec<Swap> {
+    let mut fold = SwapFold::new(chain_state);
+    each_slim(bytes, |row| fold.observe(seen_of_slim(row)));
+    fold.found
+}
+
+struct Seen {
+    seq: u64,
+    kind: String,
+    provider: String,
+    adapter: String,
+    model: String,
+    close_set: bool,
+    self_md: Option<String>,
+    rules: Option<String>,
+    config: Option<String>,
+}
+
+struct SwapFold {
+    chain_state: String,
+    last_boot: Option<Seen>,
+    last_close: Option<Seen>,
+    found: Vec<Swap>,
+}
+
+impl SwapFold {
+    fn new(chain_state: &str) -> Self {
+        Self {
+            chain_state: chain_state.to_string(),
+            last_boot: None,
+            last_close: None,
+            found: Vec::new(),
         }
-        let between = to.seq.saturating_sub(from.seq).saturating_sub(1);
-        found.push(Swap {
-            kind: kind.to_string(),
+    }
+
+    fn observe(&mut self, seen: Seen) {
+        match seen.kind.as_str() {
+            "boot" => {
+                if let Some(prev) = self.last_boot.take() {
+                    self.push(&prev, &seen, true);
+                }
+                self.last_boot = Some(seen);
+            }
+            "close" if seen.close_set => {
+                if let Some(prev) = self.last_close.take() {
+                    self.push(&prev, &seen, false);
+                }
+                self.last_close = Some(seen);
+            }
+            _ => {}
+        }
+    }
+
+    fn push(&mut self, from: &Seen, to: &Seen, identity: bool) {
+        if from.provider == to.provider && from.adapter == to.adapter && from.model == to.model {
+            return;
+        }
+        self.found.push(Swap {
+            kind: to.kind.clone(),
             from_seq: from.seq,
             to_seq: to.seq,
-            from_provider,
-            to_provider,
-            from_adapter,
-            to_adapter,
-            from_model,
-            to_model,
+            from_provider: from.provider.clone(),
+            to_provider: to.provider.clone(),
+            from_adapter: from.adapter.clone(),
+            to_adapter: to.adapter.clone(),
+            from_model: from.model.clone(),
+            to_model: to.model.clone(),
             identity: identity.then(|| IdentityCarry {
-                self_md: ident(from, "self_md") == ident(to, "self_md"),
-                rules: ident(from, "rules") == ident(to, "rules"),
-                config: ident(from, "config") == ident(to, "config"),
+                self_md: from.self_md == to.self_md,
+                rules: from.rules == to.rules,
+                config: from.config == to.config,
             }),
-            chain: chain.to_string(),
-            between,
+            chain: self.chain_state.clone(),
+            between: to.seq.saturating_sub(from.seq).saturating_sub(1),
         });
     }
 }
 
+#[cfg(test)]
+fn seen_of_row(row: &chain::Row) -> Seen {
+    let kind = row.e.get("kind").and_then(Value::as_str).unwrap_or("");
+    let model = field(row, "model");
+    Seen {
+        seq: row.seq,
+        kind: kind.to_string(),
+        provider: field(row, "provider"),
+        adapter: field(row, "adapter"),
+        close_set: kind != "close" || resolved_model(row).is_some(),
+        model,
+        self_md: ident(row, "self_md"),
+        rules: ident(row, "rules"),
+        config: ident(row, "config"),
+    }
+}
+
+fn seen_of_slim(row: SlimRow) -> Seen {
+    let model = row.e.model.clone().unwrap_or_default();
+    let close_set = row.e.kind != "close" || !model.is_empty();
+    let identity = row.e.identity;
+    Seen {
+        seq: row.seq,
+        kind: row.e.kind,
+        provider: row.e.provider,
+        adapter: row.e.adapter,
+        model,
+        close_set,
+        self_md: identity.as_ref().and_then(|item| item.self_md.clone()),
+        rules: identity.as_ref().and_then(|item| item.rules.clone()),
+        config: identity.as_ref().and_then(|item| item.config.clone()),
+    }
+}
+
 /// A close model that came from a response. Absent and empty are unset.
+#[cfg(test)]
 fn resolved_model(row: &chain::Row) -> Option<&str> {
     row.e
         .get("model")
@@ -436,6 +740,7 @@ fn resolved_model(row: &chain::Row) -> Option<&str> {
         .filter(|model| !model.is_empty())
 }
 
+#[cfg(test)]
 fn field(row: &chain::Row, name: &str) -> String {
     row.e
         .get(name)
@@ -444,6 +749,7 @@ fn field(row: &chain::Row, name: &str) -> String {
         .to_string()
 }
 
+#[cfg(test)]
 fn ident(row: &chain::Row, name: &str) -> Option<String> {
     row.e
         .get("identity")
@@ -618,17 +924,38 @@ fn emit_verify(
     inspected: &Inspected,
     located: &Located,
     protection: Protection,
+    anchors: Option<&Outcome>,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    let verdict = anchors.and_then(|item| match item.state {
+        "mismatch" | "rewind" => Some(item.state),
+        _ => None,
+    });
     if json_out {
-        println!(
-            "{}",
-            serde_json::to_string(&verify_json(inspected, located, protection))?
-        );
+        let mut value = verify_json(inspected, located, protection);
+        if let Some(anchors) = anchors {
+            if let Some(verdict) = verdict {
+                value["state"] = json!(verdict);
+            }
+            value["anchors"] = json!(anchors
+                .notes
+                .iter()
+                .map(|note| json!({"backend": note.backend, "state": note.state}))
+                .collect::<Vec<_>>());
+        }
+        println!("{}", serde_json::to_string(&value)?);
     } else {
         println!("{}", preamble(located, &protection));
         print_human(inspected);
+        if let Some(anchors) = anchors {
+            for note in &anchors.notes {
+                println!("anchor {} {}", note.backend, note.state);
+            }
+            if let Some(verdict) = verdict {
+                println!("{verdict}");
+            }
+        }
     }
-    if inspected.report.first_break.is_some() {
+    if inspected.report.first_break.is_some() || verdict.is_some() {
         Err(Box::new(PrintedExit(1)))
     } else {
         Ok(())
@@ -1835,13 +2162,13 @@ mod tests {
         assert_eq!(truncated, 40 * 39 / 2 - 10);
 
         let mut json = Vec::new();
-        write_overlaps(&mut json, true, "ok", &concurrent, None, 10).unwrap();
+        write_overlaps(&mut json, true, "ok", &spans_of(&concurrent), None, 10).unwrap();
         let parsed: serde_json::Value = serde_json::from_slice(&json).unwrap();
         assert_eq!(parsed["truncated"], 770);
         assert_eq!(parsed["overlaps"].as_array().unwrap().len(), 10);
 
         let mut text = Vec::new();
-        write_overlaps(&mut text, false, "ok", &concurrent, None, 10).unwrap();
+        write_overlaps(&mut text, false, "ok", &spans_of(&concurrent), None, 10).unwrap();
         let text = String::from_utf8(text).unwrap();
         assert!(text.ends_with("truncated, 770 more not shown\n"), "{text}");
         assert_eq!(text.lines().count(), 11);
@@ -1903,5 +2230,289 @@ mod tests {
             .unwrap_err();
         let printed = err.downcast_ref::<PrintedExit>().expect("printed exit");
         assert_eq!(printed.0, 1);
+    }
+
+    #[test]
+    fn capped_concurrent_spans_finish_without_walking_every_pair() {
+        let mut rows = Vec::with_capacity(80_000);
+        for index in 0..40_000 {
+            rows.push(open_at(
+                index + 1,
+                "2026-10-25T00:00:00.000Z",
+                &format!("c{index}"),
+            ));
+        }
+        for index in 0..40_000 {
+            rows.push(close_at(
+                40_001 + index,
+                "2026-10-25T00:01:00.000Z",
+                &format!("c{index}"),
+                Outcome::Acted,
+            ));
+        }
+        let started = std::time::Instant::now();
+        let (shown, truncated) = find_overlaps(&rows, None, DEFAULT_OVERLAP_LIMIT);
+        let elapsed = started.elapsed();
+        assert_eq!(shown.len(), usize::try_from(DEFAULT_OVERLAP_LIMIT).unwrap());
+        assert_eq!(truncated, 40_000 * 39_999 / 2 - DEFAULT_OVERLAP_LIMIT);
+        assert!(
+            elapsed < std::time::Duration::from_secs(1),
+            "40k concurrent spans at the default cap took {elapsed:?}"
+        );
+
+        let started = std::time::Instant::now();
+        let (shown, truncated) = find_overlaps(
+            &rows,
+            Some("2026-10-25T00:02:00.000Z"),
+            DEFAULT_OVERLAP_LIMIT,
+        );
+        let elapsed = started.elapsed();
+        assert!(shown.is_empty());
+        assert_eq!(truncated, 0);
+        assert!(
+            elapsed < std::time::Duration::from_secs(1),
+            "a bound that drops every span took {elapsed:?}"
+        );
+    }
+
+    #[test]
+    fn a_closed_pipe_is_not_a_broken_chain() {
+        struct Closed;
+        impl std::io::Write for Closed {
+            fn write(&mut self, _buf: &[u8]) -> std::io::Result<usize> {
+                Err(std::io::Error::new(std::io::ErrorKind::BrokenPipe, "pipe"))
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let rows = vec![
+            open_at(1, "2026-10-25T00:00:00.000Z", "a"),
+            open_at(2, "2026-10-25T00:00:00.000Z", "b"),
+            close_at(3, "2026-10-25T00:01:00.000Z", "a", Outcome::Acted),
+            close_at(4, "2026-10-25T00:01:00.000Z", "b", Outcome::Acted),
+        ];
+        let spans = spans_of(&rows);
+        assert!(write_overlaps(&mut Closed, false, "ok", &spans, None, 0).is_ok());
+        assert!(write_overlaps(&mut Closed, true, "ok", &spans, None, 0).is_ok());
+    }
+
+    #[test]
+    fn a_large_file_is_scanned_one_line_at_a_time() {
+        let mut bytes = Vec::new();
+        for index in 0..20_000 {
+            let line = format!(
+                "{{\"v\":1,\"seq\":{index},\"prev\":\"{}\",\"ts\":\"2026-10-25T00:00:00.000Z\",\"e\":{{\"kind\":\"boot\",\"pulse\":\"echo\",\"version\":\"0\",\"provider\":\"same\",\"adapter\":\"\",\"model\":\"same\",\"identity\":{{\"self_md\":null,\"rules\":null,\"config\":null}},\"fd_source\":\"self\",\"protected\":false,\"append_only\":false}}}}\n",
+                "0".repeat(64)
+            );
+            bytes.extend_from_slice(line.as_bytes());
+        }
+        let started = std::time::Instant::now();
+        let swaps = swaps_of_bytes(&bytes, "ok");
+        let spans = spans_of_bytes(&bytes);
+        let elapsed = started.elapsed();
+        assert!(swaps.is_empty());
+        assert!(spans.is_empty());
+        assert!(
+            elapsed < std::time::Duration::from_secs(2),
+            "{} bytes took {elapsed:?}",
+            bytes.len()
+        );
+    }
+
+    fn mode(path: &std::path::Path, bits: u32) {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(bits)).unwrap();
+    }
+
+    fn local_config(dir: &std::path::Path) -> std::path::PathBuf {
+        let path = dir.join("anchor.toml");
+        std::fs::write(&path, "[[backend]]\nkind = \"local\"\n").unwrap();
+        mode(&path, 0o600);
+        path
+    }
+
+    fn code(err: Box<dyn std::error::Error>) -> i32 {
+        err.downcast_ref::<PrintedExit>()
+            .map(|exit| exit.0)
+            .unwrap_or(-1)
+    }
+
+    #[tokio::test]
+    async fn anchor_appends_one_line_ignores_a_torn_tail_and_refuses_a_mismatch() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = sample(dir.path());
+        let config = local_config(dir.path());
+        anchor(
+            "echo".into(),
+            Some(path.clone()),
+            Some(config.clone()),
+            None,
+            true,
+        )
+        .await
+        .unwrap();
+        assert!(!dir.path().join("anchors.log").exists());
+        anchor(
+            "echo".into(),
+            Some(path.clone()),
+            Some(config.clone()),
+            None,
+            false,
+        )
+        .await
+        .unwrap();
+        let log = dir.path().join("anchors.log");
+        let text = std::fs::read_to_string(&log).unwrap();
+        assert_eq!(text.lines().count(), 1, "{text}");
+        anchor(
+            "echo".into(),
+            Some(path.clone()),
+            Some(config.clone()),
+            None,
+            false,
+        )
+        .await
+        .unwrap();
+        assert_eq!(std::fs::read_to_string(&log).unwrap(), text);
+
+        let mut torn = std::fs::read(&path).unwrap();
+        torn.extend_from_slice(b"partial");
+        let torn_dir = tempfile::tempdir().unwrap();
+        let torn_file = torn_dir.path().join("receipts.jsonl");
+        std::fs::write(&torn_file, &torn).unwrap();
+        let torn_config = local_config(torn_dir.path());
+        anchor(
+            "echo".into(),
+            Some(torn_file),
+            Some(torn_config),
+            None,
+            false,
+        )
+        .await
+        .unwrap();
+        let torn_log = std::fs::read_to_string(torn_dir.path().join("anchors.log")).unwrap();
+        assert_eq!(torn_log.lines().count(), 1, "{torn_log}");
+        assert!(!torn_log.contains("partial"));
+
+        let parts: Vec<&str> = text.split_whitespace().collect();
+        let bad = format!(
+            "v1 {} {} {} {} {}\n",
+            parts[1],
+            parts[2],
+            parts[3],
+            "ab".repeat(32),
+            parts[5]
+        );
+        std::fs::write(&log, &bad).unwrap();
+        let err = anchor(
+            "echo".into(),
+            Some(path.clone()),
+            Some(config.clone()),
+            None,
+            false,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(code(err), 1);
+        assert_eq!(std::fs::read_to_string(&log).unwrap(), bad);
+        let err = verify_at(Some(path.clone()), true, true, Some(config.clone()), None)
+            .await
+            .unwrap_err();
+        assert_eq!(code(err), 1);
+
+        let ahead = format!(
+            "v1 {} {} 99 {} {}\n",
+            parts[1],
+            parts[2],
+            "cd".repeat(32),
+            parts[5]
+        );
+        std::fs::write(&log, &ahead).unwrap();
+        let err = anchor(
+            "echo".into(),
+            Some(path.clone()),
+            Some(config.clone()),
+            None,
+            false,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(code(err), 1);
+        assert_eq!(std::fs::read_to_string(&log).unwrap(), ahead);
+
+        let err = anchor(
+            "other".into(),
+            Some(path.clone()),
+            Some(config.clone()),
+            None,
+            false,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(code(err), 2);
+
+        let mut flipped = std::fs::read(&path).unwrap();
+        flipped[0] ^= 0x01;
+        let bad_file = dir.path().join("bad.jsonl");
+        std::fs::write(&bad_file, flipped).unwrap();
+        let before = std::fs::read(&log).unwrap();
+        let err = anchor(
+            "echo".into(),
+            Some(bad_file),
+            Some(config.clone()),
+            None,
+            false,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(code(err), 1);
+        assert_eq!(std::fs::read(&log).unwrap(), before);
+
+        verify_at(
+            Some(path.clone()),
+            false,
+            false,
+            Some(dir.path().join("missing.toml")),
+            None,
+        )
+        .await
+        .unwrap();
+
+        let token = dir.path().join("token");
+        std::fs::write(&token, "pn108-token-do-not-leak\n").unwrap();
+        mode(&token, 0o644);
+        let github = dir.path().join("github.toml");
+        std::fs::write(
+            &github,
+            format!(
+                "[[backend]]\nkind = \"github\"\nrepo = \"owner/repo\"\napi_base = \"http://127.0.0.1:9\"\ntoken_file = \"{}\"\n",
+                token.display()
+            ),
+        )
+        .unwrap();
+        mode(&github, 0o600);
+        let err = anchor("echo".into(), Some(path.clone()), Some(github), None, false)
+            .await
+            .unwrap_err();
+        assert_eq!(code(err), 2);
+
+        let private = dir.path().join("private-token");
+        std::fs::write(&private, "pn108-token-do-not-leak\n").unwrap();
+        mode(&private, 0o600);
+        let plain = dir.path().join("plain.toml");
+        std::fs::write(
+            &plain,
+            format!(
+                "[[backend]]\nkind = \"github\"\nrepo = \"owner/repo\"\napi_base = \"http://example.com\"\ntoken_file = \"{}\"\n",
+                private.display()
+            ),
+        )
+        .unwrap();
+        mode(&plain, 0o600);
+        let err = anchor("echo".into(), Some(path), Some(plain), None, false)
+            .await
+            .unwrap_err();
+        assert_eq!(code(err), 2);
     }
 }
