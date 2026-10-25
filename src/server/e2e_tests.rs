@@ -1706,7 +1706,8 @@ async fn e2e_chat_stream_reset_on_fallback() {
     let bin = dir.path().join("fake-cli");
     crate::cli_provider::fake_cli::write_script(
         &bin,
-        r#"printf '%s\n' '{"result":"the fallback answer"}'"#,
+        r#"cat >/dev/null
+printf '%s\n' '{"result":"the fallback answer"}'"#,
     );
     let mut config = test_config();
     config.llm.provider = "cli".into();
@@ -1993,7 +1994,8 @@ async fn owner_http_refusal_takes_the_fallback() {
     let bin = dir.path().join("fake-cli");
     crate::cli_provider::fake_cli::write_script(
         &bin,
-        r#"printf '%s\n' '{"result":"the fallback answer"}'"#,
+        r#"cat >/dev/null
+printf '%s\n' '{"result":"the fallback answer"}'"#,
     );
     let mut config = test_config();
     config.llm.provider = "cli".into();
