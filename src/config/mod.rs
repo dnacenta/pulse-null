@@ -1903,6 +1903,10 @@ mod pulse_rename_tests {
                 "unset"
             );
             assert!(effective_rules_require_root(config_value, Some("1")));
+            assert!(
+                effective_rules_require_root(config_value, Some(" 1 ")),
+                "trimmed 1"
+            );
             assert!(effective_rules_require_root(config_value, Some("true")));
             assert!(effective_rules_require_root(config_value, Some("YES")));
             assert_eq!(
@@ -1998,6 +2002,32 @@ mod strict_config_load_tests {
         let err = Config::load_from(dir).unwrap_err().to_string();
         assert!(err.contains(&path.display().to_string()), "{err}");
         assert!(err.contains("strict mode wants root"), "{err}");
+    }
+
+    #[test]
+    fn unrecognised_rules_require_root_env_warns_once() {
+        let pulse = PulseConfig {
+            name: "Echo".into(),
+            owner_name: "D".into(),
+            owner_alias: "D".into(),
+            rules_dir: None,
+            rules_require_root: false,
+        };
+        let log = warnings_from(|| {
+            with_rules_require_root_env(|| {
+                std::env::set_var(RULES_REQUIRE_ROOT_ENV, "garbage");
+                struct Clear;
+                impl Drop for Clear {
+                    fn drop(&mut self) {
+                        std::env::remove_var(RULES_REQUIRE_ROOT_ENV);
+                    }
+                }
+                let _clear = Clear;
+                assert!(!rules_require_root(&pulse));
+                assert!(!rules_require_root(&pulse));
+            });
+        });
+        assert_eq!(log.matches("not a recognized value").count(), 1, "{log}");
     }
 
     #[test]
