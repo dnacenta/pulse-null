@@ -423,15 +423,15 @@ enum Class {
 }
 
 fn classify(bytes: &[u8]) -> Result<Class, StoreError> {
-    if bytes.is_empty() {
+    // Replace a file only when it never held a finished line: empty, or a
+    // torn genesis with no newline. Any newline-terminated byte is evidence.
+    if bytes.is_empty() || (!bytes.contains(&b'\n') && !chain::accepts_line(bytes, 0, GENESIS_PREV))
+    {
         return Ok(Class::NoRow);
     }
     let (prefix, last, last_nl) = split_last(bytes);
     let prefix_report = chain::verify_lines(prefix);
     if let Some(note) = prefix_report.first_break {
-        if prefix_report.rows == 0 {
-            return Ok(Class::NoRow);
-        }
         return Ok(Class::Broken(note));
     }
     let seq = match prefix_report.seq {
@@ -447,7 +447,10 @@ fn classify(bytes: &[u8]) -> Result<Class, StoreError> {
         });
     }
     if prefix_report.rows == 0 {
-        return Ok(Class::NoRow);
+        return Ok(Class::Broken(VerifyNote {
+            line: 1,
+            reason: "genesis",
+        }));
     }
     if chain::valid_json_value(last) {
         return Ok(Class::Broken(VerifyNote {
@@ -958,6 +961,71 @@ mod tests {
             ReceiptStore::open(StoreSource::Path(path), &FakeProbe::protected(), "echo").unwrap();
         assert!(opened.protection.is_protected());
         drop(store);
+    }
+
+    fn many(dir: &Path, extra: usize) -> PathBuf {
+        let path = dir.join("receipts.jsonl");
+        let (mut store, _) =
+            ReceiptStore::open(StoreSource::Path(path.clone()), &LiveProbe, "echo").unwrap();
+        for _ in 0..extra {
+            store.append(shutdown()).unwrap();
+        }
+        drop(store);
+        path
+    }
+
+    fn assert_broken_line_one(path: &Path, before: &[u8]) {
+        let err = ReceiptStore::open(StoreSource::Path(path.to_path_buf()), &LiveProbe, "echo")
+            .unwrap_err();
+        assert!(matches!(err, StoreError::Broken { line: 1, .. }), "{err}");
+        assert_eq!(std::fs::read(path).unwrap(), before);
+    }
+
+    #[test]
+    fn a_damaged_first_line_is_broken_and_the_file_stays() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = many(dir.path(), 50);
+        let mut bytes = std::fs::read(&path).unwrap();
+        assert_eq!(chain::verify_lines(bytes.as_slice()).rows, 51);
+        bytes[20] ^= 0x01;
+        std::fs::write(&path, &bytes).unwrap();
+        assert_broken_line_one(&path, &bytes);
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = many(dir.path(), 10);
+        let text = String::from_utf8(std::fs::read(&path).unwrap()).unwrap();
+        let nl = text.find('\n').unwrap();
+        let mangled = format!("{}{}", text[..nl].replacen(",", ", ", 1), &text[nl..]);
+        std::fs::write(&path, &mangled).unwrap();
+        assert_broken_line_one(&path, mangled.as_bytes());
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = many(dir.path(), 3);
+        let mut bom = vec![0xef, 0xbb, 0xbf];
+        bom.extend(std::fs::read(&path).unwrap());
+        std::fs::write(&path, &bom).unwrap();
+        assert_broken_line_one(&path, &bom);
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = many(dir.path(), 5);
+        let mut bytes = std::fs::read(&path).unwrap();
+        bytes[20] ^= 0x01;
+        std::fs::write(&path, &bytes).unwrap();
+        let appending = OpenOptions::new()
+            .read(true)
+            .append(true)
+            .open(&path)
+            .unwrap();
+        with_forced_fd(&appending, || {
+            let err = ReceiptStore::open(
+                StoreSource::SystemdFd { name: "receipts" },
+                &LiveProbe,
+                "echo",
+            )
+            .unwrap_err();
+            assert!(matches!(err, StoreError::Broken { line: 1, .. }), "{err}");
+        });
+        assert_eq!(std::fs::read(&path).unwrap(), bytes);
     }
 
     #[test]
