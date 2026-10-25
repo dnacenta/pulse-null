@@ -1327,6 +1327,20 @@ fn fs_type_ok_for_strict(f_type: i64) -> bool {
     f_type != FUSE_SUPER_MAGIC && f_type != FUSEBLK_SUPER_MAGIC
 }
 
+/// Why a strict filesystem probe rejects a path. Non-strict mode ignores the
+/// probe, including an error. An error in strict mode is a rejection; the
+/// reason is the error text and never file contents.
+fn fs_block_reason(strict: bool, fs: Result<i64, String>) -> Option<String> {
+    if !strict {
+        return None;
+    }
+    match fs {
+        Err(reason) => Some(reason),
+        Ok(kind) if !fs_type_ok_for_strict(kind) => Some("on a FUSE filesystem".to_string()),
+        Ok(_) => None,
+    }
+}
+
 fn fs_type_of_stat(stat: impl FnOnce(*mut libc::statfs) -> libc::c_int) -> Result<i64, String> {
     let mut buf = std::mem::MaybeUninit::<libc::statfs>::zeroed();
     if stat(buf.as_mut_ptr()) != 0 {
@@ -1364,12 +1378,13 @@ fn strict_rules_dir_block(root: &Path, dir: &Path) -> Option<(PathBuf, String)> 
     strict_rules_dir_block_fs(root, dir, None)
 }
 
-/// `fs_type`, when set, is the filesystem magic every component reports.
-/// Production passes `None` and reads it with `statfs`.
+/// `fs_type`, when set, is the `statfs` result every component reports.
+/// Production passes `None` and reads it with `statfs`. An error rejects
+/// the directory.
 fn strict_rules_dir_block_fs(
     root: &Path,
     dir: &Path,
-    fs_type: Option<i64>,
+    fs_type: Option<Result<i64, String>>,
 ) -> Option<(PathBuf, String)> {
     use std::os::unix::fs::MetadataExt;
     let Ok(below) = dir.strip_prefix(root) else {
@@ -1383,15 +1398,12 @@ fn strict_rules_dir_block_fs(
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return None,
             Err(e) => return Some((current, e.to_string())),
         };
-        let kind = match fs_type {
-            Some(kind) => kind,
-            None => match fs_type_of_path(&current) {
-                Ok(kind) => kind,
-                Err(e) => return Some((current, e)),
-            },
+        let probed = match fs_type.clone() {
+            Some(result) => result,
+            None => fs_type_of_path(&current),
         };
-        if !fs_type_ok_for_strict(kind) {
-            return Some((current, "on a FUSE filesystem".to_string()));
+        if let Some(reason) = fs_block_reason(true, probed) {
+            return Some((current, reason));
         }
         if let Some(reason) = pulse_rules_dir_reject(meta.uid(), meta.mode()) {
             return Some((current, reason.to_string()));
@@ -1683,14 +1695,15 @@ fn read_rule_file(
     read_rule_file_fs(path, source, strict, running_uid, None)
 }
 
-/// `fs_type`, when set, is the filesystem magic the open file reports.
-/// Production passes `None` and reads it with `fstatfs`.
+/// `fs_type`, when set, is the `fstatfs` result of the open file.
+/// Production passes `None` and reads it with `fstatfs`. Strict mode
+/// rejects an error. Non-strict mode ignores the probe.
 fn read_rule_file_fs(
     path: &Path,
     source: RulesSource,
     strict: bool,
     running_uid: u32,
-    fs_type: Option<i64>,
+    fs_type: Option<Result<i64, String>>,
 ) -> Result<String, String> {
     use std::io::Read;
     use std::os::unix::fs::MetadataExt;
@@ -1698,12 +1711,12 @@ fn read_rule_file_fs(
         .map_err(|e| e.to_string())?
         .ok_or_else(|| "vanished".to_string())?;
     if source == RulesSource::Pulse && strict {
-        let kind = match fs_type {
-            Some(kind) => kind,
-            None => fs_type_of_file(&file)?,
+        let probed = match fs_type.clone() {
+            Some(result) => result,
+            None => fs_type_of_file(&file),
         };
-        if !fs_type_ok_for_strict(kind) {
-            return Err("on a FUSE filesystem".to_string());
+        if let Some(reason) = fs_block_reason(true, probed) {
+            return Err(reason);
         }
     }
     if source == RulesSource::Pulse {
@@ -3184,12 +3197,13 @@ mod tests {
     fn strict_skips_rules_when_a_directory_reports_fuse() {
         let dir = tempfile::tempdir().unwrap();
         let rules = seed_pulse_rules(dir.path());
-        let (path, reason) = strict_rules_dir_block_fs(dir.path(), &rules, Some(FUSE_SUPER_MAGIC))
-            .expect("a fuse directory is rejected");
+        let (path, reason) =
+            strict_rules_dir_block_fs(dir.path(), &rules, Some(Ok(FUSE_SUPER_MAGIC)))
+                .expect("a fuse directory is rejected");
         assert_eq!(reason, "on a FUSE filesystem");
         assert!(path.starts_with(dir.path()), "{}", path.display());
         let (path, reason) =
-            strict_rules_dir_block_fs(dir.path(), &rules, Some(FUSEBLK_SUPER_MAGIC))
+            strict_rules_dir_block_fs(dir.path(), &rules, Some(Ok(FUSEBLK_SUPER_MAGIC)))
                 .expect("fuseblk is rejected");
         assert_eq!(reason, "on a FUSE filesystem");
         assert!(path.starts_with(dir.path()), "{}", path.display());
@@ -3202,7 +3216,7 @@ mod tests {
         std::fs::write(&path, "FUSE-RULE").unwrap();
         for magic in [FUSE_SUPER_MAGIC, FUSEBLK_SUPER_MAGIC] {
             let err =
-                read_rule_file_fs(&path, RulesSource::Pulse, true, 0, Some(magic)).unwrap_err();
+                read_rule_file_fs(&path, RulesSource::Pulse, true, 0, Some(Ok(magic))).unwrap_err();
             assert_eq!(err, "on a FUSE filesystem");
             assert!(!err.contains("FUSE-RULE"), "{err}");
         }
@@ -3219,10 +3233,63 @@ mod tests {
             RulesSource::Pulse,
             false,
             unsafe { libc::geteuid() },
-            Some(FUSE_SUPER_MAGIC),
+            Some(Ok(FUSE_SUPER_MAGIC)),
         )
         .unwrap();
         assert_eq!(text, "PLAIN-RULE");
+    }
+
+    #[test]
+    fn strict_skips_rules_when_directory_statfs_fails() {
+        let dir = tempfile::tempdir().unwrap();
+        let rules = seed_pulse_rules(dir.path());
+        let (path, reason) =
+            strict_rules_dir_block_fs(dir.path(), &rules, Some(Err("statfs failed".to_string())))
+                .expect("a statfs error rejects the directory");
+        assert_eq!(reason, "statfs failed");
+        assert!(path.starts_with(dir.path()), "{}", path.display());
+        assert!(!reason.contains("SELF-WORK-RULE"));
+    }
+
+    #[test]
+    fn strict_skips_a_rule_file_when_fstatfs_fails() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("rule.md");
+        std::fs::write(&path, "FS-ERR-RULE").unwrap();
+        let err = read_rule_file_fs(
+            &path,
+            RulesSource::Pulse,
+            true,
+            0,
+            Some(Err("fstatfs failed".to_string())),
+        )
+        .unwrap_err();
+        assert_eq!(err, "fstatfs failed");
+        assert!(!err.contains("FS-ERR-RULE"), "{err}");
+    }
+
+    #[test]
+    fn non_strict_ignores_directory_and_file_fs_errors() {
+        assert!(fs_block_reason(false, Err("statfs failed".to_string())).is_none());
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("rule.md");
+        std::fs::write(&path, "PLAIN-RULE").unwrap();
+        // SAFETY: geteuid has no preconditions and cannot fail.
+        let text = read_rule_file_fs(
+            &path,
+            RulesSource::Pulse,
+            false,
+            unsafe { libc::geteuid() },
+            Some(Err("fstatfs failed".to_string())),
+        )
+        .unwrap();
+        assert_eq!(text, "PLAIN-RULE");
+
+        let mut config = cli_config("grok");
+        config.system_prompt_budget.enabled = false;
+        seed_pulse_rules(dir.path());
+        let open = build_system_prompt(dir.path(), &config).unwrap();
+        assert!(open.contains("SELF-WORK-RULE"), "{open}");
     }
 
     #[test]
