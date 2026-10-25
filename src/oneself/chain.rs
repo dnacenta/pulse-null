@@ -278,14 +278,20 @@ fn check_row(
     if row.seq != expected_seq {
         return Err("seq");
     }
-    if row.prev != expected_prev {
+    if row.prev != expected_prev || !digest_ok(&row.prev) {
         return Err("prev");
+    }
+    if !ts_ok(&row.ts) {
+        return Err("ts");
     }
     let event: ReceiptEvent =
         serde_json::from_value(row.e.clone()).map_err(|err| schema_reason(&err))?;
     let is_genesis = matches!(event, ReceiptEvent::Genesis { .. });
     if (row.seq == 0) != is_genesis {
         return Err("genesis");
+    }
+    if !digests_ok(&event) {
+        return Err("sha256");
     }
     // The stored bytes are what a reader sees. They must be the canonical
     // form, so a duplicate key cannot show one value and hash another.
@@ -300,6 +306,66 @@ fn check_row(
         hash: hex(&hash),
         event,
     })
+}
+
+/// `YYYY-MM-DDTHH:MM:SS.mmmZ`, and a real instant.
+fn ts_ok(ts: &str) -> bool {
+    let bytes = ts.as_bytes();
+    if bytes.len() != 24 {
+        return false;
+    }
+    let marks = bytes[4] == b'-'
+        && bytes[7] == b'-'
+        && bytes[10] == b'T'
+        && bytes[13] == b':'
+        && bytes[16] == b':'
+        && bytes[19] == b'.'
+        && bytes[23] == b'Z';
+    if !marks {
+        return false;
+    }
+    let digits = [0, 1, 2, 3, 5, 6, 8, 9, 11, 12, 14, 15, 17, 18, 20, 21, 22];
+    if !digits.iter().copied().all(|i| bytes[i].is_ascii_digit()) {
+        return false;
+    }
+    chrono::DateTime::parse_from_rfc3339(ts).is_ok()
+}
+
+/// 64 lowercase hex digits.
+fn digest_ok(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+fn opt_digest(value: &Option<String>) -> bool {
+    match value {
+        Some(text) => digest_ok(text),
+        None => true,
+    }
+}
+
+fn digests_ok(event: &ReceiptEvent) -> bool {
+    match event {
+        ReceiptEvent::Boot { identity, .. } => {
+            opt_digest(&identity.self_md)
+                && opt_digest(&identity.rules)
+                && opt_digest(&identity.config)
+        }
+        ReceiptEvent::Open {
+            principal_sha256, ..
+        } => opt_digest(principal_sha256),
+        ReceiptEvent::Close {
+            input_sha256,
+            output_sha256,
+            ..
+        } => opt_digest(input_sha256) && opt_digest(output_sha256),
+        ReceiptEvent::Recover { torn_sha256, .. } => digest_ok(torn_sha256),
+        ReceiptEvent::Genesis { .. } | ReceiptEvent::Shutdown { .. } | ReceiptEvent::Gap { .. } => {
+            true
+        }
+    }
 }
 
 /// Reject a line whose bytes are not `canonical` of its JSON value.
@@ -818,6 +884,55 @@ mod tests {
         assert_eq!(report.state(), VerifyState::Broken);
         assert!(report.warns.is_empty());
         assert_eq!(note(&report), (3, "seq"));
+    }
+
+    #[test]
+    fn a_timestamp_must_be_utc_with_milliseconds() {
+        let (genesis, prev) = line_of(
+            0,
+            GENESIS_PREV,
+            TS0,
+            &ReceiptEvent::Genesis {
+                pulse: "echo".to_string(),
+            },
+        );
+        let row = Row {
+            v: 1,
+            seq: 1,
+            prev,
+            ts: "yesterday".to_string(),
+            e: serde_json::to_value(ReceiptEvent::Shutdown {
+                reason: "a".to_string(),
+            })
+            .unwrap(),
+        };
+        let line = canonical(&serde_json::to_value(&row).unwrap()).unwrap();
+        let report = verify_lines(format!("{genesis}\n{line}\n").as_bytes());
+        assert_eq!(note(&report), (2, "ts"));
+    }
+
+    #[test]
+    fn a_digest_must_be_64_lowercase_hex() {
+        let (genesis, prev) = line_of(
+            0,
+            GENESIS_PREV,
+            TS0,
+            &ReceiptEvent::Genesis {
+                pulse: "echo".to_string(),
+            },
+        );
+        let (line, _) = line_of(
+            1,
+            &prev,
+            TS1,
+            &ReceiptEvent::Recover {
+                torn_offset: 0,
+                torn_len: 1,
+                torn_sha256: "nothex".to_string(),
+            },
+        );
+        let report = verify_lines(format!("{genesis}\n{line}\n").as_bytes());
+        assert_eq!(note(&report), (2, "sha256"));
     }
 
     #[test]
