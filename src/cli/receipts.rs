@@ -25,7 +25,14 @@ impl std::fmt::Display for PrintedExit {
 impl std::error::Error for PrintedExit {}
 
 pub async fn verify(file: Option<PathBuf>, json: bool) -> Result<(), Box<dyn std::error::Error>> {
-    let inspected = store::inspect(&resolve_path(file)?)?;
+    let path = match resolve_path(file) {
+        Ok(path) => path,
+        Err(err) => return unverified(json, &err.to_string()),
+    };
+    let inspected = match store::inspect(&path) {
+        Ok(inspected) => inspected,
+        Err(err) => return unverified(json, &err.to_string()),
+    };
     emit(json, &inspected)
 }
 
@@ -36,7 +43,14 @@ pub async fn show(
     limit: Option<u64>,
     json: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let inspected = store::inspect(&resolve_path(file)?)?;
+    let path = match resolve_path(file) {
+        Ok(path) => path,
+        Err(err) => return unverified(json, &err.to_string()),
+    };
+    let inspected = match store::inspect(&path) {
+        Ok(inspected) => inspected,
+        Err(err) => return unverified(json, &err.to_string()),
+    };
     if inspected.report.first_break.is_some() {
         return emit(json, &inspected);
     }
@@ -57,11 +71,35 @@ pub async fn show(
     Ok(())
 }
 
+fn unverified(json_out: bool, message: &str) -> Result<(), Box<dyn std::error::Error>> {
+    let body = unverified_body(message);
+    if json_out {
+        println!("{}", serde_json::to_string(&body)?);
+    } else {
+        println!("{message}");
+    }
+    Err(Box::new(PrintedExit(2)))
+}
+
+fn unverified_body(message: &str) -> Value {
+    json!({
+        "state": "unverified",
+        "error": message,
+    })
+}
+
 fn resolve_path(file: Option<PathBuf>) -> Result<PathBuf, Box<dyn std::error::Error>> {
+    resolve_with(file, || Ok(Config::load()?))
+}
+
+fn resolve_with(
+    file: Option<PathBuf>,
+    load: impl FnOnce() -> Result<Config, Box<dyn std::error::Error>>,
+) -> Result<PathBuf, Box<dyn std::error::Error>> {
     if let Some(path) = file {
         return Ok(path);
     }
-    let config = Config::load()?;
+    let config = load()?;
     if !config.receipts.path.is_empty() {
         return Ok(PathBuf::from(config.receipts.path));
     }
@@ -318,5 +356,104 @@ mod tests {
         let value = json_report(&inspected);
         assert_eq!(value["state"], "warn");
         assert!(!value["warns"].as_array().unwrap().is_empty());
+    }
+
+    fn block<F: std::future::Future>(future: F) -> F::Output {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(future)
+    }
+
+    fn assert_json_unverified(message: &str, fragment: &str) {
+        assert!(
+            message.contains(fragment),
+            "message {message:?} missing {fragment:?}"
+        );
+        let text = serde_json::to_string(&unverified_body(message)).unwrap();
+        let parsed: Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(parsed["state"], "unverified");
+        assert_eq!(parsed["error"], message);
+        assert!(parsed.as_object().unwrap().len() == 2);
+    }
+
+    #[test]
+    fn a_missing_file_is_unverified() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("missing.jsonl");
+        let err = store::inspect(&path).unwrap_err();
+        assert_json_unverified(&err.to_string(), "No such file");
+        let exit = block(verify(Some(path.clone()), true)).unwrap_err();
+        assert_eq!(exit.downcast_ref::<PrintedExit>().unwrap().0, 2);
+        let shown = block(show(Some(path), None, None, None, true)).unwrap_err();
+        assert_eq!(shown.downcast_ref::<PrintedExit>().unwrap().0, 2);
+    }
+
+    #[test]
+    fn a_directory_is_unverified() {
+        let dir = tempfile::tempdir().unwrap();
+        let err = store::inspect(dir.path()).unwrap_err();
+        assert!(matches!(err, store::StoreError::NotFile { .. }), "{err}");
+        assert_json_unverified(&err.to_string(), "not a regular file");
+        let exit = block(verify(Some(dir.path().to_path_buf()), false)).unwrap_err();
+        assert_eq!(exit.downcast_ref::<PrintedExit>().unwrap().0, 2);
+    }
+
+    #[test]
+    fn an_unreadable_file_is_unverified() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("receipts.jsonl");
+        std::fs::write(&path, b"{}\n").unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let err = store::inspect(&path).unwrap_err();
+        assert_json_unverified(&err.to_string(), "Permission denied");
+        let exit = block(verify(Some(path), true)).unwrap_err();
+        assert_eq!(exit.downcast_ref::<PrintedExit>().unwrap().0, 2);
+    }
+
+    #[test]
+    fn a_missing_config_is_unverified() {
+        let missing = crate::errors::ConfigError::NotFound(
+            "No pulse-null.toml found. Run `pulse-null init` first.".into(),
+        );
+        let err = resolve_with(None, || Err(Box::new(missing))).unwrap_err();
+        assert_json_unverified(&err.to_string(), "pulse-null.toml");
+        let exit = unverified(true, &err.to_string()).unwrap_err();
+        assert_eq!(exit.downcast_ref::<PrintedExit>().unwrap().0, 2);
+        let human = unverified(false, &err.to_string()).unwrap_err();
+        assert_eq!(human.downcast_ref::<PrintedExit>().unwrap().0, 2);
+    }
+
+    #[test]
+    fn a_fifo_is_unverified() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("receipts.fifo");
+        let c_path = std::ffi::CString::new(path.to_str().unwrap()).unwrap();
+        // SAFETY: `c_path` is a NUL-terminated path in the temp directory.
+        let rc = unsafe { libc::mkfifo(c_path.as_ptr(), 0o644) };
+        assert_eq!(rc, 0, "{}", std::io::Error::last_os_error());
+        let err = store::inspect(&path).unwrap_err();
+        assert!(matches!(err, store::StoreError::NotFile { .. }), "{err}");
+        assert_json_unverified(&err.to_string(), "not a regular file");
+        let started = std::time::Instant::now();
+        let exit = block(verify(Some(path), true)).unwrap_err();
+        assert!(started.elapsed() < std::time::Duration::from_secs(2));
+        assert_eq!(exit.downcast_ref::<PrintedExit>().unwrap().0, 2);
+    }
+
+    #[test]
+    fn a_broken_chain_still_exits_1() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = sample(dir.path());
+        let mut bytes = std::fs::read(&path).unwrap();
+        let nl = bytes.iter().position(|byte| *byte == b'\n').unwrap();
+        bytes[nl / 2] ^= 0x01;
+        std::fs::write(&path, &bytes).unwrap();
+        let exit = block(verify(Some(path.clone()), true)).unwrap_err();
+        assert_eq!(exit.downcast_ref::<PrintedExit>().unwrap().0, 1);
+        let shown = block(show(Some(path), None, None, None, false)).unwrap_err();
+        assert_eq!(shown.downcast_ref::<PrintedExit>().unwrap().0, 1);
     }
 }

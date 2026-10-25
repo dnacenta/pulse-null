@@ -93,6 +93,8 @@ pub enum StoreError {
     #[error("receipt row could not be built")]
     #[cfg_attr(not(test), expect(dead_code, reason = "wired in increment 3"))]
     Row,
+    #[error("receipt path {path} is not a regular file")]
+    NotFile { path: String },
     #[error(transparent)]
     Io(#[from] std::io::Error),
 }
@@ -106,7 +108,16 @@ pub fn default_receipts_path(pulse: &str) -> PathBuf {
 }
 
 /// Read a receipt file. Does not lock, repair, or create it.
+///
+/// The type is checked before the read, so a FIFO or a device cannot block
+/// or stream forever.
 pub fn inspect(path: &Path) -> Result<Inspected, StoreError> {
+    let meta = std::fs::symlink_metadata(path)?;
+    if !meta.file_type().is_file() {
+        return Err(StoreError::NotFile {
+            path: path.display().to_string(),
+        });
+    }
     let bytes = std::fs::read(path)?;
     let report = chain::verify_lines(bytes.as_slice());
     Ok(Inspected { bytes, report })
