@@ -252,8 +252,7 @@ impl ReceiptStore {
                         pulse: pulse.to_string(),
                     },
                 )?;
-                write_all_sync(&mut file, line.as_bytes())?;
-                write_all_sync(&mut file, b"\n")?;
+                write_all_sync(&mut file, &with_newline(&line))?;
                 if let Some(dir) = Path::new(&path).parent() {
                     if let Ok(parent) = File::open(dir) {
                         let _ = parent.sync_all();
@@ -423,10 +422,17 @@ impl ReceiptStore {
         if let Some(fault) = self.fault.take() {
             return apply_fault(&mut self.file, line, fault);
         }
-        write_all_sync(&mut self.file, line)?;
-        write_all_sync(&mut self.file, b"\n")?;
+        write_all_sync(&mut self.file, &with_newline(line))?;
         Ok(())
     }
+}
+
+fn with_newline(line: impl AsRef<[u8]>) -> Vec<u8> {
+    let line = line.as_ref();
+    let mut record = Vec::with_capacity(line.len() + 1);
+    record.extend_from_slice(line);
+    record.push(b'\n');
+    record
 }
 
 #[cfg(test)]
@@ -495,9 +501,6 @@ fn repair_class(file: &mut File, class: Class) -> Result<RepairKind, StoreError>
             seq,
             prev,
         } => {
-            if needs_newline {
-                write_all_sync(file, b"\n")?;
-            }
             let line = encode_line(
                 seq,
                 &prev,
@@ -508,8 +511,16 @@ fn repair_class(file: &mut File, class: Class) -> Result<RepairKind, StoreError>
                     torn_sha256: chain::sha256_hex(&torn),
                 },
             )?;
-            write_all_sync(file, line.as_bytes())?;
-            write_all_sync(file, b"\n")?;
+            let line = with_newline(&line);
+            let record = if needs_newline {
+                let mut record = Vec::with_capacity(line.len() + 1);
+                record.push(b'\n');
+                record.extend_from_slice(&line);
+                record
+            } else {
+                line
+            };
+            write_all_sync(file, &record)?;
             Ok(RepairKind::Recovered)
         }
         Class::NoRow => Ok(RepairKind::NoRow),
@@ -553,6 +564,15 @@ fn classify(bytes: &[u8]) -> Result<Class, StoreError> {
     if bytes.is_empty() || (!bytes.contains(&b'\n') && !chain::accepts_line(bytes, 0, GENESIS_PREV))
     {
         return Ok(Class::NoRow);
+    }
+    // A crash after a finished row, including a recover row, leaves that row
+    // without its newline. Adding the newline is the whole repair.
+    if !bytes.ends_with(b"\n") {
+        let mut closed = bytes.to_vec();
+        closed.push(b'\n');
+        if chain::verify_lines(closed.as_slice()).first_break.is_none() {
+            return Ok(Class::MissingNewline);
+        }
     }
     let (prefix, last, last_nl) = split_last(bytes);
     let prefix_report = chain::verify_lines(prefix);
@@ -928,6 +948,36 @@ mod tests {
             ReceiptStore::open(StoreSource::Path(path.clone()), &LiveProbe, "echo").unwrap_err();
         assert!(matches!(err, StoreError::Broken { .. }), "{err}");
         assert_eq!(std::fs::read(&path).unwrap(), mid);
+    }
+
+    #[test]
+    fn a_recover_row_missing_its_newline_is_only_closed() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = many(dir.path(), 2);
+        let full = std::fs::read(&path).unwrap();
+        let mut cut = full.clone();
+        cut.truncate(full.len() - 8);
+        std::fs::write(&path, &cut).unwrap();
+        let (store, opened) =
+            ReceiptStore::open(StoreSource::Path(path.clone()), &LiveProbe, "echo").unwrap();
+        assert!(opened.recovered);
+        drop(store);
+        let mut repaired = std::fs::read(&path).unwrap();
+        assert_eq!(repaired.pop(), Some(b'\n'));
+        std::fs::write(&path, &repaired).unwrap();
+        let (store, opened) =
+            ReceiptStore::open(StoreSource::Path(path.clone()), &LiveProbe, "echo").unwrap();
+        assert!(opened.repaired_newline);
+        assert!(!opened.recovered);
+        drop(store);
+        let after = std::fs::read(&path).unwrap();
+        let mut expected = repaired;
+        expected.push(b'\n');
+        assert_eq!(after, expected);
+        assert_eq!(
+            chain::verify_lines(after.as_slice()).state(),
+            VerifyState::Warn
+        );
     }
 
     #[test]
