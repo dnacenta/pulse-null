@@ -3421,13 +3421,45 @@ mod tests {
         config.system_prompt_budget.enabled = false;
         assert!(!config.pulse.rules_require_root);
 
-        let closed =
-            with_rules_require_root_var("1", || build_system_prompt(dir.path(), &config).unwrap());
-        assert!(!closed.contains("SELF-WORK-RULE"), "{closed}");
+        let log = with_rules_require_root_var("1", || {
+            warnings_from(|| {
+                let closed = build_system_prompt(dir.path(), &config).unwrap();
+                assert!(!closed.contains("SELF-WORK-RULE"), "{closed}");
+            })
+        });
+        assert!(
+            log.contains("Skipping pulse rules:") && log.contains("not owned by root"),
+            "{log}"
+        );
 
         let open =
             with_rules_require_root_var("0", || build_system_prompt(dir.path(), &config).unwrap());
         assert!(open.contains("SELF-WORK-RULE"), "{open}");
+    }
+
+    /// The file check, not the directory walk. Env forces strict while the
+    /// config key stays false; `rules_component` never walks the directories.
+    #[test]
+    fn env_forces_strict_reaches_the_file_check_when_config_says_false() {
+        let dir = tempfile::tempdir().unwrap();
+        let rules = dir.path().join("rules");
+        std::fs::create_dir_all(&rules).unwrap();
+        std::fs::write(rules.join("owned.md"), "PULSE-OWNED-RULE").unwrap();
+        let mut config = minimal_config();
+        config.system_prompt_budget.enabled = false;
+        assert!(!config.pulse.rules_require_root);
+
+        let closed = with_rules_require_root_var("1", || {
+            rules_component(&rules, &[], RulesSource::Pulse, &config)
+        });
+        let text = closed.as_ref().map(|c| c.content.as_str()).unwrap_or("");
+        assert!(!text.contains("PULSE-OWNED-RULE"), "{text}");
+
+        let open = with_rules_require_root_var("0", || {
+            rules_component(&rules, &[], RulesSource::Pulse, &config)
+        })
+        .expect("env 0 leaves the config key");
+        assert!(open.content.contains("PULSE-OWNED-RULE"));
     }
 
     #[test]
