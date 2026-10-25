@@ -1938,6 +1938,20 @@ mod pulse_rename_tests {
                 .as_deref(),
             Some("strict mode wants root")
         );
+        let r = crate::server::prompt::strict_config_file_reject;
+        assert_eq!(
+            r(0, 0o664, 1, Ok(0xef53)).as_deref(),
+            Some("group- or world-writable")
+        );
+        assert_eq!(
+            r(0, 0o644, 2, Ok(0xef53)).as_deref(),
+            Some("has more than one link")
+        );
+        assert_eq!(
+            r(0, 0o644, 1, Ok(0x6573_5546)).as_deref(),
+            Some("on a FUSE filesystem")
+        );
+        assert_eq!(r(0, 0o644, 1, Err("EIO".into())).as_deref(), Some("EIO"));
     }
 
     #[test]
