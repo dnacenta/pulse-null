@@ -290,6 +290,15 @@ fn check_row(
     if (row.seq == 0) != is_genesis {
         return Err("genesis");
     }
+    if let ReceiptEvent::Gap {
+        first_at, last_at, ..
+    } = &event
+    {
+        // The same clock as `row.ts`. The fixed form sorts lexicographically.
+        if !ts_ok(first_at) || !ts_ok(last_at) || first_at.as_str() > last_at.as_str() {
+            return Err("ts");
+        }
+    }
     if !digests_ok(&event) {
         return Err("sha256");
     }
@@ -1241,6 +1250,40 @@ mod tests {
             (format!("{genesis}\n{second}\n"), (2, "genesis")),
             (format!("{genesis}\n{reserved}\n"), (2, "not a row")),
             (format!("{genesis}\n{close}\n{recover}\n"), (3, "seq")),
+            (
+                format!(
+                    "{genesis}\n{}\n",
+                    row_from_event(
+                        1,
+                        &prev,
+                        TS1,
+                        serde_json::json!({
+                            "kind": "gap",
+                            "dropped": 1,
+                            "first_at": "yesterday",
+                            "last_at": "x"
+                        }),
+                    )
+                ),
+                (2, "ts"),
+            ),
+            (
+                format!(
+                    "{genesis}\n{}\n",
+                    row_from_event(
+                        1,
+                        &prev,
+                        TS1,
+                        serde_json::json!({
+                            "kind": "gap",
+                            "dropped": 1,
+                            "first_at": TS1,
+                            "last_at": TS0
+                        }),
+                    )
+                ),
+                (2, "ts"),
+            ),
         ];
         for (text, expect) in table {
             let report = verify_lines(text.as_bytes());
