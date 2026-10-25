@@ -56,8 +56,11 @@ pub enum ReceiptEvent {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         tokens_out: Option<u64>,
         duration_ms: u64,
+        #[serde(deserialize_with = "de_json_null")]
         mailbox_head: (),
+        #[serde(deserialize_with = "de_json_null")]
         folded: (),
+        #[serde(deserialize_with = "de_json_null")]
         fence: (),
     },
     /// The daemon stopped.
@@ -121,6 +124,25 @@ pub enum ActionClass {
     Reply,
     #[serde(rename = "none")]
     None,
+}
+
+/// `()` would also accept `{}` through serde's unit deserializer. These
+/// fields are reserved and must be JSON null.
+fn de_json_null<'de, D>(deserializer: D) -> Result<(), D::Error>
+where
+    D: Deserializer<'de>,
+{
+    struct NullOnly;
+    impl<'de> serde::de::Visitor<'de> for NullOnly {
+        type Value = ();
+        fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+            formatter.write_str("null")
+        }
+        fn visit_unit<E: serde::de::Error>(self) -> Result<(), E> {
+            Ok(())
+        }
+    }
+    deserializer.deserialize_any(NullOnly)
 }
 
 fn de_principal<'de, D>(deserializer: D) -> Result<String, D::Error>

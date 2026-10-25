@@ -809,6 +809,57 @@ mod tests {
         assert_eq!(note(&report), (3, "seq"));
     }
 
+    fn row_from_event(seq: u64, prev: &str, ts: &str, e: Value) -> String {
+        let row = Row {
+            v: 1,
+            seq,
+            prev: prev.to_string(),
+            ts: ts.to_string(),
+            e,
+        };
+        canonical(&serde_json::to_value(&row).unwrap()).unwrap()
+    }
+
+    #[test]
+    fn a_close_reserved_field_must_be_null() {
+        let (genesis, prev) = line_of(
+            0,
+            GENESIS_PREV,
+            TS0,
+            &ReceiptEvent::Genesis {
+                pulse: "echo".to_string(),
+            },
+        );
+        let mut event = serde_json::json!({
+            "kind": "close",
+            "stream": "s1",
+            "outcome": "acted",
+            "action_class": "reply",
+            "provider": "cli",
+            "adapter": "recorded",
+            "model": "primary",
+            "fallback": false,
+            "duration_ms": 1,
+            "mailbox_head": null,
+            "folded": null,
+            "fence": null
+        });
+        let good = row_from_event(1, &prev, TS1, event.clone());
+        let ok = verify_lines(format!("{genesis}\n{good}\n").as_bytes());
+        assert_eq!(ok.state(), VerifyState::Ok, "{ok:?}");
+        for bad_value in [
+            serde_json::json!({}),
+            serde_json::json!([]),
+            serde_json::json!(0),
+            serde_json::json!(""),
+        ] {
+            event["mailbox_head"] = bad_value;
+            let line = row_from_event(1, &prev, TS1, event.clone());
+            let report = verify_lines(format!("{genesis}\n{line}\n").as_bytes());
+            assert_eq!(note(&report), (2, "not a row"));
+        }
+    }
+
     fn shutdown_after_genesis() -> (String, String) {
         let (genesis, prev) = line_of(
             0,
