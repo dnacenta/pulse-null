@@ -381,7 +381,11 @@ impl ReceiptStore {
             return Err(StoreError::Row);
         }
         if self.poisoned {
-            self.resync()?;
+            if let Err(err) = self.resync() {
+                // The event is lost too; count it for the gap row.
+                self.note_failure(now_ts());
+                return Err(err);
+            }
             if self.poisoned {
                 self.write_gap()?;
             }
@@ -1602,5 +1606,28 @@ mod tests {
             std::fs::metadata(&path).unwrap().len(),
             MAX_RECEIPT_BYTES + 1
         );
+    }
+
+    #[test]
+    fn a_resync_that_cannot_write_counts_every_lost_append() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("receipts.jsonl");
+        let (mut store, _) = open_path(dir.path());
+        store.append(shutdown()).unwrap();
+        store.fail_record(RecordFault::Half);
+        let _ = store.append(shutdown()).unwrap_err();
+        let writable = std::mem::replace(&mut store.file, File::open(&path).unwrap());
+        for _ in 0..3 {
+            let _ = store.append(shutdown()).unwrap_err();
+        }
+        assert_eq!(store.dropped, 4);
+        let read_only = std::mem::replace(&mut store.file, writable);
+        drop(read_only);
+        store.append(shutdown()).unwrap();
+        let bytes = std::fs::read(&path).unwrap();
+        assert_eq!(gap_dropped(&bytes), Some(4));
+        let report = chain::verify_lines(bytes.as_slice());
+        assert_ne!(report.state(), VerifyState::Broken, "{report:?}");
+        drop(store);
     }
 }
