@@ -868,6 +868,21 @@ pub struct TurnRecord<'a> {
     pub refused: bool,
     /// The turn ran on the configured fallback target.
     pub fallback_used: bool,
+    /// Success with no reply. A chat turn leaves this false.
+    pub silent: bool,
+    pub tokens_in: Option<u32>,
+    pub tokens_out: Option<u32>,
+}
+
+/// How a task, intent, farm, or comms stream ended.
+///
+/// Isolation wins. A failure is `error`. An empty success is `silent`.
+/// Any other success is `acted`.
+pub struct Settle<'a> {
+    pub text: Option<&'a str>,
+    pub model: Option<&'a str>,
+    pub isolation: bool,
+    pub failure: bool,
     pub tokens_in: Option<u32>,
     pub tokens_out: Option<u32>,
 }
@@ -882,6 +897,8 @@ pub struct OpenInfo {
     pub adapter: String,
     pub model: String,
     pub input_sha256: String,
+    pub task_id: Option<String>,
+    pub parent: Option<String>,
 }
 
 /// Drops to `close{aborted}` unless [`StreamReceipt::finish`] ran.
@@ -926,8 +943,8 @@ impl StreamReceipt {
             channel: info.channel.clone(),
             principal: info.principal.clone(),
             principal_sha256: info.principal_sha256.clone(),
-            task_id: None,
-            parent: None,
+            task_id: info.task_id.clone(),
+            parent: info.parent.clone(),
         });
         Self {
             tx: appender.tx.clone(),
@@ -936,6 +953,28 @@ impl StreamReceipt {
             info: Some(info),
             started: Instant::now(),
         }
+    }
+
+    /// Queue the `close` row for a stream that is not a chat turn.
+    pub fn settle(self, end: Settle<'_>) {
+        let empty = end.text.unwrap_or("").is_empty();
+        let silent = !end.failure && !end.isolation && empty;
+        let text = if silent || (end.failure && !end.isolation) {
+            None
+        } else {
+            end.text
+        };
+        self.finish(TurnRecord {
+            text,
+            model: end.model,
+            isolation: end.isolation,
+            truncated: false,
+            refused: false,
+            fallback_used: false,
+            silent,
+            tokens_in: end.tokens_in,
+            tokens_out: end.tokens_out,
+        });
     }
 
     /// Queue the `close` row for a turn that produced a result.
@@ -995,11 +1034,19 @@ impl Drop for StreamReceipt {
 
 fn close_event(info: &OpenInfo, end: &TurnRecord<'_>, elapsed: Duration) -> ReceiptEvent {
     let model = end.model.unwrap_or(&info.model).to_string();
-    let (outcome, action, output) = if let Some(text) = end.text {
+    let (outcome, action, output) = if end.isolation {
+        let output = end.text.map(|text| digest(text.as_bytes()));
+        let action = if output.is_some() {
+            ActionClass::Reply
+        } else {
+            ActionClass::None
+        };
+        (Outcome::Isolated, action, output)
+    } else if end.silent {
+        (Outcome::Silent, ActionClass::None, None)
+    } else if let Some(text) = end.text {
         let hash = Some(digest(text.as_bytes()));
-        if end.isolation {
-            (Outcome::Isolated, ActionClass::Reply, hash)
-        } else if end.truncated || end.refused {
+        if end.truncated || end.refused {
             (Outcome::Refused, ActionClass::None, hash)
         } else {
             (Outcome::Acted, ActionClass::Reply, hash)
@@ -1199,6 +1246,8 @@ mod tests {
             adapter: String::new(),
             model: "mock-model".into(),
             input_sha256: chain::sha256_hex(b"one"),
+            task_id: None,
+            parent: None,
         };
         let first = StreamReceipt::open(&appender, info);
         let started = Instant::now();
@@ -1213,6 +1262,8 @@ mod tests {
                 adapter: String::new(),
                 model: "mock-model".into(),
                 input_sha256: chain::sha256_hex(b"two"),
+                task_id: None,
+                parent: None,
             },
         );
         assert!(started.elapsed() < Duration::from_millis(200));
@@ -1262,6 +1313,8 @@ mod tests {
                 adapter: String::new(),
                 model: "mock-model".into(),
                 input_sha256: digest(b"request"),
+                task_id: None,
+                parent: None,
             }
         });
         let inert = StreamReceipt::open(
@@ -1275,6 +1328,8 @@ mod tests {
                 adapter: String::new(),
                 model: "mock-model".into(),
                 input_sha256: "nope".into(),
+                task_id: None,
+                parent: None,
             },
         );
         let end = TurnRecord {
@@ -1284,6 +1339,7 @@ mod tests {
             truncated: false,
             refused: false,
             fallback_used: false,
+            silent: false,
             tokens_in: None,
             tokens_out: None,
         };
@@ -1301,6 +1357,8 @@ mod tests {
             adapter: String::new(),
             model: model.to_string(),
             input_sha256: chain::sha256_hex(b"in"),
+            task_id: None,
+            parent: None,
         };
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -1323,6 +1381,7 @@ mod tests {
                 truncated: false,
                 refused: false,
                 fallback_used: used,
+                silent: false,
                 tokens_in: None,
                 tokens_out: None,
             });
@@ -1334,6 +1393,77 @@ mod tests {
             .find(|line| line.contains("\"kind\":\"close\""))
             .unwrap();
         close.contains("\"fallback\":true")
+    }
+
+    #[tokio::test]
+    async fn an_empty_success_is_silent_and_a_failure_is_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("receipts.jsonl");
+        let config = config_at(&path, true, false);
+        let appender = Appender::start(
+            &config,
+            dir.path(),
+            ListenEnv::empty(),
+            Arc::new(LiveProbe),
+            "mock",
+        )
+        .await;
+        let info = |stream: &str| OpenInfo {
+            stream: stream.into(),
+            channel: "task".into(),
+            principal: "task".into(),
+            principal_sha256: None,
+            provider: "mock".into(),
+            adapter: String::new(),
+            model: "m".into(),
+            input_sha256: chain::sha256_hex(b"in"),
+            task_id: None,
+            parent: None,
+        };
+        StreamReceipt::open(&appender, info("silent")).settle(Settle {
+            text: Some(""),
+            model: None,
+            isolation: false,
+            failure: false,
+            tokens_in: None,
+            tokens_out: None,
+        });
+        StreamReceipt::open(&appender, info("error")).settle(Settle {
+            text: None,
+            model: None,
+            isolation: false,
+            failure: true,
+            tokens_in: None,
+            tokens_out: None,
+        });
+        StreamReceipt::open(&appender, info("isolated")).settle(Settle {
+            text: None,
+            model: None,
+            isolation: true,
+            failure: true,
+            tokens_in: None,
+            tokens_out: None,
+        });
+        appender.drained().await;
+        let text = std::fs::read_to_string(&path).unwrap();
+        let outcome = |stream: &str| -> String {
+            text.lines()
+                .find(|line| {
+                    line.contains(&format!("\"stream\":\"{stream}\""))
+                        && line.contains("\"kind\":\"close\"")
+                })
+                .unwrap_or_else(|| panic!("no close for {stream}: {text}"))
+                .split("\"outcome\":\"")
+                .nth(1)
+                .unwrap()
+                .split('"')
+                .next()
+                .unwrap()
+                .to_string()
+        };
+        assert_eq!(outcome("silent"), "silent");
+        assert_eq!(outcome("error"), "error");
+        assert_eq!(outcome("isolated"), "isolated");
     }
 
     #[test]

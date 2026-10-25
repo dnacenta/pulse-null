@@ -427,6 +427,90 @@ pub(crate) async fn execute_task_as_owner(
     .await
 }
 
+/// Receipt for one task run. Unsettled drop writes `close{aborted}`.
+struct TaskGuard {
+    receipt: Option<crate::oneself::receipt::StreamReceipt>,
+    settled: bool,
+    text: Option<String>,
+    model: Option<String>,
+    failure: bool,
+    isolation: bool,
+    tokens_in: Option<u32>,
+    tokens_out: Option<u32>,
+}
+
+impl TaskGuard {
+    fn open(state: &AppState, entry: &ScheduleEntry) -> Self {
+        let receipt = crate::oneself::receipt::StreamReceipt::open_if_on(&state.receipts, || {
+            let task = &entry.task;
+            crate::oneself::receipt::OpenInfo {
+                stream: uuid::Uuid::new_v4().to_string(),
+                channel: task.channel.clone(),
+                principal: "task".into(),
+                principal_sha256: None,
+                task_id: Some(task.id.clone()),
+                parent: None,
+                provider: state.provider.name().to_string(),
+                adapter: state.config.llm.cli_adapter().unwrap_or("").to_string(),
+                model: state.config.llm.model.clone(),
+                input_sha256: crate::oneself::receipt::digest(task.prompt.as_bytes()),
+            }
+        });
+        Self {
+            receipt: Some(receipt),
+            settled: false,
+            text: None,
+            model: None,
+            failure: false,
+            isolation: false,
+            tokens_in: None,
+            tokens_out: None,
+        }
+    }
+
+    fn fail(&mut self, root: &std::path::Path) {
+        self.settled = true;
+        self.failure = true;
+        self.isolation = crate::server::isolation::is_active(root);
+    }
+
+    fn succeed(
+        &mut self,
+        root: &std::path::Path,
+        text: String,
+        model: &str,
+        tokens_in: u32,
+        tokens_out: u32,
+    ) {
+        self.settled = true;
+        self.text = Some(text);
+        self.model = Some(model.to_string());
+        self.isolation = crate::server::isolation::is_active(root);
+        self.tokens_in = Some(tokens_in);
+        self.tokens_out = Some(tokens_out);
+    }
+}
+
+impl Drop for TaskGuard {
+    fn drop(&mut self) {
+        let Some(receipt) = self.receipt.take() else {
+            return;
+        };
+        if !self.settled {
+            return;
+        }
+        let failure = self.failure;
+        receipt.settle(crate::oneself::receipt::Settle {
+            text: if failure { None } else { self.text.as_deref() },
+            model: self.model.as_deref(),
+            isolation: self.isolation,
+            failure,
+            tokens_in: self.tokens_in,
+            tokens_out: self.tokens_out,
+        });
+    }
+}
+
 /// Execute a scheduled task: build prompt, call LLM (with tools if autonomy enabled), route output.
 ///
 /// Returns what the liveness alarm should record. Execution semantics are
@@ -439,6 +523,7 @@ async fn execute_task(
     eval_state: &mut SchedulerState,
     tenure: &crate::coordinator::control::TenureLeases,
 ) -> TaskOutcome {
+    let mut guard = TaskGuard::open(state, entry);
     let task = &entry.task;
     // Use cached root_dir from AppState
     let root_dir = state.root_dir.clone();
@@ -459,7 +544,12 @@ async fn execute_task(
     // shared provider, byte for byte the previous behaviour.
     let overridden = match resolve_provider_override(&task.id, current_override.as_deref(), state) {
         Ok(provider) => provider,
-        Err(failure) => return failure,
+        Err(failure) => {
+            if state.receipts.is_on() {
+                guard.fail(&state.root_dir);
+            }
+            return failure;
+        }
     };
     let provider: &dyn pulse_system_types::llm::LmProvider = match overridden {
         Some(ref boxed) => boxed.as_ref(),
@@ -483,6 +573,9 @@ async fn execute_task(
         Ok(p) => p,
         Err(e) => {
             tracing::error!("Cannot build system prompt for task '{}': {}", task.id, e);
+            if state.receipts.is_on() {
+                guard.fail(&root_dir);
+            }
             return TaskOutcome::Failure(format!("system prompt build failed: {e}"));
         }
     };
@@ -566,6 +659,9 @@ async fn execute_task(
                     error_msg
                 );
                 handle_provider_error(state, &task.id, e.as_ref()).await;
+                if state.receipts.is_on() {
+                    guard.fail(&root_dir);
+                }
                 return TaskOutcome::Failure(error_msg);
             }
         }
@@ -611,6 +707,9 @@ async fn execute_task(
                     error_msg
                 );
                 handle_provider_error(state, &task.id, e.as_ref()).await;
+                if state.receipts.is_on() {
+                    guard.fail(&root_dir);
+                }
                 return TaskOutcome::Failure(error_msg);
             }
         }
@@ -963,6 +1062,15 @@ async fn execute_task(
         crate::session::graph_sync_vigil(&root_dir).await;
     }
 
+    if state.receipts.is_on() {
+        guard.succeed(
+            &root_dir,
+            response_text.clone(),
+            model,
+            input_tokens,
+            output_tokens,
+        );
+    }
     TaskOutcome::Success
 }
 

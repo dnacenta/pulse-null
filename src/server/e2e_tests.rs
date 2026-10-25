@@ -9684,4 +9684,438 @@ mod receipt_turns {
         assert_eq!(snap["receipts"]["state"], "unprotected");
         assert!(snap["receipts"]["seq"].is_null());
     }
+
+    fn one_reply(text: &str) -> super::LlmResponse {
+        super::LlmResponse {
+            content: vec![super::ContentBlock::Text {
+                text: text.to_string(),
+            }],
+            stop_reason: super::StopReason::EndTurn,
+            model: "mock-model".into(),
+            input_tokens: Some(3),
+            output_tokens: Some(2),
+        }
+    }
+
+    fn tenure_in(dir: &std::path::Path) -> crate::coordinator::control::TenureLeases {
+        crate::coordinator::control::TenureLeases {
+            leases: Arc::new(tokio::sync::Mutex::new(
+                crate::coordinator::durable::DurableLeaseTable::open(&dir.join("coordinator"))
+                    .unwrap(),
+            )),
+            holder: "test-holder".to_string(),
+        }
+    }
+
+    fn task_entry() -> crate::scheduler::ScheduleEntry {
+        serde_json::from_value(serde_json::json!({
+            "id": "receipt-task",
+            "name": "Receipt task",
+            "cron": "0 0 * * * *",
+            "channel": "system",
+            "prompt": "Say ok.",
+        }))
+        .unwrap()
+    }
+
+    async fn run_task(
+        state: &Arc<crate::server::AppState>,
+        dir: &std::path::Path,
+    ) -> crate::scheduler::liveness::TaskOutcome {
+        let entry = task_entry();
+        let schedule = Arc::new(tokio::sync::RwLock::new(
+            crate::scheduler::Schedule::load_or_init(dir).unwrap(),
+        ));
+        let queue = Arc::new(tokio::sync::RwLock::new(
+            crate::scheduler::intent::IntentQueue::load(dir),
+        ));
+        let mut eval_state = crate::scheduler::evaluator::SchedulerState::default();
+        crate::scheduler::runner::execute_task_as_owner(
+            &entry,
+            state,
+            &schedule,
+            &queue,
+            &mut eval_state,
+            &tenure_in(dir),
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn a_scheduled_task_writes_an_open_and_an_acted_close() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = enable(dir.path(), false);
+        let state = build_state_prepared(
+            dir.path().to_path_buf(),
+            Box::new(super::MockProvider::new(vec![one_reply("task-reply")])),
+            super::ToolRegistry::new(),
+            config,
+            None,
+            None,
+        )
+        .await;
+        let outcome = run_task(&state, dir.path()).await;
+        assert!(matches!(
+            outcome,
+            crate::scheduler::liveness::TaskOutcome::Success
+        ));
+        state.receipts.drained().await;
+        let text = std::fs::read_to_string(dir.path().join("receipts.jsonl")).unwrap();
+        assert!(!text.contains("Say ok."), "{text}");
+        assert!(!text.contains("task-reply"), "{text}");
+        let rows = events(&text);
+        let open = rows.iter().find(|event| event["kind"] == "open").unwrap();
+        let close = rows.iter().find(|event| event["kind"] == "close").unwrap();
+        assert_eq!(open["principal"], "task");
+        assert_eq!(open["task_id"], "receipt-task");
+        assert_eq!(open["stream"], close["stream"]);
+        assert_eq!(close["outcome"], "acted");
+        assert_eq!(close["action_class"], "reply");
+    }
+
+    #[tokio::test]
+    async fn a_failed_task_closes_with_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = enable(dir.path(), false);
+        let state = build_state_prepared(
+            dir.path().to_path_buf(),
+            Box::new(super::FailingProvider),
+            super::ToolRegistry::new(),
+            config,
+            None,
+            None,
+        )
+        .await;
+        let outcome = run_task(&state, dir.path()).await;
+        assert!(matches!(
+            outcome,
+            crate::scheduler::liveness::TaskOutcome::Failure(_)
+        ));
+        state.receipts.drained().await;
+        let text = std::fs::read_to_string(dir.path().join("receipts.jsonl")).unwrap();
+        let close = events(&text)
+            .into_iter()
+            .find(|event| event["kind"] == "close")
+            .unwrap();
+        assert_eq!(close["outcome"], "error");
+        assert_eq!(close["action_class"], "none");
+    }
+
+    #[tokio::test]
+    async fn an_isolated_task_closes_isolated() {
+        let dir = tempfile::tempdir().unwrap();
+        crate::server::isolation::enter(dir.path(), "test", None).unwrap();
+        let config = enable(dir.path(), false);
+        let state = build_state_prepared(
+            dir.path().to_path_buf(),
+            Box::new(super::MockProvider::new(vec![one_reply("still")])),
+            super::ToolRegistry::new(),
+            config,
+            None,
+            None,
+        )
+        .await;
+        let _ = run_task(&state, dir.path()).await;
+        state.receipts.drained().await;
+        let text = std::fs::read_to_string(dir.path().join("receipts.jsonl")).unwrap();
+        let close = events(&text)
+            .into_iter()
+            .find(|event| event["kind"] == "close")
+            .unwrap();
+        assert_eq!(close["outcome"], "isolated");
+    }
+
+    #[tokio::test]
+    async fn dropping_a_task_writes_close_aborted() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = enable(dir.path(), false);
+        let state = build_state_prepared(
+            dir.path().to_path_buf(),
+            Box::new(super::MockProvider::with_delay(
+                vec![one_reply("late")],
+                Duration::from_secs(30),
+            )),
+            super::ToolRegistry::new(),
+            config,
+            None,
+            None,
+        )
+        .await;
+        let path = dir.path().join("receipts.jsonl");
+        let state_for_task = Arc::clone(&state);
+        let dir_for_task = dir.path().to_path_buf();
+        let handle = tokio::spawn(async move { run_task(&state_for_task, &dir_for_task).await });
+        wait_text(&path, "\"open\"").await;
+        handle.abort();
+        let text = wait_text(&path, "\"aborted\"").await;
+        let close = events(&text)
+            .into_iter()
+            .find(|event| event["kind"] == "close")
+            .unwrap();
+        assert_eq!(close["outcome"], "aborted");
+    }
+
+    #[tokio::test]
+    async fn an_intent_writes_an_open_and_an_acted_close() {
+        use crate::scheduler::intent::{Intent, IntentOutput, IntentPriority, IntentSource};
+        let dir = tempfile::tempdir().unwrap();
+        let config = enable(dir.path(), false);
+        let state = build_state_prepared(
+            dir.path().to_path_buf(),
+            Box::new(super::MockProvider::new(vec![one_reply("intent-reply")])),
+            super::ToolRegistry::new(),
+            config,
+            None,
+            None,
+        )
+        .await;
+        let intent = Intent {
+            id: "intent-receipt".into(),
+            description: "Receipt intent".into(),
+            prompt: "Say ok.".into(),
+            source: IntentSource::UserCli,
+            priority: IntentPriority::Normal,
+            created_at: chrono::Utc::now(),
+            chain: None,
+            output_routing: IntentOutput::Silent,
+            depth: 0,
+        };
+        let queue = Arc::new(tokio::sync::RwLock::new(
+            crate::scheduler::intent::IntentQueue::load(dir.path()),
+        ));
+        let schedule = Arc::new(tokio::sync::RwLock::new(
+            crate::scheduler::Schedule::load_or_init(dir.path()).unwrap(),
+        ));
+        let text = crate::scheduler::intent::execute_intent_as_owner(
+            &intent,
+            &state,
+            &queue,
+            &schedule,
+            &state.config.autonomy,
+            &tenure_in(dir.path()),
+        )
+        .await;
+        assert!(text.is_some(), "intent failed");
+        state.receipts.drained().await;
+        let file = std::fs::read_to_string(dir.path().join("receipts.jsonl")).unwrap();
+        assert!(!file.contains("Say ok."));
+        let rows = events(&file);
+        let open = rows.iter().find(|event| event["kind"] == "open").unwrap();
+        let close = rows.iter().find(|event| event["kind"] == "close").unwrap();
+        assert_eq!(open["principal"], "intent");
+        assert_eq!(open["task_id"], "intent-receipt");
+        assert_eq!(close["outcome"], "acted");
+    }
+
+    #[tokio::test]
+    async fn a_farm_subtask_names_the_parent_open() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = enable(dir.path(), false);
+        let state = build_state_prepared(
+            dir.path().to_path_buf(),
+            Box::new(super::MockProvider::new(vec![
+                one_reply("alpha"),
+                one_reply("beta"),
+            ])),
+            super::ToolRegistry::new(),
+            config,
+            None,
+            None,
+        )
+        .await;
+        let farm = serde_json::json!({
+            "id": "receipt-farm",
+            "description": "two parts",
+            "subtasks": [
+                {"id": "a", "prompt": "one"},
+                {"id": "b", "prompt": "two"}
+            ]
+        })
+        .to_string();
+        crate::coordinator::farm::run_farm_from_marker(&farm, &state, &tenure_in(dir.path()))
+            .await
+            .unwrap();
+        state.receipts.drained().await;
+        let text = std::fs::read_to_string(dir.path().join("receipts.jsonl")).unwrap();
+        assert!(!text.contains("two parts"), "{text}");
+        let rows = events(&text);
+        let opens: Vec<_> = rows
+            .iter()
+            .filter(|event| event["kind"] == "open")
+            .collect();
+        assert_eq!(opens.len(), 3, "{text}");
+        let parent = opens
+            .iter()
+            .find(|event| event.get("parent").is_none())
+            .unwrap();
+        assert_eq!(parent["principal"], "farm");
+        assert_eq!(parent["task_id"], "receipt-farm");
+        let parent_id = parent["stream"].as_str().unwrap();
+        let mut children = 0;
+        for sub in opens.iter().filter(|event| event.get("parent").is_some()) {
+            assert_eq!(sub["parent"], parent_id);
+            assert_eq!(sub["principal"], "farm");
+            children += 1;
+        }
+        assert_eq!(children, 2);
+        assert!(rows
+            .iter()
+            .any(|event| event["kind"] == "close" && event["outcome"] == "acted"));
+    }
+
+    #[tokio::test]
+    async fn a_comms_turn_writes_an_open_and_an_acted_close() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = enable(dir.path(), false);
+        let state = build_state_prepared(
+            dir.path().to_path_buf(),
+            Box::new(super::MockProvider::new(vec![one_reply("comms-reply")])),
+            super::ToolRegistry::new(),
+            config,
+            None,
+            None,
+        )
+        .await;
+        let id = crate::comms::start(
+            &state,
+            crate::comms::StartRequest {
+                peer: "other".into(),
+                local_port: Some(9),
+                topic: Some("receipts".into()),
+                max_turns: 1,
+            },
+        )
+        .unwrap();
+        for _ in 0..100 {
+            if state
+                .comms
+                .get(&id)
+                .is_some_and(|dialogue| dialogue.is_over())
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(
+            state
+                .comms
+                .get(&id)
+                .is_some_and(|dialogue| dialogue.is_over()),
+            "dialogue did not finish"
+        );
+        state.receipts.drained().await;
+        let text = std::fs::read_to_string(dir.path().join("receipts.jsonl")).unwrap();
+        assert!(!text.contains("comms-reply"), "{text}");
+        let rows = events(&text);
+        let open = rows.iter().find(|event| event["kind"] == "open").unwrap();
+        let close = rows.iter().find(|event| event["kind"] == "close").unwrap();
+        assert_eq!(open["principal"], "comms");
+        assert_eq!(close["outcome"], "acted");
+        assert_eq!(open["stream"], close["stream"]);
+    }
+
+    #[tokio::test]
+    async fn receipts_off_runs_other_streams_without_a_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = test_config();
+        let path = dir.path().join("receipts.jsonl");
+        config.receipts.path = path.display().to_string();
+        config.receipts.enabled = false;
+        let state = build_state_prepared(
+            dir.path().to_path_buf(),
+            Box::new(super::MockProvider::new(vec![
+                one_reply("task"),
+                one_reply("intent"),
+                one_reply("a"),
+                one_reply("b"),
+            ])),
+            super::ToolRegistry::new(),
+            config,
+            None,
+            None,
+        )
+        .await;
+        let _ = run_task(&state, dir.path()).await;
+        let intent = crate::scheduler::intent::Intent {
+            id: "off-intent".into(),
+            description: "off".into(),
+            prompt: "Say ok.".into(),
+            source: crate::scheduler::intent::IntentSource::UserCli,
+            priority: crate::scheduler::intent::IntentPriority::Normal,
+            created_at: chrono::Utc::now(),
+            chain: None,
+            output_routing: crate::scheduler::intent::IntentOutput::Silent,
+            depth: 0,
+        };
+        let queue = Arc::new(tokio::sync::RwLock::new(
+            crate::scheduler::intent::IntentQueue::load(dir.path()),
+        ));
+        let schedule = Arc::new(tokio::sync::RwLock::new(
+            crate::scheduler::Schedule::load_or_init(dir.path()).unwrap(),
+        ));
+        crate::scheduler::intent::execute_intent_as_owner(
+            &intent,
+            &state,
+            &queue,
+            &schedule,
+            &state.config.autonomy,
+            &tenure_in(dir.path()),
+        )
+        .await;
+        let farm = serde_json::json!({
+            "id": "off-farm",
+            "description": "off",
+            "subtasks": [{"id": "a", "prompt": "one"}, {"id": "b", "prompt": "two"}]
+        })
+        .to_string();
+        crate::coordinator::farm::run_farm_from_marker(&farm, &state, &tenure_in(dir.path()))
+            .await
+            .unwrap();
+        assert!(!path.exists());
+    }
+
+    #[tokio::test]
+    async fn two_boots_with_different_providers_appear_in_swaps() {
+        let dir = tempfile::tempdir().unwrap();
+        write_identity(dir.path());
+        let config = enable(dir.path(), false);
+        let path = dir.path().join("receipts.jsonl");
+        let probe = Arc::new(crate::oneself::protect::LiveProbe);
+        let first = crate::oneself::receipt::Appender::start(
+            &config,
+            dir.path(),
+            crate::oneself::store::ListenEnv::empty(),
+            Arc::clone(&probe) as Arc<dyn crate::oneself::protect::ProtectionProbe + Send + Sync>,
+            "mock",
+        )
+        .await;
+        first.shutdown().await;
+        let second = crate::oneself::receipt::Appender::start(
+            &config,
+            dir.path(),
+            crate::oneself::store::ListenEnv::empty(),
+            probe,
+            "other",
+        )
+        .await;
+        second.shutdown().await;
+        let text = std::fs::read_to_string(&path).unwrap();
+        let report = chain::verify_lines(text.as_bytes());
+        assert!(report.first_break.is_none(), "{text}");
+        let rows: Vec<chain::Row> = text
+            .lines()
+            .filter(|line| !line.is_empty())
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        let swaps = crate::cli::receipts::find_swaps(&rows, "ok");
+        let boot = swaps
+            .iter()
+            .find(|item| item.kind == "boot")
+            .expect("a boot swap");
+        assert_eq!(boot.from_provider, "mock");
+        assert_eq!(boot.to_provider, "other");
+        let identity = boot.identity.as_ref().unwrap();
+        assert!(identity.self_md && identity.rules && identity.config);
+        assert!(boot.between >= 1, "shutdown sits between the boots");
+    }
 }

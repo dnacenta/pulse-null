@@ -731,6 +731,79 @@ pub(crate) async fn execute_intent_as_owner(
     .await
 }
 
+/// Receipt for one intent. Unsettled drop writes `close{aborted}`.
+struct IntentGuard {
+    receipt: Option<crate::oneself::receipt::StreamReceipt>,
+    settled: bool,
+    text: Option<String>,
+    failure: bool,
+    isolation: bool,
+    tokens_in: Option<u32>,
+    tokens_out: Option<u32>,
+}
+
+impl IntentGuard {
+    fn open(state: &AppState, intent: &Intent) -> Self {
+        let receipt = crate::oneself::receipt::StreamReceipt::open_if_on(&state.receipts, || {
+            crate::oneself::receipt::OpenInfo {
+                stream: uuid::Uuid::new_v4().to_string(),
+                channel: "intent".into(),
+                principal: "intent".into(),
+                principal_sha256: None,
+                task_id: Some(intent.id.clone()),
+                parent: None,
+                provider: state.provider.name().to_string(),
+                adapter: state.config.llm.cli_adapter().unwrap_or("").to_string(),
+                model: state.config.llm.model.clone(),
+                input_sha256: crate::oneself::receipt::digest(intent.prompt.as_bytes()),
+            }
+        });
+        Self {
+            receipt: Some(receipt),
+            settled: false,
+            text: None,
+            failure: false,
+            isolation: false,
+            tokens_in: None,
+            tokens_out: None,
+        }
+    }
+
+    fn fail(&mut self, root: &Path) {
+        self.settled = true;
+        self.failure = true;
+        self.isolation = crate::server::isolation::is_active(root);
+    }
+
+    fn succeed(&mut self, root: &Path, text: String, tokens_in: u32, tokens_out: u32) {
+        self.settled = true;
+        self.text = Some(text);
+        self.isolation = crate::server::isolation::is_active(root);
+        self.tokens_in = Some(tokens_in);
+        self.tokens_out = Some(tokens_out);
+    }
+}
+
+impl Drop for IntentGuard {
+    fn drop(&mut self) {
+        let Some(receipt) = self.receipt.take() else {
+            return;
+        };
+        if !self.settled {
+            return;
+        }
+        let failure = self.failure;
+        receipt.settle(crate::oneself::receipt::Settle {
+            text: if failure { None } else { self.text.as_deref() },
+            model: None,
+            isolation: self.isolation,
+            failure,
+            tokens_in: self.tokens_in,
+            tokens_out: self.tokens_out,
+        });
+    }
+}
+
 async fn execute_intent(
     intent: &Intent,
     state: &Arc<AppState>,
@@ -739,6 +812,7 @@ async fn execute_intent(
     config: &AutonomyConfig,
     tenure: &crate::coordinator::control::TenureLeases,
 ) -> Option<String> {
+    let mut guard = IntentGuard::open(state, intent);
     let root_dir = state.root_dir.clone();
 
     // Build task system prompt (minimal — identity + thought stack only).
@@ -757,6 +831,9 @@ async fn execute_intent(
                 intent.id,
                 e
             );
+            if state.receipts.is_on() {
+                guard.fail(&root_dir);
+            }
             return None;
         }
     };
@@ -794,6 +871,9 @@ async fn execute_intent(
             // Same provider bookkeeping as a failed task: classify, update
             // status, emit ProviderError. The intent is still dropped.
             super::runner::handle_provider_error(state, &intent.id, e.as_ref()).await;
+            if state.receipts.is_on() {
+                guard.fail(&root_dir);
+            }
             return None;
         }
     };
@@ -1265,6 +1345,14 @@ async fn execute_intent(
         crate::session::graph_sync_vigil(&root_dir).await;
     }
 
+    if state.receipts.is_on() {
+        guard.succeed(
+            &root_dir,
+            parsed.clean_content.clone(),
+            result.total_input_tokens,
+            result.total_output_tokens,
+        );
+    }
     Some(parsed.clean_content)
 }
 

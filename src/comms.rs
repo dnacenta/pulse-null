@@ -737,9 +737,14 @@ impl DialogueRun {
     /// The local pulse's turn; `None` (the dialogue failed) on an error.
     async fn local_reply(&mut self) -> Option<String> {
         self.d.set_phase(Phase::LocalThinking);
+        let receipt = Self::open_comms_receipt(self);
         match self.local_turn().await {
-            Ok(text) => Some(text),
+            Ok(text) => {
+                Self::finish_comms(&self.state, receipt, false, Some(&text));
+                Some(text)
+            }
             Err(e) => {
+                Self::finish_comms(&self.state, receipt, true, None);
                 self.d
                     .set_phase(Phase::Failed(format!("{}: {e}", self.d.local)));
                 None
@@ -770,6 +775,52 @@ impl DialogueRun {
         .await
         .map(|r| r.text)
         .map_err(|e| e.to_string())
+    }
+
+    fn open_comms_receipt(run: &DialogueRun) -> crate::oneself::receipt::StreamReceipt {
+        crate::oneself::receipt::StreamReceipt::open_if_on(&run.state.receipts, || {
+            let input = run
+                .conversation
+                .iter()
+                .rev()
+                .find_map(|message| match &message.content {
+                    MessageContent::Text(text) => Some(text.as_str()),
+                    _ => None,
+                })
+                .unwrap_or("");
+            crate::oneself::receipt::OpenInfo {
+                stream: uuid::Uuid::new_v4().to_string(),
+                channel: "comms".into(),
+                principal: "comms".into(),
+                principal_sha256: None,
+                task_id: Some(run.d.id.clone()),
+                parent: None,
+                provider: run.state.provider.name().to_string(),
+                adapter: run.state.config.llm.cli_adapter().unwrap_or("").to_string(),
+                model: run.state.config.llm.model.clone(),
+                input_sha256: crate::oneself::receipt::digest(input.as_bytes()),
+            }
+        })
+    }
+
+    fn finish_comms(
+        state: &AppState,
+        receipt: crate::oneself::receipt::StreamReceipt,
+        failure: bool,
+        text: Option<&str>,
+    ) {
+        if !state.receipts.is_on() {
+            return;
+        }
+        let isolation = crate::server::isolation::is_active(&state.root_dir);
+        receipt.settle(crate::oneself::receipt::Settle {
+            text,
+            model: None,
+            isolation,
+            failure: failure && !isolation,
+            tokens_in: None,
+            tokens_out: None,
+        });
     }
 
     /// The peer's turn on `last`; `None` (the dialogue failed) on an error.

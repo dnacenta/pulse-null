@@ -1,8 +1,9 @@
-//! `pulse-null receipts verify` and `show`.
+//! `pulse-null receipts verify`, `show`, `overlaps`, and `swaps`.
 //!
-//! Both read a file. Neither locks it or repairs a torn tail. The store does
-//! that when it opens.
+//! Each reads a file. None of them locks it or repairs a torn tail. The store
+//! does that when it opens.
 
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 use serde::Serialize;
@@ -78,6 +79,333 @@ pub async fn show(
         }
     }
     Ok(())
+}
+
+pub async fn overlaps(
+    file: Option<PathBuf>,
+    since: Option<String>,
+    json: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if let Some(message) = reject_filters(since.as_deref(), None) {
+        return unverified(json, message);
+    }
+    let inspected = match inspected_file(file) {
+        Ok(inspected) => inspected,
+        Err(err) => return unverified(json, &err.to_string()),
+    };
+    if inspected.report.first_break.is_some() {
+        return emit(json, &inspected);
+    }
+    let rows = accepted_rows(&inspected.bytes);
+    let found = find_overlaps(&rows, since.as_deref());
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string(&json!({
+                "state": state_name(inspected.report.state()),
+                "overlaps": found,
+            }))?
+        );
+    } else {
+        for item in &found {
+            println!("{}", overlap_line(item));
+        }
+    }
+    Ok(())
+}
+
+pub async fn swaps(file: Option<PathBuf>, json: bool) -> Result<(), Box<dyn std::error::Error>> {
+    let inspected = match inspected_file(file) {
+        Ok(inspected) => inspected,
+        Err(err) => return unverified(json, &err.to_string()),
+    };
+    if inspected.report.first_break.is_some() {
+        return emit(json, &inspected);
+    }
+    let rows = accepted_rows(&inspected.bytes);
+    let found = find_swaps(&rows, state_name(inspected.report.state()));
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string(&json!({
+                "state": state_name(inspected.report.state()),
+                "swaps": found,
+            }))?
+        );
+    } else {
+        for item in &found {
+            println!("{}", swap_line(item));
+        }
+    }
+    Ok(())
+}
+
+fn inspected_file(file: Option<PathBuf>) -> Result<Inspected, Box<dyn std::error::Error>> {
+    let path = resolve_path(file)?;
+    Ok(store::inspect(&path)?)
+}
+
+fn accepted_rows(bytes: &[u8]) -> Vec<chain::Row> {
+    let mut rows = Vec::new();
+    for line in bytes.split(|byte| *byte == b'\n') {
+        if line.is_empty() {
+            continue;
+        }
+        let Ok(text) = std::str::from_utf8(line) else {
+            continue;
+        };
+        let Ok(row) = serde_json::from_str::<chain::Row>(text) else {
+            continue;
+        };
+        rows.push(row);
+    }
+    rows
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Span {
+    stream: String,
+    start: String,
+    end: String,
+    outcome: String,
+}
+
+/// Open/close pairs on the verified rows. An open with no close is not an
+/// interval. Two intervals overlap when each starts at or before the other
+/// ends. The same stream is not an overlap with itself. `quiet_twin` is set
+/// when one outcome is `acted` and the other is not. An overlap that ended
+/// before `since` is left out.
+pub(crate) fn find_overlaps(rows: &[chain::Row], since: Option<&str>) -> Vec<Overlap> {
+    let bound = since.and_then(since_bound);
+    let spans = spans_of(rows);
+    let mut found = Vec::new();
+    for left_at in 0..spans.len() {
+        for right_at in (left_at + 1)..spans.len() {
+            let left = &spans[left_at];
+            let right = &spans[right_at];
+            if left.stream == right.stream || !intersects(left, right) {
+                continue;
+            }
+            if let Some(bound) = bound.as_deref() {
+                let end = if left.end.as_str() < right.end.as_str() {
+                    left.end.as_str()
+                } else {
+                    right.end.as_str()
+                };
+                if end < bound {
+                    continue;
+                }
+            }
+            let (a, b) = if left.stream.as_str() <= right.stream.as_str() {
+                (left, right)
+            } else {
+                (right, left)
+            };
+            found.push(Overlap {
+                a: a.stream.clone(),
+                b: b.stream.clone(),
+                a_outcome: a.outcome.clone(),
+                b_outcome: b.outcome.clone(),
+                a_open: a.start.clone(),
+                a_close: a.end.clone(),
+                b_open: b.start.clone(),
+                b_close: b.end.clone(),
+                quiet_twin: (a.outcome == "acted") != (b.outcome == "acted"),
+            });
+        }
+    }
+    found
+}
+
+fn spans_of(rows: &[chain::Row]) -> Vec<Span> {
+    let mut open_at: BTreeMap<String, String> = BTreeMap::new();
+    let mut spans = Vec::new();
+    for row in rows {
+        let kind = row.e.get("kind").and_then(Value::as_str).unwrap_or("");
+        let Some(stream) = row.e.get("stream").and_then(Value::as_str) else {
+            continue;
+        };
+        match kind {
+            "open" => {
+                open_at.insert(stream.to_string(), row.ts.clone());
+            }
+            "close" => {
+                let Some(start) = open_at.remove(stream) else {
+                    continue;
+                };
+                let outcome = row
+                    .e
+                    .get("outcome")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_string();
+                spans.push(Span {
+                    stream: stream.to_string(),
+                    start,
+                    end: row.ts.clone(),
+                    outcome,
+                });
+            }
+            _ => {}
+        }
+    }
+    spans
+}
+
+fn intersects(left: &Span, right: &Span) -> bool {
+    left.start.as_str() <= right.end.as_str() && right.start.as_str() <= left.end.as_str()
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub(crate) struct Overlap {
+    pub a: String,
+    pub b: String,
+    pub a_outcome: String,
+    pub b_outcome: String,
+    pub a_open: String,
+    pub a_close: String,
+    pub b_open: String,
+    pub b_close: String,
+    pub quiet_twin: bool,
+}
+
+fn overlap_line(item: &Overlap) -> String {
+    escape_show(&format!(
+        "a={} b={} a_outcome={} b_outcome={} quiet_twin={} a_open={} a_close={} b_open={} b_close={}",
+        item.a,
+        item.b,
+        item.a_outcome,
+        item.b_outcome,
+        item.quiet_twin,
+        item.a_open,
+        item.a_close,
+        item.b_open,
+        item.b_close
+    ))
+}
+
+/// Consecutive `boot` rows, then consecutive `close` rows, whose provider,
+/// adapter, or model differ. Identity carry-over is whether the boot digests
+/// are the same. `chain` is the verified file's state. A broken file is not
+/// passed here.
+pub(crate) fn find_swaps(rows: &[chain::Row], chain: &str) -> Vec<Swap> {
+    let mut found = Vec::new();
+    push_swaps(&mut found, rows, "boot", true, chain);
+    push_swaps(&mut found, rows, "close", false, chain);
+    found
+}
+
+fn push_swaps(found: &mut Vec<Swap>, rows: &[chain::Row], kind: &str, identity: bool, chain: &str) {
+    let chosen: Vec<&chain::Row> = rows
+        .iter()
+        .filter(|row| row.e.get("kind").and_then(Value::as_str) == Some(kind))
+        .collect();
+    for pair in chosen.windows(2) {
+        let from = pair[0];
+        let to = pair[1];
+        let from_provider = field(from, "provider");
+        let to_provider = field(to, "provider");
+        let from_adapter = field(from, "adapter");
+        let to_adapter = field(to, "adapter");
+        let from_model = field(from, "model");
+        let to_model = field(to, "model");
+        if from_provider == to_provider && from_adapter == to_adapter && from_model == to_model {
+            continue;
+        }
+        let between = to.seq.saturating_sub(from.seq).saturating_sub(1);
+        found.push(Swap {
+            kind: kind.to_string(),
+            from_seq: from.seq,
+            to_seq: to.seq,
+            from_provider,
+            to_provider,
+            from_adapter,
+            to_adapter,
+            from_model,
+            to_model,
+            identity: identity.then(|| IdentityCarry {
+                self_md: ident(from, "self_md") == ident(to, "self_md"),
+                rules: ident(from, "rules") == ident(to, "rules"),
+                config: ident(from, "config") == ident(to, "config"),
+            }),
+            chain: chain.to_string(),
+            between,
+        });
+    }
+}
+
+fn field(row: &chain::Row, name: &str) -> String {
+    row.e
+        .get(name)
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string()
+}
+
+fn ident(row: &chain::Row, name: &str) -> Option<String> {
+    row.e
+        .get("identity")
+        .and_then(|value| value.get(name))
+        .and_then(Value::as_str)
+        .map(str::to_string)
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub(crate) struct Swap {
+    pub kind: String,
+    pub from_seq: u64,
+    pub to_seq: u64,
+    pub from_provider: String,
+    pub to_provider: String,
+    pub from_adapter: String,
+    pub to_adapter: String,
+    pub from_model: String,
+    pub to_model: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub identity: Option<IdentityCarry>,
+    pub chain: String,
+    pub between: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub(crate) struct IdentityCarry {
+    pub self_md: bool,
+    pub rules: bool,
+    pub config: bool,
+}
+
+fn swap_line(item: &Swap) -> String {
+    let identity = match &item.identity {
+        Some(carry) => format!(
+            " identity self_md={} rules={} config={}",
+            carried(carry.self_md),
+            carried(carry.rules),
+            carried(carry.config)
+        ),
+        None => String::new(),
+    };
+    escape_show(&format!(
+        "{} seq {} -> {} provider {} -> {} adapter {} -> {} model {} -> {}{identity} chain={} between={}",
+        item.kind,
+        item.from_seq,
+        item.to_seq,
+        item.from_provider,
+        item.to_provider,
+        item.from_adapter,
+        item.to_adapter,
+        item.from_model,
+        item.to_model,
+        item.chain,
+        item.between
+    ))
+}
+
+fn carried(same: bool) -> &'static str {
+    if same {
+        "same"
+    } else {
+        "changed"
+    }
 }
 
 fn unverified(json_out: bool, message: &str) -> Result<(), Box<dyn std::error::Error>> {
@@ -1137,5 +1465,207 @@ mod tests {
         assert_eq!(seqs("2026-10-2"), vec![1, 2, 3]);
         assert_eq!(seqs("2026-11-3"), vec![3]);
         assert!(since_ok("2026-11-3"));
+    }
+
+    use crate::oneself::event::{ActionClass, FdSource, Identity, Outcome};
+
+    fn event_row(seq: u64, ts: &str, event: ReceiptEvent) -> chain::Row {
+        chain::Row {
+            v: 1,
+            seq,
+            prev: "0".repeat(64),
+            ts: ts.into(),
+            e: serde_json::to_value(&event).unwrap(),
+        }
+    }
+
+    fn open_at(seq: u64, ts: &str, stream: &str) -> chain::Row {
+        event_row(
+            seq,
+            ts,
+            ReceiptEvent::Open {
+                stream: stream.into(),
+                channel: "task".into(),
+                principal: "task".into(),
+                principal_sha256: None,
+                task_id: None,
+                parent: None,
+            },
+        )
+    }
+
+    fn close_at(seq: u64, ts: &str, stream: &str, outcome: Outcome) -> chain::Row {
+        event_row(
+            seq,
+            ts,
+            ReceiptEvent::Close {
+                stream: stream.into(),
+                outcome,
+                action_class: ActionClass::None,
+                provider: "mock".into(),
+                adapter: String::new(),
+                model: "m".into(),
+                fallback: false,
+                input_sha256: None,
+                output_sha256: None,
+                tokens_in: None,
+                tokens_out: None,
+                duration_ms: 1,
+                mailbox_head: (),
+                folded: (),
+                fence: (),
+            },
+        )
+    }
+
+    fn boot_at(
+        seq: u64,
+        provider: &str,
+        model: &str,
+        self_md: &str,
+        config_digest: &str,
+    ) -> chain::Row {
+        event_row(
+            seq,
+            "2026-10-25T00:00:00.000Z",
+            ReceiptEvent::Boot {
+                pulse: "echo".into(),
+                version: "0".into(),
+                provider: provider.into(),
+                adapter: String::new(),
+                model: model.into(),
+                fallback_model: None,
+                identity: Identity {
+                    self_md: Some(self_md.into()),
+                    rules: Some("rules".into()),
+                    config: Some(config_digest.into()),
+                },
+                fd_source: FdSource::SelfOpened,
+                protected: false,
+                append_only: false,
+            },
+        )
+    }
+
+    #[test]
+    fn overlaps_cover_disjoint_nested_partial_same_stream_and_quiet_twin() {
+        let rows = vec![
+            open_at(1, "2026-10-25T00:00:00.000Z", "a"),
+            close_at(2, "2026-10-25T00:01:00.000Z", "a", Outcome::Acted),
+            open_at(3, "2026-10-25T00:02:00.000Z", "b"),
+            close_at(4, "2026-10-25T00:03:00.000Z", "b", Outcome::Acted),
+            open_at(5, "2026-10-25T00:04:00.000Z", "c"),
+            open_at(6, "2026-10-25T00:05:00.000Z", "d"),
+            close_at(7, "2026-10-25T00:06:00.000Z", "d", Outcome::Acted),
+            close_at(8, "2026-10-25T00:10:00.000Z", "c", Outcome::Acted),
+            open_at(9, "2026-10-25T00:08:00.000Z", "e"),
+            open_at(10, "2026-10-25T00:11:00.000Z", "f"),
+            close_at(11, "2026-10-25T00:12:00.000Z", "e", Outcome::Acted),
+            close_at(12, "2026-10-25T00:13:00.000Z", "f", Outcome::Silent),
+            open_at(13, "2026-10-25T01:00:00.000Z", "g"),
+            close_at(14, "2026-10-25T01:05:00.000Z", "g", Outcome::Acted),
+            open_at(15, "2026-10-25T01:04:00.000Z", "g"),
+            close_at(16, "2026-10-25T01:06:00.000Z", "g", Outcome::Acted),
+        ];
+        let found = find_overlaps(&rows, None);
+        let pairs: Vec<_> = found
+            .iter()
+            .map(|item| (item.a.as_str(), item.b.as_str(), item.quiet_twin))
+            .collect();
+        assert!(pairs.contains(&("c", "d", false)), "nested: {pairs:?}");
+        assert!(
+            pairs.contains(&("e", "f", true)),
+            "partial quiet twin: {pairs:?}"
+        );
+        assert!(
+            !pairs
+                .iter()
+                .any(|(a, b, _)| *a == "a" || *b == "a" || *a == "b"),
+            "disjoint: {pairs:?}"
+        );
+        assert!(
+            !pairs.iter().any(|(a, b, _)| *a == "g" && *b == "g"),
+            "same stream: {pairs:?}"
+        );
+        let later = find_overlaps(&rows, Some("2026-10-25T00:07:00.000Z"));
+        assert!(
+            !later.iter().any(|item| item.a == "c" && item.b == "d"),
+            "ended before since: {later:?}"
+        );
+        assert!(later
+            .iter()
+            .any(|item| item.a == "e" && item.b == "f" && item.quiet_twin));
+        let mut noisy = found[0].clone();
+        noisy.a = "left\u{202E}right".into();
+        let line = overlap_line(&noisy);
+        assert!(line.contains("\\u{202E}"), "{line}");
+        assert!(!line.contains('\u{202E}'), "{line}");
+    }
+
+    #[test]
+    fn swaps_flag_provider_and_model_changes_and_skip_identical() {
+        let rows = vec![
+            boot_at(1, "mock", "m1", "self", "cfg"),
+            boot_at(2, "other", "m1", "self", "cfg"),
+            boot_at(3, "other", "m2", "self", "cfg-2"),
+            boot_at(4, "other", "m2", "self", "cfg-2"),
+            close_at(5, "2026-10-25T00:00:00.000Z", "s", Outcome::Acted),
+            event_row(
+                6,
+                "2026-10-25T00:01:00.000Z",
+                ReceiptEvent::Close {
+                    stream: "t".into(),
+                    outcome: Outcome::Acted,
+                    action_class: ActionClass::Reply,
+                    provider: "other".into(),
+                    adapter: String::new(),
+                    model: "m1".into(),
+                    fallback: false,
+                    input_sha256: None,
+                    output_sha256: None,
+                    tokens_in: None,
+                    tokens_out: None,
+                    duration_ms: 1,
+                    mailbox_head: (),
+                    folded: (),
+                    fence: (),
+                },
+            ),
+        ];
+        let swaps = find_swaps(&rows, "ok");
+        assert_eq!(swaps.len(), 3, "{swaps:?}");
+        assert_eq!(swaps[0].kind, "boot");
+        assert_eq!(swaps[0].from_provider, "mock");
+        assert_eq!(swaps[0].to_provider, "other");
+        assert_eq!(swaps[0].from_model, "m1");
+        let carried = swaps[0].identity.clone().unwrap();
+        assert!(carried.self_md && carried.rules && carried.config);
+        assert_eq!(swaps[0].chain, "ok");
+        assert_eq!(swaps[0].between, 0);
+        assert_eq!(swaps[1].from_model, "m1");
+        assert_eq!(swaps[1].to_model, "m2");
+        let changed = swaps[1].identity.clone().unwrap();
+        assert!(changed.self_md);
+        assert!(!changed.config);
+        assert_eq!(swaps[2].kind, "close");
+        assert_eq!(swaps[2].from_provider, "mock");
+        assert_eq!(swaps[2].to_provider, "other");
+        assert!(swaps[2].identity.is_none());
+        let line = swap_line(&swaps[1]);
+        assert!(line.contains("self_md=same"), "{line}");
+        assert!(line.contains("config=changed"), "{line}");
+    }
+
+    #[tokio::test]
+    async fn overlaps_of_a_broken_file_exits_1() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = sample(dir.path());
+        let mut bytes = std::fs::read(&path).unwrap();
+        let flipped = bytes.len() - 2;
+        bytes[flipped] ^= 0x01;
+        std::fs::write(&path, &bytes).unwrap();
+        let err = overlaps(Some(path), None, true).await.unwrap_err();
+        let printed = err.downcast_ref::<PrintedExit>().expect("printed exit");
+        assert_eq!(printed.0, 1);
     }
 }
