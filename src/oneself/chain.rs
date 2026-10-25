@@ -178,6 +178,13 @@ fn verify_bytes(buf: &[u8]) -> VerifyReport {
         }
         match check_row(line, seq, &expected_prev) {
             Ok(accepted) => {
+                if matches!(accepted.event, ReceiptEvent::Recover { .. }) {
+                    report.first_break = Some(VerifyNote {
+                        line: line.number,
+                        reason: "recover",
+                    });
+                    return report;
+                }
                 accept(&mut report, &mut expected_seq, &mut expected_prev, accepted);
                 index += 1;
             }
@@ -811,6 +818,32 @@ mod tests {
         assert_eq!(report.state(), VerifyState::Broken);
         assert!(report.warns.is_empty());
         assert_eq!(note(&report), (3, "seq"));
+    }
+
+    #[test]
+    fn a_recover_without_a_torn_line_is_broken() {
+        let (genesis, prev) = line_of(
+            0,
+            GENESIS_PREV,
+            TS0,
+            &ReceiptEvent::Genesis {
+                pulse: "echo".to_string(),
+            },
+        );
+        let (rec, _) = line_of(
+            1,
+            &prev,
+            TS1,
+            &ReceiptEvent::Recover {
+                torn_offset: 0,
+                torn_len: 0,
+                torn_sha256: sha256_hex(b""),
+            },
+        );
+        let report = verify_lines(format!("{genesis}\n{rec}\n").as_bytes());
+        assert_eq!(report.state(), VerifyState::Broken);
+        assert!(report.warns.is_empty());
+        assert_eq!(note(&report), (2, "recover"));
     }
 
     #[test]
