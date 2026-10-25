@@ -349,6 +349,13 @@ fn canonical(value: &Value) -> String {
     out
 }
 
+/// The probe record's canonical JSON. Receipt-chain tests pin the same bytes
+/// on shared inputs; the on-disk probe format is unchanged.
+#[cfg(test)]
+pub(crate) fn canonical_json(value: &Value) -> String {
+    canonical(value)
+}
+
 /// Serialise with keys in sorted order regardless of the map's own order.
 fn write_sorted(value: &Value, out: &mut String) {
     match value {
