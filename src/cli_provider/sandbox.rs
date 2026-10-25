@@ -642,10 +642,15 @@ mod tests {
 
         // Only the child was restricted: an ordinary child spawned
         // afterwards writes where the sandboxed one could not.
-        let mut free = tokio::process::Command::new("/bin/sh");
-        free.arg("-c")
-            .arg(format!("echo out > '{}/no'", denied.path().display()));
-        assert!(free.status().await.unwrap().success());
+        let denied_path = denied.path().display().to_string();
+        let status = crate::process_state::during_fork(|| {
+            std::process::Command::new("/bin/sh")
+                .arg("-c")
+                .arg(format!("echo out > '{denied_path}/no'"))
+                .status()
+        })
+        .unwrap();
+        assert!(status.success());
         assert!(denied.path().join("no").exists());
     }
 
