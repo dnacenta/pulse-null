@@ -6,10 +6,18 @@
 //! window and across the fork keeps the two apart. The lock is re-entrant
 //! on the thread that already holds it. Drop it on that same thread.
 
+/// How long a thread waits for the process lock before panicking.
+///
+/// A holder must not wait on a worker that needs the same lock. The wait
+/// ends in a panic so that mistake cannot hang the suite.
+#[cfg(test)]
+const LOCK_WAIT: std::time::Duration = std::time::Duration::from_secs(120);
+
 /// Run `body` while this thread holds the process lock.
 ///
 /// The lock is released when `body` returns, so do not await inside it.
-/// Outside tests this only calls `body`.
+/// A holder must not wait on a worker that needs the same lock. Outside
+/// tests this only calls `body`.
 pub fn during_fork<T>(body: impl FnOnce() -> T) -> T {
     #[cfg(test)]
     let _hold = Hold::acquire();
@@ -25,18 +33,43 @@ pub struct Hold {
 #[cfg(test)]
 impl Hold {
     /// Take the lock, or share the one this thread already holds.
+    ///
+    /// A holder must not wait on a worker that needs the same lock. A thread
+    /// that does not already hold it tries until [`LOCK_WAIT`] and then
+    /// panics, instead of blocking with no deadline.
     #[must_use]
     pub fn acquire() -> Self {
         DEPTH.with(|depth| {
             let current = depth.get();
-            depth.set(current.saturating_add(1));
             if current == 0 {
-                let guard = PROCESS.lock().unwrap_or_else(|err| err.into_inner());
+                let guard = wait_for_lock();
+                depth.set(1);
                 Self { guard: Some(guard) }
             } else {
+                depth.set(current.saturating_add(1));
                 Self { guard: None }
             }
         })
+    }
+}
+
+#[cfg(test)]
+fn wait_for_lock() -> std::sync::MutexGuard<'static, ()> {
+    let wait = WAIT_OVERRIDE.with(|slot| slot.get().unwrap_or(LOCK_WAIT));
+    let deadline = std::time::Instant::now() + wait;
+    loop {
+        match PROCESS.try_lock() {
+            Ok(guard) => return guard,
+            Err(std::sync::TryLockError::Poisoned(err)) => return err.into_inner(),
+            Err(std::sync::TryLockError::WouldBlock) => {
+                if std::time::Instant::now() >= deadline {
+                    panic!(
+                        "this thread waited on the process lock for {wait:?}; a holder must not wait on a worker that needs the same lock"
+                    );
+                }
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+        }
     }
 }
 
@@ -57,4 +90,31 @@ static PROCESS: std::sync::Mutex<()> = std::sync::Mutex::new(());
 #[cfg(test)]
 thread_local! {
     static DEPTH: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+    static WAIT_OVERRIDE: std::cell::Cell<Option<std::time::Duration>> =
+        const { std::cell::Cell::new(None) };
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn waiting_on_the_process_lock_panics_instead_of_hanging() {
+        let hold = Hold::acquire();
+        let worker = std::thread::spawn(|| {
+            WAIT_OVERRIDE.with(|slot| slot.set(Some(std::time::Duration::from_millis(40))));
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let _wait = Hold::acquire();
+            }))
+        });
+        let result = worker.join().unwrap();
+        let payload = result.expect_err("the wait should panic");
+        let message = payload
+            .downcast_ref::<String>()
+            .map(String::as_str)
+            .or_else(|| payload.downcast_ref::<&str>().copied())
+            .unwrap_or("");
+        assert!(message.contains("must not wait on a worker"), "{message}");
+        drop(hold);
+    }
 }

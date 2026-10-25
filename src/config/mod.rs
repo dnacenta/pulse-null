@@ -171,6 +171,9 @@ fn hold_receipts_env() -> ReceiptsEnvHold {
 }
 
 /// Run `body` while this thread holds the receipts environment lock.
+///
+/// A holder must not wait on a worker that needs the same lock. The process
+/// lock under this one panics after its wait instead of hanging.
 #[cfg(test)]
 pub(crate) fn with_receipts_env<T>(body: impl FnOnce() -> T) -> T {
     let _hold = hold_receipts_env();
