@@ -81,13 +81,16 @@ pub async fn show(
 }
 
 fn unverified(json_out: bool, message: &str) -> Result<(), Box<dyn std::error::Error>> {
-    let body = unverified_body(message);
-    if json_out {
-        println!("{}", serde_json::to_string(&body)?);
-    } else {
-        println!("{message}");
-    }
+    println!("{}", unverified_line(json_out, message)?);
     Err(Box::new(PrintedExit(2)))
+}
+
+fn unverified_line(json_out: bool, message: &str) -> Result<String, Box<dyn std::error::Error>> {
+    if json_out {
+        Ok(serde_json::to_string(&unverified_body(message))?)
+    } else {
+        Ok(escape_show(message))
+    }
 }
 
 fn unverified_body(message: &str) -> Value {
@@ -163,9 +166,9 @@ fn located_from_config(configured: &str, pulse: &str) -> Located {
 }
 
 fn preamble(located: &Located, protection: &Protection) -> String {
+    let path = escape_show(&located.path.display().to_string());
     let mut text = format!(
-        "file={} source={}\nsystemd_fd={} owner_root={} mode_safe={} append_flag={} parent_safe={}",
-        located.path.display(),
+        "file={path} source={}\nsystemd_fd={} owner_root={} mode_safe={} append_flag={} parent_safe={}",
         from_name(located.from),
         protection.systemd_fd,
         protection.owner_root,
@@ -174,6 +177,7 @@ fn preamble(located: &Located, protection: &Protection) -> String {
         protection.parent_safe
     );
     if let Some(warn) = &located.path_warn {
+        let warn = escape_show(warn);
         text.push_str(&format!("\nwarn {warn}"));
     }
     text
@@ -809,6 +813,56 @@ mod tests {
         assert_json_unverified(&err.to_string(), "256 MiB");
         let exit = block(show(Some(huge), None, None, None, true)).unwrap_err();
         assert_eq!(exit.downcast_ref::<PrintedExit>().unwrap().0, 2);
+    }
+
+    #[test]
+    fn verify_escapes_the_path_and_the_error_for_a_human() {
+        let raw = "/var/lib/pulse-null/echo/\u{1b}\u{202e}receipts.jsonl";
+        let located = Located {
+            path: PathBuf::from(raw),
+            from: PathFrom::Config,
+            path_warn: Some(format!("config path differs from the default {raw}")),
+        };
+        let protection = Protection {
+            systemd_fd: false,
+            owner_root: false,
+            mode_safe: false,
+            append_flag: false,
+            parent_safe: false,
+        };
+        let text = preamble(&located, &protection);
+        assert!(text.contains("file="));
+        assert!(text.contains("source=config"));
+        assert!(text.contains("\\u{1B}"));
+        assert!(text.contains("\\u{202E}"));
+        assert!(!text.contains('\u{1b}'));
+        assert!(!text.contains('\u{202e}'));
+        assert!(text.contains("warn "));
+
+        let err = store::StoreError::NotFile {
+            path: raw.to_string(),
+        };
+        let human = unverified_line(false, &err.to_string()).unwrap();
+        assert!(human.contains("\\u{1B}"));
+        assert!(human.contains("\\u{202E}"));
+        assert!(!human.contains('\u{1b}'));
+        assert!(!human.contains('\u{202e}'));
+        let json_line = unverified_line(true, &err.to_string()).unwrap();
+        let parsed: Value = serde_json::from_str(&json_line).unwrap();
+        assert_eq!(parsed["state"], "unverified");
+        assert_eq!(parsed["error"], err.to_string());
+        assert!(parsed["error"].as_str().unwrap().contains('\u{202e}'));
+
+        let value = verify_json(
+            &Inspected {
+                bytes: Vec::new(),
+                report: chain::verify_lines(&b""[..]),
+            },
+            &located,
+            protection,
+        );
+        assert_eq!(value["file"], raw);
+        assert!(value["path_warn"].as_str().unwrap().contains('\u{202e}'));
     }
 
     #[test]
