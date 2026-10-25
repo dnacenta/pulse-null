@@ -590,7 +590,7 @@ async fn async_main(listen: oneself::store::ListenEnv) {
 }
 
 /// Logging: the TUI commands write to the TUI log (stdout is the screen),
-/// everything else to stdout.
+/// everything else to stderr so a `--json` report on stdout stays intact.
 fn init_tracing(command: &Commands) {
     let filter = tracing_subscriber::EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| "pulse_null=info".into());
@@ -601,7 +601,10 @@ fn init_tracing(command: &Commands) {
             .with_writer(tui_log_writer(open_tui_log()))
             .init();
     } else {
-        tracing_subscriber::fmt().with_env_filter(filter).init();
+        tracing_subscriber::fmt()
+            .with_env_filter(filter)
+            .with_writer(std::io::stderr)
+            .init();
     }
 }
 

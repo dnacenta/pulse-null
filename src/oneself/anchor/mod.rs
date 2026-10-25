@@ -62,7 +62,7 @@ pub enum AnchorError {
     Body,
     #[error("anchor token file is a symlink")]
     TokenSymlink,
-    #[error("anchor file would pass 800 KB; rotate the month file")]
+    #[error("anchor file would pass 819200 bytes (800 KiB); rotate the month file")]
     Rotate,
     #[error("anchor is already running")]
     Busy,
@@ -402,7 +402,7 @@ pub(crate) fn parse_history(text: &str) -> Result<Vec<AnchorLine>, AnchorError> 
     Ok(lines)
 }
 
-fn parse_line(line: &str) -> Result<AnchorLine, AnchorError> {
+pub(crate) fn parse_line(line: &str) -> Result<AnchorLine, AnchorError> {
     let parts: Vec<&str> = line.split_whitespace().collect();
     if parts.len() != 6 || parts[0] != "v1" {
         return Err(AnchorError::Line);

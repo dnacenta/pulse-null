@@ -6,7 +6,7 @@
 //! running the command.
 
 use std::fs::File;
-use std::io::{Read, Write};
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::os::fd::{AsRawFd, FromRawFd};
 use std::os::unix::fs::MetadataExt;
 use std::path::Path;
@@ -83,14 +83,40 @@ pub fn lock_ledger(dir: &Path) -> Result<File, AnchorError> {
             "anchors.lock must be a regular file".into(),
         ));
     }
+    flock_exclusive(&file)?;
+    Ok(file)
+}
+
+/// `LOCK_NB` once in production, so a second real run fails immediately.
+/// Tests retry for about two seconds: a forked child can hold the descriptor
+/// until it execs, and that window is not a second anchor run.
+fn flock_exclusive(file: &File) -> Result<(), AnchorError> {
+    #[cfg(test)]
+    {
+        flock_with_retry(file)
+    }
+    #[cfg(not(test))]
+    {
+        if lock_now(file)? {
+            Ok(())
+        } else {
+            Err(AnchorError::Busy)
+        }
+    }
+}
+
+/// `Ok(true)` is locked. `Ok(false)` is busy.
+fn lock_now(file: &File) -> Result<bool, AnchorError> {
     // SAFETY: `flock` on a descriptor this function owns.
     let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
     if rc == 0 {
-        return Ok(file);
+        return Ok(true);
     }
     let err = std::io::Error::last_os_error();
-    if err.raw_os_error() == Some(libc::EWOULDBLOCK) || err.raw_os_error() == Some(libc::EAGAIN) {
-        Err(AnchorError::Busy)
+    let busy =
+        err.raw_os_error() == Some(libc::EWOULDBLOCK) || err.raw_os_error() == Some(libc::EAGAIN);
+    if busy {
+        Ok(false)
     } else {
         Err(AnchorError::Local(
             "anchors.lock could not be locked".into(),
@@ -98,12 +124,77 @@ pub fn lock_ledger(dir: &Path) -> Result<File, AnchorError> {
     }
 }
 
+/// About two seconds of `LOCK_NB` when another process holds the lock.
+///
+/// A forked child can inherit the descriptor until it execs. That is not a
+/// second anchor run. A lock already held in this process is refused at once,
+/// which is what a second real run looks like.
+#[cfg(test)]
+fn flock_with_retry(file: &File) -> Result<(), AnchorError> {
+    let mut left = 40u32;
+    loop {
+        if lock_now(file)? {
+            return Ok(());
+        }
+        if held_by_this_process(file) {
+            return Err(AnchorError::Busy);
+        }
+        left -= 1;
+        if left == 0 {
+            return Err(AnchorError::Busy);
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+}
+
+/// True when this process, not a child, is the one holding `file`'s lock.
+#[cfg(test)]
+fn held_by_this_process(file: &File) -> bool {
+    let Ok(meta) = file.metadata() else {
+        return false;
+    };
+    let inode = meta.ino();
+    let dev = meta.dev();
+    let major = libc::major(dev);
+    let minor = libc::minor(dev);
+    let me = std::process::id();
+    let Ok(text) = std::fs::read_to_string("/proc/locks") else {
+        return false;
+    };
+    for line in text.lines() {
+        let parts: Vec<&str> = line.split_whitespace().collect();
+        if parts.len() < 6 || parts[1] != "FLOCK" || parts[3] != "WRITE" {
+            continue;
+        }
+        let Ok(pid) = parts[4].parse::<u32>() else {
+            continue;
+        };
+        let mut id = parts[5].split(':');
+        let (Some(maj), Some(min), Some(ino)) = (id.next(), id.next(), id.next()) else {
+            continue;
+        };
+        let Ok(maj) = u32::from_str_radix(maj, 16) else {
+            continue;
+        };
+        let Ok(min) = u32::from_str_radix(min, 16) else {
+            continue;
+        };
+        let Ok(ino) = ino.parse::<u64>() else {
+            continue;
+        };
+        if pid == me && ino == inode && maj == major && min == minor {
+            return true;
+        }
+    }
+    false
+}
+
 fn read_history(dir: &Path, owner: Option<u32>) -> Result<Vec<AnchorLine>, AnchorError> {
     let dirfd = open_dir(dir)?;
     let file = match open_at(
         dirfd.as_raw_fd(),
         "anchors.log",
-        libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC,
         false,
     ) {
         Ok(file) => file,
@@ -122,7 +213,14 @@ fn read_history(dir: &Path, owner: Option<u32>) -> Result<Vec<AnchorLine>, Ancho
         .take(HISTORY_CAP)
         .read_to_string(&mut text)
         .map_err(|_| AnchorError::Local("anchors.log could not be read".into()))?;
+    if !text.is_empty() && !text.ends_with('\n') {
+        return Err(AnchorError::Local(partial_tail().into()));
+    }
     parse_history(&text)
+}
+
+fn partial_tail() -> &'static str {
+    "anchors.log ends without a newline; add the newline or remove the partial line, then run anchor again"
 }
 
 fn append_line(dir: &Path, owner: Option<u32>, text: &str) -> Result<(), AnchorError> {
@@ -130,10 +228,18 @@ fn append_line(dir: &Path, owner: Option<u32>, text: &str) -> Result<(), AnchorE
     let mut file = open_at(
         dirfd.as_raw_fd(),
         "anchors.log",
-        libc::O_RDWR | libc::O_APPEND | libc::O_CREAT | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        libc::O_RDWR
+            | libc::O_APPEND
+            | libc::O_CREAT
+            | libc::O_NOFOLLOW
+            | libc::O_NONBLOCK
+            | libc::O_CLOEXEC,
         true,
     )?;
     check_file(&file, owner)?;
+    if !ends_with_newline(&mut file)? {
+        return Err(AnchorError::Local(partial_tail().into()));
+    }
     let mut payload = Vec::with_capacity(text.len() + 1);
     payload.extend_from_slice(text.as_bytes());
     payload.push(b'\n');
@@ -191,6 +297,21 @@ fn open_at(dirfd: i32, name: &str, flags: i32, create: bool) -> Result<File, Anc
         )));
     }
     Err(AnchorError::Local(format!("{name} could not be opened")))
+}
+
+fn ends_with_newline(file: &mut File) -> Result<bool, AnchorError> {
+    let meta = file
+        .metadata()
+        .map_err(|_| AnchorError::Local("anchors.log could not be checked".into()))?;
+    if meta.len() == 0 {
+        return Ok(true);
+    }
+    file.seek(SeekFrom::End(-1))
+        .map_err(|_| AnchorError::Local("anchors.log could not be checked".into()))?;
+    let mut byte = [0u8; 1];
+    file.read_exact(&mut byte)
+        .map_err(|_| AnchorError::Local("anchors.log could not be checked".into()))?;
+    Ok(byte[0] == b'\n')
 }
 
 fn check_file(file: &File, owner: Option<u32>) -> Result<(), AnchorError> {
@@ -277,10 +398,42 @@ mod tests {
         assert_eq!(text.lines().count(), 2);
         let mut torn = text.clone();
         torn.push_str("v1 partial");
-        std::fs::write(dir.path().join("anchors.log"), &torn).unwrap();
-        mode(&dir.path().join("anchors.log"), 0o644);
-        let history = anchor.history("echo").await.unwrap();
-        assert_eq!(history.len(), 2, "a partial tail is not a line");
+        let log = dir.path().join("anchors.log");
+        std::fs::write(&log, &torn).unwrap();
+        mode(&log, 0o644);
+        let err = anchor.history("echo").await.unwrap_err();
+        assert!(err.to_string().contains("anchors.log"), "{err}");
+        assert!(err.to_string().contains("newline"), "{err}");
+        let err = anchor.publish(&sample(3)).await.unwrap_err();
+        assert!(err.to_string().contains("anchors.log"), "{err}");
+        assert_eq!(std::fs::read_to_string(&log).unwrap(), torn);
+    }
+
+    #[tokio::test]
+    async fn a_fifo_is_refused_before_a_blocking_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("anchors.log");
+        let name = std::ffi::CString::new(path.as_os_str().as_encoded_bytes()).unwrap();
+        // SAFETY: `name` is a nul-terminated path that does not yet exist.
+        let rc = unsafe { libc::mkfifo(name.as_ptr(), 0o644) };
+        assert_eq!(rc, 0, "{}", std::io::Error::last_os_error());
+        let anchor = LocalFileAnchor::new(dir.path());
+        let started = std::time::Instant::now();
+        let history =
+            tokio::time::timeout(std::time::Duration::from_secs(2), anchor.history("echo"))
+                .await
+                .expect("history must not block on a fifo");
+        let err = history.unwrap_err();
+        assert!(err.to_string().contains("regular file"), "{err}");
+        let published = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            anchor.publish(&sample(1)),
+        )
+        .await
+        .expect("publish must not block on a fifo");
+        let err = published.unwrap_err();
+        assert!(err.to_string().contains("regular file"), "{err}");
+        assert!(started.elapsed() < std::time::Duration::from_secs(2));
     }
 
     #[tokio::test]
@@ -333,9 +486,12 @@ mod tests {
 
     #[test]
     fn a_second_lock_is_refused() {
+        let _process = crate::process_state::Hold::acquire();
         let dir = tempfile::tempdir().unwrap();
         let _held = lock_ledger(dir.path()).unwrap();
+        let started = std::time::Instant::now();
         let err = lock_ledger(dir.path()).unwrap_err();
+        assert!(started.elapsed() < std::time::Duration::from_millis(500));
         assert!(matches!(err, AnchorError::Busy), "{err}");
         assert!(err.to_string().contains("already running"), "{err}");
     }

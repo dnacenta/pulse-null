@@ -205,18 +205,24 @@ fn part_ok(part: &str) -> bool {
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
 }
 
-/// No `..`, no leading `-` or `/`, and no control characters.
+/// No `..`, no `.` or empty segment, no trailing `/`, no `.lock` suffix,
+/// no leading `-` or `/`, and no control characters.
 pub(crate) fn check_branch(branch: &str) -> Result<(), AnchorError> {
     if branch.is_empty()
         || branch.starts_with('-')
         || branch.starts_with('/')
+        || branch.ends_with('/')
         || branch.contains("..")
         || branch.bytes().any(|byte| byte < 0x20 || byte == 0x7f)
     {
-        Err(AnchorError::Config("branch".into()))
-    } else {
-        Ok(())
+        return Err(AnchorError::Config("branch".into()));
     }
+    for part in branch.split('/') {
+        if part.is_empty() || part == "." || part.ends_with(".lock") {
+            return Err(AnchorError::Config("branch".into()));
+        }
+    }
+    Ok(())
 }
 
 /// Relative, with no empty, `.`, or `..` component.
@@ -529,7 +535,19 @@ mod tests {
         assert!(
             parse_specs("[[backend]]\nkind = \"github\"\nrepo = \"owner.name/repo.ok\"\n").is_ok()
         );
-        for branch in ["-main", "/main", "a/../b", ""] {
+        for branch in [
+            "-main",
+            "/main",
+            "a/../b",
+            "",
+            "x/./y",
+            "x//y",
+            "./x",
+            "x/.",
+            "x/",
+            "main.lock",
+            "feature/foo.lock",
+        ] {
             let err = parse_specs(&format!(
                 "[[backend]]\nkind = \"github\"\nrepo = \"o/r\"\nbranch = \"{branch}\"\n"
             ))
@@ -543,6 +561,10 @@ mod tests {
         assert!(control.to_string().contains("branch"), "{control}");
         assert!(parse_specs(
             "[[backend]]\nkind = \"github\"\nrepo = \"o/r\"\nbranch = \"feature/foo\"\n"
+        )
+        .is_ok());
+        assert!(parse_specs(
+            "[[backend]]\nkind = \"github\"\nrepo = \"o/r\"\nbranch = \"release-1.2\"\n"
         )
         .is_ok());
         for dir in ["/abs", "heads/../x", "heads//x", ".", "..", "heads/./x"] {

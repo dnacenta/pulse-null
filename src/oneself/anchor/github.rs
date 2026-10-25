@@ -3,7 +3,7 @@
 //! History lists `heads/<pulse>`. A 404 there means no history. Each
 //! `YYYY-MM.log` entry is read and kept only when `encoding` is `base64` and
 //! the decoded length equals `size`. Anything else is an error and is not
-//! published. A month file that would pass 800 KB is not written.
+//! published. A month file that would pass 819200 bytes (800 KiB) is not written.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -12,7 +12,9 @@ use base64::engine::general_purpose::STANDARD;
 use base64::Engine;
 use chrono::{DateTime, Datelike, Utc};
 
-use super::{format_line, parse_history, Anchor, AnchorError, AnchorLine, BoxFuture, Secret};
+use super::{
+    format_line, parse_history, parse_line, Anchor, AnchorError, AnchorLine, BoxFuture, Secret,
+};
 
 const API_VERSION: &str = "2026-03-10";
 const MAX_BODY: usize = 2 * 1024 * 1024;
@@ -103,7 +105,7 @@ impl GitHubAnchor {
             encode(&self.owner),
             encode(&self.repo),
             encode_path(path),
-            encode_path(&self.branch)
+            self.encoded_branch()
         )
     }
 
@@ -113,8 +115,13 @@ impl GitHubAnchor {
             "{base}/repos/{}/{}/branches/{}",
             encode(&self.owner),
             encode(&self.repo),
-            encode_path(&self.branch)
+            self.encoded_branch()
         )
+    }
+
+    /// One encoding for the branch check and for `?ref=`.
+    fn encoded_branch(&self) -> String {
+        encode_path(&self.branch)
     }
 
     fn request(
@@ -245,7 +252,7 @@ impl GitHubAnchor {
         loop {
             let current = self.get_file(path).await?;
             let previous = current.as_ref().map(|file| file.text.as_str());
-            let text = append_text(previous, line);
+            let text = append_text(previous, line)?;
             if text.len() > MONTH_CAP {
                 return Err(AnchorError::Rotate);
             }
@@ -324,22 +331,37 @@ async fn read_body(mut response: reqwest::Response) -> Result<Vec<u8>, AnchorErr
     Ok(body)
 }
 
-fn append_text(previous: Option<&str>, line: &AnchorLine) -> String {
+/// Lines from a GitHub file. A last line with no newline is kept when it
+/// parses. A fragment that is not a full line is an error, not a dropped tail.
+fn remote_lines(text: &str) -> Result<Vec<AnchorLine>, AnchorError> {
+    if text.is_empty() || text.ends_with('\n') {
+        return parse_history(text);
+    }
+    let (head, tail) = match text.rfind('\n') {
+        Some(end) => (&text[..=end], &text[end + 1..]),
+        None => ("", text),
+    };
+    let mut lines = parse_history(head)?;
+    if !tail.is_empty() {
+        lines.push(parse_line(tail)?);
+    }
+    Ok(lines)
+}
+
+fn append_text(previous: Option<&str>, line: &AnchorLine) -> Result<String, AnchorError> {
     let mut text = String::new();
-    if let Some(previous) = previous {
-        let kept = if previous.is_empty() || previous.ends_with('\n') {
-            previous.to_string()
-        } else {
-            match previous.rfind('\n') {
-                Some(end) => previous[..=end].to_string(),
-                None => String::new(),
-            }
-        };
-        text.push_str(&kept);
+    if let Some(previous) = previous.filter(|text| !text.is_empty()) {
+        if !previous.ends_with('\n') {
+            remote_lines(previous)?;
+        }
+        text.push_str(previous);
+        if !previous.ends_with('\n') {
+            text.push('\n');
+        }
     }
     text.push_str(&format_line(line));
     text.push('\n');
-    text
+    Ok(text)
 }
 
 fn encode_path(path: &str) -> String {
@@ -388,7 +410,7 @@ impl Anchor for GitHubAnchor {
             for name in self.list_months(&self.pulse_dir(pulse)).await? {
                 let path = format!("{}/{name}", self.pulse_dir(pulse));
                 match self.get_file(&path).await? {
-                    Some(file) => lines.extend(parse_history(&file.text)?),
+                    Some(file) => lines.extend(remote_lines(&file.text)?),
                     None => return Err(AnchorError::Status(404)),
                 }
             }
@@ -428,6 +450,7 @@ mod tests {
         raw: Mutex<HashMap<String, String>>,
         listings: Mutex<HashMap<String, Vec<String>>>,
         paths: Mutex<Vec<String>>,
+        uris: Mutex<Vec<String>>,
         puts: Mutex<Vec<serde_json::Value>>,
         gets: AtomicUsize,
         put_status: Mutex<Vec<u16>>,
@@ -445,6 +468,7 @@ mod tests {
                 raw: Mutex::new(HashMap::new()),
                 listings: Mutex::new(HashMap::new()),
                 paths: Mutex::new(Vec::new()),
+                uris: Mutex::new(Vec::new()),
                 puts: Mutex::new(Vec::new()),
                 gets: AtomicUsize::new(0),
                 put_status: Mutex::new(Vec::new()),
@@ -479,6 +503,7 @@ mod tests {
             .to_string();
         mock.headers.lock().unwrap().push((bearer, version, agent));
         let path = request.uri().path().to_string();
+        mock.uris.lock().unwrap().push(request.uri().to_string());
         mock.paths.lock().unwrap().push(path.clone());
         let key = path.split("/contents/").nth(1).unwrap_or("").to_string();
         match request.method().as_str() {
@@ -933,7 +958,8 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(err, super::AnchorError::Rotate), "{err}");
-        assert!(err.to_string().contains("800 KB"), "{err}");
+        assert!(err.to_string().contains("819200"), "{err}");
+        assert!(err.to_string().contains("800 KiB"), "{err}");
         assert!(mock.puts.lock().unwrap().is_empty());
     }
 
@@ -947,6 +973,13 @@ mod tests {
             (".", "repo", "main", "heads"),
             ("owner", "repo", "-main", "heads"),
             ("owner", "repo", "a/../b", "heads"),
+            ("owner", "repo", "x/./y", "heads"),
+            ("owner", "repo", "x//y", "heads"),
+            ("owner", "repo", "./x", "heads"),
+            ("owner", "repo", "x/.", "heads"),
+            ("owner", "repo", "x/", "heads"),
+            ("owner", "repo", "main.lock", "heads"),
+            ("owner", "repo", "feature/foo.lock", "heads"),
             ("owner", "repo", "main", "/heads"),
             ("owner", "repo", "main", "heads/../x"),
             ("owner", "repo", "main", "."),
@@ -980,6 +1013,133 @@ mod tests {
         }
         assert_eq!(mock.gets.load(Ordering::Relaxed), 0);
         assert!(mock.puts.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_valid_last_line_without_a_newline_is_kept() {
+        let bare = format!(
+            "v1 echo 0123456789abcdef 1 {} 2026-10-25T00:00:00.000Z",
+            "ab".repeat(32)
+        );
+        assert!(!bare.ends_with('\n'));
+        let mock = Arc::new(Mock::new());
+        mock.files.lock().unwrap().insert(
+            "heads/echo/2026-06.log".into(),
+            ("sha1".into(), bare.clone()),
+        );
+        let base = serve(mock.clone()).await;
+        let anchor = github_at(base, 2026);
+        let history = anchor.history("echo").await.unwrap();
+        assert_eq!(history.len(), 1);
+        assert_eq!(history[0].seq, 1);
+        anchor.publish(&line(2, &"cd".repeat(32))).await.unwrap();
+        let text = mock
+            .files
+            .lock()
+            .unwrap()
+            .get("heads/echo/2026-06.log")
+            .unwrap()
+            .1
+            .clone();
+        let lines: Vec<_> = text.lines().collect();
+        assert_eq!(lines.len(), 2, "{text}");
+        assert_eq!(lines[0], bare);
+        assert!(lines[1].contains(" 2 "));
+        assert!(text.ends_with('\n'));
+    }
+
+    #[tokio::test]
+    async fn a_remote_fragment_is_not_dropped() {
+        let fragment = "v1 echo not-a-line";
+        let mock = Arc::new(Mock::new());
+        mock.files.lock().unwrap().insert(
+            "heads/echo/2026-06.log".into(),
+            ("sha1".into(), fragment.to_string()),
+        );
+        let base = serve(mock.clone()).await;
+        let anchor = github_at(base, 2026);
+        let err = anchor.history("echo").await.unwrap_err();
+        assert!(matches!(err, super::AnchorError::Line), "{err}");
+        let err = anchor
+            .publish(&line(2, &"cd".repeat(32)))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, super::AnchorError::Line), "{err}");
+        assert!(mock.puts.lock().unwrap().is_empty());
+        let kept = mock
+            .files
+            .lock()
+            .unwrap()
+            .get("heads/echo/2026-06.log")
+            .unwrap()
+            .1
+            .clone();
+        assert_eq!(kept, fragment);
+
+        let good = format!(
+            "v1 echo 0123456789abcdef 1 {} 2026-10-25T00:00:00.000Z\n",
+            "ab".repeat(32)
+        );
+        let torn = format!("{good}not-a-line");
+        let mock = Arc::new(Mock::new());
+        mock.files.lock().unwrap().insert(
+            "heads/echo/2026-06.log".into(),
+            ("sha1".into(), torn.clone()),
+        );
+        let base = serve(mock.clone()).await;
+        let anchor = github_at(base, 2026);
+        assert!(anchor.history("echo").await.is_err());
+        assert!(anchor.publish(&line(2, &"cd".repeat(32))).await.is_err());
+        assert!(mock.puts.lock().unwrap().is_empty());
+        let kept = mock
+            .files
+            .lock()
+            .unwrap()
+            .get("heads/echo/2026-06.log")
+            .unwrap()
+            .1
+            .clone();
+        assert_eq!(kept, torn);
+    }
+
+    #[tokio::test]
+    async fn the_branch_check_and_the_ref_use_the_same_encoding() {
+        for branch in ["feature/foo", "release-1.2", "feature/foo bar"] {
+            let mock = Arc::new(Mock::new());
+            let base = serve(mock.clone()).await;
+            let anchor = GitHubAnchor::with_clock(
+                "owner".into(),
+                "repo".into(),
+                branch.into(),
+                "heads".into(),
+                base,
+                Secret::new("pn108-token-do-not-leak".into()),
+                Arc::new(|| Utc.with_ymd_and_hms(2026, 6, 1, 0, 0, 0).unwrap()),
+            )
+            .unwrap();
+            let history = anchor.history("echo").await.unwrap();
+            assert!(history.is_empty(), "{branch}");
+            let uris = mock.uris.lock().unwrap().clone();
+            let encoded = super::encode_path(branch);
+            let branch_uri = uris
+                .iter()
+                .find(|uri| uri.contains("/branches/"))
+                .unwrap_or_else(|| panic!("no branch request for {branch}: {uris:?}"));
+            let file_uri = uris
+                .iter()
+                .find(|uri| uri.contains("ref="))
+                .unwrap_or_else(|| panic!("no ref for {branch}: {uris:?}"));
+            let branch_enc = branch_uri
+                .split("/branches/")
+                .nth(1)
+                .unwrap_or_else(|| panic!("{branch_uri}"));
+            let ref_enc = file_uri
+                .split("ref=")
+                .nth(1)
+                .unwrap_or_else(|| panic!("{file_uri}"));
+            assert_eq!(branch_enc, encoded, "{branch_uri}");
+            assert_eq!(ref_enc, encoded, "{file_uri}");
+        }
     }
 
     #[tokio::test]

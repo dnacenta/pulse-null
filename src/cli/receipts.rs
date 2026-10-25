@@ -2,9 +2,10 @@
 //!
 //! `verify`, `show`, `overlaps`, and `swaps` read a file. `anchor` is the only
 //! one that publishes, and only from this command, never from the daemon.
-//! `anchor` holds `<receipt dir>/anchors.lock` for that run. None of them
-//! locks the receipt file or repairs a torn tail. The store does that when
-//! it opens.
+//! `anchor` holds `<receipt dir>/anchors.lock` only while it publishes.
+//! A dry run, and a check that refuses, do not create that file. None of
+//! them locks the receipt file or repairs a torn tail. The store does that
+//! when it opens.
 
 use std::collections::{BTreeMap, HashMap};
 use std::path::PathBuf;
@@ -100,10 +101,11 @@ pub async fn verify_at(
 
 /// Publish one anchor line when the local chain is ahead of every backend.
 ///
-/// `<receipt dir>/anchors.lock` is held for the run. The receipt file is not
-/// locked. A trailing partial line is not part of the chain. A mismatch or a
-/// rewind publishes nothing. A backend whose check failed is skipped, and the
-/// others are still attempted.
+/// The receipt file is not locked. A trailing partial line of the receipt is
+/// not part of the chain. A mismatch, a rewind, or a backend that cannot be
+/// read returns without creating `<receipt dir>/anchors.lock`. `--dry-run`
+/// does not create it either. The lock is held only across the publish. A
+/// backend whose check failed is skipped, and the others are still attempted.
 pub async fn anchor(
     pulse: String,
     file: Option<PathBuf>,
@@ -143,14 +145,32 @@ pub async fn anchor(
         Ok(backends) => backends,
         Err(err) => return unverified(false, &err.to_string()),
     };
+    if dry_run {
+        let outcome = match anchor::sync(&index, &backends, true).await {
+            Ok(outcome) => outcome,
+            Err(err) => return unverified(false, &err.to_string()),
+        };
+        return finish_anchor(outcome);
+    }
+    let preview = match anchor::check(&index, &backends).await {
+        Ok(outcome) => outcome,
+        Err(err) => return unverified(false, &err.to_string()),
+    };
+    if matches!(preview.state, "mismatch" | "rewind" | "unverified") {
+        return finish_anchor(preview);
+    }
     let _lock = match anchor::lock_ledger(&dir) {
         Ok(lock) => lock,
         Err(err) => return unverified(false, &err.to_string()),
     };
-    let outcome = match anchor::sync(&index, &backends, dry_run).await {
+    let outcome = match anchor::sync(&index, &backends, false).await {
         Ok(outcome) => outcome,
         Err(err) => return unverified(false, &err.to_string()),
     };
+    finish_anchor(outcome)
+}
+
+fn finish_anchor(outcome: anchor::Outcome) -> Result<(), Box<dyn std::error::Error>> {
     for note in &outcome.notes {
         println!("{}", anchor_note(note));
     }
@@ -852,6 +872,31 @@ fn carried(same: bool) -> &'static str {
     }
 }
 
+#[cfg(test)]
+thread_local! {
+    static CAPTURED_OUT: std::cell::RefCell<Option<String>> = const { std::cell::RefCell::new(None) };
+}
+
+fn write_line(text: &str) {
+    #[cfg(test)]
+    {
+        let captured = CAPTURED_OUT.with(|slot| {
+            let mut slot = slot.borrow_mut();
+            if let Some(buf) = slot.as_mut() {
+                buf.push_str(text);
+                buf.push('\n');
+                true
+            } else {
+                false
+            }
+        });
+        if captured {
+            return;
+        }
+    }
+    println!("{text}");
+}
+
 fn unverified(json_out: bool, message: &str) -> Result<(), Box<dyn std::error::Error>> {
     println!("{}", unverified_line(json_out, message)?);
     Err(Box::new(PrintedExit(2)))
@@ -988,7 +1033,7 @@ fn emit_verify(
                 })
                 .collect::<Vec<_>>());
         }
-        println!("{}", serde_json::to_string(&value)?);
+        write_line(&serde_json::to_string(&value)?);
     } else {
         println!("{}", preamble(located, &protection));
         print_human(inspected);
@@ -1343,6 +1388,7 @@ mod tests {
     use crate::oneself::protect::LiveProbe;
     use crate::oneself::store::{ReceiptStore, StoreSource};
     use std::io::Write;
+    use tracing_subscriber::util::SubscriberInitExt;
 
     fn sample(dir: &std::path::Path) -> std::path::PathBuf {
         let path = dir.join("receipts.jsonl");
@@ -2388,8 +2434,9 @@ mod tests {
             .unwrap_or(-1)
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "current_thread")]
     async fn anchor_appends_one_line_ignores_a_torn_tail_and_refuses_a_mismatch() {
+        let _process = crate::process_state::Hold::acquire();
         let dir = tempfile::tempdir().unwrap();
         let path = sample(dir.path());
         let config = local_config(dir.path());
@@ -2403,6 +2450,7 @@ mod tests {
         .await
         .unwrap();
         assert!(!dir.path().join("anchors.log").exists());
+        assert!(!dir.path().join("anchors.lock").exists());
         anchor(
             "echo".into(),
             Some(path.clone()),
@@ -2581,15 +2629,18 @@ mod tests {
             .unwrap();
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "current_thread")]
     async fn a_second_anchor_exits_while_the_lock_is_held() {
+        let _process = crate::process_state::Hold::acquire();
         let dir = tempfile::tempdir().unwrap();
         let path = sample(dir.path());
         let config = local_config(dir.path());
         let _held = crate::oneself::anchor::lock_ledger(dir.path()).unwrap();
+        let started = std::time::Instant::now();
         let err = anchor("echo".into(), Some(path), Some(config), None, false)
             .await
             .unwrap_err();
+        assert!(started.elapsed() < std::time::Duration::from_secs(1));
         assert_eq!(code(err), 2);
         assert!(!dir.path().join("anchors.log").exists());
     }
@@ -2648,5 +2699,142 @@ mod tests {
             .await
             .unwrap_err();
         assert_eq!(code(err), 2);
+        assert!(!dir.path().join("anchors.lock").exists());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_partial_anchors_log_is_left_unchanged() {
+        let _process = crate::process_state::Hold::acquire();
+        let dir = tempfile::tempdir().unwrap();
+        let path = sample(dir.path());
+        let log = dir.path().join("anchors.log");
+        let partial = b"v1 echo partial";
+        std::fs::write(&log, partial).unwrap();
+        mode(&log, 0o644);
+        let config = local_config(dir.path());
+        let err = anchor(
+            "echo".into(),
+            Some(path.clone()),
+            Some(config.clone()),
+            None,
+            false,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(code(err), 2);
+        assert_eq!(std::fs::read(&log).unwrap(), partial);
+        assert!(!dir.path().join("anchors.lock").exists());
+        let _capture = capture_out();
+        let err = verify_at(Some(path), true, true, Some(config), None)
+            .await
+            .unwrap_err();
+        let text = super::CAPTURED_OUT.with(|slot| slot.borrow_mut().take().unwrap());
+        assert_eq!(code(err), 2);
+        let value: serde_json::Value = serde_json::from_str(text.trim()).unwrap();
+        assert_eq!(value["state"], "unverified");
+        let detail = value["anchors"][0]["detail"].as_str().unwrap_or("");
+        assert!(detail.contains("anchors.log"), "{detail}");
+        assert!(detail.contains("newline"), "{detail}");
+        assert_eq!(std::fs::read(&log).unwrap(), partial);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn anchor_refuses_a_fifo_without_taking_the_lock() {
+        let _process = crate::process_state::Hold::acquire();
+        let dir = tempfile::tempdir().unwrap();
+        let path = sample(dir.path());
+        let fifo = dir.path().join("anchors.log");
+        let name = std::ffi::CString::new(fifo.as_os_str().as_encoded_bytes()).unwrap();
+        // SAFETY: `name` is a nul-terminated path that does not yet exist.
+        let rc = unsafe { libc::mkfifo(name.as_ptr(), 0o644) };
+        assert_eq!(rc, 0, "{}", std::io::Error::last_os_error());
+        let config = local_config(dir.path());
+        let started = std::time::Instant::now();
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            anchor("echo".into(), Some(path), Some(config), None, false),
+        )
+        .await
+        .expect("anchor must not block on a fifo");
+        let err = result.unwrap_err();
+        assert_eq!(code(err), 2);
+        assert!(!dir.path().join("anchors.lock").exists());
+        assert!(started.elapsed() < std::time::Duration::from_secs(2));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn verify_anchors_json_stays_json_when_a_request_fails() {
+        let _process = crate::process_state::Hold::acquire();
+        let app = axum::Router::new().route(
+            "/{*rest}",
+            axum::routing::any(|| async { axum::http::StatusCode::UNAUTHORIZED }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let dir = tempfile::tempdir().unwrap();
+        let path = sample(dir.path());
+        let token = dir.path().join("token");
+        std::fs::write(&token, "pn108-token-do-not-leak\n").unwrap();
+        mode(&token, 0o600);
+        let config = dir.path().join("anchor.toml");
+        std::fs::write(
+            &config,
+            format!(
+                "[[backend]]\nkind = \"github\"\nrepo = \"owner/repo\"\napi_base = \"http://127.0.0.1:{port}\"\ntoken_file = \"{}\"\n",
+                token.display()
+            ),
+        )
+        .unwrap();
+        mode(&config, 0o600);
+        let log = std::sync::Arc::new(std::sync::Mutex::new(Vec::<u8>::new()));
+        let writer = log.clone();
+        let _tracing = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::WARN)
+            .with_ansi(false)
+            .with_writer(move || LogWriter(writer.clone()))
+            .set_default();
+        let _capture = capture_out();
+        let err = verify_at(Some(path), true, true, Some(config), None)
+            .await
+            .unwrap_err();
+        let text = super::CAPTURED_OUT.with(|slot| slot.borrow_mut().take().unwrap());
+        assert_eq!(code(err), 2);
+        let value: serde_json::Value = serde_json::from_str(text.trim()).expect(&text);
+        assert_eq!(value["state"], "unverified");
+        assert!(!text.contains("anchor request failed"), "{text}");
+        assert!(!text.contains("pn108-token-do-not-leak"), "{text}");
+        let logged = String::from_utf8(log.lock().unwrap().clone()).unwrap();
+        assert!(logged.contains("anchor request failed"), "{logged}");
+        assert!(logged.contains("401"), "{logged}");
+        assert!(!logged.contains("pn108-token-do-not-leak"), "{logged}");
+    }
+
+    fn capture_out() -> CaptureOut {
+        super::CAPTURED_OUT.with(|slot| *slot.borrow_mut() = Some(String::new()));
+        CaptureOut
+    }
+
+    struct CaptureOut;
+
+    impl Drop for CaptureOut {
+        fn drop(&mut self) {
+            super::CAPTURED_OUT.with(|slot| *slot.borrow_mut() = None);
+        }
+    }
+
+    struct LogWriter(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for LogWriter {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
     }
 }
