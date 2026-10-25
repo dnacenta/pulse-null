@@ -156,7 +156,9 @@ fn verify_bytes(buf: &[u8]) -> VerifyReport {
             });
             return report;
         };
-        if index + 1 < lines.len() {
+        // A recover names a torn line. A complete row followed by recover
+        // stays a row; it is not rewritten into a warning.
+        if index + 1 < lines.len() && torn_payload(line) {
             if let Some(accepted) = matching_recover(&lines[index + 1], line, seq, &expected_prev) {
                 report.warns.push(VerifyNote {
                     line: line.number,
@@ -234,8 +236,8 @@ fn matching_recover(
     }
 }
 
-/// A line the writer would treat as torn: it does not parse as JSON, or it
-/// is the last line and the file has no trailing newline.
+/// Not a JSON value, or the final line of a file that has no trailing
+/// newline. A matching `recover` is accepted only for this kind of line.
 fn torn_payload(line: &Phys<'_>) -> bool {
     if !line.has_newline {
         return true;
@@ -419,7 +421,7 @@ pub(crate) fn hex(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::oneself::event::ReceiptEvent;
+    use crate::oneself::event::{ActionClass, Outcome, ReceiptEvent};
 
     const TS0: &str = "2026-10-25T03:00:00.000Z";
     const TS1: &str = "2026-10-25T03:00:00.001Z";
@@ -763,6 +765,48 @@ mod tests {
         assert_eq!(report.warns[0].reason, "torn line");
         assert_eq!(report.rows, 4);
         assert_eq!(report.seq, Some(3));
+    }
+
+    #[test]
+    fn a_recover_after_a_valid_close_is_broken() {
+        let (genesis, prev) = line_of(
+            0,
+            GENESIS_PREV,
+            TS0,
+            &ReceiptEvent::Genesis {
+                pulse: "echo".to_string(),
+            },
+        );
+        let close_event = ReceiptEvent::Close {
+            stream: "s1".to_string(),
+            outcome: Outcome::Acted,
+            action_class: ActionClass::Reply,
+            provider: "cli".to_string(),
+            adapter: "recorded".to_string(),
+            model: "primary".to_string(),
+            fallback: false,
+            input_sha256: None,
+            output_sha256: None,
+            tokens_in: None,
+            tokens_out: None,
+            duration_ms: 1,
+            mailbox_head: (),
+            folded: (),
+            fence: (),
+        };
+        let (close, _) = line_of(1, &prev, TS1, &close_event);
+        let recover = ReceiptEvent::Recover {
+            torn_offset: u64::try_from(genesis.len() + 1).unwrap(),
+            torn_len: u64::try_from(close.len()).unwrap(),
+            torn_sha256: sha256_hex(close.as_bytes()),
+        };
+        // Same seq as the close, which is what made the old check drop it.
+        let (rec, _) = line_of(1, &prev, TS2, &recover);
+        let text = format!("{genesis}\n{close}\n{rec}\n");
+        let report = verify_lines(text.as_bytes());
+        assert_eq!(report.state(), VerifyState::Broken);
+        assert!(report.warns.is_empty());
+        assert_eq!(note(&report), (3, "seq"));
     }
 
     fn shutdown_after_genesis() -> (String, String) {
