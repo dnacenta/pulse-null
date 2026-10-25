@@ -577,6 +577,7 @@ fn repair_class(file: &mut File, class: Class) -> Result<RepairKind, StoreError>
     match class {
         Class::Ready => Ok(RepairKind::Ready),
         Class::MissingNewline => {
+            ensure_repair_fits(file, 1)?;
             write_all_sync(file, b"\n")?;
             Ok(RepairKind::Newline)
         }
@@ -606,12 +607,28 @@ fn repair_class(file: &mut File, class: Class) -> Result<RepairKind, StoreError>
             } else {
                 line
             };
+            ensure_repair_fits(file, record.len())?;
             write_all_sync(file, &record)?;
             Ok(RepairKind::Recovered)
         }
         Class::NoRow => Ok(RepairKind::NoRow),
         Class::Broken(note) => Ok(RepairKind::Broken(note)),
     }
+}
+
+/// A recover row or a missing newline must not push the file past the cap.
+#[cfg_attr(not(test), expect(dead_code, reason = "wired in increment 3"))]
+fn ensure_repair_fits(file: &File, extra: usize) -> Result<(), StoreError> {
+    let len = file.metadata()?.len();
+    let extra = u64::try_from(extra).unwrap_or(u64::MAX);
+    let bytes = len.saturating_add(extra);
+    if bytes > MAX_RECEIPT_BYTES {
+        return Err(StoreError::TooLarge {
+            path: fd_path(file.as_raw_fd()),
+            bytes,
+        });
+    }
+    Ok(())
 }
 
 #[cfg_attr(not(test), expect(dead_code, reason = "wired in increment 3"))]
@@ -690,6 +707,13 @@ fn classify(bytes: &[u8]) -> Result<Class, StoreError> {
         return Ok(Class::Broken(VerifyNote {
             line: prefix_report.rows as usize + 1,
             reason: "not a row",
+        }));
+    }
+    if last.len() > chain::MAX_LINE_BYTES {
+        let line = prefix.iter().filter(|byte| **byte == b'\n').count() + 1;
+        return Ok(Class::Broken(VerifyNote {
+            line,
+            reason: "oversize",
         }));
     }
     Ok(Class::Torn {
@@ -1629,5 +1653,52 @@ mod tests {
         let report = chain::verify_lines(bytes.as_slice());
         assert_ne!(report.state(), VerifyState::Broken, "{report:?}");
         drop(store);
+    }
+
+    #[test]
+    fn an_oversize_torn_tail_is_not_repaired() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("receipts.jsonl");
+        let (store, _) = open_path(dir.path());
+        drop(store);
+        let mut bytes = std::fs::read(&path).unwrap();
+        bytes.extend(vec![b'x'; 100 * 1024]);
+        std::fs::write(&path, &bytes).unwrap();
+        let err =
+            ReceiptStore::open(StoreSource::Path(path.clone()), &LiveProbe, "echo").unwrap_err();
+        match err {
+            StoreError::Broken { line, reason } => {
+                assert_eq!(line, 2, "{reason}");
+                assert_eq!(reason, "oversize");
+            }
+            other => panic!("{other}"),
+        }
+        assert_eq!(std::fs::read(&path).unwrap(), bytes);
+    }
+
+    #[test]
+    fn a_repair_that_would_pass_the_size_cap_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("receipts.jsonl");
+        let marker = b"keep-me";
+        std::fs::write(&path, marker).unwrap();
+        let mut file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&path)
+            .unwrap();
+        file.set_len(MAX_RECEIPT_BYTES).unwrap();
+        let err = match repair_class(&mut file, Class::MissingNewline) {
+            Err(err) => err,
+            Ok(_) => panic!("repair wrote past the cap"),
+        };
+        assert!(matches!(err, StoreError::TooLarge { .. }), "{err}");
+        assert!(err.to_string().contains("256 MiB"), "{err}");
+        drop(file);
+        assert_eq!(std::fs::metadata(&path).unwrap().len(), MAX_RECEIPT_BYTES);
+        let mut head = [0u8; 7];
+        let mut opened = File::open(&path).unwrap();
+        opened.read_exact(&mut head).unwrap();
+        assert_eq!(&head, marker);
     }
 }
