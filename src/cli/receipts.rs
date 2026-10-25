@@ -181,6 +181,8 @@ pub(crate) const DEFAULT_OVERLAP_LIMIT: u64 = 1000;
 /// the row sequence, not the timestamp text. The same stream is not an
 /// overlap with itself. `quiet_twin` is set when one outcome is `acted`
 /// and the other is not. An overlap that ended before `since` is left out.
+/// The command streams through [`visit_overlaps`]; this collector is for tests.
+#[cfg(test)]
 pub(crate) fn find_overlaps(
     rows: &[chain::Row],
     since: Option<&str>,
