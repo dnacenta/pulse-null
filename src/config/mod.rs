@@ -61,8 +61,8 @@ pub struct Config {
     /// Growth-record probes (PN-144); off by default.
     #[serde(default)]
     pub probe: ProbeConfig,
-    /// Receipt file location. Empty means the default path. The daemon does
-    /// not read this yet; `receipts verify` and `show` do.
+    /// Receipt file. Off unless `enabled` or `PULSE_NULL_RECEIPTS=required`.
+    /// `receipts verify` and `show` read `path` either way.
     #[serde(default, skip_serializing_if = "ReceiptsConfig::is_unset")]
     pub receipts: ReceiptsConfig,
     #[serde(default)]
@@ -74,18 +74,185 @@ pub struct Config {
     pub plugin_turns: PluginTurnsConfig,
 }
 
-/// `[receipts]`: where the receipt file lives. No enable switch yet.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+/// `[receipts]`: whether the daemon writes a receipt file, and where.
+///
+/// Off by default. `PULSE_NULL_RECEIPTS=required` forces `enabled` and
+/// `require_protected` on; the file cannot turn that off.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct ReceiptsConfig {
+    /// The daemon opens the store only when this is true, or when the
+    /// environment requires receipts.
+    #[serde(default)]
+    pub enabled: bool,
     /// Empty uses `/var/lib/pulse-null/<pulse>/receipts.jsonl`.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub path: String,
+    /// Refuse to write unless the protection probe passes. Default true.
+    #[serde(default = "default_require_protected")]
+    pub require_protected: bool,
+    /// What a row records. `digest` hashes the text and does not store it.
+    #[serde(default = "default_receipt_content")]
+    pub content: String,
+}
+
+fn default_require_protected() -> bool {
+    true
+}
+
+fn default_receipt_content() -> String {
+    "digest".to_string()
+}
+
+impl Default for ReceiptsConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            path: String::new(),
+            require_protected: true,
+            content: default_receipt_content(),
+        }
+    }
 }
 
 impl ReceiptsConfig {
     fn is_unset(&self) -> bool {
-        self.path.is_empty()
+        !self.enabled && self.path.is_empty() && self.require_protected && self.content == "digest"
+    }
+}
+
+/// Environment variable that forces receipts on, with protection required.
+#[cfg_attr(not(test), expect(dead_code, reason = "read when the daemon starts"))]
+pub(crate) const RECEIPTS_ENV: &str = "PULSE_NULL_RECEIPTS";
+
+thread_local! {
+    static RECEIPTS_ENV_LOCK_HELD: Cell<bool> = const { Cell::new(false) };
+}
+#[cfg_attr(not(test), expect(dead_code, reason = "read when the daemon starts"))]
+static RECEIPTS_ENV_LOCK: Mutex<()> = Mutex::new(());
+
+#[cfg_attr(not(test), expect(dead_code, reason = "read when the daemon starts"))]
+struct ReceiptsEnvHold {
+    release: bool,
+    _guard: Option<std::sync::MutexGuard<'static, ()>>,
+}
+
+impl Drop for ReceiptsEnvHold {
+    fn drop(&mut self) {
+        if self.release {
+            RECEIPTS_ENV_LOCK_HELD.with(|held| held.set(false));
+        }
+    }
+}
+
+/// Serialize reads of [`RECEIPTS_ENV`] with a test that sets it.
+/// Re-entrant on the thread that already holds it.
+#[cfg_attr(not(test), expect(dead_code, reason = "read when the daemon starts"))]
+fn hold_receipts_env() -> ReceiptsEnvHold {
+    if RECEIPTS_ENV_LOCK_HELD.with(|held| held.get()) {
+        return ReceiptsEnvHold {
+            release: false,
+            _guard: None,
+        };
+    }
+    let guard = RECEIPTS_ENV_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    RECEIPTS_ENV_LOCK_HELD.with(|held| held.set(true));
+    ReceiptsEnvHold {
+        release: true,
+        _guard: Some(guard),
+    }
+}
+
+/// Run `body` while this thread holds the receipts environment lock.
+#[cfg(test)]
+pub(crate) fn with_receipts_env<T>(body: impl FnOnce() -> T) -> T {
+    let _hold = hold_receipts_env();
+    body()
+}
+
+/// Whether the daemon writes receipts, after the environment override.
+///
+/// `PULSE_NULL_RECEIPTS=required` (case-insensitive, trimmed) forces
+/// receipts on and protection required. Any other non-empty value is
+/// warned once and ignored. The decision is [`effective_receipts`].
+#[cfg_attr(not(test), expect(dead_code, reason = "read when the daemon starts"))]
+pub(crate) fn receipts_mode(config: &ReceiptsConfig) -> ReceiptsMode {
+    let _hold = hold_receipts_env();
+    let raw = std::env::var(RECEIPTS_ENV).ok();
+    log_receipts_env(raw.as_deref());
+    effective_receipts(config, raw.as_deref())
+}
+
+/// Receipts after the environment override: on or off, and whether a write
+/// requires the protection probe to pass.
+#[cfg_attr(not(test), expect(dead_code, reason = "read when the daemon starts"))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ReceiptsMode {
+    pub enabled: bool,
+    pub require_protected: bool,
+}
+
+#[cfg_attr(not(test), expect(dead_code, reason = "read when the daemon starts"))]
+enum ReceiptsEnvClass {
+    Unset,
+    Required,
+    Other,
+}
+
+#[cfg_attr(not(test), expect(dead_code, reason = "read when the daemon starts"))]
+fn receipts_env_class(env: Option<&str>) -> ReceiptsEnvClass {
+    let Some(raw) = env else {
+        return ReceiptsEnvClass::Unset;
+    };
+    let value = raw.trim();
+    if value.is_empty() {
+        return ReceiptsEnvClass::Unset;
+    }
+    if value.eq_ignore_ascii_case("required") {
+        return ReceiptsEnvClass::Required;
+    }
+    ReceiptsEnvClass::Other
+}
+
+#[cfg_attr(not(test), expect(dead_code, reason = "read when the daemon starts"))]
+fn log_receipts_env(env: Option<&str>) {
+    match receipts_env_class(env) {
+        ReceiptsEnvClass::Required => {
+            static LOGGED: AtomicBool = AtomicBool::new(false);
+            if !LOGGED.swap(true, Ordering::Relaxed) {
+                tracing::info!("receipts are required by the environment");
+            }
+        }
+        ReceiptsEnvClass::Other => {
+            static LOGGED: AtomicBool = AtomicBool::new(false);
+            if !LOGGED.swap(true, Ordering::Relaxed) {
+                tracing::warn!(
+                    "PULSE_NULL_RECEIPTS is not a recognized value; receipts follow the config file"
+                );
+            }
+        }
+        ReceiptsEnvClass::Unset => {}
+    }
+}
+
+/// Receipts mode after applying `PULSE_NULL_RECEIPTS` to the config keys.
+///
+/// `env` is the raw value, or `None` when the variable is unset. `required`
+/// forces both keys on. Anything else leaves the file's values.
+#[must_use]
+#[cfg_attr(not(test), expect(dead_code, reason = "read when the daemon starts"))]
+pub(crate) fn effective_receipts(config: &ReceiptsConfig, env: Option<&str>) -> ReceiptsMode {
+    match receipts_env_class(env) {
+        ReceiptsEnvClass::Required => ReceiptsMode {
+            enabled: true,
+            require_protected: true,
+        },
+        ReceiptsEnvClass::Unset | ReceiptsEnvClass::Other => ReceiptsMode {
+            enabled: config.enabled,
+            require_protected: config.require_protected,
+        },
     }
 }
 
@@ -1978,12 +2145,67 @@ mod pulse_rename_tests {
     fn receipts_path_defaults_empty_and_can_be_set() {
         let bare = Config::from_toml_str(&format!("{}{REST}", identity("pulse"))).unwrap();
         assert!(bare.receipts.path.is_empty());
+        assert!(!bare.receipts.enabled);
+        assert!(bare.receipts.require_protected);
+        assert_eq!(bare.receipts.content, "digest");
+        assert!(bare.receipts.is_unset());
         let set = Config::from_toml_str(&format!(
-            "{}{REST}[receipts]\npath = \"/tmp/receipts.jsonl\"\n",
+            "{}{REST}[receipts]\npath = \"/tmp/receipts.jsonl\"\nenabled = true\nrequire_protected = false\n",
             identity("pulse")
         ))
         .unwrap();
         assert_eq!(set.receipts.path, "/tmp/receipts.jsonl");
+        assert!(set.receipts.enabled);
+        assert!(!set.receipts.require_protected);
+        assert_eq!(set.receipts.content, "digest");
+        assert!(!set.receipts.is_unset());
+    }
+
+    #[test]
+    fn required_env_forces_receipts_and_the_file_cannot_turn_them_off() {
+        let off = ReceiptsConfig {
+            enabled: false,
+            require_protected: false,
+            ..ReceiptsConfig::default()
+        };
+        assert_eq!(
+            effective_receipts(&off, Some("required")),
+            ReceiptsMode {
+                enabled: true,
+                require_protected: true,
+            }
+        );
+        assert_eq!(
+            effective_receipts(&off, Some("  Required  ")),
+            ReceiptsMode {
+                enabled: true,
+                require_protected: true,
+            }
+        );
+        assert_eq!(
+            effective_receipts(&off, None),
+            ReceiptsMode {
+                enabled: false,
+                require_protected: false,
+            }
+        );
+        assert_eq!(
+            effective_receipts(&off, Some("false")),
+            effective_receipts(&off, None)
+        );
+        let on = ReceiptsConfig {
+            enabled: true,
+            require_protected: false,
+            path: "/tmp/receipts.jsonl".into(),
+            content: "digest".into(),
+        };
+        assert_eq!(
+            effective_receipts(&on, Some("required")),
+            ReceiptsMode {
+                enabled: true,
+                require_protected: true,
+            }
+        );
     }
 
     #[test]
@@ -2121,6 +2343,33 @@ mod strict_config_load_tests {
                 && log.contains("strict mode wants root"),
             "{log}"
         );
+    }
+
+    #[test]
+    fn unrecognised_receipts_env_warns_once_and_follows_the_file() {
+        let off = ReceiptsConfig {
+            enabled: false,
+            require_protected: false,
+            ..ReceiptsConfig::default()
+        };
+        let log = warnings_from(|| {
+            with_receipts_env(|| {
+                std::env::set_var(RECEIPTS_ENV, "yes");
+                struct Clear;
+                impl Drop for Clear {
+                    fn drop(&mut self) {
+                        std::env::remove_var(RECEIPTS_ENV);
+                    }
+                }
+                let _clear = Clear;
+                let mode = receipts_mode(&off);
+                assert!(!mode.enabled);
+                assert!(!mode.require_protected);
+                let again = receipts_mode(&off);
+                assert!(!again.enabled);
+            });
+        });
+        assert_eq!(log.matches("not a recognized value").count(), 1, "{log}");
     }
 }
 
