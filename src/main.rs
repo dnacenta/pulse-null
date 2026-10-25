@@ -22,6 +22,8 @@ mod interaction;
 mod ledger;
 mod logbook;
 mod ollama_provider;
+// The module is exercised by tests only until the store lands.
+#[cfg(test)]
 mod oneself;
 mod outreach;
 mod peer;
