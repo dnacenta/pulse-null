@@ -3129,6 +3129,28 @@ mod tests {
         );
     }
 
+    /// The config flag, not a direct `load_rule_files(..., true)`, is what
+    /// reaches the file check. The directory walk is not on this path.
+    #[test]
+    fn strict_config_reaches_the_file_check() {
+        let dir = tempfile::tempdir().unwrap();
+        let rules = dir.path().join("rules");
+        std::fs::create_dir_all(&rules).unwrap();
+        std::fs::write(rules.join("owned.md"), "PULSE-OWNED-RULE").unwrap();
+        let mut config = minimal_config();
+        config.system_prompt_budget.enabled = false;
+        config.pulse.rules_require_root = true;
+
+        let closed = rules_component(&rules, &[], RulesSource::Pulse, &config);
+        let text = closed.as_ref().map(|c| c.content.as_str()).unwrap_or("");
+        assert!(!text.contains("PULSE-OWNED-RULE"), "{text}");
+
+        config.pulse.rules_require_root = false;
+        let open = rules_component(&rules, &[], RulesSource::Pulse, &config)
+            .expect("non-strict loads the file");
+        assert!(open.content.contains("PULSE-OWNED-RULE"));
+    }
+
     #[test]
     fn strict_accepts_a_root_owned_file_under_root_owned_dirs() {
         assert!(pulse_rule_meta_ok(0, 0o644, 1, 4_242, true).is_ok());
