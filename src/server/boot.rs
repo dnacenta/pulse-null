@@ -444,6 +444,101 @@ mod tests {
         );
     }
 
+    /// Two pulses with a connection held open share one drain window.
+    #[tokio::test]
+    async fn two_pulses_share_one_drain_window() {
+        struct Restore;
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                crate::registry::set_drain_window_for_test(None);
+            }
+        }
+        let _restore = Restore;
+        let window = std::time::Duration::from_millis(200);
+        crate::registry::set_drain_window_for_test(Some(window));
+
+        async fn hang_one(
+            name: &str,
+        ) -> (
+            crate::registry::RunningPulse,
+            tokio::net::TcpStream,
+            tempfile::TempDir,
+        ) {
+            let hang = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let hang_port = hang.local_addr().unwrap().port();
+            let (accepted_tx, accepted_rx) = tokio::sync::oneshot::channel();
+            tokio::spawn(async move {
+                if let Ok((sock, _)) = hang.accept().await {
+                    let _ = accepted_tx.send(());
+                    std::future::pending::<()>().await;
+                    drop(sock);
+                }
+            });
+            let mut config = offline_config();
+            config.pulse.name = name.to_string();
+            config.llm.base_url = Some(format!("http://127.0.0.1:{hang_port}"));
+            let dir = tempfile::tempdir().unwrap();
+            let booted = boot_pulse(
+                config.clone(),
+                dir.path().to_path_buf(),
+                0,
+                crate::oneself::store::ListenEnv::empty(),
+            )
+            .await
+            .unwrap();
+            let port = booted.actual_port;
+            let mut client = tokio::net::TcpStream::connect(("127.0.0.1", port))
+                .await
+                .unwrap();
+            let body = b"{\"message\":\"hang\",\"channel\":\"tui\"}";
+            let head = format!(
+                "POST /chat HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n",
+                body.len()
+            );
+            client.write_all(head.as_bytes()).await.unwrap();
+            client.write_all(body).await.unwrap();
+            tokio::time::timeout(std::time::Duration::from_secs(2), accepted_rx)
+                .await
+                .expect("the provider was not called")
+                .unwrap();
+            let pulse = crate::registry::RunningPulse {
+                name: name.into(),
+                dir: dir.path().to_path_buf(),
+                config,
+                port,
+                server_handle: booted.server_handle,
+                stop: booted.stop,
+                coordinator: booted.coordinator,
+                event_bus: booted.event_bus,
+                persist_coordinator: booted.persist_coordinator,
+                turns: booted.turns,
+                receipts: booted.receipts,
+            };
+            (pulse, client, dir)
+        }
+
+        let (first, client_a, dir_a) = hang_one("one").await;
+        let (second, client_b, dir_b) = hang_one("two").await;
+        let mut registry = crate::registry::PulseRegistry::new(0);
+        registry.register(first);
+        registry.register(second);
+        let started = std::time::Instant::now();
+        registry.shutdown_all().await;
+        let elapsed = started.elapsed();
+        drop(client_a);
+        drop(client_b);
+        drop(dir_a);
+        drop(dir_b);
+        assert!(
+            elapsed >= window,
+            "shutdown returned in {elapsed:?}, before one window"
+        );
+        assert!(
+            elapsed < window * 2,
+            "two pulses took {elapsed:?}, longer than one window"
+        );
+    }
+
     #[tokio::test]
     async fn a_pulse_whose_provider_cannot_be_built_does_not_boot() {
         let dir = tempfile::tempdir().unwrap();

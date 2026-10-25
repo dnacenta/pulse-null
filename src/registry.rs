@@ -1,5 +1,7 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
+#[cfg(test)]
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use tokio::sync::watch;
@@ -19,7 +21,7 @@ pub struct RunningPulse {
     #[allow(dead_code)]
     pub port: u16,
     pub server_handle: JoinHandle<()>,
-    /// Tells the server to stop accepting and to drain open connections.
+    /// Tells the server to stop accepting.
     pub stop: watch::Sender<bool>,
     pub coordinator: crate::coordinator::control::Coordinator,
     #[allow(dead_code)]
@@ -70,14 +72,19 @@ impl PulseRegistry {
     /// Gracefully shut down all pulses.
     ///
     /// No pulse starts a plugin turn from the first step on; the turns in
-    /// flight get the drain window. Each pulse then stops its coordinator,
-    /// finishes its server task, flushes persistence, and writes the receipt
-    /// shutdown row.
+    /// flight get the drain window. The pulses then stop together, so the
+    /// window is one wait, not one wait per pulse. Each pulse stops its
+    /// coordinator, finishes its server task, flushes persistence, and writes
+    /// the receipt shutdown row.
     pub async fn shutdown_all(&mut self) {
         self.quiesce_plugin_turns().await;
+        let mut pending = tokio::task::JoinSet::new();
         for (name, pulse) in self.pulses.drain() {
-            shut_down_pulse(&name, pulse).await;
+            pending.spawn(async move {
+                shut_down_pulse(&name, pulse).await;
+            });
         }
+        while pending.join_next().await.is_some() {}
     }
 
     async fn quiesce_plugin_turns(&self) {
@@ -98,12 +105,12 @@ impl PulseRegistry {
 
 /// Stop the pulse in the same order as the daemon's shutdown.
 ///
-/// The server stops accepting and drains connections that are already open.
-/// The coordinator stops while that drain runs. The drain is bounded by the
-/// same window the daemon uses. A connection still open when the window ends
-/// is aborted. Persistence is flushed after the drain, and the shutdown row
-/// is written last. A turn whose close row was not queued is reconciled as
-/// `close{lost}` on the next boot.
+/// The server stops accepting. Connections already open are given the drain
+/// window. When the window ends, the server task is dropped. That stops the
+/// accept loop and leaves those connection tasks running. Persistence is
+/// flushed after the window, and the shutdown row is written last. A turn
+/// whose close row was not queued is reconciled as `close{lost}` on the next
+/// boot.
 async fn shut_down_pulse(name: &str, pulse: RunningPulse) {
     tracing::info!("Shutting down pulse: {}", name);
     let RunningPulse {
@@ -121,9 +128,13 @@ async fn shut_down_pulse(name: &str, pulse: RunningPulse) {
     receipts.shutdown().await;
 }
 
-/// Wait for the server task to finish the drain, then abort what is left.
+/// Wait for the server task, then drop it.
+///
+/// Dropping the task stops the accept loop. A connection task that is still
+/// running is left in place. Its close is reconciled as `close{lost}` on the
+/// next boot.
 async fn drain_server(name: &str, mut server_handle: JoinHandle<()>) {
-    let drain = crate::server::turns::DRAIN_WINDOW;
+    let drain = drain_window();
     tokio::select! {
         biased;
         joined = &mut server_handle => {
@@ -133,13 +144,35 @@ async fn drain_server(name: &str, mut server_handle: JoinHandle<()>) {
         }
         () = tokio::time::sleep(drain) => {
             tracing::warn!(
-                "{name}: server drain did not finish within {drain:?}, aborting"
+                "{name}: server task still running after {drain:?}; leaving open connections for the next boot"
             );
             server_handle.abort();
             let _ = server_handle.await;
         }
     }
 }
+
+fn drain_window() -> std::time::Duration {
+    #[cfg(test)]
+    {
+        let millis = DRAIN_OVERRIDE_MS.load(Ordering::Relaxed);
+        if millis > 0 {
+            return std::time::Duration::from_millis(millis);
+        }
+    }
+    crate::server::turns::DRAIN_WINDOW
+}
+
+/// Shorten the registry drain for a test. `None` restores the daemon window.
+/// The value is process-wide.
+#[cfg(test)]
+pub(crate) fn set_drain_window_for_test(window: Option<std::time::Duration>) {
+    let millis = window.map(|window| u64::try_from(window.as_millis()).unwrap_or(u64::MAX));
+    DRAIN_OVERRIDE_MS.store(millis.unwrap_or(0), Ordering::Relaxed);
+}
+
+#[cfg(test)]
+static DRAIN_OVERRIDE_MS: AtomicU64 = AtomicU64::new(0);
 
 /// Flush any in-flight persistence tasks (5s timeout per pulse).
 async fn flush_persistence(name: &str, persist_coordinator: &PersistCoordinator) {
