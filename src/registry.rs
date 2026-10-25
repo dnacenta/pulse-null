@@ -1,7 +1,5 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
-#[cfg(test)]
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use tokio::sync::watch;
@@ -37,6 +35,10 @@ pub struct RunningPulse {
 pub struct PulseRegistry {
     pulses: HashMap<String, RunningPulse>,
     port_sequence: u16,
+    /// Replaces the daemon drain window. Tests set it on this registry so a
+    /// short window does not change a pulse that is shutting down elsewhere.
+    #[cfg(test)]
+    drain_for_test: Option<std::time::Duration>,
 }
 
 impl PulseRegistry {
@@ -44,7 +46,15 @@ impl PulseRegistry {
         Self {
             pulses: HashMap::new(),
             port_sequence: base_port,
+            #[cfg(test)]
+            drain_for_test: None,
         }
+    }
+
+    /// Shorten the drain for this registry only.
+    #[cfg(test)]
+    pub(crate) fn set_drain_window_for_test(&mut self, window: std::time::Duration) {
+        self.drain_for_test = Some(window);
     }
 
     /// Allocate the next available port, skipping any that are in use.
@@ -78,10 +88,16 @@ impl PulseRegistry {
     /// the receipt shutdown row.
     pub async fn shutdown_all(&mut self) {
         self.quiesce_plugin_turns().await;
+        #[cfg(test)]
+        let drain = self
+            .drain_for_test
+            .unwrap_or(crate::server::turns::DRAIN_WINDOW);
+        #[cfg(not(test))]
+        let drain = crate::server::turns::DRAIN_WINDOW;
         let mut pending = tokio::task::JoinSet::new();
         for (name, pulse) in self.pulses.drain() {
             pending.spawn(async move {
-                shut_down_pulse(&name, pulse).await;
+                shut_down_pulse(&name, pulse, drain).await;
             });
         }
         while pending.join_next().await.is_some() {}
@@ -111,7 +127,7 @@ impl PulseRegistry {
 /// flushed after the window, and the shutdown row is written last. A turn
 /// whose close row was not queued is reconciled as `close{lost}` on the next
 /// boot.
-async fn shut_down_pulse(name: &str, pulse: RunningPulse) {
+async fn shut_down_pulse(name: &str, pulse: RunningPulse, drain: std::time::Duration) {
     tracing::info!("Shutting down pulse: {}", name);
     let RunningPulse {
         coordinator,
@@ -123,7 +139,7 @@ async fn shut_down_pulse(name: &str, pulse: RunningPulse) {
     } = pulse;
     let _ = stop.send(true);
     coordinator.shutdown().await;
-    drain_server(name, server_handle).await;
+    drain_server(name, server_handle, drain).await;
     flush_persistence(name, &persist_coordinator).await;
     receipts.shutdown().await;
 }
@@ -133,8 +149,7 @@ async fn shut_down_pulse(name: &str, pulse: RunningPulse) {
 /// Dropping the task stops the accept loop. A connection task that is still
 /// running is left in place. Its close is reconciled as `close{lost}` on the
 /// next boot.
-async fn drain_server(name: &str, mut server_handle: JoinHandle<()>) {
-    let drain = drain_window();
+async fn drain_server(name: &str, mut server_handle: JoinHandle<()>, drain: std::time::Duration) {
     tokio::select! {
         biased;
         joined = &mut server_handle => {
@@ -151,28 +166,6 @@ async fn drain_server(name: &str, mut server_handle: JoinHandle<()>) {
         }
     }
 }
-
-fn drain_window() -> std::time::Duration {
-    #[cfg(test)]
-    {
-        let millis = DRAIN_OVERRIDE_MS.load(Ordering::Relaxed);
-        if millis > 0 {
-            return std::time::Duration::from_millis(millis);
-        }
-    }
-    crate::server::turns::DRAIN_WINDOW
-}
-
-/// Shorten the registry drain for a test. `None` restores the daemon window.
-/// The value is process-wide.
-#[cfg(test)]
-pub(crate) fn set_drain_window_for_test(window: Option<std::time::Duration>) {
-    let millis = window.map(|window| u64::try_from(window.as_millis()).unwrap_or(u64::MAX));
-    DRAIN_OVERRIDE_MS.store(millis.unwrap_or(0), Ordering::Relaxed);
-}
-
-#[cfg(test)]
-static DRAIN_OVERRIDE_MS: AtomicU64 = AtomicU64::new(0);
 
 /// Flush any in-flight persistence tasks (5s timeout per pulse).
 async fn flush_persistence(name: &str, persist_coordinator: &PersistCoordinator) {

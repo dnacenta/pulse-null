@@ -447,15 +447,7 @@ mod tests {
     /// Two pulses with a connection held open share one drain window.
     #[tokio::test]
     async fn two_pulses_share_one_drain_window() {
-        struct Restore;
-        impl Drop for Restore {
-            fn drop(&mut self) {
-                crate::registry::set_drain_window_for_test(None);
-            }
-        }
-        let _restore = Restore;
         let window = std::time::Duration::from_millis(200);
-        crate::registry::set_drain_window_for_test(Some(window));
 
         async fn hang_one(
             name: &str,
@@ -520,6 +512,7 @@ mod tests {
         let (first, client_a, dir_a) = hang_one("one").await;
         let (second, client_b, dir_b) = hang_one("two").await;
         let mut registry = crate::registry::PulseRegistry::new(0);
+        registry.set_drain_window_for_test(window);
         registry.register(first);
         registry.register(second);
         let started = std::time::Instant::now();
