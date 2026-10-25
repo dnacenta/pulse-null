@@ -22,6 +22,7 @@ mod interaction;
 mod ledger;
 mod logbook;
 mod ollama_provider;
+mod oneself;
 mod outreach;
 mod peer;
 mod persist;
