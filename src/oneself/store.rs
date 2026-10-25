@@ -13,6 +13,8 @@ use std::io::{Read, Seek, SeekFrom, Write};
 use std::os::fd::{AsRawFd, FromRawFd};
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::AtomicBool;
+use std::sync::Arc;
 
 use thiserror::Error;
 
@@ -23,26 +25,41 @@ use super::protect::{Protection, ProtectionProbe};
 /// `LISTEN_PID`, `LISTEN_FDS`, and `LISTEN_FDNAMES` captured before the runtime.
 #[derive(Debug, Clone)]
 pub struct ListenEnv {
-    #[cfg_attr(not(test), expect(dead_code, reason = "wired in increment 3"))]
     pub pid: Option<String>,
-    #[cfg_attr(not(test), expect(dead_code, reason = "wired in increment 3"))]
     pub fds: Option<String>,
     #[cfg_attr(not(test), expect(dead_code, reason = "wired in increment 3"))]
     pub names: Option<String>,
+    /// Shared by clones. The first open spends it, including a refusal.
+    #[cfg_attr(not(test), expect(dead_code, reason = "wired in increment 3"))]
+    spent: Arc<AtomicBool>,
+}
+
+impl ListenEnv {
+    fn captured(pid: Option<String>, fds: Option<String>, names: Option<String>) -> Self {
+        Self {
+            pid,
+            fds,
+            names,
+            spent: Arc::new(AtomicBool::new(false)),
+        }
+    }
 }
 
 /// Read the systemd listen variables and clear them.
 ///
 /// Call this before any runtime thread exists. Later opens take the returned
-/// value; they do not read the process environment again.
+/// value; they do not read the process environment again. When the pid is
+/// this process, every listed fd gets `FD_CLOEXEC` before anything else
+/// inherits it.
 #[must_use]
 pub fn take_listen_env() -> ListenEnv {
-    let listen = ListenEnv {
-        pid: std::env::var("LISTEN_PID").ok(),
-        fds: std::env::var("LISTEN_FDS").ok(),
-        names: std::env::var("LISTEN_FDNAMES").ok(),
-    };
+    let listen = ListenEnv::captured(
+        std::env::var("LISTEN_PID").ok(),
+        std::env::var("LISTEN_FDS").ok(),
+        std::env::var("LISTEN_FDNAMES").ok(),
+    );
     clear_listen_env();
+    shield_listed(&listen);
     listen
 }
 
@@ -53,6 +70,47 @@ pub fn retain_listen(listen: ListenEnv) {
         .lock()
         .unwrap_or_else(|err| err.into_inner());
     *slot = Some(listen);
+}
+
+/// Take the snapshot saved by [`retain_listen`]. A second call is `None`.
+#[cfg_attr(not(test), expect(dead_code, reason = "wired in increment 3"))]
+#[must_use]
+pub fn take_retained_listen() -> Option<ListenEnv> {
+    let mut slot = RETAINED_LISTEN
+        .lock()
+        .unwrap_or_else(|err| err.into_inner());
+    slot.take()
+}
+
+fn shield_listed(listen: &ListenEnv) {
+    let pid_matches = listen
+        .pid
+        .as_deref()
+        .is_some_and(|pid| pid == std::process::id().to_string());
+    if !pid_matches {
+        return;
+    }
+    let Some(count) = listen
+        .fds
+        .as_deref()
+        .and_then(|text| text.parse::<i32>().ok())
+    else {
+        return;
+    };
+    shield_fds(3, count);
+}
+
+/// Set `FD_CLOEXEC` on `count` fds starting at `first`. A closed number is skipped.
+fn shield_fds(first: i32, count: i32) {
+    if first < 0 || count <= 0 {
+        return;
+    }
+    for index in 0..count {
+        let Some(fd) = first.checked_add(index) else {
+            return;
+        };
+        let _ = set_cloexec(fd);
+    }
 }
 
 static RETAINED_LISTEN: std::sync::Mutex<Option<ListenEnv>> = std::sync::Mutex::new(None);
@@ -304,9 +362,12 @@ impl ReceiptStore {
     ) -> Result<(Self, Opened), StoreError> {
         // A fork in another test inherits this fd until that child execs, so
         // a reopen can see the previous lock for that window. The lock test's
-        // child must not retry: it has to observe the held lock.
+        // child must not retry: it has to observe the held lock. A systemd
+        // snapshot is single-use, so that retry stays on the path open.
         #[cfg(test)]
-        if std::env::var_os("RECEIPT_FLOCK_CHILD").is_none() {
+        if std::env::var_os("RECEIPT_FLOCK_CHILD").is_none()
+            && matches!(source, StoreSource::Path(_))
+        {
             for _ in 0..40 {
                 match Self::open_once(source.clone(), probe, pulse) {
                     Err(StoreError::Locked) => {
@@ -877,6 +938,13 @@ fn check_regular(path: &Path, meta: &std::fs::Metadata) -> Result<(), StoreError
 
 #[cfg_attr(not(test), expect(dead_code, reason = "wired in increment 3"))]
 fn take_systemd(name: &str, listen: &ListenEnv) -> Result<File, StoreError> {
+    // Spend before touching an fd. A refusal closes it, and a later open
+    // must not adopt a file that reused the number.
+    if listen.spent.swap(true, std::sync::atomic::Ordering::SeqCst) {
+        return Err(StoreError::NotUsed {
+            name: name.to_string(),
+        });
+    }
     let Some(listed) = listen_fd(
         listen.pid.as_deref(),
         listen.fds.as_deref(),
@@ -952,7 +1020,6 @@ fn validate_fd(fd: i32) -> Result<(), StoreError> {
     Ok(())
 }
 
-#[cfg_attr(not(test), expect(dead_code, reason = "wired in increment 3"))]
 fn set_cloexec(fd: i32) -> Result<(), StoreError> {
     let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
     if flags < 0 {
@@ -1052,11 +1119,11 @@ mod tests {
         let err = ReceiptStore::open(
             StoreSource::SystemdFd {
                 name: "receipts",
-                listen: ListenEnv {
-                    pid: Some("1".to_string()),
-                    fds: Some("1".to_string()),
-                    names: Some("receipts".to_string()),
-                },
+                listen: ListenEnv::captured(
+                    Some("1".to_string()),
+                    Some("1".to_string()),
+                    Some("receipts".to_string()),
+                ),
             },
             &LiveProbe,
             "echo",
@@ -1066,11 +1133,11 @@ mod tests {
         let missing = ReceiptStore::open(
             StoreSource::SystemdFd {
                 name: "receipts",
-                listen: ListenEnv {
-                    pid: Some(std::process::id().to_string()),
-                    fds: Some("1".to_string()),
-                    names: Some("other".to_string()),
-                },
+                listen: ListenEnv::captured(
+                    Some(std::process::id().to_string()),
+                    Some("1".to_string()),
+                    Some("other".to_string()),
+                ),
             },
             &LiveProbe,
             "echo",
@@ -1080,11 +1147,11 @@ mod tests {
     }
 
     fn our_listen() -> ListenEnv {
-        ListenEnv {
-            pid: Some(std::process::id().to_string()),
-            fds: Some("1".to_string()),
-            names: Some("receipts".to_string()),
-        }
+        ListenEnv::captured(
+            Some(std::process::id().to_string()),
+            Some("1".to_string()),
+            Some("receipts".to_string()),
+        )
     }
 
     /// Device and inode of an open fd. `None` once that fd has been closed.
@@ -1202,6 +1269,101 @@ mod tests {
             let id = file_id(write_only.as_raw_fd()).expect("write-only fstat");
             assert_fd_closed(fd, id);
         });
+    }
+
+    #[test]
+    fn a_refused_fd_is_not_adopted_when_its_number_is_reused() {
+        let dir = tempfile::tempdir().unwrap();
+        let plain_path = dir.path().join("plain.jsonl");
+        let plain = OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .open(&plain_path)
+            .unwrap();
+        let listen = our_listen();
+        let _clear = ClearRetained;
+        retain_listen(listen.clone());
+        assert!(take_retained_listen().is_some());
+        assert!(take_retained_listen().is_none());
+
+        // A high number stays free after we close it: other tests allocate
+        // the lowest fd, so they do not land on this one between close and dup2.
+        let _guard = FD_LOCK.lock().unwrap_or_else(|err| err.into_inner());
+        let fd = unsafe { libc::fcntl(plain.as_raw_fd(), libc::F_DUPFD, 1000) };
+        assert!(fd >= 1000, "{}", std::io::Error::last_os_error());
+        let plain_id = file_id(fd).expect("dup fstat");
+        FORCED_FD.store(fd, std::sync::atomic::Ordering::SeqCst);
+        struct Reset {
+            fd: i32,
+            close_if: Option<(u64, u64)>,
+        }
+        impl Drop for Reset {
+            fn drop(&mut self) {
+                FORCED_FD.store(-1, std::sync::atomic::Ordering::SeqCst);
+                if self.close_if.is_some() && file_id(self.fd) == self.close_if {
+                    // SAFETY: the inode is still the one this test put here.
+                    unsafe { libc::close(self.fd) };
+                }
+            }
+        }
+        let mut reset = Reset {
+            fd,
+            close_if: Some(plain_id),
+        };
+
+        let err = ReceiptStore::open(
+            StoreSource::SystemdFd {
+                name: "receipts",
+                listen: listen.clone(),
+            },
+            &LiveProbe,
+            "echo",
+        )
+        .unwrap_err();
+        assert!(matches!(err, StoreError::NotAppend { .. }), "{err}");
+        assert_fd_closed(fd, plain_id);
+        reset.close_if = None;
+
+        let other = dir.path().join("other.jsonl");
+        std::fs::write(&other, b"keep").unwrap();
+        let appending = OpenOptions::new()
+            .read(true)
+            .append(true)
+            .open(&other)
+            .unwrap();
+        assert!(file_id(fd).is_none(), "high fd was reused");
+        // SAFETY: `fd` is closed and is not the lowest free number.
+        let rc = unsafe { libc::dup2(appending.as_raw_fd(), fd) };
+        assert_eq!(rc, fd, "{}", std::io::Error::last_os_error());
+        reset.close_if = file_id(fd);
+
+        let err = ReceiptStore::open(
+            StoreSource::SystemdFd {
+                name: "receipts",
+                listen,
+            },
+            &LiveProbe,
+            "echo",
+        )
+        .unwrap_err();
+        assert!(matches!(err, StoreError::NotUsed { .. }), "{err}");
+        assert_eq!(std::fs::read(&other).unwrap(), b"keep");
+    }
+
+    #[test]
+    fn listed_fds_get_cloexec_without_touching_fd_three() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("plain");
+        let file = std::fs::File::create(&path).unwrap();
+        // SAFETY: `file` stays open until this dup is closed below.
+        // Start high so this is not fd 3.
+        let duped = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_DUPFD, 1000) };
+        assert!(duped >= 1000, "{}", std::io::Error::last_os_error());
+        shield_fds(duped, 1);
+        let flags = unsafe { libc::fcntl(duped, libc::F_GETFD) };
+        assert!(flags & libc::FD_CLOEXEC != 0, "{flags}");
+        unsafe { libc::close(duped) };
     }
 
     #[test]
@@ -1674,6 +1836,14 @@ mod tests {
         assert!(!protection.systemd_fd);
         let meta = std::fs::symlink_metadata(&path).unwrap();
         assert!(meta.file_type().is_fifo());
+    }
+
+    struct ClearRetained;
+
+    impl Drop for ClearRetained {
+        fn drop(&mut self) {
+            let _ = take_retained_listen();
+        }
     }
 
     struct ClearInspectHook;
