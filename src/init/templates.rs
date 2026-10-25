@@ -53,7 +53,7 @@ name = "{pulse_name}"
 owner_name = "{owner_name}"
 owner_alias = "{owner_alias}"
 {rules_dir_line}
-# rules_require_root = false  # pulse rules only when the files and the directories down to them are root-owned and those directories and the rule files are not group- or world-writable (strict mode enforces 0644). Strict mode rejects a FUSE-mounted rules path. Where the pulse user can still mount filesystems, also set NoNewPrivileges=yes, PrivateDevices=yes (or no /dev/fuse) and no setuid fusermount: the loader can only check what it can see.
+# rules_require_root = false  # pulse rules only when the files and the directories down to them are root-owned and those directories and the rule files are not group- or world-writable (strict mode enforces 0644). Strict mode rejects a FUSE-mounted rules path. Where the pulse user can still mount filesystems, also set NoNewPrivileges=yes, PrivateDevices=yes (or no /dev/fuse) and no setuid fusermount: the loader can only check what it can see. The key is in this file, which a pulse that owns its home can edit. For a real guarantee set Environment=PULSE_NULL_RULES_REQUIRE_ROOT=1 in the root-owned systemd unit. Optionally make this file root-owned and immutable (chattr +i, an operator option, not verified here).
 
 [server]
 host = "127.0.0.1"

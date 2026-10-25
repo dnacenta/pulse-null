@@ -1280,9 +1280,7 @@ fn rules_components(root_dir: &Path, config: &Config) -> Vec<PromptComponent> {
         );
         return components;
     }
-    let blocked = config
-        .pulse
-        .rules_require_root
+    let blocked = crate::config::rules_require_root(&config.pulse)
         .then(|| strict_rules_dir_block(root_dir, &dir))
         .flatten();
     if let Some((path, reason)) = blocked {
@@ -1429,7 +1427,7 @@ fn rules_component(
     source: RulesSource,
     config: &Config,
 ) -> Option<PromptComponent> {
-    let strict = source == RulesSource::Pulse && config.pulse.rules_require_root;
+    let strict = source == RulesSource::Pulse && crate::config::rules_require_root(&config.pulse);
     let rules = match load_rule_files(dir, exclude, source, strict) {
         Ok(rules) => rules,
         Err(e) => {
@@ -3255,6 +3253,39 @@ mod tests {
         assert!(!closed.contains("SELF-WORK-RULE"), "{closed}");
         assert!(!closed.contains("FIRST-RULE"), "{closed}");
         assert!(!closed.contains("RECALL-HOOK-RULE"), "{closed}");
+    }
+
+    /// Set `PULSE_NULL_RULES_REQUIRE_ROOT` for `body`, then clear it.
+    /// Holds the same lock the loader takes while it reads the variable.
+    fn with_rules_require_root_var<T>(value: &str, body: impl FnOnce() -> T) -> T {
+        crate::config::with_rules_require_root_env(|| {
+            std::env::set_var(crate::config::RULES_REQUIRE_ROOT_ENV, value);
+            struct Clear;
+            impl Drop for Clear {
+                fn drop(&mut self) {
+                    std::env::remove_var(crate::config::RULES_REQUIRE_ROOT_ENV);
+                }
+            }
+            let _clear = Clear;
+            body()
+        })
+    }
+
+    #[test]
+    fn env_forces_strict_when_the_config_file_says_false() {
+        let dir = tempfile::tempdir().unwrap();
+        seed_pulse_rules(dir.path());
+        let mut config = cli_config("grok");
+        config.system_prompt_budget.enabled = false;
+        assert!(!config.pulse.rules_require_root);
+
+        let closed =
+            with_rules_require_root_var("1", || build_system_prompt(dir.path(), &config).unwrap());
+        assert!(!closed.contains("SELF-WORK-RULE"), "{closed}");
+
+        let open =
+            with_rules_require_root_var("0", || build_system_prompt(dir.path(), &config).unwrap());
+        assert!(open.contains("SELF-WORK-RULE"), "{open}");
     }
 
     #[test]

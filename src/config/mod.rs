@@ -3,8 +3,11 @@ pub(crate) mod validate;
 
 pub use probe::{ProbeCadence, ProbeConfig};
 
+use std::cell::Cell;
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Mutex;
 
 use serde::{Deserialize, Serialize};
 
@@ -118,8 +121,142 @@ pub struct PulseConfig {
     /// `PrivateDevices=yes` or no `/dev/fuse`, no setuid fusermount for the
     /// pulse user): the loader can only check what it can see. False reads
     /// a file the running user or root owns.
+    ///
+    /// This key lives in the pulse's `pulse-null.toml`. A pulse that owns its
+    /// home can edit it and turn strict mode off. For a real guarantee set
+    /// `Environment=PULSE_NULL_RULES_REQUIRE_ROOT=1` in the root-owned systemd
+    /// unit. `1`, `true`, and `yes` force strict mode; `0` and `false` leave
+    /// this key; any other value is ignored and warned once. Optionally make
+    /// `pulse-null.toml` root-owned and immutable (`chattr +i`, an operator
+    /// option, not verified here).
     #[serde(default)]
     pub rules_require_root: bool,
+}
+
+/// Environment variable that forces strict pulse-rule checks.
+pub(crate) const RULES_REQUIRE_ROOT_ENV: &str = "PULSE_NULL_RULES_REQUIRE_ROOT";
+
+thread_local! {
+    static RULES_ENV_LOCK_HELD: Cell<bool> = const { Cell::new(false) };
+}
+static RULES_ENV_LOCK: Mutex<()> = Mutex::new(());
+
+struct RulesEnvHold {
+    release: bool,
+    _guard: Option<std::sync::MutexGuard<'static, ()>>,
+}
+
+impl Drop for RulesEnvHold {
+    fn drop(&mut self) {
+        if self.release {
+            RULES_ENV_LOCK_HELD.with(|held| held.set(false));
+        }
+    }
+}
+
+/// Serialize reads of [`RULES_REQUIRE_ROOT_ENV`] with a test that sets it.
+/// Re-entrant on the thread that already holds it, so the test can call back
+/// into [`rules_require_root`].
+fn hold_rules_env() -> RulesEnvHold {
+    if RULES_ENV_LOCK_HELD.with(|held| held.get()) {
+        return RulesEnvHold {
+            release: false,
+            _guard: None,
+        };
+    }
+    let guard = RULES_ENV_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    RULES_ENV_LOCK_HELD.with(|held| held.set(true));
+    RulesEnvHold {
+        release: true,
+        _guard: Some(guard),
+    }
+}
+
+/// Run `body` while this thread holds the environment lock.
+#[cfg(test)]
+pub(crate) fn with_rules_require_root_env<T>(body: impl FnOnce() -> T) -> T {
+    let _hold = hold_rules_env();
+    body()
+}
+
+/// Whether pulse rules are under strict checks.
+///
+/// `PULSE_NULL_RULES_REQUIRE_ROOT` set to `1`, `true`, or `yes`
+/// (case-insensitive) forces strict mode, and the config file cannot turn
+/// it off. `0` and `false` leave the config value. Any other non-empty value
+/// is treated as unset and warned once. The decision is
+/// [`effective_rules_require_root`].
+pub(crate) fn rules_require_root(pulse: &PulseConfig) -> bool {
+    let _hold = hold_rules_env();
+    let raw = std::env::var(RULES_REQUIRE_ROOT_ENV).ok();
+    log_rules_require_root_env(raw.as_deref());
+    effective_rules_require_root(pulse.rules_require_root, raw.as_deref())
+}
+
+enum RulesEnvClass {
+    Unset,
+    Force,
+    LeaveConfig,
+    Unparseable,
+}
+
+fn rules_env_class(env: Option<&str>) -> RulesEnvClass {
+    let Some(raw) = env else {
+        return RulesEnvClass::Unset;
+    };
+    let value = raw.trim();
+    if value.is_empty() {
+        return RulesEnvClass::Unset;
+    }
+    if ["1", "true", "yes"]
+        .iter()
+        .any(|token| value.eq_ignore_ascii_case(token))
+    {
+        return RulesEnvClass::Force;
+    }
+    if ["0", "false"]
+        .iter()
+        .any(|token| value.eq_ignore_ascii_case(token))
+    {
+        return RulesEnvClass::LeaveConfig;
+    }
+    RulesEnvClass::Unparseable
+}
+
+fn log_rules_require_root_env(env: Option<&str>) {
+    match rules_env_class(env) {
+        RulesEnvClass::Force => {
+            static LOGGED: AtomicBool = AtomicBool::new(false);
+            if !LOGGED.swap(true, Ordering::Relaxed) {
+                tracing::info!("strict mode is forced by the environment");
+            }
+        }
+        RulesEnvClass::Unparseable => {
+            static LOGGED: AtomicBool = AtomicBool::new(false);
+            if !LOGGED.swap(true, Ordering::Relaxed) {
+                tracing::warn!(
+                    "PULSE_NULL_RULES_REQUIRE_ROOT is not a recognized value; strict mode follows the config file"
+                );
+            }
+        }
+        RulesEnvClass::Unset | RulesEnvClass::LeaveConfig => {}
+    }
+}
+
+/// Strict mode after applying the environment override to the config key.
+///
+/// `env` is the raw `PULSE_NULL_RULES_REQUIRE_ROOT` value, or `None` when
+/// the variable is unset.
+#[must_use]
+pub(crate) fn effective_rules_require_root(config_value: bool, env: Option<&str>) -> bool {
+    match rules_env_class(env) {
+        RulesEnvClass::Force => true,
+        RulesEnvClass::Unset | RulesEnvClass::LeaveConfig | RulesEnvClass::Unparseable => {
+            config_value
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1687,6 +1824,35 @@ mod pulse_rename_tests {
         ))
         .unwrap();
         assert!(cfg.pulse.rules_require_root);
+    }
+
+    #[test]
+    fn effective_rules_require_root_follows_the_env_matrix() {
+        for config_value in [false, true] {
+            assert_eq!(
+                effective_rules_require_root(config_value, None),
+                config_value,
+                "unset"
+            );
+            assert!(effective_rules_require_root(config_value, Some("1")));
+            assert!(effective_rules_require_root(config_value, Some("true")));
+            assert!(effective_rules_require_root(config_value, Some("YES")));
+            assert_eq!(
+                effective_rules_require_root(config_value, Some("0")),
+                config_value,
+                "0"
+            );
+            assert_eq!(
+                effective_rules_require_root(config_value, Some("false")),
+                config_value,
+                "false"
+            );
+            assert_eq!(
+                effective_rules_require_root(config_value, Some("garbage")),
+                config_value,
+                "garbage"
+            );
+        }
     }
 
     #[test]

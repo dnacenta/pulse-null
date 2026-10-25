@@ -93,6 +93,8 @@ directories `0755`, with root-owned `0644` files. Strict mode enforces that file
 mode: a group- or world-writable rule file is skipped. A file is then read only when root owns
 it and every directory below the pulse root, through the rules directory, is root-owned and
 not group- or world-writable. The pulse root itself is not checked, because the pulse owns its home. Strict mode also rejects a rules path on a FUSE filesystem.
+
+`rules_require_root` lives in the pulse's `pulse-null.toml`. A pulse that owns its home can edit that file and turn strict mode off. For a real guarantee set `Environment=PULSE_NULL_RULES_REQUIRE_ROOT=1` in the root-owned systemd unit (`1`, `true`, and `yes` force strict mode; `0` and `false` leave the config key; any other value is ignored and warned once). Optionally make `pulse-null.toml` root-owned and immutable (`chattr +i`, an operator option, not verified here).
 Where the pulse user can still mount filesystems, deny that too (`NoNewPrivileges=yes`,
 `PrivateDevices=yes` or no `/dev/fuse`, no setuid fusermount for the pulse user): the
 loader can only check what it can see. Anything else is skipped, and the warning names
