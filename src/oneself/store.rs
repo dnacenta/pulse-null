@@ -156,14 +156,58 @@ pub fn default_receipts_path(pulse: &str) -> PathBuf {
 
 /// Read a receipt file. Does not lock, repair, or create it.
 ///
-/// The type is checked before the read, so a FIFO or a device cannot block
-/// or stream forever.
+/// Opens the path once. See [`read_receipt`].
 pub fn inspect(path: &Path) -> Result<Inspected, StoreError> {
-    let meta = std::fs::symlink_metadata(path)?;
-    check_regular(path, &meta)?;
-    let bytes = std::fs::read(path)?;
+    let (bytes, file) = read_receipt(path)?;
+    drop(file);
     let report = chain::verify_lines(bytes.as_slice());
     Ok(Inspected { bytes, report })
+}
+
+/// Open `path` once and read at most [`MAX_RECEIPT_BYTES`] from that fd.
+///
+/// Flags are `O_NOFOLLOW` and `O_NONBLOCK` (plus the `O_CLOEXEC` that
+/// `OpenOptions` sets). `fstat` on this fd decides regular file and the size
+/// cap. The caller runs protection checks on the returned file and does not
+/// open `path` again.
+pub fn read_receipt(path: &Path) -> Result<(Vec<u8>, File), StoreError> {
+    let mut file = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(path)
+        .map_err(|err| {
+            if err.raw_os_error() == Some(libc::ELOOP) {
+                StoreError::NotFile {
+                    path: path.display().to_string(),
+                }
+            } else {
+                StoreError::Io(err)
+            }
+        })?;
+    let meta = file.metadata()?;
+    check_regular(path, &meta)?;
+    #[cfg(test)]
+    after_inspect_stat(path);
+    let mut bytes = Vec::new();
+    Read::by_ref(&mut file)
+        .take(MAX_RECEIPT_BYTES)
+        .read_to_end(&mut bytes)?;
+    Ok((bytes, file))
+}
+
+#[cfg(test)]
+thread_local! {
+    static INSPECT_AFTER_FSTAT: std::cell::RefCell<Option<fn(&Path)>> =
+        std::cell::RefCell::new(None);
+}
+
+/// Test seam: runs after `fstat` and before the read, then clears itself.
+#[cfg(test)]
+fn after_inspect_stat(path: &Path) {
+    let hook = INSPECT_AFTER_FSTAT.with(|slot| slot.replace(None));
+    if let Some(hook) = hook {
+        hook(path);
+    }
 }
 
 /// Streams with an `open` and no later `close` for that stream.
@@ -975,6 +1019,7 @@ mod tests {
     use crate::oneself::chain::VerifyState;
     use crate::oneself::protect::{FakeProbe, LiveProbe};
     use std::os::fd::AsRawFd;
+    use std::os::unix::fs::FileTypeExt;
     use std::sync::Mutex;
 
     static FD_LOCK: Mutex<()> = Mutex::new(());
@@ -1606,6 +1651,48 @@ mod tests {
             matches!(inspected, StoreError::NotFile { .. }),
             "{inspected}"
         );
+    }
+
+    /// After `fstat`, the path becomes a FIFO. The read uses the fd already
+    /// open, so it returns the original bytes and does not block.
+    #[test]
+    fn a_fifo_swapped_in_after_open_does_not_block_the_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("receipts.jsonl");
+        let payload = b"keep-bytes\n";
+        std::fs::write(&path, payload).unwrap();
+        let _clear = ClearInspectHook;
+        INSPECT_AFTER_FSTAT.with(|slot| {
+            slot.replace(Some(swap_path_for_a_fifo));
+        });
+        let started = std::time::Instant::now();
+        let (bytes, file) = read_receipt(&path).unwrap();
+        let protection = LiveProbe.probe(&file, false);
+        drop(file);
+        assert!(started.elapsed() < std::time::Duration::from_secs(2));
+        assert_eq!(bytes, payload);
+        assert!(!protection.systemd_fd);
+        let meta = std::fs::symlink_metadata(&path).unwrap();
+        assert!(meta.file_type().is_fifo());
+    }
+
+    struct ClearInspectHook;
+
+    impl Drop for ClearInspectHook {
+        fn drop(&mut self) {
+            INSPECT_AFTER_FSTAT.with(|slot| {
+                slot.replace(None);
+            });
+        }
+    }
+
+    fn swap_path_for_a_fifo(path: &Path) {
+        let aside = path.with_extension("aside");
+        std::fs::rename(path, &aside).unwrap();
+        let c_path = std::ffi::CString::new(path.to_str().unwrap()).unwrap();
+        // SAFETY: `c_path` is a NUL-terminated path in the temp directory.
+        let rc = unsafe { libc::mkfifo(c_path.as_ptr(), 0o644) };
+        assert_eq!(rc, 0, "{}", std::io::Error::last_os_error());
     }
 
     #[test]

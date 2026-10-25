@@ -3,8 +3,7 @@
 //! Both read a file. Neither locks it or repairs a torn tail. The store does
 //! that when it opens.
 
-use std::fs::OpenOptions;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use serde::Serialize;
 use serde_json::{json, Value};
@@ -12,7 +11,7 @@ use serde_json::{json, Value};
 use crate::config::Config;
 use crate::oneself::chain::{self, VerifyState};
 use crate::oneself::protect::{LiveProbe, Protection, ProtectionProbe};
-use crate::oneself::store::{self, Inspected, StoreError};
+use crate::oneself::store::{self, Inspected};
 
 /// Exit after the report was already printed.
 #[derive(Debug)]
@@ -31,14 +30,15 @@ pub async fn verify(file: Option<PathBuf>, json: bool) -> Result<(), Box<dyn std
         Ok(located) => located,
         Err(err) => return unverified(json, &err.to_string()),
     };
-    let inspected = match store::inspect(&located.path) {
-        Ok(inspected) => inspected,
+    let (bytes, file) = match store::read_receipt(&located.path) {
+        Ok(opened) => opened,
         Err(err) => return unverified(json, &err.to_string()),
     };
-    let protection = match probe_file(&located.path) {
-        Ok(protection) => protection,
-        Err(err) => return unverified(json, &err.to_string()),
-    };
+    // Protection looks at this fd. The path is not opened again.
+    let protection = LiveProbe.probe(&file, false);
+    drop(file);
+    let report = chain::verify_lines(bytes.as_slice());
+    let inspected = Inspected { bytes, report };
     emit_verify(json, &inspected, &located, protection)
 }
 
@@ -160,11 +160,6 @@ fn located_from_config(configured: &str, pulse: &str) -> Located {
         from: PathFrom::Config,
         path_warn,
     }
-}
-
-fn probe_file(path: &Path) -> Result<Protection, StoreError> {
-    let file = OpenOptions::new().read(true).open(path)?;
-    Ok(LiveProbe.probe(&file, false))
 }
 
 fn preamble(located: &Located, protection: &Protection) -> String {
@@ -697,7 +692,9 @@ mod tests {
             from: PathFrom::Flag,
             path_warn: None,
         };
-        let protection = probe_file(&path).unwrap();
+        let (_bytes, file) = store::read_receipt(&path).unwrap();
+        let protection = LiveProbe.probe(&file, false);
+        drop(file);
         assert!(!protection.systemd_fd);
         let inspected = store::inspect(&path).unwrap();
         let value = verify_json(&inspected, &located, protection);
