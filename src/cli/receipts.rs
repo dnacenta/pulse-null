@@ -3,14 +3,16 @@
 //! Both read a file. Neither locks it or repairs a torn tail. The store does
 //! that when it opens.
 
-use std::path::PathBuf;
+use std::fs::OpenOptions;
+use std::path::{Path, PathBuf};
 
 use serde::Serialize;
 use serde_json::{json, Value};
 
 use crate::config::Config;
 use crate::oneself::chain::{self, VerifyState};
-use crate::oneself::store::{self, Inspected};
+use crate::oneself::protect::{LiveProbe, Protection, ProtectionProbe};
+use crate::oneself::store::{self, Inspected, StoreError};
 
 /// Exit after the report was already printed.
 #[derive(Debug)]
@@ -25,15 +27,19 @@ impl std::fmt::Display for PrintedExit {
 impl std::error::Error for PrintedExit {}
 
 pub async fn verify(file: Option<PathBuf>, json: bool) -> Result<(), Box<dyn std::error::Error>> {
-    let path = match resolve_path(file) {
-        Ok(path) => path,
+    let located = match resolve_with(file, || Ok(Config::load()?)) {
+        Ok(located) => located,
         Err(err) => return unverified(json, &err.to_string()),
     };
-    let inspected = match store::inspect(&path) {
+    let inspected = match store::inspect(&located.path) {
         Ok(inspected) => inspected,
         Err(err) => return unverified(json, &err.to_string()),
     };
-    emit(json, &inspected)
+    let protection = match probe_file(&located.path) {
+        Ok(protection) => protection,
+        Err(err) => return unverified(json, &err.to_string()),
+    };
+    emit_verify(json, &inspected, &located, protection)
 }
 
 pub async fn show(
@@ -88,49 +94,147 @@ fn unverified_body(message: &str) -> Value {
     })
 }
 
+/// Where `verify` got the path it checked.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PathFrom {
+    Flag,
+    Config,
+    Default,
+}
+
+#[derive(Debug)]
+struct Located {
+    path: PathBuf,
+    from: PathFrom,
+    /// Set when `[receipts] path` is not the default file.
+    path_warn: Option<String>,
+}
+
+fn from_name(from: PathFrom) -> &'static str {
+    match from {
+        PathFrom::Flag => "--file",
+        PathFrom::Config => "config",
+        PathFrom::Default => "default",
+    }
+}
+
 fn resolve_path(file: Option<PathBuf>) -> Result<PathBuf, Box<dyn std::error::Error>> {
-    resolve_with(file, || Ok(Config::load()?))
+    Ok(resolve_with(file, || Ok(Config::load()?))?.path)
 }
 
 fn resolve_with(
     file: Option<PathBuf>,
     load: impl FnOnce() -> Result<Config, Box<dyn std::error::Error>>,
-) -> Result<PathBuf, Box<dyn std::error::Error>> {
+) -> Result<Located, Box<dyn std::error::Error>> {
     if let Some(path) = file {
-        return Ok(path);
+        return Ok(Located {
+            path,
+            from: PathFrom::Flag,
+            path_warn: None,
+        });
     }
     let config = load()?;
-    if !config.receipts.path.is_empty() {
-        return Ok(PathBuf::from(config.receipts.path));
+    Ok(located_from_config(
+        &config.receipts.path,
+        &config.pulse.name,
+    ))
+}
+
+fn located_from_config(configured: &str, pulse: &str) -> Located {
+    let default = store::default_receipts_path(pulse);
+    if configured.is_empty() {
+        return Located {
+            path: default,
+            from: PathFrom::Default,
+            path_warn: None,
+        };
     }
-    Ok(store::default_receipts_path(&config.pulse.name))
+    let path = PathBuf::from(configured);
+    let path_warn = (path != default)
+        .then(|| format!("config path differs from the default {}", default.display()));
+    Located {
+        path,
+        from: PathFrom::Config,
+        path_warn,
+    }
+}
+
+fn probe_file(path: &Path) -> Result<Protection, StoreError> {
+    let file = OpenOptions::new().read(true).open(path)?;
+    Ok(LiveProbe.probe(&file, false))
+}
+
+fn preamble(located: &Located, protection: &Protection) -> String {
+    let mut text = format!(
+        "file={} source={}\nsystemd_fd={} owner_root={} mode_safe={} append_flag={} parent_safe={}",
+        located.path.display(),
+        from_name(located.from),
+        protection.systemd_fd,
+        protection.owner_root,
+        protection.mode_safe,
+        protection.append_flag,
+        protection.parent_safe
+    );
+    if let Some(warn) = &located.path_warn {
+        text.push_str(&format!("\nwarn {warn}"));
+    }
+    text
+}
+
+fn emit_verify(
+    json_out: bool,
+    inspected: &Inspected,
+    located: &Located,
+    protection: Protection,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if json_out {
+        println!(
+            "{}",
+            serde_json::to_string(&verify_json(inspected, located, protection))?
+        );
+    } else {
+        println!("{}", preamble(located, &protection));
+        print_human(inspected);
+    }
+    if inspected.report.first_break.is_some() {
+        Err(Box::new(PrintedExit(1)))
+    } else {
+        Ok(())
+    }
 }
 
 fn emit(json: bool, inspected: &Inspected) -> Result<(), Box<dyn std::error::Error>> {
     let report = &inspected.report;
     if json {
         println!("{}", serde_json::to_string(&json_report(inspected))?);
-    } else if let Some(broken) = &report.first_break {
-        println!("broken line {}: {}", broken.line, broken.reason);
     } else {
-        let seq = report
-            .seq
-            .map(|seq| seq.to_string())
-            .unwrap_or_else(|| "-".to_string());
-        println!(
-            "{} rows={} seq={seq} head={}",
-            state_name(report.state()),
-            report.rows,
-            report.head
-        );
-        for warn in &report.warns {
-            println!("line {}: {}", warn.line, warn.reason);
-        }
+        print_human(inspected);
     }
     if report.first_break.is_some() {
         Err(Box::new(PrintedExit(1)))
     } else {
         Ok(())
+    }
+}
+
+fn print_human(inspected: &Inspected) {
+    let report = &inspected.report;
+    if let Some(broken) = &report.first_break {
+        println!("broken line {}: {}", broken.line, broken.reason);
+        return;
+    }
+    let seq = report
+        .seq
+        .map(|seq| seq.to_string())
+        .unwrap_or_else(|| "-".to_string());
+    println!(
+        "{} rows={} seq={seq} head={}",
+        state_name(report.state()),
+        report.rows,
+        report.head
+    );
+    for warn in &report.warns {
+        println!("line {}: {}", warn.line, warn.reason);
     }
 }
 
@@ -148,6 +252,21 @@ fn json_report(inspected: &Inspected) -> Value {
         })),
         "orphans": store::orphan_streams(&inspected.bytes),
     })
+}
+
+fn verify_json(inspected: &Inspected, located: &Located, protection: Protection) -> Value {
+    let mut value = json_report(inspected);
+    value["file"] = json!(located.path.display().to_string());
+    value["source"] = json!(from_name(located.from));
+    value["protection"] = json!({
+        "systemd_fd": protection.systemd_fd,
+        "owner_root": protection.owner_root,
+        "mode_safe": protection.mode_safe,
+        "append_flag": protection.append_flag,
+        "parent_safe": protection.parent_safe,
+    });
+    value["path_warn"] = json!(located.path_warn);
+    value
 }
 
 fn notes(items: &[crate::oneself::chain::VerifyNote]) -> Vec<Value> {
@@ -455,5 +574,91 @@ mod tests {
         assert_eq!(exit.downcast_ref::<PrintedExit>().unwrap().0, 1);
         let shown = block(show(Some(path), None, None, None, false)).unwrap_err();
         assert_eq!(shown.downcast_ref::<PrintedExit>().unwrap().0, 1);
+    }
+
+    #[test]
+    fn verify_names_the_file_the_source_and_the_five_checks() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = sample(dir.path());
+        let located = Located {
+            path: path.clone(),
+            from: PathFrom::Flag,
+            path_warn: None,
+        };
+        let protection = probe_file(&path).unwrap();
+        assert!(!protection.systemd_fd);
+        let inspected = store::inspect(&path).unwrap();
+        let value = verify_json(&inspected, &located, protection);
+        assert_eq!(value["file"], path.display().to_string());
+        assert_eq!(value["source"], "--file");
+        assert_eq!(value["protection"]["systemd_fd"], false);
+        assert!(value["protection"]["owner_root"].is_boolean());
+        assert!(value["protection"]["mode_safe"].is_boolean());
+        assert!(value["protection"]["append_flag"].is_boolean());
+        assert!(value["protection"]["parent_safe"].is_boolean());
+        assert!(value["path_warn"].is_null());
+        assert_eq!(value["state"], "ok");
+        let text = preamble(&located, &protection);
+        let rendered = path.display().to_string();
+        assert!(text.contains(&format!("file={rendered} source=--file")));
+        assert!(text.contains(&format!(
+            "systemd_fd={} owner_root={} mode_safe={} append_flag={} parent_safe={}",
+            protection.systemd_fd,
+            protection.owner_root,
+            protection.mode_safe,
+            protection.append_flag,
+            protection.parent_safe
+        )));
+        assert!(block(verify(Some(path), true)).is_ok());
+    }
+
+    #[test]
+    fn a_config_path_off_the_default_is_warned() {
+        let located = located_from_config("/tmp/decoy.jsonl", "echo");
+        assert_eq!(from_name(located.from), "config");
+        let warn = located.path_warn.clone().unwrap();
+        assert!(
+            warn.contains("/var/lib/pulse-null/echo/receipts.jsonl"),
+            "{warn}"
+        );
+        let protection = Protection {
+            systemd_fd: false,
+            owner_root: false,
+            mode_safe: false,
+            append_flag: false,
+            parent_safe: false,
+        };
+        let text = preamble(&located, &protection);
+        assert!(text.contains("file=/tmp/decoy.jsonl source=config"));
+        assert!(text.contains(&format!("warn {warn}")));
+        let value = verify_json(
+            &Inspected {
+                bytes: Vec::new(),
+                report: chain::verify_lines(&b""[..]),
+            },
+            &located,
+            protection,
+        );
+        assert_eq!(value["source"], "config");
+        assert_eq!(value["path_warn"], warn);
+
+        let fallback = located_from_config("", "echo");
+        assert_eq!(from_name(fallback.from), "default");
+        assert!(fallback.path_warn.is_none());
+        assert_eq!(fallback.path, store::default_receipts_path("echo"));
+
+        let same = located_from_config(
+            &store::default_receipts_path("echo").display().to_string(),
+            "echo",
+        );
+        assert_eq!(from_name(same.from), "config");
+        assert!(same.path_warn.is_none());
+
+        let flagged = resolve_with(Some(PathBuf::from("/tmp/flag.jsonl")), || {
+            panic!("--file must not load config")
+        })
+        .unwrap();
+        assert_eq!(from_name(flagged.from), "--file");
+        assert!(flagged.path_warn.is_none());
     }
 }

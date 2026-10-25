@@ -30,6 +30,8 @@ An append that fails poisons the store. The next append that succeeds writes a `
 
 Protection is five checks, all required: the fd came from systemd, the owner is uid 0, the mode is not group- or world-writable, the append-only flag is set, and the parent directory is owned by uid 0 and not group- or world-writable. A path open fails the systemd check, so it is not protected. That is reported, not refused, until a later slice.
 
+`verify` prints the file it checked, whether that path came from `--file`, `[receipts] path`, or the default, and those five checks. A `[receipts] path` the pulse can write can point `verify` at a decoy file. The printed path, where it came from, and the protection checks are how an operator notices. Production verification should use `--file` on the root-owned path.
+
 `verify` exits 0 for ok or warn, and exits 1 naming the first broken line. `--json` prints `state`, `rows`, `seq`, `head`, `warns`, `break`, and `orphans`. `show` prints matching rows. `--since` keeps a `ts` at least that string, `--kind` matches `e.kind`, and `--limit` keeps the latest N.
 
 ## Canonical form
