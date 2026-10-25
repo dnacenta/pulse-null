@@ -27,7 +27,7 @@ pulse-null probe sets install --from DIR --pulse NAME   (root) install the seale
 pulse-null probe export-graph [--if-due]  export the live graph for the next run; --if-due exits 0 without contacting the server when a scheduled run would be refused
 pulse-null receipts verify [--file P] [--json]   check a receipt file's hash chain
 pulse-null receipts show [--file P] [--since T] [--kind K] [--limit N] [--json]   print receipt rows
-pulse-null receipts overlaps [--file P] [--since T] [--json]   open intervals that overlap, including quiet_twin
+pulse-null receipts overlaps [--file P] [--since T] [--limit N] [--json]   open intervals that overlap, including quiet_twin
 pulse-null receipts swaps [--file P] [--json]   provider, adapter, or model changes between boots or closes
 ```
 
