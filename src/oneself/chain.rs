@@ -197,6 +197,12 @@ fn verify_bytes(buf: &[u8]) -> VerifyReport {
             }
         }
     }
+    if lines.is_empty() && report.first_break.is_none() {
+        report.warns.push(VerifyNote {
+            line: 1,
+            reason: "empty",
+        });
+    }
     report
 }
 
@@ -241,6 +247,33 @@ fn matching_recover(
         }
         _ => None,
     }
+}
+
+/// Whether `bytes` (no trailing newline) is the next canonical row.
+///
+/// The store's tail repair is the caller. The binary does not open the
+/// store until increment 3.
+#[cfg_attr(not(test), expect(dead_code, reason = "wired in increment 3"))]
+pub(crate) fn accepts_line(bytes: &[u8], seq: u64, prev: &str) -> bool {
+    let line = Phys {
+        number: 1,
+        offset: 0,
+        bytes,
+        has_newline: true,
+    };
+    check_row(&line, seq, prev).is_ok()
+}
+
+/// UTF-8 that `serde_json` accepts as one value. A torn line is the opposite,
+/// or a final line with no newline.
+///
+/// Used by tail repair. See [`accepts_line`].
+#[cfg_attr(not(test), expect(dead_code, reason = "wired in increment 3"))]
+pub(crate) fn valid_json_value(bytes: &[u8]) -> bool {
+    let Ok(text) = std::str::from_utf8(bytes) else {
+        return false;
+    };
+    serde_json::from_str::<Value>(text).is_ok()
 }
 
 /// Not a JSON value, or the final line of a file that has no trailing
@@ -290,6 +323,15 @@ fn check_row(
     if (row.seq == 0) != is_genesis {
         return Err("genesis");
     }
+    if let ReceiptEvent::Gap {
+        first_at, last_at, ..
+    } = &event
+    {
+        // The same clock as `row.ts`. The fixed form sorts lexicographically.
+        if !ts_ok(first_at) || !ts_ok(last_at) || first_at.as_str() > last_at.as_str() {
+            return Err("ts");
+        }
+    }
     if !digests_ok(&event) {
         return Err("sha256");
     }
@@ -309,7 +351,7 @@ fn check_row(
 }
 
 /// `YYYY-MM-DDTHH:MM:SS.mmmZ`, and a real instant.
-fn ts_ok(ts: &str) -> bool {
+pub(crate) fn ts_ok(ts: &str) -> bool {
     let bytes = ts.as_bytes();
     if bytes.len() != 24 {
         return false;
@@ -1241,11 +1283,57 @@ mod tests {
             (format!("{genesis}\n{second}\n"), (2, "genesis")),
             (format!("{genesis}\n{reserved}\n"), (2, "not a row")),
             (format!("{genesis}\n{close}\n{recover}\n"), (3, "seq")),
+            (
+                format!(
+                    "{genesis}\n{}\n",
+                    row_from_event(
+                        1,
+                        &prev,
+                        TS1,
+                        serde_json::json!({
+                            "kind": "gap",
+                            "dropped": 1,
+                            "first_at": "yesterday",
+                            "last_at": "x"
+                        }),
+                    )
+                ),
+                (2, "ts"),
+            ),
+            (
+                format!(
+                    "{genesis}\n{}\n",
+                    row_from_event(
+                        1,
+                        &prev,
+                        TS1,
+                        serde_json::json!({
+                            "kind": "gap",
+                            "dropped": 1,
+                            "first_at": TS1,
+                            "last_at": TS0
+                        }),
+                    )
+                ),
+                (2, "ts"),
+            ),
         ];
         for (text, expect) in table {
             let report = verify_lines(text.as_bytes());
             assert_eq!(note(&report), expect, "{text}");
             assert!(report.warns.is_empty(), "{text}");
         }
+    }
+
+    #[test]
+    fn an_empty_buffer_warns_empty() {
+        let report = verify_lines(&b""[..]);
+        assert_eq!(report.state(), VerifyState::Warn);
+        assert_eq!(report.rows, 0);
+        assert!(report.seq.is_none());
+        assert!(report.first_break.is_none());
+        assert_eq!(report.warns.len(), 1);
+        assert_eq!(report.warns[0].line, 1);
+        assert_eq!(report.warns[0].reason, "empty");
     }
 }

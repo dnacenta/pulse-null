@@ -22,8 +22,6 @@ mod interaction;
 mod ledger;
 mod logbook;
 mod ollama_provider;
-// The module is exercised by tests only until the store lands.
-#[cfg(test)]
 mod oneself;
 mod outreach;
 mod peer;
@@ -86,6 +84,45 @@ enum Commands {
     Probe {
         #[command(subcommand)]
         action: ProbeAction,
+    },
+    /// Read a receipt file
+    Receipts {
+        #[command(subcommand)]
+        action: ReceiptsAction,
+    },
+}
+
+/// `pulse-null receipts`.
+#[derive(Subcommand)]
+enum ReceiptsAction {
+    /// Check the hash chain
+    Verify {
+        /// Receipt file. Default: `[receipts] path`, or
+        /// `/var/lib/pulse-null/<pulse>/receipts.jsonl`.
+        #[arg(long)]
+        file: Option<std::path::PathBuf>,
+        /// Print one JSON object
+        #[arg(long)]
+        json: bool,
+    },
+    /// Print rows
+    Show {
+        /// Receipt file. Default: `[receipts] path`, or
+        /// `/var/lib/pulse-null/<pulse>/receipts.jsonl`.
+        #[arg(long)]
+        file: Option<std::path::PathBuf>,
+        /// Keep rows whose `ts` is at least this string
+        #[arg(long)]
+        since: Option<String>,
+        /// Keep rows of this `e.kind`
+        #[arg(long)]
+        kind: Option<String>,
+        /// Print at most this many matching rows, the latest ones
+        #[arg(long)]
+        limit: Option<u64>,
+        /// Print one JSON object
+        #[arg(long)]
+        json: bool,
     },
 }
 
@@ -478,8 +515,17 @@ type CommandResult = Result<(), Box<dyn std::error::Error>>;
 /// routing can be checked without touching a pulse.
 type CommandFuture = std::pin::Pin<Box<dyn std::future::Future<Output = CommandResult>>>;
 
-#[tokio::main]
-async fn main() {
+fn main() {
+    let listen = oneself::store::take_listen_env();
+    oneself::store::retain_listen(listen);
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .expect("tokio runtime");
+    runtime.block_on(async_main());
+}
+
+async fn async_main() {
     let cli = Cli::parse();
     init_tracing(&cli.command);
     if let Err(message) = run_command(cli.command, cli::root_guard::refuse_root).await {
@@ -536,7 +582,13 @@ async fn run_command(
     if let Some(refusal) = root_check(&command).and_then(|check| check.refusal(refuse_root)) {
         return Err(refusal);
     }
-    dispatch(command).await.map_err(|e| format!("Error: {e}"))
+    dispatch(command).await.map_err(|err| {
+        if let Some(exit) = err.downcast_ref::<cli::receipts::PrintedExit>() {
+            let code = exit.0;
+            std::process::exit(code);
+        }
+        format!("Error: {err}")
+    })
 }
 
 /// A command's refusal to run as root, checked before it does any work.
@@ -597,6 +649,20 @@ fn dispatch(command: Commands) -> CommandFuture {
         Commands::Repair => Box::pin(cli::repair::run()),
         Commands::Isolate { action } => isolate_command(action),
         Commands::Probe { action } => probe_command(action),
+        Commands::Receipts { action } => receipts_command(action),
+    }
+}
+
+fn receipts_command(action: ReceiptsAction) -> CommandFuture {
+    match action {
+        ReceiptsAction::Verify { file, json } => Box::pin(cli::receipts::verify(file, json)),
+        ReceiptsAction::Show {
+            file,
+            since,
+            kind,
+            limit,
+            json,
+        } => Box::pin(cli::receipts::show(file, since, kind, limit, json)),
     }
 }
 
@@ -862,7 +928,7 @@ mod tests {
             [
                 "init", "up", "chat", "down", "status", "schedule", "pipeline", "archive",
                 "plugin", "intent", "outreach", "recall", "praxis", "vigil", "repair", "isolate",
-                "probe",
+                "probe", "receipts",
             ]
         );
     }
@@ -889,6 +955,7 @@ mod tests {
                 &["probe", "sets", "install", "--from", "d", "--pulse", "echo"],
                 None,
             ),
+            (&["receipts", "verify", "--file", "x"], None),
             (&["down"], None),
             (&["status"], None),
             (&["schedule", "list"], None),

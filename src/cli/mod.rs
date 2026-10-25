@@ -10,6 +10,7 @@ pub mod plugin;
 pub mod praxis;
 pub mod probe;
 pub mod recall;
+pub mod receipts;
 pub mod repair;
 pub mod root_guard;
 pub mod schedule;

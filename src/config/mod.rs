@@ -61,6 +61,10 @@ pub struct Config {
     /// Growth-record probes (PN-144); off by default.
     #[serde(default)]
     pub probe: ProbeConfig,
+    /// Receipt file location. Empty means the default path. The daemon does
+    /// not read this yet; `receipts verify` and `show` do.
+    #[serde(default, skip_serializing_if = "ReceiptsConfig::is_unset")]
+    pub receipts: ReceiptsConfig,
     #[serde(default)]
     pub peers: HashMap<String, PeerConfig>,
     #[serde(default)]
@@ -68,6 +72,21 @@ pub struct Config {
     /// Caps on the turns plugins run for guests (PN-110 audit R2-5).
     #[serde(default)]
     pub plugin_turns: PluginTurnsConfig,
+}
+
+/// `[receipts]`: where the receipt file lives. No enable switch yet.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ReceiptsConfig {
+    /// Empty uses `/var/lib/pulse-null/<pulse>/receipts.jsonl`.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub path: String,
+}
+
+impl ReceiptsConfig {
+    fn is_unset(&self) -> bool {
+        self.path.is_empty()
+    }
 }
 
 /// `[plugin_turns]`: what a plugin's guests may cost (PN-110 audit R2-5).
@@ -1569,6 +1588,7 @@ pub mod test_support {
             platform: PlatformConfig::default(),
             system_prompt_budget: SystemPromptBudgetConfig::default(),
             probe: ProbeConfig::default(),
+            receipts: ReceiptsConfig::default(),
             peers: HashMap::new(),
             plugins: HashMap::new(),
             tui: TuiConfig::default(),
@@ -1952,6 +1972,18 @@ mod pulse_rename_tests {
             Some("on a FUSE filesystem")
         );
         assert_eq!(r(0, 0o644, 1, Err("EIO".into())).as_deref(), Some("EIO"));
+    }
+
+    #[test]
+    fn receipts_path_defaults_empty_and_can_be_set() {
+        let bare = Config::from_toml_str(&format!("{}{REST}", identity("pulse"))).unwrap();
+        assert!(bare.receipts.path.is_empty());
+        let set = Config::from_toml_str(&format!(
+            "{}{REST}[receipts]\npath = \"/tmp/receipts.jsonl\"\n",
+            identity("pulse")
+        ))
+        .unwrap();
+        assert_eq!(set.receipts.path, "/tmp/receipts.jsonl");
     }
 
     #[test]
