@@ -274,6 +274,9 @@ fn check_row(
     }
     let event: ReceiptEvent =
         serde_json::from_value(row.e.clone()).map_err(|err| schema_reason(&err))?;
+    // The stored bytes are what a reader sees. They must be the canonical
+    // form, so a duplicate key cannot show one value and hash another.
+    stored_line_is_canonical(text)?;
     let hash = match row_hash(&row) {
         Ok(hash) => hash,
         Err(ChainError::Float) => return Err("float"),
@@ -284,6 +287,25 @@ fn check_row(
         hash: hex(&hash),
         event,
     })
+}
+
+/// Reject a line whose bytes are not `canonical` of its JSON value.
+///
+/// `serde_json` keeps the last of a duplicate key. Canonical output has one
+/// copy of each key and no extra whitespace, so a duplicate-key line, a
+/// reordered line, or a `\u` escape cannot compare equal.
+fn stored_line_is_canonical(text: &str) -> Result<(), &'static str> {
+    let parsed: Value = serde_json::from_str(text).map_err(|_| "not a row")?;
+    let canon = match canonical(&parsed) {
+        Ok(canon) => canon,
+        Err(ChainError::Float) => return Err("float"),
+        Err(ChainError::Row) => return Err("not a row"),
+    };
+    if canon == text {
+        Ok(())
+    } else {
+        Err("not canonical")
+    }
 }
 
 fn schema_reason(err: &serde_json::Error) -> &'static str {
@@ -741,5 +763,59 @@ mod tests {
         assert_eq!(report.warns[0].reason, "torn line");
         assert_eq!(report.rows, 4);
         assert_eq!(report.seq, Some(3));
+    }
+
+    fn shutdown_after_genesis() -> (String, String) {
+        let (genesis, prev) = line_of(
+            0,
+            GENESIS_PREV,
+            TS0,
+            &ReceiptEvent::Genesis {
+                pulse: "echo".to_string(),
+            },
+        );
+        let (row, _) = line_of(
+            1,
+            &prev,
+            TS1,
+            &ReceiptEvent::Shutdown {
+                reason: "stop".to_string(),
+            },
+        );
+        (genesis, row)
+    }
+
+    #[test]
+    fn duplicate_keys_are_not_canonical() {
+        let (genesis, row) = shutdown_after_genesis();
+        let kind = row.replace(
+            "\"kind\":\"shutdown\"",
+            "\"kind\":\"genesis\",\"kind\":\"shutdown\"",
+        );
+        let seq = row.replace("\"seq\":1", "\"seq\":99,\"seq\":1");
+        for line in [kind, seq] {
+            let text = format!("{genesis}\n{line}\n");
+            let report = verify_lines(text.as_bytes());
+            assert_eq!(note(&report), (2, "not canonical"));
+        }
+    }
+
+    #[test]
+    fn a_non_canonical_line_is_rejected() {
+        let (genesis, row) = shutdown_after_genesis();
+        let spaced = row.replace(',', ", ");
+        let escaped = row.replace("\"reason\":\"stop\"", "\"reason\":\"\\u0073top\"");
+        let crlf = format!("{row}\r");
+        let trailed = format!("{row} ");
+        let parsed: Value = serde_json::from_str(&row).unwrap();
+        let prev = parsed["prev"].as_str().unwrap().to_string();
+        let reordered = format!(
+            "{{\"v\":1,\"ts\":\"{TS1}\",\"seq\":1,\"prev\":\"{prev}\",\"e\":{{\"reason\":\"stop\",\"kind\":\"shutdown\"}}}}"
+        );
+        for line in [spaced, escaped, crlf, trailed, reordered] {
+            let text = format!("{genesis}\n{line}\n");
+            let report = verify_lines(text.as_bytes());
+            assert_eq!(note(&report), (2, "not canonical"), "{line}");
+        }
     }
 }
