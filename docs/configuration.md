@@ -8,6 +8,7 @@ everything below has a default. The core:
 name = "atlas"
 owner_name = "Ada"
 owner_alias = "Ada"
+# rules_require_root = false
 
 [server]
 host = "127.0.0.1"
@@ -31,6 +32,7 @@ Every key:
 | `pulse` | `owner_name` | — | Your name |
 | `pulse` | `owner_alias` | — | How the pulse addresses you |
 | `pulse` | `rules_dir` | — | Shared protocol files directory |
+| `pulse` | `rules_require_root` | `false` | Pulse rules load only from root-owned files under directories below the pulse root (through the rules directory) that root owns and that are not group- or world-writable. The pulse root itself is not checked because the pulse owns its home. Strict mode enforces the same on the rule file (0644). Strict mode also rejects a path on a FUSE filesystem. Where the pulse user can still mount filesystems, deny that too (`NoNewPrivileges=yes`, `PrivateDevices=yes` or no `/dev/fuse`, no setuid fusermount for the pulse user): the loader can only check what it can see. `false` still reads a file the pulse user or root owns. The environment variable is the guarantee, and it is decided before this file is trusted. Set `Environment=PULSE_NULL_RULES_REQUIRE_ROOT=1` in the root-owned systemd unit (`1`, `true`, and `yes` force strict mode; `0` and `false` leave the config key; any other value is ignored and warned once). When strict mode is in effect, `pulse-null.toml` must pass the same check as a strict rule file — root-owned, one link, not group- or world-writable, and not on FUSE — or the pulse is skipped. The warning names the path and the reason, and no key is taken from the file (`rules_dir`, the CLI adapter, and the rest). The file's own `rules_require_root` counts only after that check passes. A strict deployment keeps `pulse-null.toml` at `root:pulse` `0644`. The pulse root itself is still not required to be root-owned, so the file must be immutable (`chattr +i`) or otherwise non-renamable; that is an operator step and is not verified here. Replacing the file by renaming it inside the pulse-owned directory leaves a pulse-owned file, which this check refuses, so the pulse is skipped (unloadable) rather than run from the replacement. Peer save and plugin install or remove write this file; in strict mode those writes fail because it is root-owned `0644`. A non-strict load is unchanged. |
 | `server` | `host` | `127.0.0.1` | Bind address |
 | `server` | `port` | `3100` (init suggests from 3200) | Bind port |
 | `llm` | `provider` | set at init (`anthropic` if missing) | `cli`, `anthropic`, `ollama` |
@@ -67,8 +69,8 @@ Every key:
 | `graph` | `extract_daily_token_budget` | init: `2000000` | Extraction token cap per UTC day (`0` = none) |
 | `context_buffer` | `pulse_filter` | `true` | On shared channels, drop other pulses' messages from context |
 | `tui` | `theme`, `motion`, `nerd_font` | `gruvbox`, `full`, `auto` | See [tui.md](tui.md) |
-| `plugin_turns` | `daily_turns` | `500` | Guest turns per plugin, and HTTP voice turns as their own day, per UTC day; the owner's turns don't count; in memory, so a restart starts the day again (`0` = no cap) |
-| `plugin_turns` | `voice_turns_per_call` | `60` | Turns one voice call may take, per plugin and for HTTP voice turns as their own (`0` = no cap) |
+| `plugin_turns` | `daily_turns` | `150` | Guest turns per plugin, and HTTP voice turns as their own day, per UTC day; counted in memory, so a restart starts the day again; the owner's turns don't count (`0` = no cap) |
+| `plugin_turns` | `voice_turns_per_call` | `20` | Turns one voice call may take, per plugin and for HTTP voice turns as their own (`0` = no cap) |
 | `plugin_turns` | `guest_burst`, `guest_per_minute` | `5`, `6` | Per-sender token bucket for text-channel guests, per plugin (`guest_burst = 0` = no bucket). HTTP voice turns are calls on their own ledger, not this bucket |
 | `probe` | `enabled` | `false` | Growth-record probe runs ([methods](methods/probe-runner.md)) |
 | `probe` | `cadence` | `max` | `max`: due Mon/Wed/Fri · `pro`: every 14 days |

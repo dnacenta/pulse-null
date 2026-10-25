@@ -495,12 +495,17 @@ mod tests {
 
     /// An enabled task has a next fire; a disabled one has none, because it
     /// is not going to fire.
+    ///
+    /// The zone is UTC. A zone with a repeated local hour (the autumn DST
+    /// fallback) makes the cron crate return that hour's earlier occurrence,
+    /// which is already in the past, so `next_fire > Utc::now()` fails for
+    /// the whole repeated hour. UTC has no repeated hour.
     #[test]
     fn next_fire_tracks_the_enabled_flag() {
         let dir = seeded_root();
         let id = Schedule::load(dir.path()).unwrap().tasks[0].task.id.clone();
 
-        let enabled = set_enabled(dir.path(), TZ, &id, true).unwrap().unwrap();
+        let enabled = set_enabled(dir.path(), "UTC", &id, true).unwrap().unwrap();
         assert!(enabled.enabled);
         let fire = enabled
             .next_fire

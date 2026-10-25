@@ -92,7 +92,8 @@ pub fn has_pulse_children(dir: &Path) -> bool {
 /// Booting a pulse runs the binaries and hooks its files name with our
 /// rights, so a directory qualifies only when it is a real directory (not
 /// a symlink into someone else's tree), owned by the running user, and its
-/// `pulse-null.toml` is a real file owned by the same user.
+/// `pulse-null.toml` is a real file owned by that user or by root. A strict
+/// deployment keeps the file root-owned.
 pub fn untrusted_reason(dir: &Path) -> Option<String> {
     use std::os::unix::fs::MetadataExt;
     // SAFETY: geteuid has no preconditions and cannot fail.
@@ -117,10 +118,20 @@ pub fn untrusted_reason(dir: &Path) -> Option<String> {
     if toml.file_type().is_symlink() {
         return Some("pulse-null.toml is a symlink".to_string());
     }
-    if toml.uid() != me {
-        return Some("pulse-null.toml not owned by you".to_string());
+    if let Some(reason) = toml_owner_reject(toml.uid(), me) {
+        return Some(reason.to_string());
     }
     None
+}
+
+/// Why this config file's owner is refused. The running user or root is
+/// accepted. A third uid is not.
+fn toml_owner_reject(file_uid: u32, running_uid: u32) -> Option<&'static str> {
+    if file_uid != running_uid && file_uid != 0 {
+        Some("pulse-null.toml not owned by you or root")
+    } else {
+        None
+    }
 }
 
 /// Every pulse directory under `pulse_home` this user owns, whether or
@@ -392,6 +403,19 @@ mod tests {
             std::fs::write(d.join("pulse-null.toml"), toml(port)).unwrap();
         }
         assert_eq!(suggest_port(home.path()), 3202);
+    }
+
+    /// Root may own `pulse-null.toml`. A third uid may not. No chown: the
+    /// uids are injected. Removing the root clause refuses uid 0.
+    #[test]
+    fn root_owned_toml_is_trusted_and_a_third_uid_is_not() {
+        let me = 4_242;
+        assert!(toml_owner_reject(0, me).is_none());
+        assert!(toml_owner_reject(me, me).is_none());
+        assert_eq!(
+            toml_owner_reject(me.wrapping_add(1), me),
+            Some("pulse-null.toml not owned by you or root")
+        );
     }
 
     #[test]

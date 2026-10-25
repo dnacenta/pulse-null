@@ -2260,6 +2260,42 @@ mod tests {
             .expect("rules item")
     }
 
+    /// A rules directory the process cannot write (mode 0555) makes the
+    /// generated rule a skip. Root ignores that mode, so the test does not
+    /// run as root. The directory mode is restored so the temp dir can be removed.
+    #[test]
+    fn a_read_only_rules_dir_skips_the_generated_rule() {
+        use std::os::unix::fs::PermissionsExt;
+        // SAFETY: geteuid has no preconditions and cannot fail.
+        if unsafe { libc::geteuid() } == 0 {
+            return;
+        }
+        let dir = pulse();
+        let root = dir.path().canonicalize().unwrap();
+        ensure_files(&root, "recall-echo");
+        let rules = root.join(".claude/rules");
+        std::fs::remove_file(rules.join(RECALL_ECHO_RULES_FILE)).unwrap();
+        let prior = std::fs::metadata(&rules).unwrap().permissions().mode();
+        std::fs::set_permissions(&rules, std::fs::Permissions::from_mode(0o555)).unwrap();
+        struct Restore<'a>(&'a std::path::Path, u32);
+        impl Drop for Restore<'_> {
+            fn drop(&mut self) {
+                use std::os::unix::fs::PermissionsExt;
+                let _ = std::fs::set_permissions(self.0, std::fs::Permissions::from_mode(self.1));
+            }
+        }
+        let _restore = Restore(&rules, prior);
+        let items = ensure_files(&root, "recall-echo");
+        let item = rules_item(&items);
+        let ItemStatus::Skipped(reason) = &item.status else {
+            panic!("expected a skip, got {item:?}");
+        };
+        assert!(
+            reason.to_ascii_lowercase().contains("permission denied"),
+            "{reason}"
+        );
+    }
+
     #[test]
     fn rules_template_has_no_manual_checkpoint_or_consume() {
         let rules = render_rules_md();
