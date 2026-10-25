@@ -247,7 +247,7 @@ fn matching_recover(
 ///
 /// The store's tail repair is the caller. The binary does not open the
 /// store until increment 3.
-#[allow(dead_code)]
+#[cfg_attr(not(test), expect(dead_code, reason = "wired in increment 3"))]
 pub(crate) fn accepts_line(bytes: &[u8], seq: u64, prev: &str) -> bool {
     let line = Phys {
         number: 1,
@@ -262,7 +262,7 @@ pub(crate) fn accepts_line(bytes: &[u8], seq: u64, prev: &str) -> bool {
 /// or a final line with no newline.
 ///
 /// Used by tail repair. See [`accepts_line`].
-#[allow(dead_code)]
+#[cfg_attr(not(test), expect(dead_code, reason = "wired in increment 3"))]
 pub(crate) fn valid_json_value(bytes: &[u8]) -> bool {
     let Ok(text) = std::str::from_utf8(bytes) else {
         return false;
