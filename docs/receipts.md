@@ -14,11 +14,13 @@ One JSON object per line, UTF-8, at most 64 KiB not counting the newline. Lines 
 
 `e.kind` is one of `genesis`, `boot`, `open`, `close`, `shutdown`, `recover`, `gap`. Unknown kinds and unknown fields are rejected. Optional fields that are absent are omitted; they are not written as null. `close` always carries `mailbox_head`, `folded`, and `fence`, each null, reserved for later.
 
-A line that is not a JSON value, or a final line with no newline, is torn. It is not a row. The next row must be `recover` with `torn_offset` (byte offset of those bytes), `torn_len` (their length), and `torn_sha256` (their SHA-256). The chain then warns. Without that matching row, the chain is broken at the torn line.
+A stored line must be exactly the canonical form. A torn line is only a last line that fails to parse as a row, and it must be followed by a matching `recover` row: `torn_offset` (byte offset of those bytes), `torn_len` (their length), and `torn_sha256` (their SHA-256). The chain then warns. Without that matching row, the chain is broken at the torn line. A valid JSON line that is not an object is broken.
+
+Increment 2: the store must write a `recover` row whenever the last line is not a valid row, not only when the last byte is not `\n`. A complete row missing only its `\n` gets `\n` appended, and no recover row.
 
 ## Canonical form
 
-The hash is over canonical JSON, not over the raw line:
+A stored line is exactly this form, and the hash is SHA-256 of those bytes:
 
 - object keys sorted by UTF-8 byte order at every level
 - no whitespace
