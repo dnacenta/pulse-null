@@ -30,9 +30,10 @@ pulse-null receipts show [--file P] [--since T] [--kind K] [--limit N] [--json] 
 pulse-null receipts overlaps [--file P] [--since T] [--limit N] [--json]   open intervals that overlap, including quiet_twin
 pulse-null receipts swaps [--file P] [--json]   provider, adapter, or model changes between boots or closes
 pulse-null receipts anchor --pulse NAME [--file P] [--config C] [--token-file T] [--dry-run]   append one anchor line when the file is ahead
+pulse-null receipts install --pulse NAME --group GROUP [--dir DIR] [--adopt]   (root) create the receipt directory, receipts.jsonl, and anchors.log
 ```
 
-`verify`, `show`, `overlaps`, and `swaps` read a file and do not write one. `anchor` publishes one line and is not run by the daemon. The row format, the streams, and the exit codes are in [receipts.md](receipts.md).
+`verify`, `show`, `overlaps`, and `swaps` read a file and do not write one. `anchor` publishes one line and is not run by the daemon. `install` creates `/var/lib/pulse-null/<pulse>/` unless `--dir` says otherwise, and it refuses unless it runs as root. The row format, the streams, and the exit codes are in [receipts.md](receipts.md).
 
 Probes are described in [methods/probe-runner.md](methods/probe-runner.md); they refuse to run
 without Landlock (kernel ABI 4) and refuse root.

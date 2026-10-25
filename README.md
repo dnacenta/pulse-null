@@ -44,6 +44,10 @@ pulse-null chat              # talk to it in the terminal
 pulse-null up --headless     # or run it as a daemon (systemd)
 ```
 
+## Receipts
+
+A receipt file is a hash chain of what each stream did. `receipts install` (as root) creates the directory, `receipts.jsonl` (root and the named group, mode 0640, append-only) with a genesis row, and an empty `anchors.log`. `receipts verify` checks the chain. The row format, the commands, and the deploy steps are in [docs/receipts.md](docs/receipts.md).
+
 ## Docs
 
 - [Concepts](docs/concepts.md): what a pulse has and how the pieces fit

@@ -1,11 +1,12 @@
-//! `pulse-null receipts verify`, `show`, `overlaps`, `swaps`, and `anchor`.
+//! `pulse-null receipts verify`, `show`, `overlaps`, `swaps`, `anchor`, and `install`.
 //!
-//! `verify`, `show`, `overlaps`, and `swaps` read a file. `anchor` is the only
-//! one that publishes, and only from this command, never from the daemon.
-//! `anchor` holds `<receipt dir>/anchors.lock` only while it publishes.
-//! A dry run, and a check that refuses, do not create that file. None of
-//! them locks the receipt file or repairs a torn tail. The store does that
-//! when it opens.
+//! `verify`, `show`, `overlaps`, and `swaps` read a file. `anchor` publishes
+//! from this command, never from the daemon. `install` creates the receipt
+//! directory. `anchor` takes `<receipt dir>/anchors.lock` after a preview that
+//! is not mismatch, rewind, or unverified, including when there is nothing new
+//! to publish. A dry run does not create that file. None of these commands
+//! locks the receipt file or repairs a torn tail. The store does that when it
+//! opens.
 
 use std::collections::{BTreeMap, HashMap};
 use std::path::PathBuf;
@@ -104,7 +105,8 @@ pub async fn verify_at(
 /// The receipt file is not locked. A trailing partial line of the receipt is
 /// not part of the chain. A mismatch, a rewind, or a backend that cannot be
 /// read returns without creating `<receipt dir>/anchors.lock`. `--dry-run`
-/// does not create it either. The lock is held only across the publish. A
+/// does not create it either. Any other preview takes the lock, including
+/// when there is nothing new to publish, and holds it across the publish. A
 /// backend whose check failed is skipped, and the others are still attempted.
 pub async fn anchor(
     pulse: String,
@@ -290,6 +292,45 @@ pub async fn swaps(file: Option<PathBuf>, json: bool) -> Result<(), Box<dyn std:
         }
     }
     Ok(())
+}
+
+/// Create `<dir>/<pulse>/`, `receipts.jsonl`, and `anchors.log`.
+///
+/// Refuses unless the process is root. A second run that finds the same
+/// layout prints that nothing changed. `--adopt` sets the owner, mode, and
+/// append-only flag on a file that already verifies for this pulse, and does
+/// not rewrite it.
+pub async fn install(
+    pulse: String,
+    group: String,
+    dir: PathBuf,
+    adopt: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    match crate::oneself::install::install(
+        &pulse,
+        &group,
+        &dir,
+        adopt,
+        &crate::oneself::install::LiveHost,
+    ) {
+        Ok(crate::oneself::install::Outcome::Installed(path)) => {
+            println!("installed {}", path.display());
+            Ok(())
+        }
+        Ok(crate::oneself::install::Outcome::Adopted(path)) => {
+            println!("adopted {}; receipt file unchanged", path.display());
+            Ok(())
+        }
+        Ok(crate::oneself::install::Outcome::Unchanged) => {
+            println!("already installed; nothing changed");
+            Ok(())
+        }
+        Err(crate::oneself::install::InstallError::Broken { line, reason }) => {
+            println!("broken line {line}: {reason}");
+            Err(Box::new(PrintedExit(1)))
+        }
+        Err(err) => unverified(false, &err.to_string()),
+    }
 }
 
 fn inspected_file(file: Option<PathBuf>) -> Result<Inspected, Box<dyn std::error::Error>> {
