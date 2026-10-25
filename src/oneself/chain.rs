@@ -351,7 +351,7 @@ fn check_row(
 }
 
 /// `YYYY-MM-DDTHH:MM:SS.mmmZ`, and a real instant.
-fn ts_ok(ts: &str) -> bool {
+pub(crate) fn ts_ok(ts: &str) -> bool {
     let bytes = ts.as_bytes();
     if bytes.len() != 24 {
         return false;

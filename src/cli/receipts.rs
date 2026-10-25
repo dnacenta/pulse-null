@@ -294,18 +294,74 @@ fn reject_filters(since: Option<&str>, kind: Option<&str>) -> Option<&'static st
 }
 
 fn since_ok(since: &str) -> bool {
-    if chrono::DateTime::parse_from_rfc3339(since).is_ok() {
-        return true;
+    since_bound(since).is_some()
+}
+
+/// UTC instant in the stored form `YYYY-MM-DDTHH:MM:SS.mmmZ`.
+///
+/// A full RFC3339 value, including an offset or a fractional second, is
+/// converted. A shorter prefix of that form is completed and checked as a
+/// real date, so `2026-13` is rejected and `2026-10-25` starts at midnight.
+fn since_bound(since: &str) -> Option<String> {
+    if let Some(utc) = parse_rfc3339_utc(since) {
+        return Some(format_ms(utc));
     }
-    const FORM: &[u8] = b"YYYY-MM-DDTHH:MM:SS.mmmZ";
-    let bytes = since.as_bytes();
-    if bytes.is_empty() || bytes.len() > FORM.len() {
-        return false;
+    let completed = complete_prefix(since)?;
+    if chain::ts_ok(&completed) {
+        Some(completed)
+    } else {
+        None
     }
-    bytes.iter().zip(FORM).all(|(byte, slot)| match slot {
-        b'Y' | b'M' | b'D' | b'H' | b'S' | b'm' => byte.is_ascii_digit(),
-        other => byte == other,
-    })
+}
+
+fn parse_rfc3339_utc(since: &str) -> Option<chrono::DateTime<chrono::Utc>> {
+    let parsed = chrono::DateTime::parse_from_rfc3339(since)
+        .ok()
+        .or_else(|| {
+            let with_seconds = insert_zero_seconds(since)?;
+            chrono::DateTime::parse_from_rfc3339(&with_seconds).ok()
+        })?;
+    Some(parsed.with_timezone(&chrono::Utc))
+}
+
+/// `HH:MM` with no seconds, before `Z` or a numeric offset.
+fn insert_zero_seconds(since: &str) -> Option<String> {
+    let time_at = since.find('T')?;
+    let time = &since[time_at + 1..];
+    let zone_at = time.find(['Z', '+', '-'])?;
+    let hour_minute = &time[..zone_at];
+    if hour_minute.len() == 5 && hour_minute.as_bytes().get(2) == Some(&b':') {
+        let mut out = String::with_capacity(since.len() + 3);
+        out.push_str(&since[..=time_at]);
+        out.push_str(hour_minute);
+        out.push_str(":00");
+        out.push_str(&time[zone_at..]);
+        return Some(out);
+    }
+    None
+}
+
+fn format_ms(utc: chrono::DateTime<chrono::Utc>) -> String {
+    let millis = utc.timestamp_subsec_millis();
+    format!("{}.{:03}Z", utc.format("%Y-%m-%dT%H:%M:%S"), millis)
+}
+
+fn complete_prefix(since: &str) -> Option<String> {
+    const FORM: &str = "0000-01-01T00:00:00.000Z";
+    if since.is_empty() || since.len() > FORM.len() {
+        return None;
+    }
+    let form = FORM.as_bytes();
+    for (index, byte) in since.bytes().enumerate() {
+        if form[index].is_ascii_digit() {
+            if !byte.is_ascii_digit() {
+                return None;
+            }
+        } else if byte != form[index] {
+            return None;
+        }
+    }
+    Some(format!("{since}{}", &FORM[since.len()..]))
 }
 
 fn kind_ok(kind: &str) -> bool {
@@ -353,6 +409,7 @@ fn filtered_rows(
     kind: Option<&str>,
     limit: Option<u64>,
 ) -> Vec<ShownRow> {
+    let bound = since.and_then(since_bound);
     let mut rows = Vec::new();
     for line in inspected.bytes.split(|byte| *byte == b'\n') {
         if line.is_empty() {
@@ -375,8 +432,8 @@ fn filtered_rows(
                 continue;
             }
         }
-        if let Some(since) = since {
-            if row.ts.as_str() < since {
+        if let Some(bound) = bound.as_deref() {
+            if row.ts.as_str() < bound {
                 continue;
             }
         }
@@ -786,6 +843,8 @@ mod tests {
         assert!(since_ok("2026-10-25T03:00:00.000+00:00"));
         assert!(since_ok("2026-10-25"));
         assert!(!since_ok("yesterday"));
+        assert!(!since_ok("2026-13"));
+        assert!(!since_ok("2026-02-31"));
         assert!(!since_ok(""));
         assert!(kind_ok("recover"));
         assert!(!kind_ok("bogus"));
@@ -805,7 +864,7 @@ mod tests {
         .unwrap_err();
         assert_eq!(since.downcast_ref::<PrintedExit>().unwrap().0, 2);
         let kind = block(show(
-            Some(path),
+            Some(path.clone()),
             None,
             Some("bogus".to_string()),
             None,
@@ -814,5 +873,82 @@ mod tests {
         .unwrap_err();
         assert_eq!(kind.downcast_ref::<PrintedExit>().unwrap().0, 2);
         assert!(reject_filters(Some("2026-10-25T04"), Some("gap")).is_none());
+        let bad_month = block(show(
+            Some(path),
+            Some("2026-13".to_string()),
+            None,
+            None,
+            true,
+        ))
+        .unwrap_err();
+        assert_eq!(bad_month.downcast_ref::<PrintedExit>().unwrap().0, 2);
+    }
+
+    #[test]
+    fn since_compares_an_offset_in_utc_milliseconds() {
+        assert_eq!(
+            since_bound("2026-10-25T05:00:01+02:00").unwrap(),
+            "2026-10-25T03:00:01.000Z"
+        );
+        assert_eq!(
+            since_bound("2026-10-25T03:00:01Z").unwrap(),
+            "2026-10-25T03:00:01.000Z"
+        );
+        assert_eq!(
+            since_bound("2026-10-25T03:00:01.5Z").unwrap(),
+            "2026-10-25T03:00:01.500Z"
+        );
+        assert_eq!(
+            since_bound("2026-10-25T05:00+02:00").unwrap(),
+            "2026-10-25T03:00:00.000Z"
+        );
+        assert_eq!(
+            since_bound("2026-10-25").unwrap(),
+            "2026-10-25T00:00:00.000Z"
+        );
+        assert!(since_bound("2026-13").is_none());
+
+        let mut prev = chain::GENESIS_PREV.to_string();
+        let mut body = Vec::new();
+        for (seq, ts) in [
+            (0, "2026-10-25T03:00:00.000Z"),
+            (1, "2026-10-25T03:00:01.000Z"),
+            (2, "2026-10-25T04:00:00.000Z"),
+        ] {
+            let event = if seq == 0 {
+                ReceiptEvent::Genesis {
+                    pulse: "echo".to_string(),
+                }
+            } else {
+                ReceiptEvent::Shutdown {
+                    reason: "stop".to_string(),
+                }
+            };
+            let line = chain::canonical(
+                &serde_json::to_value(chain::Row {
+                    v: 1,
+                    seq,
+                    prev: prev.clone(),
+                    ts: ts.to_string(),
+                    e: serde_json::to_value(event).unwrap(),
+                })
+                .unwrap(),
+            )
+            .unwrap();
+            prev = chain::sha256_hex(line.as_bytes());
+            writeln!(&mut body, "{line}").unwrap();
+        }
+        let inspected = Inspected {
+            bytes: body,
+            report: chain::verify_lines(&b""[..]),
+        };
+        let offset = filtered_rows(&inspected, Some("2026-10-25T05:00:01+02:00"), None, None);
+        assert_eq!(
+            offset.iter().map(|row| row.seq).collect::<Vec<_>>(),
+            vec![1, 2]
+        );
+        let bare = filtered_rows(&inspected, Some("2026-10-25T03:00:01Z"), None, None);
+        assert_eq!(bare[0].ts, "2026-10-25T03:00:01.000Z");
+        assert_eq!(bare.len(), 2);
     }
 }
