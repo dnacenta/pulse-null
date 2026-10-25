@@ -376,6 +376,7 @@ fn test_config() -> Config {
         platform: crate::config::PlatformConfig::default(),
         system_prompt_budget: crate::config::SystemPromptBudgetConfig::default(),
         probe: crate::config::ProbeConfig::default(),
+        receipts: crate::config::ReceiptsConfig::default(),
         peers: HashMap::new(),
         plugins: HashMap::new(),
         tui: crate::config::TuiConfig::default(),

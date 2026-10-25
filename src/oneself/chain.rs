@@ -243,6 +243,33 @@ fn matching_recover(
     }
 }
 
+/// Whether `bytes` (no trailing newline) is the next canonical row.
+///
+/// The store's tail repair is the caller. The binary does not open the
+/// store until increment 3.
+#[allow(dead_code)]
+pub(crate) fn accepts_line(bytes: &[u8], seq: u64, prev: &str) -> bool {
+    let line = Phys {
+        number: 1,
+        offset: 0,
+        bytes,
+        has_newline: true,
+    };
+    check_row(&line, seq, prev).is_ok()
+}
+
+/// UTF-8 that `serde_json` accepts as one value. A torn line is the opposite,
+/// or a final line with no newline.
+///
+/// Used by tail repair. See [`accepts_line`].
+#[allow(dead_code)]
+pub(crate) fn valid_json_value(bytes: &[u8]) -> bool {
+    let Ok(text) = std::str::from_utf8(bytes) else {
+        return false;
+    };
+    serde_json::from_str::<Value>(text).is_ok()
+}
+
 /// Not a JSON value, or the final line of a file that has no trailing
 /// newline. A matching `recover` is accepted only for this kind of line.
 fn torn_payload(line: &Phys<'_>) -> bool {

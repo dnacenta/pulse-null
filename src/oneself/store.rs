@@ -1,0 +1,981 @@
+//! Append-only receipt file.
+//!
+//! One process holds an exclusive lock. A path open is the dev mode. A
+//! systemd fd named `receipts` is used only when it belongs to this process,
+//! is a regular file, and is open for append. The daemon calls [`ReceiptStore::open`]
+//! in a later slice. `verify` and `show` read through [`inspect`] and do not
+//! lock or repair.
+//!
+//! The writer is allowed to look unused in the binary until that slice.
+#![allow(dead_code)]
+
+use std::fs::{File, OpenOptions};
+use std::io::{Read, Seek, SeekFrom, Write};
+use std::os::fd::{AsRawFd, FromRawFd};
+use std::os::unix::fs::OpenOptionsExt;
+use std::path::{Path, PathBuf};
+
+use thiserror::Error;
+
+use super::chain::{self, VerifyNote, VerifyReport, GENESIS_PREV};
+use super::event::ReceiptEvent;
+use super::protect::{Protection, ProtectionProbe};
+
+/// Where the bytes live.
+#[derive(Debug, Clone)]
+pub enum StoreSource {
+    /// systemd `OpenFile=` fd whose name is `name` (`receipts`).
+    SystemdFd { name: &'static str },
+    /// Dev path. Created if missing.
+    Path(PathBuf),
+}
+
+/// The last accepted row.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Head {
+    pub seq: u64,
+    pub hash: String,
+}
+
+/// What open did to the tail, plus the protection report.
+#[derive(Debug, Clone)]
+pub struct Opened {
+    /// A `recover` row was appended for a torn tail.
+    pub recovered: bool,
+    /// A complete row was missing only its newline.
+    pub repaired_newline: bool,
+    /// Path mode replaced a file that held no complete row.
+    pub recreated: bool,
+    pub protection: Protection,
+    pub report: VerifyReport,
+}
+
+/// A file read by `verify` and `show`. Not locked, not repaired.
+#[derive(Debug, Clone)]
+pub struct Inspected {
+    pub bytes: Vec<u8>,
+    pub report: VerifyReport,
+}
+
+/// Why the store did not open or append.
+#[derive(Debug, Error)]
+pub enum StoreError {
+    #[error("receipt file is locked by another process")]
+    Locked,
+    #[error("systemd fd {name} was not passed to this process")]
+    NotUsed { name: String },
+    #[error("systemd fd {fd} is not a regular file")]
+    NotRegular { fd: i32 },
+    #[error("systemd fd {fd} is not open for append")]
+    NotAppend { fd: i32 },
+    #[error("receipt file {path} has no complete row and cannot be recovered; rotate the file")]
+    Rotate { path: String },
+    #[error("receipt file is broken at line {line}: {reason}")]
+    Broken { line: usize, reason: &'static str },
+    #[error("receipt append failed and the store is poisoned ({dropped} dropped)")]
+    Append {
+        dropped: u64,
+        #[source]
+        source: std::io::Error,
+    },
+    #[error("receipt row could not be built")]
+    Row,
+    #[error(transparent)]
+    Io(#[from] std::io::Error),
+}
+
+/// Default file when `[receipts] path` is empty.
+#[must_use]
+pub fn default_receipts_path(pulse: &str) -> PathBuf {
+    PathBuf::from("/var/lib/pulse-null")
+        .join(pulse)
+        .join("receipts.jsonl")
+}
+
+/// Read a receipt file. Does not lock, repair, or create it.
+pub fn inspect(path: &Path) -> Result<Inspected, StoreError> {
+    let bytes = std::fs::read(path)?;
+    let report = chain::verify_lines(bytes.as_slice());
+    Ok(Inspected { bytes, report })
+}
+
+/// Streams with an `open` and no later `close` for that stream.
+#[must_use]
+pub fn orphan_streams(bytes: &[u8]) -> Vec<String> {
+    let mut open = Vec::new();
+    for line in bytes.split(|byte| *byte == b'\n') {
+        if line.is_empty() {
+            continue;
+        }
+        let Ok(text) = std::str::from_utf8(line) else {
+            continue;
+        };
+        let Ok(row) = serde_json::from_str::<chain::Row>(text) else {
+            continue;
+        };
+        let Ok(event) = serde_json::from_value::<ReceiptEvent>(row.e) else {
+            continue;
+        };
+        match event {
+            ReceiptEvent::Open { stream, .. } => open.push(stream),
+            ReceiptEvent::Close { stream, .. } => {
+                if let Some(index) = open.iter().position(|item| item == &stream) {
+                    open.remove(index);
+                }
+            }
+            _ => {}
+        }
+    }
+    open
+}
+
+/// fd index from `LISTEN_*`, or nothing when this process should not use it.
+///
+/// Fds start at 3. A wrong pid or a missing name is "not used", not an error
+/// from this function.
+#[must_use]
+pub fn listen_fd(
+    pid_env: Option<&str>,
+    fds_env: Option<&str>,
+    names_env: Option<&str>,
+    our_pid: u32,
+    name: &str,
+) -> Option<i32> {
+    let pid = pid_env?;
+    if pid != our_pid.to_string() {
+        return None;
+    }
+    let count: i32 = fds_env?.parse().ok()?;
+    if count <= 0 {
+        return None;
+    }
+    let index = names_env?.split(':').position(|item| item == name)?;
+    let index = i32::try_from(index).ok()?;
+    if index >= count {
+        return None;
+    }
+    Some(3 + index)
+}
+
+/// One appender. Dropping it releases the lock and closes the fd.
+pub struct ReceiptStore {
+    file: File,
+    next_seq: u64,
+    prev: String,
+    poisoned: bool,
+    dropped: u64,
+    gap_first: Option<String>,
+    gap_last: Option<String>,
+    #[cfg(test)]
+    fail_writes: u32,
+}
+
+impl std::fmt::Debug for ReceiptStore {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ReceiptStore")
+            .field("next_seq", &self.next_seq)
+            .field("poisoned", &self.poisoned)
+            .field("dropped", &self.dropped)
+            .finish()
+    }
+}
+
+impl ReceiptStore {
+    /// Open `source`, lock it, and repair only a torn or unterminated tail.
+    pub fn open(
+        source: StoreSource,
+        probe: &dyn ProtectionProbe,
+        pulse: &str,
+    ) -> Result<(Self, Opened), StoreError> {
+        // A fork in another test inherits this fd until that child execs, so
+        // a reopen can see the previous lock for that window. The lock test's
+        // child must not retry: it has to observe the held lock.
+        #[cfg(test)]
+        if std::env::var_os("RECEIPT_FLOCK_CHILD").is_none() {
+            for _ in 0..40 {
+                match Self::open_once(source.clone(), probe, pulse) {
+                    Err(StoreError::Locked) => {
+                        std::thread::sleep(std::time::Duration::from_millis(5));
+                    }
+                    other => return other,
+                }
+            }
+        }
+        Self::open_once(source, probe, pulse)
+    }
+
+    fn open_once(
+        source: StoreSource,
+        probe: &dyn ProtectionProbe,
+        pulse: &str,
+    ) -> Result<(Self, Opened), StoreError> {
+        let (mut file, from_systemd, path) = adopt(source)?;
+        let protection = probe.probe(&file, from_systemd);
+        lock_exclusive(&file)?;
+        let bytes = read_all(&mut file)?;
+        let had_bytes = !bytes.is_empty();
+        let class = classify(&bytes)?;
+        let mut recovered = false;
+        let mut repaired_newline = false;
+        let mut recreated = false;
+        match class {
+            Class::Ready => {}
+            Class::MissingNewline => {
+                write_all_sync(&mut file, b"\n")?;
+                repaired_newline = true;
+            }
+            Class::Torn {
+                offset,
+                torn,
+                needs_newline,
+                seq,
+                prev,
+            } => {
+                if needs_newline {
+                    write_all_sync(&mut file, b"\n")?;
+                }
+                let line = encode_line(
+                    seq,
+                    &prev,
+                    &now_ts(),
+                    &ReceiptEvent::Recover {
+                        torn_offset: offset,
+                        torn_len: u64::try_from(torn.len()).map_err(|_| StoreError::Row)?,
+                        torn_sha256: chain::sha256_hex(&torn),
+                    },
+                )?;
+                write_all_sync(&mut file, line.as_bytes())?;
+                write_all_sync(&mut file, b"\n")?;
+                recovered = true;
+            }
+            Class::NoRow => {
+                if from_systemd {
+                    return Err(StoreError::Rotate {
+                        path: fd_path(file.as_raw_fd()),
+                    });
+                }
+                if had_bytes {
+                    tracing::warn!(
+                        %path,
+                        "receipt file has no complete row; replacing it with genesis"
+                    );
+                } else {
+                    tracing::info!(%path, "receipt file is empty; writing genesis");
+                }
+                file.set_len(0)?;
+                let line = encode_line(
+                    0,
+                    GENESIS_PREV,
+                    &now_ts(),
+                    &ReceiptEvent::Genesis {
+                        pulse: pulse.to_string(),
+                    },
+                )?;
+                write_all_sync(&mut file, line.as_bytes())?;
+                write_all_sync(&mut file, b"\n")?;
+                if let Some(dir) = Path::new(&path).parent() {
+                    if let Ok(parent) = File::open(dir) {
+                        let _ = parent.sync_all();
+                    }
+                }
+                recreated = true;
+            }
+            Class::Broken(note) => {
+                return Err(StoreError::Broken {
+                    line: note.line,
+                    reason: note.reason,
+                });
+            }
+        }
+        let bytes = read_all(&mut file)?;
+        let report = chain::verify_lines(bytes.as_slice());
+        if let Some(note) = &report.first_break {
+            return Err(StoreError::Broken {
+                line: note.line,
+                reason: note.reason,
+            });
+        }
+        let next_seq = match report.seq {
+            None => 0,
+            Some(seq) => seq.checked_add(1).ok_or(StoreError::Row)?,
+        };
+        let store = Self {
+            file,
+            next_seq,
+            prev: report.head.clone(),
+            poisoned: false,
+            dropped: 0,
+            gap_first: None,
+            gap_last: None,
+            #[cfg(test)]
+            fail_writes: 0,
+        };
+        Ok((
+            store,
+            Opened {
+                recovered,
+                repaired_newline,
+                recreated,
+                protection,
+                report,
+            },
+        ))
+    }
+
+    /// Append `event`. A poisoned store writes a `gap` row first.
+    ///
+    /// `genesis` and `recover` are written by open, not by this method.
+    pub fn append(&mut self, event: ReceiptEvent) -> Result<Head, StoreError> {
+        if matches!(
+            event,
+            ReceiptEvent::Genesis { .. } | ReceiptEvent::Recover { .. } | ReceiptEvent::Gap { .. }
+        ) {
+            return Err(StoreError::Row);
+        }
+        if self.poisoned {
+            self.write_gap()?;
+        }
+        self.write_event(&event)
+    }
+
+    #[cfg(test)]
+    fn fail_next_write(&mut self) {
+        self.fail_writes = 1;
+    }
+
+    #[cfg(test)]
+    fn is_poisoned(&self) -> bool {
+        self.poisoned
+    }
+
+    fn write_gap(&mut self) -> Result<(), StoreError> {
+        let first = self.gap_first.clone().ok_or(StoreError::Row)?;
+        let mut last = self.gap_last.clone().ok_or(StoreError::Row)?;
+        if last < first {
+            last.clone_from(&first);
+        }
+        let event = ReceiptEvent::Gap {
+            dropped: self.dropped,
+            first_at: first,
+            last_at: last,
+        };
+        self.write_event(&event)?;
+        self.poisoned = false;
+        self.dropped = 0;
+        self.gap_first = None;
+        self.gap_last = None;
+        Ok(())
+    }
+
+    fn write_event(&mut self, event: &ReceiptEvent) -> Result<Head, StoreError> {
+        let ts = now_ts();
+        let line = encode_line(self.next_seq, &self.prev, &ts, event)?;
+        let hash = chain::sha256_hex(line.as_bytes());
+        if let Err(source) = self.write_record(line.as_bytes()) {
+            self.note_failure(ts);
+            return Err(StoreError::Append {
+                dropped: self.dropped,
+                source,
+            });
+        }
+        self.prev = hash.clone();
+        self.next_seq = self.next_seq.checked_add(1).ok_or(StoreError::Row)?;
+        Ok(Head {
+            seq: self.next_seq - 1,
+            hash,
+        })
+    }
+
+    fn note_failure(&mut self, ts: String) {
+        if self.gap_first.is_none() {
+            self.gap_first = Some(ts.clone());
+        }
+        self.gap_last = Some(ts);
+        self.dropped = self.dropped.saturating_add(1);
+        self.poisoned = true;
+    }
+
+    fn write_record(&mut self, line: &[u8]) -> std::io::Result<()> {
+        #[cfg(test)]
+        if self.fail_writes > 0 {
+            self.fail_writes -= 1;
+            return Err(std::io::Error::other("injected append failure"));
+        }
+        write_all_sync(&mut self.file, line)?;
+        write_all_sync(&mut self.file, b"\n")?;
+        Ok(())
+    }
+}
+
+enum Class {
+    Ready,
+    MissingNewline,
+    Torn {
+        offset: u64,
+        torn: Vec<u8>,
+        needs_newline: bool,
+        seq: u64,
+        prev: String,
+    },
+    NoRow,
+    Broken(VerifyNote),
+}
+
+fn classify(bytes: &[u8]) -> Result<Class, StoreError> {
+    if bytes.is_empty() {
+        return Ok(Class::NoRow);
+    }
+    let (prefix, last, last_nl) = split_last(bytes);
+    let prefix_report = chain::verify_lines(prefix);
+    if let Some(note) = prefix_report.first_break {
+        if prefix_report.rows == 0 {
+            return Ok(Class::NoRow);
+        }
+        return Ok(Class::Broken(note));
+    }
+    let seq = match prefix_report.seq {
+        None => 0,
+        Some(seq) => seq.checked_add(1).ok_or(StoreError::Row)?,
+    };
+    let prev = prefix_report.head.clone();
+    if chain::accepts_line(last, seq, &prev) {
+        return Ok(if last_nl {
+            Class::Ready
+        } else {
+            Class::MissingNewline
+        });
+    }
+    if prefix_report.rows == 0 {
+        return Ok(Class::NoRow);
+    }
+    if chain::valid_json_value(last) {
+        return Ok(Class::Broken(VerifyNote {
+            line: prefix_report.rows as usize + 1,
+            reason: "not a row",
+        }));
+    }
+    Ok(Class::Torn {
+        offset: u64::try_from(prefix.len()).map_err(|_| StoreError::Row)?,
+        torn: last.to_vec(),
+        needs_newline: !last_nl,
+        seq,
+        prev,
+    })
+}
+
+/// Split into `(prefix including its trailing newline, last line, last has newline)`.
+fn split_last(bytes: &[u8]) -> (&[u8], &[u8], bool) {
+    match bytes.iter().rposition(|byte| *byte == b'\n') {
+        None => (b"", bytes, false),
+        Some(pos) if pos + 1 == bytes.len() => {
+            let before = &bytes[..pos];
+            match before.iter().rposition(|byte| *byte == b'\n') {
+                Some(start) => (&bytes[..=start], &bytes[start + 1..pos], true),
+                None => (b"", &bytes[..pos], true),
+            }
+        }
+        Some(pos) => (&bytes[..=pos], &bytes[pos + 1..], false),
+    }
+}
+
+fn encode_line(seq: u64, prev: &str, ts: &str, event: &ReceiptEvent) -> Result<String, StoreError> {
+    let row = chain::Row {
+        v: 1,
+        seq,
+        prev: prev.to_string(),
+        ts: ts.to_string(),
+        e: serde_json::to_value(event).map_err(|_| StoreError::Row)?,
+    };
+    let value = serde_json::to_value(&row).map_err(|_| StoreError::Row)?;
+    let text = chain::canonical(&value).map_err(|_| StoreError::Row)?;
+    if text.len() > chain::MAX_LINE_BYTES {
+        return Err(StoreError::Row);
+    }
+    if !chain::accepts_line(text.as_bytes(), seq, prev) {
+        return Err(StoreError::Row);
+    }
+    Ok(text)
+}
+
+fn now_ts() -> String {
+    let now = chrono::Utc::now();
+    let millis = now.timestamp_subsec_millis();
+    format!("{}.{:03}Z", now.format("%Y-%m-%dT%H:%M:%S"), millis)
+}
+
+fn adopt(source: StoreSource) -> Result<(File, bool, String), StoreError> {
+    match source {
+        StoreSource::Path(path) => {
+            if let Some(dir) = path.parent() {
+                std::fs::create_dir_all(dir)?;
+            }
+            let file = OpenOptions::new()
+                .create(true)
+                .read(true)
+                .append(true)
+                .mode(0o640)
+                .open(&path)?;
+            let display = path.display().to_string();
+            Ok((file, false, display))
+        }
+        StoreSource::SystemdFd { name } => {
+            let file = take_systemd(name)?;
+            let path = fd_path(file.as_raw_fd());
+            Ok((file, true, path))
+        }
+    }
+}
+
+fn take_systemd(name: &str) -> Result<File, StoreError> {
+    let pid = std::env::var("LISTEN_PID").ok();
+    let fds = std::env::var("LISTEN_FDS").ok();
+    let names = std::env::var("LISTEN_FDNAMES").ok();
+    let Some(listed) = listen_fd(
+        pid.as_deref(),
+        fds.as_deref(),
+        names.as_deref(),
+        std::process::id(),
+        name,
+    ) else {
+        return Err(StoreError::NotUsed {
+            name: name.to_string(),
+        });
+    };
+    // Tests pass a private dup. The process fd 3 is not ours to replace:
+    // other tests hold files there, and `dup2` onto it drops their locks.
+    #[cfg(test)]
+    let fd = {
+        let forced = FORCED_FD.load(std::sync::atomic::Ordering::SeqCst);
+        if forced >= 0 {
+            forced
+        } else {
+            listed
+        }
+    };
+    #[cfg(not(test))]
+    let fd = listed;
+    validate_fd(fd)?;
+    set_cloexec(fd)?;
+    // SAFETY: `fd` is open, validated, and systemd handed it to this process.
+    // `File` is now the only owner.
+    let file = unsafe { File::from_raw_fd(fd) };
+    std::env::remove_var("LISTEN_PID");
+    std::env::remove_var("LISTEN_FDS");
+    std::env::remove_var("LISTEN_FDNAMES");
+    Ok(file)
+}
+
+fn validate_fd(fd: i32) -> Result<(), StoreError> {
+    let mut stat = unsafe { std::mem::zeroed::<libc::stat>() };
+    // SAFETY: `stat` is a valid out-pointer and `fd` is still open.
+    let rc = unsafe { libc::fstat(fd, &mut stat) };
+    if rc != 0 {
+        return Err(StoreError::Io(std::io::Error::last_os_error()));
+    }
+    if stat.st_mode & libc::S_IFMT != libc::S_IFREG {
+        return Err(StoreError::NotRegular { fd });
+    }
+    let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+    if flags < 0 {
+        return Err(StoreError::Io(std::io::Error::last_os_error()));
+    }
+    if flags & libc::O_APPEND == 0 {
+        return Err(StoreError::NotAppend { fd });
+    }
+    Ok(())
+}
+
+fn set_cloexec(fd: i32) -> Result<(), StoreError> {
+    let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+    if flags < 0 {
+        return Err(StoreError::Io(std::io::Error::last_os_error()));
+    }
+    let rc = unsafe { libc::fcntl(fd, libc::F_SETFD, flags | libc::FD_CLOEXEC) };
+    if rc != 0 {
+        return Err(StoreError::Io(std::io::Error::last_os_error()));
+    }
+    Ok(())
+}
+
+fn lock_exclusive(file: &File) -> Result<(), StoreError> {
+    // SAFETY: `flock` on a descriptor this store owns.
+    let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+    if rc == 0 {
+        return Ok(());
+    }
+    let err = std::io::Error::last_os_error();
+    if err.raw_os_error() == Some(libc::EWOULDBLOCK) || err.raw_os_error() == Some(libc::EAGAIN) {
+        Err(StoreError::Locked)
+    } else {
+        Err(StoreError::Io(err))
+    }
+}
+
+fn read_all(file: &mut File) -> Result<Vec<u8>, StoreError> {
+    file.seek(SeekFrom::Start(0))?;
+    let mut buf = Vec::new();
+    file.read_to_end(&mut buf)?;
+    Ok(buf)
+}
+
+fn write_all_sync(file: &mut File, bytes: &[u8]) -> std::io::Result<()> {
+    file.write_all(bytes)?;
+    file.sync_all()?;
+    Ok(())
+}
+
+fn fd_path(fd: i32) -> String {
+    std::fs::read_link(format!("/proc/self/fd/{fd}"))
+        .map(|path| path.display().to_string())
+        .unwrap_or_else(|_| format!("fd {fd}"))
+}
+
+/// Test double for the systemd fd number. `-1` means use `3 + index`.
+#[cfg(test)]
+static FORCED_FD: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(-1);
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::oneself::chain::VerifyState;
+    use crate::oneself::protect::{FakeProbe, LiveProbe};
+    use std::os::fd::AsRawFd;
+    use std::sync::Mutex;
+
+    static FD_LOCK: Mutex<()> = Mutex::new(());
+
+    fn shutdown() -> ReceiptEvent {
+        ReceiptEvent::Shutdown {
+            reason: "stop".to_string(),
+        }
+    }
+
+    fn open_path(dir: &Path) -> (ReceiptStore, Opened) {
+        let path = dir.join("receipts.jsonl");
+        ReceiptStore::open(StoreSource::Path(path), &LiveProbe, "echo").unwrap()
+    }
+
+    #[test]
+    fn a_wrong_listen_pid_or_a_missing_name_is_not_used() {
+        assert_eq!(
+            listen_fd(Some("1"), Some("1"), Some("receipts"), 99, "receipts"),
+            None
+        );
+        assert_eq!(
+            listen_fd(Some("99"), Some("1"), Some("other"), 99, "receipts"),
+            None
+        );
+        assert_eq!(
+            listen_fd(Some("99"), Some("1"), Some("receipts"), 99, "receipts"),
+            Some(3)
+        );
+        let _guard = FD_LOCK.lock().unwrap_or_else(|err| err.into_inner());
+        std::env::set_var("LISTEN_PID", "1");
+        std::env::set_var("LISTEN_FDS", "1");
+        std::env::set_var("LISTEN_FDNAMES", "receipts");
+        let err = match ReceiptStore::open(
+            StoreSource::SystemdFd { name: "receipts" },
+            &LiveProbe,
+            "echo",
+        ) {
+            Ok(_) => panic!("fd was used"),
+            Err(err) => err,
+        };
+        assert!(matches!(err, StoreError::NotUsed { .. }), "{err}");
+        assert!(std::env::var("LISTEN_PID").is_ok());
+        std::env::remove_var("LISTEN_PID");
+        std::env::remove_var("LISTEN_FDS");
+        std::env::remove_var("LISTEN_FDNAMES");
+    }
+
+    /// Dup `file` and offer that fd as the systemd socket. Does not touch fd 3.
+    ///
+    /// The store takes the dup only after the fd checks pass. If it does, it
+    /// clears `LISTEN_PID` and owns the close. Otherwise this closes the dup.
+    fn with_forced_fd(file: &File, body: impl FnOnce()) {
+        let _guard = FD_LOCK.lock().unwrap_or_else(|err| err.into_inner());
+        // SAFETY: `file` is open for the duration of this call.
+        let duped = unsafe { libc::dup(file.as_raw_fd()) };
+        assert!(duped >= 0, "dup: {}", std::io::Error::last_os_error());
+        FORCED_FD.store(duped, std::sync::atomic::Ordering::SeqCst);
+        std::env::set_var("LISTEN_PID", std::process::id().to_string());
+        std::env::set_var("LISTEN_FDS", "1");
+        std::env::set_var("LISTEN_FDNAMES", "receipts");
+        struct Reset(i32);
+        impl Drop for Reset {
+            fn drop(&mut self) {
+                FORCED_FD.store(-1, std::sync::atomic::Ordering::SeqCst);
+                let taken = std::env::var("LISTEN_PID").is_err();
+                std::env::remove_var("LISTEN_PID");
+                std::env::remove_var("LISTEN_FDS");
+                std::env::remove_var("LISTEN_FDNAMES");
+                if !taken {
+                    // SAFETY: the store did not take this dup, so it is still open.
+                    unsafe { libc::close(self.0) };
+                }
+            }
+        }
+        let _reset = Reset(duped);
+        body();
+    }
+
+    #[test]
+    fn an_fd_without_o_append_is_refused_and_cloexec_is_set() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("receipts.jsonl");
+        let plain = OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .open(&path)
+            .unwrap();
+        with_forced_fd(&plain, || {
+            let err = ReceiptStore::open(
+                StoreSource::SystemdFd { name: "receipts" },
+                &LiveProbe,
+                "echo",
+            )
+            .unwrap_err();
+            assert!(matches!(err, StoreError::NotAppend { .. }), "{err}");
+            assert!(std::env::var("LISTEN_PID").is_ok());
+        });
+        drop(plain);
+
+        let _prepared =
+            ReceiptStore::open(StoreSource::Path(path.clone()), &LiveProbe, "echo").unwrap();
+        drop(_prepared);
+        let appending = OpenOptions::new()
+            .read(true)
+            .append(true)
+            .open(&path)
+            .unwrap();
+        with_forced_fd(&appending, || {
+            let (store, opened) = ReceiptStore::open(
+                StoreSource::SystemdFd { name: "receipts" },
+                &LiveProbe,
+                "echo",
+            )
+            .unwrap();
+            assert!(!opened.recreated);
+            let flags = unsafe { libc::fcntl(store.file.as_raw_fd(), libc::F_GETFD) };
+            assert!(flags & libc::FD_CLOEXEC != 0, "{flags}");
+            assert!(std::env::var("LISTEN_PID").is_err());
+            drop(store);
+        });
+    }
+
+    #[test]
+    fn a_torn_tail_gets_a_recover_row_and_a_mid_file_tear_is_left_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("receipts.jsonl");
+        let (mut store, _) = open_path(dir.path());
+        store.append(shutdown()).unwrap();
+        drop(store);
+        let mut bytes = std::fs::read(&path).unwrap();
+        bytes.truncate(bytes.len() - 8);
+        let torn = bytes.clone();
+        std::fs::write(&path, &torn).unwrap();
+        let (store, opened) =
+            ReceiptStore::open(StoreSource::Path(path.clone()), &LiveProbe, "echo").unwrap();
+        assert!(opened.recovered);
+        assert!(!opened.repaired_newline);
+        assert_eq!(opened.report.state(), VerifyState::Warn);
+        drop(store);
+        let repaired = std::fs::read(&path).unwrap();
+        assert!(repaired.starts_with(&torn));
+        let report = chain::verify_lines(repaired.as_slice());
+        assert_eq!(report.state(), VerifyState::Warn, "{report:?}");
+        let text = std::str::from_utf8(&repaired).unwrap();
+        assert!(text.contains("\"kind\":\"recover\""));
+
+        let nl = repaired.iter().position(|byte| *byte == b'\n').unwrap();
+        let mut mid = repaired[..nl + 1].to_vec();
+        let marker = b"XXXX-mid-tear";
+        mid.extend(marker);
+        mid.push(b'\n');
+        mid.extend(&repaired[nl + 1..]);
+        std::fs::write(&path, &mid).unwrap();
+        let err =
+            ReceiptStore::open(StoreSource::Path(path.clone()), &LiveProbe, "echo").unwrap_err();
+        assert!(matches!(err, StoreError::Broken { .. }), "{err}");
+        assert_eq!(std::fs::read(&path).unwrap(), mid);
+    }
+
+    #[test]
+    fn a_complete_row_missing_its_newline_gets_only_a_newline() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("receipts.jsonl");
+        let (mut store, _) = open_path(dir.path());
+        store.append(shutdown()).unwrap();
+        drop(store);
+        let mut bytes = std::fs::read(&path).unwrap();
+        assert_eq!(bytes.pop(), Some(b'\n'));
+        std::fs::write(&path, &bytes).unwrap();
+        let (store, opened) =
+            ReceiptStore::open(StoreSource::Path(path.clone()), &LiveProbe, "echo").unwrap();
+        assert!(opened.repaired_newline);
+        assert!(!opened.recovered);
+        drop(store);
+        let after = std::fs::read(&path).unwrap();
+        let mut expected = bytes;
+        expected.push(b'\n');
+        assert_eq!(after, expected);
+        assert_eq!(
+            chain::verify_lines(after.as_slice()).state(),
+            VerifyState::Ok
+        );
+    }
+
+    #[test]
+    fn a_torn_first_line_is_replaced_on_a_path_and_refused_on_a_systemd_fd() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("receipts.jsonl");
+        let torn = b"{\"e\":{\"kind\":\"gen";
+        std::fs::write(&path, torn).unwrap();
+        let (store, opened) =
+            ReceiptStore::open(StoreSource::Path(path.clone()), &LiveProbe, "echo").unwrap();
+        assert!(opened.recreated);
+        drop(store);
+        let text = std::fs::read(&path).unwrap();
+        let report = chain::verify_lines(text.as_slice());
+        assert_eq!(report.state(), VerifyState::Ok, "{report:?}");
+        assert_eq!(report.rows, 1);
+        assert_ne!(text, torn);
+
+        std::fs::write(&path, torn).unwrap();
+        let appending = OpenOptions::new()
+            .read(true)
+            .append(true)
+            .open(&path)
+            .unwrap();
+        with_forced_fd(&appending, || {
+            let err = ReceiptStore::open(
+                StoreSource::SystemdFd { name: "receipts" },
+                &LiveProbe,
+                "echo",
+            )
+            .unwrap_err();
+            let StoreError::Rotate { path: named } = err else {
+                panic!("expected rotate");
+            };
+            assert!(named.contains("receipts.jsonl"), "{named}");
+            assert!(std::fs::read(&path).unwrap() == torn);
+        });
+    }
+
+    #[test]
+    fn second_open_on_the_same_file_fails() {
+        if std::env::var_os("RECEIPT_FLOCK_CHILD").is_some() {
+            let path = std::env::var("RECEIPT_FLOCK_PATH").unwrap();
+            let err =
+                ReceiptStore::open(StoreSource::Path(path.into()), &LiveProbe, "echo").unwrap_err();
+            assert!(matches!(err, StoreError::Locked), "{err}");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("receipts.jsonl");
+        let store =
+            ReceiptStore::open(StoreSource::Path(path.clone()), &LiveProbe, "echo").unwrap();
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .arg("oneself::store::tests::second_open_on_the_same_file_fails")
+            .arg("--exact")
+            .env("RECEIPT_FLOCK_CHILD", "1")
+            .env("RECEIPT_FLOCK_PATH", &path)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "stdout {}\nstderr {}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        drop(store.0);
+    }
+
+    #[test]
+    fn an_append_failure_poisons_the_store_and_the_next_success_writes_a_gap() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("receipts.jsonl");
+        let (mut store, _) = open_path(dir.path());
+        store.fail_next_write();
+        let err = store.append(shutdown()).unwrap_err();
+        assert!(store.is_poisoned());
+        assert!(err.to_string().contains("poisoned"), "{err}");
+        let before = std::fs::read(&path).unwrap();
+        store.append(shutdown()).unwrap();
+        assert!(!store.is_poisoned());
+        let after = std::fs::read(&path).unwrap();
+        assert!(after.starts_with(&before));
+        let added = std::str::from_utf8(&after[before.len()..]).unwrap();
+        assert!(added.contains("\"kind\":\"gap\""));
+        assert!(added.contains("\"dropped\":1"));
+        assert!(added.contains("\"kind\":\"shutdown\""));
+        assert_eq!(
+            chain::verify_lines(after.as_slice()).state(),
+            VerifyState::Ok
+        );
+    }
+
+    #[test]
+    fn each_protection_condition_can_fail_on_its_own() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("receipts.jsonl");
+        let cases = [
+            FakeProbe {
+                systemd_fd: false,
+                ..FakeProbe::protected()
+            },
+            FakeProbe {
+                owner_root: false,
+                ..FakeProbe::protected()
+            },
+            FakeProbe {
+                mode_safe: false,
+                ..FakeProbe::protected()
+            },
+            FakeProbe {
+                append_flag: false,
+                ..FakeProbe::protected()
+            },
+            FakeProbe {
+                parent_safe: false,
+                ..FakeProbe::protected()
+            },
+        ];
+        for probe in cases {
+            let (store, opened) =
+                ReceiptStore::open(StoreSource::Path(path.clone()), &probe, "echo").unwrap();
+            assert!(!opened.protection.is_protected());
+            assert_eq!(opened.protection.systemd_fd, probe.systemd_fd);
+            assert_eq!(opened.protection.owner_root, probe.owner_root);
+            assert_eq!(opened.protection.mode_safe, probe.mode_safe);
+            assert_eq!(opened.protection.append_flag, probe.append_flag);
+            assert_eq!(opened.protection.parent_safe, probe.parent_safe);
+            drop(store);
+        }
+        let (store, opened) =
+            ReceiptStore::open(StoreSource::Path(path), &FakeProbe::protected(), "echo").unwrap();
+        assert!(opened.protection.is_protected());
+        drop(store);
+    }
+
+    #[test]
+    fn an_open_without_a_close_is_an_orphan() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut store, _) = open_path(dir.path());
+        store
+            .append(ReceiptEvent::Open {
+                stream: "s1".to_string(),
+                channel: "chat".to_string(),
+                principal: "owner".to_string(),
+                principal_sha256: None,
+                task_id: None,
+                parent: None,
+            })
+            .unwrap();
+        drop(store);
+        let bytes = std::fs::read(dir.path().join("receipts.jsonl")).unwrap();
+        assert_eq!(orphan_streams(&bytes), vec!["s1".to_string()]);
+    }
+}

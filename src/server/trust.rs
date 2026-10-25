@@ -130,6 +130,7 @@ mod tests {
             platform: crate::config::PlatformConfig::default(),
             system_prompt_budget: crate::config::SystemPromptBudgetConfig::default(),
             probe: crate::config::ProbeConfig::default(),
+            receipts: crate::config::ReceiptsConfig::default(),
             peers: std::collections::HashMap::new(),
             plugins: std::collections::HashMap::new(),
             tui: crate::config::TuiConfig::default(),
