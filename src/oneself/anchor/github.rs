@@ -1,7 +1,9 @@
-//! Contents API on `heads/<pulse>/<year>.log`.
+//! Contents API on `heads/<pulse>/<YYYY>-<MM>.log` (UTC).
 //!
-//! GET the object, PUT the previous bytes plus one line. A 409 is one fresh
-//! GET and one retry. A 404 on GET creates the file.
+//! History lists `heads/<pulse>`. A 404 there means no history. Each
+//! `YYYY-MM.log` entry is read and kept only when `encoding` is `base64` and
+//! the decoded length equals `size`. Anything else is an error and is not
+//! published. A month file that would pass 800 KB is not written.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -13,7 +15,8 @@ use chrono::{DateTime, Datelike, Utc};
 use super::{format_line, parse_history, Anchor, AnchorError, AnchorLine, BoxFuture, Secret};
 
 const API_VERSION: &str = "2026-03-10";
-const MAX_BYTES: usize = 1024 * 1024;
+const MAX_BODY: usize = 2 * 1024 * 1024;
+const MONTH_CAP: usize = 800 * 1024;
 
 pub struct GitHubAnchor {
     owner: String,
@@ -56,6 +59,9 @@ impl GitHubAnchor {
         now: Arc<dyn Fn() -> DateTime<Utc> + Send + Sync>,
     ) -> Result<Self, AnchorError> {
         super::config::check_api_base(&api_base)?;
+        super::config::check_repo_parts(&owner, &repo)?;
+        super::config::check_branch(&branch)?;
+        super::config::check_dir(&dir)?;
         let client = reqwest::Client::builder()
             .timeout(Duration::from_secs(30))
             .redirect(reqwest::redirect::Policy::none())
@@ -73,8 +79,21 @@ impl GitHubAnchor {
         })
     }
 
-    fn path(&self, pulse: &str, year: i32) -> String {
-        format!("{}/{pulse}/{year}.log", self.dir.trim_matches('/'))
+    fn root(&self) -> &str {
+        self.dir.trim_matches('/')
+    }
+
+    fn pulse_dir(&self, pulse: &str) -> String {
+        format!("{}/{pulse}", self.root())
+    }
+
+    fn month_path(&self, pulse: &str, when: DateTime<Utc>) -> String {
+        format!(
+            "{}/{pulse}/{:04}-{:02}.log",
+            self.root(),
+            when.year(),
+            when.month()
+        )
     }
 
     fn url(&self, path: &str) -> String {
@@ -84,48 +103,99 @@ impl GitHubAnchor {
             encode(&self.owner),
             encode(&self.repo),
             encode_path(path),
-            encode(&self.branch)
+            encode_path(&self.branch)
         )
     }
 
-    fn request(&self, method: reqwest::Method, url: &str) -> reqwest::RequestBuilder {
-        self.client
+    fn branch_url(&self) -> String {
+        let base = self.api_base.trim_end_matches('/');
+        format!(
+            "{base}/repos/{}/{}/branches/{}",
+            encode(&self.owner),
+            encode(&self.repo),
+            encode_path(&self.branch)
+        )
+    }
+
+    fn request(
+        &self,
+        method: reqwest::Method,
+        url: &str,
+    ) -> Result<reqwest::RequestBuilder, AnchorError> {
+        let mut authorization =
+            reqwest::header::HeaderValue::from_str(&format!("Bearer {}", self.token.expose()))
+                .map_err(|_| AnchorError::Transport)?;
+        authorization.set_sensitive(true);
+        Ok(self
+            .client
             .request(method, url)
-            .header("Authorization", format!("Bearer {}", self.token.expose()))
+            .header(reqwest::header::AUTHORIZATION, authorization)
             .header("X-GitHub-Api-Version", API_VERSION)
             .header(
                 "User-Agent",
                 format!("pulse-null/{}", env!("CARGO_PKG_VERSION")),
-            )
+            ))
     }
 
-    async fn get(&self, path: &str) -> Result<Option<(String, String)>, AnchorError> {
+    async fn ensure_branch(&self) -> Result<(), AnchorError> {
         let response = self
-            .request(reqwest::Method::GET, &self.url(path))
+            .request(reqwest::Method::GET, &self.branch_url())?
+            .header("Accept", "application/vnd.github+json")
+            .send()
+            .await
+            .map_err(|_| AnchorError::Transport)?;
+        let status = response.status();
+        let _body = read_body(response).await?;
+        if status.is_success() {
+            return Ok(());
+        }
+        Err(self.status(status))
+    }
+
+    async fn list_months(&self, dir: &str) -> Result<Vec<String>, AnchorError> {
+        let response = self
+            .request(reqwest::Method::GET, &self.url(dir))?
+            .header("Accept", "application/vnd.github+json")
+            .send()
+            .await
+            .map_err(|_| AnchorError::Transport)?;
+        let status = response.status();
+        let bytes = read_body(response).await?;
+        if status.as_u16() == 404 {
+            return Ok(Vec::new());
+        }
+        if !status.is_success() {
+            return Err(self.status(status));
+        }
+        let listed: Vec<Listed> = serde_json::from_slice(&bytes).map_err(|_| AnchorError::Body)?;
+        let mut names: Vec<String> = listed
+            .into_iter()
+            .map(|item| item.name)
+            .filter(|name| month_log(name))
+            .collect();
+        names.sort();
+        names.dedup();
+        Ok(names)
+    }
+
+    /// `Ok(None)` is a missing file. Any other body must be a verified object.
+    async fn get_file(&self, path: &str) -> Result<Option<RemoteFile>, AnchorError> {
+        let response = self
+            .request(reqwest::Method::GET, &self.url(path))?
             .header("Accept", "application/vnd.github.object+json")
             .send()
             .await
             .map_err(|_| AnchorError::Transport)?;
         let status = response.status();
+        let bytes = read_body(response).await?;
         if status.as_u16() == 404 {
             return Ok(None);
         }
         if !status.is_success() {
             return Err(self.status(status));
         }
-        let body: Object = response.json().await.map_err(|_| AnchorError::Transport)?;
-        let raw = body.content.unwrap_or_default();
-        let cleaned: String = raw.chars().filter(|ch| !ch.is_whitespace()).collect();
-        let bytes = if cleaned.is_empty() {
-            Vec::new()
-        } else {
-            STANDARD.decode(cleaned).map_err(|_| AnchorError::Line)?
-        };
-        if bytes.len() > MAX_BYTES {
-            return Err(AnchorError::TooLarge);
-        }
-        let text = String::from_utf8(bytes).map_err(|_| AnchorError::Line)?;
-        Ok(Some((body.sha.unwrap_or_default(), text)))
+        let object: Object = serde_json::from_slice(&bytes).map_err(|_| AnchorError::Body)?;
+        Ok(Some(verified_file(object)?))
     }
 
     async fn put_once(
@@ -135,8 +205,8 @@ impl GitHubAnchor {
         sha: Option<&str>,
         message: &str,
     ) -> Result<(), AnchorError> {
-        if text.len() > MAX_BYTES {
-            return Err(AnchorError::TooLarge);
+        if text.len() > MONTH_CAP {
+            return Err(AnchorError::Rotate);
         }
         let mut body = serde_json::json!({
             "message": message,
@@ -144,16 +214,20 @@ impl GitHubAnchor {
             "branch": self.branch,
         });
         if let Some(sha) = sha {
+            if sha.is_empty() {
+                return Err(AnchorError::Sha);
+            }
             body["sha"] = serde_json::Value::String(sha.to_string());
         }
         let response = self
-            .request(reqwest::Method::PUT, &self.url(path))
+            .request(reqwest::Method::PUT, &self.url(path))?
             .header("Accept", "application/vnd.github+json")
             .json(&body)
             .send()
             .await
             .map_err(|_| AnchorError::Transport)?;
         let status = response.status();
+        let _body = read_body(response).await?;
         if status.is_success() {
             return Ok(());
         }
@@ -169,9 +243,13 @@ impl GitHubAnchor {
         let message = format!("{} {}", line.pulse, line.seq);
         let mut retried = false;
         loop {
-            let current = self.get(path).await?;
-            let text = append_text(current.as_ref().map(|(_, text)| text.as_str()), line);
-            let sha = current.as_ref().map(|(sha, _)| sha.as_str());
+            let current = self.get_file(path).await?;
+            let previous = current.as_ref().map(|file| file.text.as_str());
+            let text = append_text(previous, line);
+            if text.len() > MONTH_CAP {
+                return Err(AnchorError::Rotate);
+            }
+            let sha = current.as_ref().map(|file| file.sha.as_str());
             match self.put_once(path, &text, sha, &message).await {
                 Ok(()) => return Ok(()),
                 Err(AnchorError::Status(409)) if !retried => {
@@ -181,6 +259,69 @@ impl GitHubAnchor {
             }
         }
     }
+}
+
+struct RemoteFile {
+    sha: String,
+    text: String,
+}
+
+fn verified_file(object: Object) -> Result<RemoteFile, AnchorError> {
+    if object.encoding.as_deref() != Some("base64") {
+        return Err(AnchorError::Encoding);
+    }
+    let Some(size) = object.size else {
+        return Err(AnchorError::Size);
+    };
+    let raw = object.content.unwrap_or_default();
+    let cleaned: String = raw.chars().filter(|ch| !ch.is_whitespace()).collect();
+    let bytes = if cleaned.is_empty() {
+        Vec::new()
+    } else {
+        STANDARD.decode(cleaned).map_err(|_| AnchorError::Body)?
+    };
+    if bytes.len() as u64 != size || bytes.len() > MAX_BODY {
+        return Err(if bytes.len() > MAX_BODY {
+            AnchorError::TooLarge
+        } else {
+            AnchorError::Size
+        });
+    }
+    let sha = object.sha.unwrap_or_default();
+    if sha.is_empty() {
+        return Err(AnchorError::Sha);
+    }
+    let text = String::from_utf8(bytes).map_err(|_| AnchorError::Body)?;
+    Ok(RemoteFile { sha, text })
+}
+
+fn month_log(name: &str) -> bool {
+    let bytes = name.as_bytes();
+    bytes.len() == 11
+        && bytes[4] == b'-'
+        && bytes[7] == b'.'
+        && &bytes[8..] == b"log"
+        && bytes[..4].iter().all(u8::is_ascii_digit)
+        && bytes[5..7].iter().all(u8::is_ascii_digit)
+}
+
+fn plain_pulse(pulse: &str) -> Result<(), AnchorError> {
+    if crate::config::validate::is_plain_pulse_name(pulse) {
+        Ok(())
+    } else {
+        Err(AnchorError::Config("pulse".into()))
+    }
+}
+
+async fn read_body(mut response: reqwest::Response) -> Result<Vec<u8>, AnchorError> {
+    let mut body = Vec::new();
+    while let Some(chunk) = response.chunk().await.map_err(|_| AnchorError::Transport)? {
+        if body.len().saturating_add(chunk.len()) > MAX_BODY {
+            return Err(AnchorError::TooLarge);
+        }
+        body.extend_from_slice(&chunk);
+    }
+    Ok(body)
 }
 
 fn append_text(previous: Option<&str>, line: &AnchorLine) -> String {
@@ -222,6 +363,13 @@ fn encode(text: &str) -> String {
 struct Object {
     sha: Option<String>,
     content: Option<String>,
+    encoding: Option<String>,
+    size: Option<u64>,
+}
+
+#[derive(serde::Deserialize)]
+struct Listed {
+    name: String,
 }
 
 impl Anchor for GitHubAnchor {
@@ -234,12 +382,14 @@ impl Anchor for GitHubAnchor {
         pulse: &'a str,
     ) -> BoxFuture<'a, Result<Vec<AnchorLine>, AnchorError>> {
         Box::pin(async move {
-            let year = (self.now)().year();
+            plain_pulse(pulse)?;
+            self.ensure_branch().await?;
             let mut lines = Vec::new();
-            for year in [year - 1, year] {
-                let path = self.path(pulse, year);
-                if let Some((_, text)) = self.get(&path).await? {
-                    lines.extend(parse_history(&text)?);
+            for name in self.list_months(&self.pulse_dir(pulse)).await? {
+                let path = format!("{}/{name}", self.pulse_dir(pulse));
+                match self.get_file(&path).await? {
+                    Some(file) => lines.extend(parse_history(&file.text)?),
+                    None => return Err(AnchorError::Status(404)),
                 }
             }
             Ok(lines)
@@ -247,8 +397,12 @@ impl Anchor for GitHubAnchor {
     }
 
     fn publish<'a>(&'a self, line: &'a AnchorLine) -> BoxFuture<'a, Result<(), AnchorError>> {
-        let path = self.path(&line.pulse, (self.now)().year());
-        Box::pin(async move { self.publish_path(&path, line).await })
+        Box::pin(async move {
+            plain_pulse(&line.pulse)?;
+            self.ensure_branch().await?;
+            let path = self.month_path(&line.pulse, (self.now)());
+            self.publish_path(&path, line).await
+        })
     }
 }
 
@@ -271,12 +425,16 @@ mod tests {
 
     struct Mock {
         files: Mutex<HashMap<String, (String, String)>>,
+        raw: Mutex<HashMap<String, String>>,
+        listings: Mutex<HashMap<String, Vec<String>>>,
+        paths: Mutex<Vec<String>>,
         puts: Mutex<Vec<serde_json::Value>>,
         gets: AtomicUsize,
         put_status: Mutex<Vec<u16>>,
         get_status: Mutex<Vec<u16>>,
         headers: Mutex<Vec<(String, String, String)>>,
         stale_once: AtomicBool,
+        missing: AtomicBool,
         sha_n: AtomicUsize,
     }
 
@@ -284,12 +442,16 @@ mod tests {
         fn new() -> Self {
             Self {
                 files: Mutex::new(HashMap::new()),
+                raw: Mutex::new(HashMap::new()),
+                listings: Mutex::new(HashMap::new()),
+                paths: Mutex::new(Vec::new()),
                 puts: Mutex::new(Vec::new()),
                 gets: AtomicUsize::new(0),
                 put_status: Mutex::new(Vec::new()),
                 get_status: Mutex::new(Vec::new()),
                 headers: Mutex::new(Vec::new()),
                 stale_once: AtomicBool::new(false),
+                missing: AtomicBool::new(false),
                 sha_n: AtomicUsize::new(1),
             }
         }
@@ -317,23 +479,54 @@ mod tests {
             .to_string();
         mock.headers.lock().unwrap().push((bearer, version, agent));
         let path = request.uri().path().to_string();
+        mock.paths.lock().unwrap().push(path.clone());
         let key = path.split("/contents/").nth(1).unwrap_or("").to_string();
         match request.method().as_str() {
             "GET" => {
                 mock.gets.fetch_add(1, Ordering::Relaxed);
+                if mock.missing.load(Ordering::Relaxed) {
+                    return (StatusCode::NOT_FOUND, "missing".into());
+                }
                 if let Some(status) = mock.get_status.lock().unwrap().pop() {
                     return (StatusCode::from_u16(status).unwrap(), "no".into());
                 }
-                let files = mock.files.lock().unwrap();
-                if let Some((sha, text)) = files.get(&key) {
+                if path.contains("/branches/") {
+                    return (StatusCode::OK, "{\"name\":\"main\"}".into());
+                }
+                if let Some(body) = mock.raw.lock().unwrap().get(&key).cloned() {
+                    return (StatusCode::OK, body);
+                }
+                let file = mock.files.lock().unwrap().get(&key).cloned();
+                if let Some((sha, text)) = file {
                     let body = serde_json::json!({
                         "sha": sha,
                         "content": STANDARD.encode(text.as_bytes()),
                         "encoding": "base64",
+                        "size": text.len(),
                     });
-                    (StatusCode::OK, body.to_string())
-                } else {
+                    return (StatusCode::OK, body.to_string());
+                }
+                if let Some(names) = mock.listings.lock().unwrap().get(&key).cloned() {
+                    return (StatusCode::OK, listed(&names));
+                }
+                let names = {
+                    let files = mock.files.lock().unwrap();
+                    let prefix = format!("{key}/");
+                    let mut names: Vec<String> = files
+                        .keys()
+                        .filter_map(|item| {
+                            item.strip_prefix(&prefix)
+                                .filter(|rest| !rest.contains('/'))
+                                .map(str::to_string)
+                        })
+                        .collect();
+                    names.sort();
+                    names
+                };
+                if names.is_empty() {
                     (StatusCode::NOT_FOUND, "missing".into())
+                } else {
+                    (StatusCode::OK, listed(&names))
                 }
             }
             "PUT" => {
@@ -378,6 +571,14 @@ mod tests {
         }
     }
 
+    fn listed(names: &[String]) -> String {
+        serde_json::json!(names
+            .iter()
+            .map(|name| serde_json::json!({"name": name}))
+            .collect::<Vec<_>>())
+        .to_string()
+    }
+
     async fn serve(mock: Arc<Mock>) -> String {
         let app = Router::new()
             .route("/{*rest}", any(handle))
@@ -400,7 +601,7 @@ mod tests {
         }
     }
 
-    fn anchor(base: String, year: i32) -> GitHubAnchor {
+    fn github_at(base: String, year: i32) -> GitHubAnchor {
         GitHubAnchor::with_clock(
             "owner".into(),
             "repo".into(),
@@ -413,17 +614,29 @@ mod tests {
         .unwrap()
     }
 
+    fn echo_index() -> chain::ChainIndex {
+        let bytes = super::super::receipt_bytes(&[
+            ReceiptEvent::Genesis {
+                pulse: "echo".into(),
+            },
+            ReceiptEvent::Shutdown {
+                reason: "stop".into(),
+            },
+        ]);
+        chain::index_bytes(&bytes)
+    }
+
     #[tokio::test]
     async fn create_append_conflict_and_headers() {
         let mock = Arc::new(Mock::new());
         let base = serve(mock.clone()).await;
-        let anchor = anchor(base, 2026);
+        let anchor = github_at(base, 2026);
         anchor.publish(&line(1, &"ab".repeat(32))).await.unwrap();
         let stored = mock
             .files
             .lock()
             .unwrap()
-            .get("heads/echo/2026.log")
+            .get("heads/echo/2026-06.log")
             .unwrap()
             .1
             .clone();
@@ -446,7 +659,7 @@ mod tests {
             .files
             .lock()
             .unwrap()
-            .get("heads/echo/2026.log")
+            .get("heads/echo/2026-06.log")
             .unwrap()
             .1
             .clone();
@@ -465,15 +678,15 @@ mod tests {
             let mock = Arc::new(Mock::new());
             if status == 404 {
                 mock.put_status.lock().unwrap().push(404);
-                mock.files
-                    .lock()
-                    .unwrap()
-                    .insert("heads/echo/2026.log".into(), ("sha1".into(), String::new()));
+                mock.files.lock().unwrap().insert(
+                    "heads/echo/2026-06.log".into(),
+                    ("sha1".into(), String::new()),
+                );
             } else {
                 mock.get_status.lock().unwrap().push(status);
             }
             let base = serve(mock).await;
-            let anchor = anchor(base, 2026);
+            let anchor = github_at(base, 2026);
             let err = anchor
                 .publish(&line(1, &"ab".repeat(32)))
                 .await
@@ -489,7 +702,7 @@ mod tests {
         let mock = Arc::new(Mock::new());
         mock.get_status.lock().unwrap().push(401);
         let base = serve(mock).await;
-        let anchor = anchor(base, 2026);
+        let anchor = github_at(base, 2026);
         let buf = std::sync::Arc::new(Mutex::new(Vec::<u8>::new()));
         let writer = buf.clone();
         let subscriber = tracing_subscriber::fmt()
@@ -519,6 +732,37 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_month_rollover_reads_both_months() {
+        let mock = Arc::new(Mock::new());
+        let base = serve(mock.clone()).await;
+        let month = Arc::new(std::sync::atomic::AtomicU32::new(6));
+        let clock = month.clone();
+        let anchor = GitHubAnchor::with_clock(
+            "owner".into(),
+            "repo".into(),
+            "main".into(),
+            "heads".into(),
+            base,
+            Secret::new("pn108-token-do-not-leak".into()),
+            Arc::new(move || {
+                let month = clock.load(Ordering::Relaxed);
+                Utc.with_ymd_and_hms(2026, month, 1, 0, 0, 0).unwrap()
+            }),
+        )
+        .unwrap();
+        anchor.publish(&line(1, &"ab".repeat(32))).await.unwrap();
+        month.store(7, Ordering::Relaxed);
+        anchor.publish(&line(2, &"cd".repeat(32))).await.unwrap();
+        let history = anchor.history("echo").await.unwrap();
+        assert_eq!(history.len(), 2, "{history:?}");
+        assert_eq!(history[0].seq, 1);
+        assert_eq!(history[1].seq, 2);
+        let files = mock.files.lock().unwrap();
+        assert!(files.contains_key("heads/echo/2026-06.log"));
+        assert!(files.contains_key("heads/echo/2026-07.log"));
+    }
+
+    #[tokio::test]
     async fn a_year_rollover_reads_both_files() {
         let mock = Arc::new(Mock::new());
         let base = serve(mock.clone()).await;
@@ -544,16 +788,198 @@ mod tests {
         assert_eq!(history.len(), 2, "{history:?}");
         assert_eq!(history[0].seq, 1);
         assert_eq!(history[1].seq, 2);
-        assert!(mock
-            .files
+        let files = mock.files.lock().unwrap();
+        assert!(files.contains_key("heads/echo/2026-01.log"));
+        assert!(files.contains_key("heads/echo/2027-01.log"));
+    }
+
+    #[tokio::test]
+    async fn encoding_none_and_a_size_mismatch_publish_nothing() {
+        let head = "ab".repeat(32);
+        let text = format!("v1 echo 0123456789abcdef 1 {head} 2026-10-25T00:00:00.000Z\n");
+        let mock = Arc::new(Mock::new());
+        mock.files.lock().unwrap().insert(
+            "heads/echo/2026-06.log".into(),
+            ("bigsha".into(), text.clone()),
+        );
+        mock.raw.lock().unwrap().insert(
+            "heads/echo/2026-06.log".into(),
+            serde_json::json!({
+                "sha": "bigsha",
+                "content": "",
+                "encoding": "none",
+                "size": 1_100_000,
+            })
+            .to_string(),
+        );
+        let base = serve(mock.clone()).await;
+        let anchor = github_at(base, 2026);
+        let err = anchor.history("echo").await.unwrap_err();
+        assert!(matches!(err, super::AnchorError::Encoding), "{err}");
+        let err = anchor.publish(&line(2, &head)).await.unwrap_err();
+        assert!(matches!(err, super::AnchorError::Encoding), "{err}");
+        assert!(mock.puts.lock().unwrap().is_empty());
+
+        let mock = Arc::new(Mock::new());
+        mock.raw.lock().unwrap().insert(
+            "heads/echo/2026-06.log".into(),
+            serde_json::json!({
+                "sha": "abc",
+                "content": STANDARD.encode(b"hello"),
+                "encoding": "base64",
+                "size": 999,
+            })
+            .to_string(),
+        );
+        let base = serve(mock.clone()).await;
+        let anchor = github_at(base, 2026);
+        let err = anchor.publish(&line(2, &head)).await.unwrap_err();
+        assert!(matches!(err, super::AnchorError::Size), "{err}");
+        assert!(err.to_string().contains("size"), "{err}");
+        assert!(mock.puts.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_hostile_directory_listing_reads_only_month_files() {
+        let head = "ab".repeat(32);
+        let text = format!("v1 echo 0123456789abcdef 1 {head} 2026-10-25T00:00:00.000Z\n");
+        let mock = Arc::new(Mock::new());
+        mock.files
             .lock()
             .unwrap()
-            .contains_key("heads/echo/2026.log"));
-        assert!(mock
-            .files
+            .insert("heads/echo/2026-06.log".into(), ("sha1".into(), text));
+        mock.listings.lock().unwrap().insert(
+            "heads/echo".into(),
+            vec![
+                "../x.log".into(),
+                "note.txt".into(),
+                "2026.log".into(),
+                "2026-06.log.bak".into(),
+                "2026-06.log".into(),
+            ],
+        );
+        let base = serve(mock.clone()).await;
+        let anchor = github_at(base, 2026);
+        let history = anchor.history("echo").await.unwrap();
+        assert_eq!(history.len(), 1);
+        assert_eq!(history[0].seq, 1);
+        let paths = mock.paths.lock().unwrap().clone();
+        let contents: Vec<_> = paths
+            .iter()
+            .filter(|path| path.contains("/contents/"))
+            .cloned()
+            .collect();
+        assert!(
+            contents.iter().any(|path| path.ends_with("/heads/echo")),
+            "{contents:?}"
+        );
+        assert!(
+            contents
+                .iter()
+                .any(|path| path.ends_with("/heads/echo/2026-06.log")),
+            "{contents:?}"
+        );
+        assert!(
+            contents.iter().all(|path| {
+                !path.contains("x.log") && !path.contains("note.txt") && !path.contains(".bak")
+            }),
+            "{contents:?}"
+        );
+        assert!(mock.puts.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_missing_branch_is_unverified_and_an_empty_history_is_none() {
+        let index = echo_index();
+        let mock = Arc::new(Mock::new());
+        mock.missing.store(true, Ordering::Relaxed);
+        let base = serve(mock.clone()).await;
+        let backends: Vec<Box<dyn Anchor>> = vec![Box::new(github_at(base, 2026))];
+        let out = super::super::check(&index, &backends).await.unwrap();
+        assert_eq!(out.state, "unverified");
+        assert_eq!(out.notes[0].state, "unverified");
+        assert!(
+            out.notes[0].detail.as_deref().unwrap_or("").contains("404"),
+            "{out:?}"
+        );
+        assert_ne!(out.notes[0].state, "ok");
+        let out = super::super::sync(&index, &backends, false).await.unwrap();
+        assert_eq!(out.state, "unverified");
+        assert!(mock.puts.lock().unwrap().is_empty());
+
+        let mock = Arc::new(Mock::new());
+        let base = serve(mock.clone()).await;
+        let backends: Vec<Box<dyn Anchor>> = vec![Box::new(github_at(base, 2026))];
+        let out = super::super::check(&index, &backends).await.unwrap();
+        assert_eq!(out.notes[0].state, "none");
+        assert_ne!(out.notes[0].state, "ok");
+        assert!(mock.puts.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_month_file_over_800kb_is_not_extended() {
+        let mock = Arc::new(Mock::new());
+        let mut body = vec![b'x'; 800 * 1024];
+        *body.last_mut().unwrap() = b'\n';
+        let text = String::from_utf8(body).unwrap();
+        mock.files
             .lock()
             .unwrap()
-            .contains_key("heads/echo/2027.log"));
+            .insert("heads/echo/2026-06.log".into(), ("sha1".into(), text));
+        let base = serve(mock.clone()).await;
+        let anchor = github_at(base, 2026);
+        let err = anchor
+            .publish(&line(1, &"ab".repeat(32)))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, super::AnchorError::Rotate), "{err}");
+        assert!(err.to_string().contains("800 KB"), "{err}");
+        assert!(mock.puts.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_bad_target_sends_nothing() {
+        let mock = Arc::new(Mock::new());
+        let base = serve(mock.clone()).await;
+        let bad = [
+            ("..", "repo", "main", "heads"),
+            ("owner", "..", "main", "heads"),
+            (".", "repo", "main", "heads"),
+            ("owner", "repo", "-main", "heads"),
+            ("owner", "repo", "a/../b", "heads"),
+            ("owner", "repo", "main", "/heads"),
+            ("owner", "repo", "main", "heads/../x"),
+            ("owner", "repo", "main", "."),
+        ];
+        for (owner, repo, branch, dir) in bad {
+            let built = GitHubAnchor::with_clock(
+                owner.into(),
+                repo.into(),
+                branch.into(),
+                dir.into(),
+                base.clone(),
+                Secret::new("pn108-token-do-not-leak".into()),
+                Arc::new(Utc::now),
+            );
+            let Err(err) = built else {
+                panic!("expected a config error for {owner}/{repo}");
+            };
+            assert!(
+                err.to_string().contains("anchor config"),
+                "{owner} {repo} {branch} {dir}: {err}"
+            );
+        }
+        let anchor = github_at(base, 2026);
+        for pulse in ["../x", "a/b", "\u{1b}esc", "\u{202e}bidi", "", ".."] {
+            let err = anchor.history(pulse).await.unwrap_err();
+            assert!(err.to_string().contains("pulse"), "{pulse:?}: {err}");
+            let mut bad_line = line(1, &"ab".repeat(32));
+            bad_line.pulse = pulse.to_string();
+            let err = anchor.publish(&bad_line).await.unwrap_err();
+            assert!(err.to_string().contains("pulse"), "{pulse:?}: {err}");
+        }
+        assert_eq!(mock.gets.load(Ordering::Relaxed), 0);
+        assert!(mock.puts.lock().unwrap().is_empty());
     }
 
     #[tokio::test]
@@ -570,7 +996,7 @@ mod tests {
         ];
         let first = super::super::receipt_bytes(&events);
         let index = chain::index_bytes(super::super::complete_prefix(&first));
-        let backends: Vec<Box<dyn Anchor>> = vec![Box::new(anchor(base.clone(), 2026))];
+        let backends: Vec<Box<dyn Anchor>> = vec![Box::new(github_at(base.clone(), 2026))];
         let out = super::super::sync(&index, &backends, false).await.unwrap();
         assert_eq!(out.state, "published");
 
@@ -579,7 +1005,7 @@ mod tests {
         });
         let second = super::super::receipt_bytes(&events);
         let index = chain::index_bytes(super::super::complete_prefix(&second));
-        let backends: Vec<Box<dyn Anchor>> = vec![Box::new(anchor(base.clone(), 2026))];
+        let backends: Vec<Box<dyn Anchor>> = vec![Box::new(github_at(base.clone(), 2026))];
         let out = super::super::sync(&index, &backends, false).await.unwrap();
         assert_eq!(out.state, "published");
         assert_eq!(mock.puts.lock().unwrap().len(), 2);
@@ -587,13 +1013,13 @@ mod tests {
             .files
             .lock()
             .unwrap()
-            .get("heads/echo/2026.log")
+            .get("heads/echo/2026-06.log")
             .unwrap()
             .1
             .clone();
         assert_eq!(text.lines().count(), 2, "{text}");
 
-        let backends: Vec<Box<dyn Anchor>> = vec![Box::new(anchor(base.clone(), 2026))];
+        let backends: Vec<Box<dyn Anchor>> = vec![Box::new(github_at(base.clone(), 2026))];
         let out = super::super::sync(&index, &backends, false).await.unwrap();
         assert_eq!(out.state, "unchanged");
         assert_eq!(mock.puts.lock().unwrap().len(), 2);
@@ -603,7 +1029,7 @@ mod tests {
         });
         let third = super::super::receipt_bytes(&events);
         let index = chain::index_bytes(&third);
-        let backends: Vec<Box<dyn Anchor>> = vec![Box::new(anchor(base, 2026))];
+        let backends: Vec<Box<dyn Anchor>> = vec![Box::new(github_at(base, 2026))];
         let out = super::super::sync(&index, &backends, true).await.unwrap();
         assert_eq!(out.state, "dry-run");
         assert!(out.line.as_deref().unwrap().starts_with("v1 echo "));
@@ -626,44 +1052,47 @@ mod tests {
 
         let mock = Arc::new(Mock::new());
         mock.files.lock().unwrap().insert(
-            "heads/echo/2026.log".into(),
+            "heads/echo/2026-06.log".into(),
             (
                 "sha1".into(),
                 format!("v1 echo {ledger} 0 {head} 2026-10-25T03:00:00.000Z\n"),
             ),
         );
         let base = serve(mock.clone()).await;
-        let backends: Vec<Box<dyn Anchor>> = vec![Box::new(anchor(base, 2026))];
+        let backends: Vec<Box<dyn Anchor>> = vec![Box::new(github_at(base, 2026))];
         let out = super::super::sync(&index, &backends, false).await.unwrap();
         assert_eq!(out.state, "mismatch");
         assert!(mock.puts.lock().unwrap().is_empty());
 
         let mock = Arc::new(Mock::new());
         mock.files.lock().unwrap().insert(
-            "heads/echo/2026.log".into(),
+            "heads/echo/2026-06.log".into(),
             (
                 "sha1".into(),
                 format!("v1 echo {ledger} 9 {head} 2026-10-25T03:00:00.000Z\n"),
             ),
         );
         let base = serve(mock.clone()).await;
-        let backends: Vec<Box<dyn Anchor>> = vec![Box::new(anchor(base, 2026))];
+        let backends: Vec<Box<dyn Anchor>> = vec![Box::new(github_at(base, 2026))];
         let out = super::super::sync(&index, &backends, false).await.unwrap();
         assert_eq!(out.state, "rewind");
         assert!(mock.puts.lock().unwrap().is_empty());
 
         let mock = Arc::new(Mock::new());
         mock.files.lock().unwrap().insert(
-            "heads/echo/2026.log".into(),
+            "heads/echo/2026-06.log".into(),
             (
                 "sha1".into(),
                 format!("v1 echo 0000000000000000 9 {head} 2026-10-25T03:00:00.000Z\n"),
             ),
         );
         let base = serve(mock.clone()).await;
-        let backends: Vec<Box<dyn Anchor>> = vec![Box::new(anchor(base, 2026))];
+        let backends: Vec<Box<dyn Anchor>> = vec![Box::new(github_at(base, 2026))];
         let out = super::super::sync(&index, &backends, false).await.unwrap();
         assert_eq!(out.state, "mismatch");
+        let detail = out.notes[0].detail.as_deref().unwrap_or("");
+        assert!(detail.contains("ledger_id 0000000000000000"), "{detail}");
+        assert!(detail.contains(&format!("local {ledger}")), "{detail}");
         assert!(mock.puts.lock().unwrap().is_empty());
     }
 }

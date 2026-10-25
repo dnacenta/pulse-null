@@ -2,8 +2,9 @@
 //!
 //! `verify`, `show`, `overlaps`, and `swaps` read a file. `anchor` is the only
 //! one that publishes, and only from this command, never from the daemon.
-//! None of them locks the receipt file or repairs a torn tail. The store does
-//! that when it opens.
+//! `anchor` holds `<receipt dir>/anchors.lock` for that run. None of them
+//! locks the receipt file or repairs a torn tail. The store does that when
+//! it opens.
 
 use std::collections::{BTreeMap, HashMap};
 use std::path::PathBuf;
@@ -51,11 +52,24 @@ pub async fn verify_at(
     // Protection looks at this fd. The path is not opened again.
     let protection = LiveProbe.probe(&file, false);
     drop(file);
-    let index = anchors.then(|| chain::index_bytes(bytes.as_slice()));
-    let report = match &index {
+    let prefix = if anchors {
+        anchor::complete_prefix(bytes.as_slice())
+    } else {
+        bytes.as_slice()
+    };
+    let torn = anchors && prefix.len() != bytes.len();
+    let index = anchors.then(|| chain::index_bytes(prefix));
+    let mut report = match &index {
         Some(index) => index.report.clone(),
         None => chain::verify_lines(bytes.as_slice()),
     };
+    if torn && report.first_break.is_none() {
+        let line = prefix.iter().filter(|byte| **byte == b'\n').count() + 1;
+        report.warns.push(chain::VerifyNote {
+            line,
+            reason: "torn tail",
+        });
+    }
     let path = located.path.clone();
     let inspected = Inspected { bytes, report };
     let compared = if let Some(index) = index
@@ -86,8 +100,10 @@ pub async fn verify_at(
 
 /// Publish one anchor line when the local chain is ahead of every backend.
 ///
-/// The receipt file is not locked. A trailing partial line is not part of
-/// the chain. A mismatch or a rewind publishes nothing.
+/// `<receipt dir>/anchors.lock` is held for the run. The receipt file is not
+/// locked. A trailing partial line is not part of the chain. A mismatch or a
+/// rewind publishes nothing. A backend whose check failed is skipped, and the
+/// others are still attempted.
 pub async fn anchor(
     pulse: String,
     file: Option<PathBuf>,
@@ -95,8 +111,8 @@ pub async fn anchor(
     token_file: Option<PathBuf>,
     dry_run: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    if pulse.is_empty() || pulse.split_whitespace().nth(1).is_some() {
-        return unverified(false, "pulse must be a single word");
+    if !crate::config::validate::is_plain_pulse_name(&pulse) {
+        return unverified(false, "pulse must be letters, digits, - or _");
     }
     let path = match resolve_path(file) {
         Ok(path) => path,
@@ -106,20 +122,29 @@ pub async fn anchor(
         Ok(opened) => opened,
         Err(err) => return unverified(false, &err.to_string()),
     };
-    let index = chain::index_bytes(anchor::complete_prefix(&bytes));
+    let prefix = anchor::complete_prefix(&bytes);
+    let torn = prefix.len() != bytes.len();
+    let index = chain::index_bytes(prefix);
     if let Some(broken) = &index.report.first_break {
         println!("broken line {}: {}", broken.line, broken.reason);
         return Err(Box::new(PrintedExit(1)));
     }
+    if torn {
+        println!("warn torn tail");
+    }
     if index.pulse.as_deref() != Some(pulse.as_str()) {
         return unverified(false, "pulse does not match the genesis row");
     }
-    let backends = match anchor::open_backends(
-        config.as_deref(),
-        token_file.as_deref(),
-        path.parent().unwrap_or(std::path::Path::new(".")),
-    ) {
+    let dir = path
+        .parent()
+        .unwrap_or(std::path::Path::new("."))
+        .to_path_buf();
+    let backends = match anchor::open_backends(config.as_deref(), token_file.as_deref(), &dir) {
         Ok(backends) => backends,
+        Err(err) => return unverified(false, &err.to_string()),
+    };
+    let _lock = match anchor::lock_ledger(&dir) {
+        Ok(lock) => lock,
         Err(err) => return unverified(false, &err.to_string()),
     };
     let outcome = match anchor::sync(&index, &backends, dry_run).await {
@@ -127,12 +152,16 @@ pub async fn anchor(
         Err(err) => return unverified(false, &err.to_string()),
     };
     for note in &outcome.notes {
-        println!("anchor {} {}", note.backend, note.state);
+        println!("{}", anchor_note(note));
     }
     match outcome.state {
         "mismatch" | "rewind" => {
             println!("{} {}", outcome.state, outcome.backend);
             Err(Box::new(PrintedExit(1)))
+        }
+        "unverified" => {
+            println!("unverified");
+            Err(Box::new(PrintedExit(2)))
         }
         "published" | "dry-run" => {
             println!("{}", outcome.state);
@@ -145,6 +174,13 @@ pub async fn anchor(
             println!("unchanged");
             Ok(())
         }
+    }
+}
+
+fn anchor_note(note: &anchor::AnchorNote) -> String {
+    match &note.detail {
+        Some(detail) => format!("anchor {} {} {detail}", note.backend, note.state),
+        None => format!("anchor {} {}", note.backend, note.state),
     }
 }
 
@@ -930,16 +966,26 @@ fn emit_verify(
         "mismatch" | "rewind" => Some(item.state),
         _ => None,
     });
+    let anchor_unverified =
+        anchors.is_some_and(|item| item.state == "unverified" || !item.failures.is_empty());
     if json_out {
         let mut value = verify_json(inspected, located, protection);
         if let Some(anchors) = anchors {
             if let Some(verdict) = verdict {
                 value["state"] = json!(verdict);
+            } else if anchor_unverified {
+                value["state"] = json!("unverified");
             }
             value["anchors"] = json!(anchors
                 .notes
                 .iter()
-                .map(|note| json!({"backend": note.backend, "state": note.state}))
+                .map(|note| {
+                    let mut item = json!({"backend": note.backend, "state": note.state});
+                    if let Some(detail) = &note.detail {
+                        item["detail"] = json!(detail);
+                    }
+                    item
+                })
                 .collect::<Vec<_>>());
         }
         println!("{}", serde_json::to_string(&value)?);
@@ -948,15 +994,19 @@ fn emit_verify(
         print_human(inspected);
         if let Some(anchors) = anchors {
             for note in &anchors.notes {
-                println!("anchor {} {}", note.backend, note.state);
+                println!("{}", anchor_note(note));
             }
             if let Some(verdict) = verdict {
                 println!("{verdict}");
+            } else if anchor_unverified {
+                println!("unverified");
             }
         }
     }
     if inspected.report.first_break.is_some() || verdict.is_some() {
         Err(Box::new(PrintedExit(1)))
+    } else if anchor_unverified {
+        Err(Box::new(PrintedExit(2)))
     } else {
         Ok(())
     }
@@ -2511,6 +2561,90 @@ mod tests {
         .unwrap();
         mode(&plain, 0o600);
         let err = anchor("echo".into(), Some(path), Some(plain), None, false)
+            .await
+            .unwrap_err();
+        assert_eq!(code(err), 2);
+    }
+
+    #[tokio::test]
+    async fn verify_anchors_warns_a_torn_tail_and_plain_verify_does_not() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = sample(dir.path());
+        let mut torn = std::fs::read(&path).unwrap();
+        torn.extend_from_slice(b"partial");
+        std::fs::write(&path, &torn).unwrap();
+        let config = local_config(dir.path());
+        let err = verify(Some(path.clone()), false).await.unwrap_err();
+        assert_eq!(code(err), 1);
+        verify_at(Some(path), false, true, Some(config), None)
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_second_anchor_exits_while_the_lock_is_held() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = sample(dir.path());
+        let config = local_config(dir.path());
+        let _held = crate::oneself::anchor::lock_ledger(dir.path()).unwrap();
+        let err = anchor("echo".into(), Some(path), Some(config), None, false)
+            .await
+            .unwrap_err();
+        assert_eq!(code(err), 2);
+        assert!(!dir.path().join("anchors.log").exists());
+    }
+
+    #[tokio::test]
+    async fn a_bad_pulse_publishes_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = sample(dir.path());
+        let config = local_config(dir.path());
+        for pulse in ["../x", "a/b", "\u{1b}esc", "\u{202e}bidi", "", ".."] {
+            let err = anchor(
+                pulse.into(),
+                Some(path.clone()),
+                Some(config.clone()),
+                None,
+                false,
+            )
+            .await
+            .unwrap_err();
+            assert_eq!(code(err), 2, "{pulse:?}");
+            assert!(!dir.path().join("anchors.log").exists(), "{pulse:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn verify_anchors_is_unverified_when_the_repo_is_missing() {
+        let app = axum::Router::new().route(
+            "/{*rest}",
+            axum::routing::any(|| async { axum::http::StatusCode::NOT_FOUND }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let dir = tempfile::tempdir().unwrap();
+        let path = sample(dir.path());
+        let token = dir.path().join("token");
+        std::fs::write(&token, "pn108-token-do-not-leak\n").unwrap();
+        mode(&token, 0o600);
+        let config = dir.path().join("anchor.toml");
+        std::fs::write(
+            &config,
+            format!(
+                "[[backend]]\nkind = \"github\"\nrepo = \"owner/repo\"\napi_base = \"http://127.0.0.1:{port}\"\ntoken_file = \"{}\"\n",
+                token.display()
+            ),
+        )
+        .unwrap();
+        mode(&config, 0o600);
+        let err = verify_at(Some(path.clone()), false, true, Some(config.clone()), None)
+            .await
+            .unwrap_err();
+        assert_eq!(code(err), 2);
+        let err = anchor("echo".into(), Some(path), Some(config), None, false)
             .await
             .unwrap_err();
         assert_eq!(code(err), 2);

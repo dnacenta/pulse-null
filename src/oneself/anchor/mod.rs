@@ -16,7 +16,7 @@ use crate::oneself::chain::{ChainIndex, IndexedRow};
 
 pub(crate) use config::{load_specs, Secret, Spec};
 pub(crate) use github::GitHubAnchor;
-pub(crate) use local::LocalFileAnchor;
+pub(crate) use local::{lock_ledger, LocalFileAnchor};
 
 pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 
@@ -48,10 +48,24 @@ pub enum AnchorError {
     Status(u16),
     #[error("github anchor failed")]
     Transport,
-    #[error("anchor file is over 1 MiB")]
+    #[error("anchor response is over 2 MiB")]
     TooLarge,
-    #[error("local anchor failed")]
-    Local,
+    #[error("local anchor: {0}")]
+    Local(String),
+    #[error("github anchor: content encoding is not base64")]
+    Encoding,
+    #[error("github anchor: content size does not match")]
+    Size,
+    #[error("github anchor: object sha is missing")]
+    Sha,
+    #[error("github anchor: response is not usable")]
+    Body,
+    #[error("anchor token file is a symlink")]
+    TokenSymlink,
+    #[error("anchor file would pass 800 KB; rotate the month file")]
+    Rotate,
+    #[error("anchor is already running")]
+    Busy,
     #[error("anchor line is not valid")]
     Line,
 }
@@ -100,15 +114,19 @@ pub fn complete_prefix(bytes: &[u8]) -> &[u8] {
 pub struct AnchorNote {
     pub backend: String,
     pub state: String,
+    /// Why a mismatch or an unverified backend looks the way it does.
+    pub detail: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Outcome {
-    /// `published`, `unchanged`, `dry-run`, `mismatch`, or `rewind`.
+    /// `published`, `unchanged`, `dry-run`, `mismatch`, `rewind`, or `unverified`.
     pub state: &'static str,
     pub backend: String,
     pub line: Option<String>,
     pub notes: Vec<AnchorNote>,
+    /// Backend failures that are not a chain mismatch. Any entry is exit 2.
+    pub failures: Vec<String>,
 }
 
 /// Read each backend and compare `(seq, head)`. Nothing is published.
@@ -116,97 +134,91 @@ pub async fn check(
     index: &ChainIndex,
     backends: &[Box<dyn Anchor>],
 ) -> Result<Outcome, AnchorError> {
-    let (failure, notes, _, _) = assess(index, backends).await?;
-    if let Some((state, backend)) = failure {
-        return Ok(Outcome {
-            state,
-            backend,
-            line: None,
-            notes,
-        });
-    }
-    Ok(Outcome {
-        state: "ok",
-        backend: String::new(),
-        line: None,
-        notes,
-    })
+    let assessed = assess(index, backends).await?;
+    Ok(outcome_of(assessed, None, false))
 }
 
 /// Read each backend, compare `(seq, head)`, and publish at most one line.
 ///
-/// A mismatch or a rewind publishes nothing. `dry_run` publishes nothing either.
+/// A mismatch or a rewind publishes nothing. A backend whose check failed is
+/// not published to; the others are still attempted. `dry_run` publishes nothing.
 pub async fn sync(
     index: &ChainIndex,
     backends: &[Box<dyn Anchor>],
     dry_run: bool,
 ) -> Result<Outcome, AnchorError> {
-    let (failure, notes, pending, line) = assess(index, backends).await?;
-    if let Some((state, backend)) = failure {
-        return Ok(Outcome {
-            state,
-            backend,
-            line: None,
-            notes,
-        });
+    let mut assessed = assess(index, backends).await?;
+    if assessed.failure.is_some() {
+        assessed.pending.fill(false);
+        return Ok(outcome_of(assessed, None, false));
     }
-    let needs = pending.iter().any(|needs| *needs);
-    let Some(line) = line else {
-        return Ok(Outcome {
-            state: "unchanged",
-            backend: String::new(),
-            line: None,
-            notes,
-        });
+    let Some(line) = assessed.line.clone() else {
+        return Ok(outcome_of(assessed, None, false));
     };
-    if !needs {
-        return Ok(Outcome {
-            state: "unchanged",
-            backend: String::new(),
-            line: None,
-            notes,
-        });
+    if !assessed.pending.iter().any(|needs| *needs) {
+        return Ok(outcome_of(assessed, None, false));
     }
     let text = format_line(&line);
     if dry_run {
-        return Ok(Outcome {
-            state: "dry-run",
-            backend: String::new(),
-            line: Some(text),
-            notes,
-        });
+        return Ok(outcome_of(assessed, Some(text), true));
     }
-    for (backend, needs) in backends.iter().zip(pending) {
-        if needs {
-            backend.publish(&line).await?;
+    for ((backend, note), needs) in backends
+        .iter()
+        .zip(assessed.notes.iter_mut())
+        .zip(assessed.pending.iter().copied())
+    {
+        if !needs {
+            continue;
+        }
+        if let Err(err) = backend.publish(&line).await {
+            note.state = "unverified".to_string();
+            note.detail = Some(err.to_string());
+            assessed.failures.push(format!("{}: {err}", backend.name()));
         }
     }
-    Ok(Outcome {
-        state: "published",
-        backend: String::new(),
-        line: Some(text),
-        notes,
-    })
+    let published = assessed.pending.iter().any(|needs| *needs) && assessed.failures.is_empty();
+    Ok(outcome_of(assessed, published.then_some(text), false))
 }
 
-async fn assess(
-    index: &ChainIndex,
-    backends: &[Box<dyn Anchor>],
-) -> Result<
-    (
-        Option<(&'static str, String)>,
-        Vec<AnchorNote>,
-        Vec<bool>,
-        Option<AnchorLine>,
-    ),
-    AnchorError,
-> {
+struct Assessed {
+    failure: Option<(&'static str, String)>,
+    notes: Vec<AnchorNote>,
+    pending: Vec<bool>,
+    line: Option<AnchorLine>,
+    failures: Vec<String>,
+}
+
+fn outcome_of(assessed: Assessed, line: Option<String>, dry_run: bool) -> Outcome {
+    let (state, backend) = if let Some((state, backend)) = assessed.failure {
+        (state, backend)
+    } else if !assessed.failures.is_empty() {
+        ("unverified", String::new())
+    } else if dry_run {
+        ("dry-run", String::new())
+    } else if line.is_some() {
+        ("published", String::new())
+    } else {
+        ("unchanged", String::new())
+    };
+    Outcome {
+        state,
+        backend,
+        line,
+        notes: assessed.notes,
+        failures: assessed.failures,
+    }
+}
+
+async fn assess(index: &ChainIndex, backends: &[Box<dyn Anchor>]) -> Result<Assessed, AnchorError> {
     let ledger_id = index
         .genesis_hash
         .as_deref()
         .filter(|hash| hash.len() >= 16)
         .map(|hash| hash[..16].to_string());
     let pulse = index.pulse.clone().unwrap_or_default();
+    if index.pulse.is_some() && !crate::config::validate::is_plain_pulse_name(&pulse) {
+        return Err(AnchorError::Config("pulse".into()));
+    }
     let heads: HashMap<u64, &str> = index
         .rows
         .iter()
@@ -215,11 +227,25 @@ async fn assess(
     let mut failure: Option<(&'static str, String)> = None;
     let mut notes = Vec::new();
     let mut pending = Vec::new();
+    let mut failures = Vec::new();
     for backend in backends {
         let history = if pulse.is_empty() {
-            Vec::new()
+            Ok(Vec::new())
         } else {
-            backend.history(&pulse).await?
+            backend.history(&pulse).await
+        };
+        let history = match history {
+            Ok(history) => history,
+            Err(err) => {
+                failures.push(format!("{}: {err}", backend.name()));
+                notes.push(AnchorNote {
+                    backend: backend.name().to_string(),
+                    state: "unverified".to_string(),
+                    detail: Some(err.to_string()),
+                });
+                pending.push(false);
+                continue;
+            }
         };
         let judged = judge(
             backend.name(),
@@ -238,20 +264,28 @@ async fn assess(
         notes.push(AnchorNote {
             backend: backend.name().to_string(),
             state: judged.state.to_string(),
+            detail: judged.detail,
         });
-        pending.push(judged.needs_publish && failure.is_none());
+        pending.push(judged.needs_publish && judged.failure.is_none());
     }
     if failure.is_some() {
         pending.fill(false);
     }
     let line = tip_line(index, ledger_id.as_deref());
-    Ok((failure, notes, pending, line))
+    Ok(Assessed {
+        failure,
+        notes,
+        pending,
+        line,
+        failures,
+    })
 }
 
 struct Judged {
     state: &'static str,
     failure: Option<&'static str>,
     needs_publish: bool,
+    detail: Option<String>,
 }
 
 fn judge(
@@ -263,33 +297,47 @@ fn judge(
     local_seq: Option<u64>,
     tip: Option<&IndexedRow>,
 ) -> Judged {
-    if name == "noop" {
+    if name == "noop" || history.is_empty() {
         return Judged {
             state: "none",
             failure: None,
-            needs_publish: false,
+            needs_publish: name != "noop" && tip.is_some(),
+            detail: None,
         };
     }
     let mut last_seq = None;
     for line in history {
+        if let Some(prev) = last_seq {
+            if line.seq < prev {
+                return failed("mismatch", Some("seq goes backwards".to_string()));
+            }
+        }
         if line.pulse != pulse {
-            return failed("mismatch");
+            return failed("mismatch", Some(format!("pulse {}", line.pulse)));
         }
         let Some(ledger_id) = ledger_id else {
-            return failed("mismatch");
+            return failed("mismatch", Some(format!("ledger_id {}", line.ledger_id)));
         };
         if line.ledger_id != ledger_id {
-            return failed("mismatch");
+            return failed(
+                "mismatch",
+                Some(format!("ledger_id {} (local {ledger_id})", line.ledger_id)),
+            );
         }
         match heads.get(&line.seq).copied() {
             Some(head) if head == line.head => {}
-            Some(_) => return failed("mismatch"),
-            None if local_seq.is_none_or(|seq| line.seq > seq) => return failed("rewind"),
-            None => return failed("mismatch"),
+            Some(_) => {
+                return failed("mismatch", Some(format!("head at seq {}", line.seq)));
+            }
+            None if local_seq.is_none_or(|seq| line.seq > seq) => {
+                return failed("rewind", Some(format!("seq {} is ahead", line.seq)));
+            }
+            None => return failed("mismatch", Some(format!("seq {}", line.seq))),
         }
         last_seq = Some(line.seq);
     }
-    let needs_publish = match (tip.map(|row| row.seq), last_seq) {
+    let anchored = history.iter().map(|line| line.seq).max();
+    let needs_publish = match (tip.map(|row| row.seq), anchored) {
         (Some(local), Some(anchored)) => local > anchored,
         (Some(_), None) => true,
         (None, _) => false,
@@ -298,14 +346,16 @@ fn judge(
         state: "ok",
         failure: None,
         needs_publish,
+        detail: None,
     }
 }
 
-fn failed(state: &'static str) -> Judged {
+fn failed(state: &'static str, detail: Option<String>) -> Judged {
     Judged {
         state,
         failure: Some(state),
         needs_publish: false,
+        detail,
     }
 }
 
@@ -313,7 +363,7 @@ fn tip_line(index: &ChainIndex, ledger_id: Option<&str>) -> Option<AnchorLine> {
     let ledger_id = ledger_id?;
     let row = index.rows.last()?;
     let pulse = index.pulse.clone()?;
-    if pulse.split_whitespace().nth(1).is_some() {
+    if !crate::config::validate::is_plain_pulse_name(&pulse) {
         return None;
     }
     Some(AnchorLine {
@@ -544,5 +594,158 @@ mod tests {
         assert_eq!(out.state, "unchanged");
         let again = std::fs::read_to_string(dir.path().join("anchors.log")).unwrap();
         assert_eq!(again, text);
+    }
+
+    fn row_line(index: &ChainIndex, seq: u64, ledger: &str) -> AnchorLine {
+        let row = index.rows.iter().find(|row| row.seq == seq).unwrap();
+        AnchorLine {
+            pulse: index.pulse.clone().unwrap(),
+            ledger_id: ledger.to_string(),
+            seq,
+            head: row.hash.clone(),
+            ts: row.ts.clone(),
+        }
+    }
+
+    struct Fail {
+        publishes: std::sync::Arc<Mutex<u64>>,
+    }
+
+    impl Anchor for Fail {
+        fn name(&self) -> &'static str {
+            "fail"
+        }
+
+        fn history<'a>(
+            &'a self,
+            _pulse: &'a str,
+        ) -> BoxFuture<'a, Result<Vec<AnchorLine>, AnchorError>> {
+            Box::pin(async { Err(AnchorError::Status(500)) })
+        }
+
+        fn publish<'a>(&'a self, _line: &'a AnchorLine) -> BoxFuture<'a, Result<(), AnchorError>> {
+            *self.publishes.lock().unwrap() += 1;
+            Box::pin(async { Err(AnchorError::Status(500)) })
+        }
+    }
+
+    struct Stop {
+        puts: std::sync::Arc<Mutex<u64>>,
+    }
+
+    impl Anchor for Stop {
+        fn name(&self) -> &'static str {
+            "stop"
+        }
+
+        fn history<'a>(
+            &'a self,
+            _pulse: &'a str,
+        ) -> BoxFuture<'a, Result<Vec<AnchorLine>, AnchorError>> {
+            Box::pin(async { Ok(Vec::new()) })
+        }
+
+        fn publish<'a>(&'a self, _line: &'a AnchorLine) -> BoxFuture<'a, Result<(), AnchorError>> {
+            *self.puts.lock().unwrap() += 1;
+            Box::pin(async { Err(AnchorError::Status(500)) })
+        }
+    }
+
+    #[tokio::test]
+    async fn a_backwards_seq_is_a_mismatch_and_nothing_is_published() {
+        let index = indexed(&chain(true));
+        let ledger = index.genesis_hash.clone().unwrap();
+        let ledger = &ledger[..16];
+        let mem = Mem::new(vec![
+            row_line(&index, 2, ledger),
+            row_line(&index, 1, ledger),
+        ]);
+        let puts = std::sync::Arc::clone(&mem.puts);
+        let backends: Vec<Box<dyn Anchor>> = vec![Box::new(mem)];
+        let out = sync(&index, &backends, false).await.unwrap();
+        assert_eq!(out.state, "mismatch");
+        assert_eq!(out.notes[0].detail.as_deref(), Some("seq goes backwards"));
+        assert_eq!(*puts.lock().unwrap(), 0);
+
+        let same = Mem::new(vec![
+            row_line(&index, 1, ledger),
+            row_line(&index, 1, ledger),
+        ]);
+        let backends: Vec<Box<dyn Anchor>> = vec![Box::new(same)];
+        let short = indexed(&chain(false));
+        let out = sync(&short, &backends, false).await.unwrap();
+        assert_eq!(out.state, "unchanged");
+    }
+
+    #[tokio::test]
+    async fn a_failed_backend_does_not_stop_the_next() {
+        let index = indexed(&chain(false));
+        let publishes = std::sync::Arc::new(Mutex::new(0));
+        let fail = Fail {
+            publishes: std::sync::Arc::clone(&publishes),
+        };
+        let mem = Mem::new(Vec::new());
+        let puts = std::sync::Arc::clone(&mem.puts);
+        let backends: Vec<Box<dyn Anchor>> = vec![Box::new(fail), Box::new(mem)];
+        let out = sync(&index, &backends, false).await.unwrap();
+        assert_eq!(out.state, "unverified");
+        assert_eq!(out.notes[0].state, "unverified");
+        assert!(out.notes[0].detail.as_deref().unwrap_or("").contains("500"));
+        assert_eq!(
+            *publishes.lock().unwrap(),
+            0,
+            "a failed check is not published"
+        );
+        assert_eq!(
+            *puts.lock().unwrap(),
+            1,
+            "a later backend is still published"
+        );
+
+        let stopped = std::sync::Arc::new(Mutex::new(0));
+        let stop = Stop {
+            puts: std::sync::Arc::clone(&stopped),
+        };
+        let mem = Mem::new(Vec::new());
+        let puts = std::sync::Arc::clone(&mem.puts);
+        let backends: Vec<Box<dyn Anchor>> = vec![Box::new(stop), Box::new(mem)];
+        let out = sync(&index, &backends, false).await.unwrap();
+        assert_eq!(out.state, "unverified");
+        assert_eq!(*stopped.lock().unwrap(), 1);
+        assert_eq!(*puts.lock().unwrap(), 1);
+
+        let ledger = index.genesis_hash.clone().unwrap();
+        let bad = row_line(&index, 0, "0000000000000000");
+        let mem = Mem::new(vec![bad]);
+        let puts = std::sync::Arc::clone(&mem.puts);
+        let later = Mem::new(Vec::new());
+        let later_puts = std::sync::Arc::clone(&later.puts);
+        let backends: Vec<Box<dyn Anchor>> = vec![Box::new(mem), Box::new(later)];
+        let out = sync(&index, &backends, false).await.unwrap();
+        assert_eq!(out.state, "mismatch");
+        let detail = out.notes[0].detail.as_deref().unwrap_or("");
+        assert!(detail.contains("ledger_id 0000000000000000"), "{detail}");
+        assert!(
+            detail.contains(&format!("local {}", &ledger[..16])),
+            "{detail}"
+        );
+        assert_eq!(*puts.lock().unwrap(), 0);
+        assert_eq!(*later_puts.lock().unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn a_pulse_that_is_not_plain_publishes_nothing() {
+        for pulse in ["../x", "a/b", "\u{1b}esc", "\u{202e}bidi", "", ".."] {
+            let bytes = receipt_bytes(&[ReceiptEvent::Genesis {
+                pulse: pulse.to_string(),
+            }]);
+            let index = indexed(&bytes);
+            let mem = Mem::new(Vec::new());
+            let puts = std::sync::Arc::clone(&mem.puts);
+            let backends: Vec<Box<dyn Anchor>> = vec![Box::new(mem)];
+            let err = sync(&index, &backends, false).await.unwrap_err();
+            assert!(err.to_string().contains("pulse"), "{pulse:?}: {err}");
+            assert_eq!(*puts.lock().unwrap(), 0);
+        }
     }
 }

@@ -96,7 +96,7 @@ Also present, with defaults: `[owner]`, `[prediction]`, `[tension]`, `[outreach]
 | `PULSE_CLI_BIN` | CLI binary when `[llm] cli_bin` is unset |
 | `PULSE_NULL_ALLOW_ROOT` | `1` lets `init` / `up` run as root (CI) |
 | `PULSE_NULL_RECEIPTS` | `required` forces receipts on and protection required. The file cannot turn that off, and `[receipts] path` is not opened. Any other non-empty value is ignored |
-| `PULSE_NULL_ANCHOR_TOKEN_FILE` | Token file for `receipts anchor`, after `--token-file` and the backend's `token_file` |
+| `PULSE_NULL_ANCHOR_TOKEN_FILE` | Token file for `receipts anchor` and `receipts verify --anchors`, after `--token-file` and the backend's `token_file` |
 | `PULSE_NULL_ANCHOR_TOKEN` | Token string, used only when no token file is set. A file must not be group- or world-readable |
 | `CREDENTIALS_DIRECTORY` | When set, `anchor-token` in that directory is the token file after `PULSE_NULL_ANCHOR_TOKEN_FILE` |
 | `RUST_LOG` | Log level, e.g. `pulse_null=debug` |
