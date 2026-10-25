@@ -45,7 +45,10 @@ pub enum ReceiptEvent {
         action_class: ActionClass,
         provider: String,
         adapter: String,
-        model: String,
+        /// Present when the turn's response named one. An error, an abort,
+        /// or a lost open has none, and the field is omitted.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        model: Option<String>,
         fallback: bool,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         input_sha256: Option<String>,

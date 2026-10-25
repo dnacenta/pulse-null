@@ -125,6 +125,32 @@ enum ReceiptsAction {
         #[arg(long)]
         json: bool,
     },
+    /// Open intervals that overlap
+    Overlaps {
+        /// Receipt file. Default: `[receipts] path`, or
+        /// `/var/lib/pulse-null/<pulse>/receipts.jsonl`.
+        #[arg(long)]
+        file: Option<std::path::PathBuf>,
+        /// Drop an overlap that ended before this instant
+        #[arg(long)]
+        since: Option<String>,
+        /// Print at most this many overlaps. 0 lists every overlap.
+        #[arg(long, default_value_t = crate::cli::receipts::DEFAULT_OVERLAP_LIMIT)]
+        limit: u64,
+        /// Print one JSON object
+        #[arg(long)]
+        json: bool,
+    },
+    /// Provider, adapter, or model changes between boots or closes
+    Swaps {
+        /// Receipt file. Default: `[receipts] path`, or
+        /// `/var/lib/pulse-null/<pulse>/receipts.jsonl`.
+        #[arg(long)]
+        file: Option<std::path::PathBuf>,
+        /// Print one JSON object
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 /// Creating, starting, talking to and stopping a pulse.
@@ -683,6 +709,13 @@ fn receipts_command(action: ReceiptsAction) -> CommandFuture {
             limit,
             json,
         } => Box::pin(cli::receipts::show(file, since, kind, limit, json)),
+        ReceiptsAction::Overlaps {
+            file,
+            since,
+            limit,
+            json,
+        } => Box::pin(cli::receipts::overlaps(file, since, limit, json)),
+        ReceiptsAction::Swaps { file, json } => Box::pin(cli::receipts::swaps(file, json)),
     }
 }
 

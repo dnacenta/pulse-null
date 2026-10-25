@@ -290,8 +290,9 @@ fn open_receipt(state: &AppState, admitted: &Admitted) -> crate::oneself::receip
             principal_sha256,
             provider: state.provider.name().to_string(),
             adapter: state.config.llm.cli_adapter().unwrap_or("").to_string(),
-            model: state.config.llm.model.clone(),
             input_sha256: crate::oneself::receipt::digest(req.message.as_bytes()),
+            task_id: None,
+            parent: None,
         }
     })
 }
@@ -307,6 +308,7 @@ fn turn_record(
             truncated: response.truncated,
             refused: false,
             fallback_used: response.fallback_used,
+            silent: false,
             tokens_in: response.input_tokens,
             tokens_out: response.output_tokens,
         },
@@ -320,6 +322,7 @@ fn turn_record(
             // before `run_turn` sees a `(StatusCode, String)`.
             refused: message.contains("the model declined this request"),
             fallback_used: false,
+            silent: false,
             tokens_in: None,
             tokens_out: None,
         },

@@ -6,11 +6,13 @@
 //! [`ReceiptStore::open_for_daemon`]. `verify` and `show` read through
 //! [`inspect`] and do not lock or repair.
 
+use std::ffi::CString;
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::os::fd::{AsRawFd, FromRawFd};
-use std::os::unix::fs::OpenOptionsExt;
-use std::path::{Path, PathBuf};
+use std::os::unix::ffi::OsStrExt;
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 
@@ -237,6 +239,11 @@ pub enum StoreError {
     /// Non-empty, and it does not start with a genesis row. Leave it unchanged.
     #[error("receipt file {path} has no genesis row; leave it unchanged and choose another path")]
     NotLedger { path: String },
+    /// More than one name for this inode. Leave it unchanged.
+    #[error(
+        "receipt file {path} has more than one hard link; leave it unchanged and choose another path"
+    )]
+    Linked { path: String },
     #[error(transparent)]
     Io(#[from] std::io::Error),
 }
@@ -425,10 +432,13 @@ impl ReceiptStore {
         stop_if_unprotected: bool,
     ) -> Result<OpenChoice, StoreError> {
         // A child forked by another test inherits this flock until it execs.
-        // Retry every source, including a systemd fd. The lock test's child
-        // must not retry: it has to observe the held lock.
+        // Retry a path. A systemd fd spends its snapshot on the first try, so
+        // a later try cannot take the lock: it returns not-used. The lock
+        // test's child must not retry: it has to observe the held lock.
         #[cfg(test)]
-        if std::env::var_os("RECEIPT_FLOCK_CHILD").is_none() {
+        if std::env::var_os("RECEIPT_FLOCK_CHILD").is_none()
+            && matches!(&source, StoreSource::Path(_))
+        {
             for _ in 0..40 {
                 match Self::open_once(source.clone(), probe, pulse, stop_if_unprotected) {
                     Err(StoreError::Locked) => {
@@ -986,36 +996,7 @@ fn now_ts() -> String {
 
 fn adopt(source: StoreSource) -> Result<(File, bool, String), StoreError> {
     match source {
-        StoreSource::Path(path) => {
-            if let Some(dir) = path.parent() {
-                std::fs::create_dir_all(dir)?;
-            }
-            match std::fs::symlink_metadata(&path) {
-                Ok(meta) => check_regular(&path, &meta)?,
-                Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
-                Err(err) => return Err(StoreError::Io(err)),
-            }
-            let file = OpenOptions::new()
-                .create(true)
-                .read(true)
-                .append(true)
-                .mode(0o640)
-                .custom_flags(libc::O_NOFOLLOW)
-                .open(&path)
-                .map_err(|err| {
-                    if err.raw_os_error() == Some(libc::ELOOP) {
-                        StoreError::NotFile {
-                            path: path.display().to_string(),
-                        }
-                    } else {
-                        StoreError::Io(err)
-                    }
-                })?;
-            let meta = file.metadata()?;
-            check_regular(&path, &meta)?;
-            let display = path.display().to_string();
-            Ok((file, false, display))
-        }
+        StoreSource::Path(path) => adopt_path(&path),
         StoreSource::SystemdFd { name, listen } => {
             let file = take_systemd(name, &listen)?;
             let path = fd_path(file.as_raw_fd());
@@ -1029,6 +1010,193 @@ fn adopt(source: StoreSource) -> Result<(File, bool, String), StoreError> {
             Ok((file, true, path))
         }
     }
+}
+
+/// Open a path by walking every component from `/`.
+///
+/// Each directory is opened with `openat`, `O_DIRECTORY`, and `O_NOFOLLOW`,
+/// so a symlink in the middle is refused and nothing is created through it.
+/// A missing directory is created with `mkdirat` on the directory already
+/// opened, mode `0700`. A component that is a regular file is [`StoreError::NotFile`].
+/// The file itself is opened with `openat` and `O_NOFOLLOW`. A file with more
+/// than one hard link is refused. `..` is refused so a component cannot leave
+/// the directory that was opened.
+fn adopt_path(path: &Path) -> Result<(File, bool, String), StoreError> {
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()?.join(path)
+    };
+    let shown = absolute.display().to_string();
+    if absolute
+        .components()
+        .any(|component| matches!(component, Component::ParentDir))
+    {
+        return Err(StoreError::NotFile { path: shown });
+    }
+    let mut names = Vec::new();
+    for component in absolute.components() {
+        match component {
+            Component::Normal(name) => names.push(name.to_os_string()),
+            Component::RootDir | Component::CurDir => {}
+            Component::ParentDir | Component::Prefix(_) => {
+                return Err(StoreError::NotFile { path: shown });
+            }
+        }
+    }
+    let Some(file_name) = names.pop() else {
+        return Err(StoreError::NotFile { path: shown });
+    };
+    let mut dir = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_DIRECTORY | libc::O_CLOEXEC)
+        .open("/")
+        .map_err(StoreError::Io)?;
+    for name in &names {
+        dir = descend(dir, name, &shown)?;
+    }
+    let name_c = c_name(&file_name, &shown)?;
+    refuse_linked_or_special(dir.as_raw_fd(), &name_c, &absolute)?;
+    let flags = libc::O_RDWR | libc::O_APPEND | libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_CREAT;
+    // SAFETY: `dir` is open, `name_c` is nul-terminated, and the mode is the
+    // create mode. `O_NOFOLLOW` refuses a symlink at this name.
+    let fd = unsafe {
+        libc::openat(
+            dir.as_raw_fd(),
+            name_c.as_ptr(),
+            flags,
+            0o640 as libc::mode_t,
+        )
+    };
+    if fd < 0 {
+        let err = std::io::Error::last_os_error();
+        let code = err.raw_os_error();
+        if code == Some(libc::ELOOP) || code == Some(libc::ENOTDIR) || code == Some(libc::EISDIR) {
+            return Err(StoreError::NotFile { path: shown });
+        }
+        return Err(StoreError::Io(err));
+    }
+    // SAFETY: `openat` succeeded, so this process owns `fd`.
+    let file = unsafe { File::from_raw_fd(fd) };
+    let meta = file.metadata()?;
+    check_regular(&absolute, &meta)?;
+    if meta.nlink() > 1 {
+        return Err(StoreError::Linked { path: shown });
+    }
+    Ok((file, false, shown))
+}
+
+fn c_name(name: &std::ffi::OsStr, path: &str) -> Result<CString, StoreError> {
+    CString::new(name.as_bytes()).map_err(|_| StoreError::NotFile {
+        path: path.to_string(),
+    })
+}
+
+/// Open one directory component. `ENOENT` is returned as that errno so the
+/// caller can create it. A symlink or a non-directory is [`StoreError::NotFile`].
+fn open_dir_at(dirfd: i32, name: CString) -> Result<File, StoreError> {
+    let flags = libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC;
+    // SAFETY: `dirfd` is `AT_FDCWD` or an open directory, and `name` is
+    // nul-terminated. `O_NOFOLLOW` does not follow this component.
+    let fd = unsafe { libc::openat(dirfd, name.as_ptr(), flags) };
+    if fd >= 0 {
+        // SAFETY: `openat` succeeded, so this process owns `fd`.
+        return Ok(unsafe { File::from_raw_fd(fd) });
+    }
+    let err = std::io::Error::last_os_error();
+    Err(dir_open_error(err))
+}
+
+fn dir_open_error(err: std::io::Error) -> StoreError {
+    let code = err.raw_os_error();
+    if code == Some(libc::ENOENT) {
+        return StoreError::Io(err);
+    }
+    // A symlink opened with `O_DIRECTORY|O_NOFOLLOW` is `ENOTDIR` on Linux,
+    // and `ELOOP` otherwise. A regular file is `ENOTDIR` too.
+    if code == Some(libc::ELOOP) || code == Some(libc::ENOTDIR) || code == Some(libc::EEXIST) {
+        return StoreError::NotFile {
+            path: String::new(),
+        };
+    }
+    StoreError::Io(err)
+}
+
+fn descend(dir: File, name: &std::ffi::OsStr, shown: &str) -> Result<File, StoreError> {
+    let name_c = c_name(name, shown)?;
+    match open_dir_at(dir.as_raw_fd(), name_c.clone()) {
+        Ok(next) => Ok(next),
+        Err(StoreError::Io(err)) if err.raw_os_error() == Some(libc::ENOENT) => {
+            // SAFETY: `dir` is open and `name_c` is nul-terminated. The mode
+            // is `0700`. The new directory is a child of this descriptor.
+            let rc = unsafe { libc::mkdirat(dir.as_raw_fd(), name_c.as_ptr(), 0o700) };
+            if rc != 0 {
+                let created = std::io::Error::last_os_error();
+                if created.raw_os_error() != Some(libc::EEXIST) {
+                    return Err(not_a_directory(created, shown));
+                }
+            }
+            match open_dir_at(dir.as_raw_fd(), name_c) {
+                Ok(next) => Ok(next),
+                Err(StoreError::NotFile { .. }) => Err(StoreError::NotFile {
+                    path: shown.to_string(),
+                }),
+                Err(StoreError::Io(err)) => Err(not_a_directory(err, shown)),
+                Err(other) => Err(other),
+            }
+        }
+        Err(StoreError::NotFile { .. }) => Err(StoreError::NotFile {
+            path: shown.to_string(),
+        }),
+        Err(other) => Err(other),
+    }
+}
+
+/// `ENOTDIR` and `EEXIST` from a parent that is a file are "not a file".
+fn not_a_directory(err: std::io::Error, shown: &str) -> StoreError {
+    let code = err.raw_os_error();
+    if code == Some(libc::ENOTDIR) || code == Some(libc::EEXIST) || code == Some(libc::ELOOP) {
+        StoreError::NotFile {
+            path: shown.to_string(),
+        }
+    } else {
+        StoreError::Io(err)
+    }
+}
+
+/// Refuse a symlink, a non-regular file, a second hard link, or an oversize
+/// file before `openat` creates or writes anything.
+fn refuse_linked_or_special(dir: i32, name: &CString, path: &Path) -> Result<(), StoreError> {
+    let mut stat = unsafe { std::mem::zeroed::<libc::stat>() };
+    // SAFETY: `stat` is a valid out-pointer, `dir` is open, and `name` is
+    // nul-terminated. `AT_SYMLINK_NOFOLLOW` does not follow this name.
+    let rc = unsafe { libc::fstatat(dir, name.as_ptr(), &mut stat, libc::AT_SYMLINK_NOFOLLOW) };
+    if rc != 0 {
+        let err = std::io::Error::last_os_error();
+        if err.kind() == std::io::ErrorKind::NotFound {
+            return Ok(());
+        }
+        return Err(StoreError::Io(err));
+    }
+    let kind = stat.st_mode & libc::S_IFMT;
+    if kind != libc::S_IFREG {
+        return Err(StoreError::NotFile {
+            path: path.display().to_string(),
+        });
+    }
+    if stat.st_nlink > 1 {
+        return Err(StoreError::Linked {
+            path: path.display().to_string(),
+        });
+    }
+    let bytes = u64::try_from(stat.st_size).unwrap_or(u64::MAX);
+    if bytes > MAX_RECEIPT_BYTES {
+        return Err(StoreError::TooLarge {
+            path: path.display().to_string(),
+            bytes,
+        });
+    }
+    Ok(())
 }
 
 fn check_regular(path: &Path, meta: &std::fs::Metadata) -> Result<(), StoreError> {
@@ -1646,6 +1814,145 @@ mod tests {
             String::from_utf8_lossy(&output.stderr)
         );
         drop(store.0);
+    }
+
+    #[test]
+    fn a_locked_systemd_fd_returns_locked_without_a_retry() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("receipts.jsonl");
+        let (store, _) =
+            ReceiptStore::open(StoreSource::Path(path.clone()), &LiveProbe, "echo").unwrap();
+        let other = OpenOptions::new()
+            .read(true)
+            .append(true)
+            .open(&path)
+            .unwrap();
+        with_forced_fd(&other, || {
+            let err = ReceiptStore::open(
+                StoreSource::SystemdFd {
+                    name: "receipts",
+                    listen: our_listen(),
+                },
+                &LiveProbe,
+                "echo",
+            )
+            .unwrap_err();
+            assert!(
+                matches!(err, StoreError::Locked),
+                "a retry would spend the snapshot and return not-used: {err}"
+            );
+        });
+        drop(store);
+    }
+
+    #[test]
+    fn a_path_open_retries_a_lock_that_clears() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("receipts.jsonl");
+        let (store, _) =
+            ReceiptStore::open(StoreSource::Path(path.clone()), &LiveProbe, "echo").unwrap();
+        let (go_tx, go_rx) = std::sync::mpsc::channel::<()>();
+        let path_for_open = path.clone();
+        let opener = std::thread::spawn(move || {
+            go_rx.recv().unwrap();
+            ReceiptStore::open(StoreSource::Path(path_for_open), &LiveProbe, "echo").map(|_| ())
+        });
+        go_tx.send(()).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(40));
+        drop(store);
+        opener.join().unwrap().unwrap();
+    }
+
+    #[test]
+    fn a_hard_link_is_refused_and_the_outside_file_stays_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        let outside = dir.path().join("outside.jsonl");
+        std::fs::write(&outside, b"").unwrap();
+        let pulse = dir.path().join("pulse");
+        std::fs::create_dir(&pulse).unwrap();
+        let linked = pulse.join("receipts.jsonl");
+        std::fs::hard_link(&outside, &linked).unwrap();
+        let err = ReceiptStore::open(StoreSource::Path(linked), &LiveProbe, "echo").unwrap_err();
+        assert!(matches!(err, StoreError::Linked { .. }), "{err}");
+        assert!(err.to_string().contains("leave it unchanged"), "{err}");
+        assert_eq!(std::fs::read(&outside).unwrap(), b"");
+    }
+
+    #[test]
+    fn a_symlink_parent_is_refused_and_creates_nothing_outside() {
+        let dir = tempfile::tempdir().unwrap();
+        let outside = dir.path().join("outside");
+        std::fs::create_dir(&outside).unwrap();
+        let pulse = dir.path().join("pulse");
+        std::fs::create_dir(&pulse).unwrap();
+        let link = pulse.join("escape");
+        std::fs::create_dir(&link).unwrap();
+        std::fs::remove_dir(&link).unwrap();
+        std::os::unix::fs::symlink(&outside, &link).unwrap();
+        let path = link.join("receipts.jsonl");
+        let err = ReceiptStore::open(StoreSource::Path(path), &LiveProbe, "echo").unwrap_err();
+        assert!(matches!(err, StoreError::NotFile { .. }), "{err}");
+        assert!(!outside.join("receipts.jsonl").exists());
+        assert_eq!(std::fs::read_dir(&outside).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn a_symlink_in_the_middle_is_refused_and_creates_nothing_outside() {
+        let dir = tempfile::tempdir().unwrap();
+        let outside = dir.path().join("outside");
+        std::fs::create_dir(&outside).unwrap();
+        let pulse = dir.path().join("pulse");
+        std::fs::create_dir(&pulse).unwrap();
+        std::os::unix::fs::symlink(&outside, pulse.join("mid")).unwrap();
+        let nested = pulse
+            .join("mid")
+            .join("new")
+            .join("deep")
+            .join("receipts.jsonl");
+        let err = ReceiptStore::open(StoreSource::Path(nested), &LiveProbe, "echo").unwrap_err();
+        assert!(matches!(err, StoreError::NotFile { .. }), "{err}");
+        assert!(!outside.join("new").exists());
+        assert!(!outside.join("receipts.jsonl").exists());
+        assert_eq!(std::fs::read_dir(&outside).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn a_regular_file_parent_is_not_a_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let parent = dir.path().join("notadir");
+        std::fs::write(&parent, b"keep").unwrap();
+        let path = parent.join("receipts.jsonl");
+        let err = ReceiptStore::open(StoreSource::Path(path), &LiveProbe, "echo").unwrap_err();
+        assert!(matches!(err, StoreError::NotFile { .. }), "{err}");
+        assert_eq!(std::fs::read(&parent).unwrap(), b"keep");
+    }
+
+    #[test]
+    fn a_nested_path_and_a_var_lib_style_path_open() {
+        let dir = tempfile::tempdir().unwrap();
+        let nested = dir
+            .path()
+            .join("pulse")
+            .join("a")
+            .join("b")
+            .join("receipts.jsonl");
+        ReceiptStore::open(StoreSource::Path(nested.clone()), &LiveProbe, "echo").unwrap();
+        assert!(nested.is_file());
+        use std::os::unix::fs::MetadataExt;
+        let mode = |path: &Path| std::fs::metadata(path).unwrap().mode() & 0o777;
+        assert_eq!(mode(&dir.path().join("pulse").join("a")), 0o700);
+        assert_eq!(mode(&dir.path().join("pulse").join("a").join("b")), 0o700);
+
+        let styled = dir
+            .path()
+            .join("var")
+            .join("lib")
+            .join("pulse-null")
+            .join("echo");
+        std::fs::create_dir_all(&styled).unwrap();
+        let path = styled.join("receipts.jsonl");
+        ReceiptStore::open(StoreSource::Path(path.clone()), &LiveProbe, "echo").unwrap();
+        assert!(path.is_file());
     }
 
     #[test]

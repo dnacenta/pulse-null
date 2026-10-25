@@ -1,7 +1,7 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use tokio::sync::RwLock;
+use tokio::sync::{watch, RwLock};
 use tokio::task::JoinHandle;
 
 use crate::config::Config;
@@ -15,6 +15,8 @@ use super::AppState;
 /// Result of booting a pulse's server.
 pub struct BootedPulse {
     pub server_handle: JoinHandle<()>,
+    /// Tells the server to stop accepting and to drain open connections.
+    pub stop: watch::Sender<bool>,
     pub coordinator: crate::coordinator::control::Coordinator,
     pub event_bus: Arc<EventBus>,
     pub actual_port: u16,
@@ -47,10 +49,11 @@ pub async fn boot_pulse(
     // Build router (plugin_routes collected before AppState construction)
     let app = super::build_router(Arc::clone(&state), plugin_routes);
     let (listener, actual_port) = bind_pulse_listener(&state.config, fallback_port).await?;
-    let server_handle = serve_pulse(state.config.pulse.name.clone(), listener, app);
+    let (server_handle, stop) = serve_pulse(state.config.pulse.name.clone(), listener, app);
 
     Ok(BootedPulse {
         server_handle,
+        stop,
         coordinator,
         event_bus: Arc::clone(&state.event_bus),
         actual_port,
@@ -197,17 +200,24 @@ async fn bind_pulse_listener(
     Ok((listener, actual_port))
 }
 
-/// Serve as a background task (non-blocking).
+/// Serve until `stop` flips, then drain connections that are already open.
 fn serve_pulse(
     pulse_name: String,
     listener: tokio::net::TcpListener,
     app: axum::Router,
-) -> JoinHandle<()> {
-    tokio::spawn(async move {
-        if let Err(e) = axum::serve(listener, app).await {
+) -> (JoinHandle<()>, watch::Sender<bool>) {
+    let (stop, mut stop_rx) = watch::channel(false);
+    let server_handle = tokio::spawn(async move {
+        if let Err(e) = axum::serve(listener, app)
+            .with_graceful_shutdown(async move {
+                let _ = stop_rx.changed().await;
+            })
+            .await
+        {
             tracing::error!("Pulse \"{}\" server error: {}", pulse_name, e);
         }
-    })
+    });
+    (server_handle, stop)
 }
 
 /// A secret that actually protects something: present and not blank.
@@ -337,6 +347,7 @@ mod tests {
             config: offline_config(),
             port,
             server_handle: booted.server_handle,
+            stop: booted.stop,
             coordinator: booted.coordinator,
             event_bus: booted.event_bus,
             persist_coordinator: booted.persist_coordinator,
@@ -355,6 +366,170 @@ mod tests {
             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         }
         assert!(closed, "the server still answers after shutdown");
+    }
+
+    /// A chat turn stuck in the provider holds the drain. Closing the client
+    /// lets shutdown finish inside the window, without waiting the window out.
+    #[tokio::test]
+    async fn registry_shutdown_drains_an_open_connection() {
+        let hang = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let hang_port = hang.local_addr().unwrap().port();
+        let (accepted_tx, accepted_rx) = tokio::sync::oneshot::channel();
+        tokio::spawn(async move {
+            if let Ok((sock, _)) = hang.accept().await {
+                let _ = accepted_tx.send(());
+                std::future::pending::<()>().await;
+                drop(sock);
+            }
+        });
+        let mut config = offline_config();
+        config.llm.base_url = Some(format!("http://127.0.0.1:{hang_port}"));
+        let dir = tempfile::tempdir().unwrap();
+        let booted = boot_pulse(
+            config.clone(),
+            dir.path().to_path_buf(),
+            0,
+            crate::oneself::store::ListenEnv::empty(),
+        )
+        .await
+        .unwrap();
+        let port = booted.actual_port;
+        let mut client = tokio::net::TcpStream::connect(("127.0.0.1", port))
+            .await
+            .unwrap();
+        let body = b"{\"message\":\"hang\",\"channel\":\"tui\"}";
+        let head = format!(
+            "POST /chat HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n",
+            body.len()
+        );
+        client.write_all(head.as_bytes()).await.unwrap();
+        client.write_all(body).await.unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(2), accepted_rx)
+            .await
+            .expect("the provider was not called")
+            .unwrap();
+
+        let mut registry = crate::registry::PulseRegistry::new(0);
+        registry.register(crate::registry::RunningPulse {
+            name: "Test".into(),
+            dir: dir.path().to_path_buf(),
+            config: offline_config(),
+            port,
+            server_handle: booted.server_handle,
+            stop: booted.stop,
+            coordinator: booted.coordinator,
+            event_bus: booted.event_bus,
+            persist_coordinator: booted.persist_coordinator,
+            turns: booted.turns,
+            receipts: booted.receipts,
+        });
+        let (done_tx, mut done_rx) = tokio::sync::oneshot::channel();
+        tokio::spawn(async move {
+            registry.shutdown_all().await;
+            let _ = done_tx.send(());
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+        assert!(
+            done_rx.try_recv().is_err(),
+            "shutdown finished while a connection was still open"
+        );
+        drop(client);
+        tokio::time::timeout(std::time::Duration::from_secs(5), done_rx)
+            .await
+            .expect("drain held the window")
+            .unwrap();
+        assert!(
+            health_status(port).await.is_err(),
+            "the server still answers after the drain"
+        );
+    }
+
+    /// Two pulses with a connection held open share one drain window.
+    #[tokio::test]
+    async fn two_pulses_share_one_drain_window() {
+        let window = std::time::Duration::from_millis(200);
+
+        async fn hang_one(
+            name: &str,
+        ) -> (
+            crate::registry::RunningPulse,
+            tokio::net::TcpStream,
+            tempfile::TempDir,
+        ) {
+            let hang = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let hang_port = hang.local_addr().unwrap().port();
+            let (accepted_tx, accepted_rx) = tokio::sync::oneshot::channel();
+            tokio::spawn(async move {
+                if let Ok((sock, _)) = hang.accept().await {
+                    let _ = accepted_tx.send(());
+                    std::future::pending::<()>().await;
+                    drop(sock);
+                }
+            });
+            let mut config = offline_config();
+            config.pulse.name = name.to_string();
+            config.llm.base_url = Some(format!("http://127.0.0.1:{hang_port}"));
+            let dir = tempfile::tempdir().unwrap();
+            let booted = boot_pulse(
+                config.clone(),
+                dir.path().to_path_buf(),
+                0,
+                crate::oneself::store::ListenEnv::empty(),
+            )
+            .await
+            .unwrap();
+            let port = booted.actual_port;
+            let mut client = tokio::net::TcpStream::connect(("127.0.0.1", port))
+                .await
+                .unwrap();
+            let body = b"{\"message\":\"hang\",\"channel\":\"tui\"}";
+            let head = format!(
+                "POST /chat HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n",
+                body.len()
+            );
+            client.write_all(head.as_bytes()).await.unwrap();
+            client.write_all(body).await.unwrap();
+            tokio::time::timeout(std::time::Duration::from_secs(2), accepted_rx)
+                .await
+                .expect("the provider was not called")
+                .unwrap();
+            let pulse = crate::registry::RunningPulse {
+                name: name.into(),
+                dir: dir.path().to_path_buf(),
+                config,
+                port,
+                server_handle: booted.server_handle,
+                stop: booted.stop,
+                coordinator: booted.coordinator,
+                event_bus: booted.event_bus,
+                persist_coordinator: booted.persist_coordinator,
+                turns: booted.turns,
+                receipts: booted.receipts,
+            };
+            (pulse, client, dir)
+        }
+
+        let (first, client_a, dir_a) = hang_one("one").await;
+        let (second, client_b, dir_b) = hang_one("two").await;
+        let mut registry = crate::registry::PulseRegistry::new(0);
+        registry.set_drain_window_for_test(window);
+        registry.register(first);
+        registry.register(second);
+        let started = std::time::Instant::now();
+        registry.shutdown_all().await;
+        let elapsed = started.elapsed();
+        drop(client_a);
+        drop(client_b);
+        drop(dir_a);
+        drop(dir_b);
+        assert!(
+            elapsed >= window,
+            "shutdown returned in {elapsed:?}, before one window"
+        );
+        assert!(
+            elapsed < window * 2,
+            "two pulses took {elapsed:?}, longer than one window"
+        );
     }
 
     #[tokio::test]

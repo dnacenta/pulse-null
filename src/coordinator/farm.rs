@@ -199,6 +199,16 @@ impl FarmResults {
     }
 }
 
+/// Receipt writer for a farm and its subtasks. `parent` is the farm open's
+/// stream id, and it is `None` when receipts are off so no id is minted.
+#[derive(Clone)]
+pub struct FarmStreams {
+    appender: crate::oneself::receipt::Appender,
+    parent: Option<String>,
+    provider: String,
+    adapter: String,
+}
+
 /// Run a farm to completion (or its wall budget). The executor is one child
 /// attempt: it receives the subtask spec and returns the child's text.
 pub async fn run_farm<F, Fut>(
@@ -207,6 +217,7 @@ pub async fn run_farm<F, Fut>(
     root_dir: PathBuf,
     spec: FarmSpec,
     caps: FarmCaps,
+    streams: Option<FarmStreams>,
     executor: F,
 ) -> FarmOutcome
 where
@@ -254,6 +265,7 @@ where
         let tenure_holder = tenure_holder.to_string();
         let farm_id = farm_id.clone();
         let sub_for_task = sub.clone();
+        let streams = streams.clone();
 
         let handle = tokio::spawn(async move {
             subtask_controller(
@@ -268,6 +280,7 @@ where
                 farm_id,
                 index,
                 sub_for_task,
+                streams,
             )
             .await
         });
@@ -327,6 +340,7 @@ async fn subtask_controller<F, Fut>(
     farm_id: String,
     index: usize,
     sub: SubtaskSpec,
+    streams: Option<FarmStreams>,
 ) -> ControllerOutput
 where
     F: Fn(SubtaskSpec) -> Fut + Send + Sync + Clone + 'static,
@@ -336,6 +350,8 @@ where
     // lease id budget once composed with the farm id.
     let resource = format!("farm-{farm_id}-s{index}");
     let mut stalled_child: Option<AbortOnDrop<bool>> = None;
+    let track = streams.as_ref().is_some_and(|s| s.appender.is_on());
+    let mut receipt = Some(open_subtask(streams.as_ref(), &sub));
 
     for attempt in 1..=caps.max_attempts {
         // Shed with everything else: a farm never outlives isolation entry.
@@ -344,6 +360,9 @@ where
                 "farm '{farm_id}': ISOLATION active — abandoning '{}'",
                 sub.id
             );
+            if track {
+                settle_sub(receipt.take(), true, false, None);
+            }
             return None;
         }
 
@@ -360,6 +379,9 @@ where
             Ok(lease) => lease,
             Err(e) => {
                 tracing::warn!("farm '{farm_id}': claim failed on '{}': {e}", sub.id);
+                if track {
+                    settle_sub(receipt.take(), false, true, None);
+                }
                 return None;
             }
         };
@@ -419,6 +441,10 @@ where
                                 let _ = tokio::time::timeout(caps.subtask_ttl, &mut old.0).await;
                             }
                         }
+                        if track {
+                            let isolated = crate::server::isolation::is_active(&root_dir);
+                            settle_sub(receipt.take(), isolated, false, Some(&text));
+                        }
                         return Some((attempt, text));
                     }
                 }
@@ -443,7 +469,51 @@ where
         }
     }
 
+    if track {
+        settle_sub(receipt.take(), false, true, None);
+    }
     None
+}
+
+fn open_subtask(
+    streams: Option<&FarmStreams>,
+    sub: &SubtaskSpec,
+) -> crate::oneself::receipt::StreamReceipt {
+    let Some(streams) = streams else {
+        return crate::oneself::receipt::StreamReceipt::inert();
+    };
+    crate::oneself::receipt::StreamReceipt::open_if_on(&streams.appender, || {
+        crate::oneself::receipt::OpenInfo {
+            stream: uuid::Uuid::new_v4().to_string(),
+            channel: "farm".into(),
+            principal: "farm".into(),
+            principal_sha256: None,
+            task_id: Some(sub.id.clone()),
+            parent: streams.parent.clone(),
+            provider: streams.provider.clone(),
+            adapter: streams.adapter.clone(),
+            input_sha256: crate::oneself::receipt::digest(sub.prompt.as_bytes()),
+        }
+    })
+}
+
+fn settle_sub(
+    receipt: Option<crate::oneself::receipt::StreamReceipt>,
+    isolation: bool,
+    failure: bool,
+    text: Option<&str>,
+) {
+    let Some(receipt) = receipt else {
+        return;
+    };
+    receipt.settle(crate::oneself::receipt::Settle {
+        text,
+        model: None,
+        isolation,
+        failure,
+        tokens_in: None,
+        tokens_out: None,
+    });
 }
 
 /// Parse and run a `[FARM: {json}]` marker under the current tenure. Returns
@@ -456,12 +526,19 @@ pub async fn run_farm_from_marker(
     tenure: &super::control::TenureLeases,
 ) -> Result<String, String> {
     let spec = parse_farm_marker(farm_json)?;
-    let system_prompt = crate::server::prompt::build_task_system_prompt_async(
+    let (mut farm_receipt, streams) = open_farm(state, &spec);
+    let system_prompt = match crate::server::prompt::build_task_system_prompt_async(
         state.root_dir.clone(),
         state.config.clone(),
     )
     .await
-    .map_err(|e| format!("cannot build farm system prompt: {e}"))?;
+    {
+        Ok(prompt) => prompt,
+        Err(e) => {
+            finish_farm(state, farm_receipt.take(), true, None);
+            return Err(format!("cannot build farm system prompt: {e}"));
+        }
+    };
     let farm = FarmModel {
         state: Arc::clone(state),
         system_prompt: Arc::from(system_prompt),
@@ -476,10 +553,17 @@ pub async fn run_farm_from_marker(
         state.root_dir.clone(),
         spec,
         FarmCaps::default(),
+        streams,
         farm.executor(),
     )
     .await;
-    let composed = compose_results(&farm_label, &outcome)?;
+    let composed = match compose_results(&farm_label, &outcome) {
+        Ok(composed) => composed,
+        Err(e) => {
+            finish_farm(state, farm_receipt.take(), true, None);
+            return Err(e);
+        }
+    };
     let final_text = farm.synthesize(&farm_label, synthesis, composed).await;
 
     crate::logbook::write_entry(
@@ -493,7 +577,59 @@ pub async fn run_farm_from_marker(
             outcome.late_fenced
         ),
     );
+    finish_farm(state, farm_receipt.take(), false, Some(&final_text));
     Ok(final_text)
+}
+
+/// The farm's own open, and the parent id subtasks record. Receipts that are
+/// off return before any id or digest.
+fn open_farm(
+    state: &crate::server::AppState,
+    spec: &FarmSpec,
+) -> (
+    Option<crate::oneself::receipt::StreamReceipt>,
+    Option<FarmStreams>,
+) {
+    if !state.receipts.is_on() {
+        return (None, None);
+    }
+    let parent = uuid::Uuid::new_v4().to_string();
+    let provider = state.provider.name().to_string();
+    let adapter = state.config.llm.cli_adapter().unwrap_or("").to_string();
+    let receipt = crate::oneself::receipt::StreamReceipt::open(
+        &state.receipts,
+        crate::oneself::receipt::OpenInfo {
+            stream: parent.clone(),
+            channel: "farm".into(),
+            principal: "farm".into(),
+            principal_sha256: None,
+            task_id: Some(spec.id.clone()),
+            parent: None,
+            provider: provider.clone(),
+            adapter: adapter.clone(),
+            input_sha256: crate::oneself::receipt::digest(spec.description.as_bytes()),
+        },
+    );
+    let streams = FarmStreams {
+        appender: state.receipts.clone(),
+        parent: Some(parent),
+        provider,
+        adapter,
+    };
+    (Some(receipt), Some(streams))
+}
+
+fn finish_farm(
+    state: &crate::server::AppState,
+    receipt: Option<crate::oneself::receipt::StreamReceipt>,
+    failure: bool,
+    text: Option<&str>,
+) {
+    if !state.receipts.is_on() {
+        return;
+    }
+    let isolation = crate::server::isolation::is_active(&state.root_dir);
+    settle_sub(receipt, isolation, failure, text);
 }
 
 /// The marker's spec, with between one and [`MAX_SUBTASKS`] subtasks.
@@ -661,6 +797,7 @@ mod tests {
             dir.path().to_path_buf(),
             spec(&[("a", "pa"), ("b", "pb"), ("c", "pc")]),
             caps(10_000, true),
+            None,
             |sub: SubtaskSpec| async move { Ok(format!("done:{}", sub.id)) },
         )
         .await;
@@ -699,6 +836,7 @@ mod tests {
             dir.path().to_path_buf(),
             spec(&[("slow", "p")]),
             caps(1_000, false),
+            None,
             move |_sub: SubtaskSpec| {
                 let n = attempt_c.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                 async move {
@@ -765,6 +903,7 @@ mod tests {
             dir.path().to_path_buf(),
             spec(&[("a", "p")]),
             caps(1_000, true),
+            None,
             |_sub: SubtaskSpec| async move { Ok("should never land".to_string()) },
         )
         .await;
@@ -784,6 +923,7 @@ mod tests {
             dir.path().to_path_buf(),
             spec(&[("a", "p")]),
             caps(2_000, true),
+            None,
             |_sub: SubtaskSpec| async move { Err("provider exploded".to_string()) },
         )
         .await;
@@ -804,6 +944,7 @@ mod tests {
             dir.path().to_path_buf(),
             spec(&[("a", "p")]),
             c,
+            None,
             |_sub: SubtaskSpec| async move {
                 tokio::time::sleep(Duration::from_secs(60)).await;
                 Ok("too late".to_string())
@@ -825,6 +966,7 @@ mod tests {
             dir.path().to_path_buf(),
             spec(&[("a", "p1"), ("a", "p2")]),
             caps(5_000, true),
+            None,
             |sub: SubtaskSpec| async move { Ok(format!("done:{}", sub.prompt)) },
         )
         .await;
