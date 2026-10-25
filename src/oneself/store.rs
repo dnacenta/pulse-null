@@ -1014,28 +1014,50 @@ mod tests {
         }
     }
 
+    /// Device and inode of an open fd. `None` once that fd has been closed.
+    fn file_id(fd: i32) -> Option<(u64, u64)> {
+        let mut stat = unsafe { std::mem::zeroed::<libc::stat>() };
+        // SAFETY: `stat` is a valid out-pointer. A closed fd returns an error.
+        let rc = unsafe { libc::fstat(fd, &mut stat) };
+        if rc != 0 {
+            return None;
+        }
+        Some((stat.st_dev, stat.st_ino))
+    }
+
+    /// The refused dup is closed. Another test may reuse the number; that
+    /// descriptor is a different file.
+    fn assert_fd_closed(fd: i32, id: (u64, u64)) {
+        if let Some(now) = file_id(fd) {
+            assert_ne!(now, id, "refused fd still open");
+        }
+    }
+
     /// Dup `file` and offer that fd as the systemd socket. Does not touch fd 3.
     ///
     /// The caller passes [`our_listen`] on the source. This closes the dup
-    /// when the store did not take ownership.
+    /// when the store did not take ownership. A reused fd number is left alone.
     fn with_forced_fd(file: &File, body: impl FnOnce()) {
         let _guard = FD_LOCK.lock().unwrap_or_else(|err| err.into_inner());
         // SAFETY: `file` is open for the duration of this call.
         let duped = unsafe { libc::dup(file.as_raw_fd()) };
         assert!(duped >= 0, "dup: {}", std::io::Error::last_os_error());
+        let id = file_id(duped).expect("dup fstat");
         FORCED_FD.store(duped, std::sync::atomic::Ordering::SeqCst);
-        struct Reset(i32);
+        struct Reset {
+            fd: i32,
+            id: (u64, u64),
+        }
         impl Drop for Reset {
             fn drop(&mut self) {
                 FORCED_FD.store(-1, std::sync::atomic::Ordering::SeqCst);
-                let flags = unsafe { libc::fcntl(self.0, libc::F_GETFD) };
-                if flags >= 0 {
-                    // SAFETY: the store did not take this dup, so it is still open.
-                    unsafe { libc::close(self.0) };
+                if file_id(self.fd) == Some(self.id) {
+                    // SAFETY: this is still the dup, so the store did not take it.
+                    unsafe { libc::close(self.fd) };
                 }
             }
         }
-        let _reset = Reset(duped);
+        let _reset = Reset { fd: duped, id };
         body();
     }
 
@@ -1061,8 +1083,8 @@ mod tests {
             )
             .unwrap_err();
             assert!(matches!(err, StoreError::NotAppend { .. }), "{err}");
-            let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
-            assert!(flags < 0, "refused fd still open: {flags}");
+            let id = file_id(plain.as_raw_fd()).expect("plain fstat");
+            assert_fd_closed(fd, id);
         });
         drop(plain);
 
@@ -1104,8 +1126,8 @@ mod tests {
             .unwrap_err();
             assert!(matches!(err, StoreError::NotReadWrite { .. }), "{err}");
             assert!(err.to_string().contains("reading and writing"), "{err}");
-            let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
-            assert!(flags < 0, "refused fd still open: {flags}");
+            let id = file_id(write_only.as_raw_fd()).expect("write-only fstat");
+            assert_fd_closed(fd, id);
         });
     }
 
