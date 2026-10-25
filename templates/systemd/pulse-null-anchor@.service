@@ -15,11 +15,11 @@
 #   systemctl daemon-reload
 #   systemctl enable --now pulse-null-anchor@<pulse>.timer
 #
-# WorkingDirectory is the pulse directory, so `pulse-null.toml` loads.
-# `[receipts] path` empty uses /var/lib/pulse-null/%i/receipts.jsonl.
-# %i must be that file's genesis pulse. A group- or world-writable
-# anchor.toml is refused. `--config` is not set, so the file must be owned
-# by root.
+# The process is root with an empty capability bounding set. It does not
+# read the pulse home or `pulse-null.toml`. `--file` is the receipt file
+# from `receipts install`. %i must be that file's genesis pulse. A group-
+# or world-writable anchor.toml is refused. `--config` is not set, so
+# /etc/pulse-null/anchor.toml must be owned by root.
 
 [Unit]
 Description=pulse-null receipt anchor (%i)
@@ -30,8 +30,7 @@ Wants=network-online.target
 Type=oneshot
 User=root
 Group=root
-WorkingDirectory=/home/pulse/pulse-null/%i
-ExecStart=/usr/local/bin/pulse-null receipts anchor --pulse %i
+ExecStart=/usr/local/bin/pulse-null receipts anchor --pulse %i --file /var/lib/pulse-null/%i/receipts.jsonl
 Environment=RUST_LOG=info
 LoadCredential=anchor-token:/etc/pulse-null/anchor/token
 UMask=0077

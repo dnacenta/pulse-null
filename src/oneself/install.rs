@@ -4,7 +4,11 @@
 //! root:`<group>` mode 0640 with one `genesis` row, the append-only flag on
 //! that file, and an empty `anchors.log` as root:root mode 0644. Every
 //! component is opened with `openat` and `O_NOFOLLOW`. A second run that
-//! finds this layout changes nothing.
+//! finds this layout changes nothing and prints `already installed; nothing
+//! changed`. An existing file is opened read-only. A file that is not owned
+//! by root is not reused: without `--adopt` it is refused, and with `--adopt`
+//! a verified chain is copied onto a new inode. Stop the pulse before
+//! `--adopt`.
 
 use std::ffi::{CString, OsStr};
 use std::fs::File;
@@ -49,6 +53,12 @@ pub enum InstallError {
         line: usize,
         reason: &'static str,
     },
+    /// `receipts.jsonl` or `anchors.log` exists and is not owned by root.
+    NotRootOwned {
+        file: &'static str,
+    },
+    /// The pulse directory is not owned by root, or it is group- or world-writable.
+    DirUnsafe,
     /// `openat` returned `ENOENT`. Callers create the file or map this to a
     /// message. It is not returned from [`install`].
     Missing,
@@ -70,6 +80,13 @@ impl std::fmt::Display for InstallError {
             Self::Broken { line, reason } => {
                 write!(formatter, "broken line {line}: {reason}")
             }
+            Self::NotRootOwned { file } => write!(
+                formatter,
+                "{file} is not owned by root; stop the pulse and move the file aside, or pass --adopt"
+            ),
+            Self::DirUnsafe => formatter.write_str(
+                "pulse directory must be owned by root and not group- or world-writable",
+            ),
             Self::Missing => formatter.write_str("a path component is missing"),
             Self::Local(text) => formatter.write_str(text),
         }
@@ -88,6 +105,11 @@ pub trait Host {
     fn chown(&self, file: &File, uid: u32, gid: u32) -> Result<(), InstallError>;
     fn append_flag(&self, file: &File) -> Result<bool, InstallError>;
     fn set_append(&self, file: &File) -> Result<(), InstallError>;
+    /// Clear `FS_APPEND_FL` on this descriptor.
+    fn clear_append(&self, file: &File) -> Result<(), InstallError>;
+    /// Fail before any receipt byte is written when this filesystem cannot
+    /// store `FS_APPEND_FL`.
+    fn append_supported(&self, dir: &File) -> Result<(), InstallError>;
 }
 
 /// The real uid, the group database, `fchown`, and `FS_APPEND_FL`.
@@ -120,16 +142,43 @@ impl Host for LiveHost {
     }
 
     fn append_flag(&self, file: &File) -> Result<bool, InstallError> {
-        let flags = get_flags(file)?;
+        let flags = get_flags(file).map_err(flag_io)?;
         Ok(flags & FS_APPEND_FL != 0)
     }
 
     fn set_append(&self, file: &File) -> Result<(), InstallError> {
-        let mut flags = get_flags(file)?;
+        let mut flags = get_flags(file).map_err(flag_io)?;
         flags |= FS_APPEND_FL;
         set_flags(file, flags)
     }
+
+    fn clear_append(&self, file: &File) -> Result<(), InstallError> {
+        let flags = get_flags(file).map_err(flag_io)?;
+        set_flags(file, flags & !FS_APPEND_FL)
+    }
+
+    fn append_supported(&self, dir: &File) -> Result<(), InstallError> {
+        match get_flags(dir) {
+            Ok(_) => Ok(()),
+            Err(err) if unsupported_flags(&err) => Err(InstallError::Local(format!(
+                "filesystem does not support the append-only flag (FS_APPEND_FL): {err}"
+            ))),
+            Err(err) => Err(flag_io(err)),
+        }
+    }
 }
+
+const OPEN_READ: i32 =
+    libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC | libc::O_NOCTTY;
+const OPEN_NEW: i32 = libc::O_RDWR
+    | libc::O_CREAT
+    | libc::O_EXCL
+    | libc::O_NOFOLLOW
+    | libc::O_NONBLOCK
+    | libc::O_CLOEXEC
+    | libc::O_NOCTTY;
+const OPEN_WRITE: i32 =
+    libc::O_RDWR | libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC | libc::O_NOCTTY;
 
 /// Create the layout, or report that it is already there.
 pub fn install(
@@ -149,55 +198,222 @@ pub fn install(
         return Err(InstallError::GroupName);
     }
     let gid = host.group_gid(group)?;
-    let (pulse_dir, dirfd) = prepare_tree(dir, pulse, host)?;
-    // Refuse a symlink or a hard link at `anchors.log` before the receipt
-    // file is created or written. A missing `anchors.log` is created later.
-    anchors_usable(dirfd.as_raw_fd())?;
-    let receipt = match open_name(
-        dirfd.as_raw_fd(),
-        "receipts.jsonl",
-        libc::O_RDWR | libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC,
-        None,
-    ) {
-        Ok(file) => file,
-        Err(InstallError::Missing) => create_receipt(dirfd.as_raw_fd())?,
-        Err(err) => return Err(err),
-    };
-    let meta = receipt.metadata().map_err(io_err)?;
-    if !meta.is_file() || meta.nlink() != 1 {
-        return Err(InstallError::Local(
-            "receipts.jsonl must be one regular file".into(),
-        ));
+    let (pulse_dir, dirfd, created_dirs) = prepare_tree(dir, pulse, host)?;
+    let mut created_files = Vec::new();
+    let result = install_in(
+        &pulse_dir,
+        &dirfd,
+        pulse,
+        gid,
+        adopt,
+        host,
+        &mut created_files,
+    );
+    if result.is_err() {
+        remove_created(&created_files, &created_dirs);
     }
-    let step = if meta.len() == 0 {
-        ReceiptStep::Write
-    } else {
-        decide(&receipt, pulse, gid, adopt, host)?
-    };
-    let mut wrote = false;
-    let mut adopted = false;
-    match step {
-        ReceiptStep::Write => {
-            write_genesis(&receipt, pulse)?;
-            wrote = true;
-            finish_receipt(&receipt, gid, host)?;
-        }
-        ReceiptStep::Fix => {
-            if finish_receipt(&receipt, gid, host)? {
-                adopted = true;
+    result
+}
+
+fn install_in(
+    pulse_dir: &Path,
+    dirfd: &File,
+    pulse: &str,
+    gid: u32,
+    adopt: bool,
+    host: &dyn Host,
+    created_files: &mut Vec<PathBuf>,
+) -> Result<Outcome, InstallError> {
+    let dir_rw = reopen_dir(dirfd.as_raw_fd())?;
+    ensure_dir_safe(&dir_rw, host)?;
+    // A filesystem that cannot store the flag fails here, before a genesis
+    // row or an owner change on a receipt file.
+    host.append_supported(&dir_rw)?;
+    inspect_anchors(dirfd.as_raw_fd(), host)?;
+    let done = place_receipt(
+        dirfd.as_raw_fd(),
+        pulse_dir,
+        pulse,
+        gid,
+        adopt,
+        host,
+        created_files,
+    )?;
+    let dir_changed = ensure_mode_owner(&dir_rw, DIR_MODE, 0, 0, host)?;
+    let anchors_changed = ensure_anchors(dirfd.as_raw_fd(), pulse_dir, host, created_files)?;
+    match done {
+        ReceiptDone::Wrote => Ok(Outcome::Installed(pulse_dir.to_path_buf())),
+        ReceiptDone::Adjusted => Ok(Outcome::Adopted(pulse_dir.to_path_buf())),
+        ReceiptDone::Ready => {
+            if dir_changed || anchors_changed {
+                Ok(Outcome::Adopted(pulse_dir.to_path_buf()))
+            } else {
+                Ok(Outcome::Unchanged)
             }
         }
-        ReceiptStep::Ready => {}
     }
-    let dir_changed = ensure_mode_owner(&reopen_dir(dirfd.as_raw_fd())?, DIR_MODE, 0, 0, host)?;
-    let anchors_changed = ensure_anchors(dirfd.as_raw_fd(), host)?;
-    drop(dirfd);
-    if wrote {
-        Ok(Outcome::Installed(pulse_dir))
-    } else if adopted || dir_changed || anchors_changed {
-        Ok(Outcome::Adopted(pulse_dir))
+}
+
+enum ReceiptDone {
+    Wrote,
+    Adjusted,
+    Ready,
+}
+
+fn ensure_dir_safe(dir: &File, host: &dyn Host) -> Result<(), InstallError> {
+    let (uid, _) = host.owner(dir)?;
+    let mode = dir.metadata().map_err(io_err)?.mode();
+    if uid != 0 || mode & 0o022 != 0 {
+        Err(InstallError::DirUnsafe)
     } else {
-        Ok(Outcome::Unchanged)
+        Ok(())
+    }
+}
+
+fn place_receipt(
+    dirfd: i32,
+    pulse_dir: &Path,
+    pulse: &str,
+    gid: u32,
+    adopt: bool,
+    host: &dyn Host,
+    created_files: &mut Vec<PathBuf>,
+) -> Result<ReceiptDone, InstallError> {
+    match open_read(dirfd, "receipts.jsonl") {
+        Err(InstallError::Missing) => {
+            let file = create_exclusive(dirfd, "receipts.jsonl", 0o600)?;
+            created_files.push(pulse_dir.join("receipts.jsonl"));
+            write_genesis(&file, pulse)?;
+            finish_receipt(&file, gid, host)?;
+            Ok(ReceiptDone::Wrote)
+        }
+        Ok(file) => existing_receipt(dirfd, &file, pulse, gid, adopt, host),
+        Err(err) => Err(err),
+    }
+}
+
+fn existing_receipt(
+    dirfd: i32,
+    file: &File,
+    pulse: &str,
+    gid: u32,
+    adopt: bool,
+    host: &dyn Host,
+) -> Result<ReceiptDone, InstallError> {
+    let meta = require_regular(file, "receipts.jsonl")?;
+    let (uid, _) = host.owner(file)?;
+    if uid != 0 {
+        if !adopt {
+            return Err(InstallError::NotRootOwned {
+                file: "receipts.jsonl",
+            });
+        }
+        replace_receipt(dirfd, file, &meta, pulse, gid, host)?;
+        return Ok(ReceiptDone::Adjusted);
+    }
+    if meta.len() == 0 {
+        let writing = open_write(dirfd, "receipts.jsonl")?;
+        require_regular(&writing, "receipts.jsonl")?;
+        write_genesis(&writing, pulse)?;
+        finish_receipt(&writing, gid, host)?;
+        return Ok(ReceiptDone::Wrote);
+    }
+    match decide(file, pulse, gid, adopt, host)? {
+        ReceiptStep::Write => Err(InstallError::Local(
+            "receipt file changed while it was checked".into(),
+        )),
+        ReceiptStep::Fix => {
+            if finish_receipt(file, gid, host)? {
+                Ok(ReceiptDone::Adjusted)
+            } else {
+                Ok(ReceiptDone::Ready)
+            }
+        }
+        ReceiptStep::Ready => Ok(ReceiptDone::Ready),
+    }
+}
+
+fn replace_receipt(
+    dirfd: i32,
+    file: &File,
+    meta: &std::fs::Metadata,
+    pulse: &str,
+    gid: u32,
+    host: &dyn Host,
+) -> Result<(), InstallError> {
+    if meta.len() > MAX_RECEIPT_BYTES {
+        return Err(InstallError::Local(
+            "receipts.jsonl is larger than 256 MiB".into(),
+        ));
+    }
+    if meta.len() == 0 {
+        return Err(InstallError::Local(
+            "receipt file is empty and does not verify for this pulse".into(),
+        ));
+    }
+    let bytes = read_fd(file, meta.len())?;
+    if genesis_pulse(&bytes).is_some_and(|name| name != pulse) {
+        return Err(InstallError::OtherPulse);
+    }
+    let report = chain::verify_lines(bytes.as_slice());
+    if let Some(note) = report.first_break {
+        return Err(InstallError::Broken {
+            line: note.line,
+            reason: note.reason,
+        });
+    }
+    if genesis_pulse(&bytes).as_deref() != Some(pulse) {
+        return Err(InstallError::Broken {
+            line: 1,
+            reason: "genesis",
+        });
+    }
+    let tmp_name = format!(".receipts.jsonl.{}.tmp", std::process::id());
+    let tmp_c = CString::new(tmp_name.as_str())
+        .map_err(|_| InstallError::Local("path is not usable".into()))?;
+    let mut temp = TempFile {
+        dirfd,
+        name: Some(tmp_c),
+    };
+    let new_file = create_exclusive(dirfd, &tmp_name, 0o600)?;
+    write_all_at(&new_file, &bytes)?;
+    new_file.sync_all().map_err(io_err)?;
+    host.chown(&new_file, 0, gid)?;
+    fchmod(&new_file, RECEIPT_MODE)?;
+    sync_dir(dirfd)?;
+    let dest = CString::new("receipts.jsonl")
+        .map_err(|_| InstallError::Local("path is not usable".into()))?;
+    // SAFETY: both names are nul-terminated children of this directory fd.
+    let rc = unsafe {
+        libc::renameat(
+            dirfd,
+            temp.name.as_ref().unwrap().as_ptr(),
+            dirfd,
+            dest.as_ptr(),
+        )
+    };
+    if rc != 0 {
+        return Err(io_err(io::Error::last_os_error()));
+    }
+    temp.name = None;
+    drop(new_file);
+    let installed = open_read(dirfd, "receipts.jsonl")?;
+    host.set_append(&installed)?;
+    sync_dir(dirfd)?;
+    Ok(())
+}
+
+struct TempFile {
+    dirfd: i32,
+    name: Option<CString>,
+}
+
+impl Drop for TempFile {
+    fn drop(&mut self) {
+        if let Some(name) = self.name.take() {
+            // SAFETY: `name` is the temp file this install created.
+            unsafe { libc::unlinkat(self.dirfd, name.as_ptr(), 0) };
+        }
     }
 }
 
@@ -207,30 +423,37 @@ enum ReceiptStep {
     Ready,
 }
 
-fn create_receipt(dirfd: i32) -> Result<File, InstallError> {
-    match open_name(
-        dirfd,
-        "receipts.jsonl",
-        libc::O_RDWR
-            | libc::O_CREAT
-            | libc::O_EXCL
-            | libc::O_NOFOLLOW
-            | libc::O_NONBLOCK
-            | libc::O_CLOEXEC,
-        Some(RECEIPT_MODE),
-    ) {
+fn open_read(dirfd: i32, name: &str) -> Result<File, InstallError> {
+    open_name(dirfd, name, OPEN_READ, None)
+}
+
+fn open_write(dirfd: i32, name: &str) -> Result<File, InstallError> {
+    open_name(dirfd, name, OPEN_WRITE, None)
+}
+
+fn create_exclusive(dirfd: i32, name: &str, mode: u32) -> Result<File, InstallError> {
+    match open_name(dirfd, name, OPEN_NEW, Some(mode)) {
         Ok(file) => Ok(file),
-        Err(InstallError::Missing) => Err(InstallError::Local(
-            "receipts.jsonl could not be created".into(),
-        )),
-        Err(InstallError::Local(text)) if text == "exists" => open_name(
-            dirfd,
-            "receipts.jsonl",
-            libc::O_RDWR | libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC,
-            None,
-        ),
+        Err(InstallError::Missing) => {
+            Err(InstallError::Local(format!("{name} could not be created")))
+        }
         Err(err) => Err(err),
     }
+}
+
+fn require_regular(file: &File, name: &str) -> Result<std::fs::Metadata, InstallError> {
+    let meta = file.metadata().map_err(io_err)?;
+    if !meta.is_file() {
+        return Err(InstallError::Local(format!(
+            "{name} must be a regular file"
+        )));
+    }
+    if meta.nlink() != 1 {
+        return Err(InstallError::Local(format!(
+            "{name} has more than one link"
+        )));
+    }
+    Ok(meta)
 }
 
 fn decide(
@@ -302,9 +525,52 @@ fn receipt_ready(file: &File, gid: u32, host: &dyn Host) -> Result<bool, Install
 }
 
 fn finish_receipt(file: &File, gid: u32, host: &dyn Host) -> Result<bool, InstallError> {
-    let changed = ensure_mode_owner(file, RECEIPT_MODE, 0, gid, host)?;
-    let flagged = ensure_append(file, host)?;
-    Ok(changed || flagged)
+    let meta = file.metadata().map_err(io_err)?;
+    let (uid, file_gid) = host.owner(file)?;
+    let mode_differs = meta.mode() & 0o777 != RECEIPT_MODE;
+    let owner_differs = uid != 0 || file_gid != gid;
+    let flagged = host.append_flag(file)?;
+    if !mode_differs && !owner_differs {
+        if flagged {
+            return Ok(false);
+        }
+        host.set_append(file)?;
+        return Ok(true);
+    }
+    // `fchown` and `fchmod` fail while `FS_APPEND_FL` is set. Clear it, then
+    // put it back. A failed restore is reported on its own.
+    if flagged {
+        host.clear_append(file)?;
+    }
+    if let Err(err) = ensure_mode_owner(file, RECEIPT_MODE, 0, gid, host) {
+        return restore_append(file, host, flagged, err);
+    }
+    if let Err(err) = host.set_append(file) {
+        if flagged {
+            return Err(InstallError::Local(format!(
+                "the append-only flag was cleared and could not be set again: {err}"
+            )));
+        }
+        return Err(err);
+    }
+    Ok(true)
+}
+
+fn restore_append(
+    file: &File,
+    host: &dyn Host,
+    flagged: bool,
+    err: InstallError,
+) -> Result<bool, InstallError> {
+    if !flagged {
+        return Err(err);
+    }
+    match host.set_append(file) {
+        Ok(()) => Err(err),
+        Err(restore) => Err(InstallError::Local(format!(
+            "the append-only flag was cleared and could not be restored: {restore}; while handling: {err}"
+        ))),
+    }
 }
 
 fn write_genesis(file: &File, pulse: &str) -> Result<(), InstallError> {
@@ -352,63 +618,40 @@ fn genesis_pulse(bytes: &[u8]) -> Option<String> {
     event.get("pulse")?.as_str().map(str::to_string)
 }
 
-fn anchors_usable(dirfd: i32) -> Result<(), InstallError> {
-    let file = match open_name(
-        dirfd,
-        "anchors.log",
-        libc::O_RDWR | libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC,
-        None,
-    ) {
-        Ok(file) => file,
-        Err(InstallError::Missing) => return Ok(()),
-        Err(err) => return Err(err),
-    };
-    let meta = file.metadata().map_err(io_err)?;
-    if !meta.is_file() {
-        return Err(InstallError::Local(
-            "anchors.log must be a regular file".into(),
-        ));
+fn inspect_anchors(dirfd: i32, host: &dyn Host) -> Result<(), InstallError> {
+    match open_read(dirfd, "anchors.log") {
+        Err(InstallError::Missing) => Ok(()),
+        Ok(file) => {
+            require_regular(&file, "anchors.log")?;
+            let (uid, _) = host.owner(&file)?;
+            if uid != 0 {
+                Err(InstallError::NotRootOwned {
+                    file: "anchors.log",
+                })
+            } else {
+                Ok(())
+            }
+        }
+        Err(err) => Err(err),
     }
-    if meta.nlink() != 1 {
-        return Err(InstallError::Local(
-            "anchors.log has more than one link".into(),
-        ));
-    }
-    Ok(())
 }
 
-fn ensure_anchors(dirfd: i32, host: &dyn Host) -> Result<bool, InstallError> {
-    let file = match open_name(
-        dirfd,
-        "anchors.log",
-        libc::O_RDWR | libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC,
-        None,
-    ) {
+fn ensure_anchors(
+    dirfd: i32,
+    pulse_dir: &Path,
+    host: &dyn Host,
+    created_files: &mut Vec<PathBuf>,
+) -> Result<bool, InstallError> {
+    let file = match open_read(dirfd, "anchors.log") {
         Ok(file) => file,
-        Err(InstallError::Missing) => open_name(
-            dirfd,
-            "anchors.log",
-            libc::O_RDWR
-                | libc::O_CREAT
-                | libc::O_EXCL
-                | libc::O_NOFOLLOW
-                | libc::O_NONBLOCK
-                | libc::O_CLOEXEC,
-            Some(ANCHOR_MODE),
-        )?,
+        Err(InstallError::Missing) => {
+            let file = create_exclusive(dirfd, "anchors.log", 0o600)?;
+            created_files.push(pulse_dir.join("anchors.log"));
+            file
+        }
         Err(err) => return Err(err),
     };
-    let meta = file.metadata().map_err(io_err)?;
-    if !meta.is_file() {
-        return Err(InstallError::Local(
-            "anchors.log must be a regular file".into(),
-        ));
-    }
-    if meta.nlink() != 1 {
-        return Err(InstallError::Local(
-            "anchors.log has more than one link".into(),
-        ));
-    }
+    require_regular(&file, "anchors.log")?;
     ensure_mode_owner(&file, ANCHOR_MODE, 0, 0, host)
 }
 
@@ -437,15 +680,34 @@ fn ensure_mode_owner(
     Ok(changed)
 }
 
-fn ensure_append(file: &File, host: &dyn Host) -> Result<bool, InstallError> {
-    if host.append_flag(file)? {
-        return Ok(false);
+fn fchmod(file: &File, mode: u32) -> Result<(), InstallError> {
+    // SAFETY: `fchmod` sets the mode of this open descriptor.
+    let rc = unsafe { libc::fchmod(file.as_raw_fd(), mode as libc::mode_t) };
+    if rc == 0 {
+        Ok(())
+    } else {
+        Err(io_err(io::Error::last_os_error()))
     }
-    host.set_append(file)?;
-    Ok(true)
 }
 
-fn prepare_tree(dir: &Path, pulse: &str, host: &dyn Host) -> Result<(PathBuf, File), InstallError> {
+fn sync_dir(dirfd: i32) -> Result<(), InstallError> {
+    reopen_dir(dirfd)?.sync_all().map_err(io_err)
+}
+
+fn remove_created(files: &[PathBuf], dirs: &[PathBuf]) {
+    for path in files.iter().rev() {
+        let _ = std::fs::remove_file(path);
+    }
+    for path in dirs.iter().rev() {
+        let _ = std::fs::remove_dir(path);
+    }
+}
+
+fn prepare_tree(
+    dir: &Path,
+    pulse: &str,
+    host: &dyn Host,
+) -> Result<(PathBuf, File, Vec<PathBuf>), InstallError> {
     let absolute = if dir.is_absolute() {
         dir.to_path_buf()
     } else {
@@ -465,26 +727,49 @@ fn prepare_tree(dir: &Path, pulse: &str, host: &dyn Host) -> Result<(PathBuf, Fi
     let root = open_root()?;
     let mut current = root;
     let mut built = PathBuf::from("/");
+    let mut created = Vec::new();
     for name in &names {
         built.push(name);
         match open_child_dir(current.as_raw_fd(), name) {
             Ok(next) => {
-                // An existing directory is adjusted only after the receipt
-                // file is accepted. A directory this loop creates is adjusted
-                // below, because it did not exist to hold a foreign file.
+                // An existing directory is not chmod'd here. The pulse
+                // directory must already be root-owned before any file is
+                // trusted. A directory this loop creates is adjusted below.
                 current = next;
             }
             Err(InstallError::Missing) => {
-                mkdir_child(current.as_raw_fd(), name)?;
-                let next = open_child_dir(current.as_raw_fd(), name)?;
-                let rw = open_child_rdonly(current.as_raw_fd(), name)?;
-                ensure_mode_owner(&rw, DIR_MODE, 0, 0, host)?;
+                if let Err(err) = mkdir_child(current.as_raw_fd(), name) {
+                    remove_created(&[], &created);
+                    return Err(err);
+                }
+                created.push(built.clone());
+                let next = match open_child_dir(current.as_raw_fd(), name) {
+                    Ok(next) => next,
+                    Err(err) => {
+                        remove_created(&[], &created);
+                        return Err(err);
+                    }
+                };
+                let rw = match open_child_rdonly(current.as_raw_fd(), name) {
+                    Ok(rw) => rw,
+                    Err(err) => {
+                        remove_created(&[], &created);
+                        return Err(err);
+                    }
+                };
+                if let Err(err) = ensure_mode_owner(&rw, DIR_MODE, 0, 0, host) {
+                    remove_created(&[], &created);
+                    return Err(err);
+                }
                 current = next;
             }
-            Err(err) => return Err(err),
+            Err(err) => {
+                remove_created(&[], &created);
+                return Err(err);
+            }
         }
     }
-    Ok((built, current))
+    Ok((built, current, created))
 }
 
 fn reopen_dir(dirfd: i32) -> Result<File, InstallError> {
@@ -639,47 +924,66 @@ fn lookup_group(name: &str) -> Result<u32, InstallError> {
 }
 
 /// `_IOR('f', 1, long)` and `_IOW('f', 2, long)` on 64-bit Linux.
-#[cfg(all(target_os = "linux", target_pointer_width = "64"))]
-const FS_IOC_GETFLAGS: libc::Ioctl = 0x8008_6601;
-#[cfg(all(target_os = "linux", target_pointer_width = "64"))]
-const FS_IOC_SETFLAGS: libc::Ioctl = 0x4008_6602;
-#[cfg(all(target_os = "linux", target_pointer_width = "64"))]
-const FS_APPEND_FL: libc::c_long = 0x20;
+///
+/// Stored as `u32` and cast to [`libc::Ioctl`] at the call, so the same
+/// bits fit musl's `c_int` request type and glibc's `c_ulong`. The kernel
+/// reads and writes an `int`, not a `long`.
+const FS_IOC_GETFLAGS: u32 = 0x8008_6601;
+const FS_IOC_SETFLAGS: u32 = 0x4008_6602;
+const FS_APPEND_FL: libc::c_int = 0x20;
+
+const _: () = assert!(std::mem::size_of::<libc::c_int>() == 4);
+
+fn ioctl_request(value: u32) -> libc::Ioctl {
+    value as libc::Ioctl
+}
+
+fn flag_io(err: io::Error) -> InstallError {
+    InstallError::Local(format!("could not read file flags: {err}"))
+}
+
+fn unsupported_flags(err: &io::Error) -> bool {
+    matches!(
+        err.raw_os_error(),
+        Some(libc::ENOTTY) | Some(libc::EOPNOTSUPP)
+    )
+}
 
 #[cfg(all(target_os = "linux", target_pointer_width = "64"))]
-fn get_flags(file: &File) -> Result<libc::c_long, InstallError> {
-    let mut flags: libc::c_long = 0;
-    // SAFETY: the request writes one `long` into `flags`. The fd is open.
-    let rc = unsafe { libc::ioctl(file.as_raw_fd(), FS_IOC_GETFLAGS, &mut flags) };
+fn get_flags(file: &File) -> Result<libc::c_int, io::Error> {
+    let mut flags: libc::c_int = 0;
+    // SAFETY: the request writes one `int` into `flags`. The fd is open.
+    let rc = unsafe { libc::ioctl(file.as_raw_fd(), ioctl_request(FS_IOC_GETFLAGS), &mut flags) };
     if rc == 0 {
         Ok(flags)
     } else {
-        Err(io_err(io::Error::last_os_error()))
+        Err(io::Error::last_os_error())
     }
 }
 
 #[cfg(all(target_os = "linux", target_pointer_width = "64"))]
-fn set_flags(file: &File, mut flags: libc::c_long) -> Result<(), InstallError> {
-    // SAFETY: the request reads one `long` from `flags`. The fd is open.
-    let rc = unsafe { libc::ioctl(file.as_raw_fd(), FS_IOC_SETFLAGS, &mut flags) };
+fn set_flags(file: &File, mut flags: libc::c_int) -> Result<(), InstallError> {
+    // SAFETY: the request reads one `int` from `flags`. The fd is open.
+    let rc = unsafe { libc::ioctl(file.as_raw_fd(), ioctl_request(FS_IOC_SETFLAGS), &mut flags) };
     if rc == 0 {
         Ok(())
     } else {
-        Err(InstallError::Local(
-            "could not set the append-only flag".into(),
-        ))
+        let err = io::Error::last_os_error();
+        Err(InstallError::Local(format!(
+            "could not change the append-only flag: {err}"
+        )))
     }
 }
 
 #[cfg(not(all(target_os = "linux", target_pointer_width = "64")))]
-fn get_flags(_file: &File) -> Result<libc::c_long, InstallError> {
-    Err(InstallError::Local(
-        "the append-only flag is only set on 64-bit Linux".into(),
+fn get_flags(_file: &File) -> Result<libc::c_int, io::Error> {
+    Err(io::Error::other(
+        "the append-only flag is only set on 64-bit Linux",
     ))
 }
 
 #[cfg(not(all(target_os = "linux", target_pointer_width = "64")))]
-fn set_flags(_file: &File, _flags: libc::c_long) -> Result<(), InstallError> {
+fn set_flags(_file: &File, _flags: libc::c_int) -> Result<(), InstallError> {
     Err(InstallError::Local(
         "the append-only flag is only set on 64-bit Linux".into(),
     ))
@@ -689,7 +993,7 @@ fn set_flags(_file: &File, _flags: libc::c_long) -> Result<(), InstallError> {
 mod tests {
     use super::*;
     use std::collections::HashMap;
-    use std::os::unix::fs::PermissionsExt;
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
     use std::sync::Mutex;
 
     struct Fake {
@@ -697,8 +1001,9 @@ mod tests {
         gid: Option<u32>,
         chowns: Mutex<Vec<(PathBuf, u32, u32)>>,
         appends: Mutex<Vec<PathBuf>>,
-        owners: Mutex<HashMap<PathBuf, (u32, u32)>>,
-        flags: Mutex<HashMap<PathBuf, bool>>,
+        clears: Mutex<Vec<PathBuf>>,
+        owners: Mutex<HashMap<(u64, u64), (u32, u32)>>,
+        flags: Mutex<HashMap<(u64, u64), bool>>,
     }
 
     impl Fake {
@@ -708,9 +1013,23 @@ mod tests {
                 gid: Some(gid),
                 chowns: Mutex::new(Vec::new()),
                 appends: Mutex::new(Vec::new()),
+                clears: Mutex::new(Vec::new()),
                 owners: Mutex::new(HashMap::new()),
                 flags: Mutex::new(HashMap::new()),
             }
+        }
+
+        fn claim(&self, path: &Path, uid: u32, gid: u32) {
+            let file = File::open(path).unwrap();
+            self.owners
+                .lock()
+                .unwrap()
+                .insert(file_key(&file), (uid, gid));
+        }
+
+        fn claim_flag(&self, path: &Path) {
+            let file = File::open(path).unwrap();
+            self.flags.lock().unwrap().insert(file_key(&file), true);
         }
     }
 
@@ -724,8 +1043,8 @@ mod tests {
         }
 
         fn owner(&self, file: &File) -> Result<(u32, u32), InstallError> {
-            let path = fd_path(file);
-            if let Some(pair) = self.owners.lock().unwrap().get(&path) {
+            let key = file_key(file);
+            if let Some(pair) = self.owners.lock().unwrap().get(&key) {
                 return Ok(*pair);
             }
             let meta = file.metadata().map_err(io_err)?;
@@ -734,28 +1053,46 @@ mod tests {
 
         fn chown(&self, file: &File, uid: u32, gid: u32) -> Result<(), InstallError> {
             let path = fd_path(file);
-            self.chowns.lock().unwrap().push((path.clone(), uid, gid));
-            self.owners.lock().unwrap().insert(path, (uid, gid));
+            self.chowns.lock().unwrap().push((path, uid, gid));
+            self.owners
+                .lock()
+                .unwrap()
+                .insert(file_key(file), (uid, gid));
             Ok(())
         }
 
         fn append_flag(&self, file: &File) -> Result<bool, InstallError> {
-            let path = fd_path(file);
             Ok(self
                 .flags
                 .lock()
                 .unwrap()
-                .get(&path)
+                .get(&file_key(file))
                 .copied()
                 .unwrap_or(false))
         }
 
         fn set_append(&self, file: &File) -> Result<(), InstallError> {
             let path = fd_path(file);
-            self.appends.lock().unwrap().push(path.clone());
-            self.flags.lock().unwrap().insert(path, true);
+            self.appends.lock().unwrap().push(path);
+            self.flags.lock().unwrap().insert(file_key(file), true);
             Ok(())
         }
+
+        fn clear_append(&self, file: &File) -> Result<(), InstallError> {
+            let path = fd_path(file);
+            self.clears.lock().unwrap().push(path);
+            self.flags.lock().unwrap().insert(file_key(file), false);
+            Ok(())
+        }
+
+        fn append_supported(&self, _dir: &File) -> Result<(), InstallError> {
+            Ok(())
+        }
+    }
+
+    fn file_key(file: &File) -> (u64, u64) {
+        let meta = file.metadata().unwrap();
+        (meta.dev(), meta.ino())
     }
 
     fn fd_path(file: &File) -> PathBuf {
@@ -874,16 +1211,114 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let pulse = dir.path().join("echo");
         std::fs::create_dir(&pulse).unwrap();
+        std::fs::set_permissions(&pulse, std::fs::Permissions::from_mode(0o755)).unwrap();
         let receipt = pulse.join("receipts.jsonl");
         std::fs::write(&receipt, b"not a receipt\n").unwrap();
-        let mode = mode_of(&pulse);
         let host = Fake::root_group(42);
+        host.claim(&pulse, 0, 0);
+        host.claim(&receipt, 0, 0);
         let err = run(dir.path(), "echo", "pulse", false, &host).unwrap_err();
         assert!(matches!(err, InstallError::RefuseAdopt), "{err}");
         assert_eq!(std::fs::read(&receipt).unwrap(), b"not a receipt\n");
-        assert_eq!(mode_of(&pulse), mode);
         assert!(!pulse.join("anchors.log").exists());
         assert!(host.appends.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn receipt_install_refuses_a_file_not_owned_by_root() {
+        let dir = tempfile::tempdir().unwrap();
+        let pulse = dir.path().join("echo");
+        std::fs::create_dir(&pulse).unwrap();
+        std::fs::set_permissions(&pulse, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let receipt = pulse.join("receipts.jsonl");
+        std::fs::write(&receipt, b"").unwrap();
+        let host = Fake::root_group(42);
+        host.claim(&pulse, 0, 0);
+        let err = run(dir.path(), "echo", "pulse", false, &host).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                InstallError::NotRootOwned {
+                    file: "receipts.jsonl"
+                }
+            ),
+            "{err}"
+        );
+        assert!(err.to_string().contains("stop the pulse"));
+        assert_eq!(std::fs::read(&receipt).unwrap(), b"");
+        assert!(!pulse.join("anchors.log").exists());
+
+        let anchors = pulse.join("anchors.log");
+        std::fs::write(&anchors, b"keep").unwrap();
+        std::fs::remove_file(&receipt).unwrap();
+        let err = run(dir.path(), "echo", "pulse", true, &host).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                InstallError::NotRootOwned {
+                    file: "anchors.log"
+                }
+            ),
+            "{err}"
+        );
+        assert_eq!(std::fs::read(&anchors).unwrap(), b"keep");
+        assert!(!receipt.exists());
+    }
+
+    #[test]
+    fn receipt_install_refuses_an_unsafe_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let pulse = dir.path().join("echo");
+        std::fs::create_dir(&pulse).unwrap();
+        std::fs::set_permissions(&pulse, std::fs::Permissions::from_mode(0o777)).unwrap();
+        let host = Fake::root_group(42);
+        host.claim(&pulse, 0, 0);
+        let err = run(dir.path(), "echo", "pulse", false, &host).unwrap_err();
+        assert!(matches!(err, InstallError::DirUnsafe), "{err}");
+        assert!(!pulse.join("receipts.jsonl").exists());
+    }
+
+    #[test]
+    fn receipt_install_adopt_replaces_a_non_root_inode() {
+        let dir = tempfile::tempdir().unwrap();
+        let pulse = dir.path().join("echo");
+        std::fs::create_dir(&pulse).unwrap();
+        std::fs::set_permissions(&pulse, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let receipt = pulse.join("receipts.jsonl");
+        let bytes = genesis_bytes("echo").unwrap();
+        std::fs::write(&receipt, &bytes).unwrap();
+        let before = std::fs::metadata(&receipt).unwrap().ino();
+        let held = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&receipt)
+            .unwrap();
+        let host = Fake::root_group(42);
+        host.claim(&pulse, 0, 0);
+        let outcome = run(dir.path(), "echo", "pulse", true, &host).unwrap();
+        assert_eq!(outcome, Outcome::Adopted(pulse.clone()));
+        let after = std::fs::metadata(&receipt).unwrap().ino();
+        assert_ne!(before, after);
+        assert_eq!(std::fs::read(&receipt).unwrap(), bytes);
+        std::os::unix::fs::FileExt::write_at(&held, b"X", 0).unwrap();
+        assert_eq!(std::fs::read(&receipt).unwrap(), bytes);
+        assert_eq!(mode_of(&receipt), RECEIPT_MODE);
+    }
+
+    #[test]
+    fn receipt_install_clears_the_append_flag_before_a_mode_change() {
+        let dir = tempfile::tempdir().unwrap();
+        let host = Fake::root_group(42);
+        run(dir.path(), "echo", "pulse", false, &host).unwrap();
+        let receipt = dir.path().join("echo/receipts.jsonl");
+        std::fs::set_permissions(&receipt, std::fs::Permissions::from_mode(0o600)).unwrap();
+        host.claim_flag(&receipt);
+        let clears = host.clears.lock().unwrap().len();
+        let outcome = run(dir.path(), "echo", "pulse", true, &host).unwrap();
+        assert_eq!(outcome, Outcome::Adopted(dir.path().join("echo")));
+        assert!(host.clears.lock().unwrap().len() > clears);
+        assert_eq!(mode_of(&receipt), RECEIPT_MODE);
+        assert!(host.append_flag(&File::open(&receipt).unwrap()).unwrap());
     }
 
     #[test]
@@ -891,10 +1326,13 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let pulse = dir.path().join("echo");
         std::fs::create_dir(&pulse).unwrap();
+        std::fs::set_permissions(&pulse, std::fs::Permissions::from_mode(0o755)).unwrap();
         let receipt = pulse.join("receipts.jsonl");
         let bytes = genesis_bytes("other").unwrap();
         std::fs::write(&receipt, &bytes).unwrap();
         let host = Fake::root_group(42);
+        host.claim(&pulse, 0, 0);
+        host.claim(&receipt, 0, 0);
         let err = run(dir.path(), "echo", "pulse", true, &host).unwrap_err();
         assert!(matches!(err, InstallError::OtherPulse), "{err}");
         assert_eq!(std::fs::read(&receipt).unwrap(), bytes);
@@ -909,11 +1347,13 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let pulse = dir.path().join("echo");
         std::fs::create_dir(&pulse).unwrap();
+        std::fs::set_permissions(&pulse, std::fs::Permissions::from_mode(0o755)).unwrap();
         let receipt = pulse.join("receipts.jsonl");
         let mut bytes = genesis_bytes("echo").unwrap();
         bytes.extend_from_slice(b"not-a-row\n");
         std::fs::write(&receipt, &bytes).unwrap();
         let host = Fake::root_group(42);
+        host.claim(&pulse, 0, 0);
         let err = run(dir.path(), "echo", "pulse", true, &host).unwrap_err();
         match err {
             InstallError::Broken { line, .. } => assert_eq!(line, 2),
@@ -928,11 +1368,15 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let pulse = dir.path().join("echo");
         std::fs::create_dir(&pulse).unwrap();
+        std::fs::set_permissions(&pulse, std::fs::Permissions::from_mode(0o755)).unwrap();
         let receipt = pulse.join("receipts.jsonl");
         let bytes = genesis_bytes("echo").unwrap();
         std::fs::write(&receipt, &bytes).unwrap();
         std::fs::set_permissions(&receipt, std::fs::Permissions::from_mode(0o666)).unwrap();
+        let before = std::fs::metadata(&receipt).unwrap().ino();
         let host = Fake::root_group(42);
+        host.claim(&pulse, 0, 0);
+        host.claim(&receipt, 0, 42);
         let refused = run(dir.path(), "echo", "pulse", false, &host).unwrap_err();
         assert!(matches!(refused, InstallError::RefuseAdopt), "{refused}");
         assert_eq!(mode_of(&receipt), 0o666);
@@ -940,6 +1384,7 @@ mod tests {
         assert_eq!(outcome, Outcome::Adopted(pulse.clone()));
         assert_eq!(std::fs::read(&receipt).unwrap(), bytes);
         assert_eq!(mode_of(&receipt), RECEIPT_MODE);
+        assert_eq!(std::fs::metadata(&receipt).unwrap().ino(), before);
         assert_eq!(host.appends.lock().unwrap().len(), 1);
         assert!(pulse.join("anchors.log").exists());
     }
@@ -957,6 +1402,8 @@ mod tests {
 
         let pulse = dir.path().join("echo");
         std::fs::create_dir(&pulse).unwrap();
+        std::fs::set_permissions(&pulse, std::fs::Permissions::from_mode(0o755)).unwrap();
+        host.claim(&pulse, 0, 0);
         let outside = dir.path().join("outside");
         std::fs::write(&outside, b"keep").unwrap();
         std::os::unix::fs::symlink(&outside, pulse.join("receipts.jsonl")).unwrap();
@@ -967,6 +1414,8 @@ mod tests {
 
         let again = dir.path().join("again");
         std::fs::create_dir(&again).unwrap();
+        std::fs::set_permissions(&again, std::fs::Permissions::from_mode(0o755)).unwrap();
+        host.claim(&again, 0, 0);
         let target = dir.path().join("anchor-target");
         std::fs::write(&target, b"keep").unwrap();
         std::os::unix::fs::symlink(&target, again.join("anchors.log")).unwrap();
@@ -991,39 +1440,53 @@ mod tests {
         assert!(conf.contains("OpenFile=/var/lib/pulse-null/%i/receipts.jsonl:receipts:append"));
         assert!(conf.contains("Environment=PULSE_NULL_RECEIPTS=required"));
         assert!(conf.contains("253"));
-        assert!(service.contains("ExecStart=/usr/local/bin/pulse-null receipts anchor --pulse %i"));
+        assert!(service.contains(
+            "ExecStart=/usr/local/bin/pulse-null receipts anchor --pulse %i --file /var/lib/pulse-null/%i/receipts.jsonl"
+        ));
+        assert!(!service.contains("WorkingDirectory="));
+        assert!(!service.contains("/home/pulse"));
         assert!(service.contains("LoadCredential=anchor-token:/etc/pulse-null/anchor/token"));
         assert!(service.contains("User=root"));
+        assert!(service.contains("CapabilityBoundingSet="));
         assert!(service.contains("/etc/pulse-null/anchor.toml"));
         assert!(timer.contains("OnCalendar=hourly"));
         assert!(timer.contains("pulse-null-anchor@%i.service"));
-        if which_systemd_analyze() {
+        if std::path::Path::new("/run/systemd/system").is_dir() && which_systemd_analyze() {
             for unit in ["pulse-null-anchor@.service", "pulse-null-anchor@.timer"] {
-                let output = std::process::Command::new("systemd-analyze")
-                    .arg("verify")
-                    .arg(root.join(unit))
-                    .output()
-                    .unwrap();
+                let output = crate::process_state::during_fork(|| {
+                    std::process::Command::new("systemd-analyze")
+                        .arg("verify")
+                        .arg(root.join(unit))
+                        .output()
+                        .unwrap()
+                });
                 let stderr = String::from_utf8_lossy(&output.stderr);
+                let lower = stderr.to_ascii_lowercase();
+                assert!(!lower.contains("unknown key"), "{unit}\n{stderr}");
+                assert!(!lower.contains("ignoring"), "{unit}\n{stderr}");
                 assert!(
                     output.status.success() || stderr.contains("is not executable"),
-                    "{unit}\n{stderr}"
-                );
-                assert!(
-                    !stderr.to_ascii_lowercase().contains("failed to parse"),
                     "{unit}\n{stderr}"
                 );
             }
         }
     }
 
+    #[test]
+    fn receipt_install_append_flag_ioctl_argument_is_an_int() {
+        assert_eq!(std::mem::size_of::<libc::c_int>(), 4);
+        assert_eq!(std::mem::size_of_val(&FS_APPEND_FL), 4);
+    }
+
     fn which_systemd_analyze() -> bool {
-        std::process::Command::new("systemd-analyze")
-            .arg("--version")
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status()
-            .map(|status| status.success())
-            .unwrap_or(false)
+        crate::process_state::during_fork(|| {
+            std::process::Command::new("systemd-analyze")
+                .arg("--version")
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status()
+                .map(|status| status.success())
+                .unwrap_or(false)
+        })
     }
 }

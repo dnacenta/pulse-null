@@ -297,9 +297,12 @@ pub async fn swaps(file: Option<PathBuf>, json: bool) -> Result<(), Box<dyn std:
 /// Create `<dir>/<pulse>/`, `receipts.jsonl`, and `anchors.log`.
 ///
 /// Refuses unless the process is root. A second run that finds the same
-/// layout prints that nothing changed. `--adopt` sets the owner, mode, and
-/// append-only flag on a file that already verifies for this pulse, and does
-/// not rewrite it.
+/// layout prints `already installed; nothing changed` and changes nothing.
+/// A file that is not owned by root is refused unless `--adopt`. `--adopt`
+/// copies a chain that verifies for this pulse onto a new root-owned inode.
+/// Stop the pulse first: a descriptor opened before that still names the
+/// old inode. A file root already owns is not replaced; its owner, mode,
+/// and append-only flag are corrected on that inode.
 pub async fn install(
     pulse: String,
     group: String,

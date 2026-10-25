@@ -81,7 +81,7 @@ Every key:
 | `receipts` | `require_protected` | `true` | Write only through a protected systemd fd. A path is not opened |
 | `receipts` | `content` | `digest` | What a row stores. Only `digest` is accepted |
 
-Anchor backends are not in this file. They are read from `/etc/pulse-null/anchor.toml` (see [receipts.md](receipts.md#anchors)). `pulse-null.toml` cannot name a repo or a token. `pulse-null receipts install` does not read this file: it creates `/var/lib/pulse-null/<pulse>/` (or `--dir`) as root. The service drop-in sets `PULSE_NULL_RECEIPTS=required`, which forces receipts on and ignores `[receipts] path`.
+Anchor backends are not in this file. They are read from `/etc/pulse-null/anchor.toml` (see [receipts.md](receipts.md#anchors)). `pulse-null.toml` cannot name a repo or a token. `pulse-null receipts install` does not read this file: it creates `/var/lib/pulse-null/<pulse>/` (or `--dir`) as root. The service drop-in sets `PULSE_NULL_RECEIPTS=required`, which forces receipts on for the daemon and ignores `[receipts] path` there. `receipts anchor`, `receipts verify`, and the anchor timer still use `[receipts] path` unless `--file` is given. The timer passes `--file` and does not read this file.
 
 Also present, with defaults: `[owner]`, `[prediction]`, `[tension]`, `[outreach]`,
 `[sessions]`, `[session_health]`, `[platform]`, `[system_prompt_budget]`, `[peers]`,
