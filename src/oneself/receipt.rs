@@ -421,7 +421,7 @@ fn open_error(err: StoreError) -> Appender {
             );
             Appender::unprotected()
         }
-        StoreError::Foreign { .. } | StoreError::NotLedger { .. } => {
+        StoreError::Foreign { .. } | StoreError::NotLedger { .. } | StoreError::NotFile { .. } => {
             tracing::warn!("{err}");
             Appender::unavailable()
         }
@@ -632,7 +632,7 @@ fn lost_close(stream: &str) -> ReceiptEvent {
         action_class: ActionClass::None,
         provider: String::new(),
         adapter: String::new(),
-        model: String::new(),
+        model: None,
         fallback: false,
         input_sha256: None,
         output_sha256: None,
@@ -895,7 +895,6 @@ pub struct OpenInfo {
     pub principal_sha256: Option<String>,
     pub provider: String,
     pub adapter: String,
-    pub model: String,
     pub input_sha256: String,
     pub task_id: Option<String>,
     pub parent: Option<String>,
@@ -1017,7 +1016,7 @@ impl Drop for StreamReceipt {
             action_class: ActionClass::None,
             provider: info.provider.clone(),
             adapter: info.adapter.clone(),
-            model: info.model.clone(),
+            model: None,
             fallback: false,
             input_sha256: Some(info.input_sha256.clone()),
             output_sha256: None,
@@ -1033,7 +1032,9 @@ impl Drop for StreamReceipt {
 }
 
 fn close_event(info: &OpenInfo, end: &TurnRecord<'_>, elapsed: Duration) -> ReceiptEvent {
-    let model = end.model.unwrap_or(&info.model).to_string();
+    // Only a response-resolved name is stored. The configured name on the
+    // open is not copied onto an error, an abort, or a silent close.
+    let model = end.model.map(str::to_string);
     let (outcome, action, output) = if end.isolation {
         let output = end.text.map(|text| digest(text.as_bytes()));
         let action = if output.is_some() {
@@ -1244,7 +1245,6 @@ mod tests {
             principal_sha256: None,
             provider: "mock".into(),
             adapter: String::new(),
-            model: "mock-model".into(),
             input_sha256: chain::sha256_hex(b"one"),
             task_id: None,
             parent: None,
@@ -1260,7 +1260,6 @@ mod tests {
                 principal_sha256: None,
                 provider: "mock".into(),
                 adapter: String::new(),
-                model: "mock-model".into(),
                 input_sha256: chain::sha256_hex(b"two"),
                 task_id: None,
                 parent: None,
@@ -1311,7 +1310,6 @@ mod tests {
                 principal_sha256: None,
                 provider: "mock".into(),
                 adapter: String::new(),
-                model: "mock-model".into(),
                 input_sha256: digest(b"request"),
                 task_id: None,
                 parent: None,
@@ -1326,7 +1324,6 @@ mod tests {
                 principal_sha256: None,
                 provider: "mock".into(),
                 adapter: String::new(),
-                model: "mock-model".into(),
                 input_sha256: "nope".into(),
                 task_id: None,
                 parent: None,
@@ -1355,7 +1352,6 @@ mod tests {
             principal_sha256: None,
             provider: "mock".into(),
             adapter: String::new(),
-            model: model.to_string(),
             input_sha256: chain::sha256_hex(b"in"),
             task_id: None,
             parent: None,
@@ -1415,7 +1411,6 @@ mod tests {
             principal_sha256: None,
             provider: "mock".into(),
             adapter: String::new(),
-            model: "m".into(),
             input_sha256: chain::sha256_hex(b"in"),
             task_id: None,
             parent: None,
@@ -1464,6 +1459,92 @@ mod tests {
         assert_eq!(outcome("silent"), "silent");
         assert_eq!(outcome("error"), "error");
         assert_eq!(outcome("isolated"), "isolated");
+    }
+
+    #[tokio::test]
+    async fn an_error_close_omits_the_model_and_equal_successes_are_not_a_swap() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("receipts.jsonl");
+        let config = config_at(&path, true, false);
+        let appender = Appender::start(
+            &config,
+            dir.path(),
+            ListenEnv::empty(),
+            Arc::new(LiveProbe),
+            "mock",
+        )
+        .await;
+        let info = |stream: &str| OpenInfo {
+            stream: stream.into(),
+            channel: "task".into(),
+            principal: "task".into(),
+            principal_sha256: None,
+            provider: "mock".into(),
+            adapter: String::new(),
+            input_sha256: chain::sha256_hex(b"in"),
+            task_id: None,
+            parent: None,
+        };
+        let settle = |stream: &str, model: Option<&str>, failure: bool| {
+            StreamReceipt::open(&appender, info(stream)).settle(Settle {
+                text: if failure { None } else { Some("reply") },
+                model,
+                isolation: false,
+                failure,
+                tokens_in: None,
+                tokens_out: None,
+            });
+        };
+        settle("ok-1", Some("resolved"), false);
+        settle("bad", None, true);
+        settle("ok-2", Some("resolved"), false);
+        settle("ok-3", Some("other"), false);
+        appender.drained().await;
+        let text = std::fs::read_to_string(&path).unwrap();
+        let close = |stream: &str| -> String {
+            text.lines()
+                .find(|line| {
+                    line.contains(&format!("\"stream\":\"{stream}\""))
+                        && line.contains("\"kind\":\"close\"")
+                })
+                .unwrap_or_else(|| panic!("no close for {stream}: {text}"))
+                .to_string()
+        };
+        assert!(close("ok-1").contains("\"model\":\"resolved\""));
+        assert!(!close("ok-1").contains("configured-alias"));
+        assert!(!close("bad").contains("\"model\""));
+        assert!(!close("bad").contains("configured-alias"));
+        let rows: Vec<chain::Row> = text
+            .lines()
+            .filter(|line| !line.is_empty())
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        let swaps = crate::cli::receipts::find_swaps(&rows, "ok");
+        let closes: Vec<_> = swaps.iter().filter(|item| item.kind == "close").collect();
+        assert_eq!(closes.len(), 1, "{closes:?}");
+        assert_eq!(closes[0].from_model, "resolved");
+        assert_eq!(closes[0].to_model, "other");
+    }
+
+    #[tokio::test]
+    async fn a_regular_file_parent_is_unavailable() {
+        let dir = tempfile::tempdir().unwrap();
+        let parent = dir.path().join("notadir");
+        std::fs::write(&parent, b"keep").unwrap();
+        let path = parent.join("receipts.jsonl");
+        let config = config_at(&path, true, false);
+        let appender = Appender::start(
+            &config,
+            dir.path(),
+            ListenEnv::empty(),
+            Arc::new(LiveProbe),
+            "mock",
+        )
+        .await;
+        assert_eq!(appender.snapshot().state, "unavailable");
+        assert!(appender.snapshot().seq.is_none());
+        assert_eq!(std::fs::read(&parent).unwrap(), b"keep");
+        assert!(!path.exists());
     }
 
     #[test]

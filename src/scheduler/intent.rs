@@ -754,7 +754,6 @@ impl IntentGuard {
                 parent: None,
                 provider: state.provider.name().to_string(),
                 adapter: state.config.llm.cli_adapter().unwrap_or("").to_string(),
-                model: state.config.llm.model.clone(),
                 input_sha256: crate::oneself::receipt::digest(intent.prompt.as_bytes()),
             }
         });

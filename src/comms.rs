@@ -797,7 +797,6 @@ impl DialogueRun {
                 parent: None,
                 provider: run.state.provider.name().to_string(),
                 adapter: run.state.config.llm.cli_adapter().unwrap_or("").to_string(),
-                model: run.state.config.llm.model.clone(),
                 input_sha256: crate::oneself::receipt::digest(input.as_bytes()),
             }
         })

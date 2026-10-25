@@ -134,6 +134,9 @@ enum ReceiptsAction {
         /// Drop an overlap that ended before this instant
         #[arg(long)]
         since: Option<String>,
+        /// Print at most this many overlaps. 0 lists every overlap.
+        #[arg(long, default_value_t = crate::cli::receipts::DEFAULT_OVERLAP_LIMIT)]
+        limit: u64,
         /// Print one JSON object
         #[arg(long)]
         json: bool,
@@ -706,9 +709,12 @@ fn receipts_command(action: ReceiptsAction) -> CommandFuture {
             limit,
             json,
         } => Box::pin(cli::receipts::show(file, since, kind, limit, json)),
-        ReceiptsAction::Overlaps { file, since, json } => {
-            Box::pin(cli::receipts::overlaps(file, since, json))
-        }
+        ReceiptsAction::Overlaps {
+            file,
+            since,
+            limit,
+            json,
+        } => Box::pin(cli::receipts::overlaps(file, since, limit, json)),
         ReceiptsAction::Swaps { file, json } => Box::pin(cli::receipts::swaps(file, json)),
     }
 }

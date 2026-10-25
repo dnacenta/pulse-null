@@ -207,7 +207,6 @@ pub struct FarmStreams {
     parent: Option<String>,
     provider: String,
     adapter: String,
-    model: String,
 }
 
 /// Run a farm to completion (or its wall budget). The executor is one child
@@ -493,7 +492,6 @@ fn open_subtask(
             parent: streams.parent.clone(),
             provider: streams.provider.clone(),
             adapter: streams.adapter.clone(),
-            model: streams.model.clone(),
             input_sha256: crate::oneself::receipt::digest(sub.prompt.as_bytes()),
         }
     })
@@ -598,7 +596,6 @@ fn open_farm(
     let parent = uuid::Uuid::new_v4().to_string();
     let provider = state.provider.name().to_string();
     let adapter = state.config.llm.cli_adapter().unwrap_or("").to_string();
-    let model = state.config.llm.model.clone();
     let receipt = crate::oneself::receipt::StreamReceipt::open(
         &state.receipts,
         crate::oneself::receipt::OpenInfo {
@@ -610,7 +607,6 @@ fn open_farm(
             parent: None,
             provider: provider.clone(),
             adapter: adapter.clone(),
-            model: model.clone(),
             input_sha256: crate::oneself::receipt::digest(spec.description.as_bytes()),
         },
     );
@@ -619,7 +615,6 @@ fn open_farm(
         parent: Some(parent),
         provider,
         adapter,
-        model,
     };
     (Some(receipt), Some(streams))
 }
