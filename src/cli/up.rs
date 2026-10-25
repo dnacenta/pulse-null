@@ -101,6 +101,7 @@ async fn boot_into(
                 config: pulse.config,
                 port: booted.actual_port,
                 server_handle: booted.server_handle,
+                stop: booted.stop,
                 coordinator: booted.coordinator,
                 event_bus: booted.event_bus,
                 persist_coordinator: booted.persist_coordinator,

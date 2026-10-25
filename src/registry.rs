@@ -2,6 +2,7 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use tokio::sync::watch;
 use tokio::task::JoinHandle;
 
 use crate::config::Config;
@@ -18,6 +19,8 @@ pub struct RunningPulse {
     #[allow(dead_code)]
     pub port: u16,
     pub server_handle: JoinHandle<()>,
+    /// Tells the server to stop accepting and to drain open connections.
+    pub stop: watch::Sender<bool>,
     pub coordinator: crate::coordinator::control::Coordinator,
     #[allow(dead_code)]
     pub event_bus: Arc<EventBus>,
@@ -95,23 +98,47 @@ impl PulseRegistry {
 
 /// Stop the pulse in the same order as the daemon's shutdown.
 ///
-/// The coordinator stops first. Aborting the server then lets in-flight
-/// turns drop their receipt guards, so those close rows are queued before
-/// the shutdown row. Persistence is flushed after those turns.
+/// The server stops accepting and drains connections that are already open.
+/// The coordinator stops while that drain runs. The drain is bounded by the
+/// same window the daemon uses. A connection still open when the window ends
+/// is aborted. Persistence is flushed after the drain, and the shutdown row
+/// is written last. A turn whose close row was not queued is reconciled as
+/// `close{lost}` on the next boot.
 async fn shut_down_pulse(name: &str, pulse: RunningPulse) {
     tracing::info!("Shutting down pulse: {}", name);
     let RunningPulse {
         coordinator,
         server_handle,
+        stop,
         persist_coordinator,
         receipts,
         ..
     } = pulse;
+    let _ = stop.send(true);
     coordinator.shutdown().await;
-    server_handle.abort();
-    let _ = server_handle.await;
+    drain_server(name, server_handle).await;
     flush_persistence(name, &persist_coordinator).await;
     receipts.shutdown().await;
+}
+
+/// Wait for the server task to finish the drain, then abort what is left.
+async fn drain_server(name: &str, mut server_handle: JoinHandle<()>) {
+    let drain = crate::server::turns::DRAIN_WINDOW;
+    tokio::select! {
+        biased;
+        joined = &mut server_handle => {
+            if let Err(err) = joined {
+                tracing::warn!("{name}: server task ended during drain: {err}");
+            }
+        }
+        () = tokio::time::sleep(drain) => {
+            tracing::warn!(
+                "{name}: server drain did not finish within {drain:?}, aborting"
+            );
+            server_handle.abort();
+            let _ = server_handle.await;
+        }
+    }
 }
 
 /// Flush any in-flight persistence tasks (5s timeout per pulse).
