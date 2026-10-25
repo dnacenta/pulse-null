@@ -58,7 +58,9 @@ const HOME_TICK: Duration = Duration::from_secs(2);
 
 /// `pulse-null up`: Home — the logo and the pulse menu. Nothing is
 /// started until a row is chosen.
-pub async fn run_home() -> Result<(), Box<dyn std::error::Error>> {
+pub async fn run_home(
+    listen: crate::oneself::store::ListenEnv,
+) -> Result<(), Box<dyn std::error::Error>> {
     let rows = rescan_home();
     let tui = crate::config::TuiConfig::default();
     let mut app = App::new(
@@ -70,12 +72,15 @@ pub async fn run_home() -> Result<(), Box<dyn std::error::Error>> {
         Glyphs::from_setting(&tui.nerd_font),
     );
     app.start_home(rows);
-    run_app(app, None).await
+    run_app(app, None, &listen).await
 }
 
 /// `pulse-null chat`: the TUI for the pulse in `config`, straight into
 /// Talk when a daemon is already up.
-pub async fn run_chat(config: Config) -> Result<(), Box<dyn std::error::Error>> {
+pub async fn run_chat(
+    config: Config,
+    listen: crate::oneself::store::ListenEnv,
+) -> Result<(), Box<dyn std::error::Error>> {
     let root = config.root_dir()?;
     let mut started = Vec::new();
     let client = Client::new(
@@ -84,7 +89,7 @@ pub async fn run_chat(config: Config) -> Result<(), Box<dyn std::error::Error>> 
         config.security.secret.clone(),
     );
     let state = home::PulseState::from(client.probe_detail(&config.pulse.name).await);
-    let session = Session::open(&config, root, state, &mut started)
+    let session = Session::open(&config, root, state, &mut started, &listen)
         .map_err(|why| format!("cannot open {}: {why}", config.pulse.name))?;
     let mut app = App::new(
         "",
@@ -101,11 +106,15 @@ pub async fn run_chat(config: Config) -> Result<(), Box<dyn std::error::Error>> 
         app.screen = app::Screen::Boot;
         app.boot.status = "starting the daemon".to_string();
     }
-    run_app_with(app, Some(session), started).await
+    run_app_with(app, Some(session), started, &listen).await
 }
 
-async fn run_app(app: App, session: Option<Session>) -> Result<(), Box<dyn std::error::Error>> {
-    run_app_with(app, session, Vec::new()).await
+async fn run_app(
+    app: App,
+    session: Option<Session>,
+    listen: &crate::oneself::store::ListenEnv,
+) -> Result<(), Box<dyn std::error::Error>> {
+    run_app_with(app, session, Vec::new(), listen).await
 }
 
 /// Terminal setup, the loop, terminal teardown, then stop every daemon this
@@ -115,6 +124,7 @@ async fn run_app_with(
     mut app: App,
     session: Option<Session>,
     mut started: Vec<Daemon>,
+    listen: &crate::oneself::store::ListenEnv,
 ) -> Result<(), Box<dyn std::error::Error>> {
     // Between wizard prompts the terminal is cooked, so a Ctrl+c there
     // reaches this process as SIGINT. Swallow it: the child wizard dies
@@ -125,7 +135,7 @@ async fn run_app_with(
         }
     });
     let mut term = enter_terminal();
-    let result = event_loop(&mut term, &mut app, session, &mut started).await;
+    let result = event_loop(&mut term, &mut app, session, &mut started, listen).await;
     leave_terminal(&term);
     if !started.is_empty() {
         eprintln!("stopping {} pulse(s) this shell started…", started.len());
@@ -246,6 +256,7 @@ impl Session {
         root: std::path::PathBuf,
         state: home::PulseState,
         started: &mut Vec<Daemon>,
+        listen: &crate::oneself::store::ListenEnv,
     ) -> Result<Self, String> {
         if let Some(why) = crate::discovery::untrusted_reason(&root) {
             return Err(why);
@@ -269,8 +280,9 @@ impl Session {
             let (stop, stop_rx) = tokio::sync::watch::channel(false);
             let cfg = config.clone();
             let dir = root.clone();
+            let listen = listen.clone();
             let task = tokio::spawn(async move {
-                crate::server::start_in(cfg, dir, Some(stop_rx))
+                crate::server::start_in(cfg, dir, Some(stop_rx), listen)
                     .await
                     .map_err(|e| e.to_string())
             });
@@ -323,13 +335,14 @@ fn open_peer(
     a: usize,
     cfg_a: &Config,
     peer: &str,
+    listen: &crate::oneself::store::ListenEnv,
 ) -> Result<Client, String> {
     let root = app.home.rows[a].dir.clone();
     if app.home.rows[a].state != home::PulseState::Up {
         return Err(format!("{} is not up", cfg_a.pulse.name));
     }
     drop(session.take());
-    let s = Session::open(cfg_a, root, home::PulseState::Up, started)?;
+    let s = Session::open(cfg_a, root, home::PulseState::Up, started, listen)?;
     let client = s.client.clone();
     *session = Some(s);
     app.enter_pulse(cfg_a);
@@ -431,10 +444,15 @@ async fn run_wizard(target: &std::path::Path) -> Result<(), String> {
     };
     let mut dir_arg = std::ffi::OsString::from("--dir=");
     dir_arg.push(target);
-    let status = tokio::process::Command::new(exe)
-        .arg("init")
-        .arg(dir_arg)
-        .status()
+    let mut child = crate::process_state::during_fork(|| {
+        tokio::process::Command::new(exe)
+            .arg("init")
+            .arg(dir_arg)
+            .spawn()
+    })
+    .map_err(|e| format!("could not start the wizard: {e}"))?;
+    let status = child
+        .wait()
         .await
         .map_err(|e| format!("could not start the wizard: {e}"))?;
     if status.success() {
@@ -480,6 +498,7 @@ async fn event_loop(
     app: &mut App,
     mut session: Option<Session>,
     started: &mut Vec<Daemon>,
+    listen: &crate::oneself::store::ListenEnv,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let mut attached = session.as_ref().is_some_and(|s| s.attached);
     let mut events = EventStream::new();
@@ -572,7 +591,7 @@ async fn event_loop(
                                     task.abort();
                                 }
                                 turn_rx = None;
-                                match Session::open(&config, root.clone(), state, started) {
+                                match Session::open(&config, root.clone(), state, started, listen) {
                                     Ok(s) => {
                                         attached = s.attached;
                                         attach_deadline = Instant::now() + ATTACH_TIMEOUT;
@@ -737,7 +756,7 @@ async fn event_loop(
                             launch,
                         }) = comms_launch.take()
                         {
-                            match open_peer(app, &mut session, started, a, &cfg_a, &peer) {
+                            match open_peer(app, &mut session, started, a, &cfg_a, &peer, listen) {
                                 Ok(client) => {
                                     let (tx, rx) = tokio::sync::mpsc::channel(64);
                                     comms_rx = Some(rx);

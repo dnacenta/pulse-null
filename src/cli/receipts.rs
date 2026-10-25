@@ -299,18 +299,18 @@ fn since_ok(since: &str) -> bool {
 /// UTC instant in the stored form `YYYY-MM-DDTHH:MM:SS.mmmZ`.
 ///
 /// A full RFC3339 value, including an offset or a fractional second, is
-/// converted. A shorter prefix of that form is completed and checked as a
-/// real date, so `2026-13` is rejected and `2026-10-25` starts at midnight.
+/// converted. A shorter prefix is a lower bound: it is padded with zeros
+/// (`2026-1` is `2026-10-00…`) and kept only when some real instant starts
+/// with it, so `2026-13` and `2026-02-31` are rejected and `2026-10-25`
+/// starts at midnight.
 fn since_bound(since: &str) -> Option<String> {
     if let Some(utc) = parse_rfc3339_utc(since) {
         return Some(format_ms(utc));
     }
-    let completed = complete_prefix(since)?;
-    if chain::ts_ok(&completed) {
-        Some(completed)
-    } else {
-        None
+    if !prefix_can_start_an_instant(since) {
+        return None;
     }
+    Some(zero_pad(since))
 }
 
 fn parse_rfc3339_utc(since: &str) -> Option<chrono::DateTime<chrono::Utc>> {
@@ -345,22 +345,98 @@ fn format_ms(utc: chrono::DateTime<chrono::Utc>) -> String {
     format!("{}.{:03}Z", utc.format("%Y-%m-%dT%H:%M:%S"), millis)
 }
 
-fn complete_prefix(since: &str) -> Option<String> {
-    const FORM: &str = "0000-01-01T00:00:00.000Z";
-    if since.is_empty() || since.len() > FORM.len() {
-        return None;
+fn zero_pad(since: &str) -> String {
+    const ZEROS: &str = "0000-00-00T00:00:00.000Z";
+    format!("{since}{}", &ZEROS[since.len()..])
+}
+
+/// True when `since` is a non-empty prefix of `YYYY-MM-DDTHH:MM:SS.mmmZ`
+/// and at least one real instant starts with those characters.
+fn prefix_can_start_an_instant(since: &str) -> bool {
+    const SHAPE: &str = "0000-00-00T00:00:00.000Z";
+    if since.is_empty() || since.len() > SHAPE.len() {
+        return false;
     }
-    let form = FORM.as_bytes();
-    for (index, byte) in since.bytes().enumerate() {
-        if form[index].is_ascii_digit() {
+    let bytes = since.as_bytes();
+    let shape = SHAPE.as_bytes();
+    for (index, byte) in bytes.iter().copied().enumerate() {
+        if shape[index] == b'0' {
             if !byte.is_ascii_digit() {
-                return None;
+                return false;
             }
-        } else if byte != form[index] {
-            return None;
+        } else if byte != shape[index] {
+            return false;
         }
     }
-    Some(format!("{since}{}", &FORM[since.len()..]))
+    let len = bytes.len();
+    if len <= 4 {
+        return true;
+    }
+    if len > 5 && !partial_in_range(bytes, 5, 2, 1, 12) {
+        return false;
+    }
+    if len <= 8 {
+        return true;
+    }
+    if !partial_in_range(bytes, 8, 2, 1, max_day(bytes)) {
+        return false;
+    }
+    if len <= 11 {
+        return true;
+    }
+    if !partial_in_range(bytes, 11, 2, 0, 23) {
+        return false;
+    }
+    if len <= 14 {
+        return true;
+    }
+    if !partial_in_range(bytes, 14, 2, 0, 59) {
+        return false;
+    }
+    if len <= 17 {
+        return true;
+    }
+    partial_in_range(bytes, 17, 2, 0, 59)
+}
+
+/// Some completion of the digits we have falls in `min..=max`.
+fn partial_in_range(bytes: &[u8], start: usize, width: usize, min: u32, max: u32) -> bool {
+    if bytes.len() <= start {
+        return true;
+    }
+    let have = (bytes.len() - start).min(width);
+    let mut value = 0u32;
+    for index in 0..have {
+        value = value * 10 + u32::from(bytes[start + index] - b'0');
+    }
+    let scale = 10u32.pow(u32::try_from(width - have).unwrap_or(0));
+    let low = value.saturating_mul(scale);
+    let high = low.saturating_add(scale.saturating_sub(1));
+    low <= max && high >= min
+}
+
+fn max_day(bytes: &[u8]) -> u32 {
+    let month = u32::from(bytes[5] - b'0') * 10 + u32::from(bytes[6] - b'0');
+    match month {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11 => 30,
+        2 => {
+            let year = u32::from(bytes[0] - b'0') * 1000
+                + u32::from(bytes[1] - b'0') * 100
+                + u32::from(bytes[2] - b'0') * 10
+                + u32::from(bytes[3] - b'0');
+            if is_leap(year) {
+                29
+            } else {
+                28
+            }
+        }
+        _ => 0,
+    }
+}
+
+fn is_leap(year: u32) -> bool {
+    (year.is_multiple_of(4) && !year.is_multiple_of(100)) || year.is_multiple_of(400)
 }
 
 fn kind_ok(kind: &str) -> bool {
@@ -958,6 +1034,17 @@ mod tests {
             "2026-10-25T00:00:00.000Z"
         );
         assert!(since_bound("2026-13").is_none());
+        assert_eq!(since_bound("2026-1").unwrap(), "2026-10-00T00:00:00.000Z");
+        assert_eq!(
+            since_bound("2026-10-2").unwrap(),
+            "2026-10-20T00:00:00.000Z"
+        );
+        assert_eq!(
+            since_bound("2026-11-3").unwrap(),
+            "2026-11-30T00:00:00.000Z"
+        );
+        assert!(since_bound("2026-02-3").is_none());
+        assert!(since_bound("2026-2").is_none());
 
         let mut prev = chain::GENESIS_PREV.to_string();
         let mut body = Vec::new();
@@ -1001,5 +1088,54 @@ mod tests {
         let bare = filtered_rows(&inspected, Some("2026-10-25T03:00:01Z"), None, None);
         assert_eq!(bare[0].ts, "2026-10-25T03:00:01.000Z");
         assert_eq!(bare.len(), 2);
+    }
+
+    #[test]
+    fn since_prefix_matches_instants_that_start_with_it() {
+        let mut prev = chain::GENESIS_PREV.to_string();
+        let mut body = Vec::new();
+        for (seq, ts) in [
+            (0, "2026-09-30T00:00:00.000Z"),
+            (1, "2026-10-20T00:00:00.000Z"),
+            (2, "2026-10-25T00:00:00.000Z"),
+            (3, "2026-11-30T12:00:00.000Z"),
+        ] {
+            let event = if seq == 0 {
+                ReceiptEvent::Genesis {
+                    pulse: "echo".to_string(),
+                }
+            } else {
+                ReceiptEvent::Shutdown {
+                    reason: "stop".to_string(),
+                }
+            };
+            let line = chain::canonical(
+                &serde_json::to_value(chain::Row {
+                    v: 1,
+                    seq,
+                    prev: prev.clone(),
+                    ts: ts.to_string(),
+                    e: serde_json::to_value(event).unwrap(),
+                })
+                .unwrap(),
+            )
+            .unwrap();
+            prev = chain::sha256_hex(line.as_bytes());
+            writeln!(&mut body, "{line}").unwrap();
+        }
+        let inspected = Inspected {
+            bytes: body,
+            report: chain::verify_lines(&b""[..]),
+        };
+        let seqs = |since: &str| -> Vec<u64> {
+            filtered_rows(&inspected, Some(since), None, None)
+                .iter()
+                .map(|row| row.seq)
+                .collect()
+        };
+        assert_eq!(seqs("2026-1"), vec![1, 2, 3]);
+        assert_eq!(seqs("2026-10-2"), vec![1, 2, 3]);
+        assert_eq!(seqs("2026-11-3"), vec![3]);
+        assert!(since_ok("2026-11-3"));
     }
 }

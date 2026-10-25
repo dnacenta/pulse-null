@@ -52,6 +52,9 @@ pub struct ChatResponse {
     /// deltas it already showed.
     #[serde(skip_serializing_if = "std::ops::Not::not", default)]
     pub truncated: bool,
+    /// The turn ran on the configured fallback target. Not part of the wire.
+    #[serde(skip)]
+    pub fallback_used: bool,
 }
 
 fn default_channel() -> String {
@@ -257,12 +260,70 @@ pub(crate) async fn run_turn(
     sink: Option<TurnSink>,
     control: Option<Arc<tool_loop::ControlPlane>>,
 ) -> Result<ChatResponse, (StatusCode, String)> {
+    // The receipt guard covers this future. Dropping it, including a client
+    // that went away, writes close{aborted}. Nothing in the stream path
+    // records a receipt.
+    let receipt = open_receipt(&state, &admitted);
     // Only the owner's turns reach the agent CLI with its full tool surface;
     // a guest or peer runs on the restricted one, whatever the isolation
     // state (PN-110 audit P1). Everything below — compaction, the provider
     // call, the refusal fallback — runs inside this scope.
     let surface = crate::tool_surface::ToolSurface::for_principal(admitted.key());
-    crate::tool_surface::scope(surface, run_resolved_turn(state, admitted, sink, control)).await
+    let result =
+        crate::tool_surface::scope(surface, run_resolved_turn(state, admitted, sink, control))
+            .await;
+    receipt.finish(turn_record(&result));
+    result
+}
+
+/// The open row for one turn. The sender string is hashed, never stored.
+///
+/// Receipts that are off return before the id, the copies, and the digest.
+fn open_receipt(state: &AppState, admitted: &Admitted) -> crate::oneself::receipt::StreamReceipt {
+    crate::oneself::receipt::StreamReceipt::open_if_on(&state.receipts, || {
+        let req = admitted.request();
+        let (principal, principal_sha256) = crate::oneself::receipt::principal_of(admitted.key());
+        crate::oneself::receipt::OpenInfo {
+            stream: uuid::Uuid::new_v4().to_string(),
+            channel: req.channel.clone(),
+            principal,
+            principal_sha256,
+            provider: state.provider.name().to_string(),
+            adapter: state.config.llm.cli_adapter().unwrap_or("").to_string(),
+            model: state.config.llm.model.clone(),
+            input_sha256: crate::oneself::receipt::digest(req.message.as_bytes()),
+        }
+    })
+}
+
+fn turn_record(
+    result: &Result<ChatResponse, (StatusCode, String)>,
+) -> crate::oneself::receipt::TurnRecord<'_> {
+    match result {
+        Ok(response) => crate::oneself::receipt::TurnRecord {
+            text: Some(&response.response),
+            model: Some(&response.model),
+            isolation: response.isolation || response.model == "isolation-control",
+            truncated: response.truncated,
+            refused: false,
+            fallback_used: response.fallback_used,
+            tokens_in: response.input_tokens,
+            tokens_out: response.output_tokens,
+        },
+        Err((_, message)) => crate::oneself::receipt::TurnRecord {
+            text: None,
+            model: None,
+            isolation: false,
+            truncated: false,
+            // `RefusalError` is the typed refusal. `steps::public_failure_message`
+            // turns it into this text, and may prefix the isolation banner,
+            // before `run_turn` sees a `(StatusCode, String)`.
+            refused: message.contains("the model declined this request"),
+            fallback_used: false,
+            tokens_in: None,
+            tokens_out: None,
+        },
+    }
 }
 
 /// The turn after its principal is resolved to `resolved_key`: the steps of

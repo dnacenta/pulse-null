@@ -48,12 +48,14 @@ pub(crate) fn write_script(path: &Path, body: &str) {
 
 fn wait_until_it_execs(path: &Path) {
     for _ in 0..PROBE_ATTEMPTS {
-        let probe = Command::new(path)
-            .env(PROBE_ENV, "1")
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status();
+        let probe = crate::process_state::during_fork(|| {
+            Command::new(path)
+                .env(PROBE_ENV, "1")
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status()
+        });
         match probe {
             Ok(_) => return,
             Err(e) if e.raw_os_error() == Some(TEXT_FILE_BUSY) => {
@@ -77,7 +79,7 @@ mod tests {
         write_script(&bin, &format!("touch '{}'", marker.display()));
         assert!(!marker.exists(), "the probe ran the script's body");
         assert!(!dir.path().join("fake.partial").exists());
-        let status = Command::new(&bin).status().unwrap();
+        let status = crate::process_state::during_fork(|| Command::new(&bin).status()).unwrap();
         assert!(status.success());
         assert!(marker.exists());
     }

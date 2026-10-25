@@ -453,6 +453,18 @@ async fn build_state_with_buffer(
     config: Config,
     context_buffer: Option<crate::context_buffer::ContextBufferStore>,
 ) -> Arc<AppState> {
+    build_state_prepared(root_dir, provider, tools, config, context_buffer, None).await
+}
+
+/// [`build_state_with_buffer`] with a protection probe. `None` is the live one.
+async fn build_state_prepared(
+    root_dir: std::path::PathBuf,
+    provider: Box<dyn crate::streaming::StreamingProvider>,
+    tools: ToolRegistry,
+    config: Config,
+    context_buffer: Option<crate::context_buffer::ContextBufferStore>,
+    probe: Option<Arc<dyn crate::oneself::protect::ProtectionProbe + Send + Sync>>,
+) -> Arc<AppState> {
     let wal =
         crate::wal::WalWriter::new(&root_dir.join("sessions"), crate::wal::WalFsync::None).ok();
     let mut session_store =
@@ -464,6 +476,16 @@ async fn build_state_with_buffer(
     let plugin_manager = crate::plugins::manager::PluginManager::new(&config);
     let alert_queue = crate::scheduler::alerts::AlertQueue::load(&root_dir);
     let pools = crate::server::stream_pools();
+    let provider_name = provider.name().to_string();
+    let probe = probe.unwrap_or_else(|| Arc::new(crate::oneself::protect::LiveProbe));
+    let receipts = crate::oneself::receipt::Appender::start(
+        &config,
+        &root_dir,
+        crate::oneself::store::ListenEnv::empty(),
+        probe,
+        &provider_name,
+    )
+    .await;
     Arc::new(AppState {
         config,
         provider,
@@ -490,6 +512,7 @@ async fn build_state_with_buffer(
         graph_extractor: None,
         ledger: Arc::new(crate::ledger::LedgerRing::new(64)),
         turns: crate::server::turns::TurnRunner::new(),
+        receipts,
     })
 }
 
@@ -9282,5 +9305,383 @@ mod session_cleanup_e2e {
             .get_existing_by_key("guest:stale")
             .await
             .is_some());
+    }
+}
+
+mod receipt_turns {
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    use axum::body::Body;
+    use axum::http::{Request, StatusCode};
+    use tower::ServiceExt;
+
+    use super::{build_app, build_state_prepared, post_chat, post_chat_secret, test_config};
+    use crate::oneself::chain;
+    use crate::oneself::protect::{FakeProbe, ProtectionProbe};
+    use crate::server::admission::admit_turn;
+    use crate::server::auth::AuthIdentity;
+    use crate::server::handlers::chat::{run_turn, ChatRequest};
+
+    fn enable(dir: &std::path::Path, require: bool) -> crate::config::Config {
+        let mut config = test_config();
+        config.receipts.enabled = true;
+        config.receipts.require_protected = require;
+        config.receipts.path = dir.join("receipts.jsonl").display().to_string();
+        config.receipts.content = "digest".into();
+        config.llm.fallback_model = Some("fallback-model".into());
+        config.pulse.rules_dir = Some(dir.join("rules").display().to_string());
+        config
+    }
+
+    fn write_identity(dir: &std::path::Path) {
+        std::fs::write(dir.join("SELF.md"), b"self-bytes").unwrap();
+        let rules = dir.join("rules");
+        std::fs::create_dir(&rules).unwrap();
+        std::fs::write(rules.join("b.md"), b"bee").unwrap();
+        std::fs::write(rules.join("a.md"), b"ay").unwrap();
+        std::fs::write(dir.join("pulse-null.toml"), b"cfg-bytes").unwrap();
+    }
+
+    fn rules_digest() -> String {
+        let pairs = serde_json::json!([
+            ["a.md", chain::sha256_hex(b"ay")],
+            ["b.md", chain::sha256_hex(b"bee")],
+        ]);
+        chain::sha256_hex(serde_json::to_string(&pairs).unwrap().as_bytes())
+    }
+
+    async fn health(app: &axum::Router) -> serde_json::Value {
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/health")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        serde_json::from_slice(&bytes).unwrap()
+    }
+
+    async fn wait_text(path: &std::path::Path, needle: &str) -> String {
+        for _ in 0..100 {
+            if let Ok(text) = std::fs::read_to_string(path) {
+                if text.contains(needle) {
+                    return text;
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        panic!("receipt file never contained {needle}");
+    }
+
+    fn events(text: &str) -> Vec<serde_json::Value> {
+        text.lines()
+            .filter(|line| !line.is_empty())
+            .map(|line| {
+                let row: serde_json::Value = serde_json::from_str(line).unwrap();
+                row["e"].clone()
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn an_owner_turn_writes_boot_open_and_close_without_the_text() {
+        let dir = tempfile::tempdir().unwrap();
+        write_identity(dir.path());
+        let config = enable(dir.path(), false);
+        let reply = "mock reply zeta";
+        let state = build_state_prepared(
+            dir.path().to_path_buf(),
+            Box::new(super::MockProvider::new(vec![super::LlmResponse {
+                content: vec![super::ContentBlock::Text {
+                    text: reply.to_string(),
+                }],
+                stop_reason: super::StopReason::EndTurn,
+                model: "mock-model".into(),
+                input_tokens: Some(10),
+                output_tokens: Some(4),
+            }])),
+            super::ToolRegistry::new(),
+            config,
+            None,
+            None,
+        )
+        .await;
+        let app = build_app(Arc::clone(&state));
+        let message = "zephyr-receipt-plaintext-unique";
+        let (status, body) = post_chat_secret(&app, "tui", None, message, None).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        state.receipts.drained().await;
+        let path = dir.path().join("receipts.jsonl");
+        let verified = crate::cli::receipts::verify(Some(path.clone()), true).await;
+        assert!(verified.is_ok(), "{verified:?}");
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(!text.contains(message), "{text}");
+        assert!(!text.contains(reply), "{text}");
+        let rows = events(&text);
+        let kinds: Vec<_> = rows
+            .iter()
+            .map(|event| event["kind"].as_str().unwrap())
+            .collect();
+        assert_eq!(kinds, ["genesis", "boot", "open", "close"]);
+        let boot = &rows[1];
+        assert_eq!(boot["version"], env!("CARGO_PKG_VERSION"));
+        assert_eq!(boot["provider"], "mock");
+        assert_eq!(boot["adapter"], "");
+        assert_eq!(boot["model"], "mock-model");
+        assert_eq!(boot["fallback_model"], "fallback-model");
+        assert_eq!(boot["fd_source"], "self");
+        assert_eq!(boot["protected"], false);
+        assert_eq!(boot["append_only"], false);
+        assert_eq!(
+            boot["identity"]["self_md"],
+            chain::sha256_hex(b"self-bytes")
+        );
+        assert_eq!(boot["identity"]["rules"], rules_digest());
+        assert_eq!(boot["identity"]["config"], chain::sha256_hex(b"cfg-bytes"));
+        let open = &rows[2];
+        let close = &rows[3];
+        assert_eq!(open["principal"], "owner");
+        assert!(open.get("principal_sha256").is_none());
+        assert_eq!(open["channel"], "tui");
+        assert_eq!(open["stream"], close["stream"]);
+        assert_eq!(close["outcome"], "acted");
+        assert_eq!(close["action_class"], "reply");
+        assert_eq!(close["provider"], "mock");
+        assert_eq!(close["model"], "mock-model");
+        assert_eq!(close["fallback"], false);
+        assert_eq!(close["input_sha256"], chain::sha256_hex(message.as_bytes()));
+        assert_eq!(close["output_sha256"], chain::sha256_hex(reply.as_bytes()));
+        assert_eq!(close["tokens_in"], 10);
+        assert_eq!(close["tokens_out"], 4);
+        let snap = health(&app).await;
+        assert_eq!(snap["receipts"]["state"], "ok");
+        assert!(snap["receipts"]["seq"].is_u64());
+    }
+
+    #[tokio::test]
+    async fn receipts_off_creates_no_file_and_health_says_off() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = test_config();
+        let path = dir.path().join("receipts.jsonl");
+        config.receipts.path = path.display().to_string();
+        config.receipts.enabled = false;
+        let state = build_state_prepared(
+            dir.path().to_path_buf(),
+            Box::new(super::MockProvider::new(vec![super::LlmResponse {
+                content: vec![super::ContentBlock::Text { text: "hi".into() }],
+                stop_reason: super::StopReason::EndTurn,
+                model: "mock-model".into(),
+                input_tokens: None,
+                output_tokens: None,
+            }])),
+            super::ToolRegistry::new(),
+            config,
+            None,
+            None,
+        )
+        .await;
+        let app = build_app(state);
+        let (status, body) = post_chat(&app, "hello").await;
+        assert_eq!(status, StatusCode::OK);
+        let reply: serde_json::Value = serde_json::from_str(&body).unwrap();
+        let allowed = [
+            "response",
+            "model",
+            "input_tokens",
+            "output_tokens",
+            "isolation",
+            "truncated",
+        ];
+        for key in reply.as_object().unwrap().keys() {
+            assert!(allowed.contains(&key.as_str()), "{key} {body}");
+        }
+        assert!(reply.get("receipts").is_none(), "{body}");
+        assert!(reply.get("fallback_used").is_none(), "{body}");
+        assert!(!path.exists());
+        let snap = health(&app).await;
+        assert_eq!(snap["receipts"]["state"], "off");
+        assert!(snap["receipts"]["seq"].is_null());
+    }
+
+    #[tokio::test]
+    async fn dropping_the_turn_future_writes_close_aborted() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = enable(dir.path(), false);
+        let state = build_state_prepared(
+            dir.path().to_path_buf(),
+            Box::new(super::MockProvider::with_delay(
+                vec![super::LlmResponse {
+                    content: vec![super::ContentBlock::Text {
+                        text: "late".into(),
+                    }],
+                    stop_reason: super::StopReason::EndTurn,
+                    model: "mock-model".into(),
+                    input_tokens: None,
+                    output_tokens: None,
+                }],
+                Duration::from_secs(30),
+            )),
+            super::ToolRegistry::new(),
+            config,
+            None,
+            None,
+        )
+        .await;
+        let path = dir.path().join("receipts.jsonl");
+        let admitted = admit_turn(
+            &state,
+            AuthIdentity::Owner,
+            ChatRequest {
+                message: "drop-this-turn".into(),
+                channel: "tui".into(),
+                sender: None,
+            },
+        )
+        .unwrap();
+        let handle = tokio::spawn(run_turn(Arc::clone(&state), admitted, None, None));
+        wait_text(&path, "\"open\"").await;
+        handle.abort();
+        let text = wait_text(&path, "\"aborted\"").await;
+        assert!(!text.contains("drop-this-turn"), "{text}");
+        let close = events(&text)
+            .into_iter()
+            .find(|event| event["kind"] == "close")
+            .unwrap();
+        assert_eq!(close["outcome"], "aborted");
+        assert_eq!(close["action_class"], "none");
+    }
+
+    #[tokio::test]
+    async fn a_guest_row_hashes_the_sender_and_stores_neither_string() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = enable(dir.path(), false);
+        let state = build_state_prepared(
+            dir.path().to_path_buf(),
+            Box::new(super::MockProvider::new(vec![super::LlmResponse {
+                content: vec![super::ContentBlock::Text {
+                    text: "guest-reply".into(),
+                }],
+                stop_reason: super::StopReason::EndTurn,
+                model: "mock-model".into(),
+                input_tokens: None,
+                output_tokens: None,
+            }])),
+            super::ToolRegistry::new(),
+            config,
+            None,
+            None,
+        )
+        .await;
+        let app = build_app(Arc::clone(&state));
+        let (status, _) =
+            post_chat_secret(&app, "chat", Some("zephyr-sender"), "zephyr-body", None).await;
+        assert_eq!(status, StatusCode::OK);
+        state.receipts.drained().await;
+        let text = std::fs::read_to_string(dir.path().join("receipts.jsonl")).unwrap();
+        assert!(!text.contains("zephyr-sender"), "{text}");
+        assert!(!text.contains("zephyr-body"), "{text}");
+        assert!(!text.contains("guest-reply"), "{text}");
+        let open = events(&text)
+            .into_iter()
+            .find(|event| event["kind"] == "open")
+            .unwrap();
+        assert_eq!(open["principal"], "guest");
+        assert_eq!(
+            open["principal_sha256"],
+            chain::sha256_hex(b"zephyr-sender")
+        );
+    }
+
+    #[tokio::test]
+    async fn a_fault_leaves_the_turn_answered_and_one_gap_follows() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = enable(dir.path(), false);
+        let replies = (0..4)
+            .map(|index| super::LlmResponse {
+                content: vec![super::ContentBlock::Text {
+                    text: format!("reply-{index}"),
+                }],
+                stop_reason: super::StopReason::EndTurn,
+                model: "mock-model".into(),
+                input_tokens: None,
+                output_tokens: None,
+            })
+            .collect();
+        let state = build_state_prepared(
+            dir.path().to_path_buf(),
+            Box::new(super::MockProvider::new(replies)),
+            super::ToolRegistry::new(),
+            config,
+            None,
+            None,
+        )
+        .await;
+        let app = build_app(Arc::clone(&state));
+        state.receipts.arm_fault(2).await;
+        let (status, body) = post_chat_secret(&app, "tui", None, "fault-body", None).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let mut degraded = false;
+        for _ in 0..50 {
+            if health(&app).await["receipts"]["state"] == "degraded" {
+                degraded = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(degraded, "health stayed healthy after a failed append");
+        let (status, _) = post_chat_secret(&app, "tui", None, "after-fault", None).await;
+        assert_eq!(status, StatusCode::OK);
+        state.receipts.drained().await;
+        let text = std::fs::read_to_string(dir.path().join("receipts.jsonl")).unwrap();
+        assert!(!text.contains("fault-body"), "{text}");
+        assert!(!text.contains("after-fault"), "{text}");
+        assert_eq!(text.matches("\"kind\":\"gap\"").count(), 1, "{text}");
+    }
+
+    #[tokio::test]
+    async fn required_and_an_unprotected_probe_serves_and_writes_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("receipts.jsonl");
+        std::fs::write(&path, b"").unwrap();
+        let mut config = enable(dir.path(), true);
+        config.receipts.path = path.display().to_string();
+        let probe: Arc<dyn ProtectionProbe + Send + Sync> = Arc::new(FakeProbe {
+            systemd_fd: false,
+            owner_root: false,
+            mode_safe: false,
+            append_flag: false,
+            parent_safe: false,
+        });
+        let state = build_state_prepared(
+            dir.path().to_path_buf(),
+            Box::new(super::MockProvider::new(vec![super::LlmResponse {
+                content: vec![super::ContentBlock::Text {
+                    text: "still here".into(),
+                }],
+                stop_reason: super::StopReason::EndTurn,
+                model: "mock-model".into(),
+                input_tokens: None,
+                output_tokens: None,
+            }])),
+            super::ToolRegistry::new(),
+            config,
+            None,
+            Some(probe),
+        )
+        .await;
+        let app = build_app(state);
+        let (status, body) = post_chat(&app, "unprotected-body").await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(std::fs::read(&path).unwrap(), b"");
+        let snap = health(&app).await;
+        assert_eq!(snap["receipts"]["state"], "unprotected");
+        assert!(snap["receipts"]["seq"].is_null());
     }
 }

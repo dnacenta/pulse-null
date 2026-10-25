@@ -2,11 +2,9 @@
 //!
 //! One process holds an exclusive lock. A path open is the dev mode. A
 //! systemd fd named `receipts` is used only when it belongs to this process,
-//! is a regular file, and is open for append. The daemon calls [`ReceiptStore::open`]
-//! in a later slice. `verify` and `show` read through [`inspect`] and do not
-//! lock or repair.
-//!
-//! The writer is allowed to look unused in the binary until that slice.
+//! is a regular file, and is open for append. The daemon calls
+//! [`ReceiptStore::open_for_daemon`]. `verify` and `show` read through
+//! [`inspect`] and do not lock or repair.
 
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
@@ -27,21 +25,46 @@ use super::protect::{Protection, ProtectionProbe};
 pub struct ListenEnv {
     pub pid: Option<String>,
     pub fds: Option<String>,
-    #[cfg_attr(not(test), expect(dead_code, reason = "wired in increment 3"))]
     pub names: Option<String>,
     /// Shared by clones. The first open spends it, including a refusal.
-    #[cfg_attr(not(test), expect(dead_code, reason = "wired in increment 3"))]
     spent: Arc<AtomicBool>,
 }
 
 impl ListenEnv {
-    fn captured(pid: Option<String>, fds: Option<String>, names: Option<String>) -> Self {
+    pub(crate) fn captured(
+        pid: Option<String>,
+        fds: Option<String>,
+        names: Option<String>,
+    ) -> Self {
         Self {
             pid,
             fds,
             names,
             spent: Arc::new(AtomicBool::new(false)),
         }
+    }
+
+    /// Mark the snapshot spent, as the first pulse's open does.
+    ///
+    /// A later open of this snapshot returns [`StoreError::NotUsed`] without
+    /// touching a descriptor. Tests use it so a second pulse does not adopt
+    /// fd 3.
+    #[cfg(test)]
+    pub(crate) fn claim_for_test(&self) -> bool {
+        !self.spent.swap(true, std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// No systemd fds. Tests and a pulse that does not own the snapshot use this.
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "in-process tests pass an empty snapshot; the daemon passes the one main captured"
+        )
+    )]
+    #[must_use]
+    pub(crate) fn empty() -> Self {
+        Self::captured(None, None, None)
     }
 }
 
@@ -63,8 +86,8 @@ pub fn take_listen_env() -> ListenEnv {
     listen
 }
 
-/// Held for the daemon open in a later slice. Tests pass [`ListenEnv`] into
-/// [`StoreSource`] instead of using this.
+/// Held so a test can take the snapshot [`take_listen_env`] captured.
+/// The daemon is given its own clone and does not call [`take_retained_listen`].
 pub fn retain_listen(listen: ListenEnv) {
     let mut slot = RETAINED_LISTEN
         .lock()
@@ -73,7 +96,13 @@ pub fn retain_listen(listen: ListenEnv) {
 }
 
 /// Take the snapshot saved by [`retain_listen`]. A second call is `None`.
-#[cfg_attr(not(test), expect(dead_code, reason = "wired in increment 3"))]
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "tests take the snapshot; the daemon keeps its own clone"
+    )
+)]
 #[must_use]
 pub fn take_retained_listen() -> Option<ListenEnv> {
     let mut slot = RETAINED_LISTEN
@@ -117,7 +146,6 @@ static RETAINED_LISTEN: std::sync::Mutex<Option<ListenEnv>> = std::sync::Mutex::
 
 /// Where the bytes live.
 #[derive(Debug, Clone)]
-#[cfg_attr(not(test), expect(dead_code, reason = "wired in increment 3"))]
 pub enum StoreSource {
     /// systemd `OpenFile=` fd whose name is `name` (`receipts`).
     SystemdFd {
@@ -130,15 +158,21 @@ pub enum StoreSource {
 
 /// The last accepted row.
 #[derive(Debug, Clone, PartialEq, Eq)]
-#[cfg_attr(not(test), expect(dead_code, reason = "wired in increment 3"))]
 pub struct Head {
     pub seq: u64,
     pub hash: String,
 }
 
+/// A store ready to append, or a probe that refused a protected open.
+pub enum OpenChoice {
+    /// The file is locked and repaired. Append to this store.
+    Ready(Box<(ReceiptStore, Opened)>),
+    /// Protection was required and the probe did not pass. Nothing was written.
+    Unprotected(Protection),
+}
+
 /// What open did to the tail, plus the protection report.
 #[derive(Debug, Clone)]
-#[cfg_attr(not(test), expect(dead_code, reason = "wired in increment 3"))]
 pub struct Opened {
     /// A `recover` row was appended for a torn tail.
     pub recovered: bool,
@@ -166,40 +200,43 @@ pub struct Inspected {
 #[derive(Debug, Error)]
 pub enum StoreError {
     #[error("receipt file is locked by another process")]
-    #[cfg_attr(not(test), expect(dead_code, reason = "wired in increment 3"))]
     Locked,
     #[error("systemd fd {name} was not passed to this process")]
-    #[cfg_attr(not(test), expect(dead_code, reason = "wired in increment 3"))]
     NotUsed { name: String },
     #[error("systemd fd {fd} is not a regular file")]
-    #[cfg_attr(not(test), expect(dead_code, reason = "wired in increment 3"))]
     NotRegular { fd: i32 },
     #[error("systemd fd {fd} is not open for append")]
-    #[cfg_attr(not(test), expect(dead_code, reason = "wired in increment 3"))]
     NotAppend { fd: i32 },
     #[error("systemd fd {fd} is not open for reading and writing")]
-    #[cfg_attr(not(test), expect(dead_code, reason = "wired in increment 3"))]
     NotReadWrite { fd: i32 },
     #[error("receipt file {path} has no complete row and cannot be recovered; rotate the file")]
-    #[cfg_attr(not(test), expect(dead_code, reason = "wired in increment 3"))]
     Rotate { path: String },
     #[error("receipt file is broken at line {line}: {reason}")]
-    #[cfg_attr(not(test), expect(dead_code, reason = "wired in increment 3"))]
     Broken { line: usize, reason: &'static str },
     #[error("receipt append failed and the store is poisoned ({dropped} dropped)")]
-    #[cfg_attr(not(test), expect(dead_code, reason = "wired in increment 3"))]
     Append {
         dropped: u64,
         #[source]
         source: std::io::Error,
     },
     #[error("receipt row could not be built")]
-    #[cfg_attr(not(test), expect(dead_code, reason = "wired in increment 3"))]
     Row,
     #[error("receipt path {path} is not a regular file")]
     NotFile { path: String },
     #[error("receipt file {path} is {bytes} bytes, over the 256 MiB cap")]
     TooLarge { path: String, bytes: u64 },
+    /// The file already belongs to another pulse. Leave it unchanged.
+    #[error(
+        "receipt file {path} belongs to pulse {found}, not {pulse}; leave it unchanged and choose another path"
+    )]
+    Foreign {
+        path: String,
+        found: String,
+        pulse: String,
+    },
+    /// Non-empty, and it does not start with a genesis row. Leave it unchanged.
+    #[error("receipt file {path} has no genesis row; leave it unchanged and choose another path")]
+    NotLedger { path: String },
     #[error(transparent)]
     Io(#[from] std::io::Error),
 }
@@ -303,7 +340,6 @@ pub fn orphan_streams(bytes: &[u8]) -> Vec<String> {
 /// Fds start at 3. A wrong pid or a missing name is "not used", not an error
 /// from this function.
 #[must_use]
-#[cfg_attr(not(test), expect(dead_code, reason = "wired in increment 3"))]
 pub fn listen_fd(
     pid_env: Option<&str>,
     fds_env: Option<&str>,
@@ -328,7 +364,6 @@ pub fn listen_fd(
 }
 
 /// One appender. Dropping it releases the lock and closes the fd.
-#[cfg_attr(not(test), expect(dead_code, reason = "wired in increment 3"))]
 pub struct ReceiptStore {
     file: File,
     next_seq: u64,
@@ -339,6 +374,9 @@ pub struct ReceiptStore {
     gap_last: Option<String>,
     #[cfg(test)]
     fault: Option<RecordFault>,
+    /// Appends that fail before any byte is written. The daemon's test hook.
+    #[cfg(test)]
+    fault_left: u64,
 }
 
 impl std::fmt::Debug for ReceiptStore {
@@ -354,22 +392,45 @@ impl std::fmt::Debug for ReceiptStore {
 
 impl ReceiptStore {
     /// Open `source`, lock it, and repair only a torn or unterminated tail.
-    #[cfg_attr(not(test), expect(dead_code, reason = "wired in increment 3"))]
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "verify tests call this; the daemon calls open_for_daemon"
+        )
+    )]
     pub fn open(
         source: StoreSource,
         probe: &dyn ProtectionProbe,
         pulse: &str,
     ) -> Result<(Self, Opened), StoreError> {
-        // A fork in another test inherits this fd until that child execs, so
-        // a reopen can see the previous lock for that window. The lock test's
-        // child must not retry: it has to observe the held lock. A systemd
-        // snapshot is single-use, so that retry stays on the path open.
+        Self::open_retry(source, probe, pulse, false).and_then(ready_store)
+    }
+
+    /// [`open`](Self::open), and when `stop_if_unprotected` the probe runs
+    /// before any repair or genesis. An unprotected file is not written.
+    pub fn open_for_daemon(
+        source: StoreSource,
+        probe: &dyn ProtectionProbe,
+        pulse: &str,
+        stop_if_unprotected: bool,
+    ) -> Result<OpenChoice, StoreError> {
+        Self::open_retry(source, probe, pulse, stop_if_unprotected)
+    }
+
+    fn open_retry(
+        source: StoreSource,
+        probe: &dyn ProtectionProbe,
+        pulse: &str,
+        stop_if_unprotected: bool,
+    ) -> Result<OpenChoice, StoreError> {
+        // A child forked by another test inherits this flock until it execs.
+        // Retry every source, including a systemd fd. The lock test's child
+        // must not retry: it has to observe the held lock.
         #[cfg(test)]
-        if std::env::var_os("RECEIPT_FLOCK_CHILD").is_none()
-            && matches!(source, StoreSource::Path(_))
-        {
+        if std::env::var_os("RECEIPT_FLOCK_CHILD").is_none() {
             for _ in 0..40 {
-                match Self::open_once(source.clone(), probe, pulse) {
+                match Self::open_once(source.clone(), probe, pulse, stop_if_unprotected) {
                     Err(StoreError::Locked) => {
                         std::thread::sleep(std::time::Duration::from_millis(5));
                     }
@@ -377,20 +438,42 @@ impl ReceiptStore {
                 }
             }
         }
-        Self::open_once(source, probe, pulse)
+        Self::open_once(source, probe, pulse, stop_if_unprotected)
     }
 
-    #[cfg_attr(not(test), expect(dead_code, reason = "wired in increment 3"))]
     fn open_once(
         source: StoreSource,
         probe: &dyn ProtectionProbe,
         pulse: &str,
-    ) -> Result<(Self, Opened), StoreError> {
+        stop_if_unprotected: bool,
+    ) -> Result<OpenChoice, StoreError> {
         let (mut file, from_systemd, path) = adopt(source)?;
         let protection = probe.probe(&file, from_systemd);
+        if stop_if_unprotected && !protection.is_protected() {
+            return Ok(OpenChoice::Unprotected(protection));
+        }
         lock_exclusive(&file)?;
         let bytes = read_all(&mut file)?;
         let had_bytes = !bytes.is_empty();
+        // A non-empty file that does not start with this pulse's genesis is
+        // not repaired and not replaced. Empty is the only file open creates.
+        if !bytes.is_empty() {
+            let line = first_physical_line(&bytes);
+            match genesis_pulse(line) {
+                Some(found) if found == pulse => {}
+                Some(found) => {
+                    return Err(StoreError::Foreign {
+                        path,
+                        found,
+                        pulse: pulse.to_string(),
+                    });
+                }
+                None if from_systemd => {
+                    return Err(StoreError::Rotate { path });
+                }
+                None => return Err(StoreError::NotLedger { path }),
+            }
+        }
         let class = classify(&bytes)?;
         let mut recovered = false;
         let mut repaired_newline = false;
@@ -406,20 +489,12 @@ impl ReceiptStore {
                 });
             }
             RepairKind::NoRow => {
-                if from_systemd {
+                if from_systemd || had_bytes {
                     return Err(StoreError::Rotate {
                         path: fd_path(file.as_raw_fd()),
                     });
                 }
-                if had_bytes {
-                    tracing::warn!(
-                        %path,
-                        "receipt file has no complete row; replacing it with genesis"
-                    );
-                } else {
-                    tracing::info!(%path, "receipt file is empty; writing genesis");
-                }
-                file.set_len(0)?;
+                tracing::info!(%path, "receipt file is empty; writing genesis");
                 let line = encode_line(
                     0,
                     GENESIS_PREV,
@@ -460,8 +535,10 @@ impl ReceiptStore {
             gap_last: None,
             #[cfg(test)]
             fault: None,
+            #[cfg(test)]
+            fault_left: 0,
         };
-        Ok((
+        Ok(OpenChoice::Ready(Box::new((
             store,
             Opened {
                 recovered,
@@ -471,13 +548,12 @@ impl ReceiptStore {
                 protection,
                 report,
             },
-        ))
+        ))))
     }
 
     /// Append `event`. A poisoned store writes a `gap` row first.
     ///
     /// `genesis` and `recover` are written by open, not by this method.
-    #[cfg_attr(not(test), expect(dead_code, reason = "wired in increment 3"))]
     pub fn append(&mut self, event: ReceiptEvent) -> Result<Head, StoreError> {
         if matches!(
             event,
@@ -498,6 +574,24 @@ impl ReceiptStore {
         self.write_event(&event)
     }
 
+    /// Count `n` events that never reached the store. The next successful
+    /// append writes one `gap` row that includes them.
+    pub fn lose(&mut self, n: u64) {
+        if n == 0 {
+            return;
+        }
+        let ts = now_ts();
+        for _ in 0..n {
+            self.note_failure(ts.clone());
+        }
+    }
+
+    /// The next `n` appends fail before any byte is written.
+    #[cfg(test)]
+    pub fn fail_next_appends(&mut self, n: u64) {
+        self.fault_left = n;
+    }
+
     #[cfg(test)]
     fn fail_next_write(&mut self) {
         self.fault = Some(RecordFault::Before);
@@ -515,7 +609,6 @@ impl ReceiptStore {
 
     /// Re-read the tail after a failed append and repair it the way open does.
     /// A row that actually landed is not counted as dropped. Nothing is truncated.
-    #[cfg_attr(not(test), expect(dead_code, reason = "wired in increment 3"))]
     fn resync(&mut self) -> Result<(), StoreError> {
         let attempted = self.next_seq;
         let bytes = read_all(&mut self.file)?;
@@ -554,7 +647,6 @@ impl ReceiptStore {
         Ok(())
     }
 
-    #[cfg_attr(not(test), expect(dead_code, reason = "wired in increment 3"))]
     fn write_gap(&mut self) -> Result<(), StoreError> {
         let first = self.gap_first.clone().ok_or(StoreError::Row)?;
         let mut last = self.gap_last.clone().ok_or(StoreError::Row)?;
@@ -574,7 +666,6 @@ impl ReceiptStore {
         Ok(())
     }
 
-    #[cfg_attr(not(test), expect(dead_code, reason = "wired in increment 3"))]
     fn write_event(&mut self, event: &ReceiptEvent) -> Result<Head, StoreError> {
         let ts = now_ts();
         let line = encode_line(self.next_seq, &self.prev, &ts, event)?;
@@ -594,7 +685,6 @@ impl ReceiptStore {
         })
     }
 
-    #[cfg_attr(not(test), expect(dead_code, reason = "wired in increment 3"))]
     fn note_failure(&mut self, ts: String) {
         if self.gap_first.is_none() {
             self.gap_first = Some(ts.clone());
@@ -604,8 +694,12 @@ impl ReceiptStore {
         self.poisoned = true;
     }
 
-    #[cfg_attr(not(test), expect(dead_code, reason = "wired in increment 3"))]
     fn write_record(&mut self, line: &[u8]) -> std::io::Result<()> {
+        #[cfg(test)]
+        if self.fault_left > 0 {
+            self.fault_left -= 1;
+            return Err(std::io::Error::other("injected append failure"));
+        }
         #[cfg(test)]
         if let Some(fault) = self.fault.take() {
             return apply_fault(&mut self.file, line, fault);
@@ -615,7 +709,16 @@ impl ReceiptStore {
     }
 }
 
-#[cfg_attr(not(test), expect(dead_code, reason = "wired in increment 3"))]
+fn ready_store(choice: OpenChoice) -> Result<(ReceiptStore, Opened), StoreError> {
+    match choice {
+        OpenChoice::Ready(pair) => {
+            let (store, opened) = *pair;
+            Ok((store, opened))
+        }
+        OpenChoice::Unprotected(_) => Err(StoreError::Row),
+    }
+}
+
 fn with_newline(line: impl AsRef<[u8]>) -> Vec<u8> {
     let line = line.as_ref();
     let mut record = Vec::with_capacity(line.len() + 1);
@@ -665,7 +768,6 @@ fn apply_fault(file: &mut File, line: &[u8], fault: RecordFault) -> std::io::Res
     }
 }
 
-#[cfg_attr(not(test), expect(dead_code, reason = "wired in increment 3"))]
 enum RepairKind {
     Ready,
     Newline,
@@ -677,7 +779,6 @@ enum RepairKind {
 /// Tail repair shared by open and by a poisoned append. `NoRow` is not written
 /// here: only open may replace an empty file, and it never truncates a file
 /// that already has a finished line.
-#[cfg_attr(not(test), expect(dead_code, reason = "wired in increment 3"))]
 fn repair_class(file: &mut File, class: Class) -> Result<RepairKind, StoreError> {
     match class {
         Class::Ready => Ok(RepairKind::Ready),
@@ -722,7 +823,6 @@ fn repair_class(file: &mut File, class: Class) -> Result<RepairKind, StoreError>
 }
 
 /// A recover row or a missing newline must not push the file past the cap.
-#[cfg_attr(not(test), expect(dead_code, reason = "wired in increment 3"))]
 fn ensure_repair_fits(file: &File, extra: usize) -> Result<(), StoreError> {
     let len = file.metadata()?.len();
     let extra = u64::try_from(extra).unwrap_or(u64::MAX);
@@ -736,7 +836,6 @@ fn ensure_repair_fits(file: &File, extra: usize) -> Result<(), StoreError> {
     Ok(())
 }
 
-#[cfg_attr(not(test), expect(dead_code, reason = "wired in increment 3"))]
 fn committed_attempt(bytes: &[u8], attempted: u64) -> bool {
     let Ok(text) = std::str::from_utf8(bytes) else {
         return false;
@@ -753,7 +852,6 @@ fn committed_attempt(bytes: &[u8], attempted: u64) -> bool {
     row.seq == attempted && !matches!(event, ReceiptEvent::Recover { .. })
 }
 
-#[cfg_attr(not(test), expect(dead_code, reason = "wired in increment 3"))]
 enum Class {
     Ready,
     MissingNewline,
@@ -768,10 +866,26 @@ enum Class {
     Broken(VerifyNote),
 }
 
-#[cfg_attr(not(test), expect(dead_code, reason = "wired in increment 3"))]
+/// Bytes before the first newline, or the whole buffer when it has none.
+fn first_physical_line(bytes: &[u8]) -> &[u8] {
+    match bytes.iter().position(|byte| *byte == b'\n') {
+        Some(end) => &bytes[..end],
+        None => bytes,
+    }
+}
+
+/// Pulse name from a canonical genesis line, or nothing when `line` is not one.
+fn genesis_pulse(line: &[u8]) -> Option<String> {
+    if line.is_empty() || !chain::accepts_line(line, 0, GENESIS_PREV) {
+        return None;
+    }
+    let value: serde_json::Value = serde_json::from_slice(line).ok()?;
+    value.get("e")?.get("pulse")?.as_str().map(str::to_string)
+}
+
 fn classify(bytes: &[u8]) -> Result<Class, StoreError> {
-    // Replace a file only when it never held a finished line: empty, or a
-    // torn genesis with no newline. Any newline-terminated byte is evidence.
+    // Empty, or a torn first line with no newline. Open refuses the latter
+    // before it gets here when the bytes are not a genesis row.
     if bytes.is_empty() || (!bytes.contains(&b'\n') && !chain::accepts_line(bytes, 0, GENESIS_PREV))
     {
         return Ok(Class::NoRow);
@@ -831,7 +945,6 @@ fn classify(bytes: &[u8]) -> Result<Class, StoreError> {
 }
 
 /// Split into `(prefix including its trailing newline, last line, last has newline)`.
-#[cfg_attr(not(test), expect(dead_code, reason = "wired in increment 3"))]
 fn split_last(bytes: &[u8]) -> (&[u8], &[u8], bool) {
     match bytes.iter().rposition(|byte| *byte == b'\n') {
         None => (b"", bytes, false),
@@ -846,7 +959,6 @@ fn split_last(bytes: &[u8]) -> (&[u8], &[u8], bool) {
     }
 }
 
-#[cfg_attr(not(test), expect(dead_code, reason = "wired in increment 3"))]
 fn encode_line(seq: u64, prev: &str, ts: &str, event: &ReceiptEvent) -> Result<String, StoreError> {
     let row = chain::Row {
         v: 1,
@@ -866,14 +978,12 @@ fn encode_line(seq: u64, prev: &str, ts: &str, event: &ReceiptEvent) -> Result<S
     Ok(text)
 }
 
-#[cfg_attr(not(test), expect(dead_code, reason = "wired in increment 3"))]
 fn now_ts() -> String {
     let now = chrono::Utc::now();
     let millis = now.timestamp_subsec_millis();
     format!("{}.{:03}Z", now.format("%Y-%m-%dT%H:%M:%S"), millis)
 }
 
-#[cfg_attr(not(test), expect(dead_code, reason = "wired in increment 3"))]
 fn adopt(source: StoreSource) -> Result<(File, bool, String), StoreError> {
     match source {
         StoreSource::Path(path) => {
@@ -936,7 +1046,6 @@ fn check_regular(path: &Path, meta: &std::fs::Metadata) -> Result<(), StoreError
     Ok(())
 }
 
-#[cfg_attr(not(test), expect(dead_code, reason = "wired in increment 3"))]
 fn take_systemd(name: &str, listen: &ListenEnv) -> Result<File, StoreError> {
     // Spend before touching an fd. A refusal closes it, and a later open
     // must not adopt a file that reused the number.
@@ -990,13 +1099,11 @@ fn clear_listen_env() {
     std::env::remove_var("LISTEN_FDNAMES");
 }
 
-#[cfg_attr(not(test), expect(dead_code, reason = "wired in increment 3"))]
 fn release_refused(fd: i32) {
     // SAFETY: validation failed before `File::from_raw_fd`, so `fd` is still ours.
     unsafe { libc::close(fd) };
 }
 
-#[cfg_attr(not(test), expect(dead_code, reason = "wired in increment 3"))]
 fn validate_fd(fd: i32) -> Result<(), StoreError> {
     let mut stat = unsafe { std::mem::zeroed::<libc::stat>() };
     // SAFETY: `stat` is a valid out-pointer and `fd` is still open.
@@ -1032,7 +1139,6 @@ fn set_cloexec(fd: i32) -> Result<(), StoreError> {
     Ok(())
 }
 
-#[cfg_attr(not(test), expect(dead_code, reason = "wired in increment 3"))]
 fn lock_exclusive(file: &File) -> Result<(), StoreError> {
     // SAFETY: `flock` on a descriptor this store owns.
     let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
@@ -1047,7 +1153,6 @@ fn lock_exclusive(file: &File) -> Result<(), StoreError> {
     }
 }
 
-#[cfg_attr(not(test), expect(dead_code, reason = "wired in increment 3"))]
 fn read_all(file: &mut File) -> Result<Vec<u8>, StoreError> {
     file.seek(SeekFrom::Start(0))?;
     let bytes = file.metadata()?.len();
@@ -1062,14 +1167,12 @@ fn read_all(file: &mut File) -> Result<Vec<u8>, StoreError> {
     Ok(buf)
 }
 
-#[cfg_attr(not(test), expect(dead_code, reason = "wired in increment 3"))]
 fn write_all_sync(file: &mut File, bytes: &[u8]) -> std::io::Result<()> {
     file.write_all(bytes)?;
     file.sync_all()?;
     Ok(())
 }
 
-#[cfg_attr(not(test), expect(dead_code, reason = "wired in increment 3"))]
 fn fd_path(fd: i32) -> String {
     std::fs::read_link(format!("/proc/self/fd/{fd}"))
         .map(|path| path.display().to_string())
@@ -1178,6 +1281,9 @@ mod tests {
     /// The caller passes [`our_listen`] on the source. This closes the dup
     /// when the store did not take ownership. A reused fd number is left alone.
     fn with_forced_fd(file: &File, body: impl FnOnce()) {
+        // Held until the dup is closed or marked close-on-exec, so a test
+        // that forks cannot inherit the lock.
+        let _process = crate::process_state::Hold::acquire();
         let _guard = FD_LOCK.lock().unwrap_or_else(|err| err.into_inner());
         // SAFETY: `file` is open for the duration of this call.
         let duped = unsafe { libc::dup(file.as_raw_fd()) };
@@ -1289,6 +1395,7 @@ mod tests {
 
         // A high number stays free after we close it: other tests allocate
         // the lowest fd, so they do not land on this one between close and dup2.
+        let _process = crate::process_state::Hold::acquire();
         let _guard = FD_LOCK.lock().unwrap_or_else(|err| err.into_inner());
         let fd = unsafe { libc::fcntl(plain.as_raw_fd(), libc::F_DUPFD, 1000) };
         assert!(fd >= 1000, "{}", std::io::Error::last_os_error());
@@ -1459,20 +1566,16 @@ mod tests {
     }
 
     #[test]
-    fn a_torn_first_line_is_replaced_on_a_path_and_refused_on_a_systemd_fd() {
+    fn a_torn_first_line_is_left_unchanged_on_a_path_and_refused_on_a_systemd_fd() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("receipts.jsonl");
         let torn = b"{\"e\":{\"kind\":\"gen";
         std::fs::write(&path, torn).unwrap();
-        let (store, opened) =
-            ReceiptStore::open(StoreSource::Path(path.clone()), &LiveProbe, "echo").unwrap();
-        assert!(opened.recreated);
-        drop(store);
-        let text = std::fs::read(&path).unwrap();
-        let report = chain::verify_lines(text.as_slice());
-        assert_eq!(report.state(), VerifyState::Ok, "{report:?}");
-        assert_eq!(report.rows, 1);
-        assert_ne!(text, torn);
+        let err =
+            ReceiptStore::open(StoreSource::Path(path.clone()), &LiveProbe, "echo").unwrap_err();
+        assert!(matches!(err, StoreError::NotLedger { .. }), "{err}");
+        assert!(err.to_string().contains("leave it unchanged"), "{err}");
+        assert_eq!(std::fs::read(&path).unwrap(), torn);
 
         std::fs::write(&path, torn).unwrap();
         let appending = OpenOptions::new()
@@ -1499,6 +1602,21 @@ mod tests {
     }
 
     #[test]
+    fn a_ledger_for_another_pulse_is_refused_and_left_unchanged() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("receipts.jsonl");
+        let (store, _) =
+            ReceiptStore::open(StoreSource::Path(path.clone()), &LiveProbe, "bravo").unwrap();
+        drop(store);
+        let before = std::fs::read(&path).unwrap();
+        let err =
+            ReceiptStore::open(StoreSource::Path(path.clone()), &LiveProbe, "alpha").unwrap_err();
+        assert!(matches!(err, StoreError::Foreign { .. }), "{err}");
+        assert!(err.to_string().contains("bravo"), "{err}");
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+    }
+
+    #[test]
     fn second_open_on_the_same_file_fails() {
         if std::env::var_os("RECEIPT_FLOCK_CHILD").is_some() {
             let path = std::env::var("RECEIPT_FLOCK_PATH").unwrap();
@@ -1509,6 +1627,9 @@ mod tests {
         }
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("receipts.jsonl");
+        // The child returns before it takes this lock. Holding it here keeps
+        // every other fork out while this file is locked.
+        let _process = crate::process_state::Hold::acquire();
         let store =
             ReceiptStore::open(StoreSource::Path(path.clone()), &LiveProbe, "echo").unwrap();
         let output = std::process::Command::new(std::env::current_exe().unwrap())
@@ -1702,22 +1823,23 @@ mod tests {
         path
     }
 
-    fn assert_broken_line_one(path: &Path, before: &[u8]) {
+    fn assert_not_this_genesis(path: &Path, before: &[u8]) {
         let err = ReceiptStore::open(StoreSource::Path(path.to_path_buf()), &LiveProbe, "echo")
             .unwrap_err();
-        assert!(matches!(err, StoreError::Broken { line: 1, .. }), "{err}");
+        assert!(matches!(err, StoreError::NotLedger { .. }), "{err}");
+        assert!(err.to_string().contains("leave it unchanged"), "{err}");
         assert_eq!(std::fs::read(path).unwrap(), before);
     }
 
     #[test]
-    fn a_damaged_first_line_is_broken_and_the_file_stays() {
+    fn a_damaged_first_line_is_refused_and_the_file_stays() {
         let dir = tempfile::tempdir().unwrap();
         let path = many(dir.path(), 50);
         let mut bytes = std::fs::read(&path).unwrap();
         assert_eq!(chain::verify_lines(bytes.as_slice()).rows, 51);
         bytes[20] ^= 0x01;
         std::fs::write(&path, &bytes).unwrap();
-        assert_broken_line_one(&path, &bytes);
+        assert_not_this_genesis(&path, &bytes);
 
         let dir = tempfile::tempdir().unwrap();
         let path = many(dir.path(), 10);
@@ -1725,14 +1847,14 @@ mod tests {
         let nl = text.find('\n').unwrap();
         let mangled = format!("{}{}", text[..nl].replacen(",", ", ", 1), &text[nl..]);
         std::fs::write(&path, &mangled).unwrap();
-        assert_broken_line_one(&path, mangled.as_bytes());
+        assert_not_this_genesis(&path, mangled.as_bytes());
 
         let dir = tempfile::tempdir().unwrap();
         let path = many(dir.path(), 3);
         let mut bom = vec![0xef, 0xbb, 0xbf];
         bom.extend(std::fs::read(&path).unwrap());
         std::fs::write(&path, &bom).unwrap();
-        assert_broken_line_one(&path, &bom);
+        assert_not_this_genesis(&path, &bom);
 
         let dir = tempfile::tempdir().unwrap();
         let path = many(dir.path(), 5);
@@ -1754,7 +1876,10 @@ mod tests {
                 "echo",
             )
             .unwrap_err();
-            assert!(matches!(err, StoreError::Broken { line: 1, .. }), "{err}");
+            let StoreError::Rotate { path: named } = err else {
+                panic!("expected rotate, got {err}");
+            };
+            assert!(named.contains("receipts.jsonl"), "{named}");
         });
         assert_eq!(std::fs::read(&path).unwrap(), bytes);
     }

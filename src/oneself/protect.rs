@@ -25,10 +25,31 @@ pub struct Protection {
 }
 
 impl Protection {
-    #[cfg_attr(not(test), expect(dead_code, reason = "wired in increment 3"))]
     #[must_use]
     pub fn is_protected(self) -> bool {
         self.systemd_fd && self.owner_root && self.mode_safe && self.append_flag && self.parent_safe
+    }
+
+    /// The checks that failed, for the log line. Empty when protected.
+    #[must_use]
+    pub fn unmet(self) -> String {
+        let mut missing = Vec::new();
+        if !self.systemd_fd {
+            missing.push("not a systemd fd");
+        }
+        if !self.owner_root {
+            missing.push("not owned by root");
+        }
+        if !self.mode_safe {
+            missing.push("group- or world-writable");
+        }
+        if !self.append_flag {
+            missing.push("append-only flag is not set");
+        }
+        if !self.parent_safe {
+            missing.push("parent directory is not root-owned and mode-safe");
+        }
+        missing.join(", ")
     }
 }
 
@@ -56,7 +77,10 @@ impl ProtectionProbe for LiveProbe {
 }
 
 /// A fixed report. `from_systemd` is ignored so a test can set each flag.
-#[cfg_attr(not(test), expect(dead_code, reason = "wired in increment 3"))]
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "test double; the daemon uses LiveProbe")
+)]
 #[derive(Debug, Clone)]
 pub struct FakeProbe {
     pub systemd_fd: bool,
@@ -67,7 +91,10 @@ pub struct FakeProbe {
 }
 
 impl FakeProbe {
-    #[cfg_attr(not(test), expect(dead_code, reason = "wired in increment 3"))]
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "test double; the daemon uses LiveProbe")
+    )]
     #[must_use]
     pub fn protected() -> Self {
         Self {

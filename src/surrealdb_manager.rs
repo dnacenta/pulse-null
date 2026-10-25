@@ -66,7 +66,7 @@ pub async fn ensure_running(
         });
     }
 
-    let mut child = cmd.spawn().map_err(|e| {
+    let mut child = crate::process_state::during_fork(|| cmd.spawn()).map_err(|e| {
         format!(
             "failed to spawn SurrealDB: {e}. Binary: {}",
             surreal_bin.display()

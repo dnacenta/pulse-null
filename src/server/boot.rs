@@ -21,6 +21,8 @@ pub struct BootedPulse {
     pub persist_coordinator: Arc<PersistCoordinator>,
     /// The pulse's plugin turn runner, refused and drained at shutdown.
     pub turns: super::turns::TurnRunner,
+    /// Receipt writer, so shutdown can append the shutdown row.
+    pub receipts: crate::oneself::receipt::Appender,
 }
 
 /// Boot a pulse's HTTP server and scheduler as background tasks.
@@ -31,10 +33,11 @@ pub async fn boot_pulse(
     config: Config,
     root_dir: PathBuf,
     fallback_port: u16,
+    listen: crate::oneself::store::ListenEnv,
 ) -> Result<BootedPulse, Box<dyn std::error::Error>> {
     super::ensure_infrastructure(&root_dir);
     let provider = crate::providers::create_streaming_provider(&config, &root_dir)?;
-    let (state, plugin_routes) = assemble_pulse_state(config, root_dir, provider).await?;
+    let (state, plugin_routes) = assemble_pulse_state(config, root_dir, provider, listen).await?;
 
     // Scheduler — gated on control-plane leadership (fail-open: the pulse's
     // interactive surfaces never wait on the coordinator).
@@ -53,6 +56,7 @@ pub async fn boot_pulse(
         actual_port,
         persist_coordinator: Arc::clone(&state.persist_coordinator),
         turns: state.turns.clone(),
+        receipts: state.receipts.clone(),
     })
 }
 
@@ -62,6 +66,7 @@ async fn assemble_pulse_state(
     config: Config,
     root_dir: PathBuf,
     provider: Box<dyn crate::streaming::StreamingProvider>,
+    listen: crate::oneself::store::ListenEnv,
 ) -> Result<(Arc<AppState>, axum::Router<()>), Box<dyn std::error::Error>> {
     let monitors = super::setup::create_monitors(&config);
     let mut tools = super::setup::register_builtin_tools(&root_dir, &config);
@@ -95,6 +100,15 @@ async fn assemble_pulse_state(
     let alert_queue = crate::scheduler::alerts::AlertQueue::load(&root_dir);
 
     let pools = crate::server::stream_pools();
+    let provider_name = provider.name().to_string();
+    let receipts = crate::oneself::receipt::Appender::start(
+        &config,
+        &root_dir,
+        listen,
+        Arc::new(crate::oneself::protect::LiveProbe),
+        &provider_name,
+    )
+    .await;
     let state = Arc::new(AppState {
         config: config.clone(),
         provider,
@@ -123,6 +137,7 @@ async fn assemble_pulse_state(
         )),
         graph_extractor: crate::graph_extract::GraphExtractor::for_pulse(&config, &root_dir),
         turns,
+        receipts,
     });
     state.turns.bind(&state);
     Ok((state, plugin_routes))
@@ -299,9 +314,14 @@ mod tests {
     #[tokio::test]
     async fn a_pulse_serves_in_the_background_until_the_registry_shuts_it_down() {
         let dir = tempfile::tempdir().unwrap();
-        let booted = boot_pulse(offline_config(), dir.path().to_path_buf(), 0)
-            .await
-            .unwrap();
+        let booted = boot_pulse(
+            offline_config(),
+            dir.path().to_path_buf(),
+            0,
+            crate::oneself::store::ListenEnv::empty(),
+        )
+        .await
+        .unwrap();
         let port = booted.actual_port;
         assert_ne!(port, 0);
         assert!(
@@ -321,6 +341,7 @@ mod tests {
             event_bus: booted.event_bus,
             persist_coordinator: booted.persist_coordinator,
             turns: booted.turns,
+            receipts: booted.receipts,
         });
         registry.shutdown_all().await;
         assert_eq!(registry.count(), 0);
@@ -341,9 +362,14 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mut config = offline_config();
         config.llm.provider = "no-such-provider".to_string();
-        assert!(boot_pulse(config, dir.path().to_path_buf(), 0)
-            .await
-            .is_err());
+        assert!(boot_pulse(
+            config,
+            dir.path().to_path_buf(),
+            0,
+            crate::oneself::store::ListenEnv::empty(),
+        )
+        .await
+        .is_err());
     }
 
     #[tokio::test]

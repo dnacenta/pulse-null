@@ -35,7 +35,35 @@ pub fn validate(config: &Config) -> Result<(), ConfigError> {
             "[security] voice_secret must differ from secret".into(),
         ));
     }
-    validate_probe(&config.probe)
+    validate_probe(&config.probe)?;
+    validate_receipts(&config.receipts)
+}
+
+/// `[receipts]`: `content` is `digest`, and a set path is a file path.
+///
+/// The path is opened only when receipts are on and protection is not
+/// required (`require_protected` is false and `PULSE_NULL_RECEIPTS` is not
+/// `required`). It must then resolve under the pulse directory or
+/// `/var/lib/pulse-null/<pulse>/`. A `..` component is refused here; the
+/// directory check happens when the daemon opens the file.
+fn validate_receipts(receipts: &super::ReceiptsConfig) -> Result<(), ConfigError> {
+    if receipts.content != "digest" {
+        return Err(ConfigError::Validation(format!(
+            "[receipts] content must be \"digest\" (got {})",
+            receipts.content
+        )));
+    }
+    if receipts.path.contains('\0') {
+        return Err(ConfigError::Validation(
+            "[receipts] path must not contain a NUL byte".into(),
+        ));
+    }
+    if receipts.path.split(['/', '\\']).any(|part| part == "..") {
+        return Err(ConfigError::Validation(
+            "[receipts] path must not contain a .. component".into(),
+        ));
+    }
+    Ok(())
 }
 
 /// A pulse name safe as one path component: letters, digits, `-` or `_`,
@@ -296,6 +324,22 @@ mod tests {
         );
         probe.probe.enabled = false;
         assert!(super::validate(&probe).is_ok(), "a disabled one is not");
+        assert!(error(&|c| c.receipts.content = "full".into())
+            .ends_with("[receipts] content must be \"digest\" (got full)"));
+        assert!(
+            error(&|c| c.receipts.path = "/var/lib/pulse-null/p/../receipts.jsonl".into())
+                .ends_with("[receipts] path must not contain a .. component")
+        );
+        assert!(error(&|c| c.receipts.path = "/tmp/receipts\0.jsonl".into())
+            .ends_with("[receipts] path must not contain a NUL byte"));
+        let mut receipts = minimal_config();
+        receipts.receipts.enabled = true;
+        receipts.receipts.path = "/var/lib/pulse-null/echo/receipts.jsonl".into();
+        receipts.receipts.require_protected = false;
+        assert!(
+            super::validate(&receipts).is_ok(),
+            "digest and a plain path"
+        );
     }
 
     #[test]

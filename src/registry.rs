@@ -24,6 +24,8 @@ pub struct RunningPulse {
     pub persist_coordinator: Arc<PersistCoordinator>,
     /// The pulse's plugin turn runner.
     pub turns: crate::server::turns::TurnRunner,
+    /// Receipt writer. Shutdown appends the shutdown row through it.
+    pub receipts: crate::oneself::receipt::Appender,
 }
 
 /// In-memory registry of all running pulses.
@@ -65,8 +67,9 @@ impl PulseRegistry {
     /// Gracefully shut down all pulses.
     ///
     /// No pulse starts a plugin turn from the first step on; the turns in
-    /// flight get the drain window. Then flushes in-flight persistence tasks
-    /// before aborting server/scheduler handles so no writes are lost.
+    /// flight get the drain window. Each pulse then stops its coordinator,
+    /// finishes its server task, flushes persistence, and writes the receipt
+    /// shutdown row.
     pub async fn shutdown_all(&mut self) {
         self.quiesce_plugin_turns().await;
         for (name, pulse) in self.pulses.drain() {
@@ -90,13 +93,25 @@ impl PulseRegistry {
     }
 }
 
-/// Flush the pulse's in-flight persistence, then stop its server and its
-/// coordinator.
+/// Stop the pulse in the same order as the daemon's shutdown.
+///
+/// The coordinator stops first. Aborting the server then lets in-flight
+/// turns drop their receipt guards, so those close rows are queued before
+/// the shutdown row. Persistence is flushed after those turns.
 async fn shut_down_pulse(name: &str, pulse: RunningPulse) {
     tracing::info!("Shutting down pulse: {}", name);
-    flush_persistence(name, &pulse.persist_coordinator).await;
-    pulse.server_handle.abort();
-    pulse.coordinator.shutdown().await;
+    let RunningPulse {
+        coordinator,
+        server_handle,
+        persist_coordinator,
+        receipts,
+        ..
+    } = pulse;
+    coordinator.shutdown().await;
+    server_handle.abort();
+    let _ = server_handle.await;
+    flush_persistence(name, &persist_coordinator).await;
+    receipts.shutdown().await;
 }
 
 /// Flush any in-flight persistence tasks (5s timeout per pulse).

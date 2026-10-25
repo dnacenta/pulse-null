@@ -696,7 +696,10 @@ fn die_with_runner(cmd: &mut tokio::process::Command) {
     // SAFETY: getpid has no preconditions.
     let parent = unsafe { libc::getpid() };
     // SAFETY: the hook runs in the forked child before exec and makes only
-    // two raw syscalls on integers.
+    // raw syscalls on integers. Exec of a normal program sets the dumpable
+    // flag to 1, so the child's `/proc/<pid>/cwd` stays readable and
+    // `kill_stale_server` can see this directory. Setting the flag here
+    // would repeat what exec already does.
     unsafe {
         cmd.pre_exec(move || {
             if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL, 0, 0, 0) != 0 {
@@ -1120,13 +1123,15 @@ mod tests {
             port_owned_by(std::process::id(), port),
             "this process holds the listening socket"
         );
-        let mut child = std::process::Command::new("/bin/sleep")
-            .arg("30")
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .spawn()
-            .unwrap();
+        let mut child = crate::process_state::during_fork(|| {
+            std::process::Command::new("/bin/sleep")
+                .arg("30")
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn()
+        })
+        .unwrap();
         assert!(
             !port_owned_by(child.id(), port),
             "the listener is not the child's"
@@ -1626,12 +1631,14 @@ except OSError:
         let scratch = tempfile::tempdir().unwrap();
         let server_dir = scratch.path().join(SERVER_DIR);
         std::fs::create_dir_all(&server_dir).unwrap();
-        let mut sleeper = tokio::process::Command::new("/bin/sleep")
+        let mut sleeper = tokio::process::Command::new("/bin/sleep");
+        sleeper
             .arg("30")
             .current_dir(&server_dir)
-            .kill_on_drop(true)
-            .spawn()
-            .unwrap();
+            .kill_on_drop(true);
+        // Exec of sleep sets the dumpable flag to 1, so this child's cwd
+        // stays readable even when the parent cleared the flag for receipts.
+        let mut sleeper = crate::process_state::during_fork(|| sleeper.spawn()).unwrap();
         let pid = sleeper.id().unwrap();
         std::fs::write(server_dir.join(SERVER_PID_FILE), pid.to_string()).unwrap();
         // A pid whose process runs elsewhere is left alone.

@@ -322,6 +322,31 @@ mod timeout_tests {
 
     #[test]
     fn default_timeout_is_fifteen_minutes() {
+        let _hold = crate::process_state::Hold::acquire();
+        let saved = [
+            (
+                "PULSE_LLM_TIMEOUT_SECS",
+                std::env::var("PULSE_LLM_TIMEOUT_SECS").ok(),
+            ),
+            (
+                "RECALL_LLM_TIMEOUT_SECS",
+                std::env::var("RECALL_LLM_TIMEOUT_SECS").ok(),
+            ),
+        ];
+        struct Restore {
+            saved: [(&'static str, Option<String>); 2],
+        }
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                for (key, value) in &self.saved {
+                    match value {
+                        Some(value) => std::env::set_var(key, value),
+                        None => std::env::remove_var(key),
+                    }
+                }
+            }
+        }
+        let _restore = Restore { saved };
         std::env::remove_var("PULSE_LLM_TIMEOUT_SECS");
         std::env::remove_var("RECALL_LLM_TIMEOUT_SECS");
         assert_eq!(subprocess_timeout().as_secs(), 900);
