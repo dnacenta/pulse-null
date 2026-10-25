@@ -276,6 +276,10 @@ fn check_row(
     }
     let event: ReceiptEvent =
         serde_json::from_value(row.e.clone()).map_err(|err| schema_reason(&err))?;
+    let is_genesis = matches!(event, ReceiptEvent::Genesis { .. });
+    if (row.seq == 0) != is_genesis {
+        return Err("genesis");
+    }
     // The stored bytes are what a reader sees. They must be the canonical
     // form, so a duplicate key cannot show one value and hash another.
     stored_line_is_canonical(text)?;
@@ -807,6 +811,42 @@ mod tests {
         assert_eq!(report.state(), VerifyState::Broken);
         assert!(report.warns.is_empty());
         assert_eq!(note(&report), (3, "seq"));
+    }
+
+    #[test]
+    fn seq_zero_must_be_genesis() {
+        let (row, _) = line_of(
+            0,
+            GENESIS_PREV,
+            TS0,
+            &ReceiptEvent::Shutdown {
+                reason: "x".to_string(),
+            },
+        );
+        let report = verify_lines(format!("{row}\n").as_bytes());
+        assert_eq!(note(&report), (1, "genesis"));
+    }
+
+    #[test]
+    fn a_second_genesis_is_broken() {
+        let (genesis, prev) = line_of(
+            0,
+            GENESIS_PREV,
+            TS0,
+            &ReceiptEvent::Genesis {
+                pulse: "echo".to_string(),
+            },
+        );
+        let (again, _) = line_of(
+            1,
+            &prev,
+            TS1,
+            &ReceiptEvent::Genesis {
+                pulse: "other".to_string(),
+            },
+        );
+        let report = verify_lines(format!("{genesis}\n{again}\n").as_bytes());
+        assert_eq!(note(&report), (2, "genesis"));
     }
 
     fn row_from_event(seq: u64, prev: &str, ts: &str, e: Value) -> String {
