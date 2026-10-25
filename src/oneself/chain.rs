@@ -118,7 +118,13 @@ pub fn verify_lines<R: BufRead>(mut reader: R) -> VerifyReport {
         });
         return report;
     }
-    verify_bytes(&buf)
+    walk(&buf, false).report
+}
+
+/// The same check as [`verify_lines`], also recording each accepted row.
+#[must_use]
+pub fn index_bytes(buf: &[u8]) -> ChainIndex {
+    walk(buf, true)
 }
 
 struct Phys<'a> {
@@ -131,15 +137,42 @@ struct Phys<'a> {
 struct Accepted {
     seq: u64,
     hash: String,
+    ts: String,
     event: ReceiptEvent,
 }
 
-fn verify_bytes(buf: &[u8]) -> VerifyReport {
+/// One accepted row, kept when an anchor needs `(seq, head)`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IndexedRow {
+    pub seq: u64,
+    pub hash: String,
+    pub ts: String,
+}
+
+/// The chain check plus the accepted rows an anchor compares.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChainIndex {
+    pub report: VerifyReport,
+    pub pulse: Option<String>,
+    pub genesis_hash: Option<String>,
+    pub rows: Vec<IndexedRow>,
+}
+
+fn walk(buf: &[u8], keep: bool) -> ChainIndex {
     let lines = split_lines(buf);
+    let mut kept = ChainIndex {
+        report: VerifyReport::empty(),
+        pulse: None,
+        genesis_hash: None,
+        rows: Vec::new(),
+    };
     let mut report = VerifyReport::empty();
     let mut expected_seq = Some(0u64);
     let mut expected_prev = GENESIS_PREV.to_string();
     let mut index = 0;
+    let finish = |report: VerifyReport, kept: &mut ChainIndex| {
+        kept.report = report;
+    };
     while index < lines.len() {
         let line = &lines[index];
         if line.bytes.len() > MAX_LINE_BYTES {
@@ -147,14 +180,16 @@ fn verify_bytes(buf: &[u8]) -> VerifyReport {
                 line: line.number,
                 reason: "oversize",
             });
-            return report;
+            finish(report, &mut kept);
+            return kept;
         }
         let Some(seq) = expected_seq else {
             report.first_break = Some(VerifyNote {
                 line: line.number,
                 reason: "seq",
             });
-            return report;
+            finish(report, &mut kept);
+            return kept;
         };
         // A recover names a torn line. A complete row followed by recover
         // stays a row; it is not rewritten into a warning.
@@ -164,7 +199,14 @@ fn verify_bytes(buf: &[u8]) -> VerifyReport {
                     line: line.number,
                     reason: "torn line",
                 });
-                accept(&mut report, &mut expected_seq, &mut expected_prev, accepted);
+                accept(
+                    &mut kept,
+                    &mut report,
+                    &mut expected_seq,
+                    &mut expected_prev,
+                    accepted,
+                    keep,
+                );
                 index += 2;
                 continue;
             }
@@ -174,7 +216,8 @@ fn verify_bytes(buf: &[u8]) -> VerifyReport {
                 line: line.number,
                 reason: "torn line",
             });
-            return report;
+            finish(report, &mut kept);
+            return kept;
         }
         match check_row(line, seq, &expected_prev) {
             Ok(accepted) => {
@@ -183,9 +226,17 @@ fn verify_bytes(buf: &[u8]) -> VerifyReport {
                         line: line.number,
                         reason: "recover",
                     });
-                    return report;
+                    finish(report, &mut kept);
+                    return kept;
                 }
-                accept(&mut report, &mut expected_seq, &mut expected_prev, accepted);
+                accept(
+                    &mut kept,
+                    &mut report,
+                    &mut expected_seq,
+                    &mut expected_prev,
+                    accepted,
+                    keep,
+                );
                 index += 1;
             }
             Err(reason) => {
@@ -193,7 +244,8 @@ fn verify_bytes(buf: &[u8]) -> VerifyReport {
                     line: line.number,
                     reason,
                 });
-                return report;
+                finish(report, &mut kept);
+                return kept;
             }
         }
     }
@@ -203,15 +255,29 @@ fn verify_bytes(buf: &[u8]) -> VerifyReport {
             reason: "empty",
         });
     }
-    report
+    finish(report, &mut kept);
+    kept
 }
 
 fn accept(
+    index: &mut ChainIndex,
     report: &mut VerifyReport,
     expected_seq: &mut Option<u64>,
     expected_prev: &mut String,
     accepted: Accepted,
+    keep: bool,
 ) {
+    if keep {
+        if let ReceiptEvent::Genesis { pulse } = &accepted.event {
+            index.pulse = Some(pulse.clone());
+            index.genesis_hash = Some(accepted.hash.clone());
+        }
+        index.rows.push(IndexedRow {
+            seq: accepted.seq,
+            hash: accepted.hash.clone(),
+            ts: accepted.ts.clone(),
+        });
+    }
     report.rows += 1;
     report.seq = Some(accepted.seq);
     report.head.clone_from(&accepted.hash);
@@ -343,6 +409,7 @@ fn check_row(
     Ok(Accepted {
         seq: row.seq,
         hash: hex(&hash),
+        ts: row.ts,
         event,
     })
 }

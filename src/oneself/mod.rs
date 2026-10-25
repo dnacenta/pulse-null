@@ -4,6 +4,7 @@
 //! writer. The writer stays off unless receipts are enabled. `pulse-null
 //! receipts verify` and `show` read a file either way.
 
+pub mod anchor;
 pub mod chain;
 pub mod event;
 pub mod protect;

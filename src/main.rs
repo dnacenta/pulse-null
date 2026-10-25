@@ -105,6 +105,15 @@ enum ReceiptsAction {
         /// Print one JSON object
         #[arg(long)]
         json: bool,
+        /// Compare anchored `(seq, head)` values. Publishes nothing.
+        #[arg(long)]
+        anchors: bool,
+        /// Anchor config. Default: `/etc/pulse-null/anchor.toml`.
+        #[arg(long)]
+        config: Option<std::path::PathBuf>,
+        /// Token file. Overrides the config file and the environment.
+        #[arg(long)]
+        token_file: Option<std::path::PathBuf>,
     },
     /// Print rows
     Show {
@@ -150,6 +159,25 @@ enum ReceiptsAction {
         /// Print one JSON object
         #[arg(long)]
         json: bool,
+    },
+    /// Append one anchor line when this receipt file is ahead
+    Anchor {
+        /// Pulse name. Must match the genesis row.
+        #[arg(long)]
+        pulse: String,
+        /// Receipt file. Default: `[receipts] path`, or
+        /// `/var/lib/pulse-null/<pulse>/receipts.jsonl`.
+        #[arg(long)]
+        file: Option<std::path::PathBuf>,
+        /// Anchor config. Default: `/etc/pulse-null/anchor.toml`.
+        #[arg(long)]
+        config: Option<std::path::PathBuf>,
+        /// Print the line and publish nothing.
+        #[arg(long)]
+        dry_run: bool,
+        /// Token file. Overrides the config file and the environment.
+        #[arg(long)]
+        token_file: Option<std::path::PathBuf>,
     },
 }
 
@@ -562,7 +590,7 @@ async fn async_main(listen: oneself::store::ListenEnv) {
 }
 
 /// Logging: the TUI commands write to the TUI log (stdout is the screen),
-/// everything else to stdout.
+/// everything else to stderr so a `--json` report on stdout stays intact.
 fn init_tracing(command: &Commands) {
     let filter = tracing_subscriber::EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| "pulse_null=info".into());
@@ -573,7 +601,10 @@ fn init_tracing(command: &Commands) {
             .with_writer(tui_log_writer(open_tui_log()))
             .init();
     } else {
-        tracing_subscriber::fmt().with_env_filter(filter).init();
+        tracing_subscriber::fmt()
+            .with_env_filter(filter)
+            .with_writer(std::io::stderr)
+            .init();
     }
 }
 
@@ -701,7 +732,30 @@ fn dispatch(command: Commands, listen: oneself::store::ListenEnv) -> CommandFutu
 
 fn receipts_command(action: ReceiptsAction) -> CommandFuture {
     match action {
-        ReceiptsAction::Verify { file, json } => Box::pin(cli::receipts::verify(file, json)),
+        ReceiptsAction::Verify {
+            file,
+            json,
+            anchors,
+            config,
+            token_file,
+        } => {
+            if !anchors && config.is_none() && token_file.is_none() {
+                Box::pin(cli::receipts::verify(file, json))
+            } else {
+                Box::pin(cli::receipts::verify_at(
+                    file, json, anchors, config, token_file,
+                ))
+            }
+        }
+        ReceiptsAction::Anchor {
+            pulse,
+            file,
+            config,
+            dry_run,
+            token_file,
+        } => Box::pin(cli::receipts::anchor(
+            pulse, file, config, token_file, dry_run,
+        )),
         ReceiptsAction::Show {
             file,
             since,
