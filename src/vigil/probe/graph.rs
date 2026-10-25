@@ -696,10 +696,16 @@ fn die_with_runner(cmd: &mut tokio::process::Command) {
     // SAFETY: getpid has no preconditions.
     let parent = unsafe { libc::getpid() };
     // SAFETY: the hook runs in the forked child before exec and makes only
-    // two raw syscalls on integers.
+    // raw syscalls on integers. Dumpable is set back to 1 so a daemon that
+    // cleared its own flag (receipts) does not hide this process: a
+    // non-dumpable child makes `/proc/<pid>/cwd` unreadable, and
+    // `kill_stale_server` would then leave it running.
     unsafe {
         cmd.pre_exec(move || {
             if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL, 0, 0, 0) != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            if libc::prctl(libc::PR_SET_DUMPABLE, 1, 0, 0, 0) != 0 {
                 return Err(std::io::Error::last_os_error());
             }
             if libc::getppid() != parent {
@@ -1626,12 +1632,24 @@ except OSError:
         let scratch = tempfile::tempdir().unwrap();
         let server_dir = scratch.path().join(SERVER_DIR);
         std::fs::create_dir_all(&server_dir).unwrap();
-        let mut sleeper = tokio::process::Command::new("/bin/sleep")
+        let mut sleeper = tokio::process::Command::new("/bin/sleep");
+        sleeper
             .arg("30")
             .current_dir(&server_dir)
-            .kill_on_drop(true)
-            .spawn()
-            .unwrap();
+            .kill_on_drop(true);
+        // A sibling test may have cleared the process dumpable flag. The
+        // child inherits it, `/proc/<pid>/cwd` is then hidden, and the kill
+        // below would not see this directory. Set the flag before exec.
+        // SAFETY: the hook runs in the child before exec and only sets an integer flag.
+        unsafe {
+            sleeper.pre_exec(|| {
+                if libc::prctl(libc::PR_SET_DUMPABLE, 1, 0, 0, 0) != 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+        let mut sleeper = sleeper.spawn().unwrap();
         let pid = sleeper.id().unwrap();
         std::fs::write(server_dir.join(SERVER_PID_FILE), pid.to_string()).unwrap();
         // A pid whose process runs elsewhere is left alone.
