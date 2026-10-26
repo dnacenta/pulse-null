@@ -134,14 +134,12 @@ enum Job {
 pub struct Appender {
     tx: Option<mpsc::Sender<Job>>,
     health: Arc<Health>,
-    /// Last clone restores the dumpable flag. Only set after it was cleared.
-    /// Owning the guard is the use; nothing reads the field.
-    #[cfg(test)]
+    /// Last clone restores the dumpable flag in tests. Nothing reads it.
     #[expect(
         dead_code,
         reason = "dropped with the last appender to restore the dumpable flag"
     )]
-    restore: Option<Arc<RestoreDumpable>>,
+    slot: crate::hardening::DumpableSlot,
 }
 
 impl Appender {
@@ -151,8 +149,7 @@ impl Appender {
         Self {
             tx: None,
             health: Arc::new(Health::new(STATE_OFF)),
-            #[cfg(test)]
-            restore: None,
+            slot: crate::hardening::DumpableSlot::empty(),
         }
     }
 
@@ -211,18 +208,19 @@ impl Appender {
         if !mode.enabled {
             return Self::off();
         }
-        disarm_core_dumps();
+        crate::hardening::set_non_dumpable();
+        let slot = crate::hardening::take_slot();
         let root_buf = root.to_path_buf();
         let decision = decide_source(config, &root_buf, listen, mode.require_protected);
         let source = match decision {
             SourceDecision::Open(source) => source,
             SourceDecision::Unprotected(reason) => {
                 tracing::warn!("{reason}");
-                return Self::unprotected();
+                return Self::unprotected(slot);
             }
             SourceDecision::Unavailable(reason) => {
                 tracing::warn!("{reason}");
-                return Self::unavailable();
+                return Self::unavailable(slot);
             }
         };
         if mode.require_protected && source_missing(&source) {
@@ -230,7 +228,7 @@ impl Appender {
                 path = %path_of(&source),
                 "receipt file is missing; not creating it while protection is required"
             );
-            return Self::unprotected();
+            return Self::unprotected(slot);
         }
         let pulse = config.pulse.name.clone();
         let boot_config = config.clone();
@@ -247,7 +245,7 @@ impl Appender {
             Ok(pair) => pair,
             Err(err) => {
                 tracing::warn!("receipt store did not open: {err}");
-                return Self::degraded();
+                return Self::degraded(slot);
             }
         };
         let boot = boot_event(config, provider_name, ident);
@@ -258,10 +256,10 @@ impl Appender {
                     reason = %protection.unmet(),
                     "receipt store is not protected; writing nothing"
                 );
-                return Self::unprotected();
+                return Self::unprotected(slot);
             }
             Err(err) => {
-                return open_error(err);
+                return open_error(err, slot);
             }
         };
         tracing::info!(
@@ -289,35 +287,31 @@ impl Appender {
         Self {
             tx: Some(tx),
             health,
-            #[cfg(test)]
-            restore: take_restore(),
+            slot,
         }
     }
 
-    fn unprotected() -> Self {
+    fn unprotected(slot: crate::hardening::DumpableSlot) -> Self {
         Self {
             tx: None,
             health: Arc::new(Health::new(STATE_UNPROTECTED)),
-            #[cfg(test)]
-            restore: take_restore(),
+            slot,
         }
     }
 
-    fn degraded() -> Self {
+    fn degraded(slot: crate::hardening::DumpableSlot) -> Self {
         Self {
             tx: None,
             health: Arc::new(Health::new(STATE_DEGRADED)),
-            #[cfg(test)]
-            restore: take_restore(),
+            slot,
         }
     }
 
-    fn unavailable() -> Self {
+    fn unavailable(slot: crate::hardening::DumpableSlot) -> Self {
         Self {
             tx: None,
             health: Arc::new(Health::new(STATE_UNAVAILABLE)),
-            #[cfg(test)]
-            restore: take_restore(),
+            slot,
         }
     }
 
@@ -413,21 +407,21 @@ enum SourceDecision {
     Unavailable(String),
 }
 
-fn open_error(err: StoreError) -> Appender {
+fn open_error(err: StoreError, slot: crate::hardening::DumpableSlot) -> Appender {
     match err {
         StoreError::NotUsed { .. } => {
             tracing::warn!(
                 "systemd receipts fd is already in use by another pulse; this pulse will not write"
             );
-            Appender::unprotected()
+            Appender::unprotected(slot)
         }
         StoreError::Foreign { .. } | StoreError::NotLedger { .. } | StoreError::NotFile { .. } => {
             tracing::warn!("{err}");
-            Appender::unavailable()
+            Appender::unavailable(slot)
         }
         other => {
             tracing::warn!("receipt store did not open: {other}");
-            Appender::degraded()
+            Appender::degraded(slot)
         }
     }
 }
@@ -803,60 +797,6 @@ fn collect_files(
         }
     }
     Ok(())
-}
-
-/// Clear the dumpable flag so a crash does not write the process image.
-///
-/// Called only when receipts are on, including when the store is left
-/// unwritten because it is not protected. Exec of another program sets the
-/// flag back to 1; this process stays cleared until the test guard drops.
-fn disarm_core_dumps() {
-    // Same lock as a test that forks or reads the flag, so the two do not
-    // overlap. The guard restores the flag when the appender drops.
-    #[cfg(test)]
-    let _hold = crate::process_state::Hold::acquire();
-    // SAFETY: `PR_SET_DUMPABLE` takes an integer argument and no pointer.
-    // Zero disables core dumps for this process.
-    let rc = unsafe { libc::prctl(libc::PR_SET_DUMPABLE, 0, 0, 0, 0) };
-    if rc != 0 {
-        tracing::warn!(
-            "could not clear the dumpable flag: {}",
-            std::io::Error::last_os_error()
-        );
-    }
-    #[cfg(test)]
-    arm_restore();
-}
-
-#[cfg(test)]
-struct RestoreDumpable;
-
-#[cfg(test)]
-impl Drop for RestoreDumpable {
-    fn drop(&mut self) {
-        let _hold = crate::process_state::Hold::acquire();
-        // SAFETY: integer flag only. 1 is the ordinary value for this process.
-        unsafe { libc::prctl(libc::PR_SET_DUMPABLE, 1, 0, 0, 0) };
-    }
-}
-
-#[cfg(test)]
-fn arm_restore() {
-    RESTORE.with(|slot| {
-        if slot.borrow().is_none() {
-            *slot.borrow_mut() = Some(Arc::new(RestoreDumpable));
-        }
-    });
-}
-
-#[cfg(test)]
-fn take_restore() -> Option<Arc<RestoreDumpable>> {
-    RESTORE.with(|slot| slot.borrow_mut().take())
-}
-
-#[cfg(test)]
-std::thread_local! {
-    static RESTORE: std::cell::RefCell<Option<Arc<RestoreDumpable>>> = const { std::cell::RefCell::new(None) };
 }
 
 /// What a finished turn tells the close row. The request text is not here.

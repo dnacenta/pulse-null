@@ -16,6 +16,7 @@ mod fs_safe;
 mod graph_context;
 mod graph_extract;
 mod graph_feedback;
+mod hardening;
 mod init;
 mod intake_audit;
 mod interaction;
@@ -599,10 +600,80 @@ fn main() {
 
 async fn async_main(listen: oneself::store::ListenEnv) {
     let cli = Cli::parse();
+    if let Err(refusal) = refuse_unless_owner(&cli.command) {
+        eprintln!("{}", refusal.message);
+        std::process::exit(refusal.code);
+    }
     init_tracing(&cli.command);
     if let Err(message) = run_command(cli.command, cli::root_guard::refuse_root, listen).await {
         eprintln!("{message}");
         std::process::exit(1);
+    }
+}
+
+/// Refuse a command that acts on a pulse unless this user owns the folder.
+///
+/// `up` outside a pulse, and any guarded command with no pulse to find, is
+/// left to the command itself. Root without the override is refused here
+/// when a folder exists, naming that folder's owner.
+fn refuse_unless_owner(command: &Commands) -> Result<(), cli::owner_guard::Refusal> {
+    let (name, action) = command_parts(command);
+    let acts = cli::owner_guard::command_acts_on_a_pulse(name, action)
+        .expect("every command is classified");
+    if !acts {
+        return Ok(());
+    }
+    let argv: Vec<std::ffi::OsString> = std::env::args_os().skip(1).collect();
+    let Some(path) = owner_path(command) else {
+        return Ok(());
+    };
+    if matches!(command, Commands::Lifecycle(LifecycleCommand::Init { .. })) {
+        cli::owner_guard::guard_path(&path, &argv, true)
+    } else {
+        cli::owner_guard::require_owner(&path, &argv)
+    }
+}
+
+fn owner_path(command: &Commands) -> Option<std::path::PathBuf> {
+    if let Commands::Lifecycle(LifecycleCommand::Init { dir }) = command {
+        let path = match dir {
+            Some(dir) => std::path::PathBuf::from(dir),
+            None => std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from(".")),
+        };
+        return Some(path);
+    }
+    config::Config::find_config()
+        .ok()
+        .and_then(|path| path.parent().map(std::path::Path::to_path_buf))
+}
+
+fn command_parts(command: &Commands) -> (&'static str, Option<&'static str>) {
+    match command {
+        Commands::Lifecycle(LifecycleCommand::Init { .. }) => ("init", None),
+        Commands::Lifecycle(LifecycleCommand::Up { .. }) => ("up", None),
+        Commands::Lifecycle(LifecycleCommand::Chat) => ("chat", None),
+        Commands::Lifecycle(LifecycleCommand::Down) => ("down", None),
+        Commands::Lifecycle(LifecycleCommand::Status) => ("status", None),
+        Commands::Work(WorkCommand::Schedule { .. }) => ("schedule", None),
+        Commands::Work(WorkCommand::Pipeline { .. }) => ("pipeline", None),
+        Commands::Work(WorkCommand::Archive { .. }) => ("archive", None),
+        Commands::Work(WorkCommand::Plugin { .. }) => ("plugin", None),
+        Commands::Work(WorkCommand::Intent { .. }) => ("intent", None),
+        Commands::Work(WorkCommand::Outreach { .. }) => ("outreach", None),
+        Commands::Cognition(CognitionCommand::Recall { .. }) => ("recall", None),
+        Commands::Cognition(CognitionCommand::Praxis { .. }) => ("praxis", None),
+        Commands::Cognition(CognitionCommand::Vigil { .. }) => ("vigil", None),
+        Commands::Repair => ("repair", None),
+        Commands::Isolate { action } => (
+            "isolate",
+            Some(match action {
+                IsolateAction::On { .. } => "on",
+                IsolateAction::Off => "off",
+                IsolateAction::Status => "status",
+            }),
+        ),
+        Commands::Probe { .. } => ("probe", None),
+        Commands::Receipts { .. } => ("receipts", None),
     }
 }
 
@@ -1105,6 +1176,59 @@ mod tests {
         ];
         for (args, expected) in cases {
             assert_eq!(root_check(&parse(args)), *expected, "{args:?}");
+        }
+    }
+
+    #[test]
+    fn owner_checks_match_the_commands_that_act_on_a_pulse() {
+        use clap::CommandFactory as _;
+        // Parallel to EVERY_COMMAND. `graph provision` is guarded too, once
+        // that command exists.
+        let want = [
+            true, true, // init
+            true, true, // up
+            true, // chat
+            false, false, // down, status
+            true, true, true, true, true, true, true, // schedule
+            true, true, // pipeline
+            true, true, // archive
+            true, true, true, // plugin
+            true, true, true, true, // intent
+            true, true, // outreach
+            true, true, true, // recall
+            true, true, true, true, true, true, true, // praxis
+            true, true, true, true, // vigil
+            true, // repair
+            true, true, false, // isolate on, off, status
+            false, false, false, false, false, false, false, false, false, // probe
+        ];
+        assert_eq!(EVERY_COMMAND.len(), want.len(), "the owner table drifted");
+        for (args, want) in EVERY_COMMAND.iter().zip(want) {
+            let (name, action) = command_parts(&parse(args));
+            assert_eq!(
+                cli::owner_guard::command_acts_on_a_pulse(name, action),
+                Some(want),
+                "{args:?}"
+            );
+        }
+        assert_eq!(
+            cli::owner_guard::command_acts_on_a_pulse("graph", Some("provision")),
+            Some(true)
+        );
+        assert_eq!(
+            cli::owner_guard::command_acts_on_a_pulse("receipts", Some("verify")),
+            Some(false)
+        );
+        assert_eq!(
+            cli::owner_guard::command_acts_on_a_pulse("not-a-command", None),
+            None
+        );
+        for sub in Cli::command().get_subcommands() {
+            assert!(
+                cli::owner_guard::command_acts_on_a_pulse(sub.get_name(), None).is_some(),
+                "{} is not classified",
+                sub.get_name()
+            );
         }
     }
 

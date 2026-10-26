@@ -46,6 +46,9 @@ struct Daemon {
     coordinator: Coordinator,
     app: Router,
     listener: TcpListener,
+    /// Held until this daemon stops. In tests, dropping it restores the
+    /// dumpable flag.
+    non_dumpable: crate::hardening::DumpableSlot,
 }
 
 async fn boot(
@@ -53,6 +56,7 @@ async fn boot(
     root_dir: PathBuf,
     listen: crate::oneself::store::ListenEnv,
 ) -> Result<Daemon, BoxError> {
+    let non_dumpable = crate::hardening::own_non_dumpable();
     // The provider runs from inside the pulse (PN-104).
     let provider = crate::providers::create_streaming_provider(&config, &root_dir)?;
     prepare_pulse_dir(&config, &root_dir).await?;
@@ -67,6 +71,7 @@ async fn boot(
         coordinator,
         app,
         listener,
+        non_dumpable,
     })
 }
 
@@ -432,7 +437,11 @@ async fn serve_until(daemon: Daemon, shutdown: impl Future<Output = ()> + Send +
         coordinator,
         app,
         listener,
+        non_dumpable,
     } = daemon;
+    // Kept until this function returns, after shutdown. Dropping it in
+    // tests restores the dumpable flag.
+    let _non_dumpable = non_dumpable;
     let (shutdown_tx, _) = watch::channel(false);
     let mut shutdown_rx_axum = shutdown_tx.subscribe();
     let mut shutdown_rx_main = shutdown_tx.subscribe();
@@ -640,6 +649,11 @@ mod tests {
 
     #[tokio::test]
     async fn the_daemon_boots_in_its_pulse_dir_and_shuts_down_on_the_trigger() {
+        if !crate::process_state::isolated_test(
+            "the_daemon_boots_in_its_pulse_dir_and_shuts_down_on_the_trigger",
+        ) {
+            return;
+        }
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().to_path_buf();
         let (fire, trigger) = tokio::sync::oneshot::channel::<()>();
@@ -683,6 +697,11 @@ mod tests {
 
     #[tokio::test]
     async fn a_daemon_that_cannot_build_its_provider_fails_before_touching_the_dir() {
+        if !crate::process_state::isolated_test(
+            "a_daemon_that_cannot_build_its_provider_fails_before_touching_the_dir",
+        ) {
+            return;
+        }
         let dir = tempfile::tempdir().unwrap();
         let mut config = offline_config();
         config.llm.provider = "no-such-provider".to_string();
@@ -695,6 +714,66 @@ mod tests {
         .await;
         assert!(outcome.is_err());
         assert!(!dir.path().join("memory").exists());
+    }
+
+    #[test]
+    fn daemon_boot_clears_dumpable_without_receipts() {
+        if !crate::process_state::isolated_test("daemon_boot_clears_dumpable_without_receipts") {
+            return;
+        }
+        {
+            let _hold = crate::process_state::Hold::acquire();
+            std::env::remove_var("PULSE_NULL_RECEIPTS");
+        }
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .expect("tokio runtime");
+        runtime.block_on(async {
+            let dir = tempfile::tempdir().unwrap();
+            let root = dir.path().to_path_buf();
+            let mut config = offline_config();
+            config.receipts.enabled = false;
+            let (fire, trigger) = tokio::sync::oneshot::channel::<()>();
+            let daemon = run(
+                config,
+                root.clone(),
+                async move {
+                    let _ = trigger.await;
+                },
+                crate::oneself::store::ListenEnv::empty(),
+            );
+            let probe = async {
+                let mut booted = false;
+                for _ in 0..300 {
+                    if pidfile::read(&root).is_some() {
+                        booted = true;
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                }
+                assert!(booted, "the daemon never wrote its PID file");
+                assert_eq!(dumpable(), 0, "the daemon is still dumpable");
+                fire.send(()).unwrap();
+            };
+            let (outcome, ()) = tokio::time::timeout(Duration::from_secs(90), async {
+                tokio::join!(daemon, probe)
+            })
+            .await
+            .expect("the daemon booted and shut down in time");
+            assert!(
+                outcome.is_ok(),
+                "{:?}",
+                outcome.err().map(|e| e.to_string())
+            );
+        });
+        assert_eq!(dumpable(), 1, "the test guard restores the dumpable flag");
+    }
+
+    /// `PR_GET_DUMPABLE` returns the flag, or -1.
+    fn dumpable() -> i32 {
+        // SAFETY: the call takes no pointer. The return value is the flag.
+        unsafe { libc::prctl(libc::PR_GET_DUMPABLE, 0, 0, 0, 0) }
     }
 
     #[tokio::test]
