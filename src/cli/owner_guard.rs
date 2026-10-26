@@ -20,8 +20,7 @@ pub struct Refusal {
 
 /// Whether `name` (and `action`, when the command has one) acts on a pulse.
 ///
-/// `None` means the command is not classified. `graph provision` is guarded
-/// even though that command is not built yet.
+/// `None` means the command is not classified. `graph provision` is guarded.
 #[must_use]
 pub fn command_acts_on_a_pulse(name: &str, action: Option<&str>) -> Option<bool> {
     match name {

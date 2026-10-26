@@ -180,9 +180,17 @@ async fn provision_graph(
         tracing::error!("SurrealDB startup failed: {e}");
         return Err(e);
     }
-    crate::surrealdb_manager::provision_pulse(data_dir, &config.pulse.name, root_dir)
-        .await
-        .inspect_err(|e| tracing::error!("SurrealDB provisioning failed: {e}"))
+    let root_password = crate::surrealdb_manager::read_root_password(data_dir)?;
+    crate::surrealdb_manager::provision_pulse(
+        &graph_endpoint(config),
+        &root_password,
+        &config.pulse.name,
+        root_dir,
+        false,
+    )
+    .await
+    .map(|_| ())
+    .inspect_err(|e| tracing::error!("SurrealDB provisioning failed: {e}"))
 }
 
 /// Use a graph that `surrealdb.service` is already running. This never spawns
@@ -190,13 +198,22 @@ async fn provision_graph(
 /// unreachable server or a missing pulse password leaves the pulse up with
 /// graph features off.
 async fn attach_system_graph(config: &mut Config, root: &Path) -> Result<(), BoxError> {
-    if !regular_file(&root.join("secrets/graph-password")) {
-        tracing::warn!(
-            "secrets/graph-password is missing; graph features are unavailable. \
-             Run `pulse-null graph provision`"
-        );
-        config.graph.enabled = false;
-        return Ok(());
+    match crate::surrealdb_manager::inspect_graph_password(&root.join("secrets/graph-password")) {
+        crate::surrealdb_manager::GraphPassword::Missing => {
+            if crate::surrealdb_manager::rotation_is_pending(&root.join("secrets")) {
+                tracing::warn!("{}", crate::surrealdb_manager::pending_rotation_message());
+            } else {
+                tracing::warn!("{}", crate::surrealdb_manager::missing_password_message());
+            }
+            config.graph.enabled = false;
+            return Ok(());
+        }
+        crate::surrealdb_manager::GraphPassword::Fault(reason) => {
+            tracing::warn!("{reason}; graph features are unavailable");
+            config.graph.enabled = false;
+            return Ok(());
+        }
+        crate::surrealdb_manager::GraphPassword::Ready => {}
     }
     let addr = graph_endpoint(config);
     if !crate::surrealdb_manager::reachable(&addr).await {
@@ -215,11 +232,6 @@ async fn attach_system_graph(config: &mut Config, root: &Path) -> Result<(), Box
     }
     crate::graph_context::cache_graph_stats(root).await;
     Ok(())
-}
-
-/// A regular file, not a symlink and not a directory.
-fn regular_file(path: &Path) -> bool {
-    std::fs::symlink_metadata(path).is_ok_and(|meta| meta.file_type().is_file())
 }
 
 /// Verify this pulse's agent-CLI integration, if it runs one.
@@ -1111,7 +1123,7 @@ mod tests {
         let root_path = root.path().to_path_buf();
         let log = warnings_of(async {
             prepare_pulse_dir(&mut config, &root_path).await.unwrap();
-            assert!(!config.graph.enabled, "graph features stay available");
+            assert!(!config.graph.enabled, "graph features stayed available");
         });
         let hits: Vec<_> = log
             .lines()
@@ -1137,7 +1149,7 @@ mod tests {
         let root_path = root.path().to_path_buf();
         let log = warnings_of(async {
             prepare_pulse_dir(&mut config, &root_path).await.unwrap();
-            assert!(!config.graph.enabled, "graph features stay available");
+            assert!(!config.graph.enabled, "graph features stayed available");
         });
         let hits: Vec<_> = log
             .lines()
@@ -1145,6 +1157,78 @@ mod tests {
             .collect();
         assert_eq!(hits.len(), 1, "{log}");
         assert!(!log.contains("surrealdb.service"), "{log}");
+        assert!(!log.contains(secret), "{log}");
+        assert!(!data.path().join("bin/spawned").exists());
+        assert_password_unread(&password, secret);
+    }
+
+    #[test]
+    fn m1_system_boot_refuses_a_fifo_secrets_dir() {
+        let root = tempfile::tempdir().unwrap();
+        let data = tempfile::tempdir().unwrap();
+        plant_surreal(data.path());
+        let secret = "root-secret-unread-fifo-dir";
+        let password = lock_root_password(data.path(), secret);
+        let secrets = root.path().join("secrets");
+        use std::os::unix::ffi::OsStrExt;
+        let name = std::ffi::CString::new(secrets.as_os_str().as_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(name.as_ptr(), 0o600) }, 0);
+        let (listener, addr) = loopback_listener();
+        drop(listener);
+        let mut config = system_graph(data.path(), Some(addr));
+        let root_path = root.path().to_path_buf();
+        let data_path = data.path().to_path_buf();
+        let handle = std::thread::spawn(move || {
+            let log = warnings_of(async {
+                prepare_pulse_dir(&mut config, &root_path).await.unwrap();
+                assert!(!config.graph.enabled, "graph features stayed available");
+            });
+            (log, config.graph.enabled)
+        });
+        let started = std::time::Instant::now();
+        while !handle.is_finished() {
+            assert!(
+                started.elapsed() < std::time::Duration::from_secs(2),
+                "system boot hung on a fifo secrets directory"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        let (log, enabled) = handle.join().unwrap();
+        assert!(!enabled);
+        assert!(log.to_ascii_lowercase().contains("directory"), "{log}");
+        assert!(!log.contains(secret), "{log}");
+        assert!(!data_path.join("bin/spawned").exists());
+        assert_password_unread(&password, secret);
+    }
+
+    #[test]
+    fn system_graph_pending_rotation_logs_rotate() {
+        let root = tempfile::tempdir().unwrap();
+        let data = tempfile::tempdir().unwrap();
+        plant_surreal(data.path());
+        let secret = "root-secret-unread-pending";
+        let password = lock_root_password(data.path(), secret);
+        let side = root.path().join("secrets/graph-password.new");
+        std::fs::create_dir(side.parent().unwrap()).unwrap();
+        std::fs::write(&side, "pending-side").unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&side, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let (listener, addr) = loopback_listener();
+        drop(listener);
+        let mut config = system_graph(data.path(), Some(addr));
+        let root_path = root.path().to_path_buf();
+        let log = warnings_of(async {
+            prepare_pulse_dir(&mut config, &root_path).await.unwrap();
+            assert!(!config.graph.enabled, "graph features stayed available");
+        });
+        let hits: Vec<_> = log
+            .lines()
+            .filter(|line| line.contains("pending"))
+            .collect();
+        assert_eq!(hits.len(), 1, "{log}");
+        assert!(hits[0].contains("--rotate"), "{log}");
+        assert!(hits[0].contains("as the owner"), "{log}");
+        assert!(!log.contains("is missing"), "{log}");
         assert!(!log.contains(secret), "{log}");
         assert!(!data.path().join("bin/spawned").exists());
         assert_password_unread(&password, secret);
@@ -1163,13 +1247,78 @@ mod tests {
             prepare_pulse_dir(&mut config, &root_path).await.unwrap();
             assert!(
                 config.graph.enabled,
-                "a reachable provisioned graph stays on"
+                "a reachable provisioned graph was turned off"
             );
         });
         drop(listener);
         assert!(!log.contains("surrealdb.service"), "{log}");
         assert!(!log.contains("pulse-null graph provision"), "{log}");
         assert!(!data.path().join("bin/spawned").exists());
+    }
+
+    #[test]
+    fn system_graph_empty_password_boots_without_graph() {
+        assert_unusable_password(b"", 0o600, "empty");
+    }
+
+    #[test]
+    fn system_graph_wrong_mode_boots_without_graph() {
+        assert_unusable_password(b"pulse-secret", 0o644, "chmod 600 secrets/graph-password");
+    }
+
+    #[test]
+    fn system_graph_symlink_password_boots_without_graph() {
+        let root = tempfile::tempdir().unwrap();
+        let data = tempfile::tempdir().unwrap();
+        let elsewhere = tempfile::tempdir().unwrap();
+        std::fs::create_dir(root.path().join("secrets")).unwrap();
+        std::os::unix::fs::symlink(
+            elsewhere.path().join("secret"),
+            root.path().join("secrets/graph-password"),
+        )
+        .unwrap();
+        let (listener, addr) = loopback_listener();
+        drop(listener);
+        let mut config = system_graph(data.path(), Some(addr));
+        let root_path = root.path().to_path_buf();
+        let log = warnings_of(async {
+            prepare_pulse_dir(&mut config, &root_path).await.unwrap();
+            assert!(!config.graph.enabled, "graph features stayed available");
+        });
+        assert!(log.contains("not a regular file"), "{log}");
+        assert_eq!(
+            log.lines()
+                .filter(|line| line.contains("not a regular file"))
+                .count(),
+            1,
+            "{log}"
+        );
+        assert!(!elsewhere.path().join("secret").exists());
+    }
+
+    fn assert_unusable_password(bytes: &[u8], mode: u32, needle: &str) {
+        let root = tempfile::tempdir().unwrap();
+        let data = tempfile::tempdir().unwrap();
+        let path = root.path().join("secrets/graph-password");
+        std::fs::create_dir(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, bytes).unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode)).unwrap();
+        let (listener, addr) = loopback_listener();
+        drop(listener);
+        let mut config = system_graph(data.path(), Some(addr));
+        let root_path = root.path().to_path_buf();
+        let log = warnings_of(async {
+            prepare_pulse_dir(&mut config, &root_path).await.unwrap();
+            assert!(!config.graph.enabled, "graph features stayed available");
+        });
+        assert!(log.contains(needle), "{log}");
+        assert_eq!(
+            log.lines().filter(|line| line.contains(needle)).count(),
+            1,
+            "{log}"
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), bytes);
     }
 
     fn system_graph(data: &Path, addr: Option<String>) -> Config {
@@ -1200,7 +1349,9 @@ mod tests {
     fn write_graph_password(root: &Path) {
         let path = root.join("secrets/graph-password");
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-        std::fs::write(path, "pulse-secret").unwrap();
+        std::fs::write(&path, "pulse-secret").unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
     }
 
     fn lock_root_password(data: &Path, secret: &str) -> PathBuf {
