@@ -2145,6 +2145,7 @@ mod tests {
     }
 
     fn many(dir: &Path, extra: usize) -> PathBuf {
+        let _hold = crate::process_state::Hold::acquire();
         let path = dir.join("receipts.jsonl");
         let (mut store, _) =
             ReceiptStore::open(StoreSource::Path(path.clone()), &LiveProbe, "echo").unwrap();

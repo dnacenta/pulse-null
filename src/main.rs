@@ -179,6 +179,23 @@ enum ReceiptsAction {
         #[arg(long)]
         token_file: Option<std::path::PathBuf>,
     },
+    /// Create the receipt directory, the receipt file, and anchors.log
+    Install {
+        /// Pulse name. Letters, digits, `-` or `_`.
+        #[arg(long)]
+        pulse: String,
+        /// Group that may read the receipt file. Letters, digits, `-` or `_`.
+        #[arg(long)]
+        group: String,
+        /// Parent of the pulse directory.
+        #[arg(long, default_value = "/var/lib/pulse-null")]
+        dir: std::path::PathBuf,
+        /// Copy a verified receipt file onto a new root-owned inode. The same
+        /// inode is kept only when the file is already root-owned, has no
+        /// group or world write bit, and has no ACL. Stop the pulse first.
+        #[arg(long)]
+        adopt: bool,
+    },
 }
 
 /// Creating, starting, talking to and stopping a pulse.
@@ -770,6 +787,12 @@ fn receipts_command(action: ReceiptsAction) -> CommandFuture {
             json,
         } => Box::pin(cli::receipts::overlaps(file, since, limit, json)),
         ReceiptsAction::Swaps { file, json } => Box::pin(cli::receipts::swaps(file, json)),
+        ReceiptsAction::Install {
+            pulse,
+            group,
+            dir,
+            adopt,
+        } => Box::pin(cli::receipts::install(pulse, group, dir, adopt)),
     }
 }
 

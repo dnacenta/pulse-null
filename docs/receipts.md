@@ -1,6 +1,17 @@
 # Receipts
 
-The daemon opens a receipt file when receipts are on. They are off unless `[receipts] enabled` is true or `PULSE_NULL_RECEIPTS=required`. `pulse-null receipts verify`, `show`, `overlaps`, and `swaps` read a file and do not write one. `pulse-null receipts anchor` is a separate command. The daemon never runs it.
+The daemon opens a receipt file when receipts are on. They are off unless `[receipts] enabled` is true or `PULSE_NULL_RECEIPTS=required`. `pulse-null receipts verify`, `show`, `overlaps`, and `swaps` read a file and do not write one. `pulse-null receipts anchor` and `pulse-null receipts install` are separate commands. The daemon never runs them.
+
+## Threat model
+
+| Who | Can | Cannot |
+|---|---|---|
+| Pulse user, in `<group>` | Read `receipts.jsonl` (mode 0640, group `<group>`) | Write it after it is root-owned, mode 0640, and append-only, unless the pulse still holds a descriptor from before that. Stop the pulse before `install` or `--adopt`. A fresh install refuses a file the pulse still owns. `--adopt` keeps the same inode only for a root-owned file with no group or world write bit and no ACL. Every other file it accepts is copied onto a new inode, so a descriptor opened before the copy no longer names the file |
+| Daemon | Append through the systemd fd named `receipts` when every protection check passes | Rewrite earlier bytes. Append-only rejects that. A path open is not protected |
+| Root anchor timer | Append one anchor line to `anchors.log` and, when configured, to the private repository | Run inside the pulse process. The token is a systemd credential, not a pulse file |
+| Anyone with the file | `receipts verify` offline, and `verify --anchors` when they can read the anchor config | Publish. A mismatch or a rewind publishes nothing |
+
+`install` creates that layout. It does not start the daemon and it does not create the repository or the token.
 
 ## Row
 
@@ -89,6 +100,35 @@ A publish reads that month's file. A 404 creates it. A verified body is the prev
 `pulse-null receipts verify --anchors [--config C] [--token-file T]` does the same comparison and does not publish. States are `ok`, `warn`, `broken`, `mismatch`, `rewind`, `unverified`, and `none`. Exit 0 is ok or warn. Exit 1 is broken, mismatch, or rewind. Exit 2 is unverified or a usage error. Without `--anchors` the report is unchanged.
 
 A private repository can block force-push with a ruleset. That control needs a paid plan. The token should allow contents read and write on that one repository and nothing else.
+
+## Install
+
+`pulse-null receipts install --pulse <name> --group <group> [--dir /var/lib/pulse-null] [--adopt]` creates the directory the daemon and the anchor command use. It refuses unless the effective uid is 0.
+
+`<name>` and `<group>` must be plain names: letters, digits, `-` or `_`, not empty, and not starting with `.`. `<group>` must be a group on this machine. The default `--dir` is `/var/lib/pulse-null`.
+
+The command walks every component from `/` with `openat`, `O_DIRECTORY`, and `O_NOFOLLOW`. A symlink, or a component that is not a directory, is refused and nothing is created through it. `..` is refused. Missing directories are created mode 0755, owner root:root. An existing pulse directory is used only when it is already owned by root and is not group- or world-writable; otherwise the command refuses and changes nothing. Directories above the pulse directory are not changed. The filesystem must support `FS_APPEND_FL`. If it does not, the command fails before it writes a genesis row or changes a receipt file's owner or mode, and it removes a directory it created for that attempt.
+
+`receipts.jsonl` is created mode 0640, owner root:`<group>`, with one `genesis` row for `<name>`. `anchors.log` is created empty, mode 0644, owner root:root, and only then does the receipt file get the append-only flag (`FS_APPEND_FL`). Existing files are opened read-only (`O_RDONLY`, `O_NOFOLLOW`, `O_NONBLOCK`) and must be regular files before any write-capable open. A second run that finds this layout opens that file read-only, changes nothing, and prints `already installed; nothing changed`.
+
+A file that already exists and is not owned by root is refused. The message tells the operator to stop the pulse and move the file aside, or to pass `--adopt`. An `anchors.log` that is not owned by root is also refused. That message tells the operator to stop the pulse and move or chown the file. `--adopt` does not accept `anchors.log`. `--adopt` still refuses a genesis row that names another pulse, and it refuses a chain that does not verify (exit 1, naming the line). On a chain that verifies for this pulse, the same inode is kept only when the file is already root-owned, has no group or world write bit, and has no ACL. The command then corrects that inode's owner, mode, and append-only flag. The summary says `mode or owner repaired` when the owner or mode changed. Every other accepted file is copied to a new file in the same directory (mode 0600, then owner root:`<group>` and mode 0640) and renamed over `receipts.jsonl`. The summary says `inode replaced`. A descriptor opened on the old inode does not follow the new file. Stop the pulse first. If that old inode has the append-only flag and the rename is refused, the command clears the flag on the old inode and renames again. A failure while creating `anchors.log` still removes a receipt file this command created, because the append-only flag is not set until `anchors.log` exists. Cleanup clears that flag before it unlinks a file, and a cleanup failure is included in the error. A later run that only sets the flag on a receipt file which already has the right owner and mode does not print `installed`: a half-finished install cannot be told from an existing receipt file, and the summary says so. An empty root-owned file with no group or world write bit and no ACL gets the genesis row on that inode. A symlink at `receipts.jsonl` or `anchors.log` is refused and the target is not opened.
+
+Exit 0 is installed, adopted, or already installed (`already installed; nothing changed`). Exit 1 is a broken chain under `--adopt`. Exit 2 is not root, a bad name, an unknown group, a symlink, another pulse's genesis, a file or directory that is not safe to take over, a non-empty root-owned file whose owner or mode is not the installed layout without `--adopt`, a filesystem without the append-only flag, or a path that cannot be used.
+
+## Deploy
+
+The operator runs these steps. This repository does not create the repository or the token.
+
+1. `systemctl --version` is 253 or newer. `OpenFile=` needs that.
+2. `sudo pulse-null receipts install --pulse <name> --group <group>`. `<group>` is the pulse user's group.
+3. Install `templates/systemd/pulse-null-receipts.conf` as a drop-in for the pulse's service (`OpenFile=` and `PULSE_NULL_RECEIPTS=required`), then reload systemd and restart the service.
+4. `pulse-null receipts verify --file /var/lib/pulse-null/<name>/receipts.jsonl` exits 0.
+5. Create the private repository and a contents read/write token for that repository only. Put the token at `/etc/pulse-null/anchor/token`, mode 0600, owner root. Write `/etc/pulse-null/anchor.toml` (see [Anchors](#anchors)). A local backend needs no token.
+6. Install `templates/systemd/pulse-null-anchor@.service` and `pulse-null-anchor@.timer`, then `systemctl enable --now pulse-null-anchor@<name>.timer`.
+
+The timer runs `pulse-null receipts anchor --pulse <name> --file /var/lib/pulse-null/<name>/receipts.jsonl` as root, once an hour, with an empty capability bounding set. It does not read the pulse home or `pulse-null.toml`. The token is loaded as the credential `anchor-token`. The daemon does not read it. `ReadWritePaths` is `/var/lib/pulse-null`, so a receipt file outside that directory is not writable by this unit.
+
+`scripts/smoke-receipts.sh` checks a temp-directory file, a local anchor, and a one-byte change. It does not need root, a network, or systemd. It is not a deploy check.
 
 ## Canonical form
 

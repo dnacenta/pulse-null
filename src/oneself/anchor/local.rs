@@ -89,21 +89,10 @@ pub fn lock_ledger(dir: &Path) -> Result<File, AnchorError> {
 
 /// `LOCK_NB` once, so a second run fails immediately.
 fn flock_exclusive(file: &File) -> Result<(), AnchorError> {
-    #[cfg(test)]
-    {
-        if lock_now(file)? {
-            Ok(())
-        } else {
-            Err(AnchorError::Busy)
-        }
-    }
-    #[cfg(not(test))]
-    {
-        if lock_now(file)? {
-            Ok(())
-        } else {
-            Err(AnchorError::Busy)
-        }
+    if lock_now(file)? {
+        Ok(())
+    } else {
+        Err(AnchorError::Busy)
     }
 }
 

@@ -1,0 +1,20 @@
+# Wakes the receipt anchor once an hour. TEMPLATE: installed at deploy.
+# A missed hour runs once when the timer is next active, not once per
+# missed hour. The service runs as root; see pulse-null-anchor@.service
+# for the token file (/etc/pulse-null/anchor/token) and the config
+# (/etc/pulse-null/anchor.toml). The operator creates the repository and
+# the token. Enable with:
+#   systemctl enable --now pulse-null-anchor@<pulse>.timer
+
+[Unit]
+Description=pulse-null receipt anchor timer (%i)
+
+[Timer]
+OnCalendar=hourly
+AccuracySec=1min
+RandomizedDelaySec=5min
+Persistent=true
+Unit=pulse-null-anchor@%i.service
+
+[Install]
+WantedBy=timers.target

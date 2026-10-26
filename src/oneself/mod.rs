@@ -7,6 +7,7 @@
 pub mod anchor;
 pub mod chain;
 pub mod event;
+pub mod install;
 pub mod protect;
 pub mod receipt;
 pub mod store;

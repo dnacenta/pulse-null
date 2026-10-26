@@ -1,0 +1,59 @@
+# Hourly receipt anchor for one pulse. TEMPLATE: installed at deploy, never
+# by the runtime. Runs as root. Needs the receipt directory from
+# `pulse-null receipts install` and systemd 253 or newer for the receipt
+# drop-in (`OpenFile=`). This unit itself does not use OpenFile=.
+#
+# The operator creates the private repository and a token that can read and
+# write contents on that repository only. Neither is created here.
+#   install -m 0600 -o root -g root /path/to/token /etc/pulse-null/anchor/token
+#   install -m 0644 -o root -g root anchor.toml /etc/pulse-null/anchor.toml
+# The token reaches the process as the credential `anchor-token`
+# (`$CREDENTIALS_DIRECTORY/anchor-token`). It is not written in this file.
+#
+# Install:
+#   cp pulse-null-anchor@.service pulse-null-anchor@.timer /etc/systemd/system/
+#   systemctl daemon-reload
+#   systemctl enable --now pulse-null-anchor@<pulse>.timer
+#
+# The process is root with an empty capability bounding set. It does not
+# read the pulse home or `pulse-null.toml`. `--file` is the receipt file
+# from `receipts install`. %i must be that file's genesis pulse. A group-
+# or world-writable anchor.toml is refused. `--config` is not set, so
+# /etc/pulse-null/anchor.toml must be owned by root.
+
+[Unit]
+Description=pulse-null receipt anchor (%i)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=root
+Group=root
+ExecStart=/usr/local/bin/pulse-null receipts anchor --pulse %i --file /var/lib/pulse-null/%i/receipts.jsonl
+Environment=RUST_LOG=info
+LoadCredential=anchor-token:/etc/pulse-null/anchor/token
+UMask=0077
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/var/lib/pulse-null
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectProc=invisible
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+RestrictSUIDSGID=yes
+RestrictNamespaces=yes
+RestrictRealtime=yes
+LockPersonality=yes
+SystemCallArchitectures=native
+CapabilityBoundingSet=
+AmbientCapabilities=
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+MemoryMax=512M
+TimeoutStartSec=5min
