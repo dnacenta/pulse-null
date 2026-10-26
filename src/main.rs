@@ -190,10 +190,9 @@ enum ReceiptsAction {
         /// Parent of the pulse directory.
         #[arg(long, default_value = "/var/lib/pulse-null")]
         dir: std::path::PathBuf,
-        /// Copy a non-root receipt file onto a new root-owned inode when it
-        /// verifies for this pulse. A root-owned file is not replaced; its
-        /// owner, mode, and append-only flag are corrected. Stop the pulse
-        /// first.
+        /// Copy a verified receipt file onto a new root-owned inode. The same
+        /// inode is kept only when the file is already root-owned, has no
+        /// group or world write bit, and has no ACL. Stop the pulse first.
         #[arg(long)]
         adopt: bool,
     },

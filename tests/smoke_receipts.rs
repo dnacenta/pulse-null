@@ -1,5 +1,13 @@
 //! The receipt smoke script, against this package's binary.
 
+use std::os::unix::process::CommandExt;
+
+extern "C" {
+    fn killpg(pgrp: i32, sig: i32) -> i32;
+}
+
+const SIGKILL: i32 = 9;
+
 #[test]
 fn receipt_install_smoke_script_exits_0() {
     let bin = env!("CARGO_BIN_EXE_pulse-null");
@@ -10,6 +18,7 @@ fn receipt_install_smoke_script_exits_0() {
         .current_dir(manifest)
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
+        .process_group(0)
         .spawn()
         .expect("smoke script");
     let mut stdout = child.stdout.take().unwrap();
@@ -29,7 +38,11 @@ fn receipt_install_smoke_script_exits_0() {
         match child.try_wait() {
             Ok(Some(status)) => break status,
             Ok(None) if std::time::Instant::now() >= deadline => {
-                let _ = child.kill();
+                let pid = child.id() as i32;
+                // SAFETY: `process_group(0)` made this child's pid its process
+                // group id. `SIGKILL` stops that group, including children of
+                // the script.
+                unsafe { killpg(pid, SIGKILL) };
                 let _ = child.wait();
                 panic!("smoke script exceeded 300s");
             }

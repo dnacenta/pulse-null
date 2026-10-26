@@ -299,10 +299,10 @@ pub async fn swaps(file: Option<PathBuf>, json: bool) -> Result<(), Box<dyn std:
 /// Refuses unless the process is root. A second run that finds the same
 /// layout prints `already installed; nothing changed` and changes nothing.
 /// A file that is not owned by root is refused unless `--adopt`. `--adopt`
-/// copies a chain that verifies for this pulse onto a new root-owned inode.
-/// Stop the pulse first: a descriptor opened before that still names the
-/// old inode. A file root already owns is not replaced; its owner, mode,
-/// and append-only flag are corrected on that inode.
+/// keeps the same inode only when the file is already root-owned, has no
+/// group or world write bit, and has no ACL. Anything else it accepts is
+/// copied onto a new root-owned inode. Stop the pulse first: a descriptor
+/// opened before that copy still names the old inode.
 pub async fn install(
     pulse: String,
     group: String,
@@ -316,16 +316,8 @@ pub async fn install(
         adopt,
         &crate::oneself::install::LiveHost,
     ) {
-        Ok(crate::oneself::install::Outcome::Installed(path)) => {
-            println!("installed {}", path.display());
-            Ok(())
-        }
-        Ok(crate::oneself::install::Outcome::Adopted(path)) => {
-            println!("adopted {}; receipt file unchanged", path.display());
-            Ok(())
-        }
-        Ok(crate::oneself::install::Outcome::Unchanged) => {
-            println!("already installed; nothing changed");
+        Ok(outcome) => {
+            println!("{}", crate::oneself::install::summary(&outcome));
             Ok(())
         }
         Err(crate::oneself::install::InstallError::Broken { line, reason }) => {

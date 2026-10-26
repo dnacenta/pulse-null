@@ -5,17 +5,17 @@
 //! that file, and an empty `anchors.log` as root:root mode 0644. Every
 //! component is opened with `openat` and `O_NOFOLLOW`. A second run that
 //! finds this layout changes nothing and prints `already installed; nothing
-//! changed`. An existing file is opened read-only. A file that is not owned
-//! by root is not reused: without `--adopt` it is refused, and with `--adopt`
-//! a verified chain is copied onto a new inode. Stop the pulse before
-//! `--adopt`.
+//! changed`. An existing file is opened read-only. The same inode is kept
+//! only when the file is already owned by root, has no group or world write
+//! bit, and has no ACL. Anything else that `--adopt` accepts is copied onto
+//! a new inode. Stop the pulse before `--adopt`.
 
 use std::ffi::{CString, OsStr};
 use std::fs::File;
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::os::fd::{AsRawFd, FromRawFd};
 use std::os::unix::ffi::OsStrExt;
-use std::os::unix::fs::MetadataExt;
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Component, Path, PathBuf};
 
 use super::chain::{self, GENESIS_PREV};
@@ -32,11 +32,55 @@ const ANCHOR_MODE: u32 = 0o644;
 pub enum Outcome {
     /// A genesis row was written into the receipt file.
     Installed(PathBuf),
-    /// The receipt bytes were left as they were. The mode, the owner, the
-    /// append-only flag, the directory, or `anchors.log` was adjusted.
-    Adopted(PathBuf),
+    /// The verified chain was copied onto a new inode.
+    Replaced(PathBuf),
+    /// The same inode was kept and its mode, owner, or append-only flag changed.
+    ///
+    /// `half` means the owner and mode already matched and only the flag was
+    /// set. A half-finished install cannot be told from an existing receipt
+    /// file, so [`summary`] does not say installed. `layout` means the
+    /// directory or `anchors.log` was also created or repaired.
+    Repaired {
+        path: PathBuf,
+        half: bool,
+        layout: bool,
+    },
+    /// The receipt file was already in place. The directory or `anchors.log`
+    /// was created or repaired.
+    Layout(PathBuf),
     /// The layout was already in place.
     Unchanged,
+}
+
+const HALF_NOTE: &str = "a half-finished install cannot be told from an existing receipt file, so this is not reported as installed";
+
+/// The line `receipts install` prints for this outcome.
+pub fn summary(outcome: &Outcome) -> String {
+    match outcome {
+        Outcome::Installed(path) => format!("installed {}", path.display()),
+        Outcome::Replaced(path) => format!("adopted {}; inode replaced", path.display()),
+        Outcome::Repaired { path, half, layout } => {
+            let detail = if *half {
+                "append-only flag set"
+            } else {
+                "mode or owner repaired"
+            };
+            let mut line = format!("adopted {}; {detail}", path.display());
+            if *layout {
+                line.push_str("; directory or anchors.log created or repaired");
+            }
+            if *half {
+                line.push_str("; ");
+                line.push_str(HALF_NOTE);
+            }
+            line
+        }
+        Outcome::Layout(path) => format!(
+            "adopted {}; directory or anchors.log created or repaired",
+            path.display()
+        ),
+        Outcome::Unchanged => "already installed; nothing changed".to_string(),
+    }
 }
 
 /// Why `install` wrote nothing, or stopped.
@@ -80,10 +124,19 @@ impl std::fmt::Display for InstallError {
             Self::Broken { line, reason } => {
                 write!(formatter, "broken line {line}: {reason}")
             }
-            Self::NotRootOwned { file } => write!(
-                formatter,
-                "{file} is not owned by root; stop the pulse and move the file aside, or pass --adopt"
-            ),
+            Self::NotRootOwned { file } => {
+                if *file == "anchors.log" {
+                    write!(
+                        formatter,
+                        "{file} is not owned by root; stop the pulse and move or chown the file"
+                    )
+                } else {
+                    write!(
+                        formatter,
+                        "{file} is not owned by root; stop the pulse and move the file aside, or pass --adopt"
+                    )
+                }
+            }
             Self::DirUnsafe => formatter.write_str(
                 "pulse directory must be owned by root and not group- or world-writable",
             ),
@@ -209,10 +262,10 @@ pub fn install(
         host,
         &mut created_files,
     );
-    if result.is_err() {
-        remove_created(&created_files, &created_dirs);
+    match result {
+        Ok(outcome) => Ok(outcome),
+        Err(err) => Err(with_cleanup(err, &created_files, &created_dirs, host)),
     }
-    result
 }
 
 fn install_in(
@@ -230,7 +283,7 @@ fn install_in(
     // row or an owner change on a receipt file.
     host.append_supported(&dir_rw)?;
     inspect_anchors(dirfd.as_raw_fd(), host)?;
-    let done = place_receipt(
+    let pending = place_receipt(
         dirfd.as_raw_fd(),
         pulse_dir,
         pulse,
@@ -239,24 +292,39 @@ fn install_in(
         host,
         created_files,
     )?;
+    // `anchors.log` exists before the receipt file gets `FS_APPEND_FL`, so a
+    // failure while creating it can still unlink a receipt file this run created.
     let dir_changed = ensure_mode_owner(&dir_rw, DIR_MODE, 0, 0, host)?;
     let anchors_changed = ensure_anchors(dirfd.as_raw_fd(), pulse_dir, host, created_files)?;
-    match done {
-        ReceiptDone::Wrote => Ok(Outcome::Installed(pulse_dir.to_path_buf())),
-        ReceiptDone::Adjusted => Ok(Outcome::Adopted(pulse_dir.to_path_buf())),
+    let done = seal_receipt(dirfd.as_raw_fd(), pending, gid, host)?;
+    let path = pulse_dir.to_path_buf();
+    let layout = dir_changed || anchors_changed;
+    Ok(match done {
+        ReceiptDone::Wrote => Outcome::Installed(path),
+        ReceiptDone::Replaced => Outcome::Replaced(path),
+        ReceiptDone::Repaired { half } => Outcome::Repaired { path, half, layout },
         ReceiptDone::Ready => {
-            if dir_changed || anchors_changed {
-                Ok(Outcome::Adopted(pulse_dir.to_path_buf()))
+            if layout {
+                Outcome::Layout(path)
             } else {
-                Ok(Outcome::Unchanged)
+                Outcome::Unchanged
             }
         }
-    }
+    })
 }
 
 enum ReceiptDone {
     Wrote,
-    Adjusted,
+    Replaced,
+    Repaired { half: bool },
+    Ready,
+}
+
+enum Pending {
+    Wrote,
+    Replaced,
+    NeedsRepair,
+    NeedsFlag,
     Ready,
 }
 
@@ -278,14 +346,14 @@ fn place_receipt(
     adopt: bool,
     host: &dyn Host,
     created_files: &mut Vec<PathBuf>,
-) -> Result<ReceiptDone, InstallError> {
+) -> Result<Pending, InstallError> {
     match open_read(dirfd, "receipts.jsonl") {
         Err(InstallError::Missing) => {
             let file = create_exclusive(dirfd, "receipts.jsonl", 0o600)?;
             created_files.push(pulse_dir.join("receipts.jsonl"));
             write_genesis(&file, pulse)?;
-            finish_receipt(&file, gid, host)?;
-            Ok(ReceiptDone::Wrote)
+            ensure_mode_owner(&file, RECEIPT_MODE, 0, gid, host)?;
+            Ok(Pending::Wrote)
         }
         Ok(file) => existing_receipt(dirfd, &file, pulse, gid, adopt, host),
         Err(err) => Err(err),
@@ -299,37 +367,132 @@ fn existing_receipt(
     gid: u32,
     adopt: bool,
     host: &dyn Host,
-) -> Result<ReceiptDone, InstallError> {
+) -> Result<Pending, InstallError> {
     let meta = require_regular(file, "receipts.jsonl")?;
-    let (uid, _) = host.owner(file)?;
-    if uid != 0 {
-        if !adopt {
-            return Err(InstallError::NotRootOwned {
-                file: "receipts.jsonl",
-            });
-        }
-        replace_receipt(dirfd, file, &meta, pulse, gid, host)?;
-        return Ok(ReceiptDone::Adjusted);
+    if !keeps_inode(file, host)? {
+        return replace_or_refuse(dirfd, file, &meta, pulse, gid, adopt, host);
     }
     if meta.len() == 0 {
         let writing = open_write(dirfd, "receipts.jsonl")?;
         require_regular(&writing, "receipts.jsonl")?;
         write_genesis(&writing, pulse)?;
-        finish_receipt(&writing, gid, host)?;
-        return Ok(ReceiptDone::Wrote);
+        ensure_mode_owner(&writing, RECEIPT_MODE, 0, gid, host)?;
+        return Ok(Pending::Wrote);
     }
     match decide(file, pulse, gid, adopt, host)? {
         ReceiptStep::Write => Err(InstallError::Local(
             "receipt file changed while it was checked".into(),
         )),
-        ReceiptStep::Fix => {
-            if finish_receipt(file, gid, host)? {
-                Ok(ReceiptDone::Adjusted)
+        ReceiptStep::Fix => Ok(Pending::NeedsRepair),
+        ReceiptStep::FlagOnly => Ok(Pending::NeedsFlag),
+        ReceiptStep::Ready => Ok(Pending::Ready),
+    }
+}
+
+/// The same inode is safe only when a group member cannot have opened it for
+/// writing. The append-only flag is not part of this: a handle opened before
+/// the flag was set can still write.
+fn keeps_inode(file: &File, host: &dyn Host) -> Result<bool, InstallError> {
+    let (uid, _) = host.owner(file)?;
+    let mode = file.metadata().map_err(io_err)?.mode();
+    if uid != 0 || mode & 0o022 != 0 {
+        return Ok(false);
+    }
+    Ok(!has_acl(file)?)
+}
+
+fn has_acl(file: &File) -> Result<bool, InstallError> {
+    for name in [
+        c"system.posix_acl_access".as_ptr(),
+        c"system.posix_acl_default".as_ptr(),
+    ] {
+        // SAFETY: `name` is a nul-terminated literal. A null buffer and a
+        // size of 0 return the attribute's size. A non-negative result means
+        // the attribute is present, including an empty one. Any ACL replaces
+        // the inode. `ENODATA` and `ENOTSUP` mean there is no ACL.
+        let rc = unsafe { libc::fgetxattr(file.as_raw_fd(), name, std::ptr::null_mut(), 0) };
+        if rc >= 0 {
+            return Ok(true);
+        }
+        let err = io::Error::last_os_error();
+        let code = err.raw_os_error();
+        let no_acl = code == Some(libc::ENODATA)
+            || code == Some(libc::ENOTSUP)
+            || code == Some(libc::EOPNOTSUPP);
+        if !no_acl {
+            return Err(io_err(err));
+        }
+    }
+    Ok(false)
+}
+
+fn replace_or_refuse(
+    dirfd: i32,
+    file: &File,
+    meta: &std::fs::Metadata,
+    pulse: &str,
+    gid: u32,
+    adopt: bool,
+    host: &dyn Host,
+) -> Result<Pending, InstallError> {
+    let (uid, _) = host.owner(file)?;
+    if uid != 0 && !adopt {
+        return Err(InstallError::NotRootOwned {
+            file: "receipts.jsonl",
+        });
+    }
+    if meta.len() > MAX_RECEIPT_BYTES {
+        return Err(InstallError::Local(
+            "receipts.jsonl is larger than 256 MiB".into(),
+        ));
+    }
+    if !adopt {
+        // Do not write a genesis row into an inode a group member can still
+        // hold open. Another pulse's genesis is still named.
+        if meta.len() > 0 {
+            let bytes = read_fd(file, meta.len())?;
+            if genesis_pulse(&bytes).is_some_and(|name| name != pulse) {
+                return Err(InstallError::OtherPulse);
+            }
+        }
+        return Err(InstallError::RefuseAdopt);
+    }
+    replace_receipt(dirfd, file, meta, pulse, gid, host)?;
+    Ok(Pending::Replaced)
+}
+
+fn seal_receipt(
+    dirfd: i32,
+    pending: Pending,
+    gid: u32,
+    host: &dyn Host,
+) -> Result<ReceiptDone, InstallError> {
+    let replaced = matches!(pending, Pending::Replaced);
+    let flag_only = matches!(pending, Pending::NeedsFlag);
+    match pending {
+        Pending::NeedsRepair => {
+            let file = open_read(dirfd, "receipts.jsonl")?;
+            if finish_receipt(&file, gid, host)? {
+                Ok(ReceiptDone::Repaired { half: false })
             } else {
                 Ok(ReceiptDone::Ready)
             }
         }
-        ReceiptStep::Ready => Ok(ReceiptDone::Ready),
+        Pending::Ready => Ok(ReceiptDone::Ready),
+        Pending::Wrote | Pending::Replaced | Pending::NeedsFlag => {
+            let file = open_read(dirfd, "receipts.jsonl")?;
+            if !host.append_flag(&file)? {
+                host.set_append(&file)?;
+                file.sync_all().map_err(io_err)?;
+            }
+            if replaced {
+                Ok(ReceiptDone::Replaced)
+            } else if flag_only {
+                Ok(ReceiptDone::Repaired { half: true })
+            } else {
+                Ok(ReceiptDone::Wrote)
+            }
+        }
     }
 }
 
@@ -383,24 +546,40 @@ fn replace_receipt(
     sync_dir(dirfd)?;
     let dest = CString::new("receipts.jsonl")
         .map_err(|_| InstallError::Local("path is not usable".into()))?;
-    // SAFETY: both names are nul-terminated children of this directory fd.
-    let rc = unsafe {
-        libc::renameat(
-            dirfd,
-            temp.name.as_ref().unwrap().as_ptr(),
-            dirfd,
-            dest.as_ptr(),
-        )
-    };
-    if rc != 0 {
-        return Err(io_err(io::Error::last_os_error()));
+    // `renameat` replaces the directory entry. The kernel refuses that when
+    // the destination inode has `FS_APPEND_FL`: `may_delete` returns `EPERM`
+    // for `IS_APPEND`. Clear the flag on the old inode and try once more.
+    // A descriptor opened before the rename still names the old inode.
+    let from = temp.name.as_ref().unwrap();
+    if let Err(err) = rename_over(dirfd, from, &dest) {
+        let append_only = err.raw_os_error() == Some(libc::EPERM) && host.append_flag(file)?;
+        if !append_only {
+            return Err(io_err(err));
+        }
+        host.clear_append(file)?;
+        if let Err(err) = rename_over(dirfd, from, &dest) {
+            return match host.set_append(file) {
+                Ok(()) => Err(io_err(err)),
+                Err(restore) => Err(InstallError::Local(format!(
+                    "the append-only flag was cleared and could not be restored: {restore}; while handling: {err}"
+                ))),
+            };
+        }
     }
     temp.name = None;
     drop(new_file);
-    let installed = open_read(dirfd, "receipts.jsonl")?;
-    host.set_append(&installed)?;
     sync_dir(dirfd)?;
     Ok(())
+}
+
+fn rename_over(dirfd: i32, from: &CString, to: &CString) -> Result<(), io::Error> {
+    // SAFETY: both names are nul-terminated children of this directory fd.
+    let rc = unsafe { libc::renameat(dirfd, from.as_ptr(), dirfd, to.as_ptr()) };
+    if rc == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error())
+    }
 }
 
 struct TempFile {
@@ -420,6 +599,7 @@ impl Drop for TempFile {
 enum ReceiptStep {
     Write,
     Fix,
+    FlagOnly,
     Ready,
 }
 
@@ -506,22 +686,23 @@ fn decide(
             InstallError::RefuseAdopt
         });
     }
-    if receipt_ready(file, gid, host)? {
+    let meta = file.metadata().map_err(io_err)?;
+    let (uid, file_gid) = host.owner(file)?;
+    let shape = meta.mode() & 0o777 == RECEIPT_MODE && uid == 0 && file_gid == gid;
+    let flagged = host.append_flag(file)?;
+    if shape && flagged {
         Ok(ReceiptStep::Ready)
+    } else if shape {
+        // The owner and mode already match. Only the append-only flag is
+        // missing. That is what a half-finished install looks like, and it
+        // is also what an existing file looks like. The summary says that
+        // these cannot be told apart and does not say installed.
+        Ok(ReceiptStep::FlagOnly)
     } else if adopt {
         Ok(ReceiptStep::Fix)
     } else {
         Err(InstallError::RefuseAdopt)
     }
-}
-
-fn receipt_ready(file: &File, gid: u32, host: &dyn Host) -> Result<bool, InstallError> {
-    let meta = file.metadata().map_err(io_err)?;
-    let (uid, file_gid) = host.owner(file)?;
-    Ok(meta.mode() & 0o777 == RECEIPT_MODE
-        && uid == 0
-        && file_gid == gid
-        && host.append_flag(file)?)
 }
 
 fn finish_receipt(file: &File, gid: u32, host: &dyn Host) -> Result<bool, InstallError> {
@@ -694,12 +875,79 @@ fn sync_dir(dirfd: i32) -> Result<(), InstallError> {
     reopen_dir(dirfd)?.sync_all().map_err(io_err)
 }
 
-fn remove_created(files: &[PathBuf], dirs: &[PathBuf]) {
+fn with_cleanup(
+    err: InstallError,
+    files: &[PathBuf],
+    dirs: &[PathBuf],
+    host: &dyn Host,
+) -> InstallError {
+    match remove_created(files, dirs, host) {
+        Ok(()) => err,
+        Err(cleanup) => InstallError::Local(format!("{err}; cleanup failed: {cleanup}")),
+    }
+}
+
+fn remove_created(
+    files: &[PathBuf],
+    dirs: &[PathBuf],
+    host: &dyn Host,
+) -> Result<(), InstallError> {
+    let mut errors = Vec::new();
     for path in files.iter().rev() {
-        let _ = std::fs::remove_file(path);
+        if let Err(err) = remove_created_file(path, host) {
+            errors.push(format!("{}: {err}", path.display()));
+        }
     }
     for path in dirs.iter().rev() {
-        let _ = std::fs::remove_dir(path);
+        match std::fs::remove_dir(path) {
+            Ok(()) => {}
+            Err(err) if err.kind() == io::ErrorKind::NotFound => {}
+            Err(err) => errors.push(format!("{}: {err}", path.display())),
+        }
+    }
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(InstallError::Local(errors.join("; ")))
+    }
+}
+
+fn remove_created_file(path: &Path, host: &dyn Host) -> Result<(), InstallError> {
+    let file = match std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK)
+        .open(path)
+    {
+        Ok(file) => file,
+        Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(err) => return Err(io_err(err)),
+    };
+    // An append-only file cannot be unlinked, including by root. Clear the
+    // flag on this descriptor first.
+    host.clear_append(&file)?;
+    let parent = path
+        .parent()
+        .ok_or_else(|| InstallError::Local("path is not usable".into()))?;
+    let name = path
+        .file_name()
+        .ok_or_else(|| InstallError::Local("path is not usable".into()))?;
+    let dir = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(parent)
+        .map_err(io_err)?;
+    let c_name = c_string(name)?;
+    // SAFETY: `c_name` is a nul-terminated child of this directory fd.
+    let rc = unsafe { libc::unlinkat(dir.as_raw_fd(), c_name.as_ptr(), 0) };
+    if rc == 0 {
+        Ok(())
+    } else {
+        let err = io::Error::last_os_error();
+        if err.raw_os_error() == Some(libc::ENOENT) {
+            Ok(())
+        } else {
+            Err(io_err(err))
+        }
     }
 }
 
@@ -739,34 +987,27 @@ fn prepare_tree(
             }
             Err(InstallError::Missing) => {
                 if let Err(err) = mkdir_child(current.as_raw_fd(), name) {
-                    remove_created(&[], &created);
-                    return Err(err);
+                    return Err(with_cleanup(err, &[], &created, host));
                 }
                 created.push(built.clone());
                 let next = match open_child_dir(current.as_raw_fd(), name) {
                     Ok(next) => next,
                     Err(err) => {
-                        remove_created(&[], &created);
-                        return Err(err);
+                        return Err(with_cleanup(err, &[], &created, host));
                     }
                 };
                 let rw = match open_child_rdonly(current.as_raw_fd(), name) {
                     Ok(rw) => rw,
                     Err(err) => {
-                        remove_created(&[], &created);
-                        return Err(err);
+                        return Err(with_cleanup(err, &[], &created, host));
                     }
                 };
                 if let Err(err) = ensure_mode_owner(&rw, DIR_MODE, 0, 0, host) {
-                    remove_created(&[], &created);
-                    return Err(err);
+                    return Err(with_cleanup(err, &[], &created, host));
                 }
                 current = next;
             }
-            Err(err) => {
-                remove_created(&[], &created);
-                return Err(err);
-            }
+            Err(err) => return Err(with_cleanup(err, &[], &created, host)),
         }
     }
     Ok((built, current, created))
@@ -1245,6 +1486,7 @@ mod tests {
             "{err}"
         );
         assert!(err.to_string().contains("stop the pulse"));
+        assert!(err.to_string().contains("--adopt"));
         assert_eq!(std::fs::read(&receipt).unwrap(), b"");
         assert!(!pulse.join("anchors.log").exists());
 
@@ -1261,6 +1503,8 @@ mod tests {
             ),
             "{err}"
         );
+        assert!(err.to_string().contains("move or chown"), "{err}");
+        assert!(!err.to_string().contains("--adopt"), "{err}");
         assert_eq!(std::fs::read(&anchors).unwrap(), b"keep");
         assert!(!receipt.exists());
     }
@@ -1296,7 +1540,8 @@ mod tests {
         let host = Fake::root_group(42);
         host.claim(&pulse, 0, 0);
         let outcome = run(dir.path(), "echo", "pulse", true, &host).unwrap();
-        assert_eq!(outcome, Outcome::Adopted(pulse.clone()));
+        assert_eq!(outcome, Outcome::Replaced(pulse.clone()));
+        assert!(summary(&outcome).contains("inode replaced"));
         let after = std::fs::metadata(&receipt).unwrap().ino();
         assert_ne!(before, after);
         assert_eq!(std::fs::read(&receipt).unwrap(), bytes);
@@ -1313,9 +1558,19 @@ mod tests {
         let receipt = dir.path().join("echo/receipts.jsonl");
         std::fs::set_permissions(&receipt, std::fs::Permissions::from_mode(0o600)).unwrap();
         host.claim_flag(&receipt);
+        let before = std::fs::metadata(&receipt).unwrap().ino();
         let clears = host.clears.lock().unwrap().len();
         let outcome = run(dir.path(), "echo", "pulse", true, &host).unwrap();
-        assert_eq!(outcome, Outcome::Adopted(dir.path().join("echo")));
+        assert_eq!(
+            outcome,
+            Outcome::Repaired {
+                path: dir.path().join("echo"),
+                half: false,
+                layout: false,
+            }
+        );
+        assert!(summary(&outcome).contains("mode or owner repaired"));
+        assert_eq!(std::fs::metadata(&receipt).unwrap().ino(), before);
         assert!(host.clears.lock().unwrap().len() > clears);
         assert_eq!(mode_of(&receipt), RECEIPT_MODE);
         assert!(host.append_flag(&File::open(&receipt).unwrap()).unwrap());
@@ -1364,7 +1619,7 @@ mod tests {
     }
 
     #[test]
-    fn receipt_install_adopt_keeps_a_valid_chain_and_sets_the_mode() {
+    fn receipt_install_adopt_replaces_a_group_writable_root_inode() {
         let dir = tempfile::tempdir().unwrap();
         let pulse = dir.path().join("echo");
         std::fs::create_dir(&pulse).unwrap();
@@ -1372,21 +1627,132 @@ mod tests {
         let receipt = pulse.join("receipts.jsonl");
         let bytes = genesis_bytes("echo").unwrap();
         std::fs::write(&receipt, &bytes).unwrap();
-        std::fs::set_permissions(&receipt, std::fs::Permissions::from_mode(0o666)).unwrap();
+        std::fs::set_permissions(&receipt, std::fs::Permissions::from_mode(0o660)).unwrap();
         let before = std::fs::metadata(&receipt).unwrap().ino();
+        let held = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&receipt)
+            .unwrap();
         let host = Fake::root_group(42);
         host.claim(&pulse, 0, 0);
         host.claim(&receipt, 0, 42);
         let refused = run(dir.path(), "echo", "pulse", false, &host).unwrap_err();
         assert!(matches!(refused, InstallError::RefuseAdopt), "{refused}");
-        assert_eq!(mode_of(&receipt), 0o666);
+        assert_eq!(mode_of(&receipt), 0o660);
+        assert_eq!(std::fs::metadata(&receipt).unwrap().ino(), before);
         let outcome = run(dir.path(), "echo", "pulse", true, &host).unwrap();
-        assert_eq!(outcome, Outcome::Adopted(pulse.clone()));
+        assert_eq!(outcome, Outcome::Replaced(pulse.clone()));
+        assert!(summary(&outcome).contains("inode replaced"));
         assert_eq!(std::fs::read(&receipt).unwrap(), bytes);
         assert_eq!(mode_of(&receipt), RECEIPT_MODE);
-        assert_eq!(std::fs::metadata(&receipt).unwrap().ino(), before);
+        let after = std::fs::metadata(&receipt).unwrap().ino();
+        assert_ne!(before, after);
+        assert_eq!(held.metadata().unwrap().ino(), before);
+        std::os::unix::fs::FileExt::write_at(&held, b"X", 0).unwrap();
+        assert_eq!(std::fs::read(&receipt).unwrap(), bytes);
         assert_eq!(host.appends.lock().unwrap().len(), 1);
         assert!(pulse.join("anchors.log").exists());
+    }
+
+    #[test]
+    fn receipt_install_finishes_a_flagless_receipt_without_calling_it_installed() {
+        let dir = tempfile::tempdir().unwrap();
+        let host = Fake::root_group(42);
+        run(dir.path(), "echo", "pulse", false, &host).unwrap();
+        let pulse = dir.path().join("echo");
+        let receipt = pulse.join("receipts.jsonl");
+        std::fs::remove_file(pulse.join("anchors.log")).unwrap();
+        host.flags
+            .lock()
+            .unwrap()
+            .remove(&file_key(&File::open(&receipt).unwrap()));
+        let before = std::fs::metadata(&receipt).unwrap().ino();
+        let outcome = run(dir.path(), "echo", "pulse", false, &host).unwrap();
+        assert_eq!(
+            outcome,
+            Outcome::Repaired {
+                path: pulse.clone(),
+                half: true,
+                layout: true,
+            }
+        );
+        let text = summary(&outcome);
+        assert!(text.starts_with("adopted "), "{text}");
+        assert!(!text.starts_with("installed"), "{text}");
+        assert!(text.contains(HALF_NOTE), "{text}");
+        assert!(text.contains("append-only flag set"), "{text}");
+        assert!(text.contains("anchors.log"), "{text}");
+        assert_eq!(std::fs::metadata(&receipt).unwrap().ino(), before);
+        assert!(host.append_flag(&File::open(&receipt).unwrap()).unwrap());
+        assert!(pulse.join("anchors.log").exists());
+    }
+
+    #[test]
+    fn receipt_install_adopt_replaces_a_root_file_with_an_acl() {
+        let dir = tempfile::tempdir().unwrap();
+        let pulse = dir.path().join("echo");
+        std::fs::create_dir(&pulse).unwrap();
+        std::fs::set_permissions(&pulse, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let receipt = pulse.join("receipts.jsonl");
+        let bytes = genesis_bytes("echo").unwrap();
+        std::fs::write(&receipt, &bytes).unwrap();
+        std::fs::set_permissions(&receipt, std::fs::Permissions::from_mode(0o640)).unwrap();
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&receipt)
+            .unwrap();
+        if !attach_user_acl(&file) {
+            eprintln!("skipping ACL replacement: filesystem refused a POSIX ACL");
+            return;
+        }
+        drop(file);
+        assert_eq!(
+            std::fs::metadata(&receipt).unwrap().mode() & 0o022,
+            0,
+            "ACL test must not rely on a group or world write bit"
+        );
+        let before = std::fs::metadata(&receipt).unwrap().ino();
+        let host = Fake::root_group(42);
+        host.claim(&pulse, 0, 0);
+        host.claim(&receipt, 0, 42);
+        host.claim_flag(&receipt);
+        let outcome = run(dir.path(), "echo", "pulse", true, &host).unwrap();
+        assert_eq!(outcome, Outcome::Replaced(pulse));
+        assert_ne!(std::fs::metadata(&receipt).unwrap().ino(), before);
+        assert_eq!(std::fs::read(&receipt).unwrap(), bytes);
+    }
+
+    fn attach_user_acl(file: &File) -> bool {
+        // POSIX ACL xattr version 2: user obj, one named user, group obj,
+        // mask, other. A named user makes `fgetxattr` report an ACL even
+        // when the mode has no group or world write bit.
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&2u32.to_le_bytes());
+        for (tag, perm, id) in [
+            (1u16, 4u16, 0u32),
+            (2, 4, 65534),
+            (4, 4, 0),
+            (0x10, 4, 0),
+            (0x20, 4, 0),
+        ] {
+            bytes.extend_from_slice(&tag.to_le_bytes());
+            bytes.extend_from_slice(&perm.to_le_bytes());
+            bytes.extend_from_slice(&id.to_le_bytes());
+        }
+        // SAFETY: the name is a nul-terminated literal and `bytes` is the
+        // value. The descriptor is open for writing.
+        let rc = unsafe {
+            libc::fsetxattr(
+                file.as_raw_fd(),
+                c"system.posix_acl_access".as_ptr(),
+                bytes.as_ptr().cast(),
+                bytes.len(),
+                0,
+            )
+        };
+        rc == 0
     }
 
     #[test]
