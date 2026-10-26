@@ -1139,6 +1139,10 @@ impl Default for EventsConfig {
     }
 }
 
+fn default_graph_server() -> String {
+    "spawn".to_string()
+}
+
 /// Configuration for recall-graph knowledge graph integration
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
@@ -1151,8 +1155,20 @@ pub struct GraphConfig {
     pub pipeline_sync: bool,
     /// Connection mode: "embedded" or "server"
     pub mode: String,
+    /// Who runs SurrealDB when `mode` is `"server"`. `"spawn"` starts it.
+    /// `"system"` uses `surrealdb.service` and never starts or stops it.
+    #[serde(default = "default_graph_server")]
+    pub server: String,
+    /// Absolute path of the `surreal` binary. Empty uses `PATH`, then
+    /// `/usr/local/bin/surreal`.
+    #[serde(default)]
+    pub surreal_bin: String,
     /// Shared data directory for SurrealDB server (default: /opt/pulse-null)
     pub data_dir: Option<String>,
+    /// Endpoint used by tests instead of `127.0.0.1:8787`.
+    #[cfg(test)]
+    #[serde(skip)]
+    pub test_addr: Option<String>,
     /// Inject relevant graph entities into the system prompt
     pub context_injection: bool,
     /// Maximum tokens for graph context block
@@ -1175,6 +1191,10 @@ impl Default for GraphConfig {
             auto_ingest: true,
             pipeline_sync: true,
             mode: "embedded".to_string(),
+            server: default_graph_server(),
+            surreal_bin: String::new(),
+            #[cfg(test)]
+            test_addr: None,
             data_dir: None,
             context_injection: true,
             context_max_tokens: 500,

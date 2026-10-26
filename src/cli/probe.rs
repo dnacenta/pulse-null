@@ -171,8 +171,8 @@ impl ProbeContext {
         if self.live_graph.is_none() {
             return Ok(None);
         }
-        let surreal_bin =
-            crate::surrealdb_manager::find_binary(&self.data_dir()).map_err(|e| e.to_string())?;
+        let surreal_bin = crate::surrealdb_manager::find_binary(&self.config.graph.surreal_bin)
+            .map_err(|e| e.to_string())?;
         Ok(Some(GraphSource {
             export: self.export_path(),
             surreal_bin,

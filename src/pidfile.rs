@@ -327,17 +327,6 @@ pub(crate) fn service_unit(unit: &str) -> bool {
             .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'@' | b'.' | b':' | b'-'))
 }
 
-/// Whether a process with `pid` still has a `/proc` directory.
-pub fn is_alive(pid: u32) -> bool {
-    Path::new(&format!("/proc/{pid}")).exists()
-}
-
-/// `SIGTERM` by pid. Surreal's own pidfile still uses this; `down` does not.
-pub fn kill(pid: u32) -> bool {
-    // SAFETY: sending SIGTERM to a process ID is a standard Unix operation.
-    unsafe { libc::kill(pid as i32, libc::SIGTERM) == 0 }
-}
-
 fn self_record() -> io::Result<PidRecord> {
     let live = LiveProc;
     let pid = std::process::id();

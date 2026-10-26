@@ -36,7 +36,41 @@ pub fn validate(config: &Config) -> Result<(), ConfigError> {
         ));
     }
     validate_probe(&config.probe)?;
-    validate_receipts(&config.receipts)
+    validate_receipts(&config.receipts)?;
+    validate_graph(&config.graph)
+}
+
+/// `[graph] server` is `spawn` or `system`. A set `surreal_bin` is absolute.
+fn validate_graph(graph: &super::GraphConfig) -> Result<(), ConfigError> {
+    if graph.server != "spawn" && graph.server != "system" {
+        return Err(ConfigError::Validation(format!(
+            "[graph] server must be \"spawn\" or \"system\" (got {})",
+            brief_value(&graph.server)
+        )));
+    }
+    if !graph.surreal_bin.is_empty() && !std::path::Path::new(&graph.surreal_bin).is_absolute() {
+        return Err(ConfigError::Validation(
+            "[graph] surreal_bin must be an absolute path".into(),
+        ));
+    }
+    Ok(())
+}
+
+/// A short single-line rendering of a rejected config value.
+fn brief_value(value: &str) -> String {
+    let mut flat = String::new();
+    for ch in value.chars() {
+        if flat.len() >= 32 {
+            flat.push_str("...");
+            break;
+        }
+        if ch.is_control() {
+            flat.push(' ');
+        } else {
+            flat.push(ch);
+        }
+    }
+    format!("\"{flat}\"")
 }
 
 /// `[receipts]`: `content` is `digest`, and a set path is a file path.
@@ -340,6 +374,52 @@ mod tests {
             super::validate(&receipts).is_ok(),
             "digest and a plain path"
         );
+    }
+
+    #[test]
+    fn graph_server_rejects_an_unknown_value() {
+        use super::super::test_support::minimal_config;
+        let mut config = minimal_config();
+        assert_eq!(config.graph.server, "spawn");
+        config.graph.server = "embedded".into();
+        let message = super::validate(&config).unwrap_err().to_string();
+        assert!(message.contains("[graph] server"), "{message}");
+        assert!(message.contains("spawn"), "{message}");
+        assert!(message.contains("system"), "{message}");
+        assert!(message.contains("embedded"), "{message}");
+
+        config.graph.server = "system".into();
+        assert!(super::validate(&config).is_ok());
+
+        let long = "x".repeat(80);
+        config.graph.server = format!("nope\n{long}");
+        let message = super::validate(&config).unwrap_err().to_string();
+        assert!(!message.contains('\n'), "{message}");
+        assert!(message.contains("..."), "{message}");
+        assert!(!message.contains(&long), "{message}");
+    }
+
+    #[test]
+    fn surreal_bin_rejects_a_relative_path() {
+        use super::super::test_support::minimal_config;
+        let mut config = minimal_config();
+        config.graph.surreal_bin.clear();
+        assert!(super::validate(&config).is_ok());
+        config.graph.surreal_bin = "bin/surreal".into();
+        let message = super::validate(&config).unwrap_err().to_string();
+        assert!(
+            message.contains("[graph] surreal_bin must be an absolute path"),
+            "{message}"
+        );
+        config.graph.surreal_bin = "/usr/local/bin/surreal".into();
+        assert!(super::validate(&config).is_ok());
+    }
+
+    #[test]
+    fn missing_graph_server_defaults_to_spawn() {
+        let graph: super::super::GraphConfig = toml::from_str("enabled = true\n").unwrap();
+        assert_eq!(graph.server, "spawn");
+        assert!(graph.surreal_bin.is_empty());
     }
 
     #[test]
