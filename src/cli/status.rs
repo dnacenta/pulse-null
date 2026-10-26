@@ -33,15 +33,10 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
         );
     }
 
-    // Check PID file first, then fall back to health endpoint
-    let status = match pidfile::read(&root_dir) {
-        Some(pid) if pidfile::is_alive(pid) => format!("RUNNING (pid {})", pid),
-        Some(pid) => {
-            pidfile::remove(&root_dir);
-            format!("STOPPED (stale pid {})", pid)
-        }
+    // A pidfile we can read decides the status. No file falls back to /health.
+    let status = match report(&root_dir, &pidfile::LiveProc) {
+        Some(status) => status,
         None => {
-            // No PID file — try health endpoint as fallback
             let url = format!(
                 "http://{}:{}/health",
                 config.server.host, config.server.port
@@ -58,6 +53,22 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
     print_task_liveness(&config, &root_dir);
     print_tension(&config, &root_dir);
     Ok(())
+}
+
+/// Pidfile status. `None` when there is no pidfile, so the caller can try
+/// `/health`. `RUNNING` only when the record still names its process; the
+/// file is deleted only when that process is gone.
+pub(crate) fn report(root: &std::path::Path, sys: &dyn pidfile::ProcView) -> Option<String> {
+    let recorded = pidfile::read(root)?;
+    let pid = recorded.pid();
+    Some(match pidfile::judge(&recorded, sys) {
+        pidfile::Verdict::Ours(_) => format!("RUNNING (pid {pid})"),
+        pidfile::Verdict::Gone => {
+            pidfile::delete(root);
+            format!("STOPPED (stale pid {pid})")
+        }
+        other => pidfile::refusal(pid, &other),
+    })
 }
 
 /// What the pulse is currently carrying (spec §8 Q2, answered yes).
@@ -271,4 +282,31 @@ fn global_liveness_line(
         style("alive".to_string()).green()
     };
     format!("{summary} — {verdict}")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::pidfile::ProcView;
+
+    #[test]
+    fn status_keeps_file_on_mismatch() {
+        let dir = tempfile::tempdir().unwrap();
+        let live = pidfile::LiveProc;
+        let pid = std::process::id();
+        let rec = pidfile::PidRecord {
+            v: 1,
+            pid,
+            start: 1,
+            pidns: live.pidns().unwrap(),
+            boot_id: live.boot_id().unwrap(),
+            uid: live.uid(pid).unwrap(),
+            unit: None,
+        };
+        pidfile::write_record(dir.path(), &rec).unwrap();
+        let status = report(dir.path(), &live).unwrap();
+        assert!(!status.starts_with("RUNNING"), "{status}");
+        assert!(status.contains("start time"), "{status}");
+        assert!(pidfile::path(dir.path()).is_file());
+    }
 }
