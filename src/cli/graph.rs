@@ -180,6 +180,9 @@ static SAVED_ECHO: SavedEcho = SavedEcho {
     term: std::cell::UnsafeCell::new(unsafe { std::mem::zeroed() }),
 };
 
+static PREV_INT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+static PREV_TERM: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
 fn publish_saved_termios(term: libc::termios) {
     // SAFETY: the handler does not read `term` until `ready` is stored below.
     unsafe { *SAVED_ECHO.term.get() = term };
@@ -196,12 +199,25 @@ fn restore_terminal_echo() {
 }
 
 extern "C" fn restore_echo_and_reraise(signal: libc::c_int) {
-    // POSIX lists `tcsetattr` as async-signal-safe. This handler only calls
-    // `tcsetattr`, `signal`, and `raise`, and it reads the saved termios
-    // static. It does not allocate, take a lock, log, or format.
-    // SAFETY: `term` was published before this handler was installed.
+    // POSIX lists `tcsetattr` as async-signal-safe. This handler calls
+    // `tcsetattr`, `signal`, and `raise`, and it reads the saved termios and
+    // the saved disposition. It does not allocate, take a lock, log, or format.
+    // A previous `SIG_IGN` stays ignored. Any other previous handler is not
+    // called: invoking an arbitrary function here is not async-signal-safe, so
+    // the handler falls back to `SIG_DFL` and re-raises. `EchoSignals`'s Drop
+    // restores the saved disposition when the process is still running.
+    // SAFETY: `term` and the dispositions were published before this handler
+    // was installed.
     unsafe {
         libc::tcsetattr(0, libc::TCSANOW, &*SAVED_ECHO.term.get());
+        let previous = if signal == libc::SIGINT {
+            PREV_INT.load(Ordering::Relaxed)
+        } else {
+            PREV_TERM.load(Ordering::Relaxed)
+        };
+        if previous == libc::SIG_IGN {
+            return;
+        }
         libc::signal(signal, libc::SIG_DFL);
         libc::raise(signal);
     }
@@ -229,6 +245,8 @@ impl EchoSignals {
                 libc::sigaction(libc::SIGINT, &previous_int, std::ptr::null_mut());
                 return None;
             }
+            PREV_INT.store(previous_int.sa_sigaction, Ordering::Relaxed);
+            PREV_TERM.store(previous_term.sa_sigaction, Ordering::Relaxed);
             Some(Self {
                 previous_int,
                 previous_term,
@@ -277,6 +295,9 @@ mod tests {
         let accepts = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let slot = std::sync::Arc::clone(&recorded);
         let count = std::sync::Arc::clone(&accepts);
+        let users = std::sync::Arc::new(std::sync::Mutex::new(
+            std::collections::HashSet::<String>::new(),
+        ));
         std::thread::spawn(move || {
             for stream in listener.incoming() {
                 count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
@@ -284,11 +305,84 @@ mod tests {
                 let _ = std::io::Write::write_all(&mut stream, b"MOCK\n");
                 let mut sql = String::new();
                 let _ = std::io::Read::read_to_string(&mut stream, &mut sql);
-                *slot.lock().unwrap() = sql;
-                let _ = std::io::Write::write_all(&mut stream, ack);
+                *slot.lock().unwrap() = sql.clone();
+                if ack == b"RST" {
+                    drop(stream);
+                    continue;
+                }
+                if ack == b"NO" {
+                    let _ = std::io::Write::write_all(&mut stream, b"NO");
+                    continue;
+                }
+                let reply = mock_reply(&sql, &users);
+                let _ = std::io::Write::write_all(&mut stream, reply.as_bytes());
             }
         });
         (addr, recorded, accepts)
+    }
+
+    /// A plain `DEFINE USER` for a user this listener already accepted is the
+    /// real server's "already exists" error. `OVERWRITE` replaces it.
+    fn mock_reply(
+        sql: &str,
+        users: &std::sync::Mutex<std::collections::HashSet<String>>,
+    ) -> String {
+        let Some((overwrite, name)) = defined_user(sql) else {
+            return "OK".into();
+        };
+        let mut held = users.lock().unwrap();
+        if !overwrite && held.contains(&name) {
+            return format!("ERR The user '{name}' already exists");
+        }
+        held.insert(name);
+        "OK".into()
+    }
+
+    fn defined_user(sql: &str) -> Option<(bool, String)> {
+        for line in sql.lines() {
+            let line = line.trim().trim_end_matches(';').trim();
+            let Some(rest) = line.strip_prefix("DEFINE USER ") else {
+                continue;
+            };
+            let overwrite = rest.starts_with("OVERWRITE ");
+            let rest = if overwrite {
+                rest["OVERWRITE ".len()..].trim_start()
+            } else {
+                rest
+            };
+            let name = rest.split_whitespace().next()?.to_string();
+            if name.is_empty() {
+                continue;
+            }
+            return Some((overwrite, name));
+        }
+        None
+    }
+
+    fn within<T: Send + 'static>(body: impl FnOnce() -> T + Send + 'static) -> T {
+        let handle = std::thread::spawn(body);
+        let started = std::time::Instant::now();
+        while !handle.is_finished() {
+            if started.elapsed() > std::time::Duration::from_secs(2) {
+                panic!("directory open hung");
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        match handle.join() {
+            Ok(value) => value,
+            Err(payload) => std::panic::resume_unwind(payload),
+        }
+    }
+
+    fn plant_fifo(path: &Path) {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).unwrap();
+        }
+        use std::os::unix::ffi::OsStrExt;
+        let name = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
+        // SAFETY: `name` is NUL-terminated. `mkfifo` creates a FIFO at that path.
+        let rc = unsafe { libc::mkfifo(name.as_ptr(), 0o600) };
+        assert_eq!(rc, 0, "{}", std::io::Error::last_os_error());
     }
 
     fn mode(path: &Path) -> u32 {
@@ -358,9 +452,14 @@ mod tests {
             "{recorded}"
         );
         assert!(
-            recorded.contains("DEFINE USER IF NOT EXISTS echo"),
+            recorded.contains("DEFINE USER echo ON DATABASE"),
             "{recorded}"
         );
+        assert!(
+            !recorded.contains("DEFINE USER IF NOT EXISTS"),
+            "{recorded}"
+        );
+        assert!(!recorded.contains("OVERWRITE"), "{recorded}");
         assert!(recorded.contains(&stored), "{recorded}");
         assert!(!recorded.contains(root_password), "{recorded}");
         assert!(!recorded.contains("env-secret-not-used"), "{recorded}");
@@ -591,13 +690,12 @@ mod tests {
     #[tokio::test]
     async fn rotate_replaces_the_password_and_the_sql_has_it_once() {
         let root = pulse();
-        let (addr, _) = mock_endpoint();
+        let (addr, sql, _) = mock_server(b"OK");
         let mut reader = Cursor::new("root-secret\n");
         provision_with(root.path(), "echo", &addr, &mut reader, false)
             .await
             .unwrap();
         let old = std::fs::read(root.path().join("secrets/graph-password")).unwrap();
-        let (addr, sql, _) = mock_server(b"OK");
         let mut reader = Cursor::new("root-secret\n");
         provision_with(root.path(), "echo", &addr, &mut reader, true)
             .await
@@ -608,7 +706,7 @@ mod tests {
         let password = String::from_utf8(new.clone()).unwrap();
         assert_eq!(recorded.matches(&password).count(), 1, "{recorded}");
         assert!(
-            recorded.contains("DEFINE USER echo ON DATABASE"),
+            recorded.contains("DEFINE USER OVERWRITE echo ON DATABASE"),
             "{recorded}"
         );
         assert!(
@@ -650,13 +748,12 @@ mod tests {
     #[tokio::test]
     async fn rotate_after_a_crash_reuses_the_side_file() {
         let root = pulse();
-        let (addr, _) = mock_endpoint();
+        let (addr, sql, _) = mock_server(b"OK");
         let mut reader = Cursor::new("root-secret\n");
         provision_with(root.path(), "echo", &addr, &mut reader, false)
             .await
             .unwrap();
         let old = std::fs::read(root.path().join("secrets/graph-password")).unwrap();
-        let (addr, first_sql, _) = mock_server(b"OK");
         let err = surrealdb_manager::provision_pulse_crash_after_define(
             &addr,
             "root-secret",
@@ -675,8 +772,12 @@ mod tests {
         );
         let side = std::fs::read(root.path().join("secrets/graph-password.new")).unwrap();
         let side_text = String::from_utf8(side.clone()).unwrap();
-        assert_eq!(first_sql.lock().unwrap().matches(&side_text).count(), 1);
-        let (addr, second_sql, _) = mock_server(b"OK");
+        assert!(
+            sql.lock().unwrap().contains("DEFINE USER OVERWRITE echo"),
+            "{}",
+            sql.lock().unwrap()
+        );
+        assert_eq!(sql.lock().unwrap().matches(&side_text).count(), 1);
         let mut reader = Cursor::new("other-root\n");
         provision_with(root.path(), "echo", &addr, &mut reader, true)
             .await
@@ -686,7 +787,8 @@ mod tests {
             side
         );
         assert!(!root.path().join("secrets/graph-password.new").exists());
-        assert_eq!(second_sql.lock().unwrap().matches(&side_text).count(), 1);
+        assert_eq!(sql.lock().unwrap().matches(&side_text).count(), 1);
+        assert!(sql.lock().unwrap().contains("DEFINE USER OVERWRITE echo"));
     }
 
     #[tokio::test]
@@ -792,9 +894,10 @@ mod tests {
         assert_eq!(mode(&root.path().join("secrets")), 0o700);
         let recorded = sql.lock().unwrap().clone();
         assert!(
-            recorded.contains("DEFINE USER IF NOT EXISTS echo"),
+            recorded.contains("DEFINE USER echo ON DATABASE"),
             "{recorded}"
         );
+        assert!(!recorded.contains("OVERWRITE"), "{recorded}");
         assert!(recorded.contains(&password), "{recorded}");
         assert!(!recorded.contains("stdin-root-secret"), "{recorded}");
         assert!(!files_contain(root.path(), "stdin-root-secret"));
@@ -836,5 +939,271 @@ mod tests {
         assert_eq!(mode(&root.path().join("secrets")), 0o700);
         assert_eq!(mode(&root.path().join("secrets/graph-password")), 0o600);
         assert_eq!(mode(&root.path().join("memory/.recall-echo.toml")), 0o600);
+    }
+
+    #[test]
+    fn m1_fifo_at_secrets_and_memory_is_refused_before_define() {
+        let secrets = tempfile::tempdir().unwrap();
+        std::fs::create_dir(secrets.path().join("memory")).unwrap();
+        plant_fifo(&secrets.path().join("secrets"));
+        let (addr, sql, accepts) = mock_server(b"OK");
+        let addr_secrets = addr.clone();
+        let secrets_path = secrets.path().to_path_buf();
+        let err = within(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            runtime.block_on(async {
+                let mut reader = Cursor::new("root-secret\n");
+                provision_with(&secrets_path, "echo", &addr_secrets, &mut reader, false)
+                    .await
+                    .unwrap_err()
+                    .to_string()
+            })
+        });
+        assert!(err.contains("not a directory"), "{err}");
+        assert!(!err.contains("root-secret"), "{err}");
+        assert_eq!(accepts.load(std::sync::atomic::Ordering::SeqCst), 0);
+        assert!(sql.lock().unwrap().is_empty());
+        assert!(!secrets.path().join("secrets/graph-password").exists());
+
+        let memory = tempfile::tempdir().unwrap();
+        plant_fifo(&memory.path().join("memory"));
+        let (addr, sql, accepts) = mock_server(b"OK");
+        let memory_path = memory.path().to_path_buf();
+        let err = within(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            runtime.block_on(async {
+                let mut reader = Cursor::new("root-secret\n");
+                provision_with(&memory_path, "echo", &addr, &mut reader, false)
+                    .await
+                    .unwrap_err()
+                    .to_string()
+            })
+        });
+        assert!(
+            err.contains("not a directory") || err.contains("Not a directory"),
+            "{err}"
+        );
+        assert_eq!(accepts.load(std::sync::atomic::Ordering::SeqCst), 0);
+        assert!(sql.lock().unwrap().is_empty());
+        assert!(!memory.path().join("secrets/graph-password").exists());
+    }
+
+    #[tokio::test]
+    async fn m3_lost_password_file_does_not_report_success() {
+        let root = pulse();
+        let (addr, sql, _) = mock_server(b"OK");
+        let mut reader = Cursor::new("root-secret\n");
+        provision_with(root.path(), "echo", &addr, &mut reader, false)
+            .await
+            .unwrap();
+        let toml = std::fs::read(root.path().join("memory/.recall-echo.toml")).unwrap();
+        std::fs::remove_file(root.path().join("secrets/graph-password")).unwrap();
+        let mut reader = Cursor::new("root-secret\n");
+        let err = provision_with(root.path(), "echo", &addr, &mut reader, false)
+            .await
+            .unwrap_err();
+        let err = err.to_string();
+        assert!(err.contains("already exists"), "{err}");
+        assert!(err.contains("--rotate"), "{err}");
+        assert!(err.contains("as the owner"), "{err}");
+        assert!(!err.contains("root-secret"), "{err}");
+        assert!(!root.path().join("secrets/graph-password").exists());
+        assert_eq!(
+            std::fs::read(root.path().join("memory/.recall-echo.toml")).unwrap(),
+            toml
+        );
+        let recorded = sql.lock().unwrap().clone();
+        assert!(
+            recorded.contains("DEFINE USER echo ON DATABASE"),
+            "{recorded}"
+        );
+        assert!(!recorded.contains("OVERWRITE"), "{recorded}");
+        assert!(
+            !recorded.contains("DEFINE USER IF NOT EXISTS"),
+            "{recorded}"
+        );
+    }
+
+    #[tokio::test]
+    async fn l2_world_readable_side_file_is_not_used() {
+        let root = pulse();
+        let (addr, _) = mock_endpoint();
+        let mut reader = Cursor::new("root-secret\n");
+        provision_with(root.path(), "echo", &addr, &mut reader, false)
+            .await
+            .unwrap();
+        let old = std::fs::read(root.path().join("secrets/graph-password")).unwrap();
+        let side = root.path().join("secrets/graph-password.new");
+        std::fs::write(&side, "AbcdefghijAbcdefghijAbcdefghij12").unwrap();
+        std::fs::set_permissions(&side, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let (addr, sql, accepts) = mock_server(b"OK");
+        let mut reader = Cursor::new("root-secret\n");
+        let err = provision_with(root.path(), "echo", &addr, &mut reader, true)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("chmod 600"), "{err}");
+        assert!(!err.to_string().contains("root-secret"), "{err}");
+        assert_eq!(
+            std::fs::read(root.path().join("secrets/graph-password")).unwrap(),
+            old
+        );
+        assert_eq!(
+            std::fs::read(&side).unwrap(),
+            b"AbcdefghijAbcdefghijAbcdefghij12"
+        );
+        assert_eq!(accepts.load(std::sync::atomic::Ordering::SeqCst), 0);
+        assert!(sql.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn l3_oversized_toml_is_refused_before_define() {
+        let root = pulse();
+        let path = root.path().join("memory/.recall-echo.toml");
+        let body = vec![b'#'; surrealdb_manager::TOML_CAP as usize + 1];
+        std::fs::write(&path, &body).unwrap();
+        let (addr, sql, accepts) = mock_server(b"OK");
+        let mut reader = Cursor::new("root-secret\n");
+        let err = provision_with(root.path(), "echo", &addr, &mut reader, false)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("too large"), "{err}");
+        assert!(!err.to_string().contains("root-secret"), "{err}");
+        assert!(!root.path().join("secrets/graph-password").exists());
+        assert_eq!(std::fs::read(&path).unwrap(), body);
+        assert_eq!(accepts.load(std::sync::atomic::Ordering::SeqCst), 0);
+        assert!(sql.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn l3_a_toml_larger_than_a_password_is_provisioned() {
+        let root = pulse();
+        let path = root.path().join("memory/.recall-echo.toml");
+        let prefix = "# kept\n".repeat(1500);
+        std::fs::write(&path, &prefix).unwrap();
+        assert!(prefix.len() > 8192);
+        let (addr, _) = mock_endpoint();
+        let mut reader = Cursor::new("root-secret\n");
+        provision_with(root.path(), "echo", &addr, &mut reader, false)
+            .await
+            .unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.starts_with("# kept\n"), "{text}");
+        assert!(text.contains(&format!("url = \"{addr}\"")), "{text}");
+        assert!(root.path().join("secrets/graph-password").is_file());
+    }
+
+    #[tokio::test]
+    async fn info4_a_lost_define_reply_keeps_the_side_file() {
+        let root = pulse();
+        let (addr, _) = mock_endpoint();
+        let mut reader = Cursor::new("root-secret\n");
+        provision_with(root.path(), "echo", &addr, &mut reader, false)
+            .await
+            .unwrap();
+        let old = std::fs::read(root.path().join("secrets/graph-password")).unwrap();
+        let (addr, _, accepts) = mock_server(b"RST");
+        let mut reader = Cursor::new("root-secret\n");
+        let err = provision_with(root.path(), "echo", &addr, &mut reader, true)
+            .await
+            .unwrap_err();
+        let err = err.to_string();
+        assert!(
+            err.contains("connection reset") || err.contains("--rotate"),
+            "{err}"
+        );
+        assert!(err.contains("--rotate"), "{err}");
+        assert!(!err.contains("root-secret"), "{err}");
+        assert_eq!(
+            std::fs::read(root.path().join("secrets/graph-password")).unwrap(),
+            old
+        );
+        assert!(root.path().join("secrets/graph-password.new").is_file());
+        assert!(accepts.load(std::sync::atomic::Ordering::SeqCst) >= 1);
+    }
+
+    #[tokio::test]
+    #[ignore]
+    async fn m2_real_surreal_provision_rotate_lost_file_and_signin() {
+        let Ok(bin) = std::env::var("PULSE_NULL_E2E_SURREAL") else {
+            return;
+        };
+        if bin.is_empty() {
+            return;
+        }
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        drop(listener);
+        let addr = format!("127.0.0.1:{port}");
+        let root_password = "e2e-root-secret";
+        let mut child = std::process::Command::new(&bin)
+            .arg("start")
+            .arg("--bind")
+            .arg(&addr)
+            .arg("--user")
+            .arg("root")
+            .arg("memory")
+            .env("SURREAL_PASS", root_password)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("surreal");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        while std::time::Instant::now() < deadline {
+            if tokio::net::TcpStream::connect(&addr).await.is_ok() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        let root = pulse();
+        let outcome =
+            surrealdb_manager::provision_pulse(&addr, root_password, "echo", root.path(), false)
+                .await
+                .unwrap();
+        assert_eq!(outcome, ProvisionOutcome::Created);
+        let first = std::fs::read_to_string(root.path().join("secrets/graph-password")).unwrap();
+        sign_in_database(&addr, "echo", &first).await;
+        surrealdb_manager::provision_pulse(&addr, root_password, "echo", root.path(), true)
+            .await
+            .unwrap();
+        let rotated = std::fs::read_to_string(root.path().join("secrets/graph-password")).unwrap();
+        assert_ne!(rotated, first);
+        sign_in_database(&addr, "echo", &rotated).await;
+        std::fs::remove_file(root.path().join("secrets/graph-password")).unwrap();
+        let err =
+            surrealdb_manager::provision_pulse(&addr, root_password, "echo", root.path(), false)
+                .await
+                .unwrap_err();
+        assert!(err.to_string().contains("already exists"), "{err}");
+        assert!(!err.to_string().contains(root_password), "{err}");
+        assert!(!root.path().join("secrets/graph-password").exists());
+        surrealdb_manager::provision_pulse(&addr, root_password, "echo", root.path(), true)
+            .await
+            .unwrap();
+        let recovered =
+            std::fs::read_to_string(root.path().join("secrets/graph-password")).unwrap();
+        sign_in_database(&addr, "echo", &recovered).await;
+        assert!(!files_contain(root.path(), root_password));
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+
+    async fn sign_in_database(addr: &str, name: &str, password: &str) {
+        let db = surrealdb::Surreal::new::<surrealdb::engine::remote::ws::Ws>(addr)
+            .await
+            .unwrap();
+        db.signin(surrealdb::opt::auth::Database {
+            namespace: "nullarc".into(),
+            database: name.into(),
+            username: name.into(),
+            password: password.into(),
+        })
+        .await
+        .unwrap();
     }
 }

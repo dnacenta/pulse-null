@@ -24,8 +24,10 @@ pub(crate) const NAMESPACE: &str = "nullarc";
 const PID_FILE: &str = "surrealdb/surreal.pid";
 const ROOT_PASSWORD_FILE: &str = "surrealdb/root-password";
 const PASSWORD_LEN: usize = 32;
-/// A password or recall file larger than this is refused as garbage.
+/// A password file larger than this is refused as garbage.
 const READ_CAP: u64 = 8192;
+/// `.recall-echo.toml` may hold a user-edited config. Password files stay at [`READ_CAP`].
+pub(crate) const TOML_CAP: u64 = 1024 * 1024;
 const STARTUP_TIMEOUT_SECS: u64 = 15;
 
 /// Ensure the SurrealDB server is running. If not reachable, spawn it.
@@ -271,12 +273,15 @@ pub async fn provision_pulse_crash_after_define(
 }
 
 fn provision_sql(pulse_name: &str, pulse_password: &str, rotate: bool) -> String {
+    // A plain DEFINE USER fails when the user already exists. OVERWRITE is the
+    // rotate form that replaces that password. The first provision uses the
+    // plain form so a lost file cannot be reported as a new password.
     let user = if rotate {
-        format!("DEFINE USER {pulse_name} ON DATABASE PASSWORD '{pulse_password}' ROLES OWNER;")
-    } else {
         format!(
-            "DEFINE USER IF NOT EXISTS {pulse_name} ON DATABASE PASSWORD '{pulse_password}' ROLES OWNER;"
+            "DEFINE USER OVERWRITE {pulse_name} ON DATABASE PASSWORD '{pulse_password}' ROLES OWNER;"
         )
+    } else {
+        format!("DEFINE USER {pulse_name} ON DATABASE PASSWORD '{pulse_password}' ROLES OWNER;")
     };
     format!(
         "DEFINE NAMESPACE IF NOT EXISTS {NAMESPACE};\n\
@@ -341,12 +346,19 @@ async fn try_mock(
     }
     stream.write_all(sql.as_bytes()).await?;
     stream.shutdown().await?;
-    let mut ack = [0u8; 2];
-    stream.read_exact(&mut ack).await?;
-    if &ack != b"OK" {
-        return Err("graph mock did not accept the statement".into());
+    let mut buf = Vec::new();
+    if let Err(err) = stream.read_to_end(&mut buf).await {
+        return Err(format!("connection reset: {err}").into());
     }
-    Ok(true)
+    let text = String::from_utf8_lossy(&buf);
+    let text = text.trim();
+    if text == "OK" {
+        return Ok(true);
+    }
+    if text.is_empty() {
+        return Err("connection reset before the graph reply".into());
+    }
+    Err(text.to_string().into())
 }
 
 /// Stop the SurrealDB process this daemon spawned, when it is still that
@@ -638,16 +650,24 @@ async fn provision_new(
             GraphPassword::Missing => {}
         }
     }
+    recall_preflight(pulse_dir)?;
     info!("Provisioning SurrealDB database for pulse '{pulse_name}'");
     let pulse_password = generate_password();
     let sql = provision_sql(pulse_name, &pulse_password, false);
-    apply_statements(endpoint, root_password, &sql)
-        .await
-        .map_err(|err| redact(&err.to_string(), root_password, &pulse_password))?;
+    if let Err(err) = apply_statements(endpoint, root_password, &sql).await {
+        let err = redact(&err.to_string(), root_password, &pulse_password);
+        if user_already_exists(&err) {
+            return Err(user_exists_message().into());
+        }
+        return Err(err.into());
+    }
     let dir = ensure_secrets_dir(secrets_dir)?;
-    write_secret(&dir, PASSWORD_NAME, pulse_password.as_bytes(), 0o600)
+    if let Err(err) = write_secret(&dir, PASSWORD_NAME, pulse_password.as_bytes(), 0o600) {
+        let err = redact(&err.to_string(), root_password, &pulse_password);
+        return Err(format!("{err}; {}", unsaved_password_message()).into());
+    }
+    write_recall(pulse_dir, endpoint, pulse_name)
         .map_err(|err| redact(&err.to_string(), root_password, &pulse_password))?;
-    write_recall(pulse_dir, endpoint, pulse_name)?;
     info!("Pulse '{pulse_name}' provisioned successfully");
     Ok(ProvisionOutcome::Created)
 }
@@ -661,6 +681,7 @@ async fn rotate_password(
     crash_after_define: bool,
 ) -> Result<ProvisionOutcome, BoxError> {
     let dir = ensure_secrets_dir(secrets_dir)?;
+    recall_preflight(pulse_dir)?;
     let pulse_password = match read_side_password(&dir) {
         Side::Absent => {
             let password = generate_password();
@@ -673,8 +694,12 @@ async fn rotate_password(
     };
     let sql = provision_sql(pulse_name, &pulse_password, true);
     if let Err(err) = apply_statements(endpoint, root_password, &sql).await {
+        let err = redact(&err.to_string(), root_password, &pulse_password);
+        if reply_may_have_applied(&err) {
+            return Err(format!("{err}; {}", pending_rotation_message()).into());
+        }
         remove_side_file(&dir);
-        return Err(redact(&err.to_string(), root_password, &pulse_password).into());
+        return Err(err.into());
     }
     if crash_after_define {
         return Err(
@@ -684,7 +709,10 @@ async fn rotate_password(
     }
     rename_side_into_place(&dir)
         .map_err(|err| redact(&err.to_string(), root_password, &pulse_password))?;
-    write_recall(pulse_dir, endpoint, pulse_name)?;
+    verify_installed_password(&dir, &pulse_password)
+        .map_err(|err| redact(&err.to_string(), root_password, &pulse_password))?;
+    write_recall(pulse_dir, endpoint, pulse_name)
+        .map_err(|err| redact(&err.to_string(), root_password, &pulse_password))?;
     info!("Pulse '{pulse_name}' provisioned successfully");
     Ok(ProvisionOutcome::Created)
 }
@@ -692,6 +720,46 @@ async fn rotate_password(
 pub(crate) fn pending_rotation_message() -> &'static str {
     "a rotation is pending in secrets/graph-password.new; \
      run `pulse-null graph provision --rotate` as the owner to finish it"
+}
+
+pub(crate) fn missing_password_message() -> &'static str {
+    "secrets/graph-password is missing; graph features are unavailable. \
+     Run `pulse-null graph provision` as the owner. If the database user already exists, \
+     run `pulse-null graph provision --rotate`"
+}
+
+pub(crate) fn user_exists_message() -> &'static str {
+    "the database user already exists but secrets/graph-password is missing or invalid; \
+     run `pulse-null graph provision --rotate` as the owner to set a new password"
+}
+
+fn unsaved_password_message() -> &'static str {
+    "the database now holds a password that was not saved; \
+     run `pulse-null graph provision --rotate` as the owner to set a new password"
+}
+
+fn user_already_exists(err: &str) -> bool {
+    err.to_ascii_lowercase().contains("already exists")
+}
+
+/// A dropped connection can mean the server applied the DEFINE and the reply
+/// was lost. An explicit server rejection is anything else.
+fn reply_may_have_applied(err: &str) -> bool {
+    let lower = err.to_ascii_lowercase();
+    [
+        "connection reset",
+        "reset by peer",
+        "broken pipe",
+        "timed out",
+        "timeout",
+        "unexpected eof",
+        "early eof",
+        "transport",
+        "connection aborted",
+        "connection closed",
+    ]
+    .iter()
+    .any(|marker| lower.contains(marker))
 }
 
 /// `secrets/graph-password` is absent and `secrets/graph-password.new` is present.
@@ -763,7 +831,7 @@ fn named_password(named: Named, euid: u32) -> GraphPassword {
 /// Classify an already-open password fd. Type, owner, mode, and size come from
 /// `fstat` on this fd, and the bytes come from the same fd.
 pub(crate) fn classify_password_fd(file: &File, euid: u32) -> GraphPassword {
-    named_password(named_from_fd(file.as_raw_fd()), euid)
+    named_password(named_from_fd(file.as_raw_fd(), READ_CAP), euid)
 }
 
 fn classify_password(mode: u32, uid: u32, bytes: &[u8], euid: u32) -> GraphPassword {
@@ -810,11 +878,22 @@ fn read_side_password(dir: &OwnedFd) -> Side {
         }
         Named::Other => Side::Fault("secrets/graph-password.new is not a regular file".into()),
         Named::TooLarge => Side::Fault("secrets/graph-password.new is too large".into()),
-        Named::File { bytes, .. } => match std::str::from_utf8(&bytes) {
-            Ok(text) if is_password_text(text) => Side::Ready(text.to_string()),
-            Ok(_) => Side::Fault("secrets/graph-password.new is not a graph password".into()),
-            Err(_) => Side::Fault("secrets/graph-password.new is not valid UTF-8".into()),
-        },
+        Named::File { mode, uid, bytes } => {
+            if uid != current_euid() {
+                return Side::Fault("secrets/graph-password.new is not owned by the caller".into());
+            }
+            let mode = mode & 0o777;
+            if mode & 0o077 != 0 {
+                return Side::Fault(format!(
+                    "secrets/graph-password.new has mode {mode:04o}; chmod 600 secrets/graph-password.new"
+                ));
+            }
+            match std::str::from_utf8(&bytes) {
+                Ok(text) if is_password_text(text) => Side::Ready(text.to_string()),
+                Ok(_) => Side::Fault("secrets/graph-password.new is not a graph password".into()),
+                Err(_) => Side::Fault("secrets/graph-password.new is not valid UTF-8".into()),
+            }
+        }
     }
 }
 
@@ -845,7 +924,31 @@ fn rename_side_into_place(dir: &OwnedFd) -> Result<(), BoxError> {
     if rc != 0 {
         return Err(std::io::Error::last_os_error().into());
     }
-    fsync_dir(dir)
+    fsync_dir(dir)?;
+    Ok(())
+}
+
+fn verify_installed_password(dir: &OwnedFd, password: &str) -> Result<(), BoxError> {
+    let name = CString::new(PASSWORD_NAME).expect("fixed name");
+    match read_named(dir, &name) {
+        Named::File { mode, uid, bytes }
+            if uid == current_euid()
+                && mode & 0o777 & 0o077 == 0
+                && bytes == password.as_bytes() =>
+        {
+            Ok(())
+        }
+        Named::File { .. } => Err(
+            "secrets/graph-password does not match the password that was defined; \
+             run `pulse-null graph provision --rotate` as the owner"
+                .into(),
+        ),
+        _ => Err(
+            "secrets/graph-password is not a private regular file after rotation; \
+             run `pulse-null graph provision --rotate` as the owner"
+                .into(),
+        ),
+    }
 }
 
 enum Named {
@@ -888,15 +991,19 @@ fn open_child(dir: &OwnedFd, name: &CString) -> OpenedChild {
 }
 
 fn read_named(dir: &OwnedFd, name: &CString) -> Named {
+    read_capped(dir, name, READ_CAP)
+}
+
+fn read_capped(dir: &OwnedFd, name: &CString, cap: u64) -> Named {
     match open_child(dir, name) {
         OpenedChild::Missing => Named::Missing,
         OpenedChild::Symlink => Named::Symlink,
         OpenedChild::Other => Named::Other,
-        OpenedChild::File(file) => named_from_fd(file.as_raw_fd()),
+        OpenedChild::File(file) => named_from_fd(file.as_raw_fd(), cap),
     }
 }
 
-fn named_from_fd(fd: i32) -> Named {
+fn named_from_fd(fd: i32, cap: u64) -> Named {
     let info = match fstat_fd(fd) {
         Ok(info) => info,
         Err(_) => return Named::Other,
@@ -904,7 +1011,7 @@ fn named_from_fd(fd: i32) -> Named {
     if (info.st_mode & libc::S_IFMT) != libc::S_IFREG {
         return Named::Other;
     }
-    match read_fd_capped(fd, info.st_size) {
+    match read_fd_capped(fd, info.st_size, cap) {
         Ok(bytes) => Named::File {
             mode: info.st_mode,
             uid: info.st_uid,
@@ -920,13 +1027,14 @@ enum ReadFail {
     Io,
 }
 
-fn read_fd_capped(fd: i32, size: i64) -> Result<Vec<u8>, ReadFail> {
-    if size < 0 || size as u64 > READ_CAP {
+fn read_fd_capped(fd: i32, size: i64, cap: u64) -> Result<Vec<u8>, ReadFail> {
+    if size < 0 || size as u64 > cap {
         return Err(ReadFail::TooLarge);
     }
-    let mut buf = vec![0u8; READ_CAP as usize + 1];
+    let cap_usize = cap as usize;
+    let mut buf = vec![0u8; cap_usize + 1];
     let mut got = 0usize;
-    while got <= READ_CAP as usize {
+    while got <= cap_usize {
         // SAFETY: `fd` is open and `buf` is writable for `got..`. `pread` does
         // not change the file offset and does not follow a new path.
         let n = unsafe {
@@ -948,7 +1056,7 @@ fn read_fd_capped(fd: i32, size: i64) -> Result<Vec<u8>, ReadFail> {
             break;
         }
         got += n as usize;
-        if got > READ_CAP as usize {
+        if got > cap_usize {
             return Err(ReadFail::TooLarge);
         }
     }
@@ -1046,7 +1154,7 @@ fn mkdir_private(dir: &Path) -> Result<OwnedFd, BoxError> {
             return Err(err.into());
         }
     }
-    let flags = libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC;
+    let flags = libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK;
     // SAFETY: `O_NOFOLLOW` refuses a symlink that replaced the new directory.
     let fd = unsafe { libc::openat(parent_fd.as_raw_fd(), name.as_ptr(), flags) };
     if fd < 0 {
@@ -1196,8 +1304,9 @@ fn open_nofollow_dir(dir: &Path) -> Result<OwnedFd, std::io::Error> {
         std::io::Error::new(std::io::ErrorKind::InvalidInput, "path contains a NUL byte")
     })?;
     // `O_DIRECTORY` would report a symlink as `ENOTDIR`. Without it, `O_NOFOLLOW`
-    // fails that open with `ELOOP`, and `fstat` on the fd says whether it is a directory.
-    let flags = libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC;
+    // fails that open with `ELOOP`. `O_NONBLOCK` keeps a FIFO from blocking;
+    // `fstat` then rejects anything that is not a directory.
+    let flags = libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK;
     // SAFETY: `path` is NUL-terminated. `O_NOFOLLOW` refuses a symlink.
     let fd = unsafe { libc::open(path.as_ptr(), flags) };
     if fd < 0 {
@@ -1251,6 +1360,36 @@ fn write_recall(pulse_dir: &Path, endpoint: &str, pulse_name: &str) -> Result<()
     write_recall_with(pulse_dir, endpoint, pulse_name, "secrets/graph-password")
 }
 
+/// Refuse an unusable `memory/` or `.recall-echo.toml` before any DEFINE.
+fn recall_preflight(pulse_dir: &Path) -> Result<(), BoxError> {
+    let memory = pulse_dir.join("memory");
+    ensure_memory_dir(&memory)?;
+    let dir = open_dir_nofollow(&memory)?;
+    let name = CString::new(RECALL_NAME).expect("fixed name");
+    match read_capped(&dir, &name, TOML_CAP) {
+        Named::Missing => Ok(()),
+        Named::Symlink => Err(format!(
+            "refusing a symlink at {}",
+            memory.join(RECALL_NAME).display()
+        )
+        .into()),
+        Named::TooLarge => {
+            Err(format!("{} is too large", memory.join(RECALL_NAME).display()).into())
+        }
+        Named::Other => Err(format!(
+            "{} is not a regular file",
+            memory.join(RECALL_NAME).display()
+        )
+        .into()),
+        Named::File { bytes, .. } => {
+            String::from_utf8(bytes).map_err(|_| {
+                format!("{} is not valid UTF-8", memory.join(RECALL_NAME).display())
+            })?;
+            Ok(())
+        }
+    }
+}
+
 fn write_recall_with(
     pulse_dir: &Path,
     endpoint: &str,
@@ -1261,7 +1400,7 @@ fn write_recall_with(
     ensure_memory_dir(&memory)?;
     let dir = open_dir_nofollow(&memory)?;
     let final_name = CString::new(RECALL_NAME).expect("fixed name");
-    let (existing, mode) = match read_named(&dir, &final_name) {
+    let (existing, mode) = match read_capped(&dir, &final_name, TOML_CAP) {
         Named::Missing => (String::new(), 0o600),
         Named::Symlink => {
             return Err(format!(
@@ -1760,5 +1899,56 @@ mod tests {
         };
         assert!(reason.contains("too large"), "{reason}");
         assert!(!reason.contains('Z'), "{reason}");
+    }
+
+    #[test]
+    fn m1_a_fifo_directory_does_not_block_the_predicates() {
+        let root = tempfile::tempdir().unwrap();
+        let secrets = root.path().join("secrets");
+        let name = std::ffi::CString::new(secrets.as_os_str().as_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(name.as_ptr(), 0o600) }, 0);
+        let secrets_pending = secrets.clone();
+        let pending = std::thread::spawn(move || rotation_is_pending(&secrets_pending));
+        let started = std::time::Instant::now();
+        while !pending.is_finished() {
+            assert!(
+                started.elapsed() < std::time::Duration::from_secs(2),
+                "rotation_is_pending hung"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        assert!(!pending.join().unwrap());
+        let password = secrets.join("graph-password");
+        let inspected = std::thread::spawn(move || inspect_graph_password(&password));
+        let started = std::time::Instant::now();
+        while !inspected.is_finished() {
+            assert!(
+                started.elapsed() < std::time::Duration::from_secs(2),
+                "inspect_graph_password hung"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        let GraphPassword::Fault(reason) = inspected.join().unwrap() else {
+            panic!("a fifo secrets directory was usable");
+        };
+        assert!(
+            reason.to_ascii_lowercase().contains("directory"),
+            "{reason}"
+        );
+    }
+
+    #[test]
+    fn l1_a_password_file_that_differs_from_the_defined_bytes_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("graph-password");
+        std::fs::write(&path, "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa").unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let fd = open_dir_nofollow(dir.path()).unwrap();
+        let err = verify_installed_password(&fd, "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb").unwrap_err();
+        let err = err.to_string();
+        assert!(err.contains("does not match"), "{err}");
+        assert!(!err.contains('b'), "{err}");
+        verify_installed_password(&fd, "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa").unwrap();
     }
 }

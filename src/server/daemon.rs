@@ -203,10 +203,7 @@ async fn attach_system_graph(config: &mut Config, root: &Path) -> Result<(), Box
             if crate::surrealdb_manager::rotation_is_pending(&root.join("secrets")) {
                 tracing::warn!("{}", crate::surrealdb_manager::pending_rotation_message());
             } else {
-                tracing::warn!(
-                    "secrets/graph-password is missing; graph features are unavailable. \
-                     Run `pulse-null graph provision`"
-                );
+                tracing::warn!("{}", crate::surrealdb_manager::missing_password_message());
             }
             config.graph.enabled = false;
             return Ok(());
@@ -1162,6 +1159,45 @@ mod tests {
         assert!(!log.contains("surrealdb.service"), "{log}");
         assert!(!log.contains(secret), "{log}");
         assert!(!data.path().join("bin/spawned").exists());
+        assert_password_unread(&password, secret);
+    }
+
+    #[test]
+    fn m1_system_boot_refuses_a_fifo_secrets_dir() {
+        let root = tempfile::tempdir().unwrap();
+        let data = tempfile::tempdir().unwrap();
+        plant_surreal(data.path());
+        let secret = "root-secret-unread-fifo-dir";
+        let password = lock_root_password(data.path(), secret);
+        let secrets = root.path().join("secrets");
+        use std::os::unix::ffi::OsStrExt;
+        let name = std::ffi::CString::new(secrets.as_os_str().as_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(name.as_ptr(), 0o600) }, 0);
+        let (listener, addr) = loopback_listener();
+        drop(listener);
+        let mut config = system_graph(data.path(), Some(addr));
+        let root_path = root.path().to_path_buf();
+        let data_path = data.path().to_path_buf();
+        let handle = std::thread::spawn(move || {
+            let log = warnings_of(async {
+                prepare_pulse_dir(&mut config, &root_path).await.unwrap();
+                assert!(!config.graph.enabled, "graph features stayed available");
+            });
+            (log, config.graph.enabled)
+        });
+        let started = std::time::Instant::now();
+        while !handle.is_finished() {
+            assert!(
+                started.elapsed() < std::time::Duration::from_secs(2),
+                "system boot hung on a fifo secrets directory"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        let (log, enabled) = handle.join().unwrap();
+        assert!(!enabled);
+        assert!(log.to_ascii_lowercase().contains("directory"), "{log}");
+        assert!(!log.contains(secret), "{log}");
+        assert!(!data_path.join("bin/spawned").exists());
         assert_password_unread(&password, secret);
     }
 
