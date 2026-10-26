@@ -198,13 +198,21 @@ async fn provision_graph(
 /// unreachable server or a missing pulse password leaves the pulse up with
 /// graph features off.
 async fn attach_system_graph(config: &mut Config, root: &Path) -> Result<(), BoxError> {
-    if !regular_file(&root.join("secrets/graph-password")) {
-        tracing::warn!(
-            "secrets/graph-password is missing; graph features are unavailable. \
-             Run `pulse-null graph provision`"
-        );
-        config.graph.enabled = false;
-        return Ok(());
+    match crate::surrealdb_manager::inspect_graph_password(&root.join("secrets/graph-password")) {
+        crate::surrealdb_manager::GraphPassword::Missing => {
+            tracing::warn!(
+                "secrets/graph-password is missing; graph features are unavailable. \
+                 Run `pulse-null graph provision`"
+            );
+            config.graph.enabled = false;
+            return Ok(());
+        }
+        crate::surrealdb_manager::GraphPassword::Fault(reason) => {
+            tracing::warn!("{reason}; graph features are unavailable");
+            config.graph.enabled = false;
+            return Ok(());
+        }
+        crate::surrealdb_manager::GraphPassword::Ready => {}
     }
     let addr = graph_endpoint(config);
     if !crate::surrealdb_manager::reachable(&addr).await {
@@ -223,11 +231,6 @@ async fn attach_system_graph(config: &mut Config, root: &Path) -> Result<(), Box
     }
     crate::graph_context::cache_graph_stats(root).await;
     Ok(())
-}
-
-/// A regular file, not a symlink and not a directory.
-fn regular_file(path: &Path) -> bool {
-    std::fs::symlink_metadata(path).is_ok_and(|meta| meta.file_type().is_file())
 }
 
 /// Verify this pulse's agent-CLI integration, if it runs one.
@@ -1180,6 +1183,71 @@ mod tests {
         assert!(!data.path().join("bin/spawned").exists());
     }
 
+    #[test]
+    fn system_graph_empty_password_boots_without_graph() {
+        assert_unusable_password(b"", 0o600, "empty");
+    }
+
+    #[test]
+    fn system_graph_wrong_mode_boots_without_graph() {
+        assert_unusable_password(b"pulse-secret", 0o644, "chmod 600 secrets/graph-password");
+    }
+
+    #[test]
+    fn system_graph_symlink_password_boots_without_graph() {
+        let root = tempfile::tempdir().unwrap();
+        let data = tempfile::tempdir().unwrap();
+        let elsewhere = tempfile::tempdir().unwrap();
+        std::fs::create_dir(root.path().join("secrets")).unwrap();
+        std::os::unix::fs::symlink(
+            elsewhere.path().join("secret"),
+            root.path().join("secrets/graph-password"),
+        )
+        .unwrap();
+        let (listener, addr) = loopback_listener();
+        drop(listener);
+        let mut config = system_graph(data.path(), Some(addr));
+        let root_path = root.path().to_path_buf();
+        let log = warnings_of(async {
+            prepare_pulse_dir(&mut config, &root_path).await.unwrap();
+            assert!(!config.graph.enabled, "graph features stayed available");
+        });
+        assert!(log.contains("not a regular file"), "{log}");
+        assert_eq!(
+            log.lines()
+                .filter(|line| line.contains("not a regular file"))
+                .count(),
+            1,
+            "{log}"
+        );
+        assert!(!elsewhere.path().join("secret").exists());
+    }
+
+    fn assert_unusable_password(bytes: &[u8], mode: u32, needle: &str) {
+        let root = tempfile::tempdir().unwrap();
+        let data = tempfile::tempdir().unwrap();
+        let path = root.path().join("secrets/graph-password");
+        std::fs::create_dir(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, bytes).unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode)).unwrap();
+        let (listener, addr) = loopback_listener();
+        drop(listener);
+        let mut config = system_graph(data.path(), Some(addr));
+        let root_path = root.path().to_path_buf();
+        let log = warnings_of(async {
+            prepare_pulse_dir(&mut config, &root_path).await.unwrap();
+            assert!(!config.graph.enabled, "graph features stayed available");
+        });
+        assert!(log.contains(needle), "{log}");
+        assert_eq!(
+            log.lines().filter(|line| line.contains(needle)).count(),
+            1,
+            "{log}"
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), bytes);
+    }
+
     fn system_graph(data: &Path, addr: Option<String>) -> Config {
         let mut config = offline_config();
         config.graph.enabled = true;
@@ -1208,7 +1276,9 @@ mod tests {
     fn write_graph_password(root: &Path) {
         let path = root.join("secrets/graph-password");
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-        std::fs::write(path, "pulse-secret").unwrap();
+        std::fs::write(&path, "pulse-secret").unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
     }
 
     fn lock_root_password(data: &Path, secret: &str) -> PathBuf {
