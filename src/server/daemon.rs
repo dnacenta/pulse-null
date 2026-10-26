@@ -200,10 +200,14 @@ async fn provision_graph(
 async fn attach_system_graph(config: &mut Config, root: &Path) -> Result<(), BoxError> {
     match crate::surrealdb_manager::inspect_graph_password(&root.join("secrets/graph-password")) {
         crate::surrealdb_manager::GraphPassword::Missing => {
-            tracing::warn!(
-                "secrets/graph-password is missing; graph features are unavailable. \
-                 Run `pulse-null graph provision`"
-            );
+            if crate::surrealdb_manager::rotation_is_pending(&root.join("secrets")) {
+                tracing::warn!("{}", crate::surrealdb_manager::pending_rotation_message());
+            } else {
+                tracing::warn!(
+                    "secrets/graph-password is missing; graph features are unavailable. \
+                     Run `pulse-null graph provision`"
+                );
+            }
             config.graph.enabled = false;
             return Ok(());
         }
@@ -1156,6 +1160,39 @@ mod tests {
             .collect();
         assert_eq!(hits.len(), 1, "{log}");
         assert!(!log.contains("surrealdb.service"), "{log}");
+        assert!(!log.contains(secret), "{log}");
+        assert!(!data.path().join("bin/spawned").exists());
+        assert_password_unread(&password, secret);
+    }
+
+    #[test]
+    fn system_graph_pending_rotation_logs_rotate() {
+        let root = tempfile::tempdir().unwrap();
+        let data = tempfile::tempdir().unwrap();
+        plant_surreal(data.path());
+        let secret = "root-secret-unread-pending";
+        let password = lock_root_password(data.path(), secret);
+        let side = root.path().join("secrets/graph-password.new");
+        std::fs::create_dir(side.parent().unwrap()).unwrap();
+        std::fs::write(&side, "pending-side").unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&side, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let (listener, addr) = loopback_listener();
+        drop(listener);
+        let mut config = system_graph(data.path(), Some(addr));
+        let root_path = root.path().to_path_buf();
+        let log = warnings_of(async {
+            prepare_pulse_dir(&mut config, &root_path).await.unwrap();
+            assert!(!config.graph.enabled, "graph features stayed available");
+        });
+        let hits: Vec<_> = log
+            .lines()
+            .filter(|line| line.contains("pending"))
+            .collect();
+        assert_eq!(hits.len(), 1, "{log}");
+        assert!(hits[0].contains("--rotate"), "{log}");
+        assert!(hits[0].contains("as the owner"), "{log}");
+        assert!(!log.contains("is missing"), "{log}");
         assert!(!log.contains(secret), "{log}");
         assert!(!data.path().join("bin/spawned").exists());
         assert_password_unread(&password, secret);

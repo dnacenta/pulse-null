@@ -171,8 +171,8 @@ struct SavedEcho {
     term: std::cell::UnsafeCell<libc::termios>,
 }
 
-// The signal handler reads `term` only while `ready` is true, and the setter
-// writes `term` before storing `ready`.
+// The setter writes `term` before storing `ready`. The handler is installed
+// only after that store, and it reads the saved termios static.
 unsafe impl Sync for SavedEcho {}
 
 static SAVED_ECHO: SavedEcho = SavedEcho {
@@ -196,10 +196,12 @@ fn restore_terminal_echo() {
 }
 
 extern "C" fn restore_echo_and_reraise(signal: libc::c_int) {
-    restore_terminal_echo();
-    // SAFETY: restoring the default disposition and re-raising `signal`
-    // delivers the interrupt that was held back while echo was off.
+    // POSIX lists `tcsetattr` as async-signal-safe. This handler only calls
+    // `tcsetattr`, `signal`, and `raise`, and it reads the saved termios
+    // static. It does not allocate, take a lock, log, or format.
+    // SAFETY: `term` was published before this handler was installed.
     unsafe {
+        libc::tcsetattr(0, libc::TCSANOW, &*SAVED_ECHO.term.get());
         libc::signal(signal, libc::SIG_DFL);
         libc::raise(signal);
     }
@@ -214,7 +216,7 @@ struct EchoSignals {
 impl EchoSignals {
     fn install(_echo: &EchoOff) -> Option<Self> {
         // SAFETY: both actions are zeroed sigaction values this function owns.
-        // The handler only restores termios and re-raises.
+        // The handler only calls tcsetattr, signal, and raise.
         unsafe {
             let mut action: libc::sigaction = std::mem::zeroed();
             action.sa_sigaction = restore_echo_and_reraise as *const () as usize;
@@ -516,6 +518,20 @@ mod tests {
         ] {
             assert!(surrealdb_manager::require_loopback(raw).is_ok(), "{raw}");
         }
+    }
+
+    #[test]
+    fn localhost_is_dialed_as_ipv4_loopback() {
+        assert_eq!(
+            surrealdb_manager::dial_addr("localhost:9").unwrap(),
+            "127.0.0.1:9"
+        );
+        assert_eq!(
+            surrealdb_manager::dial_addr("127.0.0.1:8787").unwrap(),
+            "127.0.0.1:8787"
+        );
+        assert_eq!(surrealdb_manager::dial_addr("[::1]:9").unwrap(), "[::1]:9");
+        assert!(surrealdb_manager::require_loopback("localhost:9").is_ok());
     }
 
     #[tokio::test]

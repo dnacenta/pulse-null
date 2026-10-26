@@ -6,10 +6,10 @@
 
 use std::ffi::CString;
 use std::fs::File;
-use std::io::{Read, Write};
+use std::io::Write;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::os::unix::ffi::OsStrExt;
-use std::os::unix::fs::{MetadataExt, PermissionsExt};
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
@@ -24,6 +24,8 @@ pub(crate) const NAMESPACE: &str = "nullarc";
 const PID_FILE: &str = "surrealdb/surreal.pid";
 const ROOT_PASSWORD_FILE: &str = "surrealdb/root-password";
 const PASSWORD_LEN: usize = 32;
+/// A password or recall file larger than this is refused as garbage.
+const READ_CAP: u64 = 8192;
 const STARTUP_TIMEOUT_SECS: u64 = 15;
 
 /// Ensure the SurrealDB server is running. If not reachable, spawn it.
@@ -177,6 +179,19 @@ pub(crate) fn require_loopback(raw: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// The address a connector must dial. `localhost` and `127.0.0.1` become
+/// `127.0.0.1:<port>`, and `[::1]` stays `[::1]:<port>`, so the system
+/// resolver cannot send the root password anywhere else.
+pub(crate) fn dial_addr(raw: &str) -> Result<String, String> {
+    require_loopback(raw)?;
+    let (host, port) = split_host_port(raw).expect("loopback endpoint has a host and port");
+    if host == "::1" {
+        Ok(format!("[::1]:{port}"))
+    } else {
+        Ok(format!("127.0.0.1:{port}"))
+    }
+}
+
 fn split_host_port(raw: &str) -> Option<(&str, &str)> {
     if let Some(rest) = raw.strip_prefix('[') {
         let (host, port) = rest.split_once("]:")?;
@@ -289,11 +304,12 @@ async fn apply_statements(
     root_password: &str,
     sql: &str,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let endpoint = dial_addr(endpoint)?;
     #[cfg(test)]
-    if try_mock(endpoint, sql).await? {
+    if try_mock(&endpoint, sql).await? {
         return Ok(());
     }
-    let db = surrealdb::Surreal::new::<surrealdb::engine::remote::ws::Ws>(endpoint).await?;
+    let db = surrealdb::Surreal::new::<surrealdb::engine::remote::ws::Ws>(&endpoint).await?;
     db.signin(surrealdb::opt::auth::Root {
         username: "root".to_string(),
         password: root_password.to_string(),
@@ -579,13 +595,20 @@ async fn provision_inner(
     if !crate::config::validate::is_plain_pulse_name(pulse_name) {
         return Err(format!("'{pulse_name}' is not a plain pulse name").into());
     }
-    require_loopback(endpoint)?;
+    let endpoint = dial_addr(endpoint)?;
     let secrets_dir = pulse_dir.join("secrets");
     if !rotate {
-        return provision_new(endpoint, root_password, pulse_name, pulse_dir, &secrets_dir).await;
+        return provision_new(
+            &endpoint,
+            root_password,
+            pulse_name,
+            pulse_dir,
+            &secrets_dir,
+        )
+        .await;
     }
     rotate_password(
-        endpoint,
+        &endpoint,
         root_password,
         pulse_name,
         pulse_dir,
@@ -602,19 +625,18 @@ async fn provision_new(
     pulse_dir: &Path,
     secrets_dir: &Path,
 ) -> Result<ProvisionOutcome, BoxError> {
-    if let Some(err) = secrets_symlink(secrets_dir) {
-        return Err(err);
-    }
-    if side_file_exists(secrets_dir) {
-        return Err(pending_rotation().into());
-    }
-    match inspect_graph_password(&secrets_dir.join(PASSWORD_NAME)) {
-        GraphPassword::Ready => {
-            info!("Pulse '{pulse_name}' already provisioned (password file exists)");
-            return Ok(ProvisionOutcome::Already);
+    if let Some(dir) = open_secrets(secrets_dir)? {
+        if child_present(&dir, PASSWORD_NEW) {
+            return Err(pending_rotation_message().into());
         }
-        GraphPassword::Fault(reason) => return Err(reason.into()),
-        GraphPassword::Missing => {}
+        match password_from_dir(&dir) {
+            GraphPassword::Ready => {
+                info!("Pulse '{pulse_name}' already provisioned (password file exists)");
+                return Ok(ProvisionOutcome::Already);
+            }
+            GraphPassword::Fault(reason) => return Err(reason.into()),
+            GraphPassword::Missing => {}
+        }
     }
     info!("Provisioning SurrealDB database for pulse '{pulse_name}'");
     let pulse_password = generate_password();
@@ -638,9 +660,6 @@ async fn rotate_password(
     secrets_dir: &Path,
     crash_after_define: bool,
 ) -> Result<ProvisionOutcome, BoxError> {
-    if let Some(err) = secrets_symlink(secrets_dir) {
-        return Err(err);
-    }
     let dir = ensure_secrets_dir(secrets_dir)?;
     let pulse_password = match read_side_password(&dir) {
         Side::Absent => {
@@ -670,21 +689,17 @@ async fn rotate_password(
     Ok(ProvisionOutcome::Created)
 }
 
-fn pending_rotation() -> String {
+pub(crate) fn pending_rotation_message() -> &'static str {
     "a rotation is pending in secrets/graph-password.new; \
-     pulse-null graph provision --rotate completes it"
-        .into()
+     run `pulse-null graph provision --rotate` as the owner to finish it"
 }
 
-fn secrets_symlink(dir: &Path) -> Option<BoxError> {
-    match std::fs::symlink_metadata(dir) {
-        Ok(meta) if meta.file_type().is_symlink() => Some("refusing a symlink at secrets/".into()),
-        _ => None,
-    }
-}
-
-fn side_file_exists(secrets: &Path) -> bool {
-    std::fs::symlink_metadata(secrets.join(PASSWORD_NEW)).is_ok()
+/// `secrets/graph-password` is absent and `secrets/graph-password.new` is present.
+pub(crate) fn rotation_is_pending(secrets_dir: &Path) -> bool {
+    let Ok(dir) = open_dir_nofollow(secrets_dir) else {
+        return false;
+    };
+    matches!(password_from_dir(&dir), GraphPassword::Missing) && child_present(&dir, PASSWORD_NEW)
 }
 
 /// A usable `secrets/graph-password`, or why the file that is there cannot be used.
@@ -710,13 +725,45 @@ pub(crate) fn inspect_graph_password_as(path: &Path, euid: u32) -> GraphPassword
     let Ok(name) = CString::new(name) else {
         return GraphPassword::Fault("secrets/graph-password is not a regular file".into());
     };
-    match read_named(&dir, &name) {
-        Named::Missing => GraphPassword::Missing,
-        Named::Symlink | Named::Other => {
+    password_at(&dir, &name, euid)
+}
+
+fn password_from_dir(dir: &OwnedFd) -> GraphPassword {
+    let Ok(name) = CString::new(PASSWORD_NAME) else {
+        return GraphPassword::Fault("secrets/graph-password is not a regular file".into());
+    };
+    password_at(dir, &name, current_euid())
+}
+
+fn password_at(dir: &OwnedFd, name: &CString, euid: u32) -> GraphPassword {
+    match open_child(dir, name) {
+        OpenedChild::Missing => GraphPassword::Missing,
+        OpenedChild::Symlink => {
+            GraphPassword::Fault("secrets/graph-password is a symlink, not a regular file".into())
+        }
+        OpenedChild::Other => {
             GraphPassword::Fault("secrets/graph-password is not a regular file".into())
         }
+        OpenedChild::File(file) => classify_password_fd(&file, euid),
+    }
+}
+
+fn named_password(named: Named, euid: u32) -> GraphPassword {
+    match named {
+        Named::Missing => GraphPassword::Missing,
+        Named::Symlink => {
+            GraphPassword::Fault("secrets/graph-password is a symlink, not a regular file".into())
+        }
+        Named::Other => GraphPassword::Fault("secrets/graph-password is not a regular file".into()),
+        Named::TooLarge => GraphPassword::Fault("secrets/graph-password is too large".into()),
         Named::File { mode, uid, bytes } => classify_password(mode, uid, &bytes, euid),
     }
+}
+
+/// Classify an already-open password fd. Type, owner, mode, and size come from
+/// `fstat` on this fd, and the bytes come from the same fd.
+pub(crate) fn classify_password_fd(file: &File, euid: u32) -> GraphPassword {
+    named_password(named_from_fd(file.as_raw_fd()), euid)
 }
 
 fn classify_password(mode: u32, uid: u32, bytes: &[u8], euid: u32) -> GraphPassword {
@@ -758,9 +805,11 @@ fn read_side_password(dir: &OwnedFd) -> Side {
     };
     match read_named(dir, &name) {
         Named::Missing => Side::Absent,
-        Named::Symlink | Named::Other => {
-            Side::Fault("secrets/graph-password.new is not a regular file".into())
+        Named::Symlink => {
+            Side::Fault("secrets/graph-password.new is a symlink, not a regular file".into())
         }
+        Named::Other => Side::Fault("secrets/graph-password.new is not a regular file".into()),
+        Named::TooLarge => Side::Fault("secrets/graph-password.new is too large".into()),
         Named::File { bytes, .. } => match std::str::from_utf8(&bytes) {
             Ok(text) if is_password_text(text) => Side::Ready(text.to_string()),
             Ok(_) => Side::Fault("secrets/graph-password.new is not a graph password".into()),
@@ -803,10 +852,121 @@ enum Named {
     Missing,
     Symlink,
     Other,
+    TooLarge,
     File { mode: u32, uid: u32, bytes: Vec<u8> },
 }
 
+fn child_present(dir: &OwnedFd, name: &str) -> bool {
+    let Ok(name) = CString::new(name) else {
+        return true;
+    };
+    !matches!(open_child(dir, &name), OpenedChild::Missing)
+}
+
+enum OpenedChild {
+    Missing,
+    Symlink,
+    Other,
+    File(File),
+}
+
+fn open_child(dir: &OwnedFd, name: &CString) -> OpenedChild {
+    let flags = libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK;
+    // SAFETY: `name` is a child of this directory fd. `O_NOFOLLOW` refuses a
+    // symlink. `O_NONBLOCK` keeps a FIFO from blocking the open.
+    let fd = unsafe { libc::openat(dir.as_raw_fd(), name.as_ptr(), flags) };
+    if fd < 0 {
+        let err = std::io::Error::last_os_error();
+        return match err.raw_os_error() {
+            Some(libc::ENOENT) => OpenedChild::Missing,
+            Some(libc::ELOOP) if nofollow_is_symlink(dir, name) => OpenedChild::Symlink,
+            _ => OpenedChild::Other,
+        };
+    }
+    // SAFETY: `openat` succeeded, so this process owns `fd`.
+    OpenedChild::File(unsafe { File::from_raw_fd(fd) })
+}
+
 fn read_named(dir: &OwnedFd, name: &CString) -> Named {
+    match open_child(dir, name) {
+        OpenedChild::Missing => Named::Missing,
+        OpenedChild::Symlink => Named::Symlink,
+        OpenedChild::Other => Named::Other,
+        OpenedChild::File(file) => named_from_fd(file.as_raw_fd()),
+    }
+}
+
+fn named_from_fd(fd: i32) -> Named {
+    let info = match fstat_fd(fd) {
+        Ok(info) => info,
+        Err(_) => return Named::Other,
+    };
+    if (info.st_mode & libc::S_IFMT) != libc::S_IFREG {
+        return Named::Other;
+    }
+    match read_fd_capped(fd, info.st_size) {
+        Ok(bytes) => Named::File {
+            mode: info.st_mode,
+            uid: info.st_uid,
+            bytes,
+        },
+        Err(ReadFail::TooLarge) => Named::TooLarge,
+        Err(ReadFail::Io) => Named::Other,
+    }
+}
+
+enum ReadFail {
+    TooLarge,
+    Io,
+}
+
+fn read_fd_capped(fd: i32, size: i64) -> Result<Vec<u8>, ReadFail> {
+    if size < 0 || size as u64 > READ_CAP {
+        return Err(ReadFail::TooLarge);
+    }
+    let mut buf = vec![0u8; READ_CAP as usize + 1];
+    let mut got = 0usize;
+    while got <= READ_CAP as usize {
+        // SAFETY: `fd` is open and `buf` is writable for `got..`. `pread` does
+        // not change the file offset and does not follow a new path.
+        let n = unsafe {
+            libc::pread(
+                fd,
+                buf[got..].as_mut_ptr().cast::<libc::c_void>(),
+                buf.len() - got,
+                got as i64,
+            )
+        };
+        if n < 0 {
+            let err = std::io::Error::last_os_error();
+            if err.kind() == std::io::ErrorKind::Interrupted {
+                continue;
+            }
+            return Err(ReadFail::Io);
+        }
+        if n == 0 {
+            break;
+        }
+        got += n as usize;
+        if got > READ_CAP as usize {
+            return Err(ReadFail::TooLarge);
+        }
+    }
+    buf.truncate(got);
+    Ok(buf)
+}
+
+fn fstat_fd(fd: i32) -> Result<libc::stat, std::io::Error> {
+    let mut info = unsafe { std::mem::zeroed::<libc::stat>() };
+    // SAFETY: `info` is a stat this function owns. `fd` is a descriptor this process owns.
+    if unsafe { libc::fstat(fd, &mut info) } != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(info)
+}
+
+/// `lstat` of one directory entry, used only to choose a message after `openat` returned `ELOOP`.
+fn nofollow_is_symlink(dir: &OwnedFd, name: &CString) -> bool {
     let mut info = unsafe { std::mem::zeroed::<libc::stat>() };
     // SAFETY: `name` is NUL-terminated. `AT_SYMLINK_NOFOLLOW` does not follow a symlink.
     let rc = unsafe {
@@ -817,37 +977,12 @@ fn read_named(dir: &OwnedFd, name: &CString) -> Named {
             libc::AT_SYMLINK_NOFOLLOW,
         )
     };
-    if rc != 0 {
-        return if std::io::Error::last_os_error().kind() == std::io::ErrorKind::NotFound {
-            Named::Missing
-        } else {
-            Named::Other
-        };
-    }
-    let kind = info.st_mode & libc::S_IFMT;
-    if kind == libc::S_IFLNK {
-        return Named::Symlink;
-    }
-    if kind != libc::S_IFREG {
-        return Named::Other;
-    }
-    let flags = libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC;
-    // SAFETY: `name` is a child of this directory fd. `O_NOFOLLOW` refuses a symlink.
-    let fd = unsafe { libc::openat(dir.as_raw_fd(), name.as_ptr(), flags) };
-    if fd < 0 {
-        return Named::Other;
-    }
-    // SAFETY: `openat` succeeded, so this process owns `fd`.
-    let mut file = unsafe { File::from_raw_fd(fd) };
-    let mut bytes = Vec::new();
-    if file.read_to_end(&mut bytes).is_err() {
-        return Named::Other;
-    }
-    Named::File {
-        mode: info.st_mode,
-        uid: info.st_uid,
-        bytes,
-    }
+    rc == 0 && (info.st_mode & libc::S_IFMT) == libc::S_IFLNK
+}
+
+/// `lstat` of a path, used only to choose a message after `open` returned `ELOOP`.
+fn path_is_symlink(path: &Path) -> bool {
+    std::fs::symlink_metadata(path).is_ok_and(|meta| meta.file_type().is_symlink())
 }
 
 fn current_euid() -> u32 {
@@ -855,20 +990,38 @@ fn current_euid() -> u32 {
     unsafe { libc::geteuid() }
 }
 
-fn ensure_secrets_dir(dir: &Path) -> Result<OwnedFd, BoxError> {
-    match std::fs::symlink_metadata(dir) {
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => mkdir_private(dir),
-        Ok(meta) if meta.file_type().is_symlink() => Err("refusing a symlink at secrets/".into()),
-        Ok(meta) if !meta.is_dir() => Err("secrets is not a directory".into()),
-        Ok(meta) if meta.uid() != current_euid() => {
-            Err("secrets is not owned by the caller".into())
+/// Open `secrets/` when it exists. Does not change its mode.
+///
+/// `Ok(None)` means the directory is absent. A symlink is refused from the
+/// `ELOOP` of this open; `lstat` only chooses that message.
+fn open_secrets(dir: &Path) -> Result<Option<OwnedFd>, BoxError> {
+    match open_nofollow_dir(dir) {
+        Ok(fd) => Ok(Some(fd)),
+        Err(err) if err.raw_os_error() == Some(libc::ENOENT) => Ok(None),
+        Err(err) if err.raw_os_error() == Some(libc::ELOOP) && path_is_symlink(dir) => {
+            Err("refusing a symlink at secrets/".into())
         }
-        Ok(_) => {
-            let fd = open_dir_nofollow(dir)?;
+        Err(err) if err.raw_os_error() == Some(libc::ENOTDIR) => {
+            Err("secrets is not a directory".into())
+        }
+        Err(err) => Err(err.into()),
+    }
+}
+
+fn ensure_secrets_dir(dir: &Path) -> Result<OwnedFd, BoxError> {
+    match open_secrets(dir)? {
+        Some(fd) => {
+            let info = fstat_fd(fd.as_raw_fd())?;
+            if (info.st_mode & libc::S_IFMT) != libc::S_IFDIR {
+                return Err("secrets is not a directory".into());
+            }
+            if info.st_uid != current_euid() {
+                return Err("secrets is not owned by the caller".into());
+            }
             fchmod_fd(fd.as_raw_fd(), 0o700)?;
             Ok(fd)
         }
-        Err(err) => Err(err.into()),
+        None => mkdir_private(dir),
     }
 }
 
@@ -893,15 +1046,27 @@ fn mkdir_private(dir: &Path) -> Result<OwnedFd, BoxError> {
             return Err(err.into());
         }
     }
-    let flags = libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC;
+    let flags = libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC;
     // SAFETY: `O_NOFOLLOW` refuses a symlink that replaced the new directory.
     let fd = unsafe { libc::openat(parent_fd.as_raw_fd(), name.as_ptr(), flags) };
     if fd < 0 {
-        return Err(std::io::Error::last_os_error().into());
+        let err = std::io::Error::last_os_error();
+        if err.raw_os_error() == Some(libc::ELOOP) && nofollow_is_symlink(&parent_fd, &name) {
+            return Err("refusing a symlink at secrets/".into());
+        }
+        return Err(err.into());
     }
-    fchmod_fd(fd, 0o700)?;
     // SAFETY: `openat` succeeded, so this process owns `fd`.
-    Ok(unsafe { OwnedFd::from_raw_fd(fd) })
+    let owned = unsafe { OwnedFd::from_raw_fd(fd) };
+    let info = fstat_fd(owned.as_raw_fd())?;
+    if (info.st_mode & libc::S_IFMT) != libc::S_IFDIR {
+        return Err("secrets is not a directory".into());
+    }
+    if info.st_uid != current_euid() {
+        return Err("secrets is not owned by the caller".into());
+    }
+    fchmod_fd(owned.as_raw_fd(), 0o700)?;
+    Ok(owned)
 }
 
 fn fchmod_fd(fd: i32, mode: u32) -> Result<(), BoxError> {
@@ -934,27 +1099,28 @@ fn write_temp(
 ) -> Result<(), BoxError> {
     let temp = CString::new(temp_name).map_err(|_| "temporary name contains a NUL byte")?;
     let dest = CString::new(dest_name).map_err(|_| "destination name contains a NUL byte")?;
-    if !unique {
-        match read_named(dir, &temp) {
-            Named::Missing => {}
-            Named::Symlink => {
+    let mut file = match open_exclusive(dir, &temp) {
+        Ok(file) => file,
+        Err(err) if !unique && err.raw_os_error() == Some(libc::ELOOP) => {
+            return Err(temp_open_error(err, dir, &temp, temp_name).into());
+        }
+        Err(err) if !unique && err.raw_os_error() == Some(libc::EEXIST) => {
+            // `O_EXCL|O_NOFOLLOW` on a symlink returns `EEXIST` on Linux.
+            // `lstat` only chooses the message; the symlink is not removed.
+            if nofollow_is_symlink(dir, &temp) {
                 return Err(format!("refusing a symlink at memory/{temp_name}").into());
             }
-            Named::File { .. } | Named::Other => unlink_child(dir, &temp),
+            unlink_child(dir, &temp);
+            match open_exclusive(dir, &temp) {
+                Ok(file) => file,
+                Err(err) if err.raw_os_error() == Some(libc::ELOOP) => {
+                    return Err(temp_open_error(err, dir, &temp, temp_name).into());
+                }
+                Err(err) => return Err(err.into()),
+            }
         }
-    }
-    let flags = libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW | libc::O_CLOEXEC;
-    // SAFETY: `dir` is an open directory. `O_EXCL|O_NOFOLLOW` refuses a symlink
-    // at the temporary name.
-    let fd = unsafe { libc::openat(dir.as_raw_fd(), temp.as_ptr(), flags, 0o600) };
-    if fd < 0 {
-        if !unique && matches!(read_named(dir, &temp), Named::Symlink) {
-            return Err(format!("refusing a symlink at memory/{temp_name}").into());
-        }
-        return Err(std::io::Error::last_os_error().into());
-    }
-    // SAFETY: `openat` succeeded, so this process owns `fd`.
-    let mut file = unsafe { File::from_raw_fd(fd) };
+        Err(err) => return Err(err.into()),
+    };
     let wrote = (|| -> std::io::Result<()> {
         // Create mode is masked by umask, so set the mode on the inode itself.
         if unsafe { libc::fchmod(file.as_raw_fd(), mode) } != 0 {
@@ -986,6 +1152,27 @@ fn write_temp(
     fsync_dir(dir)
 }
 
+fn open_exclusive(dir: &OwnedFd, name: &CString) -> Result<File, std::io::Error> {
+    let flags = libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW | libc::O_CLOEXEC;
+    // SAFETY: `dir` is an open directory. `O_EXCL|O_NOFOLLOW` refuses a symlink
+    // at the temporary name.
+    let fd = unsafe { libc::openat(dir.as_raw_fd(), name.as_ptr(), flags, 0o600) };
+    if fd < 0 {
+        Err(std::io::Error::last_os_error())
+    } else {
+        // SAFETY: `openat` succeeded, so this process owns `fd`.
+        Ok(unsafe { File::from_raw_fd(fd) })
+    }
+}
+
+fn temp_open_error(err: std::io::Error, dir: &OwnedFd, name: &CString, temp_name: &str) -> String {
+    if nofollow_is_symlink(dir, name) {
+        format!("refusing a symlink at memory/{temp_name}")
+    } else {
+        err.to_string()
+    }
+}
+
 fn unlink_child(dir: &OwnedFd, name: &CString) {
     // SAFETY: `name` is a child of this directory fd. The final component is
     // removed even when it is a symlink; the target is not followed.
@@ -1001,20 +1188,34 @@ fn fsync_dir(dir: &OwnedFd) -> Result<(), BoxError> {
 }
 
 fn open_dir_nofollow(dir: &Path) -> Result<OwnedFd, BoxError> {
-    let path = CString::new(dir.as_os_str().as_bytes()).map_err(|_| "path contains a NUL byte")?;
-    let flags = libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC;
+    open_nofollow_dir(dir).map_err(Into::into)
+}
+
+fn open_nofollow_dir(dir: &Path) -> Result<OwnedFd, std::io::Error> {
+    let path = CString::new(dir.as_os_str().as_bytes()).map_err(|_| {
+        std::io::Error::new(std::io::ErrorKind::InvalidInput, "path contains a NUL byte")
+    })?;
+    // `O_DIRECTORY` would report a symlink as `ENOTDIR`. Without it, `O_NOFOLLOW`
+    // fails that open with `ELOOP`, and `fstat` on the fd says whether it is a directory.
+    let flags = libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC;
     // SAFETY: `path` is NUL-terminated. `O_NOFOLLOW` refuses a symlink.
     let fd = unsafe { libc::open(path.as_ptr(), flags) };
     if fd < 0 {
-        return Err(std::io::Error::last_os_error().into());
+        return Err(std::io::Error::last_os_error());
     }
     // SAFETY: `open` succeeded, so this process owns `fd`.
-    Ok(unsafe { OwnedFd::from_raw_fd(fd) })
+    let owned = unsafe { OwnedFd::from_raw_fd(fd) };
+    let info = fstat_fd(owned.as_raw_fd())?;
+    if (info.st_mode & libc::S_IFMT) != libc::S_IFDIR {
+        return Err(std::io::Error::from_raw_os_error(libc::ENOTDIR));
+    }
+    Ok(owned)
 }
 
 fn ensure_memory_dir(dir: &Path) -> Result<(), BoxError> {
-    match std::fs::symlink_metadata(dir) {
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+    match open_nofollow_dir(dir) {
+        Ok(_) => Ok(()),
+        Err(err) if err.raw_os_error() == Some(libc::ENOENT) => {
             let parent = dir
                 .parent()
                 .filter(|parent| !parent.as_os_str().is_empty())
@@ -1029,11 +1230,19 @@ fn ensure_memory_dir(dir: &Path) -> Result<(), BoxError> {
                     return Err(err.into());
                 }
             }
+            let created = open_nofollow_dir(dir)?;
+            let info = fstat_fd(created.as_raw_fd())?;
+            if (info.st_mode & libc::S_IFMT) != libc::S_IFDIR {
+                return Err("memory is not a directory".into());
+            }
             Ok(())
         }
-        Ok(meta) if meta.file_type().is_symlink() => Err("refusing a symlink at memory/".into()),
-        Ok(meta) if !meta.is_dir() => Err("memory is not a directory".into()),
-        Ok(_) => Ok(()),
+        Err(err) if err.raw_os_error() == Some(libc::ELOOP) && path_is_symlink(dir) => {
+            Err("refusing a symlink at memory/".into())
+        }
+        Err(err) if err.raw_os_error() == Some(libc::ENOTDIR) => {
+            Err("memory is not a directory".into())
+        }
         Err(err) => Err(err.into()),
     }
 }
@@ -1060,6 +1269,9 @@ fn write_recall_with(
                 memory.join(RECALL_NAME).display()
             )
             .into());
+        }
+        Named::TooLarge => {
+            return Err(format!("{} is too large", memory.join(RECALL_NAME).display()).into());
         }
         Named::Other => {
             return Err(format!(
@@ -1470,5 +1682,83 @@ mod tests {
         let target = memory.join("not-written");
         std::os::unix::fs::symlink(&target, memory.join(".recall-echo.toml.tmp")).unwrap();
         target
+    }
+
+    #[test]
+    fn classify_password_fd_reports_the_open_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let euid = current_euid();
+        use std::os::unix::fs::PermissionsExt;
+
+        let regular = dir.path().join("regular");
+        std::fs::write(&regular, "pulse-secret").unwrap();
+        std::fs::set_permissions(&regular, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let regular_file = std::fs::File::open(&regular).unwrap();
+        assert!(matches!(
+            classify_password_fd(&regular_file, euid),
+            GraphPassword::Ready
+        ));
+        assert!(matches!(
+            inspect_graph_password(&regular),
+            GraphPassword::Ready
+        ));
+
+        let wide = dir.path().join("wide");
+        std::fs::write(&wide, "pulse-secret").unwrap();
+        std::fs::set_permissions(&wide, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let wide_file = std::fs::File::open(&wide).unwrap();
+        assert_fd_matches(&wide, &wide_file, euid, "0644");
+
+        let fifo = dir.path().join("fifo");
+        let c_fifo = CString::new(fifo.as_os_str().as_bytes()).unwrap();
+        // SAFETY: `c_fifo` is NUL-terminated. `O_NONBLOCK` keeps the open from waiting.
+        let created = unsafe { libc::mkfifo(c_fifo.as_ptr(), 0o600) };
+        assert_eq!(created, 0);
+        let fd = unsafe {
+            libc::open(
+                c_fifo.as_ptr(),
+                libc::O_RDONLY | libc::O_NONBLOCK | libc::O_CLOEXEC,
+            )
+        };
+        assert!(fd >= 0, "{}", std::io::Error::last_os_error());
+        let fifo_file = unsafe { File::from_raw_fd(fd) };
+        assert_fd_matches(&fifo, &fifo_file, euid, "not a regular file");
+
+        let big = dir.path().join("big");
+        std::fs::write(&big, vec![b'a'; READ_CAP as usize + 1]).unwrap();
+        std::fs::set_permissions(&big, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let big_file = std::fs::File::open(&big).unwrap();
+        assert_fd_matches(&big, &big_file, euid, "too large");
+
+        let folder = dir.path().join("folder");
+        std::fs::create_dir(&folder).unwrap();
+        let folder_file = std::fs::File::open(&folder).unwrap();
+        assert_fd_matches(&folder, &folder_file, euid, "not a regular file");
+    }
+
+    fn assert_fd_matches(path: &Path, file: &File, euid: u32, needle: &str) {
+        let from_fd = classify_password_fd(file, euid);
+        let from_path = inspect_graph_password(path);
+        match (from_fd, from_path) {
+            (GraphPassword::Fault(left), GraphPassword::Fault(right)) => {
+                assert_eq!(left, right);
+                assert!(left.contains(needle), "{left}");
+            }
+            other => panic!("{path:?} disagreed: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn an_oversized_graph_password_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("graph-password");
+        std::fs::write(&path, vec![b'Z'; READ_CAP as usize + 1]).unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let GraphPassword::Fault(reason) = inspect_graph_password(&path) else {
+            panic!("an oversized password was accepted");
+        };
+        assert!(reason.contains("too large"), "{reason}");
+        assert!(!reason.contains('Z'), "{reason}");
     }
 }
