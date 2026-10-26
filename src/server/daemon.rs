@@ -57,9 +57,10 @@ async fn boot(
     listen: crate::oneself::store::ListenEnv,
 ) -> Result<Daemon, BoxError> {
     let non_dumpable = crate::hardening::own_non_dumpable();
+    let mut config = config;
     // The provider runs from inside the pulse (PN-104).
     let provider = crate::providers::create_streaming_provider(&config, &root_dir)?;
-    prepare_pulse_dir(&config, &root_dir).await?;
+    prepare_pulse_dir(&mut config, &root_dir).await?;
     let (state, plugin_routes) = assemble_state(config, root_dir, provider, listen).await?;
     let (coordinator, app) = start_services(&state, plugin_routes).await?;
     let (listener, addr) = bind_listener(&state.config).await?;
@@ -79,13 +80,16 @@ async fn boot(
 
 /// Everything the pulse directory needs before the state is built: the
 /// infrastructure, the graph server (when this daemon owns one), and a check
-/// of the agent-CLI wiring.
-async fn prepare_pulse_dir(config: &Config, root_dir: &Path) -> Result<(), BoxError> {
+/// of the agent-CLI wiring. A system graph that cannot be used turns graph
+/// features off for the rest of this boot.
+async fn prepare_pulse_dir(config: &mut Config, root_dir: &Path) -> Result<(), BoxError> {
     warn_if_unsecured(config);
     // Ensure required directories and files exist
     super::ensure_infrastructure(root_dir);
-    if owns_graph_server(config) {
-        start_graph_server(config, root_dir).await?;
+    match graph_boot(config) {
+        GraphBoot::Off => {}
+        GraphBoot::Spawn => start_graph_server(config, root_dir).await?,
+        GraphBoot::System => attach_system_graph(config, root_dir).await?,
     }
     verify_agent_integration(config, root_dir);
     Ok(())
@@ -101,10 +105,42 @@ fn warn_if_unsecured(config: &Config) {
     }
 }
 
-/// Graph enabled in server mode: this daemon starts SurrealDB and shuts it
-/// down again.
+/// How this boot treats a graph server.
+enum GraphBoot {
+    /// Graph off, or not in server mode.
+    Off,
+    /// This daemon starts SurrealDB and stops the process it spawned.
+    Spawn,
+    /// Attach to `surrealdb.service`. Never spawn it and never stop it.
+    System,
+}
+
+fn graph_boot(config: &Config) -> GraphBoot {
+    if !config.graph.enabled || config.graph.mode != "server" {
+        return GraphBoot::Off;
+    }
+    if config.graph.server == "system" {
+        GraphBoot::System
+    } else {
+        GraphBoot::Spawn
+    }
+}
+
+/// Graph enabled in spawn mode: this daemon starts SurrealDB and shuts down
+/// the process it spawned. A system graph is not this daemon's to stop.
 fn owns_graph_server(config: &Config) -> bool {
-    config.graph.enabled && config.graph.mode == "server"
+    matches!(graph_boot(config), GraphBoot::Spawn)
+}
+
+/// `config.graph.test_addr` in tests, otherwise `127.0.0.1:8787`.
+fn graph_endpoint(config: &Config) -> String {
+    #[cfg(test)]
+    if let Some(addr) = &config.graph.test_addr {
+        return addr.clone();
+    }
+    #[cfg(not(test))]
+    let _ = config;
+    crate::surrealdb_manager::default_addr()
 }
 
 fn graph_data_dir(config: &Config) -> PathBuf {
@@ -134,13 +170,56 @@ async fn provision_graph(
     config: &Config,
     root_dir: &Path,
 ) -> Result<(), GraphError> {
-    if let Err(e) = crate::surrealdb_manager::ensure_running(data_dir).await {
+    if let Err(e) = crate::surrealdb_manager::ensure_running(
+        data_dir,
+        &config.graph.surreal_bin,
+        &graph_endpoint(config),
+    )
+    .await
+    {
         tracing::error!("SurrealDB startup failed: {e}");
         return Err(e);
     }
     crate::surrealdb_manager::provision_pulse(data_dir, &config.pulse.name, root_dir)
         .await
         .inspect_err(|e| tracing::error!("SurrealDB provisioning failed: {e}"))
+}
+
+/// Use a graph that `surrealdb.service` is already running. This never spawns
+/// SurrealDB, never stops it, and never reads the root password. An
+/// unreachable server or a missing pulse password leaves the pulse up with
+/// graph features off.
+async fn attach_system_graph(config: &mut Config, root: &Path) -> Result<(), BoxError> {
+    if !regular_file(&root.join("secrets/graph-password")) {
+        tracing::warn!(
+            "secrets/graph-password is missing; graph features are unavailable. \
+             Run `pulse-null graph provision`"
+        );
+        config.graph.enabled = false;
+        return Ok(());
+    }
+    let addr = graph_endpoint(config);
+    if !crate::surrealdb_manager::reachable(&addr).await {
+        tracing::warn!(
+            "graph server is unreachable at {addr}; start surrealdb.service. \
+             Graph features are unavailable"
+        );
+        config.graph.enabled = false;
+        return Ok(());
+    }
+    // A test listener is not SurrealDB. Skip the stats cache so boot does not
+    // open an embedded store against that address.
+    #[cfg(test)]
+    if config.graph.test_addr.is_some() {
+        return Ok(());
+    }
+    crate::graph_context::cache_graph_stats(root).await;
+    Ok(())
+}
+
+/// A regular file, not a symlink and not a directory.
+fn regular_file(path: &Path) -> bool {
+    std::fs::symlink_metadata(path).is_ok_and(|meta| meta.file_type().is_file())
 }
 
 /// Verify this pulse's agent-CLI integration, if it runs one.
@@ -884,7 +963,13 @@ mod tests {
         config.graph.mode = "server".to_string();
         assert!(!owns_graph_server(&config), "graph disabled");
         config.graph.enabled = true;
-        assert!(owns_graph_server(&config));
+        assert!(owns_graph_server(&config), "spawn is the default");
+        config.graph.server = "system".into();
+        assert!(
+            !owns_graph_server(&config),
+            "a system graph is not ours to run"
+        );
+        config.graph.server = "spawn".into();
         config.graph.mode = "embedded".to_string();
         assert!(!owns_graph_server(&config));
 
@@ -936,5 +1021,298 @@ mod tests {
 
         config.server.port = listener.local_addr().unwrap().port();
         assert!(bind_listener(&config).await.is_err());
+    }
+
+    /// A reachable system graph: the daemon boots and shuts down without
+    /// spawning SurrealDB, reading the root password, or signalling the pid
+    /// in `surreal.pid`.
+    #[test]
+    fn system_graph_never_spawns_or_stops() {
+        if !crate::process_state::isolated_test("system_graph_never_spawns_or_stops") {
+            return;
+        }
+        {
+            let _hold = crate::process_state::Hold::acquire();
+            std::env::remove_var("PULSE_NULL_RECEIPTS");
+        }
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .expect("tokio runtime");
+        runtime.block_on(async {
+            let root_dir = tempfile::tempdir().unwrap();
+            let data = tempfile::tempdir().unwrap();
+            plant_surreal(data.path());
+            let secret = "root-secret-unread-ac6";
+            let password = lock_root_password(data.path(), secret);
+            write_graph_password(root_dir.path());
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let addr = listener.local_addr().unwrap().to_string();
+            let mut sleep = Reap::spawn();
+            std::fs::write(
+                data.path().join("surrealdb/surreal.pid"),
+                sleep.id().to_string(),
+            )
+            .unwrap();
+            let config = system_graph(data.path(), Some(addr));
+            let root = root_dir.path().to_path_buf();
+            let (fire, trigger) = tokio::sync::oneshot::channel::<()>();
+            let daemon = run(
+                config,
+                root.clone(),
+                async move {
+                    let _ = trigger.await;
+                },
+                crate::oneself::store::ListenEnv::empty(),
+            );
+            let probe = async {
+                let mut booted = false;
+                for _ in 0..300 {
+                    if pidfile::read(&root).is_some() {
+                        booted = true;
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                }
+                assert!(booted, "the daemon never wrote its PID file");
+                fire.send(()).unwrap();
+            };
+            let (outcome, ()) = tokio::time::timeout(Duration::from_secs(90), async {
+                tokio::join!(daemon, probe)
+            })
+            .await
+            .expect("the daemon booted and shut down in time");
+            assert!(
+                outcome.is_ok(),
+                "{:?}",
+                outcome.err().map(|e| e.to_string())
+            );
+            assert!(
+                !data.path().join("bin/spawned").exists(),
+                "system mode spawned surreal"
+            );
+            assert!(!sleep.exited(), "shutdown signalled the pid in surreal.pid");
+            assert_password_unread(&password, secret);
+            drop(listener);
+        });
+    }
+
+    #[test]
+    fn system_graph_unreachable_boots_without_graph() {
+        let root = tempfile::tempdir().unwrap();
+        let data = tempfile::tempdir().unwrap();
+        plant_surreal(data.path());
+        let secret = "root-secret-unread-unreachable";
+        let password = lock_root_password(data.path(), secret);
+        write_graph_password(root.path());
+        let (listener, addr) = loopback_listener();
+        drop(listener);
+        let mut config = system_graph(data.path(), Some(addr.clone()));
+        let root_path = root.path().to_path_buf();
+        let log = warnings_of(async {
+            prepare_pulse_dir(&mut config, &root_path).await.unwrap();
+            assert!(!config.graph.enabled, "graph features stay available");
+        });
+        let hits: Vec<_> = log
+            .lines()
+            .filter(|line| line.contains("surrealdb.service"))
+            .collect();
+        assert_eq!(hits.len(), 1, "{log}");
+        assert!(hits[0].contains(&addr), "{log}");
+        assert!(!log.contains(secret), "{log}");
+        assert!(!data.path().join("bin/spawned").exists());
+        assert_password_unread(&password, secret);
+    }
+
+    #[test]
+    fn system_graph_unprovisioned_logs_provision_command() {
+        let root = tempfile::tempdir().unwrap();
+        let data = tempfile::tempdir().unwrap();
+        plant_surreal(data.path());
+        let secret = "root-secret-unread-unprovisioned";
+        let password = lock_root_password(data.path(), secret);
+        let (listener, addr) = loopback_listener();
+        drop(listener);
+        let mut config = system_graph(data.path(), Some(addr));
+        let root_path = root.path().to_path_buf();
+        let log = warnings_of(async {
+            prepare_pulse_dir(&mut config, &root_path).await.unwrap();
+            assert!(!config.graph.enabled, "graph features stay available");
+        });
+        let hits: Vec<_> = log
+            .lines()
+            .filter(|line| line.contains("pulse-null graph provision"))
+            .collect();
+        assert_eq!(hits.len(), 1, "{log}");
+        assert!(!log.contains("surrealdb.service"), "{log}");
+        assert!(!log.contains(secret), "{log}");
+        assert!(!data.path().join("bin/spawned").exists());
+        assert_password_unread(&password, secret);
+    }
+
+    #[test]
+    fn system_mode_never_spawns_when_a_binary_is_present() {
+        let root = tempfile::tempdir().unwrap();
+        let data = tempfile::tempdir().unwrap();
+        plant_surreal(data.path());
+        write_graph_password(root.path());
+        let (listener, addr) = loopback_listener();
+        let mut config = system_graph(data.path(), Some(addr));
+        let root_path = root.path().to_path_buf();
+        let log = warnings_of(async {
+            prepare_pulse_dir(&mut config, &root_path).await.unwrap();
+            assert!(
+                config.graph.enabled,
+                "a reachable provisioned graph stays on"
+            );
+        });
+        drop(listener);
+        assert!(!log.contains("surrealdb.service"), "{log}");
+        assert!(!log.contains("pulse-null graph provision"), "{log}");
+        assert!(!data.path().join("bin/spawned").exists());
+    }
+
+    fn system_graph(data: &Path, addr: Option<String>) -> Config {
+        let mut config = offline_config();
+        config.graph.enabled = true;
+        config.graph.mode = "server".into();
+        config.graph.server = "system".into();
+        config.graph.data_dir = Some(data.display().to_string());
+        config.graph.surreal_bin = data.join("bin/surreal").display().to_string();
+        config.graph.test_addr = addr;
+        config.receipts.enabled = false;
+        config
+    }
+
+    fn plant_surreal(dir: &Path) -> PathBuf {
+        let bin = dir.join("bin/surreal");
+        std::fs::create_dir_all(bin.parent().unwrap()).unwrap();
+        std::fs::write(
+            &bin,
+            "#!/bin/sh\necho spawned >> \"$(dirname \"$0\")/spawned\"\n",
+        )
+        .unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+        bin
+    }
+
+    fn write_graph_password(root: &Path) {
+        let path = root.join("secrets/graph-password");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, "pulse-secret").unwrap();
+    }
+
+    fn lock_root_password(data: &Path, secret: &str) -> PathBuf {
+        let path = data.join("surrealdb/root-password");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, secret).unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o000)).unwrap();
+        path
+    }
+
+    fn assert_password_unread(path: &Path, secret: &str) {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o000, "root-password mode changed");
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        assert_eq!(std::fs::read_to_string(path).unwrap(), secret);
+    }
+
+    fn loopback_listener() -> (std::net::TcpListener, String) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        (listener, addr)
+    }
+
+    /// A `/bin/sleep` this test spawned. Drop kills it only while it is still
+    /// the unreaped child, so a pid reused after reap is not signalled.
+    struct Reap {
+        child: std::process::Child,
+        reaped: bool,
+    }
+
+    impl Reap {
+        fn spawn() -> Self {
+            let child = crate::process_state::during_fork(|| {
+                std::process::Command::new("/bin/sleep")
+                    .arg("120")
+                    .stdin(std::process::Stdio::null())
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null())
+                    .spawn()
+                    .expect("sleep")
+            });
+            Self {
+                child,
+                reaped: false,
+            }
+        }
+
+        fn id(&self) -> u32 {
+            self.child.id()
+        }
+
+        fn exited(&mut self) -> bool {
+            if self.reaped {
+                return true;
+            }
+            match self.child.try_wait() {
+                Ok(Some(_)) => {
+                    self.reaped = true;
+                    true
+                }
+                Ok(None) => false,
+                Err(_) => false,
+            }
+        }
+    }
+
+    impl Drop for Reap {
+        fn drop(&mut self) {
+            if self.reaped {
+                return;
+            }
+            if matches!(self.child.try_wait(), Ok(Some(_))) {
+                return;
+            }
+            let _ = self.child.kill();
+            let _ = self.child.wait();
+        }
+    }
+
+    fn warnings_of(fut: impl Future<Output = ()>) -> String {
+        let buf = Arc::new(std::sync::Mutex::new(Vec::<u8>::new()));
+        let sink = Arc::clone(&buf);
+        let subscriber = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::WARN)
+            .with_ansi(false)
+            .without_time()
+            .with_target(false)
+            .with_writer(move || LogSink(Arc::clone(&sink)))
+            .finish();
+        tracing::subscriber::with_default(subscriber, || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            runtime.block_on(fut);
+        });
+        let guard = buf.lock().unwrap();
+        String::from_utf8(guard.clone()).unwrap()
+    }
+
+    struct LogSink(Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for LogSink {
+        fn write(&mut self, data: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(data);
+            Ok(data.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
     }
 }

@@ -1,10 +1,13 @@
 //! SurrealDB server process manager.
 //!
-//! Manages the SurrealDB server lifecycle: startup, health check, pulse
-//! provisioning, and graceful shutdown. The first pulse to boot spawns the
-//! server; the last to shut down stops it.
+//! `spawn` mode starts a server when its endpoint is down and stops only the
+//! process this daemon itself spawned. `system` mode never reaches that spawn
+//! or this shutdown: the daemon attaches to `surrealdb.service`.
 
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
+
+use crate::pidfile::ProcView;
 
 use tokio::io::AsyncBufReadExt;
 use tracing::{error, info, warn};
@@ -20,45 +23,36 @@ const STARTUP_TIMEOUT_SECS: u64 = 15;
 /// Ensure the SurrealDB server is running. If not reachable, spawn it.
 ///
 /// `data_dir` is the shared directory (e.g., `/opt/pulse-null/`).
+/// `surreal_bin` is an absolute path, or empty to search `PATH` and then
+/// `/usr/local/bin`. The root password is the child's `SURREAL_PASS` and is
+/// not an argument.
 pub async fn ensure_running(
     data_dir: &Path,
+    surreal_bin: &str,
+    addr: &str,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let url = format!("{SURREAL_BIND}:{SURREAL_PORT}");
-
-    // Check if already reachable
-    if is_reachable(&url).await {
-        info!("SurrealDB server already running on {url}");
+    if reachable(addr).await {
+        info!("SurrealDB server already running on {addr}");
         return Ok(());
     }
 
-    // Find the surreal binary
-    let surreal_bin = find_binary(data_dir)?;
+    let surreal_bin = find_binary(surreal_bin)?;
 
-    // Ensure data directories exist
     let db_data_dir = data_dir.join("surrealdb/data");
     std::fs::create_dir_all(&db_data_dir)?;
     std::fs::create_dir_all(data_dir.join("surrealdb"))?;
 
-    // Generate root password if first boot
     let root_password = ensure_root_password(data_dir)?;
-
-    // Spawn the server process (detached via setsid)
     let data_path = format!("surrealkv:{}", db_data_dir.display());
-    info!("Starting SurrealDB server on {url}");
+    info!("Starting SurrealDB server on {addr}");
 
-    let mut cmd = tokio::process::Command::new(&surreal_bin);
-    cmd.arg("start")
-        .arg("--bind")
-        .arg(&url)
-        .arg("--user")
-        .arg("root")
-        .arg("--pass")
-        .arg(&root_password)
-        .arg(&data_path)
-        .stdout(std::process::Stdio::piped())
+    let mut cmd = surreal_command(&surreal_bin, addr, &data_path, &root_password);
+    cmd.stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped());
 
-    // Detach the process so it survives if this pulse shuts down
+    // Detach the process so it survives if this pulse shuts down.
+    // SAFETY: `setsid` runs in the forked child, before exec, so the server
+    // is not in this process's session.
     unsafe {
         cmd.pre_exec(|| {
             libc::setsid();
@@ -74,8 +68,12 @@ pub async fn ensure_running(
     })?;
 
     let pid = child.id().ok_or("failed to get SurrealDB PID")?;
+    if let Err(err) = remember_pid(pid) {
+        child.start_kill().ok();
+        let _ = child.wait().await;
+        return Err(err);
+    }
 
-    // Write PID file
     let pid_path = data_dir.join(PID_FILE);
     std::fs::write(&pid_path, pid.to_string())?;
     info!("SurrealDB spawned with PID {pid}");
@@ -105,13 +103,13 @@ pub async fn ensure_running(
     loop {
         if tokio::time::Instant::now() > deadline {
             return Err(format!(
-                "SurrealDB did not become reachable within {STARTUP_TIMEOUT_SECS}s on {url}"
+                "SurrealDB did not become reachable within {STARTUP_TIMEOUT_SECS}s on {addr}"
             )
             .into());
         }
         tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
-        if is_reachable(&url).await {
-            info!("SurrealDB server ready on {url}");
+        if reachable(addr).await {
+            info!("SurrealDB server ready on {addr}");
             return Ok(());
         }
     }
@@ -186,58 +184,137 @@ pub async fn provision_pulse(
     Ok(())
 }
 
-/// Shut down the SurrealDB server if this process owns it.
+/// Stop the SurrealDB process this daemon spawned, when it is still that
+/// process. A pid read from `surreal.pid` is never signalled. Nothing is
+/// signalled when this process did not spawn a server.
 pub async fn shutdown_if_owner(
     data_dir: &Path,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let pid_path = data_dir.join(PID_FILE);
-
-    let pid = match std::fs::read_to_string(&pid_path) {
-        Ok(s) => match s.trim().parse::<u32>() {
-            Ok(p) => p,
-            Err(_) => return Ok(()),
-        },
-        Err(_) => return Ok(()),
-    };
-
-    // Check if the process is still alive
-    if !crate::pidfile::is_alive(pid) {
-        warn!("SurrealDB PID {pid} is not running, cleaning up PID file");
-        let _ = std::fs::remove_file(&pid_path);
+    let Some(owned) = take_owned() else {
         return Ok(());
-    }
-
-    // Send SIGTERM
-    info!("Sending SIGTERM to SurrealDB server (PID {pid})");
-    crate::pidfile::kill(pid);
-
-    // Wait for clean exit
-    for _ in 0..20 {
-        tokio::time::sleep(tokio::time::Duration::from_millis(250)).await;
-        if !crate::pidfile::is_alive(pid) {
-            info!("SurrealDB server stopped cleanly");
-            let _ = std::fs::remove_file(&pid_path);
-            return Ok(());
+    };
+    let live = crate::pidfile::LiveProc;
+    match live.start_time(owned.pid) {
+        Ok(start) if start == owned.start => {
+            info!("Sending SIGTERM to SurrealDB server (PID {})", owned.pid);
+            if let Err(err) = crate::pidfile::terminate(&owned.fd) {
+                warn!("SurrealDB shutdown signal: {err}");
+                return Ok(());
+            }
+            let pid = owned.pid;
+            let fd = owned.fd;
+            match tokio::task::spawn_blocking(move || {
+                crate::pidfile::wait_exit(&fd, std::time::Duration::from_secs(5))
+            })
+            .await
+            {
+                Ok(Ok(true)) => info!("SurrealDB server stopped cleanly"),
+                Ok(Ok(false)) => warn!("SurrealDB server did not stop within 5s"),
+                Ok(Err(err)) => warn!("SurrealDB shutdown wait: {err}"),
+                Err(err) => warn!("SurrealDB shutdown wait: {err}"),
+            }
+            remove_pidfile_if_ours(data_dir, pid);
+        }
+        Ok(_) => {
+            warn!(
+                "SurrealDB PID {} start time changed; not signalling",
+                owned.pid
+            );
+        }
+        Err(err) => {
+            warn!("SurrealDB PID {} is not running ({err})", owned.pid);
+            remove_pidfile_if_ours(data_dir, owned.pid);
         }
     }
-
-    warn!("SurrealDB server did not stop within 5s");
-    let _ = std::fs::remove_file(&pid_path);
     Ok(())
 }
 
 // ── Internal helpers ────────────────────────────────────────────────────
 
-async fn is_reachable(addr: &str) -> bool {
+/// The SurrealDB process this daemon spawned. The pid file is not consulted
+/// when deciding what to signal.
+struct OwnedServer {
+    pid: u32,
+    start: u64,
+    fd: crate::pidfile::Pidfd,
+}
+
+static OWNED: Mutex<Option<OwnedServer>> = Mutex::new(None);
+
+fn lock_owned() -> std::sync::MutexGuard<'static, Option<OwnedServer>> {
+    OWNED
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+fn remember(server: OwnedServer) {
+    let mut slot = lock_owned();
+    if slot.is_some() {
+        warn!("replacing a SurrealDB server this process already spawned");
+    }
+    *slot = Some(server);
+}
+
+fn take_owned() -> Option<OwnedServer> {
+    lock_owned().take()
+}
+
+fn remember_pid(pid: u32) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let live = crate::pidfile::LiveProc;
+    let start = live.start_time(pid)?;
+    let fd = live.open_pidfd(pid)?;
+    remember(OwnedServer { pid, start, fd });
+    Ok(())
+}
+
+fn remove_pidfile_if_ours(data_dir: &Path, pid: u32) {
+    let pid_path = data_dir.join(PID_FILE);
+    if std::fs::read_to_string(&pid_path).is_ok_and(|text| text.trim() == pid.to_string()) {
+        let _ = std::fs::remove_file(&pid_path);
+    }
+}
+
+/// `127.0.0.1:8787`, the endpoint production uses.
+pub(crate) fn default_addr() -> String {
+    format!("{SURREAL_BIND}:{SURREAL_PORT}")
+}
+
+pub(crate) async fn reachable(addr: &str) -> bool {
     tokio::net::TcpStream::connect(addr).await.is_ok()
 }
 
+/// `surreal start` with the root password in the child environment only.
+pub(crate) fn surreal_command(
+    bin: &Path,
+    addr: &str,
+    data_path: &str,
+    password: &str,
+) -> tokio::process::Command {
+    let mut cmd = tokio::process::Command::new(bin);
+    cmd.arg("start")
+        .arg("--bind")
+        .arg(addr)
+        .arg("--user")
+        .arg("root")
+        .arg(data_path)
+        .env("SURREAL_PASS", password);
+    cmd
+}
+
+/// The `surreal` binary: `surreal_bin` when set, otherwise `PATH`, then
+/// `/usr/local/bin/surreal`. A binary under the data directory is never used.
 pub(crate) fn find_binary(
-    data_dir: &Path,
+    surreal_bin: &str,
 ) -> Result<PathBuf, Box<dyn std::error::Error + Send + Sync>> {
-    let local = data_dir.join("bin/surreal");
-    if local.exists() {
-        return Ok(local);
+    if !surreal_bin.is_empty() {
+        let path = PathBuf::from(surreal_bin);
+        if !path.is_absolute() {
+            return Err("[graph] surreal_bin must be an absolute path".into());
+        }
+        if !path.is_file() {
+            return Err(format!("SurrealDB binary not found at {}", path.display()).into());
+        }
+        return Ok(path);
     }
 
     if let Ok(path) = which::which("surreal") {
@@ -245,11 +322,14 @@ pub(crate) fn find_binary(
     }
 
     let common = PathBuf::from("/usr/local/bin/surreal");
-    if common.exists() {
+    if common.is_file() {
         return Ok(common);
     }
 
-    Err("SurrealDB binary not found. Install it or place it at {data_dir}/bin/surreal".into())
+    Err(
+        "SurrealDB binary not found. Install it or set [graph] surreal_bin to an absolute path"
+            .into(),
+    )
 }
 
 fn ensure_root_password(
@@ -365,15 +445,153 @@ password_file = "{password_file}"
 mod tests {
     use super::*;
 
+    /// `<data_dir>/bin/surreal` is never the binary spawn mode runs.
     #[test]
-    fn the_data_dirs_own_binary_comes_first() {
+    fn spawn_ignores_data_dir_binary() {
         let data_dir = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(data_dir.path().join("bin")).unwrap();
-        std::fs::write(data_dir.path().join("bin/surreal"), "").unwrap();
-        assert_eq!(
-            find_binary(data_dir.path()).unwrap(),
-            data_dir.path().join("bin/surreal")
+        let planted = data_dir.path().join("bin/surreal");
+        std::fs::write(&planted, "").unwrap();
+        match find_binary("") {
+            Ok(found) => assert_ne!(found, planted),
+            Err(err) => {
+                assert!(
+                    err.to_string().starts_with("SurrealDB binary not found"),
+                    "{err}"
+                );
+            }
+        }
+
+        let chosen = data_dir.path().join("chosen-surreal");
+        std::fs::write(&chosen, "").unwrap();
+        let found = find_binary(chosen.to_str().unwrap()).unwrap();
+        assert_eq!(found, chosen);
+        assert_ne!(found, planted);
+    }
+
+    /// The spawned command has no `--pass` and takes the password from its
+    /// own environment. The parent process does not gain that variable.
+    #[test]
+    fn spawn_keeps_root_password_off_argv() {
+        let password = "root-secret-not-for-argv";
+        let cmd = surreal_command(
+            Path::new("/usr/bin/surreal"),
+            "127.0.0.1:9",
+            "surrealkv:/tmp/db",
+            password,
         );
+        let args: Vec<String> = cmd
+            .as_std()
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect();
+        assert!(!args
+            .iter()
+            .any(|arg| arg == "--pass" || arg.contains(password)));
+        assert!(cmd
+            .as_std()
+            .get_envs()
+            .any(|(key, value)| { key == "SURREAL_PASS" && value.is_some_and(|v| v == password) }));
+        assert_ne!(
+            std::env::var("SURREAL_PASS").ok().as_deref(),
+            Some(password)
+        );
+    }
+
+    /// A pid written into `surreal.pid` is left alone. Only the child this
+    /// process recorded is signalled, and only when one was recorded.
+    #[test]
+    fn shutdown_signals_only_its_own_child() {
+        if !crate::process_state::isolated_test("shutdown_signals_only_its_own_child") {
+            return;
+        }
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let data = tempfile::tempdir().unwrap();
+            std::fs::create_dir_all(data.path().join("surrealdb")).unwrap();
+            let mut ours = Reap::spawn();
+            let mut other = Reap::spawn();
+            let our_pid = ours.id();
+            let other_pid = other.id();
+            remember_pid(our_pid).unwrap();
+            write_pid(data.path(), other_pid);
+
+            shutdown_if_owner(data.path()).await.unwrap();
+            assert!(ours.exited(), "the spawned child was not signalled");
+            assert!(!other.exited(), "the pid in surreal.pid was signalled");
+
+            let mut lone = Reap::spawn();
+            let lone_pid = lone.id();
+            write_pid(data.path(), lone_pid);
+            shutdown_if_owner(data.path()).await.unwrap();
+            assert!(
+                !lone.exited(),
+                "a pid file with nothing spawned was signalled"
+            );
+        });
+    }
+
+    fn write_pid(data_dir: &Path, pid: u32) {
+        std::fs::write(data_dir.join(PID_FILE), pid.to_string()).unwrap();
+    }
+
+    /// A `/bin/sleep` this test spawned. Drop kills it only while it is still
+    /// the unreaped child, so a pid reused after reap is not signalled.
+    struct Reap {
+        child: std::process::Child,
+        reaped: bool,
+    }
+
+    impl Reap {
+        fn spawn() -> Self {
+            let child = crate::process_state::during_fork(|| {
+                std::process::Command::new("/bin/sleep")
+                    .arg("120")
+                    .stdin(std::process::Stdio::null())
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null())
+                    .spawn()
+                    .expect("sleep")
+            });
+            Self {
+                child,
+                reaped: false,
+            }
+        }
+
+        fn id(&self) -> u32 {
+            self.child.id()
+        }
+
+        fn exited(&mut self) -> bool {
+            if self.reaped {
+                return true;
+            }
+            match self.child.try_wait() {
+                Ok(Some(_)) => {
+                    self.reaped = true;
+                    true
+                }
+                Ok(None) => false,
+                Err(_) => false,
+            }
+        }
+    }
+
+    impl Drop for Reap {
+        fn drop(&mut self) {
+            if self.reaped {
+                return;
+            }
+            if matches!(self.child.try_wait(), Ok(Some(_))) {
+                return;
+            }
+            let _ = self.child.kill();
+            let _ = self.child.wait();
+        }
     }
 
     /// Each alphabet symbol is hit the same number of times, and the
@@ -396,18 +614,23 @@ mod tests {
         assert!(password.chars().all(|c| c.is_ascii_alphanumeric()));
     }
 
-    /// Without one in the data dir: the one on `PATH`, else
-    /// `/usr/local/bin/surreal`, else an error that says where to put it.
+    /// With no configured path: the one on `PATH`, else `/usr/local/bin/surreal`,
+    /// else an error that says to set `[graph] surreal_bin`.
     #[test]
     fn without_its_own_binary_the_installed_one_is_found_or_refused() {
         let data_dir = tempfile::tempdir().unwrap();
-        match find_binary(data_dir.path()) {
+        std::fs::create_dir_all(data_dir.path().join("bin")).unwrap();
+        std::fs::write(data_dir.path().join("bin/surreal"), "").unwrap();
+        match find_binary("") {
             Ok(found) => {
-                assert!(found.exists(), "{}", found.display());
-                assert!(!found.starts_with(data_dir.path()));
+                assert!(found.is_file(), "{}", found.display());
+                assert_ne!(found, data_dir.path().join("bin/surreal"));
                 assert_eq!(found.file_name().unwrap(), "surreal");
             }
-            Err(e) => assert!(e.to_string().starts_with("SurrealDB binary not found")),
+            Err(err) => assert!(
+                err.to_string().starts_with("SurrealDB binary not found"),
+                "{err}"
+            ),
         }
     }
 }
