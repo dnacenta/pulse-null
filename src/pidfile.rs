@@ -4,8 +4,9 @@
 //! namespace, the boot id, the real uid, and the systemd unit when this
 //! process was started as a service. `down` signals only a record that still
 //! names that same process, and only through a pidfd opened before the
-//! check. An older file that is just the pid is [`Recorded::Legacy`] and is
-//! never signalled.
+//! check, and only when the caller's effective uid is the uid in the record.
+//! Root stops a pulse with `sudo -u <that user> pulse-null down`. An older
+//! file that is just the pid is [`Recorded::Legacy`] and is never signalled.
 
 use std::ffi::{CStr, CString};
 use std::fs::{self, File};
@@ -35,7 +36,8 @@ pub struct PidRecord {
     pub boot_id: String,
     /// Real uid, the first number on the `Uid:` line of `/proc/<pid>/status`.
     pub uid: u32,
-    /// Set only when `INVOCATION_ID` is present and the cgroup names a service.
+    /// Set only when `INVOCATION_ID` is present and the cgroup names a service
+    /// accepted by [`service_unit`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub unit: Option<String>,
 }
@@ -183,6 +185,8 @@ pub(crate) fn delete(root_dir: &Path) {
 /// the pid namespace. Only then open a pidfd, and only then re-read the
 /// start time and real uid. The re-read is of the process the pidfd names;
 /// a start time that no longer matches is a reused pid and is not signalled.
+/// This live uid is the process's own. `down` also requires it to be the
+/// caller's effective uid before it will terminate anything.
 pub fn verify(rec: &PidRecord, sys: &dyn ProcView) -> Verdict {
     if rec.v != 1 {
         return Verdict::Unverifiable(format!("pidfile version {}", rec.v));
@@ -293,13 +297,34 @@ pub(crate) fn wait_exit(fd: &Pidfd, timeout: Duration) -> io::Result<bool> {
 }
 
 /// The service name at the end of a cgroup line, when `invocation_id` is set.
+/// A name that is not a [`service_unit`] is dropped here, when the cgroup
+/// line is read, so it is never written into the pidfile.
 fn unit_from_cgroup(cgroup: &str, invocation_id: bool) -> Option<String> {
     if !invocation_id {
         return None;
     }
     let path = cgroup.rsplit(':').next()?;
     let name = path.rsplit('/').next()?;
-    name.ends_with(".service").then(|| name.to_string())
+    service_unit(name).then(|| name.to_string())
+}
+
+/// A systemd unit safe to print in a `systemctl stop` hint.
+///
+/// One to 256 characters, no leading `-`, and only `A-Za-z0-9_@.:-` before
+/// a `.service` suffix. Anything else can be a forged string with shell
+/// metacharacters.
+pub(crate) fn service_unit(unit: &str) -> bool {
+    let bytes = unit.as_bytes();
+    if bytes.is_empty() || bytes.len() > 256 || bytes[0] == b'-' {
+        return false;
+    }
+    let Some(name) = unit.strip_suffix(".service") else {
+        return false;
+    };
+    !name.is_empty()
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'@' | b'.' | b':' | b'-'))
 }
 
 /// Whether a process with `pid` still has a `/proc` directory.
@@ -521,9 +546,16 @@ mod tests {
             start: 100,
             pidns: 7,
             boot_id: "boot-a".into(),
-            uid: 1000,
+            // The caller's uid, so a `down` test that uses this record is
+            // allowed to look at it. The live-process check is separate.
+            uid: euid(),
             unit: None,
         }
+    }
+
+    fn euid() -> u32 {
+        // SAFETY: geteuid has no preconditions and cannot fail.
+        unsafe { libc::geteuid() }
     }
 
     struct Script {
@@ -702,6 +734,21 @@ mod tests {
             unit_from_cgroup("0::/user.slice/session-1.scope", true),
             None
         );
+        assert_eq!(
+            unit_from_cgroup(
+                "0::/system.slice/pulse-null@x.service; touch /tmp/PWNED",
+                true
+            ),
+            None
+        );
+        assert_eq!(
+            unit_from_cgroup("0::/system.slice/-evil.service", true),
+            None
+        );
+        let long = format!("0::/system.slice/{}.service", "a".repeat(250));
+        assert_eq!(unit_from_cgroup(&long, true), None);
+        assert!(service_unit("pulse-null@echo.service"));
+        assert!(!service_unit("-pulse.service"));
     }
 
     #[test]
