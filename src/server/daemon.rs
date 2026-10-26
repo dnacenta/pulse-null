@@ -180,9 +180,17 @@ async fn provision_graph(
         tracing::error!("SurrealDB startup failed: {e}");
         return Err(e);
     }
-    crate::surrealdb_manager::provision_pulse(data_dir, &config.pulse.name, root_dir)
-        .await
-        .inspect_err(|e| tracing::error!("SurrealDB provisioning failed: {e}"))
+    let root_password = crate::surrealdb_manager::read_root_password(data_dir)?;
+    crate::surrealdb_manager::provision_pulse(
+        &graph_endpoint(config),
+        &root_password,
+        &config.pulse.name,
+        root_dir,
+        false,
+    )
+    .await
+    .map(|_| ())
+    .inspect_err(|e| tracing::error!("SurrealDB provisioning failed: {e}"))
 }
 
 /// Use a graph that `surrealdb.service` is already running. This never spawns
@@ -1111,7 +1119,7 @@ mod tests {
         let root_path = root.path().to_path_buf();
         let log = warnings_of(async {
             prepare_pulse_dir(&mut config, &root_path).await.unwrap();
-            assert!(!config.graph.enabled, "graph features stay available");
+            assert!(!config.graph.enabled, "graph features stayed available");
         });
         let hits: Vec<_> = log
             .lines()
@@ -1137,7 +1145,7 @@ mod tests {
         let root_path = root.path().to_path_buf();
         let log = warnings_of(async {
             prepare_pulse_dir(&mut config, &root_path).await.unwrap();
-            assert!(!config.graph.enabled, "graph features stay available");
+            assert!(!config.graph.enabled, "graph features stayed available");
         });
         let hits: Vec<_> = log
             .lines()
@@ -1163,7 +1171,7 @@ mod tests {
             prepare_pulse_dir(&mut config, &root_path).await.unwrap();
             assert!(
                 config.graph.enabled,
-                "a reachable provisioned graph stays on"
+                "a reachable provisioned graph was turned off"
             );
         });
         drop(listener);

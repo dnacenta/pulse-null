@@ -1,6 +1,7 @@
 pub mod archive;
 pub mod chat;
 pub mod down;
+pub mod graph;
 pub mod init;
 pub mod intent;
 pub mod isolate;

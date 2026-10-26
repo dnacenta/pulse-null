@@ -48,7 +48,20 @@ fn validate_graph(graph: &super::GraphConfig) -> Result<(), ConfigError> {
             brief_value(&graph.server)
         )));
     }
-    if !graph.surreal_bin.is_empty() && !std::path::Path::new(&graph.surreal_bin).is_absolute() {
+    if graph.surreal_bin.is_empty() {
+        return Ok(());
+    }
+    if graph.surreal_bin.contains('\0') {
+        return Err(ConfigError::Validation(
+            "[graph] surreal_bin must not contain a NUL byte".into(),
+        ));
+    }
+    if graph.surreal_bin.trim().is_empty() {
+        return Err(ConfigError::Validation(
+            "[graph] surreal_bin must not be empty".into(),
+        ));
+    }
+    if !std::path::Path::new(&graph.surreal_bin).is_absolute() {
         return Err(ConfigError::Validation(
             "[graph] surreal_bin must be an absolute path".into(),
         ));
@@ -413,6 +426,41 @@ mod tests {
         );
         config.graph.surreal_bin = "/usr/local/bin/surreal".into();
         assert!(super::validate(&config).is_ok());
+    }
+
+    #[test]
+    fn surreal_bin_rejects_nul_empty_and_directory() {
+        use super::super::test_support::minimal_config;
+        let mut config = minimal_config();
+        config.graph.surreal_bin = "/usr/bin/surreal\0".into();
+        let message = super::validate(&config).unwrap_err().to_string();
+        assert!(message.contains("NUL"), "{message}");
+        assert!(!message.contains('\0'), "{message}");
+
+        config.graph.surreal_bin = "   ".into();
+        let message = super::validate(&config).unwrap_err().to_string();
+        assert!(message.contains("must not be empty"), "{message}");
+
+        let dir = tempfile::tempdir().unwrap();
+        let folder = dir.path().join("surreal");
+        std::fs::create_dir(&folder).unwrap();
+        let directory =
+            crate::surrealdb_manager::find_binary(folder.to_str().unwrap()).unwrap_err();
+        assert!(
+            directory.to_string().contains("not a regular file"),
+            "{directory}"
+        );
+
+        let empty = dir.path().join("empty-surreal");
+        std::fs::write(&empty, "").unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&empty, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let missing_exec =
+            crate::surrealdb_manager::find_binary(empty.to_str().unwrap()).unwrap_err();
+        assert!(
+            missing_exec.to_string().contains("not executable"),
+            "{missing_exec}"
+        );
     }
 
     #[test]

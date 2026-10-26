@@ -92,6 +92,26 @@ enum Commands {
         #[command(subcommand)]
         action: ReceiptsAction,
     },
+    /// The pulse's SurrealDB user
+    Graph {
+        #[command(subcommand)]
+        action: GraphCommand,
+    },
+}
+
+/// `pulse-null graph`.
+#[derive(Subcommand)]
+enum GraphCommand {
+    /// Write `secrets/graph-password` and define the graph user.
+    /// The SurrealDB root password is one line on stdin.
+    Provision {
+        /// Graph endpoint. Default: `127.0.0.1:8787`.
+        #[arg(long)]
+        url: Option<String>,
+        /// Replace an existing `secrets/graph-password`.
+        #[arg(long)]
+        rotate: bool,
+    },
 }
 
 /// `pulse-null receipts`.
@@ -674,6 +694,12 @@ fn command_parts(command: &Commands) -> (&'static str, Option<&'static str>) {
         ),
         Commands::Probe { .. } => ("probe", None),
         Commands::Receipts { .. } => ("receipts", None),
+        Commands::Graph { action } => (
+            "graph",
+            Some(match action {
+                GraphCommand::Provision { .. } => "provision",
+            }),
+        ),
     }
 }
 
@@ -733,6 +759,10 @@ async fn run_command(
         if let Some(exit) = err.downcast_ref::<cli::receipts::PrintedExit>() {
             let code = exit.0;
             std::process::exit(code);
+        }
+        if let Some(exit) = err.downcast_ref::<cli::graph::ProvisionExit>() {
+            eprintln!("Error: {exit}");
+            std::process::exit(exit.code);
         }
         format!("Error: {err}")
     })
@@ -814,6 +844,12 @@ fn dispatch(command: Commands, listen: oneself::store::ListenEnv) -> CommandFutu
         Commands::Receipts { action } => {
             drop(listen);
             receipts_command(action)
+        }
+        Commands::Graph { action } => {
+            drop(listen);
+            match action {
+                GraphCommand::Provision { url, rotate } => Box::pin(cli::graph::run(url, rotate)),
+            }
         }
     }
 }
@@ -1118,6 +1154,8 @@ mod tests {
             "probe", "sets", "install", "--from", "dir", "--pulse", "echo",
         ],
         &["probe", "verify-isolation", "--turn", "--keep-scratch"],
+        &["graph", "provision"],
+        &["graph", "provision", "--url", "127.0.0.1:9", "--rotate"],
     ];
 
     #[test]
@@ -1141,7 +1179,7 @@ mod tests {
             [
                 "init", "up", "chat", "down", "status", "schedule", "pipeline", "archive",
                 "plugin", "intent", "outreach", "recall", "praxis", "vigil", "repair", "isolate",
-                "probe", "receipts",
+                "probe", "receipts", "graph",
             ]
         );
     }
@@ -1182,8 +1220,7 @@ mod tests {
     #[test]
     fn owner_checks_match_the_commands_that_act_on_a_pulse() {
         use clap::CommandFactory as _;
-        // Parallel to EVERY_COMMAND. `graph provision` is guarded too, once
-        // that command exists.
+        // Parallel to EVERY_COMMAND.
         let want = [
             true, true, // init
             true, true, // up
@@ -1201,6 +1238,7 @@ mod tests {
             true, // repair
             true, true, false, // isolate on, off, status
             false, false, false, false, false, false, false, false, false, // probe
+            true, true, // graph provision
         ];
         assert_eq!(EVERY_COMMAND.len(), want.len(), "the owner table drifted");
         for (args, want) in EVERY_COMMAND.iter().zip(want) {
@@ -1211,10 +1249,6 @@ mod tests {
                 "{args:?}"
             );
         }
-        assert_eq!(
-            cli::owner_guard::command_acts_on_a_pulse("graph", Some("provision")),
-            Some(true)
-        );
         assert_eq!(
             cli::owner_guard::command_acts_on_a_pulse("receipts", Some("verify")),
             Some(false)
