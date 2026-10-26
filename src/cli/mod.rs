@@ -5,6 +5,7 @@ pub mod init;
 pub mod intent;
 pub mod isolate;
 pub mod outreach;
+pub mod owner_guard;
 pub mod pipeline;
 pub mod plugin;
 pub mod praxis;
